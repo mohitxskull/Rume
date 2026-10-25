@@ -17,8 +17,6 @@ pub struct Cli {
 pub enum Commands {
     /// Scaffold a new Rume project.
     New { name: Option<String> },
-    /// List all available commands.
-    List,
     /// Inspect and validate environment/configuration.
     Env {
         #[command(subcommand)]
@@ -38,8 +36,6 @@ pub enum Commands {
     },
     /// Regenerate barrel and registration files.
     Codegen,
-    /// Start an interactive shell (REPL).
-    Shell,
     /// Generate a component.
     Generate {
         kind: Option<String>,
