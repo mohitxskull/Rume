@@ -12,8 +12,10 @@ pub mod env;
 pub mod error;
 pub mod validation;
 
-pub use app::Rume;
-pub use app::RumeBuilder;
+pub use app::{
+    ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle, LifecycleState,
+    ProjectPaths, Rume, RumeBuilder, detected_ai_agent, managed_by_pm2, running_in_ai_agent,
+};
 pub use error::AppError;
 pub use validation::Validated;
 

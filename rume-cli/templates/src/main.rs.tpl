@@ -8,13 +8,12 @@ struct Health {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> std::io::Result<()> {
     let router = Router::new().route("/health", get(|| async { Json(Health { status: "ok" }) }));
 
-    Rume::builder(())
+    Rume::builder()
         .router(router)
-        .bind("127.0.0.1:3333".parse().expect("invalid bind address"))
+        .bind(([127, 0, 0, 1], 3333))
         .run()
         .await
-        .expect("server error");
 }
