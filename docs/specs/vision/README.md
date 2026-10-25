@@ -273,6 +273,28 @@ Prints resolved values, sources, and redacted secrets. Useful for debugging
 Generate a JSON schema for `config/*.toml` and a `.env.example` from the typed
 structs. This gives editor autocomplete and documentation for free.
 
+#### 6.2.7 Design rationale: env vs config, TOML vs Rust
+
+**Env vs config.** `Env` holds deployment-specific values and secrets (`HOST`,
+`PORT`, `DATABASE_URL`, `APP_KEY`). `Config` holds application structure and
+behavior (`app.toml`: app name, server binding, pool sizes, feature flags).
+The split keeps secrets out of committed files and lets ops change behavior
+without recompiling. They compose: config files are validated into typed Rust
+structs, and env values are used explicitly in Rust code rather than via
+template strings.
+
+**Environment-specific files.** `.env`, `.env.development`, `.env.local`, and
+`config/app.toml`, `config/app.development.toml`, `config/app.local.toml` are
+layered overrides, not separate apps. This mirrors Adonis/Spring profiles and
+avoids `if env == "prod"` branches in code.
+
+**Why TOML instead of Rust files.** The schema and types are Rust (compile-time
+checked). The values are data (TOML) so ops can change them without a rebuild,
+review them as diffs, and keep secrets out of source. Type safety is preserved
+at the boundary: TOML is deserialized into Rust structs at boot, and bad values
+fail startup with clear errors. Rust-defined defaults may be added later as an
+additive override, but TOML remains the primary source.
+
 ### 6.3 HTTP layer
 
 Rume builds on Axum. It does not reimplement HTTP.
