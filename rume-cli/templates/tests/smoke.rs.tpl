@@ -34,6 +34,8 @@ fn default_port() -> u16 {
 
 #[test]
 fn config_loads() {
+    // Ensure test-specific config is used.
+    unsafe { std::env::set_var("RUME_ENV", "test"); }
     let config: Config = rume::config::load().expect("config should load");
     assert!(!config.app.name.is_empty());
 }

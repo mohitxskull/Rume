@@ -90,9 +90,14 @@ pub fn run(name: &str) {
 
     let mut instructions = Instructions::new();
     instructions.add(&format!("cd {}", name));
-    instructions.add("cargo run");
+    instructions.add("cp .env.example .env   # then edit .env and config/app.toml");
+    instructions.add("cargo run               # run the app (validates env/config at boot)");
+    instructions.add("cargo watch -x run      # or auto-reload during development");
+    instructions.add("cargo test              # run tests (uses test env automatically)");
     instructions.add("");
-    instructions.add("Then open http://127.0.0.1:3333/health");
+    instructions.add("rume doctor            # validate project setup");
+    instructions.add("rume --help            # see all commands");
+    instructions.render();
     instructions.render();
 }
 

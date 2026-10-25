@@ -1,11 +1,9 @@
 mod codegen;
 mod config;
-mod dev;
 mod doctor;
 mod env;
 mod generate;
 mod new;
-mod test;
 
 use crate::cli::{Cli, Commands};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -19,6 +17,14 @@ pub fn is_no_color() -> bool {
 
 pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
+}
+
+pub fn require_rume_project() {
+    if !std::path::Path::new("config/app.toml").is_file() {
+        eprintln!("error: not a Rume project (config/app.toml not found)");
+        eprintln!("hint: run `rume new <name>` to create one, or cd into a Rume project");
+        std::process::exit(1);
+    }
 }
 
 pub fn run(cli: Cli) {
@@ -37,13 +43,26 @@ pub fn run(cli: Cli) {
             }
             new::run(&name);
         }
-        Some(Commands::Dev) => dev::run(),
-        Some(Commands::Test) => test::run(),
-        Some(Commands::Env { command }) => env::run(command),
-        Some(Commands::Config { command }) => config::run(command),
-        Some(Commands::Doctor) => doctor::run(),
-        Some(Commands::Codegen) => codegen::run(),
-        Some(Commands::Generate { kind, name }) => generate::run(kind.as_deref(), name.as_deref()),
+        Some(Commands::Env { command }) => {
+            require_rume_project();
+            env::run(command);
+        }
+        Some(Commands::Config { command }) => {
+            require_rume_project();
+            config::run(command);
+        }
+        Some(Commands::Doctor) => {
+            require_rume_project();
+            doctor::run();
+        }
+        Some(Commands::Codegen) => {
+            require_rume_project();
+            codegen::run();
+        }
+        Some(Commands::Generate { kind, name }) => {
+            require_rume_project();
+            generate::run(kind.as_deref(), name.as_deref());
+        }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
             use clap_complete::generate;
@@ -53,18 +72,15 @@ pub fn run(cli: Cli) {
         Some(Commands::List) => {
             println!("Available commands:");
             println!("  new <name>          Scaffold a new Rume project");
-            println!("  dev                 Run the application in development mode");
-            println!("  test                Run the test suite");
+            println!("  doctor              Validate the project setup");
             println!("  env check [--all]   Inspect resolved environment");
             println!("  config check        Inspect merged configuration");
-            println!("  doctor              Validate the project setup");
             println!(
                 "  generate <kind>     Generate a component (handler, service, model, middleware)"
             );
             println!("  codegen             Regenerate barrel files");
             println!("  completions <sh>    Generate shell completions");
             println!("  list                List all available commands");
-            println!("  shell               Start an interactive shell");
         }
         Some(Commands::Shell) => {
             use clap::Parser;
@@ -106,17 +122,14 @@ pub fn run(cli: Cli) {
                             new::run(&name);
                         }
                     }
-                    Some(Commands::Generate { kind, name }) => {
-                        generate::run(kind.as_deref(), name.as_deref());
-                    }
                     Some(Commands::List) => {
                         println!(
-                            "Available commands: new, dev, test, env, config, doctor, generate, codegen, completions, list, shell"
+                            "Available commands: new, doctor, env, config, generate, codegen, completions, list, shell"
                         );
                     }
                     Some(other) => {
-                        eprintln!("Command not yet supported in shell mode. Use the CLI directly.");
                         let _ = other;
+                        eprintln!("Command not yet supported in shell mode. Use the CLI directly.");
                     }
                     None => {}
                 }

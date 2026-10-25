@@ -19,10 +19,6 @@ pub enum Commands {
     New { name: Option<String> },
     /// List all available commands.
     List,
-    /// Run the application in development mode.
-    Dev,
-    /// Run the test suite.
-    Test,
     /// Inspect and validate environment/configuration.
     Env {
         #[command(subcommand)]

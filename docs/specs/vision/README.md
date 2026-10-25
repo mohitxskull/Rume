@@ -523,18 +523,20 @@ cp .env.example .env
 # edit .env and config/app.toml
 
 # Run
-rume dev
+cargo run
 # -> server on http://localhost:3333
 # -> GET /health returns {"status":"ok"}
 
+# Or with auto-reload during development
+cargo watch -x run
+
 # Add a route
-rume generate controller posts
-# edit src/controllers/posts.rs
+rume generate handler posts
+# edit src/handlers/posts.rs
 
 # Test
-rume test
-# -> HTTP tests pass
-# -> DB tests pass (if configured)
+cargo test
+# -> HTTP tests pass (uses test env automatically)
 
 # Inspect
 rume env check
