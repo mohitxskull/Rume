@@ -12,6 +12,8 @@ pub mod env;
 pub mod error;
 pub mod validation;
 
+pub use app::Rume;
+pub use app::RumeBuilder;
 pub use error::AppError;
 pub use validation::Validated;
 
