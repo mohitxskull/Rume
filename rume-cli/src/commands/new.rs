@@ -40,6 +40,28 @@ const TEMPLATES: &[(&str, &str)] = &[
         "src/main.rs",
         include_str!("../../templates/src/main.rs.tpl"),
     ),
+    ("src/app.rs", include_str!("../../templates/src/app.rs.tpl")),
+    ("src/env.rs", include_str!("../../templates/src/env.rs.tpl")),
+    (
+        "src/config.rs",
+        include_str!("../../templates/src/config.rs.tpl"),
+    ),
+    (
+        "src/routes.rs",
+        include_str!("../../templates/src/routes.rs.tpl"),
+    ),
+    (
+        "src/handlers/mod.rs",
+        include_str!("../../templates/src/handlers/mod.rs.tpl"),
+    ),
+    (
+        "src/handlers/health.rs",
+        include_str!("../../templates/src/handlers/health.rs.tpl"),
+    ),
+    (
+        "tests/smoke.rs",
+        include_str!("../../templates/tests/smoke.rs.tpl"),
+    ),
     (".env", include_str!("../../templates/.env.tpl")),
     (
         ".env.example",
