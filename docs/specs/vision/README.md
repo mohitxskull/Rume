@@ -379,6 +379,23 @@ These are not part of the v1 contract but follow the same design principles.
 - Feature flags for optional functionality.
 - No runtime plugin system.
 
+### 6.11 Developer experience principles
+
+DX is a first-class requirement, not a polish phase. These principles govern
+generated code and framework APIs:
+
+- **No stringly-typed binds.** Addresses, ports, and config values are parsed
+  into typed values before reaching the builder.
+- **No `map_err` boilerplate in generated code.** Startup functions return
+  `Result<(), Box<dyn std::error::Error>>` and use `?`.
+- **No raw Axum ceremony in minimal templates.** Use `Rume::builder()`, path
+  helpers, and `rume::prelude::*`.
+- **Generated code must build.** A scaffold that does not compile is a defect.
+- **Nested config sections** (`config.app.name`) are preferred over flat keys
+  when more fields will follow.
+- **Process environment stays out of `rume env check`** unless `--all` is used.
+- **Templates are real files**, not Rust string literals.
+
 ## 7. v1 contract
 
 ### 7.1 Stable before 1.0
@@ -537,6 +554,13 @@ swap the database layer without rewriting application code.
 - 2026-10-25: Env and config are separate systems: env holds deployment values
   and secrets; config holds structured TOML validated into Rust types.
 - 2026-10-25: v1 contract is frozen; everything outside it is experimental.
+- 2026-10-25: Generated config uses nested `app` section.
+- 2026-10-25: Generated startup code returns `Result<(), Box<dyn Error>>` and
+  uses `?`.
+- 2026-10-25: `rume::prelude` provides common imports.
+- 2026-10-25: `ProjectPaths` provides `config_path`, `tmp_path`, `public_path`,
+  and `migrations_path`.
+- 2026-10-25: Architecture constraints promoted to `.opencode/rules/60-architecture.md`.
 
 ## 17. Revision history
 
