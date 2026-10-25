@@ -7,6 +7,22 @@ pub fn run() {
 
     let mut ok = true;
 
+    // Rust toolchain
+    print_check("rust toolchain", || {
+        match std::process::Command::new("rustc")
+            .arg("--version")
+            .output()
+        {
+            Ok(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            _ => {
+                ok = false;
+                "rustc not found".to_string()
+            }
+        }
+    });
+
     // Environment
     print_check("environment files", || match env::ResolvedEnv::load() {
         Ok(resolved) => {

@@ -13,20 +13,24 @@ pub fn run(all: bool) {
             }
 
             if !resolved.file_keys.is_empty() {
+                use crate::ui::table::TableBuilder;
+
                 println!("resolved environment:");
-            }
+                let mut table = TableBuilder::new();
+                table.head(&["Variable", "Value", "Source"]);
+                for key in &resolved.file_keys {
+                    let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
+                    let source = resolved
+                        .sources
+                        .get(key)
+                        .map(String::as_str)
+                        .unwrap_or("unknown");
 
-            for key in &resolved.file_keys {
-                let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
-                let source = resolved
-                    .sources
-                    .get(key)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
-
-                shown += 1;
-                let display = rume::env::redact(key, value);
-                println!("  {key}={display}  ({source})");
+                    shown += 1;
+                    let display = rume::env::redact(key, value);
+                    table.row(&[key, &display, source]);
+                }
+                table.render();
             }
 
             if all {

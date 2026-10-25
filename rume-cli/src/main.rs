@@ -1,5 +1,9 @@
+#![allow(dead_code)]
+
 mod cli;
 mod commands;
+mod prompts;
+mod ui;
 
 use crate::cli::Cli;
 use clap::Parser;

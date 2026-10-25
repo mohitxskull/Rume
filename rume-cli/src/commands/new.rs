@@ -81,13 +81,19 @@ pub fn run(name: &str) {
         std::process::exit(1);
     }
 
-    println!("Created project `{name}`");
+    use crate::ui::sticker::{Instructions, Sticker};
+
+    let mut sticker = Sticker::new();
+    sticker.add(&format!("Created project `{}`", name));
+    sticker.render();
     println!();
-    println!("Next steps:");
-    println!("  cd {name}");
-    println!("  cargo run");
-    println!();
-    println!("Then open http://127.0.0.1:3333/health");
+
+    let mut instructions = Instructions::new();
+    instructions.add(&format!("cd {}", name));
+    instructions.add("cargo run");
+    instructions.add("");
+    instructions.add("Then open http://127.0.0.1:3333/health");
+    instructions.render();
 }
 
 fn run_inner(name: &str) -> Result<(), NewError> {

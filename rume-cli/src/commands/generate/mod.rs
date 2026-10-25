@@ -19,38 +19,30 @@ pub fn run(kind: Option<&str>, name: Option<&str>) {
         return;
     };
 
+    let name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            let prompted = crate::prompts::ask(&format!("{} name", kind));
+            if prompted.is_empty() {
+                eprintln!("error: name is required");
+                std::process::exit(1);
+            }
+            prompted
+        }
+    };
+
     match kind {
         "handler" => {
-            let Some(name) = name else {
-                eprintln!("error: `rume generate handler` requires a name");
-                eprintln!("usage: rume generate handler <name>");
-                std::process::exit(1);
-            };
-            handler::run(name);
+            handler::run(&name);
         }
         "service" => {
-            let Some(name) = name else {
-                eprintln!("error: `rume generate service` requires a name");
-                eprintln!("usage: rume generate service <name>");
-                std::process::exit(1);
-            };
-            service::run(name);
+            service::run(&name);
         }
         "model" => {
-            let Some(name) = name else {
-                eprintln!("error: `rume generate model` requires a name");
-                eprintln!("usage: rume generate model <name>");
-                std::process::exit(1);
-            };
-            model::run(name);
+            model::run(&name);
         }
         "middleware" => {
-            let Some(name) = name else {
-                eprintln!("error: `rume generate middleware` requires a name");
-                eprintln!("usage: rume generate middleware <name>");
-                std::process::exit(1);
-            };
-            middleware::run(name);
+            middleware::run(&name);
         }
         _ => {
             eprintln!("error: unknown generator `{kind}`");
