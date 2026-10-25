@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Local environment / secrets
+.env
+.env.local
+.env.*.local
+.env.development
+.env.production
+.env.test
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+
+# Local-only tooling
+opencode.sh

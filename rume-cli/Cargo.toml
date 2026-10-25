@@ -1,0 +1,16 @@
+[package]
+name = "rume-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Command-line interface for the Rume framework."
+
+[[bin]]
+name = "rume"
+path = "src/main.rs"
+
+[dependencies]
+rume.workspace = true
+clap.workspace = true
+tokio.workspace = true
