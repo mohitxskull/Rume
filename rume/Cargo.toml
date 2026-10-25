@@ -27,6 +27,9 @@ dotenvy.workspace = true
 url.workspace = true
 # TOML configuration files.
 toml.workspace = true
+# Optional JSON Schema generation.
+schemars = { version = "1.2.3", optional = true, features = ["derive"] }
+serde_json = { version = "1.0.154", optional = true }
 # Tracing/logging.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # Tower utilities for testing and middleware.

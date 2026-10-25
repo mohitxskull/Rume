@@ -170,6 +170,43 @@ Three refusals:
 
 ## 6. Product shape
 
+### 6.0 Standard project layout
+
+Generated and recommended project structure:
+
+```text
+my-app/
+  Cargo.toml
+  .env
+  .env.example
+  config/
+    app.toml
+  src/
+    main.rs
+    app.rs
+    env.rs
+    config.rs
+    routes.rs
+    handlers/
+      mod.rs
+      health.rs
+    services/
+    models/
+    errors.rs
+  tests/
+    smoke.rs
+  migrations/
+  public/
+  tmp/
+```
+
+- `main.rs` stays tiny; bootstrap lives in `app.rs`.
+- `env.rs` and `config.rs` hold typed structs.
+- `routes.rs` registers routes.
+- `handlers/` holds request handlers.
+- `tests/` uses `TestApp`.
+- `migrations/`, `public/`, and `tmp/` are created on demand.
+
 ### 6.1 Application model
 
 Rume applications are built explicitly:
@@ -560,7 +597,9 @@ swap the database layer without rewriting application code.
 - 2026-10-25: `rume::prelude` provides common imports.
 - 2026-10-25: `ProjectPaths` provides `config_path`, `tmp_path`, `public_path`,
   and `migrations_path`.
-- 2026-10-25: Architecture constraints promoted to `.opencode/rules/60-architecture.md`.
+- 2026-10-25: Standard multi-file project layout adopted for `rume new`.
+- 2026-10-25: Config schema generation planned via typed structs and `schemars`.
+- 2026-10-25: `rume generate handler` implemented with module and route registration.
 
 ## 17. Revision history
 
