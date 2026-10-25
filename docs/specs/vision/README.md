@@ -600,6 +600,7 @@ swap the database layer without rewriting application code.
 - 2026-10-25: Standard multi-file project layout adopted for `rume new`.
 - 2026-10-25: Config schema generation planned via typed structs and `schemars`.
 - 2026-10-25: `rume generate handler` implemented with module and route registration.
+- 2026-10-25: `rume codegen` regenerates handler barrel files.
 
 ## 17. Revision history
 

@@ -27,6 +27,8 @@ pub enum Commands {
     },
     /// Validate the project setup.
     Doctor,
+    /// Regenerate barrel and registration files.
+    Codegen,
     /// Generate a component.
     Generate {
         kind: Option<String>,
