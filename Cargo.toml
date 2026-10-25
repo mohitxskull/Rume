@@ -4,6 +4,9 @@ members = [
     "rume",
     "rume-cli",
 ]
+exclude = [
+    "lab",
+]
 default-members = ["rume", "rume-cli"]
 
 [workspace.package]
