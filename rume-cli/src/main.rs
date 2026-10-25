@@ -20,6 +20,11 @@ enum Commands {
         #[command(subcommand)]
         command: EnvCommands,
     },
+    /// Inspect and validate configuration.
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommands,
+    },
     /// Validate the project setup.
     Doctor,
     /// Generate a component.
@@ -29,6 +34,12 @@ enum Commands {
 #[derive(Subcommand)]
 enum EnvCommands {
     /// Inspect resolved environment and configuration.
+    Check,
+}
+
+#[derive(Subcommand)]
+enum ConfigCommands {
+    /// Print the merged configuration.
     Check,
 }
 
@@ -68,6 +79,17 @@ async fn main() {
                             }
                         }
                     }
+                    Err(err) => {
+                        eprintln!("error: {err}");
+                        std::process::exit(1);
+                    }
+                }
+            }
+        },
+        Some(Commands::Config { command }) => match command {
+            ConfigCommands::Check => {
+                match rume::config::load_raw_pretty(std::path::Path::new(".")) {
+                    Ok(text) => println!("{text}"),
                     Err(err) => {
                         eprintln!("error: {err}");
                         std::process::exit(1);
