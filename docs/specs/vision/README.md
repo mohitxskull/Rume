@@ -26,7 +26,7 @@ typed where Loco is templated, and modular where Loco is monolithic.**
 The first proof of that thesis is not an ORM or a mailer. It is the thing most
 frameworks get wrong and most teams rebuild by hand: **configuration and
 environment handling.** Typed env, layered `.env`, secret redaction, provenance,
-and `rume env:check`.
+and `rume env check`.
 
 ## 2. The problem
 
@@ -263,7 +263,7 @@ let url = app.config.app.url.clone();
 
 No `config.get::<T>("app.url")`. No stringly keys. No runtime type erasure.
 
-#### 6.2.5 `rume env:check`
+#### 6.2.5 `rume env check`
 
 Prints resolved values, sources, and redacted secrets. Useful for debugging
 "why is this value what it is."
@@ -322,7 +322,7 @@ let app = TestApp::with_db().build().await;
 rume new <name>        # scaffold a project
 rume dev               # run with watch/restart
 rume test              # run tests
-rume env:check         # inspect resolved env/config
+rume env check         # inspect resolved env/config
 rume doctor            # validate DB, queue, deps, config
 rume generate <kind>   # scaffold controllers, models, etc.
 ```
@@ -366,7 +366,7 @@ These are not part of the v1 contract but follow the same design principles.
 3. HTTP layer on Axum.
 4. Validation.
 5. Testing harness.
-6. CLI (`new`, `dev`, `test`, `env:check`, `doctor`).
+6. CLI (`new`, `dev`, `test`, `env check`, `doctor`).
 7. Observability hooks.
 
 ### 7.2 Graduation criteria
@@ -461,7 +461,7 @@ rume test
 # -> DB tests pass (if configured)
 
 # Inspect
-rume env:check
+rume env check
 rume doctor
 
 # Deploy

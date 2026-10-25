@@ -15,12 +15,21 @@ enum Commands {
     Dev,
     /// Run the test suite.
     Test,
-    /// Inspect resolved environment and configuration.
-    EnvCheck,
+    /// Inspect and validate environment/configuration.
+    Env {
+        #[command(subcommand)]
+        command: EnvCommands,
+    },
     /// Validate the project setup.
     Doctor,
     /// Generate a component.
     Generate { kind: String },
+}
+
+#[derive(Subcommand)]
+enum EnvCommands {
+    /// Inspect resolved environment and configuration.
+    Check,
 }
 
 #[tokio::main]
@@ -37,9 +46,11 @@ async fn main() {
         Some(Commands::Test) => {
             println!("running tests");
         }
-        Some(Commands::EnvCheck) => {
-            println!("checking environment");
-        }
+        Some(Commands::Env { command }) => match command {
+            EnvCommands::Check => {
+                println!("checking environment");
+            }
+        },
         Some(Commands::Doctor) => {
             println!("running diagnostics");
         }
