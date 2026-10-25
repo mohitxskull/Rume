@@ -11,7 +11,8 @@ use figment::providers::Toml;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-/// Errors produced while loading configuration.
+/// A convenience alias for configuration loading results.
+pub type Result<T> = std::result::Result<T, ConfigError>;
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("no configuration file found in {dir}")]
@@ -28,7 +29,7 @@ impl From<figment::Error> for ConfigError {
 }
 
 /// Load and validate a typed configuration from the current directory.
-pub fn load<T>() -> Result<T, ConfigError>
+pub fn load<T>() -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -36,7 +37,7 @@ where
 }
 
 /// Load and validate a typed configuration rooted at `dir`.
-pub fn load_in<T>(dir: &Path) -> Result<T, ConfigError>
+pub fn load_in<T>(dir: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -45,18 +46,18 @@ where
 }
 
 /// Load the merged configuration as a raw TOML value.
-pub fn load_raw(dir: &Path) -> Result<toml::Value, ConfigError> {
+pub fn load_raw(dir: &Path) -> Result<toml::Value> {
     let figment = build_figment(dir)?;
     figment.extract::<toml::Value>().map_err(ConfigError::from)
 }
 
 /// Load the merged configuration as a pretty TOML string.
-pub fn load_raw_pretty(dir: &Path) -> Result<String, ConfigError> {
+pub fn load_raw_pretty(dir: &Path) -> Result<String> {
     let value = load_raw(dir)?;
     toml::to_string_pretty(&value).map_err(|err| ConfigError::Validation(err.to_string()))
 }
 
-fn build_figment(dir: &Path) -> Result<Figment, ConfigError> {
+fn build_figment(dir: &Path) -> Result<Figment> {
     let env_name = crate::env::resolve_env_name();
 
     let candidates = [

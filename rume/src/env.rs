@@ -36,12 +36,12 @@ pub struct ResolvedEnv {
 
 impl ResolvedEnv {
     /// Load the environment for the current working directory.
-    pub fn load() -> Result<Self, EnvError> {
+    pub fn load() -> Result<Self> {
         Self::load_in(Path::new("."))
     }
 
     /// Load the environment rooted at `dir`.
-    pub fn load_in(dir: &Path) -> Result<Self, EnvError> {
+    pub fn load_in(dir: &Path) -> Result<Self> {
         load_merged_map_in(dir)
     }
 
@@ -51,7 +51,8 @@ impl ResolvedEnv {
     }
 }
 
-/// Errors produced while loading the environment.
+/// A convenience alias for environment loading results.
+pub type Result<T> = std::result::Result<T, EnvError>;
 #[derive(Debug, Error)]
 pub enum EnvError {
     #[error("I/O error while reading {path}: {source}")]
@@ -100,7 +101,7 @@ pub fn resolve_env_name() -> String {
 }
 
 /// Load and validate a typed environment from the current directory.
-pub fn load<T>() -> Result<T, EnvError>
+pub fn load<T>() -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -108,7 +109,7 @@ where
 }
 
 /// Load and validate a typed environment rooted at `dir`.
-pub fn load_in<T>(dir: &Path) -> Result<T, EnvError>
+pub fn load_in<T>(dir: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
@@ -118,11 +119,11 @@ where
 }
 
 /// Load the merged environment map for the current directory.
-pub fn load_merged_map() -> Result<ResolvedEnv, EnvError> {
+pub fn load_merged_map() -> Result<ResolvedEnv> {
     load_merged_map_in(Path::new("."))
 }
 
-fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv, EnvError> {
+fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
     let env_name = resolve_env_name();
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
@@ -187,7 +188,7 @@ fn dotenv_candidates(dir: &Path, env_name: &str) -> Vec<(PathBuf, String)> {
     candidates
 }
 
-fn resolve_value(value: String, dir: &Path) -> Result<String, std::io::Error> {
+fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
     // Escaped literal: "file\:not-a-path" -> "file:not-a-path".
     if let Some(rest) = value.strip_prefix("file\\:") {
         return Ok(format!("file:{rest}"));

@@ -5,8 +5,6 @@ use rume::serde::Deserialize;
 pub struct Env {
     pub host: std::net::IpAddr,
     pub port: u16,
-}
-
-pub fn load() -> Result<Env, rume::env::EnvError> {
-    rume::env::load::<Env>()
+    #[serde(default)]
+    pub log_level: Option<String>,
 }
