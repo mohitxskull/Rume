@@ -1,5 +1,4 @@
-use rume::axum::Json;
-use rume::serde::Serialize;
+use rume::prelude::*;
 
 #[derive(Serialize)]
 pub struct Health {

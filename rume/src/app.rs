@@ -4,7 +4,7 @@ use axum::Router;
 use axum::routing::MethodRouter;
 use std::future::Future;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -175,6 +175,22 @@ impl ProjectPaths {
 
     pub fn from_current_dir() -> Self {
         Self::from_root(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+    }
+
+    pub fn config_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.config.join(path.as_ref())
+    }
+
+    pub fn tmp_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.tmp.join(path.as_ref())
+    }
+
+    pub fn public_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.public.join(path.as_ref())
+    }
+
+    pub fn migrations_path(&self, path: impl AsRef<Path>) -> PathBuf {
+        self.root.join("migrations").join(path.as_ref())
     }
 }
 

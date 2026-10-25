@@ -1,8 +1,13 @@
-use rume::serde::Deserialize;
+use rume::prelude::*;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
-    pub app_name: String,
+    pub app: AppConfig,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AppConfig {
+    pub name: String,
     #[serde(default = "default_port")]
     pub server_port: u16,
 }

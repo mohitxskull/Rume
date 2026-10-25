@@ -1,2 +1,3 @@
-app_name = "{{name}}"
+[app]
+name = "{{name}}"
 server_port = 3333

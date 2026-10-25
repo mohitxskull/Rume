@@ -1,4 +1,4 @@
-use rume::serde::Deserialize;
+use rume::prelude::*;
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
