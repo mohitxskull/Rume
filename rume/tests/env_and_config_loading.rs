@@ -122,3 +122,32 @@ fn loads_merged_config() {
     assert_eq!(cfg.app.name, "Base");
     assert_eq!(cfg.app.port, 2222);
 }
+
+#[derive(rume::serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+struct TypedEnv {
+    host: std::net::IpAddr,
+    port: u16,
+    #[serde(default)]
+    log_level: Option<String>,
+}
+
+#[test]
+fn loads_typed_env() {
+    let _guard = ENV_LOCK.lock().unwrap();
+    remove_env("HOST");
+    remove_env("PORT");
+    remove_env("LOG_LEVEL");
+    set_env("RUME_ENV", "development");
+
+    let dir = TempDir::new().unwrap();
+    let root = dir.path();
+
+    write(&root.join(".env"), "HOST=127.0.0.1\nPORT=3333\n");
+
+    let env: TypedEnv = rume::env::load_in(root).unwrap();
+
+    assert_eq!(env.host, std::net::IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(env.port, 3333);
+    assert_eq!(env.log_level, None);
+}
