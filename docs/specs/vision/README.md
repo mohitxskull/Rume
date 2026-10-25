@@ -524,6 +524,20 @@ swap the database layer without rewriting application code.
 5. Should `rume` be the crate name, or is there a better name?
 6. How much of Axum's API should Rume re-export vs. wrap?
 
-## 16. Revision history
+## 16. Decision log
+
+- 2026-10-25: CLI is organized as `cli.rs` plus a `commands/` module tree.
+  Nested groups (`env`, `config`) are folders; leaf commands are files.
+- 2026-10-25: `rume env check` hides process-environment variables by default
+  and shows them only with `--all`, to keep output focused on project config.
+- 2026-10-25: `lab/` is gitignored for local experiments and generated projects.
+- 2026-10-25: `rume new` templates are real files under `rume-cli/templates/`,
+  rendered with a small in-house placeholder renderer (no template engine
+  dependency).
+- 2026-10-25: Env and config are separate systems: env holds deployment values
+  and secrets; config holds structured TOML validated into Rust types.
+- 2026-10-25: v1 contract is frozen; everything outside it is experimental.
+
+## 17. Revision history
 
 - 2026-10-25: Initial vision draft.

@@ -5,25 +5,57 @@ use std::path::Path;
 // during pre-v1 development. Switch to a crates.io version before publishing.
 const FRAMEWORK_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../rume");
 
+#[derive(Debug)]
+pub enum NewError {
+    InvalidName(String),
+    AlreadyExists(String),
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for NewError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidName(name) => {
+                write!(
+                    f,
+                    "project name must contain only letters, numbers, '-' or '_': {name}"
+                )
+            }
+            Self::AlreadyExists(name) => write!(f, "directory '{name}' already exists"),
+            Self::Io(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for NewError {}
+
+struct TemplateContext<'a> {
+    name: &'a str,
+    framework_path: &'a str,
+}
+
+const TEMPLATES: &[(&str, &str)] = &[
+    ("Cargo.toml", include_str!("../../templates/Cargo.toml.tpl")),
+    (
+        "src/main.rs",
+        include_str!("../../templates/src/main.rs.tpl"),
+    ),
+    (".env", include_str!("../../templates/.env.tpl")),
+    (
+        ".env.example",
+        include_str!("../../templates/.env.example.tpl"),
+    ),
+    (
+        "config/app.toml",
+        include_str!("../../templates/config/app.toml.tpl"),
+    ),
+    ("README.md", include_str!("../../templates/README.md.tpl")),
+];
+
 pub fn run(name: &str) {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        eprintln!("error: project name must contain only letters, numbers, '-' or '_'");
-        std::process::exit(1);
-    }
-
-    let root = Path::new(name);
-    if root.exists() {
-        eprintln!("error: directory '{name}' already exists");
-        std::process::exit(1);
-    }
-
-    if let Err(err) = scaffold(root, name) {
-        eprintln!("error: failed to scaffold project: {err}");
-        let _ = fs::remove_dir_all(root);
+    if let Err(err) = run_inner(name) {
+        eprintln!("error: {err}");
+        let _ = fs::remove_dir_all(name);
         std::process::exit(1);
     }
 
@@ -36,84 +68,79 @@ pub fn run(name: &str) {
     println!("Then open http://127.0.0.1:3333/health");
 }
 
-fn scaffold(root: &Path, name: &str) -> Result<(), String> {
-    fs::create_dir_all(root.join("src")).map_err(|e| e.to_string())?;
-    fs::create_dir_all(root.join("config")).map_err(|e| e.to_string())?;
+fn run_inner(name: &str) -> Result<(), NewError> {
+    validate_name(name)?;
 
-    write(
-        &root.join("Cargo.toml"),
-        &format!(
-            r#"[package]
-name = "{name}"
-version = "0.1.0"
-edition = "2024"
+    let root = Path::new(name);
+    if root.exists() {
+        return Err(NewError::AlreadyExists(name.to_string()));
+    }
 
-[dependencies]
-rume = {{ path = "{FRAMEWORK_PATH}" }}
-serde = {{ version = "1.0.229", features = ["derive"] }}
-tokio = {{ version = "1.54.1", features = ["full"] }}
-"#
-        ),
-    )?;
+    fs::create_dir_all(root.join("src")).map_err(NewError::Io)?;
+    fs::create_dir_all(root.join("config")).map_err(NewError::Io)?;
 
-    write(
-        &root.join("src/main.rs"),
-        r#"use rume::axum::{Json, Router, routing::get};
-use rume::serde::Serialize;
+    let context = TemplateContext {
+        name,
+        framework_path: FRAMEWORK_PATH,
+    };
 
-#[derive(Serialize)]
-struct Health {
-    status: &'static str,
-}
-
-#[tokio::main]
-async fn main() {
-    let app = Router::new().route("/health", get(|| async { Json(Health { status: "ok" }) }));
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3333")
-        .await
-        .expect("failed to bind address");
-
-    println!("listening on http://127.0.0.1:3333");
-    rume::axum::serve(listener, app).await.expect("server error");
-}
-"#,
-    )?;
-
-    write(&root.join(".env"), "HOST=127.0.0.1\nPORT=3333\n")?;
-
-    write(&root.join(".env.example"), "HOST=127.0.0.1\nPORT=3333\n")?;
-
-    write(
-        &root.join("config/app.toml"),
-        &format!("[app]\nname = \"{name}\"\n"),
-    )?;
-
-    write(
-        &root.join("README.md"),
-        &format!(
-            r#"# {name}
-
-A Rume application.
-
-## Run
-
-```sh
-cargo run
-```
-
-Then visit http://127.0.0.1:3333/health.
-
-## Environment
-
-Copy `.env.example` to `.env` and adjust as needed.
-"#
-        ),
-    )?;
+    for (relative_path, template) in TEMPLATES {
+        let rendered = render(template, &context);
+        write_file(&root.join(relative_path), &rendered)?;
+    }
 
     Ok(())
 }
 
-fn write(path: &Path, content: &str) -> Result<(), String> {
-    fs::write(path, content).map_err(|e| format!("{}: {e}", path.display()))
+fn validate_name(name: &str) -> Result<(), NewError> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(NewError::InvalidName(name.to_string()));
+    }
+    Ok(())
+}
+
+fn render(template: &str, context: &TemplateContext<'_>) -> String {
+    template
+        .replace("{{name}}", context.name)
+        .replace("{{framework_path}}", context.framework_path)
+}
+
+fn write_file(path: &Path, content: &str) -> Result<(), NewError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(NewError::Io)?;
+    }
+    fs::write(path, content).map_err(NewError::Io)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accepts_valid_names() {
+        assert!(validate_name("demo").is_ok());
+        assert!(validate_name("demo-app").is_ok());
+        assert!(validate_name("demo_app").is_ok());
+    }
+
+    #[test]
+    fn rejects_invalid_names() {
+        assert!(validate_name("").is_err());
+        assert!(validate_name("demo app").is_err());
+        assert!(validate_name("demo/app").is_err());
+    }
+
+    #[test]
+    fn renders_placeholders() {
+        let context = TemplateContext {
+            name: "demo",
+            framework_path: "/tmp/rume",
+        };
+        let rendered = render("name={{name}} path={{framework_path}}", &context);
+        assert_eq!(rendered, "name=demo path=/tmp/rume");
+    }
 }
