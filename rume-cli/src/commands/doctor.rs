@@ -50,6 +50,22 @@ pub fn run() {
         }
     });
 
+    // Port availability
+    print_check("port availability", || {
+        let port = std::env::var("PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .unwrap_or(3333);
+
+        match std::net::TcpListener::bind(("127.0.0.1", port)) {
+            Ok(_) => format!("port {port} is available"),
+            Err(err) => {
+                ok = false;
+                format!("port {port} is in use: {err} (stop the process or change PORT)")
+            }
+        }
+    });
+
     println!();
     if ok {
         println!("All checks passed.");
