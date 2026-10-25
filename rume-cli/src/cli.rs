@@ -34,7 +34,11 @@ pub enum Commands {
 #[derive(Subcommand)]
 pub enum EnvCommands {
     /// Inspect resolved environment and configuration.
-    Check,
+    Check {
+        /// Include variables inherited from the process environment.
+        #[arg(long)]
+        all: bool,
+    },
 }
 
 #[derive(Subcommand)]
