@@ -239,3 +239,37 @@ pub fn redact(key: &str, value: &str) -> String {
         value.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redacts_secret_keys() {
+        assert_eq!(redact("APP_KEY", "secret"), "[redacted]");
+        assert_eq!(redact("PASSWORD", "x"), "[redacted]");
+        assert_eq!(redact("API_TOKEN", "x"), "[redacted]");
+        assert_eq!(redact("HOST", "localhost"), "localhost");
+    }
+
+    #[test]
+    fn redacts_credential_urls() {
+        assert_eq!(
+            redact("DATABASE_URL", "postgres://user:pass@host/db"),
+            "[redacted]"
+        );
+        assert_eq!(
+            redact("DATABASE_URL", "postgres://host/db"),
+            "postgres://host/db"
+        );
+    }
+
+    #[test]
+    fn detects_secret_keys() {
+        assert!(is_secret_key("APP_KEY"));
+        assert!(is_secret_key("API_TOKEN"));
+        assert!(is_secret_key("DB_PASSWORD"));
+        assert!(!is_secret_key("HOST"));
+        assert!(!is_secret_key("PORT"));
+    }
+}
