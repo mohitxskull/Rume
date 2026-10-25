@@ -1,5 +1,8 @@
-use rume::prelude::*;
+use rume::axum::Router;
 
 pub fn router() -> Router<()> {
-    Router::new().route("/health", routing::get(crate::handlers::health::health))
+    let mut router = Router::new();
+    router = router.route("/health", rume::axum::routing::get(crate::handlers::health::health));
+    // rume:routes
+    router
 }

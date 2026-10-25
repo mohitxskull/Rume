@@ -114,7 +114,18 @@ where
     T: DeserializeOwned,
 {
     let resolved = load_merged_map_in(dir)?;
-    let figment = Figment::from(Serialized::defaults(resolved.values));
+
+    // Parse scalar values the same way figment's built-in `Env` provider does,
+    // so numbers and booleans are not treated as strings.
+    let mut parsed: BTreeMap<String, figment::value::Value> = BTreeMap::new();
+    for (key, value) in resolved.values {
+        let value = value
+            .parse::<figment::value::Value>()
+            .map_err(|err| EnvError::Validation(err.to_string()))?;
+        parsed.insert(key, value);
+    }
+
+    let figment = Figment::from(Serialized::defaults(parsed));
     figment.extract::<T>().map_err(EnvError::from_figment)
 }
 

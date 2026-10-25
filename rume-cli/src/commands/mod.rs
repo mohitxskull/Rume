@@ -16,7 +16,7 @@ pub fn run(cli: Cli) {
         Some(Commands::Env { command }) => env::run(command),
         Some(Commands::Config { command }) => config::run(command),
         Some(Commands::Doctor) => doctor::run(),
-        Some(Commands::Generate { kind }) => generate::run(&kind),
+        Some(Commands::Generate { kind, name }) => generate::run(&kind, name.as_deref()),
         None => {
             println!("Rume CLI. Run `rume --help` for usage.");
         }

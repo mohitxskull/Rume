@@ -28,7 +28,7 @@ pub enum Commands {
     /// Validate the project setup.
     Doctor,
     /// Generate a component.
-    Generate { kind: String },
+    Generate { kind: String, name: Option<String> },
 }
 
 #[derive(Subcommand)]
