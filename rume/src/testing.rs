@@ -6,15 +6,26 @@ use axum::http::{Request, Response, StatusCode};
 use tower::ServiceExt;
 
 /// A lightweight test application backed by an Axum router.
-#[derive(Clone)]
 pub struct TestApp {
     router: Router<()>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl TestApp {
     /// Create a test app from an already-built router.
     pub fn new(router: Router<()>) -> Self {
-        Self { router }
+        Self {
+            router,
+            cleanup: None,
+        }
+    }
+
+    /// Create a test app with a cleanup hook for DB-backed tests.
+    pub fn with_cleanup(router: Router<()>, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            router,
+            cleanup: Some(Box::new(cleanup)),
+        }
     }
 
     /// Issue a GET request.
@@ -62,12 +73,28 @@ impl TestApp {
     pub async fn body_text(response: Response<Body>) -> String {
         String::from_utf8(Self::body_bytes(response).await).expect("body is not utf-8")
     }
+
+    /// Run teardown explicitly.
+    pub fn teardown(mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
 }
 
-/// Builder for HTTP-only test applications.
+impl Drop for TestApp {
+    fn drop(&mut self) {
+        if let Some(cleanup) = self.cleanup.take() {
+            cleanup();
+        }
+    }
+}
+
+/// Builder for test applications.
 pub struct TestAppBuilder<S> {
     state: S,
     router: Router<S>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<S> TestAppBuilder<S>
@@ -78,6 +105,7 @@ where
         Self {
             state,
             router: Router::new(),
+            cleanup: None,
         }
     }
 
@@ -86,13 +114,21 @@ where
         self
     }
 
-    pub fn route(mut self, path: &str, method_router: axum::routing::MethodRouter<S>) -> Self {
+    pub fn route<M>(mut self, path: &str, method_router: axum::routing::MethodRouter<S>) -> Self {
         self.router = self.router.route(path, method_router);
         self
     }
 
+    /// Register a cleanup hook for DB-backed tests.
+    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+        self.cleanup = Some(Box::new(cleanup));
+        self
+    }
+
     pub async fn build(self) -> TestApp {
-        TestApp::new(self.router.with_state(self.state))
+        let cleanup = self.cleanup;
+        let router = self.router.with_state(self.state);
+        TestApp { router, cleanup }
     }
 }
 
