@@ -10,6 +10,10 @@ pub mod app;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod validation;
+
+pub use error::AppError;
+pub use validation::Validated;
 
 pub use axum;
 pub use serde;
