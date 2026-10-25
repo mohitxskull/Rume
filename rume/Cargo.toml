@@ -27,6 +27,8 @@ dotenvy.workspace = true
 url.workspace = true
 # TOML configuration files.
 toml.workspace = true
+# Tracing/logging.
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # Tower utilities for testing and middleware.
 tower = "0.5.3"
 # Request validation.

@@ -472,3 +472,67 @@ mod tests {
         assert!(lifecycle.is_ready());
     }
 }
+
+/// Initialize the default tracing subscriber.
+pub fn init_tracing() {
+    use tracing_subscriber::{EnvFilter, fmt};
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    let _ = fmt().with_env_filter(filter).try_init();
+}
+
+/// A health/readiness router backed by an availability handle.
+pub fn health_router(availability: Availability) -> Router<()> {
+    let health_availability = availability.clone();
+    let ready_availability = availability;
+
+    Router::new()
+        .route(
+            "/health",
+            axum::routing::get(move || {
+                let availability = health_availability.clone();
+                async move {
+                    let status = if availability.state() == AvailabilityState::Broken {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::OK
+                    };
+                    let body = HealthStatus {
+                        status: if availability.state() == AvailabilityState::Broken {
+                            "broken"
+                        } else {
+                            "ok"
+                        },
+                    };
+                    (status, axum::Json(body))
+                }
+            }),
+        )
+        .route(
+            "/ready",
+            axum::routing::get(move || {
+                let availability = ready_availability.clone();
+                async move {
+                    if availability.is_ready() {
+                        (
+                            axum::http::StatusCode::OK,
+                            axum::Json(HealthStatus { status: "ready" }),
+                        )
+                    } else {
+                        (
+                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                            axum::Json(HealthStatus {
+                                status: "not ready",
+                            }),
+                        )
+                    }
+                }
+            }),
+        )
+}
+
+#[derive(serde::Serialize)]
+struct HealthStatus {
+    status: &'static str,
+}
