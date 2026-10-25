@@ -27,9 +27,11 @@ dotenvy.workspace = true
 url.workspace = true
 # TOML configuration files.
 toml.workspace = true
-# Request validation. Kept as a dependency because validation is part of the
-# v1 contract, not an optional extra (see .opencode/rules/85-minimalism.md).
+# Tower utilities for testing and middleware.
+tower = "0.5.3"
+# Request validation.
 garde = { version = "0.23.0", features = ["derive"] }
+
 
 [dev-dependencies]
 tempfile = "3.27.0"

@@ -11,6 +11,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod prelude;
+pub mod testing;
 pub mod validation;
 
 pub use app::{
@@ -18,6 +19,7 @@ pub use app::{
     ProjectPaths, Rume, RumeBuilder, detected_ai_agent, managed_by_pm2, running_in_ai_agent,
 };
 pub use error::AppError;
+pub use testing::{TestApp, TestAppBuilder};
 pub use validation::Validated;
 
 pub use axum;
