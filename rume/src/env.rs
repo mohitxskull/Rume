@@ -16,7 +16,7 @@
 //! let env: Env = rume::env::load()?;
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -32,6 +32,8 @@ pub struct ResolvedEnv {
     pub values: BTreeMap<String, String>,
     /// Provenance for each resolved value.
     pub sources: BTreeMap<String, String>,
+    /// Keys that originated from an env file (as opposed to process env only).
+    pub file_keys: BTreeSet<String>,
 }
 
 impl ResolvedEnv {
@@ -139,6 +141,7 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    let mut file_keys: BTreeSet<String> = BTreeSet::new();
 
     for (path, label) in dotenv_candidates(dir, &env_name) {
         if !path.is_file() {
@@ -162,7 +165,8 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
             })?;
 
             values.insert(key.clone(), value);
-            sources.insert(key, label.clone());
+            sources.insert(key.clone(), label.clone());
+            file_keys.insert(key);
         }
     }
 
@@ -172,7 +176,11 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
         sources.insert(key, "process env".to_string());
     }
 
-    Ok(ResolvedEnv { values, sources })
+    Ok(ResolvedEnv {
+        values,
+        sources,
+        file_keys,
+    })
 }
 
 /// Candidate files, from lowest to highest priority.
@@ -187,13 +195,15 @@ fn dotenv_candidates(dir: &Path, env_name: &str) -> Vec<(PathBuf, String)> {
         ),
     ];
 
+    // .env.local is not loaded in test mode (to avoid local dev settings
+    // interfering with tests). But .env.{env_name}.local IS loaded.
     if !is_test {
         candidates.push((dir.join(".env.local"), ".env.local".to_string()));
-        candidates.push((
-            dir.join(format!(".env.{env_name}.local")),
-            format!(".env.{env_name}.local"),
-        ));
     }
+    candidates.push((
+        dir.join(format!(".env.{env_name}.local")),
+        format!(".env.{env_name}.local"),
+    ));
 
     // Lowest to highest priority.
     candidates

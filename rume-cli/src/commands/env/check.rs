@@ -7,32 +7,57 @@ pub fn run(all: bool) {
             let mut shown = 0usize;
             let mut hidden = 0usize;
 
-            if resolved.values.is_empty() {
-                println!("(no environment variables resolved)");
-                return;
+            if resolved.file_keys.is_empty() && !all {
+                println!("(no environment variables resolved from .env files)");
+                // fall through to show process env if --all
             }
 
-            println!("resolved environment:");
+            if !resolved.file_keys.is_empty() {
+                println!("resolved environment:");
+            }
 
-            for (key, value) in &resolved.values {
+            for key in &resolved.file_keys {
+                let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
                 let source = resolved
                     .sources
                     .get(key)
                     .map(String::as_str)
                     .unwrap_or("unknown");
 
-                if !all && source == "process env" {
-                    hidden += 1;
-                    continue;
-                }
-
                 shown += 1;
                 let display = rume::env::redact(key, value);
                 println!("  {key}={display}  ({source})");
             }
 
+            if all {
+                // Show process-env-only variables.
+                let mut process_only: Vec<&String> = resolved
+                    .values
+                    .keys()
+                    .filter(|k| !resolved.file_keys.contains(*k))
+                    .collect();
+                process_only.sort();
+                if !process_only.is_empty() {
+                    println!("process environment:");
+                    for key in process_only {
+                        let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
+                        let display = rume::env::redact(key, value);
+                        println!("  {key}={display}  (process env)");
+                        shown += 1;
+                    }
+                }
+            } else {
+                let process_count = resolved
+                    .values
+                    .len()
+                    .saturating_sub(resolved.file_keys.len());
+                if process_count > 0 {
+                    hidden += process_count;
+                }
+            }
+
             if shown == 0 {
-                println!("  (no file-defined variables)");
+                println!("  (no variables)");
             }
 
             if hidden > 0 {
