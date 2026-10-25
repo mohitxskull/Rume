@@ -14,6 +14,7 @@ file; procedures live in `.opencode/skills/` and are loaded when you need them.
 | [`40-verification.md`](rules/40-verification.md) | run the whole check, never a grep for what you just changed |
 | [`50-agent-conduct.md`](rules/50-agent-conduct.md) | never review your own work, one implementer at a time, TDD, handoff-by-file |
 | [`55-receiving-feedback.md`](rules/55-receiving-feedback.md) | no performative agreement, verify before implementing, push back with reasoning |
+| [`60-architecture.md`](rules/60-architecture.md) | Rume architecture constraints: explicit/typed/production-ready, refusals, config/env split, crate boundaries, pre-v1 |
 | [`70-code-rationale.md`](rules/70-code-rationale.md) | record why at the decision site, so a reviewer doesn't re-derive it |
 | [`80-quality-bar.md`](rules/80-quality-bar.md) | readability/maintainability/debuggability first, root causes not symptoms, fails-before proofs, zero-warning bar, honest reports |
 | [`85-minimalism.md`](rules/85-minimalism.md) | lazy principal engineer: smallest thing that solves it, ladder, never-simplify list, defers to testing/quality-bar |
