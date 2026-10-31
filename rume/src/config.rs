@@ -89,8 +89,8 @@ fn build_figment(dir: &Path) -> Result<Figment> {
 
 /// Generate a JSON Schema for a configuration type.
 ///
-/// Enable the `schemars` and `serde_json` features on `rume` to use this.
-#[cfg(all(feature = "schemars", feature = "serde_json"))]
+/// Enable the `schemars` feature on `rume` to use this.
+#[cfg(feature = "schemars")]
 pub fn schema<T>() -> Result<String>
 where
     T: schemars::JsonSchema,

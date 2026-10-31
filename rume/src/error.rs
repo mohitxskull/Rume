@@ -6,6 +6,13 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use thiserror::Error;
 
+/// A single validation error detail, with the field path and message.
+#[derive(Debug, Serialize)]
+pub struct ValidationErrorDetail {
+    pub field: String,
+    pub message: String,
+}
+
 /// Errors that can be returned from a Rume handler.
 #[derive(Debug, Error)]
 pub enum AppError {
@@ -21,8 +28,8 @@ pub enum AppError {
     #[error("forbidden")]
     Forbidden,
 
-    #[error("validation failed: {0}")]
-    Validation(String),
+    #[error("validation failed")]
+    Validation { details: Vec<ValidationErrorDetail> },
 
     #[error("internal error: {0}")]
     Internal(String),
@@ -35,7 +42,7 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
-            Self::Validation(_) => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -49,10 +56,22 @@ struct ErrorBody {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
-        let body = Json(ErrorBody {
-            error: self.to_string(),
-        });
-        (status, body).into_response()
+
+        match self {
+            Self::Validation { details } => {
+                let body = Json(serde_json::json!({
+                    "error": "validation failed",
+                    "details": details,
+                }));
+                (status, body).into_response()
+            }
+            _ => {
+                let body = Json(ErrorBody {
+                    error: self.to_string(),
+                });
+                (status, body).into_response()
+            }
+        }
     }
 }
 
@@ -64,7 +83,7 @@ mod tests {
     fn maps_status_codes() {
         assert_eq!(AppError::NotFound.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(
-            AppError::Validation("x".into()).status_code(),
+            AppError::Validation { details: vec![] }.status_code(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(

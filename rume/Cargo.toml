@@ -29,13 +29,13 @@ url.workspace = true
 toml.workspace = true
 # Optional JSON Schema generation.
 schemars = { version = "1.2.3", optional = true, features = ["derive"] }
-serde_json = { version = "1.0.154", optional = true }
+serde_json = "1.0.154"
 # Tracing/logging.
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # Tower utilities for testing and middleware.
 tower = "0.5.3"
 # Request validation.
-garde = { version = "0.23.0", features = ["derive"] }
+garde = { version = "0.23.0", features = ["derive", "email"] }
 
 
 [dev-dependencies]
