@@ -22,14 +22,21 @@ use std::path::{Path, PathBuf};
 
 use figment::Figment;
 use figment::providers::Serialized;
+use secrecy::{ExposeSecret, SecretBox};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 /// A resolved environment: the merged values plus where each one came from.
-#[derive(Debug, Clone, Default)]
+///
+/// Secret-typed values (detected via [`is_secret_key`]) are stored in
+/// [`secrecy::SecretBox`] and only exposed through [`expose_secret`](secrecy::SecretBox::expose_secret)
+/// at the final consumption point, never in logs or error responses.
+#[derive(Debug, Default)]
 pub struct ResolvedEnv {
-    /// Resolved variable values.
+    /// Resolved non-secret variable values.
     pub values: BTreeMap<String, String>,
+    /// Resolved secret variable values, held in [`SecretBox`].
+    pub secrets: BTreeMap<String, SecretBox<String>>,
     /// Provenance for each resolved value.
     pub sources: BTreeMap<String, String>,
     /// Keys that originated from an env file (as opposed to process env only).
@@ -47,9 +54,18 @@ impl ResolvedEnv {
         load_merged_map_in(dir)
     }
 
-    /// Look up a resolved value.
+    /// Look up a resolved value. Secret values are exposed via `expose_secret()`.
     pub fn get(&self, key: &str) -> Option<&str> {
-        self.values.get(key).map(String::as_str)
+        self.secrets
+            .get(key)
+            .map(|s| s.expose_secret().as_str())
+            .or_else(|| self.values.get(key).map(String::as_str))
+    }
+
+    /// Look up a resolved secret value, returning the [`SecretBox`] without
+    /// exposing the plaintext.
+    pub fn get_secret(&self, key: &str) -> Option<&SecretBox<String>> {
+        self.secrets.get(key)
     }
 }
 
@@ -118,13 +134,22 @@ where
     let resolved = load_merged_map_in(dir)?;
 
     // Parse scalar values the same way figment's built-in `Env` provider does,
-    // so numbers and booleans are not treated as strings.
+    // so numbers and booleans are not treated as strings. Secret values are
+    // exposed at this final consumption point for deserialization into typed
+    // env structs (which may use `secrecy::SecretBox<String>` fields).
     let mut parsed: BTreeMap<String, figment::value::Value> = BTreeMap::new();
     for (key, value) in resolved.values {
         let value = value
             .parse::<figment::value::Value>()
             .map_err(|err| EnvError::Validation(err.to_string()))?;
         parsed.insert(key, value);
+    }
+    for (key, secret) in &resolved.secrets {
+        let value = secret
+            .expose_secret()
+            .parse::<figment::value::Value>()
+            .map_err(|err| EnvError::Validation(err.to_string()))?;
+        parsed.insert(key.clone(), value);
     }
 
     let figment = Figment::from(Serialized::defaults(parsed));
@@ -140,6 +165,7 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
     let env_name = resolve_env_name();
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
+    let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
 
@@ -164,7 +190,11 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
                 source,
             })?;
 
-            values.insert(key.clone(), value);
+            if is_secret_key(&key) {
+                secrets.insert(key.clone(), SecretBox::new(Box::new(value)));
+            } else {
+                values.insert(key.clone(), value);
+            }
             sources.insert(key.clone(), label.clone());
             file_keys.insert(key);
         }
@@ -172,12 +202,17 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
 
     // Process environment always wins.
     for (key, value) in std::env::vars() {
-        values.insert(key.clone(), value);
+        if is_secret_key(&key) {
+            secrets.insert(key.clone(), SecretBox::new(Box::new(value)));
+        } else {
+            values.insert(key.clone(), value);
+        }
         sources.insert(key, "process env".to_string());
     }
 
     Ok(ResolvedEnv {
         values,
+        secrets,
         sources,
         file_keys,
     })
@@ -251,13 +286,37 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
 }
 
 /// Heuristic: is this key likely to hold a secret?
+///
+/// Covers common secret suffixes/prefixes (`SECRET`, `PASSWORD`, `TOKEN`,
+/// `_KEY`, `_PASS`, `_PWD`, `_CRED`, `_PRIVATE_KEY`, `STRIPE_*`, etc.).
+///
+/// Why: The original heuristic only matched `SECRET`/`PASSWORD`/`TOKEN`/`_KEY`,
+/// so keys like `APP_PASS`, `STRIPE_SECRET_KEY`, or `DB_PWD` would print
+/// plaintext. We err on the side of redacting too much rather than too little.
 pub fn is_secret_key(key: &str) -> bool {
     let upper = key.to_ascii_uppercase();
-    upper.contains("SECRET")
+
+    // Broad substring matches (covers keys with the word anywhere).
+    if upper.contains("SECRET")
         || upper.contains("PASSWORD")
         || upper.contains("TOKEN")
-        || upper.ends_with("_KEY")
-        || upper == "KEY"
+        || upper.contains("_PASS")
+        || upper.contains("_PWD")
+        || upper.contains("_CRED")
+        || upper.contains("_KEY")
+    {
+        return true;
+    }
+
+    // Exact matches for standalone names.
+    upper == "KEY"
+        || upper == "SECRET"
+        || upper == "PASSWORD"
+        || upper == "PASS"
+        || upper == "PWD"
+        || upper == "TOKEN"
+        || upper.starts_with("STRIPE_")
+        || upper.starts_with("PRIVATE_KEY")
 }
 
 /// Heuristic: does this value look like a URL containing credentials?
@@ -310,6 +369,55 @@ mod tests {
         assert!(is_secret_key("DB_PASSWORD"));
         assert!(!is_secret_key("HOST"));
         assert!(!is_secret_key("PORT"));
+    }
+
+    #[test]
+    fn redact_broadened_catches_more_secret_keys() {
+        // S-m1: broadened detection must catch keys the old heuristic missed.
+        // These must be redacted, not printed as plaintext.
+        assert_eq!(redact("APP_PASS", "s3cret"), "[redacted]");
+        assert_eq!(redact("DB_PWD", "s3cret"), "[redacted]");
+        assert_eq!(redact("STRIPE_SECRET_KEY", "sk_live_xxx"), "[redacted]");
+        assert_eq!(redact("APP_CRED", "s3cret"), "[redacted]");
+        assert_eq!(redact("MY_SECRET_VALUE", "s3cret"), "[redacted]");
+        assert_eq!(redact("ACCESS_TOKEN", "tok123"), "[redacted]");
+        // Non-secret keys must not be redacted.
+        assert_eq!(redact("HOST", "localhost"), "localhost");
+        assert_eq!(redact("PORT", "3000"), "3000");
+    }
+
+    #[test]
+    fn secret_keys_stored_in_secrets_map_not_values_map() {
+        // S-M2: secret keys must be routed to the secrets map (SecretBox),
+        // not the plain values map, to avoid plaintext exposure.
+        let dir = std::env::temp_dir().join("rume_secret_map_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join(".env");
+        std::fs::write(&env_file, "APP_KEY=super-secret-value\nHOST=localhost\n").unwrap();
+
+        let resolved = load_merged_map_in(&dir).unwrap();
+
+        assert!(!resolved.values.contains_key("APP_KEY"));
+        assert!(resolved.secrets.contains_key("APP_KEY"));
+        assert_eq!(resolved.values.get("HOST"), Some(&"localhost".to_string()));
+        assert!(!resolved.secrets.contains_key("HOST"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_exposes_secret_via_expose_secret() {
+        // S-M2: get() exposes secret plaintext at consumption point.
+        let dir = std::env::temp_dir().join("rume_secret_get_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join(".env");
+        std::fs::write(&env_file, "APP_KEY=super-secret-value\n").unwrap();
+
+        let resolved = load_merged_map_in(&dir).unwrap();
+
+        assert_eq!(resolved.get("APP_KEY").unwrap(), "super-secret-value");
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
