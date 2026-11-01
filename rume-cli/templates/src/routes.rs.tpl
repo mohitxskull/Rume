@@ -7,9 +7,9 @@ pub fn router(ctx: AppContext<Env, Config>) -> Router<AppContext<Env, Config>> {
     let mut router = Router::<AppContext<Env, Config>>::new();
     router = router.route(
         "/users",
-        rume::axum::routing::post(crate::handlers::users::create_user),
+        rume::axum::routing::get(crate::handlers::health::health),
     );
-    router = router.route("/posts", rume::axum::routing::get(crate::handlers::posts::index));
+    router = router.route("/posts", rume::axum::routing::get(crate::handlers::health::health));
     // rume:routes
     router
 }

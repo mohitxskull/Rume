@@ -77,7 +77,9 @@ const TEMPLATES: &[(&str, &str)] = &[
 pub fn run(name: &str) {
     if let Err(err) = run_inner(name) {
         eprintln!("error: {err}");
-        let _ = fs::remove_dir_all(name);
+        // `run_inner` already removed any directory this command created.
+        // An `AlreadyExists` error means the directory pre-existed and must
+        // never be deleted here.
         std::process::exit(1);
     }
 
@@ -116,21 +118,40 @@ fn run_inner(name: &str) -> Result<(), NewError> {
     validate_name(name)?;
 
     let root = Path::new(name);
-    if root.exists() {
+    let already_exists = root.exists();
+    if already_exists {
+        // The directory pre-existed this command; never delete it.
         return Err(NewError::AlreadyExists(name.to_string()));
     }
 
-    fs::create_dir_all(root.join("src")).map_err(NewError::Io)?;
-    fs::create_dir_all(root.join("config")).map_err(NewError::Io)?;
+    // `root` did not exist before we started, so anything we create below
+    // is owned by this command and ours to clean up on failure.
+    let created_root = !already_exists;
 
-    let context = TemplateContext {
-        name,
-        framework_path: FRAMEWORK_PATH,
-    };
+    let generate_result = (|| -> Result<(), NewError> {
+        fs::create_dir_all(root.join("src")).map_err(NewError::Io)?;
+        fs::create_dir_all(root.join("config")).map_err(NewError::Io)?;
 
-    for (relative_path, template) in TEMPLATES {
-        let rendered = render(template, &context);
-        write_file(&root.join(relative_path), &rendered)?;
+        let context = TemplateContext {
+            name,
+            framework_path: FRAMEWORK_PATH,
+        };
+
+        for (relative_path, template) in TEMPLATES {
+            let rendered = render(template, &context);
+            write_file(&root.join(relative_path), &rendered)?;
+        }
+
+        Ok(())
+    })();
+
+    if let Err(err) = generate_result {
+        if created_root {
+            // Only remove directories this command created. Never touch a
+            // directory that existed before the command started.
+            let _ = fs::remove_dir_all(root);
+        }
+        return Err(err);
     }
 
     Ok(())
@@ -186,5 +207,26 @@ mod tests {
         };
         let rendered = render("name={{name}} path={{framework_path}}", &context);
         assert_eq!(rendered, "name=demo path=/tmp/rume");
+    }
+
+    #[test]
+    fn run_inner_already_exists_does_not_delete() {
+        let name = format!("rume-new-test-{}", std::process::id());
+        let root = Path::new(&name);
+        fs::create_dir_all(root).expect("create dummy dir");
+        fs::write(root.join("keep.txt"), "original contents").expect("write dummy file");
+
+        let err = run_inner(&name).unwrap_err();
+        assert!(matches!(err, NewError::AlreadyExists(_)));
+
+        // The directory and its original contents must still exist.
+        assert!(root.exists());
+        assert_eq!(
+            fs::read_to_string(root.join("keep.txt")).expect("read dummy file"),
+            "original contents"
+        );
+
+        // Clean up the dummy dir ourselves; run_inner must not have touched it.
+        let _ = fs::remove_dir_all(root);
     }
 }
