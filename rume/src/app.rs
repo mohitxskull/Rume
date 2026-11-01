@@ -60,7 +60,7 @@ pub enum LifecycleState {
 }
 
 /// A shared lifecycle handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Lifecycle {
     inner: Arc<AtomicU8>,
 }
@@ -114,7 +114,7 @@ pub enum AvailabilityState {
 }
 
 /// A shared availability handle.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct Availability {
     inner: Arc<AtomicU8>,
 }
@@ -228,6 +228,67 @@ pub fn running_in_ai_agent() -> bool {
 /// Whether the process appears to run under pm2.
 pub fn managed_by_pm2() -> bool {
     std::env::var("pm_id").is_ok()
+}
+
+/// Application context holding env, config, paths, availability, and lifecycle.
+///
+/// This is the recommended type to use as Axum state so handlers can access
+/// configuration and environment values through the [`State`] extractor.
+///
+/// # Example
+///
+/// ```ignore
+/// use rume::app::{AppContext, builder_with_context};
+/// use rume::prelude::*;
+///
+/// let ctx = AppContext::new(env, config, paths, availability);
+/// let router = routes::router(ctx.clone());
+///
+/// Rume::builder_with_context(ctx)
+///     .router(router)
+///     .run()
+///     .await?;
+/// ```
+#[derive(Clone, Debug)]
+pub struct AppContext<E, C> {
+    /// Loaded environment variables.
+    pub env: E,
+    /// Loaded application configuration.
+    pub config: C,
+    /// Project directory layout.
+    pub paths: ProjectPaths,
+    /// Application availability state (live / ready / refusing / broken).
+    pub availability: Availability,
+    /// Application lifecycle state.
+    pub lifecycle: Lifecycle,
+}
+
+impl<E, C> AppContext<E, C> {
+    /// Create a new application context.
+    pub fn new(env: E, config: C, paths: ProjectPaths, availability: Availability) -> Self {
+        Self {
+            env,
+            config,
+            paths,
+            availability,
+            lifecycle: Lifecycle::new(),
+        }
+    }
+}
+
+impl<E, C> Rume<AppContext<E, C>>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
+    /// Create a builder initialized with an [`AppContext`] as Axum state.
+    ///
+    /// This is a convenience shorthand for [`RumeBuilder::new`] that takes an
+    /// [`AppContext`] directly. Use this when you want handlers to access env,
+    /// config, paths, or availability through the [`State`] extractor.
+    pub fn builder_with_context(ctx: AppContext<E, C>) -> RumeBuilder<AppContext<E, C>> {
+        RumeBuilder::new(ctx)
+    }
 }
 
 /// A configured Rume application.
@@ -483,11 +544,17 @@ pub fn init_tracing() {
 }
 
 /// A health/readiness router backed by an availability handle.
-pub fn health_router(availability: Availability) -> Router<()> {
+///
+/// Generic over the Axum state type `S` so it can be merged with other routers
+/// that share the same state.
+pub fn health_router<S>(availability: Availability) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
     let health_availability = availability.clone();
     let ready_availability = availability;
 
-    Router::new()
+    Router::<S>::new()
         .route(
             "/health",
             axum::routing::get(move || {

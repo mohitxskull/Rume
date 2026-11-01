@@ -1,18 +1,18 @@
 use rume::prelude::*;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub app: AppConfig,
     #[allow(dead_code)]
     pub server: ServerConfig,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub name: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[allow(dead_code)]
 pub struct ServerConfig {
     #[serde(default = "default_host")]

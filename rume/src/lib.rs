@@ -15,8 +15,9 @@ pub mod testing;
 pub mod validation;
 
 pub use app::{
-    ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle, LifecycleState,
-    ProjectPaths, Rume, RumeBuilder, detected_ai_agent, managed_by_pm2, running_in_ai_agent,
+    AppContext, ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle,
+    LifecycleState, ProjectPaths, Rume, RumeBuilder, detected_ai_agent, managed_by_pm2,
+    running_in_ai_agent,
 };
 pub use error::AppError;
 pub use testing::{TestApp, TestAppBuilder};
