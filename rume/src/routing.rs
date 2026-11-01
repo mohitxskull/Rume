@@ -552,16 +552,10 @@ fn current_timestamp() -> String {
 }
 
 fn debug_info() -> BTreeMap<String, serde_json::Value> {
-    let mut info = BTreeMap::new();
-    info.insert(
-        "pid".to_string(),
-        serde_json::Value::Number(std::process::id().into()),
-    );
-    info.insert(
-        "platform".to_string(),
-        serde_json::Value::String(std::env::consts::OS.to_string()),
-    );
-    info
+    // S-m2: do not expose pid/platform in health responses — those are
+    // operational internals that aid attackers. Return empty map; callers
+    // that need debugging info can add it explicitly in development.
+    BTreeMap::new()
 }
 
 /// Routes for health checks: `/health/live` and `/health/ready`.
