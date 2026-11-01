@@ -1,6 +1,7 @@
 mod handler;
 mod middleware;
 mod model;
+mod resource;
 mod service;
 
 pub fn run(kind: Option<&str>, name: Option<&str>) {
@@ -10,12 +11,14 @@ pub fn run(kind: Option<&str>, name: Option<&str>) {
         println!("  service <name>     Generate a service struct");
         println!("  model <name>       Generate a model struct");
         println!("  middleware <name>  Generate a middleware function");
+        println!("  resource <name>    Generate RESTful resource handlers and routes");
         println!();
         println!("Usage:");
         println!("  rume generate handler users");
         println!("  rume generate service users");
         println!("  rume generate model user");
         println!("  rume generate middleware auth");
+        println!("  rume generate resource users");
         return;
     };
 
@@ -44,9 +47,12 @@ pub fn run(kind: Option<&str>, name: Option<&str>) {
         "middleware" => {
             middleware::run(&name);
         }
+        "resource" => {
+            resource::run(&name);
+        }
         _ => {
             eprintln!("error: unknown generator `{kind}`");
-            eprintln!("available generators: handler, service, model, middleware");
+            eprintln!("available generators: handler, service, model, middleware, resource");
             std::process::exit(1);
         }
     }

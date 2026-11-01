@@ -10,6 +10,7 @@ pub mod app;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod helpers;
 pub mod prelude;
 pub mod routing;
 pub mod testing;
@@ -20,6 +21,7 @@ pub use app::{
     LifecycleState, ProjectPaths, Rume, RumeBuilder, ops_router,
 };
 pub use error::AppError;
+pub use helpers::{camel_case, kebab_case, pascal_case, safe_equal, slug, snake_case};
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteSpec, ValidatedParam, registered_routes, reset_route_registry,

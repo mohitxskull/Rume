@@ -461,6 +461,31 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
         self
     }
 
+    /// Add multiple `(path, method_router)` routes to the group, applying the
+    /// group's [`prefix`](RouteGroup::prefix) to each path via [`join_path`].
+    ///
+    /// This is how a [`Resource`]'s routes are mounted under a group prefix:
+    ///
+    /// ```ignore
+    /// use axum::routing::get;
+    /// use rume::routing::{Resource, RouteGroup};
+    ///
+    /// async fn index() {}
+    ///
+    /// let routes = Resource::new("posts").index(get(index)).into_routes();
+    /// let group = RouteGroup::<()>::new().prefix("/api").add_routes(routes);
+    /// ```
+    pub fn add_routes(
+        mut self,
+        routes: impl IntoIterator<Item = (String, MethodRouter<S>)>,
+    ) -> Self {
+        for (path, router) in routes.into_iter() {
+            let full_path = Self::join_path(&self.prefix, &path);
+            self.inner = self.inner.route(&full_path, router);
+        }
+        self
+    }
+
     /// Join a prefix and path with exactly one `/` separator.
     ///
     /// Handles leading/trailing slashes on both sides so that
@@ -499,6 +524,102 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
 impl<S: Clone + Send + Sync + 'static> Default for RouteGroup<S> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Resource
+// ---------------------------------------------------------------------------
+
+/// A resourceful route builder for standard RESTful actions.
+///
+/// Maps the standard resource actions to explicit routes, with no
+/// controller-class discovery, no reflection, and no naming conventions — the
+/// user lists handlers explicitly:
+///
+/// | Action    | Method | Path             |
+/// |-----------|--------|------------------|
+/// | index     | GET    | `/{name}`        |
+/// | show      | GET    | `/{name}/{id}`    |
+/// | create    | POST   | `/{name}`        |
+/// | update    | PUT    | `/{name}/{id}`    |
+/// | destroy   | DELETE | `/{name}/{id}`    |
+///
+/// Handlers are supplied as `MethodRouter<S>` values (e.g. `axum::routing::get(handler)`).
+/// Use [`into_routes`](Self::into_routes) to get the `(path, method_router)`
+/// pairs, then mount them with [`RouteGroup::add_routes`] so the group's prefix
+/// is applied, or register them directly on an Axum [`Router`].
+///
+/// # Example
+///
+/// ```ignore
+/// use axum::routing::{delete, get, post, put};
+/// use rume::routing::Resource;
+///
+/// async fn index() {}
+/// async fn show() {}
+/// async fn create() {}
+/// async fn update() {}
+/// async fn destroy() {}
+///
+/// let routes = Resource::new("posts")
+///     .index(get(index))
+///     .show(get(show))
+///     .create(post(create))
+///     .update(put(update))
+///     .destroy(delete(destroy))
+///     .into_routes();
+/// ```
+pub struct Resource<S> {
+    name: String,
+    routes: Vec<(String, MethodRouter<S>)>,
+}
+
+impl<S> Resource<S> {
+    /// Create a new resource builder for the given resource name.
+    ///
+    /// The name becomes the URL segment, e.g. `Resource::new("posts")`
+    /// produces paths `/posts` and `/posts/{id}`.
+    pub fn new(name: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            routes: Vec::new(),
+        }
+    }
+
+    /// `GET /{name}` — list all resources.
+    pub fn index(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push((format!("/{}", self.name), router));
+        self
+    }
+
+    /// `GET /{name}/{id}` — show a single resource.
+    pub fn show(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push((format!("/{}/{{id}}", self.name), router));
+        self
+    }
+
+    /// `POST /{name}` — create a new resource.
+    pub fn create(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push((format!("/{}", self.name), router));
+        self
+    }
+
+    /// `PUT /{name}/{id}` — update an existing resource (full replacement).
+    pub fn update(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push((format!("/{}/{{id}}", self.name), router));
+        self
+    }
+
+    /// `DELETE /{name}/{id}` — destroy a resource.
+    pub fn destroy(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push((format!("/{}/{{id}}", self.name), router));
+        self
+    }
+
+    /// Consume the builder and return the list of `(path, method_router)` pairs.
+    pub fn into_routes(self) -> Vec<(String, MethodRouter<S>)> {
+        self.routes
     }
 }
 
@@ -963,5 +1084,129 @@ mod tests {
             registered_routes().iter().any(|r| r.path == "/unmounted"),
             "build-then-unmounted route should still be in registry"
         );
+    }
+
+    // --- Resourceful routing ---
+
+    #[test]
+    fn resource_generates_standard_rest_paths() {
+        async fn index() {}
+        async fn show() {}
+        async fn create() {}
+        async fn update() {}
+        async fn destroy() {}
+
+        let routes = Resource::<()>::new("posts")
+            .index(axum::routing::get(index))
+            .show(axum::routing::get(show))
+            .create(axum::routing::post(create))
+            .update(axum::routing::put(update))
+            .destroy(axum::routing::delete(destroy))
+            .into_routes();
+
+        assert_eq!(routes.len(), 5);
+
+        let paths: Vec<&str> = routes.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            vec![
+                "/posts",      // index  GET
+                "/posts/{id}", // show   GET
+                "/posts",      // create POST
+                "/posts/{id}", // update PUT
+                "/posts/{id}", // destroy DELETE
+            ],
+            "expected exactly the five standard REST paths in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn resource_routes_applied_through_route_group() {
+        use crate::testing::{TestApp, TestAppBuilder};
+        use axum::body::Body;
+        use axum::http::Request;
+        use axum::routing::{delete, get, post, put};
+
+        async fn index() -> &'static str {
+            "index"
+        }
+        async fn show(Path(params): Path<BTreeMap<String, String>>) -> String {
+            format!(
+                "show {}",
+                params.get("id").map(String::as_str).unwrap_or("?")
+            )
+        }
+        async fn create() -> &'static str {
+            "create"
+        }
+        async fn update(Path(params): Path<BTreeMap<String, String>>) -> String {
+            format!(
+                "update {}",
+                params.get("id").map(String::as_str).unwrap_or("?")
+            )
+        }
+        async fn destroy(Path(params): Path<BTreeMap<String, String>>) -> String {
+            format!(
+                "destroy {}",
+                params.get("id").map(String::as_str).unwrap_or("?")
+            )
+        }
+
+        let routes = Resource::<()>::new("posts")
+            .index(get(index))
+            .show(get(show))
+            .create(post(create))
+            .update(put(update))
+            .destroy(delete(destroy))
+            .into_routes();
+
+        let app = TestAppBuilder::http()
+            .router(
+                RouteGroup::<()>::new()
+                    .prefix("/api")
+                    .add_routes(routes)
+                    .build(),
+            )
+            .build()
+            .await;
+
+        // Prefix is applied: routes live under /api/posts.
+        let res = app.get("/posts").await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        // GET /api/posts → index
+        let res = app.get("/api/posts").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "index");
+
+        // GET /api/posts/42 → show
+        let res = app.get("/api/posts/42").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "show 42");
+
+        // POST /api/posts → create
+        let res = app.post_json("/api/posts", "{}").await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "create");
+
+        // PUT /api/posts/42 → update
+        let req = Request::builder()
+            .method(Method::PUT)
+            .uri("/api/posts/42")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.request(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "update 42");
+
+        // DELETE /api/posts/42 → destroy
+        let req = Request::builder()
+            .method(Method::DELETE)
+            .uri("/api/posts/42")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.request(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "destroy 42");
     }
 }

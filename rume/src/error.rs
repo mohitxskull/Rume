@@ -34,6 +34,9 @@ pub enum AppError {
 
     #[error("internal error: {0}")]
     Internal(String),
+
+    #[error("{message}")]
+    Custom { status: StatusCode, message: String },
 }
 
 impl AppError {
@@ -45,6 +48,7 @@ impl AppError {
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Custom { status, .. } => *status,
         }
     }
 }
@@ -80,6 +84,15 @@ impl IntoResponse for AppError {
                 warn!(error = %detail, "bad request");
                 let body = Json(ErrorBody {
                     error: "bad request".to_string(),
+                });
+                (status, body).into_response()
+            }
+            Self::Custom { message, .. } => {
+                // Custom errors are developer-intentional: the message is the
+                // payload and is safe to show clients. Nothing is logged
+                // server-side — it is not an internal error.
+                let body = Json(ErrorBody {
+                    error: message.clone(),
                 });
                 (status, body).into_response()
             }
@@ -174,5 +187,47 @@ mod tests {
         assert!(body.contains("\"error\":\"validation failed\""));
         assert!(body.contains("\"field\":\"email\""));
         assert!(body.contains("\"message\":\"invalid format\""));
+    }
+
+    #[tokio::test]
+    async fn custom_status_code_returns_custom_status() {
+        assert_eq!(
+            AppError::Custom {
+                status: StatusCode::CONFLICT,
+                message: "email taken".into(),
+            }
+            .status_code(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn custom_body_contains_message() {
+        let response = AppError::Custom {
+            status: StatusCode::CONFLICT,
+            message: "email taken".into(),
+        }
+        .into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::CONFLICT);
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&bytes).to_string();
+        assert!(body_str.contains("\"error\":\"email taken\""));
+    }
+
+    #[tokio::test]
+    async fn custom_does_not_echo_internals() {
+        // The message is developer-intentional and IS the payload, so it
+        // appears in the body; no separate internal detail is leaked.
+        let response = AppError::Custom {
+            status: StatusCode::CONFLICT,
+            message: "connection string: postgresql://user:pass@db".into(),
+        }
+        .into_response();
+        let (parts, body) = response.into_parts();
+        assert_eq!(parts.status, StatusCode::CONFLICT);
+        let bytes = to_bytes(body, usize::MAX).await.unwrap();
+        let body_str = String::from_utf8_lossy(&bytes).to_string();
+        assert!(body_str.contains("\"error\":\"connection string: postgresql://user:pass@db\""));
     }
 }

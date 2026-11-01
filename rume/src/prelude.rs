@@ -9,6 +9,7 @@ pub use crate::config::ConfigError;
 pub use crate::env;
 pub use crate::env::EnvError;
 pub use crate::error::AppError;
+pub use crate::helpers::{safe_equal, slug};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteSpec, ValidatedParam, registered_routes,

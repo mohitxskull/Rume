@@ -5,6 +5,7 @@ use axum::Router;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::MethodRouter;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -386,6 +387,23 @@ where
         Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
     on_shutdown:
         Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
+    /// Named middleware registered by alias. The closure wraps the router as a
+    /// Tower layer; it is applied only after `use_middleware` marks it.
+    middleware: BTreeMap<
+        String,
+        Box<dyn Fn(Router<AppContext<E, C>>) -> Router<AppContext<E, C>> + Send + Sync + 'static>,
+    >,
+    /// Insertion order of registered middleware names — this is the order in
+    /// which applied middleware wraps the router.
+    middleware_order: Vec<String>,
+    /// Named groups of middleware members, by alias (AdonisJS-style groups).
+    groups: BTreeMap<String, Vec<String>>,
+    /// Insertion order of registered group names — application order.
+    groups_order: Vec<String>,
+    /// Middleware names marked for application via `use_middleware`.
+    applied_middleware: BTreeSet<String>,
+    /// Group names marked for application via `use_group`.
+    applied_groups: BTreeSet<String>,
 }
 
 impl<E, C> RumeBuilder<E, C>
@@ -406,6 +424,12 @@ where
             environment: Environment::from_env(),
             on_ready: Vec::new(),
             on_shutdown: Vec::new(),
+            middleware: BTreeMap::new(),
+            middleware_order: Vec::new(),
+            groups: BTreeMap::new(),
+            groups_order: Vec::new(),
+            applied_middleware: BTreeSet::new(),
+            applied_groups: BTreeSet::new(),
         }
     }
 
@@ -493,6 +517,97 @@ where
         self.ctx.health_checks.clone()
     }
 
+    /// Register a named middleware closure by alias (AdonisJS-style).
+    ///
+    /// The closure wraps the router as a Tower layer. It is not applied yet:
+    /// call [`use_middleware`](Self::use_middleware) to mark it for
+    /// application. Applied middleware wrap the router in
+    /// [`middleware_order`](Self::middleware_order) registration order.
+    pub fn middleware<F>(mut self, name: &str, f: F) -> Self
+    where
+        F: Fn(Router<AppContext<E, C>>) -> Router<AppContext<E, C>> + Send + Sync + 'static,
+    {
+        self.middleware_order.push(name.to_string());
+        self.middleware.insert(name.to_string(), Box::new(f));
+        self
+    }
+
+    /// Mark a registered named middleware for application in [`run`].
+    ///
+    /// Does nothing (beyond recording the intent) if the name was never
+    /// registered with `middleware`.
+    pub fn use_middleware(mut self, name: &str) -> Self {
+        self.applied_middleware.insert(name.to_string());
+        self
+    }
+
+    /// Define a named middleware group by alias (AdonisJS-style groups).
+    ///
+    /// `members` are the aliases of previously registered middleware. Members
+    /// run in declaration order when the group is marked with
+    /// [`use_group`](Self::use_group).
+    pub fn group(mut self, name: &str, members: &[&str]) -> Self {
+        self.groups_order.push(name.to_string());
+        self.groups.insert(
+            name.to_string(),
+            members.iter().map(|member| member.to_string()).collect(),
+        );
+        self
+    }
+
+    /// Mark a named group for application in [`run`]; all of its members run.
+    pub fn use_group(mut self, name: &str) -> Self {
+        self.applied_groups.insert(name.to_string());
+        self
+    }
+
+    /// Build the router with all applied named middleware and groups wrapped
+    /// around the routes, without binding a port. Intended for tests;
+    /// [`run`](Self::run) calls this before serving.
+    ///
+    /// `ctx` is the Axum state the router carries; middleware closures operate
+    /// on `Router<AppContext<E, C>>`.
+    pub fn build_router(self, ctx: AppContext<E, C>) -> Router<AppContext<E, C>> {
+        let RumeBuilder {
+            router,
+            middleware,
+            middleware_order,
+            groups,
+            groups_order,
+            applied_middleware,
+            applied_groups,
+            ..
+        } = self;
+
+        let mut router: Router<AppContext<E, C>> = router.with_state(ctx);
+
+        // Apply named middleware in registration order, but only those
+        // marked with `use_middleware`. Unknown names are skipped.
+        for name in middleware_order {
+            if applied_middleware.contains(&name)
+                && let Some(mw) = middleware.get(&name)
+            {
+                router = mw(router);
+            }
+        }
+
+        // Apply named groups in registration order; each group's members run
+        // in declaration order. Members unknown to `middleware` are skipped.
+        for name in groups_order {
+            if applied_groups.contains(&name)
+                && let Some(members) = groups.get(&name)
+            {
+                for member in members {
+                    if let Some(mw) = middleware.get(member) {
+                        router = mw(router);
+                    }
+                }
+            }
+        }
+
+        router
+    }
+
     /// Run the application until a shutdown signal is received.
     pub async fn run(mut self) -> Result<(), std::io::Error> {
         let addr: SocketAddr = self
@@ -550,21 +665,30 @@ where
 
         println!("listening on http://{addr}");
 
-        let ctx = self.ctx.clone();
-        let result = axum::serve(listener, self.router.with_state(ctx))
+        // Apply named middleware and groups before serving. `build_router`
+        // consumes `self`, so take the shutdown hooks first: they must still
+        // run after the server stops.
+        let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let serve_ctx = self.ctx.clone();
+        let router = self.build_router(serve_ctx.clone());
+
+        // `build_router` returns `Router<AppContext<E, C>>`; serving requires
+        // `Router<()>`, so capture the state one final time at serve time.
+        let result = axum::serve(listener, router.with_state(serve_ctx.clone()))
             .with_graceful_shutdown(shutdown_signal())
             .await;
 
-        let ctx = self.ctx.clone();
-        ctx.lifecycle.set(LifecycleState::Terminating);
-        ctx.availability.set(AvailabilityState::RefusingTraffic);
+        serve_ctx.lifecycle.set(LifecycleState::Terminating);
+        serve_ctx
+            .availability
+            .set(AvailabilityState::RefusingTraffic);
 
-        for hook in self.on_shutdown.drain(..) {
-            hook(ctx.clone()).await;
+        for hook in on_shutdown {
+            hook(serve_ctx.clone()).await;
         }
 
-        ctx.lifecycle.set(LifecycleState::Terminated);
-        ctx.availability.set(AvailabilityState::Unknown);
+        serve_ctx.lifecycle.set(LifecycleState::Terminated);
+        serve_ctx.availability.set(AvailabilityState::Unknown);
 
         result.map_err(|err| {
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
@@ -728,6 +852,175 @@ mod tests {
         assert!(!lifecycle.is_ready());
         lifecycle.set(LifecycleState::Terminated);
         assert!(lifecycle.is_terminated());
+    }
+
+    #[tokio::test]
+    async fn middleware_runs_before_handler() {
+        // `middleware` registers by alias and `use_middleware` applies it;
+        // the middleware must wrap the router and run before the handler.
+        use crate::testing::{TestApp, TestAppBuilder};
+        use crate::{AppContext, Availability, HealthChecks, ProjectPaths};
+        use axum::middleware::from_fn;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let ctx = AppContext::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+        );
+
+        let base_router = Router::<AppContext<_, _>>::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }));
+
+        let router = crate::Rume::builder(ctx.clone())
+            .router(base_router)
+            .middleware("auth", {
+                let flag = flag.clone();
+                move |router| {
+                    let flag = flag.clone();
+                    router.layer(from_fn(move |req, next: axum::middleware::Next| {
+                        let flag = flag.clone();
+                        async move {
+                            flag.store(true, Ordering::SeqCst);
+                            next.run(req).await
+                        }
+                    }))
+                }
+            })
+            .use_middleware("auth")
+            .build_router(ctx.clone());
+
+        let app: TestApp = TestAppBuilder::new(ctx).router(router).build().await;
+
+        let response = app.get("/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "auth middleware should run before the handler"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_group_applies_all_members() {
+        // `use_group` applies every member of a named group.
+        use crate::testing::{TestApp, TestAppBuilder};
+        use crate::{AppContext, Availability, HealthChecks, ProjectPaths};
+        use axum::middleware::from_fn;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag_auth = Arc::new(AtomicBool::new(false));
+        let flag_throttle = Arc::new(AtomicBool::new(false));
+
+        let ctx = AppContext::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+        );
+
+        let base_router = Router::<AppContext<_, _>>::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }));
+
+        let router = crate::Rume::builder(ctx.clone())
+            .router(base_router)
+            .middleware("auth", {
+                let flag = flag_auth.clone();
+                move |router| {
+                    let flag = flag.clone();
+                    router.layer(from_fn(move |req, next: axum::middleware::Next| {
+                        let flag = flag.clone();
+                        async move {
+                            flag.store(true, Ordering::SeqCst);
+                            next.run(req).await
+                        }
+                    }))
+                }
+            })
+            .middleware("throttle", {
+                let flag = flag_throttle.clone();
+                move |router| {
+                    let flag = flag.clone();
+                    router.layer(from_fn(move |req, next: axum::middleware::Next| {
+                        let flag = flag.clone();
+                        async move {
+                            flag.store(true, Ordering::SeqCst);
+                            next.run(req).await
+                        }
+                    }))
+                }
+            })
+            .group("web", &["auth", "throttle"])
+            .use_group("web")
+            .build_router(ctx.clone());
+
+        let app: TestApp = TestAppBuilder::new(ctx).router(router).build().await;
+
+        let response = app.get("/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            flag_auth.load(Ordering::SeqCst),
+            "auth middleware should run via group"
+        );
+        assert!(
+            flag_throttle.load(Ordering::SeqCst),
+            "throttle middleware should run via group"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_not_applied_when_not_used() {
+        // Registering a middleware without `use_middleware` must not apply it.
+        use crate::testing::{TestApp, TestAppBuilder};
+        use crate::{AppContext, Availability, HealthChecks, ProjectPaths};
+        use axum::middleware::from_fn;
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let flag = Arc::new(AtomicBool::new(false));
+
+        let ctx = AppContext::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+        );
+
+        let base_router = Router::<AppContext<_, _>>::new()
+            .route("/", axum::routing::get(|| async { StatusCode::OK }));
+
+        let router = crate::Rume::builder(ctx.clone())
+            .router(base_router)
+            .middleware("auth", {
+                let flag = flag.clone();
+                move |router| {
+                    let flag = flag.clone();
+                    router.layer(from_fn(move |req, next: axum::middleware::Next| {
+                        let flag = flag.clone();
+                        async move {
+                            flag.store(true, Ordering::SeqCst);
+                            next.run(req).await
+                        }
+                    }))
+                }
+            })
+            .build_router(ctx.clone());
+
+        let app: TestApp = TestAppBuilder::new(ctx).router(router).build().await;
+
+        let response = app.get("/").await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "unused middleware must not run"
+        );
     }
 }
 
