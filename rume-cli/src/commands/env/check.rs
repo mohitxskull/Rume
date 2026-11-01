@@ -1,4 +1,6 @@
-pub fn run(all: bool) {
+use std::collections::BTreeSet;
+
+pub fn run(all: bool, unredacted: bool) {
     let env_name = rume::env::resolve_env_name();
     println!("environment: {env_name}");
 
@@ -7,45 +9,68 @@ pub fn run(all: bool) {
             let mut shown = 0usize;
             let mut hidden = 0usize;
 
-            if resolved.file_keys.is_empty() && !all {
+            if resolved.file_keys.is_empty() && resolved.secrets.is_empty() && !all {
                 println!("(no environment variables resolved from .env files)");
                 // fall through to show process env if --all
             }
 
-            if !resolved.file_keys.is_empty() {
+            if !resolved.file_keys.is_empty() || !resolved.secrets.is_empty() {
                 use crate::ui::table::TableBuilder;
 
                 println!("resolved environment:");
                 let mut table = TableBuilder::new();
                 table.head(&["Variable", "Value", "Source"]);
+
+                // Collect all file-sourced keys (both values and secrets).
+                let mut file_keys: BTreeSet<String> = BTreeSet::new();
                 for key in &resolved.file_keys {
-                    let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
+                    file_keys.insert(key.clone());
+                }
+                for key in resolved.secrets.keys() {
+                    file_keys.insert(key.clone());
+                }
+
+                for key in file_keys {
+                    let value = resolved.get(&key).unwrap_or("");
                     let source = resolved
                         .sources
-                        .get(key)
+                        .get(&key)
                         .map(String::as_str)
                         .unwrap_or("unknown");
 
                     shown += 1;
-                    let display = rume::env::redact(key, value);
-                    table.row(&[key, &display, source]);
+                    let display = if unredacted {
+                        value.to_string()
+                    } else {
+                        rume::env::redact(&key, value)
+                    };
+                    table.row(&[&key, &display, source]);
                 }
                 table.render();
             }
 
             if all {
-                // Show process-env-only variables.
-                let mut process_only: Vec<&String> = resolved
-                    .values
-                    .keys()
-                    .filter(|k| !resolved.file_keys.contains(*k))
-                    .collect();
-                process_only.sort();
-                if !process_only.is_empty() {
+                // Show process-env-only variables (not from .env files).
+                let mut process_keys: BTreeSet<String> = BTreeSet::new();
+                for key in resolved.values.keys() {
+                    if !resolved.file_keys.contains(key.as_str()) {
+                        process_keys.insert(key.clone());
+                    }
+                }
+                for key in resolved.secrets.keys() {
+                    if !resolved.file_keys.contains(key.as_str()) {
+                        process_keys.insert(key.clone());
+                    }
+                }
+                if !process_keys.is_empty() {
                     println!("process environment:");
-                    for key in process_only {
-                        let value = resolved.values.get(key).map(String::as_str).unwrap_or("");
-                        let display = rume::env::redact(key, value);
+                    for key in process_keys {
+                        let value = resolved.get(&key).unwrap_or("");
+                        let display = if unredacted {
+                            value.to_string()
+                        } else {
+                            rume::env::redact(&key, value)
+                        };
                         println!("  {key}={display}  (process env)");
                         shown += 1;
                     }
@@ -54,7 +79,11 @@ pub fn run(all: bool) {
                 let process_count = resolved
                     .values
                     .len()
-                    .saturating_sub(resolved.file_keys.len());
+                    .saturating_sub(resolved.file_keys.len())
+                    + resolved
+                        .secrets
+                        .len()
+                        .saturating_sub(resolved.file_keys.len());
                 if process_count > 0 {
                     hidden += process_count;
                 }

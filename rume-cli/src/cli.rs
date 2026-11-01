@@ -50,11 +50,18 @@ pub enum EnvCommands {
         /// Include variables inherited from the process environment.
         #[arg(long)]
         all: bool,
+        /// Show secret values in plaintext (default: redacted).
+        #[arg(long)]
+        unredacted: bool,
     },
 }
 
 #[derive(Subcommand)]
 pub enum ConfigCommands {
     /// Print the merged configuration.
-    Check,
+    Check {
+        /// Show secret values in plaintext (default: redacted).
+        #[arg(long)]
+        unredacted: bool,
+    },
 }
