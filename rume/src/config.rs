@@ -98,3 +98,84 @@ where
     let schema = schemars::schema_for!(T);
     serde_json::to_string_pretty(&schema).map_err(|err| ConfigError::Validation(err.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn write_config(dir: &Path, name: &str, content: &str) {
+        let path = dir.join("config").join(name);
+        fs::create_dir_all(dir.join("config")).ok();
+        fs::write(&path, content).ok();
+    }
+
+    #[test]
+    fn load_raw_not_found_when_no_config() {
+        let dir = std::env::temp_dir().join("rume_config_test_not_found");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).ok();
+
+        let result = load_raw(&dir);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ConfigError::NotFound { dir: found_dir } => {
+                assert_eq!(found_dir, dir);
+            }
+            _ => panic!("expected ConfigError::NotFound"),
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_raw_reads_app_toml() {
+        let dir = std::env::temp_dir().join("rume_config_test_app_toml");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("config")).ok();
+
+        write_config(&dir, "app.toml", "app_name = \"test\"\nport = 3000\n");
+
+        let result = load_raw(&dir);
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value.get("app_name").and_then(|v| v.as_str()), Some("test"));
+        assert_eq!(value.get("port").and_then(|v| v.as_integer()), Some(3000));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_raw_pretty_returns_valid_toml() {
+        let dir = std::env::temp_dir().join("rume_config_test_pretty");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("config")).ok();
+
+        write_config(&dir, "app.toml", "key = \"value\"\n");
+
+        let result = load_raw_pretty(&dir);
+        assert!(result.is_ok());
+        let text = result.unwrap();
+        assert!(text.contains("key"));
+        assert!(text.contains("value"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_raw_local_toml_is_loaded() {
+        let dir = std::env::temp_dir().join("rume_config_test_local");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("config")).ok();
+
+        write_config(&dir, "app.toml", "key = \"base\"\n");
+        write_config(&dir, "app.local.toml", "key = \"local\"\n");
+
+        let result = load_raw(&dir);
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("local"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
