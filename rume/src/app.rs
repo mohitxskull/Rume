@@ -54,12 +54,13 @@ pub enum ApplicationMode {
 
 /// Lifecycle state of a running application.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum LifecycleState {
-    Created,
-    Booted,
-    Ready,
-    Terminating,
-    Terminated,
+    Created = 0,
+    Booted = 1,
+    Ready = 2,
+    Terminating = 3,
+    Terminated = 4,
 }
 
 /// A shared lifecycle handle.
@@ -84,11 +85,11 @@ impl Default for Lifecycle {
 
 impl Lifecycle {
     /// The highest valid on-disc value for `LifecycleState` (`Terminated = 4`).
-    /// Any discriminant above this is out of range and maps to `Created`.
     const MAX_DISCRIMINANT: u8 = LifecycleState::Terminated as u8;
 
     pub fn state(&self) -> LifecycleState {
         match self.inner.load(Ordering::SeqCst) {
+            0 => LifecycleState::Created,
             1 => LifecycleState::Booted,
             2 => LifecycleState::Ready,
             3 => LifecycleState::Terminating,
@@ -120,12 +121,13 @@ impl Lifecycle {
 
 /// Availability state for health/readiness reporting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AvailabilityState {
-    Unknown,
-    Live,
-    Ready,
-    RefusingTraffic,
-    Broken,
+    Unknown = 0,
+    Live = 1,
+    Ready = 2,
+    RefusingTraffic = 3,
+    Broken = 4,
 }
 
 /// A shared availability handle.
@@ -150,17 +152,16 @@ impl Default for Availability {
 
 impl Availability {
     /// The highest valid on-disc value for `AvailabilityState` (`Broken = 4`).
-    /// Any discriminant above this is out of range and maps to `Unknown`.
     const MAX_DISCRIMINANT: u8 = AvailabilityState::Broken as u8;
 
     pub fn state(&self) -> AvailabilityState {
         match self.inner.load(Ordering::SeqCst) {
+            0 => AvailabilityState::Unknown,
             1 => AvailabilityState::Live,
             2 => AvailabilityState::Ready,
             3 => AvailabilityState::RefusingTraffic,
             4 => AvailabilityState::Broken,
-            // Any stray u8 (e.g. 99, 255) falls back to `Unknown` instead of
-            // pretending to be a real availability state.
+            // Any stray u8 maps to `Unknown`.
             _ => AvailabilityState::Unknown,
         }
     }
@@ -685,6 +686,48 @@ mod tests {
         assert_eq!(ctx.paths.root, custom_paths.root);
         assert_eq!(ctx.paths.config, custom_paths.config);
         assert_eq!(ctx.paths.public, custom_paths.public);
+    }
+
+    #[test]
+    fn lifecycle_invalid_u8_maps_to_created() {
+        // C-C3: an out-of-range u8 discriminant must map to Created, never
+        // to a real lifecycle state.
+        let lifecycle = Lifecycle::new();
+        assert_eq!(lifecycle.state(), LifecycleState::Created);
+
+        // Store an invalid u8 directly (simulating memory corruption).
+        lifecycle.inner.store(99, Ordering::SeqCst);
+        assert_eq!(lifecycle.state(), LifecycleState::Created);
+
+        lifecycle.inner.store(255, Ordering::SeqCst);
+        assert_eq!(lifecycle.state(), LifecycleState::Created);
+    }
+
+    #[test]
+    fn availability_invalid_u8_maps_to_unknown() {
+        // C-C3: an out-of-range u8 discriminant must map to Unknown, never
+        // to a real availability state.
+        let availability = Availability::new();
+        assert_eq!(availability.state(), AvailabilityState::Unknown);
+
+        availability.inner.store(99, Ordering::SeqCst);
+        assert_eq!(availability.state(), AvailabilityState::Unknown);
+
+        availability.inner.store(255, Ordering::SeqCst);
+        assert_eq!(availability.state(), AvailabilityState::Unknown);
+    }
+
+    #[test]
+    fn lifecycle_valid_transitions() {
+        let lifecycle = Lifecycle::new();
+        lifecycle.set(LifecycleState::Booted);
+        assert_eq!(lifecycle.state(), LifecycleState::Booted);
+        lifecycle.set(LifecycleState::Ready);
+        assert!(lifecycle.is_ready());
+        lifecycle.set(LifecycleState::Terminating);
+        assert!(!lifecycle.is_ready());
+        lifecycle.set(LifecycleState::Terminated);
+        assert!(lifecycle.is_terminated());
     }
 }
 
