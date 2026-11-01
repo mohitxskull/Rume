@@ -222,6 +222,23 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
             dir.join(path)
         };
 
+        // Resolve canonical path and enforce that it stays within `dir` to
+        // prevent path traversal (e.g. `file:../../etc/secrets/app.key`).
+        let canonical_dir = match fs::canonicalize(dir) {
+            Ok(d) => d,
+            Err(_) => dir.to_path_buf(),
+        };
+        let canonical_full = match fs::canonicalize(&full) {
+            Ok(cf) => cf,
+            Err(_) => full.clone(),
+        };
+        if !canonical_full.starts_with(&canonical_dir) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("file: path escapes directory: {path}"),
+            ));
+        }
+
         let contents = fs::read_to_string(&full)?;
         // Environment values conventionally do not carry a trailing newline.
         Ok(contents
@@ -293,5 +310,27 @@ mod tests {
         assert!(is_secret_key("DB_PASSWORD"));
         assert!(!is_secret_key("HOST"));
         assert!(!is_secret_key("PORT"));
+    }
+
+    #[test]
+    fn file_value_traversal_is_rejected() {
+        let dir = std::env::temp_dir();
+        assert!(resolve_value("file:../../etc/secrets/app.key".to_string(), &dir).is_err());
+    }
+
+    #[test]
+    fn file_value_absolute_path_is_rejected() {
+        assert!(resolve_value("file:/etc/passwd".to_string(), &std::env::temp_dir()).is_err());
+    }
+
+    #[test]
+    fn file_value_normal_path_works() {
+        let dir = std::env::temp_dir();
+        let file_path = dir.join("rume_env_test_file.txt");
+        std::fs::write(&file_path, "test content").unwrap();
+        let result = resolve_value(format!("file:{}", file_path.display()), &dir);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "test content");
+        std::fs::remove_file(&file_path).ok();
     }
 }

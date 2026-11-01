@@ -154,10 +154,13 @@ impl<M> std::ops::Deref for ValidatedParam<M> {
 /// Marker types for param matchers used with `ValidatedParam`.
 pub mod matchers {
     /// Matcher for numeric parameters.
+    #[derive(Debug)]
     pub struct Number;
     /// Matcher for UUID parameters.
+    #[derive(Debug)]
     pub struct Uuid;
     /// Matcher for slug parameters.
+    #[derive(Debug)]
     pub struct Slug;
 }
 
@@ -177,21 +180,41 @@ impl matchers::Slug {
     }
 }
 
+impl ParamMatcher for matchers::Number {
+    const PARAM_NAME: &'static str = "test_param";
+    fn validate(value: &str) -> Result<String, String> {
+        Matcher::Number.validate(value)
+    }
+}
+impl ParamMatcher for matchers::Uuid {
+    const PARAM_NAME: &'static str = "test_param";
+    fn validate(value: &str) -> Result<String, String> {
+        Matcher::Uuid.validate(value)
+    }
+}
+impl ParamMatcher for matchers::Slug {
+    const PARAM_NAME: &'static str = "test_param";
+    fn validate(value: &str) -> Result<String, String> {
+        Matcher::Slug.validate(value)
+    }
+}
+
 /// Trait for param matchers used with `ValidatedParam`.
-pub trait ParamMatcher {
+pub trait ParamMatcher: Send + Sync + 'static {
     const PARAM_NAME: &'static str;
     fn validate(value: &str) -> Result<String, String>;
 }
 
-impl<M> FromRequestParts<()> for ValidatedParam<M>
+impl<M, S> FromRequestParts<S> for ValidatedParam<M>
 where
     M: ParamMatcher,
+    S: Send + Sync + 'static,
 {
     type Rejection = Rejection;
 
     async fn from_request_parts(
         parts: &mut axum::http::request::Parts,
-        _state: &(),
+        _state: &S,
     ) -> Result<Self, Self::Rejection> {
         let Path(params): Path<BTreeMap<String, String>> = Path::from_request_parts(parts, &())
             .await
@@ -607,5 +630,101 @@ impl IntoResponse for Rejection {
             Rejection::Validation(err) => (StatusCode::UNPROCESSABLE_ENTITY, err),
         };
         (status, Json(serde_json::json!({"error": message}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{AppContext, Availability, ProjectPaths};
+
+    #[derive(Debug, Clone)]
+    #[expect(dead_code)]
+    struct TestMatcher;
+
+    impl ParamMatcher for TestMatcher {
+        const PARAM_NAME: &'static str = "test_param";
+        fn validate(value: &str) -> Result<String, String> {
+            if value == "valid" {
+                Ok(value.to_string())
+            } else {
+                Err(format!("{value} is not valid"))
+            }
+        }
+    }
+
+    #[test]
+    fn matcher_number_validates_digits() {
+        assert_eq!(Matcher::Number.validate("42"), Ok("42".to_string()));
+        assert!(Matcher::Number.validate("abc").is_err());
+        // u64 overflow should reject
+        assert!(Matcher::Number.validate("99999999999999999999").is_err());
+    }
+
+    #[test]
+    fn matcher_uuid_validates_format() {
+        assert_eq!(
+            Matcher::Uuid.validate("550e8400-e29b-41d4-a716-446655440000"),
+            Ok("550e8400-e29b-41d4-a716-446655440000".to_string())
+        );
+        assert!(Matcher::Uuid.validate("not-a-uuid").is_err());
+    }
+
+    #[test]
+    fn matcher_slug_validates_format() {
+        assert_eq!(Matcher::Slug.validate("my-slug"), Ok("my-slug".to_string()));
+        assert!(Matcher::Slug.validate("bad slug").is_err());
+        assert!(Matcher::Slug.validate("ab").is_err()); // too short
+        assert!(Matcher::Slug.validate("-bad").is_err()); // leading hyphen
+        assert!(Matcher::Slug.validate("bad--").is_err()); // doubled hyphen
+    }
+
+    #[tokio::test]
+    async fn validated_param_works_with_appcontext_state() {
+        // C1 fix: ValidatedParam must work with AppContext<E, C> state, not just ().
+        let ctx = AppContext::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            crate::routing::HealthChecks::new(),
+        );
+
+        let (mut parts, _) = axum::http::Request::builder()
+            .body(axum::body::Body::empty())
+            .unwrap()
+            .into_parts();
+
+        let extractor =
+            ValidatedParam::<matchers::Number>::from_request_parts(&mut parts, &ctx).await;
+
+        // Should fail because "test_param" key is missing
+        assert!(extractor.is_err());
+        match extractor.unwrap_err() {
+            Rejection::MissingParam(_) | Rejection::Extraction(_) => {}
+            _ => panic!("expected MissingParam or Extraction"),
+        }
+    }
+
+    #[test]
+    fn rejection_status_mapping() {
+        assert_eq!(
+            Rejection::Extraction("bad".to_string())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Rejection::MissingParam("id".to_string())
+                .into_response()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            Rejection::Validation("bad value".to_string())
+                .into_response()
+                .status(),
+            StatusCode::UNPROCESSABLE_ENTITY
+        );
     }
 }
