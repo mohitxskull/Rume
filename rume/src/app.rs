@@ -194,63 +194,32 @@ impl ProjectPaths {
     }
 }
 
-/// Detect an AI coding agent from the environment.
-pub fn detected_ai_agent() -> Option<&'static str> {
-    if std::env::var("OPENCODE").is_ok() {
-        return Some("opencode");
-    }
-    if std::env::var("CLAUDE").is_ok() || std::env::var("CLAUDE_CODE").is_ok() {
-        return Some("claude");
-    }
-    if std::env::var("COPILOT").is_ok() {
-        return Some("copilot");
-    }
-    if std::env::var("GEMINI").is_ok() {
-        return Some("gemini");
-    }
-    if std::env::var("WINDSURF").is_ok() {
-        return Some("windsurf");
-    }
-    if std::env::var("CURSOR").is_ok() {
-        return Some("cursor");
-    }
-    if std::env::var("CODEX").is_ok() {
-        return Some("codex");
-    }
-    None
-}
-
-/// Whether the process appears to run under an AI coding agent.
-pub fn running_in_ai_agent() -> bool {
-    detected_ai_agent().is_some()
-}
-
-/// Whether the process appears to run under pm2.
-pub fn managed_by_pm2() -> bool {
-    std::env::var("pm_id").is_ok()
-}
-
 /// Application context holding env, config, paths, availability, and lifecycle.
 ///
-/// This is the recommended type to use as Axum state so handlers can access
-/// configuration and environment values through the [`State`] extractor.
+/// Every Rume application is built with an [`AppContext`]. Handlers access env,
+/// config, paths, and availability through [`State<AppContext<E, C>>`].
 ///
 /// # Example
 ///
 /// ```ignore
-/// use rume::app::{AppContext, builder_with_context};
+/// use rume::app::{AppContext, Rume};
 /// use rume::prelude::*;
 ///
 /// let ctx = AppContext::new(env, config, paths, availability);
 /// let router = routes::router(ctx.clone());
 ///
-/// Rume::builder_with_context(ctx)
+/// Rume::builder(ctx)
 ///     .router(router)
+///     .bind((env.host, env.port))
 ///     .run()
 ///     .await?;
 /// ```
 #[derive(Clone, Debug)]
-pub struct AppContext<E, C> {
+pub struct AppContext<E, C>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
     /// Loaded environment variables.
     pub env: E,
     /// Loaded application configuration.
@@ -263,7 +232,11 @@ pub struct AppContext<E, C> {
     pub lifecycle: Lifecycle,
 }
 
-impl<E, C> AppContext<E, C> {
+impl<E, C> AppContext<E, C>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
     /// Create a new application context.
     pub fn new(env: E, config: C, paths: ProjectPaths, availability: Availability) -> Self {
         Self {
@@ -276,87 +249,72 @@ impl<E, C> AppContext<E, C> {
     }
 }
 
-impl<E, C> Rume<AppContext<E, C>>
+/// A configured Rume application.
+///
+/// `Rume` is a marker type for the builder API. Every Rume application carries
+/// an [`AppContext`] as its Axum state.
+pub struct Rume<E, C> {
+    _state: std::marker::PhantomData<(E, C)>,
+}
+
+impl<E, C> Rume<E, C>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
 {
     /// Create a builder initialized with an [`AppContext`] as Axum state.
     ///
-    /// This is a convenience shorthand for [`RumeBuilder::new`] that takes an
-    /// [`AppContext`] directly. Use this when you want handlers to access env,
-    /// config, paths, or availability through the [`State`] extractor.
-    pub fn builder_with_context(ctx: AppContext<E, C>) -> RumeBuilder<AppContext<E, C>> {
+    /// This is the only way to build a Rume application. Every app carries an
+    /// [`AppContext`] so handlers can access env, config, paths, and
+    /// availability through [`State`].
+    pub fn builder(ctx: AppContext<E, C>) -> RumeBuilder<E, C> {
         RumeBuilder::new(ctx)
     }
 }
 
-/// A configured Rume application.
-pub struct Rume<S> {
-    _state: std::marker::PhantomData<S>,
-}
-
-type ReadyHook<S> = Box<dyn FnOnce(S) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
-type ShutdownHook<S> = Box<dyn FnOnce(S) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
-
 /// Builder for a [`Rume`] application.
-pub struct RumeBuilder<S> {
-    state: S,
-    router: Router<S>,
+#[allow(clippy::type_complexity)]
+pub struct RumeBuilder<E, C>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
+    ctx: AppContext<E, C>,
+    router: Router<AppContext<E, C>>,
     bind: String,
     mode: ApplicationMode,
     environment: Environment,
-    paths: ProjectPaths,
-    lifecycle: Lifecycle,
-    availability: Availability,
-    on_ready: Vec<ReadyHook<S>>,
-    on_shutdown: Vec<ShutdownHook<S>>,
+    on_ready:
+        Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
+    on_shutdown:
+        Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
 }
 
-impl Rume<()> {
-    /// Create a builder for a stateless application.
-    pub fn builder() -> RumeBuilder<()> {
-        RumeBuilder::new(())
-    }
-}
-
-impl<S> Rume<S>
+impl<E, C> RumeBuilder<E, C>
 where
-    S: Clone + Send + Sync + 'static,
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
 {
-    /// Create a builder for an application with the given state.
-    pub fn builder_with_state(state: S) -> RumeBuilder<S> {
-        RumeBuilder::new(state)
-    }
-}
-
-impl<S> RumeBuilder<S>
-where
-    S: Clone + Send + Sync + 'static,
-{
-    pub fn new(state: S) -> Self {
+    pub fn new(ctx: AppContext<E, C>) -> Self {
         Self {
-            state,
+            ctx,
             router: Router::new(),
             bind: "127.0.0.1:3000".to_string(),
             mode: ApplicationMode::Run,
             environment: Environment::from_env(),
-            paths: ProjectPaths::from_current_dir(),
-            lifecycle: Lifecycle::new(),
-            availability: Availability::new(),
             on_ready: Vec::new(),
             on_shutdown: Vec::new(),
         }
     }
 
     /// Add a route to the application.
-    pub fn route(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
+    pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C>>) -> Self {
         self.router = self.router.route(path, method_router);
         self
     }
 
     /// Replace the application router.
-    pub fn router(mut self, router: Router<S>) -> Self {
+    pub fn router(mut self, router: Router<AppContext<E, C>>) -> Self {
         self.router = router;
         self
     }
@@ -384,40 +342,38 @@ where
 
     /// Override the project paths.
     pub fn paths(mut self, paths: ProjectPaths) -> Self {
-        self.paths = paths;
+        self.ctx.paths = paths;
         self
     }
 
     /// Register a startup task.
     pub fn on_ready<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnOnce(S) -> Fut + Send + 'static,
+        F: FnOnce(AppContext<E, C>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_ready
-            .push(Box::new(move |state| Box::pin(f(state))));
+        self.on_ready.push(Box::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
     /// Register a shutdown task.
     pub fn on_shutdown<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnOnce(S) -> Fut + Send + 'static,
+        F: FnOnce(AppContext<E, C>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
-        self.on_shutdown
-            .push(Box::new(move |state| Box::pin(f(state))));
+        self.on_shutdown.push(Box::new(move |ctx| Box::pin(f(ctx))));
         self
     }
 
     /// Access the lifecycle handle.
     pub fn lifecycle(&self) -> Lifecycle {
-        self.lifecycle.clone()
+        self.ctx.lifecycle.clone()
     }
 
     /// Access the availability handle.
     pub fn availability(&self) -> Availability {
-        self.availability.clone()
+        self.ctx.availability.clone()
     }
 
     /// Access the detected environment.
@@ -427,7 +383,7 @@ where
 
     /// Access the project paths.
     pub fn paths_ref(&self) -> &ProjectPaths {
-        &self.paths
+        &self.ctx.paths
     }
 
     /// Run the application until a shutdown signal is received.
@@ -444,35 +400,36 @@ where
             )
         })?;
 
-        self.lifecycle.set(LifecycleState::Booted);
-        self.availability.set(AvailabilityState::Live);
+        let ctx = self.ctx.clone();
+        ctx.lifecycle.set(LifecycleState::Booted);
+        ctx.availability.set(AvailabilityState::Live);
 
         if self.mode == ApplicationMode::Run {
-            let state = self.state.clone();
             for hook in self.on_ready.drain(..) {
-                hook(state.clone()).await;
+                hook(ctx.clone()).await;
             }
         }
 
-        self.lifecycle.set(LifecycleState::Ready);
-        self.availability.set(AvailabilityState::Ready);
+        ctx.lifecycle.set(LifecycleState::Ready);
+        ctx.availability.set(AvailabilityState::Ready);
 
         println!("listening on http://{addr}");
 
-        let state = self.state.clone();
-        let result = axum::serve(listener, self.router.with_state(self.state))
+        let ctx = self.ctx.clone();
+        let result = axum::serve(listener, self.router.with_state(ctx))
             .with_graceful_shutdown(shutdown_signal())
             .await;
 
-        self.lifecycle.set(LifecycleState::Terminating);
-        self.availability.set(AvailabilityState::RefusingTraffic);
+        let ctx = self.ctx.clone();
+        ctx.lifecycle.set(LifecycleState::Terminating);
+        ctx.availability.set(AvailabilityState::RefusingTraffic);
 
         for hook in self.on_shutdown.drain(..) {
-            hook(state.clone()).await;
+            hook(ctx.clone()).await;
         }
 
-        self.lifecycle.set(LifecycleState::Terminated);
-        self.availability.set(AvailabilityState::Unknown);
+        ctx.lifecycle.set(LifecycleState::Terminated);
+        ctx.availability.set(AvailabilityState::Unknown);
 
         result.map_err(|err| {
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
@@ -543,18 +500,33 @@ pub fn init_tracing() {
     let _ = fmt().with_env_filter(filter).try_init();
 }
 
-/// A health/readiness router backed by an availability handle.
+/// Ops endpoints for infrastructure probes (Kubernetes liveness/readiness).
 ///
-/// Generic over the Axum state type `S` so it can be merged with other routers
-/// that share the same state.
-pub fn health_router<S>(availability: Availability) -> Router<S>
+/// Adds `GET /health` and `GET /ready` routes to an existing router, backed
+/// by an [`Availability`] handle. The routes capture `availability` directly
+/// (not from Axum state), so they work with any state type.
+///
+/// # Example
+///
+/// ```ignore
+/// use rume::app::{AppContext, ops_router};
+/// use rume::prelude::*;
+///
+/// let ctx = AppContext::new(env, config, paths, availability.clone());
+/// let router = routes::router(ctx.clone());
+///
+/// let router = ops_router(router, availability.clone());
+///
+/// Rume::builder(ctx).router(router).run().await?;
+/// ```
+pub fn ops_router<S>(router: Router<S>, availability: Availability) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
     let health_availability = availability.clone();
     let ready_availability = availability;
 
-    Router::<S>::new()
+    router
         .route(
             "/health",
             axum::routing::get(move || {
@@ -565,7 +537,7 @@ where
                     } else {
                         axum::http::StatusCode::OK
                     };
-                    let body = HealthStatus {
+                    let body = OpsStatus {
                         status: if availability.state() == AvailabilityState::Broken {
                             "broken"
                         } else {
@@ -584,12 +556,12 @@ where
                     if availability.is_ready() {
                         (
                             axum::http::StatusCode::OK,
-                            axum::Json(HealthStatus { status: "ready" }),
+                            axum::Json(OpsStatus { status: "ready" }),
                         )
                     } else {
                         (
                             axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(HealthStatus {
+                            axum::Json(OpsStatus {
                                 status: "not ready",
                             }),
                         )
@@ -600,6 +572,6 @@ where
 }
 
 #[derive(serde::Serialize)]
-struct HealthStatus {
+struct OpsStatus {
     status: &'static str,
 }

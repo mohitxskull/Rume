@@ -18,8 +18,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = routes::router(ctx.clone());
 
-    Rume::builder_with_context(ctx)
-        .environment(Environment::from_env())
+    Rume::builder(ctx)
         .router(router)
         .bind((env.host, env.port))
         .run()
