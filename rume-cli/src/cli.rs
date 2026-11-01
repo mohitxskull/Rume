@@ -28,7 +28,11 @@ pub enum Commands {
         command: ConfigCommands,
     },
     /// Validate the project setup.
-    Doctor,
+    Doctor {
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
+    },
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
@@ -53,6 +57,9 @@ pub enum EnvCommands {
         /// Show secret values in plaintext (default: redacted).
         #[arg(long)]
         unredacted: bool,
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 }
 
@@ -63,5 +70,8 @@ pub enum ConfigCommands {
         /// Show secret values in plaintext (default: redacted).
         #[arg(long)]
         unredacted: bool,
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
     },
 }

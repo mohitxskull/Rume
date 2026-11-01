@@ -51,9 +51,9 @@ pub fn run(cli: Cli) {
             require_rume_project();
             config::run(command);
         }
-        Some(Commands::Doctor) => {
+        Some(Commands::Doctor { format }) => {
             require_rume_project();
-            doctor::run();
+            doctor::run(&format);
         }
         Some(Commands::Codegen) => {
             require_rume_project();

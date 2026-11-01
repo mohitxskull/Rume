@@ -99,6 +99,17 @@ pub fn run(name: &str) {
     instructions.add("rume --help            # see all commands");
     instructions.render();
     instructions.render();
+
+    // D-m3: warn about the local-path rume dependency.
+    // Pre-v1, new projects scaffold against this checkout via a path dep.
+    // Users must switch to a crates.io pin before publishing.
+    println!();
+    eprintln!(
+        "note: this project depends on rume via a local path ({}). \
+         Before publishing or depending on crates.io, update Cargo.toml to pin \
+         a released rume version.",
+        FRAMEWORK_PATH
+    );
 }
 
 fn run_inner(name: &str) -> Result<(), NewError> {

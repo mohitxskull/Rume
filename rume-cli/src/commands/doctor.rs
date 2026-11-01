@@ -1,30 +1,46 @@
 use rume::config;
 use rume::env;
+use serde::Serialize;
 
-pub fn run() {
-    println!("Rume doctor");
-    println!();
+#[derive(Serialize)]
+struct DoctorOutput {
+    all_passed: bool,
+    checks: Vec<DoctorCheck>,
+}
 
+#[derive(Serialize)]
+struct DoctorCheck {
+    label: String,
+    status: String,
+    ok: bool,
+}
+
+pub fn run(format: &str) {
     let mut ok = true;
+    let mut checks: Vec<DoctorCheck> = Vec::new();
 
     // Rust toolchain
-    print_check("rust toolchain", || {
-        match std::process::Command::new("rustc")
-            .arg("--version")
-            .output()
-        {
-            Ok(output) if output.status.success() => {
-                String::from_utf8_lossy(&output.stdout).trim().to_string()
-            }
-            _ => {
-                ok = false;
-                "rustc not found".to_string()
-            }
+    let toolchain_result = match std::process::Command::new("rustc")
+        .arg("--version")
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
         }
+        _ => {
+            ok = false;
+            "rustc not found".to_string()
+        }
+    };
+    let toolchain_ok = toolchain_result.starts_with("rustc ");
+    checks.push(DoctorCheck {
+        label: "rust toolchain".to_string(),
+        status: toolchain_result,
+        ok: toolchain_ok,
     });
 
     // Environment
-    print_check("environment files", || match env::ResolvedEnv::load() {
+    let env_result = match env::ResolvedEnv::load() {
         Ok(resolved) => {
             let file_vars = resolved
                 .sources
@@ -41,59 +57,92 @@ pub fn run() {
             ok = false;
             format!("error: {err}")
         }
+    };
+    let env_ok = !env_result.starts_with("error:");
+    checks.push(DoctorCheck {
+        label: "environment files".to_string(),
+        status: env_result,
+        ok: env_ok,
     });
 
     // Configuration
-    print_check("configuration", || {
-        match config::load_raw(std::path::Path::new(".")) {
-            Ok(value) => format!(
-                "merged config loaded ({} top-level key(s))",
-                value.as_table().map(|t| t.len()).unwrap_or(0)
-            ),
-            Err(err) => {
-                ok = false;
-                format!("error: {err}")
-            }
+    let config_result = match config::load_raw(std::path::Path::new(".")) {
+        Ok(value) => format!(
+            "merged config loaded ({} top-level key(s))",
+            value.as_table().map(|t| t.len()).unwrap_or(0)
+        ),
+        Err(err) => {
+            ok = false;
+            format!("error: {err}")
         }
+    };
+    let config_ok = !config_result.starts_with("error:");
+    checks.push(DoctorCheck {
+        label: "configuration".to_string(),
+        status: config_result,
+        ok: config_ok,
     });
 
     // .env example
-    print_check(".env.example", || {
-        if std::path::Path::new(".env.example").is_file() {
-            "present".to_string()
-        } else {
-            "missing (recommended)".to_string()
-        }
+    let env_example_result = if std::path::Path::new(".env.example").is_file() {
+        "present".to_string()
+    } else {
+        "missing (recommended)".to_string()
+    };
+    checks.push(DoctorCheck {
+        label: ".env.example".to_string(),
+        status: env_example_result,
+        ok: true,
     });
 
     // Port availability
-    print_check("port availability", || {
-        let port = std::env::var("PORT")
-            .ok()
-            .and_then(|value| value.parse::<u16>().ok())
-            .unwrap_or(3333);
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|value| value.parse::<u16>().ok())
+        .unwrap_or(3333);
 
-        match std::net::TcpListener::bind(("127.0.0.1", port)) {
-            Ok(_) => format!("port {port} is available"),
-            Err(err) => {
-                ok = false;
-                format!("port {port} is in use: {err} (stop the process or change PORT)")
-            }
+    let port_result = match std::net::TcpListener::bind(("127.0.0.1", port)) {
+        Ok(_) => format!("port {port} is available"),
+        Err(err) => {
+            ok = false;
+            format!("port {port} is in use: {err} (stop the process or change PORT)")
         }
+    };
+    let port_ok = port_result.starts_with("port ");
+    checks.push(DoctorCheck {
+        label: "port availability".to_string(),
+        status: port_result,
+        ok: port_ok,
     });
 
-    println!();
-    if ok {
-        println!("All checks passed.");
-    } else {
-        println!("Some checks failed.");
-        std::process::exit(1);
-    }
-}
+    let output = DoctorOutput {
+        all_passed: ok,
+        checks,
+    };
 
-fn print_check<F>(label: &str, f: F)
-where
-    F: FnOnce() -> String,
-{
-    println!("  [{label}] {}", f());
+    match format {
+        "json" => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&output).unwrap_or_default()
+            );
+        }
+        _ => {
+            println!("Rume doctor");
+            println!();
+
+            for check in &output.checks {
+                let status = if check.ok { "ok" } else { "FAIL" };
+                println!("  [{}] {} ({})", check.label, check.status, status);
+            }
+
+            println!();
+            if ok {
+                println!("All checks passed.");
+            } else {
+                println!("Some checks failed.");
+                std::process::exit(1);
+            }
+        }
+    }
 }

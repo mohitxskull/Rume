@@ -79,8 +79,10 @@ pub async fn index() -> Json<{struct_name}Response> {{
                 }
             } else {
                 eprintln!(
-                    "warning: could not find route marker in {routes_path}; add the route manually"
+                    "error: could not find route marker `// rume:routes` in {routes_path}; \
+                     add the marker or register the route manually"
                 );
+                std::process::exit(1);
             }
         }
         Err(err) => {
