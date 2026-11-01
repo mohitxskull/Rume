@@ -407,6 +407,34 @@ where
             .parse()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
+        // In Inspect mode, boot and run ready hooks but do NOT serve HTTP.
+        // This allows tooling (config check, env check, migrations) to run
+        // with a fully initialized app context without binding a port.
+        if self.mode == ApplicationMode::Inspect {
+            let ctx = self.ctx.clone();
+            ctx.lifecycle.set(LifecycleState::Booted);
+            ctx.availability.set(AvailabilityState::Live);
+
+            for hook in self.on_ready.drain(..) {
+                hook(ctx.clone()).await;
+            }
+
+            ctx.lifecycle.set(LifecycleState::Ready);
+            ctx.availability.set(AvailabilityState::Ready);
+
+            for hook in self.on_shutdown.drain(..) {
+                hook(ctx.clone()).await;
+            }
+
+            ctx.lifecycle.set(LifecycleState::Terminating);
+            ctx.availability.set(AvailabilityState::RefusingTraffic);
+
+            ctx.lifecycle.set(LifecycleState::Terminated);
+            ctx.availability.set(AvailabilityState::Unknown);
+
+            return Ok(());
+        }
+
         let listener = TcpListener::bind(addr).await.map_err(|err| {
             std::io::Error::new(
                 err.kind(),
@@ -502,6 +530,33 @@ mod tests {
         assert_eq!(lifecycle.state(), LifecycleState::Created);
         lifecycle.set(LifecycleState::Ready);
         assert!(lifecycle.is_ready());
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_boots_without_serving() {
+        // C2 fix: ApplicationMode::Inspect should boot and run ready/shutdown
+        // hooks but NOT serve HTTP (no port binding).
+        use crate::{AppContext, Availability, HealthChecks, ProjectPaths};
+
+        let ctx = AppContext::new(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+        );
+
+        let builder = crate::Rume::builder(ctx)
+            .mode(crate::ApplicationMode::Inspect)
+            .bind(([127, 0, 0, 1], 0))
+            .router(crate::axum::Router::<AppContext<_, _>>::new());
+
+        // Should complete without binding a port or serving
+        builder.run().await.unwrap();
+
+        // Verify lifecycle went through full transitions
+        // Note: can't easily assert on final state since app is consumed
+        // but if it reached here without error, the fix works
     }
 }
 
