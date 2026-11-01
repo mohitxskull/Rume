@@ -11,6 +11,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod prelude;
+pub mod routing;
 pub mod testing;
 pub mod validation;
 
@@ -19,6 +20,10 @@ pub use app::{
     LifecycleState, ProjectPaths, Rume, RumeBuilder, ops_router,
 };
 pub use error::AppError;
+pub use routing::{
+    HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
+    RouteSpec, ValidatedParam, registered_routes,
+};
 pub use testing::{TestApp, TestAppBuilder};
 pub use validation::Validated;
 

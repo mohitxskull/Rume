@@ -9,6 +9,11 @@ pub struct Health {
     pub app_name: String,
 }
 
+/// Custom health handler example.
+///
+/// Note: `/health/live` and `/health/ready` are already handled by
+/// `rume::routing::health_routes()` in `src/app.rs`. This handler is an
+/// example of a custom health endpoint you can add.
 pub async fn health(State(ctx): State<AppContext<Env, Config>>) -> Json<Health> {
     Json(Health {
         status: "ok",

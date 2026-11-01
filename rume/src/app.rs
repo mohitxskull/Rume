@@ -1,6 +1,9 @@
 //! Application bootstrap, lifecycle, and developer-experience helpers.
+#![allow(clippy::items_after_test_module)]
 
 use axum::Router;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Json};
 use axum::routing::MethodRouter;
 use std::future::Future;
 use std::net::SocketAddr;
@@ -194,10 +197,11 @@ impl ProjectPaths {
     }
 }
 
-/// Application context holding env, config, paths, availability, and lifecycle.
+/// Application context holding env, config, paths, availability, lifecycle,
+/// and health checks.
 ///
 /// Every Rume application is built with an [`AppContext`]. Handlers access env,
-/// config, paths, and availability through [`State<AppContext<E, C>>`].
+/// config, paths, availability, and health checks through [`State<AppContext<E, C>>`].
 ///
 /// # Example
 ///
@@ -205,14 +209,10 @@ impl ProjectPaths {
 /// use rume::app::{AppContext, Rume};
 /// use rume::prelude::*;
 ///
-/// let ctx = AppContext::new(env, config, paths, availability);
+/// let ctx = AppContext::new(env, config, paths, availability, health_checks);
 /// let router = routes::router(ctx.clone());
 ///
-/// Rume::builder(ctx)
-///     .router(router)
-///     .bind((env.host, env.port))
-///     .run()
-///     .await?;
+/// Rume::builder(ctx).router(router).run().await?;
 /// ```
 #[derive(Clone, Debug)]
 pub struct AppContext<E, C>
@@ -230,6 +230,8 @@ where
     pub availability: Availability,
     /// Application lifecycle state.
     pub lifecycle: Lifecycle,
+    /// Health check registry.
+    pub health_checks: crate::routing::HealthChecks,
 }
 
 impl<E, C> AppContext<E, C>
@@ -238,13 +240,20 @@ where
     C: Clone + Send + Sync + 'static,
 {
     /// Create a new application context.
-    pub fn new(env: E, config: C, paths: ProjectPaths, availability: Availability) -> Self {
+    pub fn new(
+        env: E,
+        config: C,
+        paths: ProjectPaths,
+        availability: Availability,
+        health_checks: crate::routing::HealthChecks,
+    ) -> Self {
         Self {
             env,
             config,
             paths,
             availability,
             lifecycle: Lifecycle::new(),
+            health_checks,
         }
     }
 }
@@ -265,8 +274,8 @@ where
     /// Create a builder initialized with an [`AppContext`] as Axum state.
     ///
     /// This is the only way to build a Rume application. Every app carries an
-    /// [`AppContext`] so handlers can access env, config, paths, and
-    /// availability through [`State`].
+    /// [`AppContext`] so handlers can access env, config, paths, availability,
+    /// and health checks through [`State`].
     pub fn builder(ctx: AppContext<E, C>) -> RumeBuilder<E, C> {
         RumeBuilder::new(ctx)
     }
@@ -386,6 +395,11 @@ where
         &self.ctx.paths
     }
 
+    /// Access the health checks registry.
+    pub fn health_checks(&self) -> crate::routing::HealthChecks {
+        self.ctx.health_checks.clone()
+    }
+
     /// Run the application until a shutdown signal is received.
     pub async fn run(mut self) -> Result<(), std::io::Error> {
         let addr: SocketAddr = self
@@ -502,9 +516,9 @@ pub fn init_tracing() {
 
 /// Ops endpoints for infrastructure probes (Kubernetes liveness/readiness).
 ///
-/// Adds `GET /health` and `GET /ready` routes to an existing router, backed
-/// by an [`Availability`] handle. The routes capture `availability` directly
-/// (not from Axum state), so they work with any state type.
+/// Adds `GET /health/live` and `GET /ready` routes to an existing router.
+/// The routes capture `availability` directly (not from Axum state), so they
+/// work with any state type.
 ///
 /// # Example
 ///
@@ -512,7 +526,7 @@ pub fn init_tracing() {
 /// use rume::app::{AppContext, ops_router};
 /// use rume::prelude::*;
 ///
-/// let ctx = AppContext::new(env, config, paths, availability.clone());
+/// let ctx = AppContext::new(env, config, paths, availability.clone(), health_checks.clone());
 /// let router = routes::router(ctx.clone());
 ///
 /// let router = ops_router(router, availability.clone());
@@ -528,50 +542,39 @@ where
 
     router
         .route(
-            "/health",
+            "/health/live",
             axum::routing::get(move || {
                 let availability = health_availability.clone();
                 async move {
-                    let status = if availability.state() == AvailabilityState::Broken {
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE
-                    } else {
-                        axum::http::StatusCode::OK
-                    };
-                    let body = OpsStatus {
-                        status: if availability.state() == AvailabilityState::Broken {
-                            "broken"
-                        } else {
-                            "ok"
-                        },
-                    };
-                    (status, axum::Json(body))
-                }
-            }),
-        )
-        .route(
-            "/ready",
-            axum::routing::get(move || {
-                let availability = ready_availability.clone();
-                async move {
-                    if availability.is_ready() {
+                    if availability.state() == AvailabilityState::Broken {
                         (
-                            axum::http::StatusCode::OK,
-                            axum::Json(OpsStatus { status: "ready" }),
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({"status": "broken"})),
                         )
+                            .into_response()
                     } else {
-                        (
-                            axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                            axum::Json(OpsStatus {
-                                status: "not ready",
-                            }),
-                        )
+                        (StatusCode::OK, Json(serde_json::json!({"status": "alive"})))
+                            .into_response()
                     }
                 }
             }),
         )
-}
-
-#[derive(serde::Serialize)]
-struct OpsStatus {
-    status: &'static str,
+        .route(
+            "/health/ready",
+            axum::routing::get(move || {
+                let availability = ready_availability.clone();
+                async move {
+                    if availability.is_ready() {
+                        (StatusCode::OK, Json(serde_json::json!({"status": "ready"})))
+                            .into_response()
+                    } else {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(serde_json::json!({"status": "not ready"})),
+                        )
+                            .into_response()
+                    }
+                }
+            }),
+        )
 }

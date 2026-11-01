@@ -9,9 +9,13 @@ pub use crate::config::ConfigError;
 pub use crate::env;
 pub use crate::env::EnvError;
 pub use crate::error::AppError;
+pub use crate::routing::{
+    HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
+    RouteSpec, ValidatedParam, registered_routes,
+};
 pub use crate::testing::{TestApp, TestAppBuilder};
 pub use crate::validation::Validated;
-
+pub use axum::extract::Path;
 pub use axum::extract::State;
 pub use axum::routing;
 pub use axum::{Json, Router};
