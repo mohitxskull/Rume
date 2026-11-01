@@ -64,27 +64,31 @@ pub enum Matcher {
 
 impl Matcher {
     /// Validate a string value against this matcher.
+    ///
+    /// Returns the validated string on success, or a generic error message on
+    /// failure. The error message does NOT echo the raw input value to avoid
+    /// leaking user-controlled data into error responses (see S-m3).
     pub fn validate(&self, value: &str) -> Result<String, String> {
         match self {
             Matcher::Number => {
                 if value.parse::<u64>().is_ok() {
                     Ok(value.to_string())
                 } else {
-                    Err(format!("{value} is not a valid number"))
+                    Err("value is not a valid number".to_string())
                 }
             }
             Matcher::Uuid => {
                 if is_valid_uuid(value) {
                     Ok(value.to_lowercase())
                 } else {
-                    Err(format!("{value} is not a valid UUID"))
+                    Err("value is not a valid UUID".to_string())
                 }
             }
             Matcher::Slug => {
                 if is_valid_slug(value) {
                     Ok(value.to_string())
                 } else {
-                    Err(format!("{value} is not a valid slug"))
+                    Err("value is not a valid slug".to_string())
                 }
             }
         }
@@ -280,6 +284,16 @@ pub fn registered_routes() -> Vec<RouteInfo> {
         .unwrap_or_default()
 }
 
+/// Reset the global route registry (for testing only).
+///
+/// Clears all registrations so each test starts from a clean slate.
+/// This is needed because `ROUTE_REGISTRY` is a process-global `OnceLock`.
+pub fn reset_route_registry() {
+    if let Ok(mut registry) = route_registry().lock() {
+        registry.clear();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // RouteSpec
 // ---------------------------------------------------------------------------
@@ -383,6 +397,13 @@ impl RouteSpec {
     /// Register the route and build route metadata.
     ///
     /// Returns `(path, method, params, name)` suitable for `Router::route()`.
+    ///
+    /// # Registration
+    ///
+    /// The route is registered in the global [`ROUTE_REGISTRY`] at build time
+    /// (this is intentional — it powers `rume list:routes`). If a route is
+    /// built but never mounted, it still appears in the registry. Use
+    /// [`reset_route_registry`] in tests to isolate registry state.
     pub fn build(self) -> (String, Method, Vec<(String, Matcher)>, Option<String>) {
         let info = RouteInfo {
             method: self.method.clone(),
@@ -915,5 +936,32 @@ mod tests {
         // C-m4: Warning → not fully healthy (503 on /health/ready)
         assert!(!report.is_healthy);
         assert_eq!(report.status, "warning");
+    }
+
+    // --- T-T9: ROUTE_REGISTRY isolation ---
+
+    #[test]
+    fn route_registry_reset_clears_registrations() {
+        // T-T9: reset_route_registry must clear the global registry between tests.
+        reset_route_registry();
+        assert!(registered_routes().is_empty());
+
+        let _ = RouteSpec::get("/temp").build();
+        assert!(!registered_routes().is_empty());
+
+        reset_route_registry();
+        assert!(registered_routes().is_empty());
+    }
+
+    #[test]
+    fn route_spec_build_without_mount_still_registers() {
+        // C-m3: build() registers in the registry even if never mounted.
+        // This is intentional (powers `rume list:routes`).
+        reset_route_registry();
+        let _ = RouteSpec::get("/unmounted").build();
+        assert!(
+            registered_routes().iter().any(|r| r.path == "/unmounted"),
+            "build-then-unmounted route should still be in registry"
+        );
     }
 }

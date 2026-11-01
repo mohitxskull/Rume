@@ -22,7 +22,7 @@ pub use app::{
 pub use error::AppError;
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
-    RouteSpec, ValidatedParam, registered_routes,
+    RouteSpec, ValidatedParam, registered_routes, reset_route_registry,
 };
 pub use testing::{TestApp, TestAppBuilder};
 pub use validation::Validated;
