@@ -239,7 +239,7 @@ where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
 {
-    /// Create a new application context.
+    /// Create a new application context with all required fields.
     pub fn new(
         env: E,
         config: C,
@@ -254,6 +254,69 @@ where
             availability,
             lifecycle: Lifecycle::new(),
             health_checks,
+        }
+    }
+
+    /// Start building an `AppContext` with sensible defaults.
+    ///
+    /// Required: `env` and `config`. Optional: `paths`, `availability`, `health_checks`.
+    /// Defaults: `ProjectPaths::from_current_dir()`, `Availability::new()`, `HealthChecks::new()`.
+    pub fn builder(env: E, config: C) -> AppContextBuilder<E, C> {
+        AppContextBuilder {
+            env,
+            config,
+            paths: None,
+            availability: None,
+            health_checks: None,
+        }
+    }
+}
+
+/// Builder for [`AppContext`] with optional defaults.
+pub struct AppContextBuilder<E, C>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
+    env: E,
+    config: C,
+    paths: Option<ProjectPaths>,
+    availability: Option<Availability>,
+    health_checks: Option<crate::routing::HealthChecks>,
+}
+
+impl<E, C> AppContextBuilder<E, C>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
+    /// Set the project paths (default: `ProjectPaths::from_current_dir()`).
+    pub fn paths(mut self, paths: ProjectPaths) -> Self {
+        self.paths = Some(paths);
+        self
+    }
+
+    /// Set the availability handle (default: `Availability::new()`).
+    pub fn availability(mut self, availability: Availability) -> Self {
+        self.availability = Some(availability);
+        self
+    }
+
+    /// Set the health checks registry (default: `HealthChecks::new()`).
+    pub fn health_checks(mut self, health_checks: crate::routing::HealthChecks) -> Self {
+        self.health_checks = Some(health_checks);
+        self
+    }
+
+    /// Build the `AppContext`.
+    pub fn build(self) -> AppContext<E, C> {
+        AppContext {
+            env: self.env,
+            config: self.config,
+            paths: self.paths.unwrap_or_else(ProjectPaths::from_current_dir),
+            availability: self.availability.unwrap_or_default(),
+            lifecycle: Lifecycle::new(),
+            health_checks: self.health_checks.unwrap_or_default(),
         }
     }
 }
@@ -557,6 +620,42 @@ mod tests {
         // Verify lifecycle went through full transitions
         // Note: can't easily assert on final state since app is consumed
         // but if it reached here without error, the fix works
+    }
+
+    #[test]
+    fn app_context_builder_with_defaults() {
+        // D-M1 fix: AppContext::builder() provides ergonomic construction with defaults.
+        use crate::AppContext;
+
+        let ctx = AppContext::builder(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+        )
+        .build();
+
+        assert_eq!(ctx.env, std::net::IpAddr::from([127, 0, 0, 1]));
+        assert!(ctx.config.is_empty());
+        assert!(!ctx.availability.is_ready()); // Unknown state
+        assert_eq!(ctx.lifecycle.state(), crate::LifecycleState::Created);
+    }
+
+    #[test]
+    fn app_context_builder_custom_paths() {
+        // D-M1 fix: builder allows overriding defaults.
+        use crate::{AppContext, ProjectPaths};
+
+        let custom_paths = ProjectPaths::from_root("/custom/root");
+
+        let ctx = AppContext::builder(
+            std::net::IpAddr::from([127, 0, 0, 1]),
+            std::collections::BTreeMap::<String, String>::new(),
+        )
+        .paths(custom_paths.clone())
+        .build();
+
+        assert_eq!(ctx.paths.root, custom_paths.root);
+        assert_eq!(ctx.paths.config, custom_paths.config);
+        assert_eq!(ctx.paths.public, custom_paths.public);
     }
 }
 
