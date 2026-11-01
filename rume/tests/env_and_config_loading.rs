@@ -1,6 +1,6 @@
 use rume::config;
 use rume::env::ResolvedEnv;
-use rume::serde::Deserialize;
+use serde::Deserialize;
 use std::fs;
 use std::sync::Mutex;
 use tempfile::TempDir;
@@ -123,7 +123,7 @@ fn loads_merged_config() {
     assert_eq!(cfg.app.port, 2222);
 }
 
-#[derive(rume::serde::Deserialize)]
+#[derive(serde::Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 struct TypedEnv {
     host: std::net::IpAddr,

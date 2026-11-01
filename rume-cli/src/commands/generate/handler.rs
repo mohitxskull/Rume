@@ -20,8 +20,8 @@ pub fn run(name: &str) {
     }
 
     let content = format!(
-        r#"use rume::axum::Json;
-use rume::serde::Serialize;
+        r#"use axum::Json;
+use serde::Serialize;
 
 #[derive(Serialize)]
 pub struct {struct_name}Response {{
@@ -62,7 +62,7 @@ pub async fn index() -> Json<{struct_name}Response> {{
     match fs::read_to_string(routes_path) {
         Ok(existing) => {
             let route_line = format!(
-                "    router = router.route(\"/{name}\", rume::axum::routing::get(crate::handlers::{module_name}::index));\n",
+                "    router = router.route(\"/{name}\", axum::routing::get(crate::handlers::{module_name}::index));\n",
                 name = name,
                 module_name = module_name
             );

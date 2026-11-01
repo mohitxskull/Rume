@@ -2,8 +2,8 @@
 //! T-T8: exercises `health_routes`, availability transitions, and
 //! `HealthChecks::run` against an actual router (not a bare handler).
 
+use axum::http::StatusCode;
 use rume::app::{AppContext, Availability, ProjectPaths};
-use rume::axum::http::StatusCode;
 use rume::prelude::{TestApp, TestAppBuilder};
 use rume::routing::{HealthCheck, HealthCheckResult, HealthChecks, HealthStatus, health_routes};
 use std::collections::BTreeMap;

@@ -642,7 +642,7 @@ mod tests {
         let builder = crate::Rume::builder(ctx)
             .mode(crate::ApplicationMode::Inspect)
             .bind(([127, 0, 0, 1], 0))
-            .router(crate::axum::Router::<AppContext<_, _>>::new());
+            .router(Router::<AppContext<_, _>>::new());
 
         // Should complete without binding a port or serving
         builder.run().await.unwrap();
