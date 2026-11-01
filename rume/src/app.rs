@@ -83,18 +83,30 @@ impl Default for Lifecycle {
 }
 
 impl Lifecycle {
+    /// The highest valid on-disc value for `LifecycleState` (`Terminated = 4`).
+    /// Any discriminant above this is out of range and maps to `Created`.
+    const MAX_DISCRIMINANT: u8 = LifecycleState::Terminated as u8;
+
     pub fn state(&self) -> LifecycleState {
         match self.inner.load(Ordering::SeqCst) {
             1 => LifecycleState::Booted,
             2 => LifecycleState::Ready,
             3 => LifecycleState::Terminating,
             4 => LifecycleState::Terminated,
+            // Any stray u8 (e.g. 99, 255) falls back to `Created` instead of
+            // pretending to be a real lifecycle state.
             _ => LifecycleState::Created,
         }
     }
 
     pub(crate) fn set(&self, state: LifecycleState) {
-        self.inner.store(state as u8, Ordering::SeqCst);
+        // The type system guarantees only valid variants reach here through
+        // safe code, but guard the stored discriminant anyway so an out-of-range
+        // u8 can never be observed through `state()`.
+        let value = state as u8;
+        if value <= Self::MAX_DISCRIMINANT {
+            self.inner.store(value, Ordering::SeqCst);
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -137,18 +149,30 @@ impl Default for Availability {
 }
 
 impl Availability {
+    /// The highest valid on-disc value for `AvailabilityState` (`Broken = 4`).
+    /// Any discriminant above this is out of range and maps to `Unknown`.
+    const MAX_DISCRIMINANT: u8 = AvailabilityState::Broken as u8;
+
     pub fn state(&self) -> AvailabilityState {
         match self.inner.load(Ordering::SeqCst) {
             1 => AvailabilityState::Live,
             2 => AvailabilityState::Ready,
             3 => AvailabilityState::RefusingTraffic,
             4 => AvailabilityState::Broken,
+            // Any stray u8 (e.g. 99, 255) falls back to `Unknown` instead of
+            // pretending to be a real availability state.
             _ => AvailabilityState::Unknown,
         }
     }
 
     pub fn set(&self, state: AvailabilityState) {
-        self.inner.store(state as u8, Ordering::SeqCst);
+        // The type system guarantees only valid variants reach here through
+        // safe code, but guard the stored discriminant anyway so an out-of-range
+        // u8 can never be observed through `state()`.
+        let value = state as u8;
+        if value <= Self::MAX_DISCRIMINANT {
+            self.inner.store(value, Ordering::SeqCst);
+        }
     }
 
     pub fn is_ready(&self) -> bool {
@@ -336,9 +360,10 @@ where
 {
     /// Create a builder initialized with an [`AppContext`] as Axum state.
     ///
-    /// This is the only way to build a Rume application. Every app carries an
-    /// [`AppContext`] so handlers can access env, config, paths, availability,
-    /// and health checks through [`State`].
+    /// This is the only public way to build a Rume application. `RumeBuilder::new`
+    /// is intentionally `pub(crate)` so `Rume::builder` is the sole entry point.
+    /// Every app carries an [`AppContext`] so handlers can access env, config,
+    /// paths, availability, and health checks through [`State`].
     pub fn builder(ctx: AppContext<E, C>) -> RumeBuilder<E, C> {
         RumeBuilder::new(ctx)
     }
@@ -367,7 +392,11 @@ where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
 {
-    pub fn new(ctx: AppContext<E, C>) -> Self {
+    /// Construct a [`RumeBuilder`] from an [`AppContext`].
+    ///
+    /// Intentionally `pub(crate)`: `Rume::builder` is the only public entry
+    /// point for building a Rume application.
+    pub(crate) fn new(ctx: AppContext<E, C>) -> Self {
         Self {
             ctx,
             router: Router::new(),

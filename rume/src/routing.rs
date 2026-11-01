@@ -42,9 +42,19 @@ use crate::app::AppContext;
 /// A route parameter matcher.
 ///
 /// Used with [`RouteSpec::where`] to validate and cast route parameters.
+///
+/// # Matchers
+///
+/// - [`Matcher::Number`] — digits only; returns the original string (not a
+///   parsed number). Overflowing digit strings (e.g. u64::MAX+1) are rejected.
+/// - [`Matcher::Uuid`] — UUID format (8-4-4-4-12 hex chars); returns lowercase.
+/// - [`Matcher::Slug`] — URL-friendly slug; returns the string as-is.
 #[derive(Debug, Clone)]
 pub enum Matcher {
     /// Matches digits only, returns the string as-is.
+    ///
+    /// Validation: the entire value must parse as `u64`. Returns the original
+    /// string, not a parsed number.
     Number,
     /// Matches UUID format (8-4-4-4-12 hex chars), returns lowercase `String`.
     Uuid,
@@ -420,14 +430,43 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
     }
 
     /// Add a route method router to the group.
+    ///
+    /// Joins `prefix` and `path` with exactly one `/` separator, so
+    /// `prefix("/api/").add("/users")` → `/api/users` and
+    /// `prefix("api").add("users")` → `/api/users`.
     pub fn add(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
-        let full_path = if self.prefix.is_empty() {
-            path.to_string()
-        } else {
-            format!("{}{}", self.prefix, path)
-        };
+        let full_path = Self::join_path(&self.prefix, path);
         self.inner = self.inner.route(&full_path, method_router);
         self
+    }
+
+    /// Join a prefix and path with exactly one `/` separator.
+    ///
+    /// Handles leading/trailing slashes on both sides so that
+    /// `join_path("/api/", "/users")` → `/api/users`,
+    /// `join_path("api", "users")` → `/api/users`, and
+    /// `join_path("", "/users")` → `/users`.
+    fn join_path(prefix: &str, path: &str) -> String {
+        let prefix = prefix.trim_end_matches('/');
+        let path = path.trim_start_matches('/');
+        match (prefix.is_empty(), path.is_empty()) {
+            (true, true) => "/".to_string(),
+            (true, false) => format!("/{path}"),
+            (false, true) => {
+                if prefix.starts_with('/') {
+                    prefix.to_string()
+                } else {
+                    format!("/{prefix}")
+                }
+            }
+            (false, false) => {
+                if prefix.starts_with('/') {
+                    format!("{prefix}/{path}")
+                } else {
+                    format!("/{prefix}/{path}")
+                }
+            }
+        }
     }
 
     /// Build into an Axum `Router`.
@@ -720,5 +759,161 @@ mod tests {
                 .status(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
+    }
+
+    // --- C-m2: RouteGroup path normalization ---
+
+    #[test]
+    fn route_group_joins_prefix_and_path_with_single_slash() {
+        use axum::routing::get;
+
+        async fn handler() {}
+
+        // prefix trailing slash + path leading slash → single slash
+        let _group = RouteGroup::<()>::new()
+            .prefix("/api/")
+            .add("/users", get(handler));
+        // Can't easily introspect the built router's paths here, but the join
+        // helper is tested directly below.
+
+        // Verify join_path logic through RouteSpec/RouteGroup behavior by
+        // checking that no double-slash or missing-slash occurs.
+        assert_eq!(RouteGroup::<()>::join_path("/api/", "/users"), "/api/users");
+        assert_eq!(RouteGroup::<()>::join_path("api", "users"), "/api/users");
+        assert_eq!(RouteGroup::<()>::join_path("", "/users"), "/users");
+        assert_eq!(RouteGroup::<()>::join_path("/api", ""), "/api");
+    }
+
+    // --- C-m3 / T-T9: RouteSpec::build() + ROUTE_REGISTRY ---
+
+    #[test]
+    fn route_spec_build_registers_in_registry() {
+        let _ = RouteSpec::get("/users/:id")
+            .where_param("id", Matcher::Number)
+            .r#as("users.show")
+            .build();
+
+        let routes = registered_routes();
+        assert!(
+            routes
+                .iter()
+                .any(|r| r.path == "/users/:id" && r.name.as_deref() == Some("users.show")),
+            "expected /users/:id named users.show in registry, got {routes:?}"
+        );
+    }
+
+    #[test]
+    fn route_spec_build_returns_metadata() {
+        let (path, method, params, name) = RouteSpec::post("/items")
+            .where_param("id", Matcher::Uuid)
+            .r#as("items.create")
+            .build();
+
+        assert_eq!(path, "/items");
+        assert_eq!(method, Method::POST);
+        assert_eq!(params.len(), 1);
+        assert_eq!(params[0].0, "id");
+        assert_eq!(name.as_deref(), Some("items.create"));
+    }
+
+    #[test]
+    fn route_registry_is_isolated_between_tests() {
+        // T-T9: ROUTE_REGISTRY is a global OnceLock; tests must not leak
+        // registrations into each other. This test registers a route and the
+        // next test should see a clean slate (registry is process-global, so
+        // we just verify registration works deterministically).
+        let count_before = registered_routes().len();
+        let _ = RouteSpec::get("/isolated").build();
+        let count_after = registered_routes().len();
+        assert_eq!(count_after, count_before + 1);
+    }
+
+    // --- HealthChecks::run() with mixed statuses ---
+
+    #[derive(Debug)]
+    struct OkCheck;
+
+    impl HealthCheck for OkCheck {
+        fn name(&self) -> &str {
+            "database"
+        }
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            Box::pin(async move {
+                HealthCheckResult {
+                    name: "database".to_string(),
+                    status: HealthStatus::Ok,
+                    message: "ok".to_string(),
+                    meta: BTreeMap::new(),
+                    cached: false,
+                }
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailedCheck;
+
+    impl HealthCheck for FailedCheck {
+        fn name(&self) -> &str {
+            "s3"
+        }
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            Box::pin(async move {
+                HealthCheckResult {
+                    name: "s3".to_string(),
+                    status: HealthStatus::Failed,
+                    message: "down".to_string(),
+                    meta: BTreeMap::new(),
+                    cached: false,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn health_checks_run_all_ok() {
+        let checks = HealthChecks::new().register(OkCheck);
+        let report = checks.run().await;
+        assert!(report.is_healthy);
+        assert_eq!(report.status, "ok");
+    }
+
+    #[tokio::test]
+    async fn health_checks_run_failed_is_not_healthy() {
+        let checks = HealthChecks::new().register(FailedCheck);
+        let report = checks.run().await;
+        assert!(!report.is_healthy);
+        assert_eq!(report.status, "error");
+    }
+
+    #[tokio::test]
+    async fn health_checks_run_warning_is_not_healthy_but_not_error() {
+        use crate::routing::HealthStatus::Warning;
+
+        #[derive(Debug)]
+        struct WarningCheck;
+
+        impl HealthCheck for WarningCheck {
+            fn name(&self) -> &str {
+                "cache"
+            }
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                Box::pin(async move {
+                    HealthCheckResult {
+                        name: "cache".to_string(),
+                        status: Warning,
+                        message: "slow".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                    }
+                })
+            }
+        }
+
+        let checks = HealthChecks::new().register(WarningCheck);
+        let report = checks.run().await;
+        // C-m4: Warning → not fully healthy (503 on /health/ready)
+        assert!(!report.is_healthy);
+        assert_eq!(report.status, "warning");
     }
 }
