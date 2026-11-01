@@ -48,7 +48,9 @@ Rust surface can ignore or remove it.
 ## Harness wiring
 
 Opencode-only. Rules load via `.opencode/opencode.json` (`instructions`);
-skills under `.opencode/skills/*/SKILL.md` are discovered automatically.
+skills under `.opencode/skills/*/SKILL.md` and commands under
+`.opencode/commands/*.md` are discovered automatically. The harness floor is
+pinned in [`rules/10-tech-stack.md`](rules/10-tech-stack.md).
 
 ## Output
 

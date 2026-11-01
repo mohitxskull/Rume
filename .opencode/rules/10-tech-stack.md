@@ -10,10 +10,11 @@
   and signatures move between minor and prerelease versions.
 - The authoritative pin table lives here or at the path named below; when it
   and reality disagree, fix the pin table in the same change.
-- **Harness floor: opencode v1.18.x.** The `.opencode/` wiring in this template
-  (`opencode.json` `instructions` globs, `skills/` auto-discovery) is verified
-  against opencode v1.18.x. Newer major versions (v2+) need re-verification
-  before adopting.
+- **Harness floor: opencode v2.2.x.** The `.opencode/` wiring
+  (`opencode.json` `instructions` globs and `permissions` rules, `skills/` and
+  `commands/` auto-discovery) is verified against opencode v2.2.5. A new major
+  version needs re-verification before adopting; a minor bump within v2 does
+  not.
 
 ## Stack
 

@@ -1,18 +1,16 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "instructions": [".opencode/AGENTS.md", ".opencode/rules/*.md"],
-  "permission": {
-    "skill": {
-      "*": "allow",
-      "brainstorming": "deny",
-      "using-git-worktrees": "deny",
-      "subagent-driven-development": "deny",
-      "writing-plans": "deny",
-      "executing-plans": "deny",
-      "requesting-code-review": "deny",
-      "finishing-a-development-branch": "deny",
-      "test-driven-development": "deny",
-      "verification-before-completion": "deny"
-    }
-  }
+  "permissions": [
+    { "action": "skill", "resource": "*", "effect": "allow" },
+    { "action": "skill", "resource": "brainstorming", "effect": "deny" },
+    { "action": "skill", "resource": "using-git-worktrees", "effect": "deny" },
+    { "action": "skill", "resource": "subagent-driven-development", "effect": "deny" },
+    { "action": "skill", "resource": "writing-plans", "effect": "deny" },
+    { "action": "skill", "resource": "executing-plans", "effect": "deny" },
+    { "action": "skill", "resource": "requesting-code-review", "effect": "deny" },
+    { "action": "skill", "resource": "finishing-a-development-branch", "effect": "deny" },
+    { "action": "skill", "resource": "test-driven-development", "effect": "deny" },
+    { "action": "skill", "resource": "verification-before-completion", "effect": "deny" }
+  ]
 }
