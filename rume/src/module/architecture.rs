@@ -3,6 +3,7 @@
 //! Provides static verification of module boundaries and dependencies (inspired by ArchUnit and
 //! Spring Modulith), ensuring that forbidden cross-domain calls and architecture violations fail in CI.
 
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
 use crate::module::Module;
@@ -72,20 +73,43 @@ impl ArchitectureRules {
             }
         }
 
-        // 2. Verify forbidden dependencies
+        // 2. Build dependency graph and compute transitive closure
+        let mut dep_graph: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for module in modules {
-            let from_name = module.name();
-            let declared_deps = module.dependencies();
+            dep_graph.insert(module.name(), module.dependencies());
+        }
 
-            for (forbidden_from, forbidden_to) in &self.forbidden_deps {
-                if from_name == forbidden_from && declared_deps.contains(&forbidden_to.as_str()) {
-                    return Err(ArchitectureViolation {
-                        rule: "forbid_dependency".to_string(),
-                        details: format!(
-                            "module '{from_name}' is forbidden from depending on '{forbidden_to}', but declares it as a dependency"
-                        ),
-                    });
+        let mut transitive_deps: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        for module in modules {
+            let mut visited = BTreeSet::new();
+            let mut queue = VecDeque::new();
+            for dep in module.dependencies() {
+                queue.push_back(dep);
+            }
+
+            while let Some(current) = queue.pop_front() {
+                if visited.insert(current)
+                    && let Some(next_deps) = dep_graph.get(current)
+                {
+                    for next in next_deps {
+                        queue.push_back(next);
+                    }
                 }
+            }
+            transitive_deps.insert(module.name(), visited);
+        }
+
+        // 3. Verify forbidden dependencies against direct and transitive dependencies
+        for (forbidden_from, forbidden_to) in &self.forbidden_deps {
+            if let Some(all_deps) = transitive_deps.get(forbidden_from.as_str())
+                && all_deps.contains(forbidden_to.as_str())
+            {
+                return Err(ArchitectureViolation {
+                    rule: "forbid_dependency".to_string(),
+                    details: format!(
+                        "module '{forbidden_from}' is forbidden from depending on '{forbidden_to}', but reaches it as a dependency"
+                    ),
+                });
             }
         }
 

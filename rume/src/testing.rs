@@ -5,10 +5,12 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use tower::ServiceExt;
 
+use std::sync::Mutex;
+
 /// A lightweight test application backed by an Axum router.
 pub struct TestApp {
     router: Router<()>,
-    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+    cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl TestApp {
@@ -16,19 +18,31 @@ impl TestApp {
     pub fn new(router: impl Into<Router<()>>) -> Self {
         Self {
             router: router.into(),
-            cleanup: None,
+            cleanup: Mutex::new(None),
         }
     }
 
     /// Create a test app with a cleanup hook for DB-backed tests.
     pub fn with_cleanup(
         router: impl Into<Router<()>>,
-        cleanup: impl FnOnce() + Send + Sync + 'static,
+        cleanup: impl FnOnce() + Send + 'static,
     ) -> Self {
         Self {
             router: router.into(),
-            cleanup: Some(Box::new(cleanup)),
+            cleanup: Mutex::new(Some(Box::new(cleanup))),
         }
+    }
+
+    /// Builds a test app from a [`crate::app::builder::RumeBuilder`], executing module startup hooks and attaching lifecycle teardown.
+    pub async fn from_builder<E, C, S>(
+        builder: crate::app::builder::RumeBuilder<E, C, S>,
+    ) -> Result<Self, crate::app::builder::BuildError>
+    where
+        E: Clone + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        builder.build_test_app().await
     }
 
     /// Issue a GET request.
@@ -78,16 +92,29 @@ impl TestApp {
     }
 
     /// Run teardown explicitly.
-    pub fn teardown(mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
+    pub fn teardown(self) {
+        if let Ok(mut lock) = self.cleanup.lock()
+            && let Some(cleanup) = lock.take()
+        {
             cleanup();
         }
     }
 }
 
+impl std::fmt::Debug for TestApp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let has_cleanup = self.cleanup.lock().map(|l| l.is_some()).unwrap_or(false);
+        f.debug_struct("TestApp")
+            .field("has_cleanup", &has_cleanup)
+            .finish()
+    }
+}
+
 impl Drop for TestApp {
     fn drop(&mut self) {
-        if let Some(cleanup) = self.cleanup.take() {
+        if let Ok(mut lock) = self.cleanup.lock()
+            && let Some(cleanup) = lock.take()
+        {
             cleanup();
         }
     }
@@ -97,7 +124,7 @@ impl Drop for TestApp {
 pub struct TestAppBuilder<S> {
     state: S,
     router: Router<S>,
-    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
+    cleanup: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl<S> TestAppBuilder<S>
@@ -123,7 +150,7 @@ where
     }
 
     /// Register a cleanup hook for DB-backed tests.
-    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
+    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
         self.cleanup = Some(Box::new(cleanup));
         self
     }
@@ -131,7 +158,10 @@ where
     pub async fn build(self) -> TestApp {
         let cleanup = self.cleanup;
         let router = self.router.with_state(self.state);
-        TestApp { router, cleanup }
+        TestApp {
+            router,
+            cleanup: Mutex::new(cleanup),
+        }
     }
 }
 

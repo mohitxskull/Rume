@@ -79,6 +79,10 @@ pub enum BuildError {
     Middleware(MiddlewareConfigError),
     /// Module registration or dependency error.
     Module(crate::module::ModuleError),
+    /// Application or module startup hook failure.
+    Startup(String),
+    /// Duplicate route collision across modules or application routes.
+    DuplicateRoute { method: String, path: String },
 }
 
 impl std::fmt::Display for BuildError {
@@ -86,6 +90,10 @@ impl std::fmt::Display for BuildError {
         match self {
             Self::Middleware(err) => write!(f, "{err}"),
             Self::Module(err) => write!(f, "{err}"),
+            Self::Startup(msg) => write!(f, "startup failure: {msg}"),
+            Self::DuplicateRoute { method, path } => {
+                write!(f, "duplicate route collision for {method} {path}")
+            }
         }
     }
 }
@@ -542,6 +550,143 @@ where
         Ok(crate::testing::TestApp::new(app_router.with_state(ctx)))
     }
 
+    /// Asynchronously builds the application and returns a [`crate::testing::TestApp`]
+    /// after executing all module `on_start` lifecycle hooks and `on_ready` hooks in topological order.
+    ///
+    /// Automatically attaches an explicit teardown hook to [`crate::testing::TestApp`] that executes
+    /// module `on_shutdown` hooks in reverse topological order upon teardown or drop.
+    pub async fn build_test_app(mut self) -> Result<crate::testing::TestApp, BuildError> {
+        let mut module_registry = crate::module::ModuleRegistry::new();
+        for m in &self.modules {
+            module_registry.register(Arc::clone(m))?;
+        }
+        let startup_modules = module_registry.resolve_startup_modules()?;
+        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
+
+        let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
+        let shutdown_timeout = self.shutdown_timeout;
+        let ctx = self.ctx.clone();
+
+        let app_router = self.build_router(ctx.clone())?;
+
+        // 1. Booted & Live
+        ctx.lifecycle.set(crate::app::state::LifecycleState::Booted);
+        ctx.availability
+            .set(crate::app::state::AvailabilityState::Live);
+
+        // 2. Run module on_start hooks in topological order with rollback
+        let mut started_modules: Vec<Arc<dyn crate::module::Module>> = Vec::new();
+        for m in startup_modules {
+            let mod_ctx = crate::module::ModuleContext::new(
+                m.name(),
+                ctx.paths.clone(),
+                ctx.availability.clone(),
+                ctx.lifecycle.clone(),
+            );
+            if let Err(err) = m.on_start(&mod_ctx).await {
+                ctx.lifecycle
+                    .set(crate::app::state::LifecycleState::Terminating);
+                ctx.availability
+                    .set(crate::app::state::AvailabilityState::Broken);
+
+                started_modules.reverse();
+                let cleanup_ctx = ctx.clone();
+                for sm in started_modules {
+                    let sm_ctx = crate::module::ModuleContext::new(
+                        sm.name(),
+                        cleanup_ctx.paths.clone(),
+                        cleanup_ctx.availability.clone(),
+                        cleanup_ctx.lifecycle.clone(),
+                    );
+                    sm.on_shutdown(&sm_ctx).await;
+                }
+                ctx.lifecycle
+                    .set(crate::app::state::LifecycleState::Terminated);
+                return Err(BuildError::Startup(format!(
+                    "module '{}' failed to start: {err}",
+                    m.name()
+                )));
+            }
+            started_modules.push(m);
+        }
+
+        // 3. Application on_ready hooks
+        for hook in on_ready {
+            if let Err(err) = hook(ctx.clone()).await {
+                ctx.lifecycle
+                    .set(crate::app::state::LifecycleState::Terminating);
+                ctx.availability
+                    .set(crate::app::state::AvailabilityState::Broken);
+
+                started_modules.reverse();
+                let cleanup_ctx = ctx.clone();
+                for sm in started_modules {
+                    let sm_ctx = crate::module::ModuleContext::new(
+                        sm.name(),
+                        cleanup_ctx.paths.clone(),
+                        cleanup_ctx.availability.clone(),
+                        cleanup_ctx.lifecycle.clone(),
+                    );
+                    sm.on_shutdown(&sm_ctx).await;
+                }
+                ctx.lifecycle
+                    .set(crate::app::state::LifecycleState::Terminated);
+                return Err(BuildError::Startup(format!("startup hook failed: {err}")));
+            }
+        }
+
+        ctx.lifecycle.set(crate::app::state::LifecycleState::Ready);
+        ctx.availability
+            .set(crate::app::state::AvailabilityState::Ready);
+
+        // 4. Attach teardown closure
+        let cleanup_ctx = ctx.clone();
+        let cleanup = Box::new(move || {
+            let shutdown_future = async move {
+                cleanup_ctx
+                    .lifecycle
+                    .set(crate::app::state::LifecycleState::Terminating);
+                cleanup_ctx
+                    .availability
+                    .set(crate::app::state::AvailabilityState::RefusingTraffic);
+
+                for m in shutdown_modules {
+                    let sm_ctx = crate::module::ModuleContext::new(
+                        m.name(),
+                        cleanup_ctx.paths.clone(),
+                        cleanup_ctx.availability.clone(),
+                        cleanup_ctx.lifecycle.clone(),
+                    );
+                    m.on_shutdown(&sm_ctx).await;
+                }
+                for hook in on_shutdown {
+                    let _ = hook(cleanup_ctx.clone()).await;
+                }
+                cleanup_ctx
+                    .lifecycle
+                    .set(crate::app::state::LifecycleState::Terminated);
+            };
+
+            let _ = std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(async {
+                        let _ = tokio::time::timeout(shutdown_timeout, shutdown_future).await;
+                    });
+                }
+            })
+            .join();
+        });
+
+        Ok(crate::testing::TestApp::with_cleanup(
+            app_router.with_state(ctx),
+            cleanup,
+        ))
+    }
+
     /// Add a route to the application.
     ///
     /// The route is mounted on the router but not recorded in the route
@@ -780,12 +925,30 @@ where
         }
         let startup_modules = module_registry.resolve_startup_modules()?;
 
-        let mut module_router = crate::routing::Router::new();
+        let mut module_axum = axum::Router::new();
+        let mut module_routes = crate::routing::RouteRegistry::new();
+        let mut seen_routes = HashSet::new();
+        for r in route_registry.routes() {
+            seen_routes.insert((r.method.to_string(), r.path.clone()));
+        }
+
         for m in &startup_modules {
-            module_router = m.register_routes(module_router);
+            let single_mod_router = m.register_routes(crate::routing::Router::new());
+            let (axum_r, routes) = single_mod_router.into_parts();
+            for r in routes.routes() {
+                let key = (r.method.to_string(), r.path.clone());
+                if !seen_routes.insert(key) {
+                    return Err(BuildError::DuplicateRoute {
+                        method: r.method.to_string(),
+                        path: r.path.clone(),
+                    });
+                }
+            }
+            module_axum = module_axum.merge(axum_r);
+            module_routes.extend(routes);
             m.register_health_checks(&mut ctx.health_checks);
         }
-        let (module_axum, module_routes) = module_router.into_parts();
+
         let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
         let router = router.merge(adapted);
         route_registry.extend(module_routes);

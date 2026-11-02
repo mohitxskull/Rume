@@ -164,7 +164,10 @@ async fn concurrent_relays_claim_disjoint_batches() {
     // Confirm disjoint set of IDs
     let set1: std::collections::HashSet<_> = batch1.iter().map(|m| &m.id).collect();
     for msg in &batch2 {
-        assert!(!set1.contains(&msg.id), "batch2 must not contain message already claimed by batch1");
+        assert!(
+            !set1.contains(&msg.id),
+            "batch2 must not contain message already claimed by batch1"
+        );
     }
 
     // Nothing pending left to claim

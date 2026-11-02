@@ -134,8 +134,9 @@ async fn test_worker_idempotency_deduplication() {
 
     let idempotency_store = std::sync::Arc::new(MemoryIdempotencyStore::new());
 
-    let worker = rume::jobs::JobWorker::new(std::sync::Arc::clone(&queue), std::sync::Arc::new(registry))
-        .with_idempotency_store(idempotency_store);
+    let worker =
+        rume::jobs::JobWorker::new(std::sync::Arc::clone(&queue), std::sync::Arc::new(registry))
+            .with_idempotency_store(idempotency_store);
     worker.start();
 
     // Enqueue job with same idempotency key twice
@@ -148,7 +149,10 @@ async fn test_worker_idempotency_deduplication() {
         .unwrap();
 
     sleep(Duration::from_millis(50)).await;
-    assert_eq!(executed_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        executed_counter.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
     // Enqueue second job with identical idempotency key
     queue
@@ -161,7 +165,10 @@ async fn test_worker_idempotency_deduplication() {
 
     sleep(Duration::from_millis(50)).await;
     // Execution count must remain 1!
-    assert_eq!(executed_counter.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        executed_counter.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
 
     let _ = worker.drain(Duration::from_millis(100)).await;
 }
@@ -175,7 +182,11 @@ async fn test_worker_heartbeat_and_abandoned_job_recovery() {
     // Worker 1 starts with heartbeat and abandoned recovery
     let worker1 = rume::jobs::JobWorker::new(Arc::clone(&queue), registry)
         .with_worker_id("worker-active-1")
-        .with_heartbeat(Arc::clone(&heartbeats), Duration::from_millis(40), Duration::from_millis(10))
+        .with_heartbeat(
+            Arc::clone(&heartbeats),
+            Duration::from_millis(40),
+            Duration::from_millis(10),
+        )
         .with_abandoned_recovery(Duration::from_millis(20));
     worker1.start();
 

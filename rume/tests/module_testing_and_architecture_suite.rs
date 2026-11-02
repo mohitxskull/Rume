@@ -131,3 +131,102 @@ fn architecture_rules_enforce_forbidden_cross_domain_calls() {
             .contains("required module 'inventory' is missing")
     );
 }
+
+struct PaymentsModule {
+    deps: Vec<&'static str>,
+}
+
+impl Module for PaymentsModule {
+    fn name(&self) -> &'static str {
+        "payments"
+    }
+
+    fn dependencies(&self) -> Vec<&'static str> {
+        self.deps.clone()
+    }
+}
+
+#[test]
+fn architecture_rules_enforce_transitive_dependencies() {
+    // A (billing) -> B (payments) -> C (frontend)
+    let frontend = FrontendModule;
+    let payments = PaymentsModule {
+        deps: vec!["frontend"],
+    };
+    let billing = BillingModule {
+        deps: vec!["payments"],
+    };
+
+    let rules = ArchitectureRules::new().forbid_dependency("billing", "frontend");
+
+    let modules: Vec<&dyn Module> = vec![&billing, &payments, &frontend];
+    let err = rules.verify(&modules).unwrap_err();
+    assert_eq!(err.rule, "forbid_dependency");
+    assert!(err.details.contains(
+        "module 'billing' is forbidden from depending on 'frontend', but reaches it as a dependency"
+    ));
+}
+
+struct CollisionModuleA;
+impl Module for CollisionModuleA {
+    fn name(&self) -> &'static str {
+        "mod_a"
+    }
+    fn register_routes(&self, router: Router) -> Router {
+        router.get("/conflict", || async { "A" })
+    }
+}
+
+struct CollisionModuleB;
+impl Module for CollisionModuleB {
+    fn name(&self) -> &'static str {
+        "mod_b"
+    }
+    fn register_routes(&self, router: Router) -> Router {
+        router.get("/conflict", || async { "B" })
+    }
+}
+
+#[tokio::test]
+async fn route_merge_collision_fails_preflight_without_panic() {
+    let builder = Rume::new()
+        .module(CollisionModuleA)
+        .module(CollisionModuleB);
+
+    let res = builder.build_test_app().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(
+        err,
+        rume::app::builder::BuildError::DuplicateRoute { ref path, .. } if path == "/conflict"
+    ));
+}
+
+#[tokio::test]
+async fn test_app_from_builder_executes_module_lifecycle() {
+    let started = Arc::new(AtomicBool::new(false));
+    let shutdown = Arc::new(AtomicBool::new(false));
+
+    let module = UsersModule {
+        started: Arc::clone(&started),
+        shutdown: Arc::clone(&shutdown),
+    };
+
+    let builder = Rume::new().module(module);
+    let app = TestApp::from_builder(builder)
+        .await
+        .expect("test app build");
+
+    // on_start hook has already run during build_test_app!
+    assert!(started.load(Ordering::SeqCst));
+    assert!(!shutdown.load(Ordering::SeqCst));
+
+    // Routes work through test app
+    let res = app.get("/users/me").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(TestApp::body_text(res).await, "current_user");
+
+    // Teardown executes on_shutdown hook cleanly
+    app.teardown();
+    assert!(shutdown.load(Ordering::SeqCst));
+}

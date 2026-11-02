@@ -87,11 +87,11 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group G — Architecture Enforcement & Module Lifecycle (solve together)
 > Root cause: Shallow graph checks and panicking route merges.
 
-- [ ] **Architecture M2 / Testing M2 — `ArchitectureRules::verify` only inspects direct 1-hop dependencies** (`architecture.md` M2, `testing.md` M2).
+- [x] **Architecture M2 / Testing M2 — `ArchitectureRules::verify` only inspects direct 1-hop dependencies** (`architecture.md` M2, `testing.md` M2).
       `rume/src/module/architecture.rs:65–85`: Rules check `declared.contains(&dep)` for immediate dependencies only, missing transitive forbidden cross-domain calls. Compute transitive closure when verifying module boundaries.
-- [ ] **Architecture M3 — Route merge collisions trigger unhandled runtime panics instead of preflight errors** (`architecture.md` M3).
+- [x] **Architecture M3 — Route merge collisions trigger unhandled runtime panics instead of preflight errors** (`architecture.md` M3).
       `rume/src/module/lifecycle.rs:70–85`: Axum's `.merge()` panics on duplicate route paths at runtime. Pre-validate route path uniqueness across modules in `RumeBuilder::build()`.
-- [ ] **Testing M4 — `TestApp` bypasses module lifecycle hooks** (`testing.md` M4).
+- [x] **Testing M4 — `TestApp` bypasses module lifecycle hooks** (`testing.md` M4).
       `rume/src/testing.rs:15–35`: `TestApp::new(router)` takes a pre-built router and never triggers `module.on_start()` or `module.on_shutdown()`. Add `TestApp::from_builder(builder)` to run the module lifecycle in memory.
 
 ### Group H — Security & Persistence Hardening (solve together)

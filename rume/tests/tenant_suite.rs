@@ -268,13 +268,29 @@ async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
 
     // Tenant 1 sets item with tag "catalog"
     scoped_cache
-        .set_with_tags("t1", "p1", &Product { name: "T1 Item".into() }, &["catalog"], None)
+        .set_with_tags(
+            "t1",
+            "p1",
+            &Product {
+                name: "T1 Item".into(),
+            },
+            &["catalog"],
+            None,
+        )
         .await
         .unwrap();
 
     // Tenant 2 sets item with identical tag name "catalog"
     scoped_cache
-        .set_with_tags("t2", "p1", &Product { name: "T2 Item".into() }, &["catalog"], None)
+        .set_with_tags(
+            "t2",
+            "p1",
+            &Product {
+                name: "T2 Item".into(),
+            },
+            &["catalog"],
+            None,
+        )
         .await
         .unwrap();
 
@@ -296,5 +312,8 @@ async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
 
     // 3rd key exceeds quota of 2
     let err = scoped_cache.set("t1", "k3", &"val3", None).await;
-    assert!(matches!(err, Err(rume::cache::CacheError::QuotaExceeded(_))));
+    assert!(matches!(
+        err,
+        Err(rume::cache::CacheError::QuotaExceeded(_))
+    ));
 }
