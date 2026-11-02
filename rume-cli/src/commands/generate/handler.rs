@@ -62,7 +62,7 @@ pub async fn index() -> Json<{struct_name}Response> {{
     match fs::read_to_string(routes_path) {
         Ok(existing) => {
             let route_line = format!(
-                "    router = router.route(\"/{name}\", axum::routing::get(crate::handlers::{module_name}::index));\n",
+                "    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n",
                 name = name,
                 module_name = module_name
             );

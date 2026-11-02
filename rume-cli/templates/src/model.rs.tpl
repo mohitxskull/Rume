@@ -1,6 +1,6 @@
-use rume::serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct {{Name}} {
     pub id: i64,
 }

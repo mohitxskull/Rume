@@ -33,7 +33,11 @@ pub fn run(cli: Cli) {
     VERBOSE.store(cli.verbose, Ordering::Relaxed);
 
     match cli.command {
-        Some(Commands::New { name }) => {
+        Some(Commands::New {
+            name,
+            path,
+            version,
+        }) => {
             let name = match name {
                 Some(n) => n,
                 None => crate::prompts::ask("project name"),
@@ -42,7 +46,7 @@ pub fn run(cli: Cli) {
                 eprintln!("error: project name is required");
                 std::process::exit(1);
             }
-            new::run(&name);
+            new::run(&name, path.as_deref(), version.as_deref());
         }
         Some(Commands::Env { command }) => {
             require_rume_project();

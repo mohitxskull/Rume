@@ -20,12 +20,12 @@ pub fn run(name: &str) {
 use axum::extract::Path;
 use serde::{{Deserialize, Serialize}};
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct {struct_name}CreateRequest {{
     pub message: Option<String>,
 }}
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct {struct_name}UpdateRequest {{
     pub message: Option<String>,
 }}
@@ -66,14 +66,14 @@ pub async fn show(Path(id): Path<String>) -> Json<{struct_name}ShowResponse> {{
 }}
 
 pub async fn create(
-    Json({struct_name}CreateRequest): Json<{struct_name}CreateRequest>,
+    Json(_payload): Json<{struct_name}CreateRequest>,
 ) -> Json<{struct_name}CreateResponse> {{
     Json({struct_name}CreateResponse {{ message: "created" }})
 }}
 
 pub async fn update(
     Path(id): Path<String>,
-    Json({struct_name}UpdateRequest): Json<{struct_name}UpdateRequest>,
+    Json(_payload): Json<{struct_name}UpdateRequest>,
 ) -> Json<{struct_name}UpdateResponse> {{
     Json({struct_name}UpdateResponse {{
         message: format!("update {{id}}")
@@ -121,27 +121,27 @@ pub async fn destroy(Path(id): Path<String>) -> Json<{struct_name}DestroyRespons
     let routes_path = "src/routes.rs";
     let route_lines = [
         format!(
-            "    router = router.route(\"/{name}\", axum::routing::get(crate::handlers::{module_name}::index));\n",
+            "    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n",
             name = name,
             module_name = module_name
         ),
         format!(
-            "    router = router.route(\"/{name}/{{id}}\", axum::routing::get(crate::handlers::{module_name}::show));\n",
+            "    router = router.get(\"/{name}/{{id}}\", crate::handlers::{module_name}::show);\n",
             name = name,
             module_name = module_name
         ),
         format!(
-            "    router = router.route(\"/{name}\", axum::routing::post(crate::handlers::{module_name}::create));\n",
+            "    router = router.post(\"/{name}\", crate::handlers::{module_name}::create);\n",
             name = name,
             module_name = module_name
         ),
         format!(
-            "    router = router.route(\"/{name}/{{id}}\", axum::routing::put(crate::handlers::{module_name}::update));\n",
+            "    router = router.put(\"/{name}/{{id}}\", crate::handlers::{module_name}::update);\n",
             name = name,
             module_name = module_name
         ),
         format!(
-            "    router = router.route(\"/{name}/{{id}}\", axum::routing::delete(crate::handlers::{module_name}::destroy));\n",
+            "    router = router.delete(\"/{name}/{{id}}\", crate::handlers::{module_name}::destroy);\n",
             name = name,
             module_name = module_name
         ),

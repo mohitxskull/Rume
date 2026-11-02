@@ -138,6 +138,9 @@ pub fn run(format: &str) {
                 "{}",
                 serde_json::to_string_pretty(&output).unwrap_or_default()
             );
+            if !ok {
+                std::process::exit(1);
+            }
         }
         _ => {
             println!("Rume doctor");

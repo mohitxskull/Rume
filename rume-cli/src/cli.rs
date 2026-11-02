@@ -16,7 +16,16 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Scaffold a new Rume project.
-    New { name: Option<String> },
+    New {
+        /// Project name.
+        name: Option<String>,
+        /// Path to local Rume framework crate (for local development or testing).
+        #[arg(long)]
+        path: Option<String>,
+        /// Rume version to depend on (defaults to CLI version).
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Inspect and validate environment/configuration.
     Env {
         #[command(subcommand)]
@@ -34,6 +43,7 @@ pub enum Commands {
         format: String,
     },
     /// List registered routes.
+    #[command(name = "list:routes", alias = "list-routes")]
     ListRoutes {
         /// Output routes as JSON.
         #[arg(long)]

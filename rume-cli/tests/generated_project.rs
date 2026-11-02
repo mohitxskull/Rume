@@ -1,20 +1,23 @@
-//! Integration test: verify that `rume new` generates a project that
-//! compiles and whose tests pass, and that supported generators produce
-//! compilable code.
+//! Integration test: verify that `rume new` generates a portable project,
+//! local development path overrides work, all generators produce compilable code,
+//! conflict detection prevents overwriting, and CLI inspection commands return
+//! valid machine-readable JSON.
 //!
-//! This is the CI quality gate for generated code: a scaffold that does not
-//! compile is a defect. The test must never silently pass.
+//! This is the CI quality gate for Milestone 2: a scaffold or generator that
+//! does not compile or produce valid outputs is a defect.
 
+use std::fs;
 use std::process::Command;
-
 use tempfile::TempDir;
 
 fn rume_binary() -> String {
-    // CARGO_BIN_EXE_rume is set by cargo test for integration tests and
-    // points directly at the built `rume` binary.
     std::env::var("CARGO_BIN_EXE_rume").expect(
         "CARGO_BIN_EXE_rume is not set — the `rume` binary must be built before running this test",
     )
+}
+
+fn framework_path() -> &'static str {
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../rume")
 }
 
 fn run_command(cmd: &mut Command) -> bool {
@@ -23,36 +26,68 @@ fn run_command(cmd: &mut Command) -> bool {
 }
 
 #[test]
-fn generated_project_compiles_and_tests_pass() {
+fn new_project_defaults_to_portable_dependency() {
+    let tmp_dir = TempDir::new().expect("failed to create temp directory");
+    let project_name = "portable-project";
+
+    // Run `rume new <name>` without path override
+    let status = Command::new(rume_binary())
+        .arg("new")
+        .arg(project_name)
+        .current_dir(tmp_dir.path())
+        .status()
+        .expect("failed to run `rume new`");
+    assert!(status.success(), "`rume new` should succeed");
+
+    let cargo_toml_path = tmp_dir.path().join(project_name).join("Cargo.toml");
+    let content = fs::read_to_string(&cargo_toml_path).expect("read generated Cargo.toml");
+
+    // Must depend on published version without local path
+    assert!(
+        content.contains("rume = \"0.1.0\""),
+        "Generated Cargo.toml should contain portable version dependency, got:\n{content}"
+    );
+    assert!(
+        !content.contains("path ="),
+        "Generated Cargo.toml should not contain path dependency in portable mode"
+    );
+}
+
+#[test]
+fn generated_project_compiles_and_tests_pass_with_all_generators() {
     let project_name = "rume-test-project";
     let tmp_dir = TempDir::new().expect("failed to create temp directory");
     let project_path = tmp_dir.path().join(project_name);
 
-    // 1. Run `rume new <name>`
-    let new_result = Command::new(rume_binary())
+    // 1. Run `rume new <name> --path <framework_path>`
+    let status = Command::new(rume_binary())
         .arg("new")
         .arg(project_name)
+        .arg("--path")
+        .arg(framework_path())
         .current_dir(tmp_dir.path())
-        .status();
-    let new_ok = match new_result {
-        Ok(s) => s.success(),
-        Err(err) => panic!("could not run `rume new`: {err}"),
-    };
-    assert!(new_ok, "`rume new {project_name}` should succeed");
+        .status()
+        .expect("could not run `rume new`");
+    assert!(status.success(), "`rume new {project_name}` should succeed");
 
-    // 2. Run `cargo fmt --check` in the project dir
+    // Verify local development path override was injected into Cargo.toml
+    let cargo_toml = fs::read_to_string(project_path.join("Cargo.toml"))
+        .expect("read generated Cargo.toml");
+    assert!(
+        cargo_toml.contains("path ="),
+        "Cargo.toml must contain path override"
+    );
+
+    // 2. Run `cargo fmt --check` in the generated project
     let fmt_ok = run_command(
         Command::new("cargo")
             .arg("fmt")
             .arg("--check")
             .current_dir(&project_path),
     );
-    assert!(
-        fmt_ok,
-        "`cargo fmt --check` should pass in generated project"
-    );
+    assert!(fmt_ok, "`cargo fmt --check` should pass in generated project");
 
-    // 3. Run `cargo check` in the project dir
+    // 3. Run `cargo check` in the generated project
     let check_ok = run_command(
         Command::new("cargo")
             .arg("check")
@@ -60,15 +95,22 @@ fn generated_project_compiles_and_tests_pass() {
     );
     assert!(check_ok, "`cargo check` should pass in generated project");
 
-    // 4. Run `cargo test` in the project dir
-    let test_ok = run_command(Command::new("cargo").arg("test").current_dir(&project_path));
+    // 4. Run `cargo test` in the generated project
+    let test_ok = run_command(
+        Command::new("cargo")
+            .arg("test")
+            .current_dir(&project_path),
+    );
     assert!(test_ok, "`cargo test` should pass in generated project");
 
-    // 5. Exercise generators — generated code must also compile and test clean
+    // 5. Exercise ALL supported generators:
+    //    handler, resource, middleware, model, service
     for (kind, name) in [
-        ("handler", "users"),
-        ("resource", "posts"),
+        ("handler", "comments"),
+        ("resource", "articles"),
         ("middleware", "auth"),
+        ("model", "user"),
+        ("service", "billing"),
     ] {
         let gen_ok = run_command(
             Command::new(rume_binary())
@@ -83,18 +125,146 @@ fn generated_project_compiles_and_tests_pass() {
         );
     }
 
-    let check_ok = run_command(
+    // 6. Verify conflict detection (C4): generating an existing component fails safely
+    let duplicate_status = Command::new(rume_binary())
+        .arg("generate")
+        .arg("model")
+        .arg("user")
+        .current_dir(&project_path)
+        .status()
+        .expect("run duplicate generate");
+    assert!(
+        !duplicate_status.success(),
+        "Generating existing model should fail with conflict error"
+    );
+
+    // 7. Check that all generated components compile cleanly with no errors
+    let check_after_gen = run_command(
         Command::new("cargo")
             .arg("check")
             .current_dir(&project_path),
     );
     assert!(
-        check_ok,
-        "`cargo check` should pass after running generators"
+        check_after_gen,
+        "`cargo check` should pass after running all generators"
     );
 
-    let test_ok = run_command(Command::new("cargo").arg("test").current_dir(&project_path));
-    assert!(test_ok, "`cargo test` should pass after running generators");
+    // 8. Run tests in the generated project after running all generators
+    let test_after_gen = run_command(
+        Command::new("cargo")
+            .arg("test")
+            .current_dir(&project_path),
+    );
+    assert!(
+        test_after_gen,
+        "`cargo test` should pass after running all generators"
+    );
 
-    // TempDir is dropped automatically when it goes out of scope.
+    // 9. Verify CLI Command Contracts & JSON output (C5):
+    //    a. `rume list:routes --json`
+    let list_routes_output = Command::new(rume_binary())
+        .arg("list:routes")
+        .arg("--json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute list:routes --json");
+    if !list_routes_output.status.success() {
+        panic!(
+            "`rume list:routes --json` failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&list_routes_output.stdout),
+            String::from_utf8_lossy(&list_routes_output.stderr)
+        );
+    }
+    let routes_json = String::from_utf8_lossy(&list_routes_output.stdout);
+    let parsed_routes: serde_json::Value =
+        serde_json::from_str(&routes_json).expect("list:routes --json must return valid JSON");
+    assert!(
+        parsed_routes.is_array(),
+        "list:routes JSON output must be an array"
+    );
+    let routes_arr = parsed_routes.as_array().unwrap();
+    // Check that generated routes are present in the runtime route registry
+    let paths: Vec<&str> = routes_arr
+        .iter()
+        .filter_map(|r| r.get("path").and_then(|p| p.as_str()))
+        .collect();
+    assert!(
+        paths.contains(&"/comments"),
+        "Route registry must contain /comments from handler generator"
+    );
+    assert!(
+        paths.contains(&"/articles"),
+        "Route registry must contain /articles from resource generator"
+    );
+
+    //    b. `rume doctor --format json`
+    let doctor_output = Command::new(rume_binary())
+        .arg("doctor")
+        .arg("--format")
+        .arg("json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute doctor --format json");
+    if !doctor_output.status.success() {
+        panic!(
+            "`rume doctor --format json` failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&doctor_output.stdout),
+            String::from_utf8_lossy(&doctor_output.stderr)
+        );
+    }
+    let doctor_json = String::from_utf8_lossy(&doctor_output.stdout);
+    let parsed_doctor: serde_json::Value =
+        serde_json::from_str(&doctor_json).expect("doctor JSON must be valid");
+    assert!(
+        parsed_doctor.get("checks").is_some(),
+        "doctor JSON must have 'checks' field"
+    );
+
+    //    c. `rume env check --format json`
+    let env_output = Command::new(rume_binary())
+        .arg("env")
+        .arg("check")
+        .arg("--format")
+        .arg("json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute env check --format json");
+    if !env_output.status.success() {
+        panic!(
+            "`rume env check --format json` failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&env_output.stdout),
+            String::from_utf8_lossy(&env_output.stderr)
+        );
+    }
+    let env_json = String::from_utf8_lossy(&env_output.stdout);
+    let parsed_env: serde_json::Value =
+        serde_json::from_str(&env_json).expect("env check JSON must be valid");
+    assert!(
+        parsed_env.get("resolved").is_some(),
+        "env check JSON must have 'resolved' field"
+    );
+
+    //    d. `rume config check --format json`
+    let config_output = Command::new(rume_binary())
+        .arg("config")
+        .arg("check")
+        .arg("--format")
+        .arg("json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute config check --format json");
+    if !config_output.status.success() {
+        panic!(
+            "`rume config check --format json` failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&config_output.stdout),
+            String::from_utf8_lossy(&config_output.stderr)
+        );
+    }
+    let config_json = String::from_utf8_lossy(&config_output.stdout);
+    let parsed_config: serde_json::Value =
+        serde_json::from_str(&config_json).expect("config check JSON must be valid");
+    assert!(
+        parsed_config.get("config").is_some(),
+        "config check JSON must have 'config' field"
+    );
 }

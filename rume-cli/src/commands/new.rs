@@ -1,10 +1,6 @@
 use std::fs;
 use std::path::Path;
 
-// Resolved at compile time so generated projects build against this checkout
-// during pre-v1 development. Switch to a crates.io version before publishing.
-const FRAMEWORK_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../rume");
-
 #[derive(Debug)]
 pub enum NewError {
     InvalidName(String),
@@ -29,9 +25,31 @@ impl std::fmt::Display for NewError {
 
 impl std::error::Error for NewError {}
 
+pub fn resolve_rume_dependency(
+    path_override: Option<&str>,
+    version_override: Option<&str>,
+) -> (String, Option<String>) {
+    let version = version_override.unwrap_or(env!("CARGO_PKG_VERSION"));
+    let path = path_override
+        .map(String::from)
+        .or_else(|| std::env::var("RUME_DEV_PATH").ok())
+        .or_else(|| std::env::var("RUME_FRAMEWORK_PATH").ok());
+
+    match path {
+        Some(p) => {
+            let dep = format!("rume = {{ version = \"{version}\", path = \"{p}\" }}");
+            (dep, Some(p))
+        }
+        None => {
+            let dep = format!("rume = \"{version}\"");
+            (dep, None)
+        }
+    }
+}
+
 struct TemplateContext<'a> {
     name: &'a str,
-    framework_path: &'a str,
+    rume_dependency: &'a str,
 }
 
 const TEMPLATES: &[(&str, &str)] = &[
@@ -74,8 +92,10 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("README.md", include_str!("../../templates/README.md.tpl")),
 ];
 
-pub fn run(name: &str) {
-    if let Err(err) = run_inner(name) {
+pub fn run(name: &str, path_override: Option<&str>, version_override: Option<&str>) {
+    let (rume_dep, resolved_path) = resolve_rume_dependency(path_override, version_override);
+
+    if let Err(err) = run_inner(name, &rume_dep) {
         eprintln!("error: {err}");
         // `run_inner` already removed any directory this command created.
         // An `AlreadyExists` error means the directory pre-existed and must
@@ -100,21 +120,24 @@ pub fn run(name: &str) {
     instructions.add("rume doctor            # validate project setup");
     instructions.add("rume --help            # see all commands");
     instructions.render();
-    instructions.render();
 
-    // D-m3: warn about the local-path rume dependency.
-    // Pre-v1, new projects scaffold against this checkout via a path dep.
-    // Users must switch to a crates.io pin before publishing.
     println!();
-    eprintln!(
-        "note: this project depends on rume via a local path ({}). \
-         Before publishing or depending on crates.io, update Cargo.toml to pin \
-         a released rume version.",
-        FRAMEWORK_PATH
-    );
+    match resolved_path {
+        Some(path) => {
+            eprintln!(
+                "note: this project depends on rume via a local path ({path}). \
+                 Before publishing or depending on crates.io, update Cargo.toml to pin \
+                 a released rume version."
+            );
+        }
+        None => {
+            let version = version_override.unwrap_or(env!("CARGO_PKG_VERSION"));
+            eprintln!("note: this project depends on published rume version {version}.");
+        }
+    }
 }
 
-fn run_inner(name: &str) -> Result<(), NewError> {
+fn run_inner(name: &str, rume_dependency: &str) -> Result<(), NewError> {
     validate_name(name)?;
 
     let root = Path::new(name);
@@ -134,7 +157,7 @@ fn run_inner(name: &str) -> Result<(), NewError> {
 
         let context = TemplateContext {
             name,
-            framework_path: FRAMEWORK_PATH,
+            rume_dependency,
         };
 
         for (relative_path, template) in TEMPLATES {
@@ -171,7 +194,7 @@ fn validate_name(name: &str) -> Result<(), NewError> {
 fn render(template: &str, context: &TemplateContext<'_>) -> String {
     template
         .replace("{{name}}", context.name)
-        .replace("{{framework_path}}", context.framework_path)
+        .replace("{{rume_dependency}}", context.rume_dependency)
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), NewError> {
@@ -200,13 +223,27 @@ mod tests {
     }
 
     #[test]
+    fn resolves_portable_dependency_by_default() {
+        let (dep, path) = resolve_rume_dependency(None, Some("0.1.0"));
+        assert_eq!(dep, "rume = \"0.1.0\"");
+        assert_eq!(path, None);
+    }
+
+    #[test]
+    fn resolves_path_override_when_provided() {
+        let (dep, path) = resolve_rume_dependency(Some("../rume"), Some("0.1.0"));
+        assert_eq!(dep, "rume = { version = \"0.1.0\", path = \"../rume\" }");
+        assert_eq!(path, Some("../rume".to_string()));
+    }
+
+    #[test]
     fn renders_placeholders() {
         let context = TemplateContext {
             name: "demo",
-            framework_path: "/tmp/rume",
+            rume_dependency: "rume = \"0.1.0\"",
         };
-        let rendered = render("name={{name}} path={{framework_path}}", &context);
-        assert_eq!(rendered, "name=demo path=/tmp/rume");
+        let rendered = render("name={{name}} dep={{rume_dependency}}", &context);
+        assert_eq!(rendered, "name=demo dep=rume = \"0.1.0\"");
     }
 
     #[test]
@@ -216,7 +253,7 @@ mod tests {
         fs::create_dir_all(root).expect("create dummy dir");
         fs::write(root.join("keep.txt"), "original contents").expect("write dummy file");
 
-        let err = run_inner(&name).unwrap_err();
+        let err = run_inner(&name, "rume = \"0.1.0\"").unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
 
         // The directory and its original contents must still exist.

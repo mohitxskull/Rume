@@ -45,6 +45,8 @@ pub fn run(name: &str) {
         }
     }
 
+    super::ensure_main_mod("middleware");
+
     println!("Generated middleware `{name}`");
     println!("  created {middleware_path}");
     println!("  updated {mod_path}");

@@ -47,6 +47,8 @@ pub fn run(name: &str) {
         }
     }
 
+    super::ensure_main_mod("models");
+
     println!("Generated model `{name}`");
     println!("  created {model_path}");
     println!("  updated {mod_path}");

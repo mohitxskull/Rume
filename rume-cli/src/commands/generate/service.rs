@@ -47,6 +47,8 @@ pub fn run(name: &str) {
         }
     }
 
+    super::ensure_main_mod("services");
+
     println!("Generated service `{name}`");
     println!("  created {service_path}");
     println!("  updated {mod_path}");

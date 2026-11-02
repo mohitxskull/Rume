@@ -57,3 +57,32 @@ pub fn run(kind: Option<&str>, name: Option<&str>) {
         }
     }
 }
+
+pub(crate) fn ensure_main_mod(module_name: &str) {
+    let main_path = "src/main.rs";
+    if let Ok(content) = std::fs::read_to_string(main_path) {
+        let mod_stmt = format!("mod {module_name};");
+        if !content.lines().any(|l| l.trim() == mod_stmt) {
+            let lines: Vec<&str> = content.lines().collect();
+            let last_mod_pos = lines
+                .iter()
+                .rposition(|l| l.trim().starts_with("mod ") && l.trim().ends_with(';'));
+            let new_content = match last_mod_pos {
+                Some(pos) => {
+                    let mut res = String::new();
+                    for (i, line) in lines.iter().enumerate() {
+                        res.push_str(line);
+                        res.push('\n');
+                        if i == pos {
+                            res.push_str(&mod_stmt);
+                            res.push('\n');
+                        }
+                    }
+                    res
+                }
+                None => format!("{mod_stmt}\n{content}"),
+            };
+            let _ = std::fs::write(main_path, new_content);
+        }
+    }
+}
