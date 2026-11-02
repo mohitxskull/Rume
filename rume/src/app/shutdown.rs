@@ -1,22 +1,14 @@
-//! Shutdown signal handling, operational routes, and tracing initialization.
+//! Shutdown signal handling and operational shutdown helpers.
 
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::{Router, get};
 use serde_json::json;
-use tracing_subscriber::{EnvFilter, fmt};
 
 use crate::app::state::{Availability, AvailabilityState};
 
-/// Initialize the tracing subscriber.
-///
-/// Reads `RUST_LOG` (or defaults to `info`) to set the filtering level, then
-/// installs a `fmt` subscriber with that filter.
-pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt::fmt().with_env_filter(filter).init();
-}
+pub use crate::app::observability::{init_tracing, try_init_tracing};
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
 pub(crate) async fn shutdown_signal() {
@@ -44,17 +36,13 @@ pub(crate) async fn shutdown_signal() {
 
 /// Wrap a router with ops routes (liveness/readiness) keyed on availability.
 ///
-/// The router's state type must be [`Availability`], since the route handlers
-/// extract it via [`State`](axum::extract::State).
+/// # Deprecated
 ///
-/// # Example
-///
-/// ```
-/// use rume::app::ops_router;
-/// use axum::Router;
-///
-/// let router = ops_router(Router::new());
-/// ```
+/// Use canonical [`rume::routing::health_routes`](crate::routing::health_routes) instead.
+#[deprecated(
+    since = "0.2.0",
+    note = "Use canonical `rume::routing::health_routes` instead"
+)]
 pub fn ops_router(router: Router<Availability>) -> Router<Availability> {
     router
         .route(

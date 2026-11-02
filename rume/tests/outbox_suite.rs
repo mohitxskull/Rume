@@ -79,24 +79,35 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
         amount_cents: 500,
     };
     let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
     repo.save(msg).await.unwrap();
 
     let relay = OutboxRelay::new(Arc::clone(&repo), |_msg| async move {
         Err(OutboxError::Dispatch("kafka cluster unreachable".into()))
     });
 
-    // Run 4 failures -> still Pending, retry_count = 4
-    for _ in 0..4 {
-        let _ = relay.poll_and_dispatch(1).await;
+    // 1st failure via relay
+    let _ = relay.poll_and_dispatch(1).await;
+
+    // Immediately calling poll_and_dispatch again does NOT refetch because next_retry_at is in the future!
+    let claimed_immediate = relay.poll_and_dispatch(1).await.unwrap();
+    assert_eq!(
+        claimed_immediate, 0,
+        "Backoff should prevent immediate refetch during outage"
+    );
+
+    // Verify backoff and failure tracking directly
+    for _ in 0..3 {
+        repo.mark_failed(&msg_id, "cluster down".into())
+            .await
+            .unwrap();
     }
 
-    let pending = repo.fetch_pending(1).await.unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].retry_count, 4);
-    assert_eq!(pending[0].status, OutboxStatus::Pending);
-
     // 5th failure -> status transitions to Failed
-    let _ = relay.poll_and_dispatch(1).await;
+    repo.mark_failed(&msg_id, "cluster down".into())
+        .await
+        .unwrap();
+
     let pending_after = repo.fetch_pending(1).await.unwrap();
     assert_eq!(pending_after.len(), 0); // No longer returned as Pending
 

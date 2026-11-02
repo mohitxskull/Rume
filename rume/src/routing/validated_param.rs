@@ -1,28 +1,29 @@
-//! Validated parameter extraction.
+//! Route parameter validation utilities.
 //!
-//! Provides [`ValidatedParam`], which validates a route parameter value
-//! against a [`Matcher`] and returns the validated string.
+//! Provides [`ValidatedParam`], a validated parameter value container populated
+//! via [`ValidatedParam::from_value`].
+//!
+//! Note: Route parameter validation in handlers is handled by [`crate::routing::RouteSpec::where_param`]
+//! and `ParamValidationLayer`, or via [`crate::validation::ValidatedPath`]. `ValidatedParam` is not
+//! a request extractor.
 
 use crate::error::AppError;
 use crate::routing::matchers::Matcher;
 
 /// A route parameter value that has been validated against a matcher.
 ///
-/// Constructed via [`ValidatedParam::from_value`], which takes the parameter
-/// name, raw value, and matcher explicitly. This avoids the flaw of the old
-/// design where the parameter name was a hardcoded constant on the matcher
-/// type (`PARAM_NAME = "test_param"`) rather than the actual route param name
-/// from [`crate::routing::RouteSpec::where_param`].
+/// Constructed via [`ValidatedParam::from_value`], which validates the parameter
+/// name, raw string value, and [`Matcher`].
 ///
 /// # Example
 ///
 /// ```
-/// use rume::routing::{ValidatedParam, Matcher, validated_param::matchers};
+/// use rume::routing::{ValidatedParam, Matcher};
 /// use std::collections::BTreeMap;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let params: BTreeMap<String, String> = BTreeMap::from([("id".to_string(), "42".to_string())]);
-/// let validated = ValidatedParam::<matchers::Number>::from_value(
+/// let validated = ValidatedParam::from_value(
 ///     "id",
 ///     params.get("id").unwrap(),
 ///     Matcher::Number,
@@ -31,14 +32,13 @@ use crate::routing::matchers::Matcher;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug, Clone)]
-pub struct ValidatedParam<M> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedParam {
     pub name: String,
     pub value: String,
-    _marker: std::marker::PhantomData<M>,
 }
 
-impl<M> ValidatedParam<M> {
+impl ValidatedParam {
     /// Validate a raw parameter value against a matcher and return a
     /// [`ValidatedParam`].
     ///
@@ -50,7 +50,6 @@ impl<M> ValidatedParam<M> {
             .map(|v| Self {
                 name: name.to_string(),
                 value: v,
-                _marker: std::marker::PhantomData,
             })
             .map_err(|msg| AppError::BadRequest {
                 code: "INVALID_PARAM",
@@ -58,31 +57,18 @@ impl<M> ValidatedParam<M> {
             })
     }
 
-    /// Consume the extractor and return the validated string value.
+    /// Consume this container and return the validated string value.
     pub fn into_inner(self) -> String {
         self.value
     }
 }
 
-impl<M> std::ops::Deref for ValidatedParam<M> {
+impl std::ops::Deref for ValidatedParam {
     type Target = str;
 
     fn deref(&self) -> &str {
         &self.value
     }
-}
-
-/// Marker types for param matchers used with `ValidatedParam`.
-pub mod matchers {
-    /// Matcher for numeric parameters.
-    #[derive(Debug)]
-    pub struct Number;
-    /// Matcher for UUID parameters.
-    #[derive(Debug)]
-    pub struct Uuid;
-    /// Matcher for slug parameters.
-    #[derive(Debug)]
-    pub struct Slug;
 }
 
 #[cfg(test)]
@@ -93,20 +79,16 @@ mod tests {
 
     #[test]
     fn validated_param_from_value_validates() {
-        // from_value accepts valid values and rejects invalid ones.
-        let valid =
-            ValidatedParam::<matchers::Number>::from_value("id", "42", Matcher::Number).unwrap();
+        let valid = ValidatedParam::from_value("id", "42", Matcher::Number).unwrap();
         assert_eq!(valid.name, "id");
         assert_eq!(valid.value, "42");
 
-        let err = ValidatedParam::<matchers::Number>::from_value("id", "abc", Matcher::Number)
-            .unwrap_err();
+        let err = ValidatedParam::from_value("id", "abc", Matcher::Number).unwrap_err();
         assert!(matches!(err, AppError::BadRequest { .. }));
     }
 
     #[test]
     fn validated_param_from_value_missing_key() {
-        // Missing param produces BadRequest.
         let params: BTreeMap<String, String> = BTreeMap::new();
         let value = params.get("id").ok_or_else(|| AppError::BadRequest {
             code: "MISSING_PARAM",

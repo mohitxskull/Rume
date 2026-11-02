@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::events::Event;
 use crate::outbox::error::OutboxError;
 
-fn current_timestamp() -> u64 {
+pub(crate) fn current_timestamp() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -46,6 +46,8 @@ pub struct OutboxMessage {
     pub created_at: u64,
     /// Diagnostic error message if the last delivery attempt failed.
     pub last_error: Option<String>,
+    /// Earliest timestamp before which this message should not be retried.
+    pub next_retry_at: Option<u64>,
 }
 
 impl OutboxMessage {
@@ -65,6 +67,7 @@ impl OutboxMessage {
             retry_count: 0,
             created_at: current_timestamp(),
             last_error: None,
+            next_retry_at: None,
         })
     }
 

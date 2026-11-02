@@ -10,3 +10,5 @@ Group H: complete (4 findings closed: Security M3, Security M4, Security m3, Cor
 Group I: complete (7 findings closed: Architecture M1, DX M1, DX M2, DX M3, DX M4, DX m4, DX m5 / Architecture m5)
 Group J: complete (5 findings closed: DX M5, DX m2, DX m3, DX m7, DX m8)
 Group K: complete (5 findings closed: Testing M1, Testing M3, Testing m1, Testing m2, Testing m3)
+Group L: complete (8 findings closed: Architecture m1 / DX m1, Architecture m2, Architecture m3, Architecture m4, Correctness m1 / DX m6, Enterprise m1, Enterprise m2, Enterprise m3)
+Total: 45 of 45 findings closed (100% complete across P0, P1, P2, P3)

@@ -23,6 +23,25 @@ use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
+/// Non-panicking initializer for the global tracing subscriber.
+///
+/// Returns `Ok(())` on successful initialization, or `Err(err)` if a global subscriber
+/// has already been set.
+pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).try_init()
+}
+
+/// Initialize the tracing subscriber if not already initialized.
+///
+/// Reads `RUST_LOG` (or defaults to `info`) to set the filtering level, then
+/// installs a `fmt` subscriber with that filter. If a global subscriber has already
+/// been registered (e.g. during tests or multiple reboots), this is safely ignored.
+pub fn init_tracing() {
+    let _ = try_init_tracing();
+}
+
 /// The standard HTTP header name for request identity: `x-request-id`.
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
@@ -324,5 +343,13 @@ mod tests {
         assert!(!is_valid_request_id("bad id with spaces"));
         assert!(!is_valid_request_id("bad\nid"));
         assert!(!is_valid_request_id(&"a".repeat(129))); // too long
+    }
+
+    #[test]
+    fn tracing_initializer_idempotency_and_try_init() {
+        init_tracing();
+        init_tracing();
+        let second_try = try_init_tracing();
+        assert!(second_try.is_err());
     }
 }

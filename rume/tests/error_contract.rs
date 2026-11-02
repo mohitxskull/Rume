@@ -119,12 +119,9 @@ async fn validated_param_number_succeeds() {
         "/users/{id}",
         axum::routing::get(
             move |params: axum::extract::Path<BTreeMap<String, String>>| async move {
-                let id = ValidatedParam::<()>::from_value(
-                    "id",
-                    params.get("id").unwrap(),
-                    Matcher::Number,
-                )
-                .unwrap();
+                let id =
+                    ValidatedParam::from_value("id", params.get("id").unwrap(), Matcher::Number)
+                        .unwrap();
                 format!("user {}", id.value)
             },
         ),
@@ -143,7 +140,7 @@ async fn validated_param_number_rejects() {
         "/users/{id}",
         axum::routing::get(
             move |params: axum::extract::Path<BTreeMap<String, String>>| async move {
-                let id = match ValidatedParam::<()>::from_value(
+                let id = match ValidatedParam::from_value(
                     "id",
                     params.get("id").unwrap(),
                     Matcher::Number,

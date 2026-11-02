@@ -158,21 +158,21 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 
 ### Group L — Subsystem Cohesion & Doc Alignment (solve together)
 
-- [ ] **Architecture m1 / DX m1 — Orphaned `ops_router` duplicates `health_routes`** (`architecture.md` m1, `dx-tooling.md` m1).
+- [x] **Architecture m1 / DX m1 — Orphaned `ops_router` duplicates `health_routes`** (`architecture.md` m1, `dx-tooling.md` m1).
       `rume/src/app/shutdown.rs:50–80`: Deprecate or remove `ops_router` in favor of canonical `health_routes`.
-- [ ] **Architecture m2 — Misplaced tracing and ops helpers in `shutdown.rs`** (`architecture.md` m2).
+- [x] **Architecture m2 — Misplaced tracing and ops helpers in `shutdown.rs`** (`architecture.md` m2).
       `rume/src/app/shutdown.rs:20–45`: `init_tracing` and `ops_router` live in `shutdown.rs`. Move to `rume/src/app/observability.rs` and `rume/src/routing/health.rs`.
-- [ ] **Architecture m3 — Stale crate architecture doc comment in `rume/src/lib.rs`** (`architecture.md` m3).
+- [x] **Architecture m3 — Stale crate architecture doc comment in `rume/src/lib.rs`** (`architecture.md` m3).
       `rume/src/lib.rs:1–6`: Doc comment claims features like auth/jobs/storage live in external crates, whereas they are now built-in. Update doc comment to reflect current architecture.
-- [ ] **Architecture m4 — `init_tracing()` panics on already-initialized subscriber** (`architecture.md` m4).
+- [x] **Architecture m4 — `init_tracing()` panics on already-initialized subscriber** (`architecture.md` m4).
       `rume/src/app/shutdown.rs:30–45`: Returns `()` and panics if called twice. Return `Result<(), TryInitError>` or provide `try_init_tracing()`.
-- [ ] **Correctness m1 / DX m6 — Stale "extractor" docstrings and unused phantom type parameter on `ValidatedParam`** (`correctness.md` m1, `dx-tooling.md` m6).
+- [x] **Correctness m1 / DX m6 — Stale "extractor" docstrings and unused phantom type parameter on `ValidatedParam`** (`correctness.md` m1, `dx-tooling.md` m6).
       `rume/src/routing/validated_param.rs:1–30`: Docs describe `ValidatedParam` as a request extractor, but it is now applied via `ParamValidationLayer`. Update docstrings and remove unused phantom types.
-- [ ] **Enterprise m1 — `MetricsService` leaks `in_flight` gauge on cancelled request futures** (`enterprise-reliability.md` m1).
+- [x] **Enterprise m1 — `MetricsService` leaks `in_flight` gauge on cancelled request futures** (`enterprise-reliability.md` m1).
       `rume/src/metrics/layer.rs:65–85`: If client disconnects mid-flight, future drop skips decrement. Wrap gauge increment in an RAII drop guard.
-- [ ] **Enterprise m2 — `OutboxRelay` lacks retry backoff** (`enterprise-reliability.md` m2).
+- [x] **Enterprise m2 — `OutboxRelay` lacks retry backoff** (`enterprise-reliability.md` m2).
       `rume/src/outbox/relay.rs:115–135`: Immediate retry burns attempt budget during prolonged downstream outages. Add exponential backoff.
-- [ ] **Enterprise m3 — `MemoryOutboxRepository::fetch_pending` dispatches messages in random hash order** (`enterprise-reliability.md` m3).
+- [x] **Enterprise m3 — `MemoryOutboxRepository::fetch_pending` dispatches messages in random hash order** (`enterprise-reliability.md` m3).
       `rume/src/outbox/repository.rs:50–70`: Pending messages are pulled from a hash map without ordering by creation timestamp. Sort by `created_at` timestamp.
 
 ---

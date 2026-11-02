@@ -7,7 +7,7 @@ use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
 use crate::outbox::error::OutboxError;
-use crate::outbox::message::{OutboxMessage, OutboxStatus};
+use crate::outbox::message::{OutboxMessage, OutboxStatus, current_timestamp};
 
 /// Pinned boxed future type alias for async outbox repository operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -76,9 +76,12 @@ impl OutboxRepository for MemoryOutboxRepository {
                 .read()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+            let now = current_timestamp();
             let mut pending: Vec<OutboxMessage> = messages
                 .values()
-                .filter(|m| m.status == OutboxStatus::Pending)
+                .filter(|m| {
+                    m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t)
+                })
                 .cloned()
                 .collect();
             pending.sort_by_key(|m| m.created_at);
@@ -98,9 +101,12 @@ impl OutboxRepository for MemoryOutboxRepository {
                 .write()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+            let now = current_timestamp();
             let mut pending_keys: Vec<(u64, String)> = messages
                 .values()
-                .filter(|m| m.status == OutboxStatus::Pending)
+                .filter(|m| {
+                    m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t)
+                })
                 .map(|m| (m.created_at, m.id.clone()))
                 .collect();
             pending_keys.sort_by_key(|(ts, _)| *ts);
@@ -128,6 +134,7 @@ impl OutboxRepository for MemoryOutboxRepository {
             if let Some(msg) = messages.get_mut(&id_str) {
                 msg.status = OutboxStatus::Published;
                 msg.last_error = None;
+                msg.next_retry_at = None;
             }
 
             Ok(())
@@ -147,8 +154,12 @@ impl OutboxRepository for MemoryOutboxRepository {
                 msg.last_error = Some(error);
                 if msg.retry_count >= 5 {
                     msg.status = OutboxStatus::Failed;
+                    msg.next_retry_at = None;
                 } else {
                     msg.status = OutboxStatus::Pending;
+                    let now = current_timestamp();
+                    let backoff_secs = 2u64.pow(msg.retry_count.saturating_sub(1));
+                    msg.next_retry_at = Some(now + backoff_secs);
                 }
             }
 
@@ -163,9 +174,13 @@ impl OutboxRepository for MemoryOutboxRepository {
                 .read()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+            let now = current_timestamp();
             Ok(messages
                 .values()
-                .filter(|m| m.status == OutboxStatus::Pending || m.status == OutboxStatus::InFlight)
+                .filter(|m| {
+                    (m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t))
+                        || m.status == OutboxStatus::InFlight
+                })
                 .count())
         })
     }

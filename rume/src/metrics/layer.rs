@@ -96,3 +96,37 @@ where
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::service_fn;
+
+    #[tokio::test]
+    async fn in_flight_decrements_on_future_cancellation() {
+        let registry = MetricsRegistry::new();
+        assert_eq!(registry.in_flight(), 0);
+
+        let service = service_fn(|_req: Request<Body>| async {
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
+        });
+
+        let mut metrics_service = MetricsService {
+            inner: service,
+            registry: registry.clone(),
+        };
+
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let fut = metrics_service.call(req);
+
+        // In-flight incremented immediately upon call
+        assert_eq!(registry.in_flight(), 1);
+
+        // Drop the pending request future (simulating client disconnection or timeout cancellation)
+        drop(fut);
+
+        // Guard must have decremented in_flight on drop
+        assert_eq!(registry.in_flight(), 0);
+    }
+}

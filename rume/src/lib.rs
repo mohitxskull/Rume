@@ -1,8 +1,9 @@
-//! Rume: an explicit, typed, production-ready application shell for Axum.
+//! Rume: a complete, modular Rust application framework built on Axum.
 //!
-//! This crate is the core of the Rume framework. It is intentionally small:
-//! optional features (auth, mail, jobs, storage, database helpers) live in
-//! separate `rume-*` crates that depend on this one.
+//! Rume combines progressive complexity with strong compile-time conventions.
+//! Small applications start with minimal boilerplate, while enterprise applications
+//! leverage built-in modules, persistence, background jobs, multi-tenancy, transactional
+//! outbox, sagas, resilience, authentication, and architectural verification.
 
 #![forbid(unsafe_code)]
 
@@ -31,10 +32,12 @@ pub mod tenant;
 pub mod testing;
 pub mod validation;
 
+#[allow(deprecated)]
+pub use app::ops_router;
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle,
     LifecycleState, MiddlewareConfigError, ObservabilityLayer, ProjectPaths, RequestId, Rume,
-    RumeBuilder, X_REQUEST_ID, init_tracing, ops_router,
+    RumeBuilder, X_REQUEST_ID, init_tracing, try_init_tracing,
 };
 pub use auth::{
     ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
