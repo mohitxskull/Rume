@@ -208,3 +208,67 @@ async fn cache_health_check_reports_diagnostics() {
     assert_eq!(res_closed.status, HealthStatus::Failed);
     assert_eq!(res_closed.message, "cache is closed");
 }
+
+#[tokio::test]
+async fn cache_remember_stampede_singleflight_protection() {
+    let cache = Arc::new(Cache::memory());
+    let fetch_count = Arc::new(AtomicUsize::new(0));
+
+    let mut handles = Vec::new();
+    for _ in 0..5 {
+        let cache_clone = Arc::clone(&cache);
+        let count_clone = Arc::clone(&fetch_count);
+        handles.push(tokio::spawn(async move {
+            cache_clone
+                .remember("stampede_key", None, || async move {
+                    count_clone.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    Ok(Product {
+                        id: "shared".into(),
+                        title: "Singleflight Product".into(),
+                        price_cents: 42,
+                    })
+                })
+                .await
+                .unwrap()
+        }));
+    }
+
+    let mut results = Vec::new();
+    for h in handles {
+        results.push(h.await.unwrap());
+    }
+    for p in results {
+        assert_eq!(p.id, "shared");
+    }
+
+    // Factory closure must run exactly once across 5 simultaneous requests
+    assert_eq!(fetch_count.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn memory_cache_backend_prune_and_capacity_bound() {
+    let backend = MemoryCacheBackend::with_capacity(3);
+    let cache = Cache::new(backend.clone(), CacheConfig::default());
+
+    // Insert 3 items
+    cache.set_json("k1", &10, None).await.unwrap();
+    cache.set_json("k2", &20, None).await.unwrap();
+    cache.set_json("k3", &30, None).await.unwrap();
+    assert_eq!(backend.len(), 3);
+
+    // Insert 4th item -> capacity bounded to 3 via eviction of oldest
+    cache.set_json("k4", &40, None).await.unwrap();
+    assert_eq!(backend.len(), 3);
+
+    // Insert short-lived item
+    cache
+        .set_json("k_temp", &99, Some(Duration::from_millis(20)))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // Prune drops expired
+    backend.prune_expired();
+    assert!(!cache.exists("k_temp").await.unwrap());
+}

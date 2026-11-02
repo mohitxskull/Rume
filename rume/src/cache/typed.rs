@@ -20,6 +20,7 @@ pub struct Cache<B: CacheBackend = MemoryCacheBackend> {
     backend: Arc<B>,
     config: CacheConfig,
     is_closed: Arc<AtomicBool>,
+    singleflight: Arc<tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>>,
 }
 
 impl Cache<MemoryCacheBackend> {
@@ -35,6 +36,7 @@ impl<B: CacheBackend> Clone for Cache<B> {
             backend: Arc::clone(&self.backend),
             config: self.config.clone(),
             is_closed: Arc::clone(&self.is_closed),
+            singleflight: Arc::clone(&self.singleflight),
         }
     }
 }
@@ -55,6 +57,7 @@ impl<B: CacheBackend> Cache<B> {
             backend: Arc::new(backend),
             config,
             is_closed: Arc::new(AtomicBool::new(false)),
+            singleflight: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -64,6 +67,15 @@ impl<B: CacheBackend> Cache<B> {
             format!("{prefix}{key}")
         } else {
             key.to_string()
+        }
+    }
+
+    /// Resolves the effective invalidation tag with configured prefix namespace.
+    fn format_tag(&self, tag: &str) -> String {
+        if let Some(prefix) = &self.config.prefix {
+            format!("{prefix}tag:{tag}")
+        } else {
+            tag.to_string()
         }
     }
 
@@ -114,12 +126,14 @@ impl<B: CacheBackend> Cache<B> {
         }
 
         let full_key = self.format_key(key);
+        let formatted_tags: Vec<String> = tags.iter().map(|t| self.format_tag(t)).collect();
+        let tag_refs: Vec<&str> = formatted_tags.iter().map(|s| s.as_str()).collect();
         let bytes =
             serde_json::to_vec(value).map_err(|e| CacheError::Serialization(e.to_string()))?;
         let eff_ttl = self.resolve_ttl(ttl);
 
         self.backend
-            .set_with_tags(&full_key, bytes, tags, eff_ttl)
+            .set_with_tags(&full_key, bytes, &tag_refs, eff_ttl)
             .await
     }
 
@@ -138,7 +152,7 @@ impl<B: CacheBackend> Cache<B> {
         self.remember_with_tags(key, &[], ttl, f).await
     }
 
-    /// Cache-aside pattern with tag invalidation support.
+    /// Cache-aside pattern with tag invalidation support and stampede (thundering herd) protection.
     pub async fn remember_with_tags<T, F, Fut>(
         &self,
         key: &str,
@@ -155,9 +169,47 @@ impl<B: CacheBackend> Cache<B> {
             return Ok(cached);
         }
 
-        let fresh = f().await?;
-        self.set_json_with_tags(key, &fresh, tags, ttl).await?;
-        Ok(fresh)
+        let full_key = self.format_key(key);
+
+        // Stampede protection: register singleflight slot
+        let waiter = {
+            let mut flights = self.singleflight.lock().await;
+            if let Some(existing) = flights.get(&full_key) {
+                Some(Arc::clone(existing))
+            } else {
+                let notify = Arc::new(tokio::sync::Notify::new());
+                flights.insert(full_key.clone(), Arc::clone(&notify));
+                None
+            }
+        };
+
+        if let Some(notify) = waiter {
+            // Concurrent request: wait for the in-flight leader to populate cache
+            notify.notified().await;
+            if let Some(cached) = self.get_json::<T>(key).await? {
+                return Ok(cached);
+            }
+        }
+
+        // Leader execution: compute fresh value
+        let result = f().await;
+
+        // Clean up flight slot and notify all awaiting stampede requests
+        let to_wake = {
+            let mut flights = self.singleflight.lock().await;
+            flights.remove(&full_key)
+        };
+        if let Some(notify) = to_wake {
+            notify.notify_waiters();
+        }
+
+        match result {
+            Ok(fresh) => {
+                self.set_json_with_tags(key, &fresh, tags, ttl).await?;
+                Ok(fresh)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Deletes a key from the cache.
@@ -183,7 +235,8 @@ impl<B: CacheBackend> Cache<B> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Err(CacheError::Closed);
         }
-        self.backend.invalidate_tag(tag).await
+        let full_tag = self.format_tag(tag);
+        self.backend.invalidate_tag(&full_tag).await
     }
 
     /// Clears all entries from the cache.

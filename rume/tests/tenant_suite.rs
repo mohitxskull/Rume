@@ -255,3 +255,46 @@ async fn test_tenant_scoped_cache() {
     assert!(settings_a.is_none());
     assert_eq!(settings_b.unwrap().theme, "light");
 }
+
+#[tokio::test]
+async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
+    let base_cache = Cache::new(MemoryCacheBackend::new(), CacheConfig::default());
+    let scoped_cache = TenantScopedCache::new(base_cache).with_max_keys_per_tenant(2);
+
+    #[derive(Serialize, Deserialize, PartialEq, Debug)]
+    struct Product {
+        name: String,
+    }
+
+    // Tenant 1 sets item with tag "catalog"
+    scoped_cache
+        .set_with_tags("t1", "p1", &Product { name: "T1 Item".into() }, &["catalog"], None)
+        .await
+        .unwrap();
+
+    // Tenant 2 sets item with identical tag name "catalog"
+    scoped_cache
+        .set_with_tags("t2", "p1", &Product { name: "T2 Item".into() }, &["catalog"], None)
+        .await
+        .unwrap();
+
+    // Invalidate tag "catalog" for Tenant 1 ONLY
+    let evicted = scoped_cache.invalidate_tag("t1", "catalog").await.unwrap();
+    assert_eq!(evicted, 1);
+
+    // Tenant 1's item is gone
+    let t1_item: Option<Product> = scoped_cache.get("t1", "p1").await.unwrap();
+    assert!(t1_item.is_none());
+
+    // Tenant 2's item is PRESERVED!
+    let t2_item: Option<Product> = scoped_cache.get("t2", "p1").await.unwrap();
+    assert_eq!(t2_item.unwrap().name, "T2 Item");
+
+    // Quota test: max 2 keys per tenant
+    scoped_cache.set("t1", "k1", &"val1", None).await.unwrap();
+    scoped_cache.set("t1", "k2", &"val2", None).await.unwrap();
+
+    // 3rd key exceeds quota of 2
+    let err = scoped_cache.set("t1", "k3", &"val3", None).await;
+    assert!(matches!(err, Err(rume::cache::CacheError::QuotaExceeded(_))));
+}

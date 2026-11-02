@@ -78,6 +78,7 @@ struct MemoryCacheState {
 #[derive(Debug, Clone)]
 pub struct MemoryCacheBackend {
     state: Arc<RwLock<MemoryCacheState>>,
+    max_capacity: usize,
 }
 
 impl Default for MemoryCacheBackend {
@@ -87,14 +88,50 @@ impl Default for MemoryCacheBackend {
 }
 
 impl MemoryCacheBackend {
-    /// Creates a new in-memory cache backend.
+    /// Default maximum cache entry capacity.
+    pub const DEFAULT_MAX_CAPACITY: usize = 10_000;
+
+    /// Creates a new in-memory cache backend with default capacity.
     pub fn new() -> Self {
+        Self::with_capacity(Self::DEFAULT_MAX_CAPACITY)
+    }
+
+    /// Creates a new in-memory cache backend with a custom maximum capacity.
+    pub fn with_capacity(max_capacity: usize) -> Self {
         Self {
             state: Arc::new(RwLock::new(MemoryCacheState {
                 entries: BTreeMap::new(),
                 tag_to_keys: BTreeMap::new(),
                 alive: true,
             })),
+            max_capacity: max_capacity.max(1),
+        }
+    }
+
+    /// Prunes expired entries and cleans up stale tag references.
+    pub fn prune_expired(&self) {
+        if let Ok(mut state) = self.state.write() {
+            Self::prune_expired_locked(&mut state);
+        }
+    }
+
+    fn prune_expired_locked(state: &mut MemoryCacheState) {
+        let now = Instant::now();
+        let mut expired = Vec::new();
+        for (k, e) in &state.entries {
+            if let Some(exp) = e.expires_at
+                && now >= exp
+            {
+                expired.push((k.clone(), e.tags.clone()));
+            }
+        }
+        for (k, tags) in expired {
+            state.entries.remove(&k);
+            for tag in tags {
+                if let Some(keys) = state.tag_to_keys.get_mut(&tag) {
+                    keys.remove(&k);
+                }
+            }
         }
     }
 
@@ -173,6 +210,22 @@ impl CacheBackend for MemoryCacheBackend {
 
             if !state.alive {
                 return Err(CacheError::Connection("cache offline".into()));
+            }
+
+            if state.entries.len() > 100 {
+                Self::prune_expired_locked(&mut state);
+            }
+
+            if state.entries.len() >= self.max_capacity
+                && !state.entries.contains_key(&k)
+                && let Some(first_key) = state.entries.keys().next().cloned()
+                && let Some(old) = state.entries.remove(&first_key)
+            {
+                for tag in old.tags {
+                    if let Some(keys) = state.tag_to_keys.get_mut(&tag) {
+                        keys.remove(&first_key);
+                    }
+                }
             }
 
             for tag in &tags_set {

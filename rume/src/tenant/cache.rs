@@ -8,16 +8,34 @@ use crate::cache::backend::CacheBackend;
 use crate::cache::error::CacheError;
 use crate::cache::typed::Cache;
 
-/// A cache wrapper that automatically isolates data per tenant using key prefixes and invalidation tags.
+use std::collections::BTreeMap;
+use std::sync::{Arc, RwLock};
+
+/// A cache wrapper that automatically isolates data per tenant using key prefixes, namespaced tags, and quotas.
 #[derive(Clone)]
 pub struct TenantScopedCache<B: CacheBackend> {
     cache: Cache<B>,
+    max_keys_per_tenant: usize,
+    tenant_key_counts: Arc<RwLock<BTreeMap<String, usize>>>,
 }
 
 impl<B: CacheBackend> TenantScopedCache<B> {
-    /// Creates a new tenant-scoped cache wrapper.
+    /// Default maximum cached keys per tenant.
+    pub const DEFAULT_MAX_KEYS_PER_TENANT: usize = 5_000;
+
+    /// Creates a new tenant-scoped cache wrapper with default quotas.
     pub fn new(cache: Cache<B>) -> Self {
-        Self { cache }
+        Self {
+            cache,
+            max_keys_per_tenant: Self::DEFAULT_MAX_KEYS_PER_TENANT,
+            tenant_key_counts: Arc::new(RwLock::new(BTreeMap::new())),
+        }
+    }
+
+    /// Sets the maximum number of keys permitted per tenant.
+    pub fn with_max_keys_per_tenant(mut self, max_keys: usize) -> Self {
+        self.max_keys_per_tenant = max_keys.max(1);
+        self
     }
 
     // Why: Length-prefixing the tenant segment ("tenant:{len}:{tenant_id}:{key}") guarantees
@@ -31,6 +49,11 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     // prevents tag collision where invalidating tenant "a" could inadvertently evict tenant "a:b".
     fn tenant_tag(tenant_id: &str) -> String {
         format!("tenant:{}:{tenant_id}", tenant_id.len())
+    }
+
+    // Why: Symmetrical length-prefixing on user-defined tags scoped to tenant
+    fn scoped_tag(tenant_id: &str, tag: &str) -> String {
+        format!("tenant:{}:{}:tag:{tag}", tenant_id.len(), tenant_id)
     }
 
     /// Retrieves a cached value scoped to `tenant_id`.
@@ -51,23 +74,81 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         value: &T,
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
+        self.set_with_tags(tenant_id, key, value, &[], ttl).await
+    }
+
+    /// Stores a cached value scoped to `tenant_id` with custom invalidation tags and tenant-level quota enforcement.
+    pub async fn set_with_tags<T: Serialize>(
+        &self,
+        tenant_id: &str,
+        key: &str,
+        value: &T,
+        tags: &[&str],
+        ttl: Option<Duration>,
+    ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
-        let tag = Self::tenant_tag(tenant_id);
+        let exists = self.cache.exists(&full_key).await?;
+
+        if !exists {
+            let mut counts = self
+                .tenant_key_counts
+                .write()
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
+            let current = counts.entry(tenant_id.to_string()).or_insert(0);
+            if *current >= self.max_keys_per_tenant {
+                return Err(CacheError::QuotaExceeded(format!(
+                    "tenant '{tenant_id}' exceeded quota of {} keys",
+                    self.max_keys_per_tenant
+                )));
+            }
+            *current += 1;
+        }
+
+        let tenant_tag = Self::tenant_tag(tenant_id);
+        let mut all_tags = vec![tenant_tag];
+        for t in tags {
+            all_tags.push(Self::scoped_tag(tenant_id, t));
+        }
+        let tag_refs: Vec<&str> = all_tags.iter().map(|s| s.as_str()).collect();
+
         self.cache
-            .set_json_with_tags(&full_key, value, &[&tag], ttl)
+            .set_json_with_tags(&full_key, value, &tag_refs, ttl)
             .await
     }
 
     /// Deletes a specific key scoped to `tenant_id`.
     pub async fn delete(&self, tenant_id: &str, key: &str) -> Result<bool, CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
-        self.cache.delete(&full_key).await
+        let deleted = self.cache.delete(&full_key).await?;
+        if deleted
+            && let Ok(mut counts) = self.tenant_key_counts.write()
+            && let Some(count) = counts.get_mut(tenant_id)
+        {
+            *count = count.saturating_sub(1);
+        }
+        Ok(deleted)
+    }
+
+    /// Evicts all cached entries belonging to `tenant_id` matching `tag`.
+    pub async fn invalidate_tag(&self, tenant_id: &str, tag: &str) -> Result<usize, CacheError> {
+        let scoped = Self::scoped_tag(tenant_id, tag);
+        let count = self.cache.invalidate_tag(&scoped).await?;
+        if let Ok(mut counts) = self.tenant_key_counts.write()
+            && let Some(c) = counts.get_mut(tenant_id)
+        {
+            *c = c.saturating_sub(count);
+        }
+        Ok(count)
     }
 
     /// Evicts all cached entries belonging to `tenant_id`.
     pub async fn invalidate_tenant(&self, tenant_id: &str) -> Result<usize, CacheError> {
         let tag = Self::tenant_tag(tenant_id);
-        self.cache.invalidate_tag(&tag).await
+        let count = self.cache.invalidate_tag(&tag).await?;
+        if let Ok(mut counts) = self.tenant_key_counts.write() {
+            counts.remove(tenant_id);
+        }
+        Ok(count)
     }
 }
 

@@ -20,4 +20,8 @@ pub enum CacheError {
     /// General cache execution error.
     #[error("cache error: {0}")]
     Backend(String),
+
+    /// Cache capacity or tenant quota exceeded.
+    #[error("cache quota exceeded: {0}")]
+    QuotaExceeded(String),
 }

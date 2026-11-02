@@ -77,11 +77,11 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group F — Cache Invalidation, Concurrency & Eviction (solve together)
 > Root cause: Missing memory eviction bounds and stampede locks.
 
-- [ ] **Enterprise-Reliability M4 — `MemoryCacheBackend` retains expired entries indefinitely without TTL eviction** (`enterprise-reliability.md` M4).
+- [x] **Enterprise-Reliability M4 — `MemoryCacheBackend` retains expired entries indefinitely without TTL eviction** (`enterprise-reliability.md` M4).
       `rume/src/cache/backend.rs:30–65`: Entries whose `expires_at < now` are only ignored on read, never removed, leaking memory. Add periodic passive eviction or bounded capacity limits.
-- [ ] **Enterprise-Reliability M5 — `Cache::remember` lacks stampede (thundering herd) protection on cache miss** (`enterprise-reliability.md` M5).
+- [x] **Enterprise-Reliability M5 — `Cache::remember` lacks stampede (thundering herd) protection on cache miss** (`enterprise-reliability.md` M5).
       `rume/src/cache/typed.rs:75–95`: Multiple concurrent requests for an expired key all execute the fallback factory in parallel. Add singleflight deduplication on cache misses.
-- [ ] **Enterprise-Reliability m4 — `TenantScopedCache` and `Cache` omit tag prefix namespacing** (`enterprise-reliability.md` m4).
+- [x] **Enterprise-Reliability m4 — `TenantScopedCache` and `Cache` omit tag prefix namespacing** (`enterprise-reliability.md` m4).
       `rume/src/tenant/cache.rs:20–40`: Cross-tenant invalidation tags can collide when user-defined tags overlap. Namespace all invalidation tags under `tenant:{id}:tag:{name}`.
 
 ### Group G — Architecture Enforcement & Module Lifecycle (solve together)
