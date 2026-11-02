@@ -5,7 +5,13 @@ use std::fmt::Debug;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
 
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use crate::outbox::{
+    BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, TransactionalOutbox,
+};
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction};
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
@@ -17,6 +23,7 @@ pub struct PoolStatus {
     pub active_connections: u32,
     pub total_connections: u32,
     pub max_connections: u32,
+    pub in_flight_transactions: u32,
     pub is_closed: bool,
 }
 
@@ -26,6 +33,8 @@ pub struct DatabasePool<B: DatabaseBackend> {
     config: DatabaseConfig,
     active_connections: Arc<AtomicU32>,
     total_connections: Arc<AtomicU32>,
+    in_flight_transactions: Arc<AtomicU32>,
+    semaphore: Arc<Semaphore>,
     is_closed: Arc<AtomicBool>,
 }
 
@@ -36,6 +45,8 @@ impl<B: DatabaseBackend> Clone for DatabasePool<B> {
             config: self.config.clone(),
             active_connections: Arc::clone(&self.active_connections),
             total_connections: Arc::clone(&self.total_connections),
+            in_flight_transactions: Arc::clone(&self.in_flight_transactions),
+            semaphore: Arc::clone(&self.semaphore),
             is_closed: Arc::clone(&self.is_closed),
         }
     }
@@ -54,11 +65,14 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     /// Creates a new database pool with the given backend and configuration.
     pub fn new(backend: B, config: DatabaseConfig) -> Self {
         let initial_conns = config.min_connections;
+        let max_conns = config.max_connections.max(1) as usize;
         Self {
             backend: Arc::new(backend),
             config,
             active_connections: Arc::new(AtomicU32::new(0)),
             total_connections: Arc::new(AtomicU32::new(initial_conns)),
+            in_flight_transactions: Arc::new(AtomicU32::new(0)),
+            semaphore: Arc::new(Semaphore::new(max_conns)),
             is_closed: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -79,27 +93,55 @@ impl<B: DatabaseBackend> DatabasePool<B> {
             active_connections: self.active_connections.load(Ordering::Relaxed),
             total_connections: self.total_connections.load(Ordering::Relaxed),
             max_connections: self.config.max_connections,
+            in_flight_transactions: self.in_flight_transactions.load(Ordering::Relaxed),
             is_closed: self.is_closed.load(Ordering::Relaxed),
         }
     }
 
-    /// Acquires a connection lease from the pool, checking capacity and closed state.
+    /// Acquires a connection lease from the pool synchronously, checking capacity and closed state.
     pub fn acquire_lease(&self) -> Result<ConnectionLease, PersistenceError> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Err(PersistenceError::Closed);
         }
 
-        let active = self.active_connections.fetch_add(1, Ordering::SeqCst);
-        if active >= self.config.max_connections {
-            self.active_connections.fetch_sub(1, Ordering::SeqCst);
-            return Err(PersistenceError::PoolExhausted {
-                active,
-                max: self.config.max_connections,
-            });
-        }
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let active = self.active_connections.load(Ordering::SeqCst);
+                return Err(PersistenceError::PoolExhausted {
+                    active,
+                    max: self.config.max_connections,
+                });
+            }
+        };
 
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
         Ok(ConnectionLease {
             counter: Arc::clone(&self.active_connections),
+            _permit: Some(permit),
+        })
+    }
+
+    /// Acquires a connection lease asynchronously, waiting up to `timeout` if pool capacity is exhausted.
+    pub async fn acquire_lease_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConnectionLease, PersistenceError> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Closed);
+        }
+
+        let permit =
+            match tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => return Err(PersistenceError::Closed),
+                Err(_) => return Err(PersistenceError::Timeout),
+            };
+
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionLease {
+            counter: Arc::clone(&self.active_connections),
+            _permit: Some(permit),
         })
     }
 
@@ -113,7 +155,19 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         Fut: std::future::Future<Output = Result<T, E>>,
         PersistenceError: From<E>,
     {
-        let _lease = self.acquire_lease()?;
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.in_flight_transactions.fetch_add(1, Ordering::SeqCst);
+
+        struct TxGuard(Arc<AtomicU32>);
+        impl Drop for TxGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _guard = TxGuard(Arc::clone(&self.in_flight_transactions));
+
         let tx = self.backend.begin_transaction().await?;
         let tx_handle = tx.clone();
 
@@ -132,7 +186,25 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     /// Gracefully closes the connection pool, refusing new leases and draining connections.
     pub fn close(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
+        self.semaphore.close();
         self.total_connections.store(0, Ordering::Relaxed);
+    }
+
+    /// Closes the pool and waits up to `timeout` for all active connections and in-flight transactions to drain.
+    ///
+    /// Returns `true` if cleanly drained within `timeout`, or `false` if active work remained.
+    pub async fn close_and_drain(&self, timeout: Duration) -> bool {
+        self.close();
+        let start = tokio::time::Instant::now();
+        while self.active_connections.load(Ordering::SeqCst) > 0
+            || self.in_flight_transactions.load(Ordering::SeqCst) > 0
+        {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
     }
 
     /// Creates a Rume [`HealthCheck`] for this database pool.
@@ -148,6 +220,7 @@ impl<B: DatabaseBackend> DatabasePool<B> {
 #[derive(Debug)]
 pub struct ConnectionLease {
     counter: Arc<AtomicU32>,
+    _permit: Option<OwnedSemaphorePermit>,
 }
 
 impl Drop for ConnectionLease {
@@ -232,5 +305,73 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                 },
             }
         })
+    }
+}
+
+impl<B> OutboxRepository for DatabasePool<B>
+where
+    B: DatabaseBackend + OutboxRepository,
+{
+    fn save(&self, msg: OutboxMessage) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        self.backend().save(msg)
+    }
+
+    fn fetch_pending(
+        &self,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.backend().fetch_pending(limit)
+    }
+
+    fn claim_pending(
+        &self,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.backend().claim_pending(limit)
+    }
+
+    fn claim_pending_with_lease(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.backend()
+            .claim_pending_with_lease(limit, lease_duration_secs)
+    }
+
+    fn mark_published(&self, id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        self.backend().mark_published(id)
+    }
+
+    fn mark_failed(&self, id: &str, error: String) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        self.backend().mark_failed(id, error)
+    }
+
+    fn recover_expired_claims(
+        &self,
+        max_lease_age_secs: u64,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        self.backend().recover_expired_claims(max_lease_age_secs)
+    }
+
+    fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        self.backend().pending_count()
+    }
+
+    fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        self.backend().published_count()
+    }
+}
+
+impl<B> TransactionalOutbox<B::Transaction> for DatabasePool<B>
+where
+    B: DatabaseBackend + TransactionalOutbox<B::Transaction>,
+{
+    fn save_tx<'a>(
+        &'a self,
+        tx: &'a B::Transaction,
+        message: OutboxMessage,
+    ) -> OutboxFuture<'a, Result<(), OutboxError>> {
+        self.backend().save_tx(tx, message)
     }
 }

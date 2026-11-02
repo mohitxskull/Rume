@@ -37,6 +37,10 @@ pub enum PersistenceError {
     #[error("database is closed")]
     Closed,
 
+    /// Connection acquisition or operation timed out.
+    #[error("database operation timed out")]
+    Timeout,
+
     /// Statement or query execution failed.
     #[error("query execution failed: {0}")]
     QueryFailed(String),

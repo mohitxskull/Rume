@@ -6,8 +6,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 
+use uuid::Uuid;
+
 use crate::outbox::error::OutboxError;
 use crate::outbox::message::{OutboxMessage, OutboxStatus, current_timestamp};
+use crate::persistence::backend::DatabaseTransaction;
 
 /// Pinned boxed future type alias for async outbox repository operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -22,9 +25,20 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
 
     /// Atomically claims up to `limit` pending outbox messages, transitioning their status
-    /// to `InFlight` and ordering by creation timestamp.
-    fn claim_pending(&self, limit: usize)
-    -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
+    /// to `InFlight` and assigning a lease token and default 30-second expiration timestamp.
+    fn claim_pending(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.claim_pending_with_lease(limit, 30)
+    }
+
+    /// Atomically claims up to `limit` pending outbox messages with a custom lease duration in seconds.
+    fn claim_pending_with_lease(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
 
     /// Marks a message as successfully published.
     fn mark_published(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
@@ -32,11 +46,34 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     /// Marks a message as failed with an error message and increments its retry counter.
     fn mark_failed(&self, id: &str, error: String) -> BoxFuture<'_, Result<(), OutboxError>>;
 
+    /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
+    /// resetting their status back to `Pending`.
+    fn recover_expired_claims(
+        &self,
+        max_lease_age_secs: u64,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        let _ = max_lease_age_secs;
+        Box::pin(async move { Ok(0) })
+    }
+
     /// Returns the number of currently pending outbox messages.
     fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>>;
 
     /// Returns the number of successfully published messages.
     fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>>;
+}
+
+/// Extension trait for outbox repositories supporting atomic persistence enlisted inside database transactions.
+pub trait TransactionalOutbox<Tx: DatabaseTransaction>: OutboxRepository {
+    /// Saves an outbox message inside an active database transaction.
+    ///
+    /// The message will only be committed if `tx.commit()` succeeds.
+    /// If `tx.rollback()` is executed, the message is completely discarded.
+    fn save_tx<'a>(
+        &'a self,
+        tx: &'a Tx,
+        message: OutboxMessage,
+    ) -> BoxFuture<'a, Result<(), OutboxError>>;
 }
 
 /// In-memory outbox repository for testing and single-node persistence.
@@ -91,9 +128,10 @@ impl OutboxRepository for MemoryOutboxRepository {
         })
     }
 
-    fn claim_pending(
+    fn claim_pending_with_lease(
         &self,
         limit: usize,
+        lease_duration_secs: u64,
     ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let mut messages = self
@@ -115,6 +153,8 @@ impl OutboxRepository for MemoryOutboxRepository {
             for (_, id) in pending_keys.into_iter().take(limit) {
                 if let Some(msg) = messages.get_mut(&id) {
                     msg.status = OutboxStatus::InFlight;
+                    msg.lease_token = Some(Uuid::new_v4().to_string());
+                    msg.lease_expires_at = Some(now + lease_duration_secs);
                     claimed.push(msg.clone());
                 }
             }
@@ -135,9 +175,42 @@ impl OutboxRepository for MemoryOutboxRepository {
                 msg.status = OutboxStatus::Published;
                 msg.last_error = None;
                 msg.next_retry_at = None;
+                msg.lease_token = None;
+                msg.lease_expires_at = None;
             }
 
             Ok(())
+        })
+    }
+
+    fn recover_expired_claims(
+        &self,
+        max_lease_age_secs: u64,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let mut messages = self
+                .messages
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let now = current_timestamp();
+            let mut recovered = 0;
+            for msg in messages.values_mut() {
+                if msg.status == OutboxStatus::InFlight {
+                    let expired = match msg.lease_expires_at {
+                        Some(exp) => now >= exp,
+                        None => now >= msg.created_at + max_lease_age_secs,
+                    };
+                    if expired {
+                        msg.status = OutboxStatus::Pending;
+                        msg.lease_token = None;
+                        msg.lease_expires_at = None;
+                        recovered += 1;
+                    }
+                }
+            }
+
+            Ok(recovered)
         })
     }
 

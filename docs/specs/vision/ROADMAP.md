@@ -11,6 +11,7 @@ Rume follows four development phases:
 2. **Phase 2: Complete Application Capabilities** — Add first-party persistence, authentication, authorization, background execution, and application events.
 3. **Phase 3: Enterprise Reliability** — Implement transactional outbox, job reliability, resilience middleware, unified observability, and architecture test verification.
 4. **Phase 4: Framework Maturation** — Expand into advanced distributed processing, workflow orchestration, and enterprise ecosystem integrations.
+5. **Phase 5: Production Semantics and Integration** — Transition from in-memory contracts to durable, multi-process production implementations with genuine persistence, transactional outbox atomicity, shared coordination, and comprehensive failure recovery.
 
 ---
 
@@ -111,7 +112,49 @@ Specialized enterprise and distributed extensions built on the proven core archi
 
 ---
 
-## Standards of Evaluation
+## Phase 5 — Production Semantics and Integration
+
+> **Priority:** P0 · Framework Integration & Correctness  
+> **Status:** Active Sprint
+
+This phase ensures Rume's capabilities function dependably under realistic application workloads, multi-process concurrency, crashes, and failure recovery. It closes the critical distinction between in-memory testing implementations and durable production semantics.
+
+### Strategic Tasks
+
+| ID | Task | Acceptance Criteria | Target |
+|---|---|---|---|
+| **REL-01** | Real Persistence Foundation | Genuine database integration (PostgreSQL driver), real connection acquisition/release, min/max pool sizing, connection acquisition timeouts, explicit transaction isolation, rollback on drop/error, real health checks, and graceful active-transaction drainage. | **P0** |
+| **REL-02** | Transactional Outbox Atomicity | Enlist outbox inserts directly into business database transactions (`BEGIN ... INSERT data ... INSERT outbox ... COMMIT`), guaranteeing atomic write/publish without message loss on crash; atomic claims across multiple relay processes with leases, expired claim recovery, exponential backoff, and strict drainage error propagation. | **P0** |
+| **REL-03** | Durable Jobs & Worker Recovery | Persistent queue backend, atomic job claiming with leases and heartbeats, automatic abandoned-job recovery, durable retry scheduling, dead-letter storage, and cross-process idempotency. | **P1** |
+| **REL-04** | Production Distributed Coordination | Real shared-store distributed lock and leader election with lease auto-renewal, node crash takeover, and monotonically increasing fencing tokens. | **P1** |
+| **REL-05** | Production Infrastructure Integrations | Production Redis cache adapter and session store, multi-instance cache quota enforcement, and distributed tag invalidation. | **P1** |
+| **REL-06** | Security & Enterprise Hardening | Standards-compliant XML parsing for SAML 2.0 with mandatory digital signature verification (protecting against XML signature-wrapping attacks), audience/issuer/time-condition validation, and hardened tenant isolation. | **P1** |
+| **REL-07** | Meaningful Architecture Verification | Clarify and enforce boundaries between declared module dependency graphs (`Module::dependencies()`) and compile-time Rust module visibility rules. | **P1** |
+
+### Sprint Prioritization Order
+
+| Order | Issue / Deliverable | Priority | Focus |
+|---|---|---|---|
+| **1** | Fix outbox relay error handling and drainage semantics | **P0** | Prevent false-positive drain completion on repo errors; propagate loop errors. |
+| **2** | Replace simulated connection leasing with real persistence semantics | **P0** | Physical connection pool interface, timeout control, and real pool drain. |
+| **3** | Design transaction-enlisted outbox storage | **P0** | Contract allowing outbox event inserts inside active database transactions. |
+| **4** | Implement production database backend | **P0** | PostgreSQL adapter with real transaction and migration execution. |
+| **5** | Implement durable outbox storage and recovery | **P0** | Atomic claim leases, expired claim re-drive, and crash recovery. |
+| **6** | Implement persistent job queue and worker recovery | **P1** | Shared storage queue, heartbeat monitoring, and abandoned job reclamation. |
+| **7** | Implement distributed locking and leader election backend | **P1** | Shared backend with monotonic lease tokens and multi-process takeover. |
+| **8** | Harden SAML, authentication and tenant isolation | **P1** | XML signature verification, audience/time validation, and tenant isolation. |
+
+### End-to-End Enterprise Integration Test Pipeline
+
+The final milestone of Phase 5 is a comprehensive failure-oriented integration test verifying a realistic enterprise pipeline:
+1. Authenticate request -> Resolve tenant -> Authorize business operation.
+2. Begin database transaction -> Update business record + Append outbox event atomically -> Commit transaction.
+3. Durable relay claims event -> Publishes to external bus -> Marks published.
+4. Background worker executes resulting job with idempotency and heartbeat tracking.
+5. Record metrics, structured logs, and tracing spans.
+6. **Failure Injection:** Kill worker, crash relay post-commit, simulate database disconnect, expire leader lease, and initiate graceful shutdown—verifying data consistency, zero event loss, and clean recovery.
+
+---
 
 Every capability on this roadmap is evaluated across five dimensions:
 

@@ -7,6 +7,9 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, RwLock};
 
+use crate::outbox::{
+    OutboxError, OutboxMessage, OutboxRepository, OutboxStatus, TransactionalOutbox,
+};
 use crate::persistence::error::PersistenceError;
 
 /// Pinned boxed future type alias for async database traits.
@@ -50,6 +53,7 @@ struct MemoryDbState {
     kv_store: BTreeMap<String, String>,
     tables: BTreeSet<String>,
     applied_migrations: BTreeSet<String>,
+    outbox: BTreeMap<String, OutboxMessage>,
     alive: bool,
 }
 
@@ -73,6 +77,7 @@ impl MemoryDatabase {
                 kv_store: BTreeMap::new(),
                 tables: BTreeSet::new(),
                 applied_migrations: BTreeSet::new(),
+                outbox: BTreeMap::new(),
                 alive: true,
             })),
         }
@@ -220,6 +225,7 @@ impl DatabaseBackend for MemoryDatabase {
 struct MemoryStagedState {
     kv: BTreeMap<String, Option<String>>,
     tables: BTreeSet<String>,
+    outbox: BTreeMap<String, Option<OutboxMessage>>,
 }
 
 /// Active transaction for the in-memory database.
@@ -228,6 +234,26 @@ pub struct MemoryTransaction {
     state: Arc<RwLock<MemoryDbState>>,
     staged: Arc<RwLock<MemoryStagedState>>,
     status: Arc<AtomicU8>, // 0: Active, 1: Committed, 2: RolledBack
+}
+
+impl MemoryTransaction {
+    /// Enlists an outbox message into this in-memory transaction.
+    ///
+    /// The message will only be committed to the database if `self.commit()` succeeds.
+    pub fn insert_outbox(&self, message: OutboxMessage) -> Result<(), PersistenceError> {
+        if self.status.load(Ordering::SeqCst) != 0 {
+            return Err(PersistenceError::TransactionError(
+                "transaction already resolved".into(),
+            ));
+        }
+
+        let mut staged = self
+            .staged
+            .write()
+            .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
+        staged.outbox.insert(message.id.clone(), Some(message));
+        Ok(())
+    }
 }
 
 impl DatabaseTransaction for MemoryTransaction {
@@ -339,6 +365,16 @@ impl DatabaseTransaction for MemoryTransaction {
             for tbl in std::mem::take(&mut staged.tables) {
                 state.tables.insert(tbl);
             }
+            for (id, opt_msg) in std::mem::take(&mut staged.outbox) {
+                match opt_msg {
+                    Some(msg) => {
+                        state.outbox.insert(id, msg);
+                    }
+                    None => {
+                        state.outbox.remove(&id);
+                    }
+                }
+            }
             Ok(())
         })
     }
@@ -348,6 +384,7 @@ impl DatabaseTransaction for MemoryTransaction {
             if let Ok(mut staged) = self.staged.write() {
                 staged.kv.clear();
                 staged.tables.clear();
+                staged.outbox.clear();
             }
             let _ = self
                 .status
@@ -363,10 +400,207 @@ impl Drop for MemoryTransaction {
             if let Ok(mut staged) = self.staged.write() {
                 staged.kv.clear();
                 staged.tables.clear();
+                staged.outbox.clear();
             }
             let _ = self
                 .status
                 .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst);
         }
+    }
+}
+
+impl OutboxRepository for MemoryDatabase {
+    fn save(&self, msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            state.outbox.insert(msg.id.clone(), msg);
+            Ok(())
+        })
+    }
+
+    fn fetch_pending(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let state = self
+                .state
+                .read()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let now = crate::outbox::message::current_timestamp();
+            let mut pending: Vec<OutboxMessage> = state
+                .outbox
+                .values()
+                .filter(|m| {
+                    m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t)
+                })
+                .cloned()
+                .collect();
+            pending.sort_by_key(|m| m.created_at);
+            pending.truncate(limit);
+            Ok(pending)
+        })
+    }
+
+    fn claim_pending_with_lease(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let now = crate::outbox::message::current_timestamp();
+            let mut pending_keys: Vec<(u64, String)> = state
+                .outbox
+                .values()
+                .filter(|m| {
+                    m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t)
+                })
+                .map(|m| (m.created_at, m.id.clone()))
+                .collect();
+            pending_keys.sort_by_key(|(ts, _)| *ts);
+
+            let mut claimed = Vec::new();
+            for (_, id) in pending_keys.into_iter().take(limit) {
+                if let Some(msg) = state.outbox.get_mut(&id) {
+                    msg.status = OutboxStatus::InFlight;
+                    msg.lease_token = Some(uuid::Uuid::new_v4().to_string());
+                    msg.lease_expires_at = Some(now + lease_duration_secs);
+                    claimed.push(msg.clone());
+                }
+            }
+            Ok(claimed)
+        })
+    }
+
+    fn mark_published(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            if let Some(msg) = state.outbox.get_mut(&id_str) {
+                msg.status = OutboxStatus::Published;
+                msg.last_error = None;
+                msg.next_retry_at = None;
+                msg.lease_token = None;
+                msg.lease_expires_at = None;
+            }
+            Ok(())
+        })
+    }
+
+    fn mark_failed(&self, id: &str, error: String) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            if let Some(msg) = state.outbox.get_mut(&id_str) {
+                msg.retry_count += 1;
+                msg.last_error = Some(error);
+                msg.lease_token = None;
+                msg.lease_expires_at = None;
+                let now = crate::outbox::message::current_timestamp();
+                let backoff_secs = 2u64.pow(msg.retry_count.saturating_sub(1));
+                msg.next_retry_at = Some(now + backoff_secs);
+
+                if msg.retry_count >= 5 {
+                    msg.status = OutboxStatus::Failed;
+                } else {
+                    msg.status = OutboxStatus::Pending;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn recover_expired_claims(
+        &self,
+        max_lease_age_secs: u64,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let now = crate::outbox::message::current_timestamp();
+            let mut recovered = 0;
+            for msg in state.outbox.values_mut() {
+                if msg.status == OutboxStatus::InFlight {
+                    let expired = match msg.lease_expires_at {
+                        Some(exp) => now >= exp,
+                        None => now >= msg.created_at + max_lease_age_secs,
+                    };
+                    if expired {
+                        msg.status = OutboxStatus::Pending;
+                        msg.lease_token = None;
+                        msg.lease_expires_at = None;
+                        recovered += 1;
+                    }
+                }
+            }
+            Ok(recovered)
+        })
+    }
+
+    fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let state = self
+                .state
+                .read()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let now = crate::outbox::message::current_timestamp();
+            Ok(state
+                .outbox
+                .values()
+                .filter(|m| {
+                    (m.status == OutboxStatus::Pending && m.next_retry_at.is_none_or(|t| now >= t))
+                        || m.status == OutboxStatus::InFlight
+                })
+                .count())
+        })
+    }
+
+    fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let state = self
+                .state
+                .read()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            Ok(state
+                .outbox
+                .values()
+                .filter(|m| m.status == OutboxStatus::Published)
+                .count())
+        })
+    }
+}
+
+impl TransactionalOutbox<MemoryTransaction> for MemoryDatabase {
+    fn save_tx<'a>(
+        &'a self,
+        tx: &'a MemoryTransaction,
+        message: OutboxMessage,
+    ) -> BoxFuture<'a, Result<(), OutboxError>> {
+        Box::pin(async move {
+            tx.insert_outbox(message)
+                .map_err(|e| OutboxError::Repository(e.to_string()))
+        })
     }
 }

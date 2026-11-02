@@ -185,3 +185,201 @@ async fn concurrent_relays_claim_disjoint_batches() {
     let remaining = repo.claim_pending(10).await.unwrap();
     assert_eq!(remaining.len(), 0);
 }
+
+#[tokio::test]
+async fn outbox_relay_drain_fails_closed_when_pending_count_errors() {
+    use rume::outbox::BoxFuture;
+
+    #[derive(Debug)]
+    struct FailingRepo;
+    impl OutboxRepository for FailingRepo {
+        fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn fetch_pending(
+            &self,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn claim_pending(
+            &self,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn claim_pending_with_lease(
+            &self,
+            _limit: usize,
+            _lease_duration_secs: u64,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+        fn mark_published(&self, _id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn mark_failed(
+            &self,
+            _id: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Err(OutboxError::Repository("database offline".into())) })
+        }
+        fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    let repo = Arc::new(FailingRepo);
+    let relay = OutboxRelay::new(repo, |_msg| async { Ok(()) });
+
+    let try_result = relay.try_drain(Duration::from_millis(50)).await;
+    assert!(
+        try_result.is_err(),
+        "try_drain must propagate repository error"
+    );
+
+    let drain_result = relay.drain(Duration::from_millis(50)).await;
+    assert!(
+        !drain_result,
+        "drain must return false when repository errors"
+    );
+}
+
+#[tokio::test]
+async fn transactional_outbox_commits_atomically_with_business_mutation() {
+    use rume::outbox::TransactionalOutbox;
+    use rume::persistence::{
+        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase,
+    };
+
+    let db = Arc::new(MemoryDatabase::new());
+    let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
+
+    let event = OrderPaidEvent {
+        order_id: "order_tx_success".into(),
+        amount_cents: 9900,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+
+    // Execute atomic business update + outbox enlistment
+    pool.transaction(|tx| {
+        let db = Arc::clone(&db);
+        async move {
+            tx.execute("SET order:order_tx_success = completed").await?;
+            db.save_tx(&tx, msg).await.unwrap();
+            Ok::<(), rume::persistence::PersistenceError>(())
+        }
+    })
+    .await
+    .unwrap();
+
+    // Verify both business data AND outbox message committed
+    let order_status = pool
+        .backend()
+        .query_scalar("GET order:order_tx_success")
+        .await
+        .unwrap();
+    assert_eq!(order_status.as_deref(), Some("completed"));
+
+    let pending = db.fetch_pending(10).await.unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, msg_id);
+    assert_eq!(pending[0].event_type, "order.paid");
+}
+
+#[tokio::test]
+async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
+    use rume::outbox::TransactionalOutbox;
+    use rume::persistence::{
+        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase,
+        PersistenceError,
+    };
+
+    let db = Arc::new(MemoryDatabase::new());
+    let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
+
+    let event = OrderPaidEvent {
+        order_id: "order_tx_fail".into(),
+        amount_cents: 4500,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+
+    // Transaction fails after enlisting outbox message
+    let tx_res = pool
+        .transaction(|tx| {
+            let db = Arc::clone(&db);
+            async move {
+                tx.execute("SET order:order_tx_fail = pending").await?;
+                db.save_tx(&tx, msg).await.unwrap();
+                Err::<(), PersistenceError>(PersistenceError::TransactionError(
+                    "simulated database abort".into(),
+                ))
+            }
+        })
+        .await;
+
+    assert!(tx_res.is_err());
+
+    // Both the business mutation AND the outbox message must be rolled back!
+    let order_status = pool
+        .backend()
+        .query_scalar("GET order:order_tx_fail")
+        .await
+        .unwrap();
+    assert_eq!(order_status, None);
+
+    let pending = db.fetch_pending(10).await.unwrap();
+    assert_eq!(
+        pending.len(),
+        0,
+        "rolled back outbox message must not be visible"
+    );
+}
+
+#[tokio::test]
+async fn outbox_claim_lease_recovery_of_abandoned_messages() {
+    let repo = Arc::new(MemoryOutboxRepository::new());
+
+    let event = OrderPaidEvent {
+        order_id: "order_abandoned".into(),
+        amount_cents: 1200,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    repo.save(msg).await.unwrap();
+
+    // 1. Worker claims the message with a 0-second lease (expires immediately)
+    let claimed = repo.claim_pending_with_lease(1, 0).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].status, OutboxStatus::InFlight);
+    assert!(claimed[0].lease_token.is_some());
+    assert!(claimed[0].lease_expires_at.is_some());
+
+    // Another worker immediate claim gets 0 messages
+    let claimed_second = repo.claim_pending(1).await.unwrap();
+    assert_eq!(claimed_second.len(), 0);
+
+    // 2. Simulating worker crash: time passes (lease expires after 0s with max_lease_age_secs = 0)
+    let recovered_count = repo.recover_expired_claims(0).await.unwrap();
+    assert_eq!(recovered_count, 1, "abandoned message must be recovered");
+
+    // 3. Message is now Pending again and can be claimed and published by the relay
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let cnt = Arc::clone(&dispatched);
+    let relay = OutboxRelay::new(Arc::clone(&repo), move |_msg| {
+        let cnt = Arc::clone(&cnt);
+        async move {
+            cnt.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    });
+
+    let published_count = relay.poll_and_dispatch(5).await.unwrap();
+    assert_eq!(published_count, 1);
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.pending_count().await.unwrap(), 0);
+}

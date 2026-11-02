@@ -48,6 +48,10 @@ pub struct OutboxMessage {
     pub last_error: Option<String>,
     /// Earliest timestamp before which this message should not be retried.
     pub next_retry_at: Option<u64>,
+    /// Unique token identifying the relay worker instance holding the claim lease.
+    pub lease_token: Option<String>,
+    /// Timestamp when the worker's exclusive claim lease expires.
+    pub lease_expires_at: Option<u64>,
 }
 
 impl OutboxMessage {
@@ -68,6 +72,8 @@ impl OutboxMessage {
             created_at: current_timestamp(),
             last_error: None,
             next_retry_at: None,
+            lease_token: None,
+            lease_expires_at: None,
         })
     }
 

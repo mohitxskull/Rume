@@ -57,6 +57,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
 
     /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
+        // Automatically reclaim any expired in-flight message leases before polling new items
+        let _ = self.repository.recover_expired_claims(30).await;
+
         let pending = self.repository.claim_pending(batch_size).await?;
         let mut published_count = 0;
 
@@ -82,28 +85,50 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         let relay = self.clone();
         tokio::spawn(async move {
             while !relay.is_stopping.load(Ordering::Relaxed) {
-                let _ = relay.poll_and_dispatch(50).await;
+                if let Err(err) = relay.poll_and_dispatch(50).await {
+                    tracing::error!(error = %err, "Outbox relay background dispatch error");
+                }
                 sleep(interval).await;
             }
         });
     }
 
     /// Requests shutdown and drains remaining pending messages within `timeout`.
-    pub async fn drain(&self, timeout: Duration) -> bool {
+    ///
+    /// Returns `Ok(true)` if all messages were drained, `Ok(false)` if the drain
+    /// timed out, or `Err(err)` if an unrecoverable repository error occurred while
+    /// checking pending count or dispatching messages.
+    pub async fn try_drain(&self, timeout: Duration) -> Result<bool, OutboxError> {
         self.is_stopping.store(true, Ordering::SeqCst);
         let start = std::time::Instant::now();
 
-        while let Ok(count) = self.repository.pending_count().await {
+        loop {
+            let count = self.repository.pending_count().await?;
             if count == 0 {
-                return true;
+                return Ok(true);
             }
             if start.elapsed() >= timeout {
-                return false;
+                tracing::warn!(
+                    remaining = count,
+                    "Outbox relay drain timed out with messages remaining"
+                );
+                return Ok(false);
             }
-            let _ = self.poll_and_dispatch(50).await;
+            self.poll_and_dispatch(50).await?;
             sleep(Duration::from_millis(20)).await;
         }
+    }
 
-        true
+    /// Requests shutdown and drains remaining pending messages within `timeout`.
+    ///
+    /// Returns `true` if all pending messages were drained, or `false` on timeout or repository error.
+    pub async fn drain(&self, timeout: Duration) -> bool {
+        match self.try_drain(timeout).await {
+            Ok(drained) => drained,
+            Err(err) => {
+                tracing::error!(error = %err, "Outbox relay failed to drain due to repository error");
+                false
+            }
+        }
     }
 }

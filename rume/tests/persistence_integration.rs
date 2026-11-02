@@ -308,3 +308,48 @@ async fn module_persistence_end_to_end() {
     let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
     assert_eq!(val["created"], "acc_42");
 }
+
+#[tokio::test]
+async fn pool_acquire_timeout_and_graceful_drain() {
+    use std::time::Duration;
+
+    let config = DatabaseConfig::new("memory://test")
+        .with_min_connections(1)
+        .with_max_connections(1)
+        .with_connect_timeout(1);
+
+    let pool = DatabasePool::new(MemoryDatabase::new(), config);
+
+    // Hold the single available connection permit
+    let lease1 = pool
+        .acquire_lease_timeout(Duration::from_millis(50))
+        .await
+        .expect("first lease should succeed");
+
+    // Second acquisition times out waiting for permit
+    let timeout_res = pool.acquire_lease_timeout(Duration::from_millis(20)).await;
+    assert!(matches!(timeout_res, Err(PersistenceError::Timeout)));
+
+    // Spawn async release after 30ms
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        drop(lease1);
+    });
+
+    // Third acquisition waits and successfully acquires once lease1 drops
+    let lease2 = pool
+        .acquire_lease_timeout(Duration::from_millis(150))
+        .await
+        .expect("should acquire after permit freed");
+
+    // Now test close_and_drain:
+    // If lease2 is held, close_and_drain times out if timeout is too short
+    let drained_early = pool.close_and_drain(Duration::from_millis(10)).await;
+    assert!(!drained_early, "should not drain while lease is active");
+
+    drop(lease2);
+
+    let drained_clean = pool.close_and_drain(Duration::from_millis(50)).await;
+    assert!(drained_clean, "should cleanly drain once lease is released");
+    assert!(pool.status().is_closed);
+}

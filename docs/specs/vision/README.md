@@ -186,6 +186,7 @@ Rume defines production readiness through strict, verifiable guarantees:
 
 The phased engineering execution plan for this vision is detailed in **[`ROADMAP.md`](ROADMAP.md)**:
 * **Phase 1: Progressive Application Architecture** (`ARCH-01` through `ARCH-07`) — *Completed & verified*
-* **Phase 2: Complete Application Capabilities** (`CAP-01` through `CAP-08`) — *Next phase*
-* **Phase 3: Enterprise Reliability** (`ENT-01` through `ENT-08`) — *Planned*
-* **Phase 4: Framework Maturation** — *Future consideration*
+* **Phase 2: Complete Application Capabilities** (`CAP-01` through `CAP-08`) — *Completed & verified*
+* **Phase 3: Enterprise Reliability** (`ENT-01` through `ENT-08`) — *Completed & verified*
+* **Phase 4: Framework Maturation** (`MAT-01` through `MAT-03`) — *Completed & verified*
+* **Phase 5: Production Semantics and Integration** (`REL-01` through `REL-07`) — *Active phase: genuine persistence, transactional outbox atomicity, shared coordination, and resilient multi-process integration*
