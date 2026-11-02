@@ -31,6 +31,9 @@ pub use crate::openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
 };
+pub use crate::outbox::{
+    MemoryOutboxRepository, OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
+};
 pub use crate::persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
 };

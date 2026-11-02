@@ -17,6 +17,7 @@ pub mod helpers;
 pub mod jobs;
 pub mod module;
 pub mod openapi;
+pub mod outbox;
 pub mod persistence;
 pub mod prelude;
 pub mod routing;
@@ -50,6 +51,9 @@ pub use module::{Module, ModuleContext, ModuleError};
 pub use openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
+};
+pub use outbox::{
+    MemoryOutboxRepository, OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
 };
 pub use persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,

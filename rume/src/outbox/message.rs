@@ -1,0 +1,73 @@
+//! Outbox message model and state representation.
+
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::events::Event;
+use crate::outbox::error::OutboxError;
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// Lifecycle status of an outbox message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutboxStatus {
+    /// Message is waiting to be published by the relay.
+    Pending,
+    /// Message was successfully published to the event bus or broker.
+    Published,
+    /// Message failed to publish and exceeded retry thresholds.
+    Failed,
+}
+
+/// A durable outbox message stored atomically within a database transaction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutboxMessage {
+    /// Unique identifier for this outbox entry.
+    pub id: String,
+    /// Canonical event type identifier.
+    pub event_type: String,
+    /// Serialized JSON event payload.
+    pub payload: Vec<u8>,
+    /// Current publication status.
+    pub status: OutboxStatus,
+    /// Number of relay delivery attempts.
+    pub retry_count: u32,
+    /// Timestamp when this message was enqueued.
+    pub created_at: u64,
+    /// Diagnostic error message if the last delivery attempt failed.
+    pub last_error: Option<String>,
+}
+
+impl OutboxMessage {
+    /// Creates a new outbox message from a serializable event.
+    pub fn from_event<E>(event: &E) -> Result<Self, OutboxError>
+    where
+        E: Event + Serialize,
+    {
+        let payload =
+            serde_json::to_vec(event).map_err(|e| OutboxError::Serialization(e.to_string()))?;
+
+        Ok(Self {
+            id: Uuid::new_v4().to_string(),
+            event_type: E::TYPE.to_string(),
+            payload,
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at: current_timestamp(),
+            last_error: None,
+        })
+    }
+
+    /// Deserializes the stored payload into a concrete typed event.
+    pub fn deserialize_payload<E: serde::de::DeserializeOwned>(&self) -> Result<E, OutboxError> {
+        serde_json::from_slice(&self.payload).map_err(|e| OutboxError::Serialization(e.to_string()))
+    }
+}
