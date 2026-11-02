@@ -1,6 +1,7 @@
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::{get, post};
 use rume::prelude::*;
+use rume::security::*;
 
 #[tokio::test]
 async fn test_default_security_headers() {

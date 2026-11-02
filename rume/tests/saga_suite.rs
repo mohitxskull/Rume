@@ -1,4 +1,4 @@
-use rume::prelude::*;
+use rume::saga::*;
 
 #[derive(Default, Debug, Clone)]
 struct OrderContext {

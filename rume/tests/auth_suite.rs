@@ -1,6 +1,7 @@
 use axum::Json;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
+use rume::auth::*;
 use rume::error::AppError;
 use rume::prelude::*;
 

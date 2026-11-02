@@ -131,9 +131,25 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
                 path: full_path,
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
+                matchers: Vec::new(),
             });
             self.router = self.router.merge(sub_router);
         }
+        self
+    }
+
+    /// Apply a Tower layer to all routes in this group.
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.router = self.router.layer(layer);
         self
     }
 
@@ -193,5 +209,20 @@ mod tests {
         assert_eq!(router.routes()[0].path, "/api/v1/users");
         assert_eq!(router.routes()[1].path, "/api/v1/users/{id}");
         assert_eq!(router.routes()[1].params, vec!["id"]);
+    }
+
+    #[tokio::test]
+    async fn route_group_applies_layer() {
+        use crate::testing::TestApp;
+
+        let group = RouteGroup::<()>::new()
+            .prefix("/api")
+            .get("/ping", dummy_handler)
+            .layer(tower::layer::util::Identity::new());
+
+        let app = TestApp::new(group.build());
+        let res = app.get("/api/ping").await;
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+        assert_eq!(TestApp::body_text(res).await, "ok");
     }
 }

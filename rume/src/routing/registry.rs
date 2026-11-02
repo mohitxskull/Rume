@@ -7,6 +7,8 @@
 use axum::http::Method;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+use crate::routing::matchers::Matcher;
+
 mod method_serde {
     use super::*;
 
@@ -34,6 +36,32 @@ pub struct RouteInfo {
     pub path: String,
     pub name: Option<String>,
     pub params: Vec<String>,
+    #[serde(default)]
+    pub matchers: Vec<(String, Matcher)>,
+}
+
+impl RouteInfo {
+    /// Create a new `RouteInfo` without matchers.
+    pub fn new(
+        method: Method,
+        path: impl Into<String>,
+        name: Option<String>,
+        params: Vec<String>,
+    ) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            name,
+            params,
+            matchers: Vec::new(),
+        }
+    }
+
+    /// Attach declared parameter matchers.
+    pub fn with_matchers(mut self, matchers: Vec<(String, Matcher)>) -> Self {
+        self.matchers = matchers;
+        self
+    }
 }
 
 /// Application-scoped route registry. Each Rume application owns its own
@@ -143,12 +171,14 @@ mod tests {
             path: "/users".to_string(),
             name: Some("users.index".to_string()),
             params: vec![],
+            matchers: vec![],
         });
         registry.register(RouteInfo {
             method: Method::POST,
             path: "/users".to_string(),
             name: Some("users.create".to_string()),
             params: vec![],
+            matchers: vec![],
         });
 
         assert_eq!(registry.len(), 2);

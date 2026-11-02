@@ -353,6 +353,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -369,6 +370,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -385,6 +387,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -401,6 +404,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -417,6 +421,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -433,6 +438,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -446,6 +452,7 @@ where
                 path: r.path.clone(),
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
+                matchers: Vec::new(),
             });
         }
         self
@@ -465,6 +472,7 @@ where
                 path: crate::routing::registry::join_path(path, &r.path),
                 name: r.name.clone(),
                 params: r.params.clone(),
+                matchers: r.matchers.clone(),
             });
         }
         self
@@ -535,6 +543,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -708,6 +717,7 @@ where
             path: path.to_string(),
             name: None,
             params: crate::routing::registry::extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -723,6 +733,30 @@ where
         self.router = self.router.merge(axum_router);
         self.route_registry.extend(registry);
         self
+    }
+
+    /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
+    pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
+        let spec = self.route_registry.to_openapi(info);
+        let json_value = spec.to_json_value();
+        self.get(path, move || {
+            let val = json_value.clone();
+            async move { axum::Json(val) }
+        })
+    }
+
+    /// Mounts a Prometheus text metrics scraping route at the specified path (e.g. `/metrics`).
+    pub fn metrics(self, path: &str, registry: crate::metrics::MetricsRegistry) -> Self {
+        self.get(path, move || {
+            let reg = registry.clone();
+            async move {
+                let body = reg.render_prometheus();
+                axum::response::Response::builder()
+                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
+                    .body(axum::body::Body::from(body))
+                    .unwrap()
+            }
+        })
     }
 
     /// Replace the application router.

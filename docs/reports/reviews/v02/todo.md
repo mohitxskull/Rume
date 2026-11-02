@@ -111,19 +111,19 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 
 ### Group I — Public API Ergonomics & Prelude Hygiene (solve together)
 
-- [ ] **Architecture M1 — Over-broad `prelude.rs` leaks niche enterprise schemas and string helpers** (`architecture.md` M1).
+- [x] **Architecture M1 — Over-broad `prelude.rs` leaks niche enterprise schemas and string helpers** (`architecture.md` M1).
       `rume/src/prelude.rs:14–25`: Prelude re-exports `ScimUser`, `SamlParser`, `DistributedLock`, `slug`, `escape_html`, cluttering autocomplete. Restrict prelude to everyday application staples; place protocols in `rume::enterprise::*`.
-- [ ] **DX M1 — OpenAPI 3.1 generator discards route parameter matchers and uses substring heuristics** (`dx-tooling.md` M1).
+- [x] **DX M1 — OpenAPI 3.1 generator discards route parameter matchers and uses substring heuristics** (`dx-tooling.md` M1).
       `rume/src/openapi/generator.rs:85–115`: Schema types are guessed from substring patterns (`param.contains("uuid")`) instead of inspecting `RouteSpec.matchers`. Propagate declared `Matcher` types into OpenAPI parameter schemas.
-- [ ] **DX M2 — `AppContext::builder` fails to infer state generic and requires `S: Default`** (`dx-tooling.md` M2).
+- [x] **DX M2 — `AppContext::builder` fails to infer state generic and requires `S: Default`** (`dx-tooling.md` M2).
       `rume/src/app/context.rs:50–80`: Builder forces users to call `AppContext::new` with 6 positional arguments. Provide `AppContext::builder()` with sensible default state or `new_with_defaults()`.
-- [ ] **DX M3 — Configuration provenance reporting is entirely absent** (`dx-tooling.md` M3).
+- [x] **DX M3 — Configuration provenance reporting is entirely absent** (`dx-tooling.md` M3).
       `rume/src/config/loader.rs:30–60`: Config loader cannot report which file or env var supplied a given setting. Expose Figment provider provenance or metadata inspector.
-- [ ] **DX M4 — Environment interpolation error formatting hides variable name via escaped braces** (`dx-tooling.md` M4).
+- [x] **DX M4 — Environment interpolation error formatting hides variable name via escaped braces** (`dx-tooling.md` M4).
       `rume/src/env/interpolation.rs:45–60`: Error string displays literal `${{variable}}` instead of actual unresolved key. Fix format string to show the missing variable name.
-- [ ] **DX m4 — `RouteGroup` lacks fluent `.layer()` middleware mounting method** (`dx-tooling.md` m4).
+- [x] **DX m4 — `RouteGroup` lacks fluent `.layer()` middleware mounting method** (`dx-tooling.md` m4).
       `rume/src/routing/group.rs:60–80`: `RouteGroup` allows adding routes but cannot mount group-wide Tower middleware. Add `.layer(L)` to `RouteGroup`.
-- [ ] **DX m5 / Architecture m5 — `RumeBuilder` lacks fluent `.openapi()`, `.metrics()`, and state transition** (`dx-tooling.md` m5, `architecture.md` m5).
+- [x] **DX m5 / Architecture m5 — `RumeBuilder` lacks fluent `.openapi()`, `.metrics()`, and state transition** (`dx-tooling.md` m5, `architecture.md` m5).
       `rume/src/app/builder.rs:75–130`: OpenAPI and Prometheus endpoints can only be mounted on inner `Router`, not `RumeBuilder`. Add `.openapi()` and `.metrics()` directly to `RumeBuilder`.
 
 ### Group J — Scaffolding, CLI & Template Alignment (solve together)

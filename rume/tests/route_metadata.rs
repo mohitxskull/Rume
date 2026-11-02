@@ -217,6 +217,7 @@ async fn route_registry_serialization_round_trip() {
         path: "/webhooks/{id}".to_string(),
         name: Some("webhooks.receive".to_string()),
         params: vec!["id".to_string()],
+        matchers: vec![],
     });
 
     let json = serde_json::to_string(&reg).expect("failed to serialize RouteRegistry");

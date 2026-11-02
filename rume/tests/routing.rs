@@ -148,6 +148,7 @@ async fn route_registry_metadata_is_correct() {
         path: path.clone(),
         name: name.clone(),
         params: params.iter().map(|(n, _)| n.clone()).collect(),
+        matchers: params,
     });
 
     let routes = registry.routes();

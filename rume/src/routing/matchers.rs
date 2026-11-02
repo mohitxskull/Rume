@@ -3,6 +3,7 @@
 //! Provides the [`Matcher`] enum used with [`crate::routing::RouteSpec::where_param`]
 //! to validate route parameters such as `:id`, `:slug`, etc.
 
+use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
 
 /// A route parameter matcher.
@@ -16,7 +17,7 @@ use std::fmt::Debug;
 ///   parsed number). Overflowing digit strings (e.g. u64::MAX+1) are rejected.
 /// - [`Matcher::Uuid`] — UUID format (8-4-4-4-12 hex chars); returns lowercase.
 /// - [`Matcher::Slug`] — URL-friendly slug; returns the string as-is.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Matcher {
     /// Matches digits only, returns the string as-is.
     ///

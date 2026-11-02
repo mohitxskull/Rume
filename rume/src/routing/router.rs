@@ -55,6 +55,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -71,6 +72,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -87,6 +89,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -103,6 +106,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -119,6 +123,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -135,6 +140,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -156,6 +162,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -198,6 +205,7 @@ where
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
+            matchers: Vec::new(),
         });
         self
     }
@@ -219,6 +227,7 @@ where
         let path = spec.path().to_string();
         let name = spec.name().map(String::from);
         let params = spec.param_names();
+        let matchers = spec.params().to_vec();
         let validation_layer = spec.validation_layer();
 
         let method_router = match method {
@@ -237,6 +246,7 @@ where
             path,
             name,
             params,
+            matchers,
         });
         self
     }
@@ -253,6 +263,7 @@ where
                 path: r.path.clone(),
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
+                matchers: Vec::new(),
             });
         }
         self
@@ -270,6 +281,7 @@ where
                 path: join_path(path, &r.path),
                 name: r.name.clone(),
                 params: r.params.clone(),
+                matchers: r.matchers.clone(),
             });
         }
         self

@@ -1,4 +1,4 @@
-use rume::prelude::*;
+use rume::coordination::*;
 use std::time::Duration;
 
 #[tokio::test]

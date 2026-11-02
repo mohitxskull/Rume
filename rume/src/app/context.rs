@@ -77,12 +77,18 @@ where
             state,
         }
     }
+}
 
-    /// Start building an `AppContext` with sensible defaults.
+impl<E, C> AppContext<E, C, ()>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+{
+    /// Start building an `AppContext` with default `state = ()`.
     ///
     /// Required: `env` and `config`. Optional: `paths`, `availability`, `health_checks`, `state`.
-    /// Defaults: `ProjectPaths::from_current_dir()`, `Availability::new()`, `HealthChecks::new()`.
-    pub fn builder(env: E, config: C) -> AppContextBuilder<E, C, S> {
+    /// Defaults: `ProjectPaths::from_current_dir()`, `Availability::new()`, `HealthChecks::new()`, `state = ()`.
+    pub fn builder(env: E, config: C) -> AppContextBuilder<E, C, ()> {
         AppContextBuilder {
             env,
             config,
@@ -90,8 +96,13 @@ where
             availability: None,
             health_checks: None,
             route_registry: None,
-            state: None,
+            state: (),
         }
+    }
+
+    /// Convenience constructor with sensible default paths, availability, health checks, and `state = ()`.
+    pub fn new_with_defaults(env: E, config: C) -> Self {
+        Self::builder(env, config).build()
     }
 }
 
@@ -108,7 +119,7 @@ where
     availability: Option<crate::app::state::Availability>,
     health_checks: Option<HealthChecks>,
     route_registry: Option<RouteRegistry>,
-    state: Option<S>,
+    state: S,
 }
 
 impl<E, C, S> AppContextBuilder<E, C, S>
@@ -141,21 +152,26 @@ where
         self
     }
 
-    /// Set the application state (db pool, redis, HTTP client, …).
-    /// Defaults to `S::default()` (`()` when `S = ()`).
-    pub fn state(mut self, state: S) -> Self {
-        self.state = Some(state);
-        self
+    /// Transition to custom application state (db pool, redis, HTTP client, …).
+    ///
+    /// Does NOT require `NewS: Default`.
+    pub fn state<NewS>(self, state: NewS) -> AppContextBuilder<E, C, NewS>
+    where
+        NewS: Clone + Send + Sync + 'static,
+    {
+        AppContextBuilder {
+            env: self.env,
+            config: self.config,
+            paths: self.paths,
+            availability: self.availability,
+            health_checks: self.health_checks,
+            route_registry: self.route_registry,
+            state,
+        }
     }
 
     /// Build the `AppContext`.
-    ///
-    /// Requires `S: Default` so the state field can fall back to `S::default()`
-    /// when `.state()` was not called.
-    pub fn build(self) -> AppContext<E, C, S>
-    where
-        S: Default,
-    {
+    pub fn build(self) -> AppContext<E, C, S> {
         AppContext {
             env: self.env,
             config: self.config,
@@ -164,7 +180,7 @@ where
             lifecycle: crate::app::state::Lifecycle::new(),
             health_checks: self.health_checks.unwrap_or_default(),
             route_registry: self.route_registry.unwrap_or_default(),
-            state: self.state.unwrap_or_default(),
+            state: self.state,
         }
     }
 }
@@ -204,5 +220,24 @@ mod tests {
         assert_eq!(ctx.paths.root, custom_paths.root);
         assert_eq!(ctx.paths.config, custom_paths.config);
         assert_eq!(ctx.paths.public, custom_paths.public);
+    }
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    struct CustomNonDefaultState {
+        id: u64,
+    }
+
+    #[test]
+    fn app_context_builder_non_default_state_and_inference() {
+        // No explicit type annotation required on builder call
+        let ctx = AppContext::builder(
+            "production".to_string(),
+            std::collections::BTreeMap::<String, String>::new(),
+        )
+        .state(CustomNonDefaultState { id: 42 })
+        .build();
+
+        assert_eq!(ctx.state, CustomNonDefaultState { id: 42 });
+        assert_eq!(ctx.env, "production");
     }
 }

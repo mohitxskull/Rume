@@ -1,4 +1,4 @@
-use rume::prelude::*;
+use rume::enterprise::*;
 
 #[test]
 fn test_scim_models_and_json_serialization() {

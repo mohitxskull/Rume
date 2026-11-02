@@ -161,18 +161,31 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
 
         let mut parameters = Vec::new();
         for param in &route.params {
+            let schema = if let Some((_, matcher)) = route.matchers.iter().find(|(p, _)| p == param)
+            {
+                match matcher {
+                    crate::routing::Matcher::Number => OpenApiSchema::integer(),
+                    crate::routing::Matcher::Uuid => OpenApiSchema::uuid(),
+                    crate::routing::Matcher::Slug => OpenApiSchema {
+                        r#type: "string".into(),
+                        format: None,
+                        pattern: Some("^[a-z0-9]+(?:-[a-z0-9]+)*$".into()),
+                    },
+                }
+            } else if param.contains("uuid") {
+                OpenApiSchema::uuid()
+            } else if param.contains("id") || param.contains("count") {
+                OpenApiSchema::integer()
+            } else {
+                OpenApiSchema::string()
+            };
+
             parameters.push(OpenApiParameter {
                 name: param.clone(),
                 r#in: OpenApiParameterIn::Path,
                 required: true,
                 description: None,
-                schema: if param.contains("uuid") {
-                    OpenApiSchema::uuid()
-                } else if param.contains("id") || param.contains("count") {
-                    OpenApiSchema::integer()
-                } else {
-                    OpenApiSchema::string()
-                },
+                schema,
             });
         }
 

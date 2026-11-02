@@ -20,10 +20,10 @@ pub enum EnvError {
         source: dotenvy::Error,
     },
 
-    #[error("failed to interpolate ${{variable}}: variable not found")]
+    #[error("failed to interpolate ${{{variable}}}: variable not found")]
     Interpolation { variable: String },
 
-    #[error("circular reference detected while interpolating ${{variable}}")]
+    #[error("circular reference detected while interpolating ${{{variable}}}")]
     CircularReference { variable: String },
 
     #[error("maximum interpolation depth ({depth}) exceeded while interpolating ${{{variable}}}")]

@@ -39,6 +39,32 @@ async fn minimal_stateless_application() {
     assert_eq!(body_string(res).await, "Hello, Rume!");
 }
 
+#[tokio::test]
+async fn builder_mounts_openapi_and_metrics_endpoints() {
+    let registry = rume::metrics::MetricsRegistry::new();
+    registry.record_http_request("GET", 200, std::time::Duration::from_millis(5));
+
+    let openapi_info = rume::openapi::OpenApiInfo::new("App API", "1.0.0");
+
+    let app = Rume::new()
+        .get("/hello", || async { "world" })
+        .openapi("/openapi.json", openapi_info)
+        .metrics("/metrics", registry)
+        .test_app()
+        .expect("build app");
+
+    let res = app.get("/openapi.json").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let doc: serde_json::Value = body_json(res).await;
+    assert_eq!(doc["info"]["title"], "App API");
+    assert!(doc["paths"]["/hello"].is_object());
+
+    let res = app.get("/metrics").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let metrics_text = body_string(res).await;
+    assert!(metrics_text.contains("http_requests_total"));
+}
+
 // ============================================================================
 // 2. Stateful Application with Two Modules (Encapsulated Scoped State)
 // ============================================================================

@@ -1,8 +1,9 @@
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use rume::cache::MemoryCacheBackend;
+use rume::cache::{Cache, CacheConfig, MemoryCacheBackend};
 use rume::prelude::*;
+use rume::tenant::*;
 
 #[tokio::test]
 async fn test_header_tenant_resolver_success_and_context_extractor() {

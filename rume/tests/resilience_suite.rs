@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use rume::prelude::*;
+use rume::resilience::*;
 use tokio::time::sleep;
 
 #[tokio::test]

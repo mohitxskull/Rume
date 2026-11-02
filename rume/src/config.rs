@@ -3,16 +3,106 @@
 //! Configuration is kept declarative: projects use TOML files under `config/`,
 //! validated into ordinary Rust structs at boot.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use figment::Figment;
 use figment::providers::Format;
 use figment::providers::Toml;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// A convenience alias for configuration loading results.
 pub type Result<T> = std::result::Result<T, ConfigError>;
+
+/// Detailed explanation for a single configuration key's provenance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigKeyExplanation {
+    /// The configuration key path (e.g. `server.port`).
+    pub key: String,
+    /// The resolved winning value for this key, if found.
+    pub value: Option<toml::Value>,
+    /// The file path that provided the winning value.
+    pub winning_file: Option<PathBuf>,
+    /// The candidate configuration files loaded in order of precedence.
+    pub candidate_precedence: Vec<PathBuf>,
+}
+
+/// Source provenance map for loaded configuration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ConfigSourceMap {
+    /// Maps dotted configuration keys (e.g. `server.port`) to the winning configuration file.
+    pub sources: BTreeMap<String, PathBuf>,
+    /// The loaded configuration files in ascending precedence order (last overrides previous).
+    pub loaded_files: Vec<PathBuf>,
+    /// The raw merged TOML value.
+    pub raw: toml::Value,
+}
+
+impl Default for ConfigSourceMap {
+    fn default() -> Self {
+        Self {
+            sources: BTreeMap::new(),
+            loaded_files: Vec::new(),
+            raw: toml::Value::Table(toml::map::Map::new()),
+        }
+    }
+}
+
+impl ConfigSourceMap {
+    /// Explain the provenance and winning value of a given configuration key.
+    pub fn explain(&self, key: &str) -> ConfigKeyExplanation {
+        let winning_file = self.sources.get(key).cloned();
+        let value = lookup_dotted_value(&self.raw, key);
+        ConfigKeyExplanation {
+            key: key.to_string(),
+            value,
+            winning_file,
+            candidate_precedence: self.loaded_files.clone(),
+        }
+    }
+}
+
+fn flatten_toml(
+    prefix: &str,
+    value: &toml::Value,
+    out: &mut BTreeMap<String, PathBuf>,
+    file: &Path,
+) {
+    match value {
+        toml::Value::Table(table) => {
+            for (k, v) in table {
+                let full_key = if prefix.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{prefix}.{k}")
+                };
+                out.insert(full_key.clone(), file.to_path_buf());
+                flatten_toml(&full_key, v, out, file);
+            }
+        }
+        _ => {
+            if !prefix.is_empty() {
+                out.insert(prefix.to_string(), file.to_path_buf());
+            }
+        }
+    }
+}
+
+fn lookup_dotted_value(root: &toml::Value, key: &str) -> Option<toml::Value> {
+    let mut current = root;
+    for part in key.split('.') {
+        match current {
+            toml::Value::Table(table) => {
+                current = table.get(part)?;
+            }
+            _ => return None,
+        }
+    }
+    Some(current.clone())
+}
+
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("no configuration file found in {dir}")]
@@ -56,6 +146,59 @@ pub fn load_raw(dir: &Path) -> Result<toml::Value> {
 pub fn load_raw_pretty(dir: &Path) -> Result<String> {
     let value = load_raw(dir)?;
     toml::to_string_pretty(&value).map_err(|err| ConfigError::Validation(err.to_string()))
+}
+
+/// Load the configuration source map rooted at `dir`, tracking winning provenance per key.
+pub fn source_map(dir: &Path) -> Result<ConfigSourceMap> {
+    let env_name = crate::env::resolve_env_name();
+
+    let candidates = [
+        dir.join("config").join("app.toml"),
+        dir.join("config").join(format!("app.{env_name}.toml")),
+        dir.join("config").join("app.local.toml"),
+        dir.join("config")
+            .join(format!("app.{env_name}.local.toml")),
+    ];
+
+    let mut sources = BTreeMap::new();
+    let mut loaded_files = Vec::new();
+    let mut found = false;
+
+    for path in candidates {
+        if path.is_file() {
+            if let Ok(content) = std::fs::read_to_string(&path)
+                && let Ok(val) = toml::from_str::<toml::Value>(&content)
+            {
+                flatten_toml("", &val, &mut sources, &path);
+            }
+            loaded_files.push(path);
+            found = true;
+        }
+    }
+
+    if !found {
+        return Err(ConfigError::NotFound {
+            dir: dir.to_path_buf(),
+        });
+    }
+
+    let raw = load_raw(dir)?;
+
+    Ok(ConfigSourceMap {
+        sources,
+        loaded_files,
+        raw,
+    })
+}
+
+/// Load and validate a typed configuration along with its source provenance map.
+pub fn load_with_provenance<T>(dir: &Path) -> Result<(T, ConfigSourceMap)>
+where
+    T: DeserializeOwned,
+{
+    let val = load_in::<T>(dir)?;
+    let map = source_map(dir)?;
+    Ok((val, map))
 }
 
 fn build_figment(dir: &Path) -> Result<Figment> {
@@ -113,11 +256,10 @@ mod tests {
 
     #[test]
     fn load_raw_not_found_when_no_config() {
-        let dir = std::env::temp_dir().join("rume_config_test_not_found");
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).ok();
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
 
-        let result = load_raw(&dir);
+        let result = load_raw(dir);
         assert!(result.is_err());
         match result.unwrap_err() {
             ConfigError::NotFound { dir: found_dir } => {
@@ -125,58 +267,85 @@ mod tests {
             }
             _ => panic!("expected ConfigError::NotFound"),
         }
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_raw_reads_app_toml() {
-        let dir = std::env::temp_dir().join("rume_config_test_app_toml");
-        let _ = fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         fs::create_dir_all(dir.join("config")).ok();
 
-        write_config(&dir, "app.toml", "app_name = \"test\"\nport = 3000\n");
+        write_config(dir, "app.toml", "app_name = \"test\"\nport = 3000\n");
 
-        let result = load_raw(&dir);
+        let result = load_raw(dir);
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value.get("app_name").and_then(|v| v.as_str()), Some("test"));
         assert_eq!(value.get("port").and_then(|v| v.as_integer()), Some(3000));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_raw_pretty_returns_valid_toml() {
-        let dir = std::env::temp_dir().join("rume_config_test_pretty");
-        let _ = fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         fs::create_dir_all(dir.join("config")).ok();
 
-        write_config(&dir, "app.toml", "key = \"value\"\n");
+        write_config(dir, "app.toml", "key = \"value\"\n");
 
-        let result = load_raw_pretty(&dir);
+        let result = load_raw_pretty(dir);
         assert!(result.is_ok());
         let text = result.unwrap();
         assert!(text.contains("key"));
         assert!(text.contains("value"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_raw_local_toml_is_loaded() {
-        let dir = std::env::temp_dir().join("rume_config_test_local");
-        let _ = fs::remove_dir_all(&dir);
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
         fs::create_dir_all(dir.join("config")).ok();
 
-        write_config(&dir, "app.toml", "key = \"base\"\n");
-        write_config(&dir, "app.local.toml", "key = \"local\"\n");
+        write_config(dir, "app.toml", "key = \"base\"\n");
+        write_config(dir, "app.local.toml", "key = \"local\"\n");
 
-        let result = load_raw(&dir);
+        let result = load_raw(dir);
         assert!(result.is_ok());
         let value = result.unwrap();
         assert_eq!(value.get("key").and_then(|v| v.as_str()), Some("local"));
+    }
 
-        let _ = fs::remove_dir_all(&dir);
+    #[test]
+    fn config_source_map_tracks_winning_file_provenance() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        fs::create_dir_all(dir.join("config")).ok();
+
+        write_config(
+            dir,
+            "app.toml",
+            "[server]\nport = 8080\nhost = \"127.0.0.1\"\n",
+        );
+        write_config(dir, "app.local.toml", "[server]\nport = 3000\n");
+
+        let sm = source_map(dir).expect("source map");
+
+        let port_explain = sm.explain("server.port");
+        assert_eq!(port_explain.key, "server.port");
+        assert_eq!(port_explain.value, Some(toml::Value::Integer(3000)));
+        assert_eq!(
+            port_explain.winning_file,
+            Some(dir.join("config").join("app.local.toml"))
+        );
+
+        let host_explain = sm.explain("server.host");
+        assert_eq!(host_explain.key, "server.host");
+        assert_eq!(
+            host_explain.value,
+            Some(toml::Value::String("127.0.0.1".into()))
+        );
+        assert_eq!(
+            host_explain.winning_file,
+            Some(dir.join("config").join("app.toml"))
+        );
     }
 }

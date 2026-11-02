@@ -152,6 +152,10 @@ mod tests {
         let vars = BTreeMap::new();
         let err = interpolate_value("${MISSING}", &vars).unwrap_err();
         assert!(matches!(err, EnvError::Interpolation { .. }));
+        assert_eq!(
+            err.to_string(),
+            "failed to interpolate ${MISSING}: variable not found"
+        );
     }
 
     #[test]
@@ -162,6 +166,10 @@ mod tests {
         ]);
         let err = interpolate_value("${A}", &vars).unwrap_err();
         assert!(matches!(err, EnvError::CircularReference { .. }));
+        assert_eq!(
+            err.to_string(),
+            "circular reference detected while interpolating ${A}"
+        );
     }
 
     #[test]
