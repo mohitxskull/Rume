@@ -44,12 +44,14 @@ deadpool-postgres = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
+mysql_async = { workspace = true, optional = true }
 
 [features]
 default = ["sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 redis = ["dep:deadpool-redis", "dep:redis"]
 sqlite = ["dep:rusqlite"]
+mysql = ["dep:mysql_async"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

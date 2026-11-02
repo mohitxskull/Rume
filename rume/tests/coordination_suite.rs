@@ -1,10 +1,33 @@
-use rume::coordination::*;
 use std::time::Duration;
+use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+use rume::coordination::*;
+
+async fn start_redis_coordination() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
+    RedisDistributedLock,
+    RedisLeaderElector,
+) {
+    let node = Redis::default().start().await.expect("start redis node");
+    let port = node
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("get redis port");
+    let url = format!("redis://127.0.0.1:{port}");
+    let pool_cfg = deadpool_redis::Config::from_url(&url);
+    let pool = pool_cfg
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .expect("create redis pool");
+    let lock = RedisDistributedLock::new(pool.clone());
+    let elector = RedisLeaderElector::new(pool);
+    (node, lock, elector)
+}
 
 #[tokio::test]
 async fn test_distributed_lock_exclusive_and_fencing() {
-    let lock_service = MemoryDistributedLock::new();
-    let ttl = Duration::from_millis(50);
+    let (_node, lock_service, _elector) = start_redis_coordination().await;
+    let ttl = Duration::from_millis(1500);
 
     // 1. Client A acquires lock
     let guard_a = lock_service.acquire("db-export", ttl).await.unwrap();
@@ -19,7 +42,7 @@ async fn test_distributed_lock_exclusive_and_fencing() {
 
     // 3. Client A renews lock
     lock_service
-        .renew(&guard_a, Duration::from_millis(100))
+        .renew(&guard_a, Duration::from_millis(2000))
         .await
         .unwrap();
 
@@ -36,9 +59,8 @@ async fn test_distributed_lock_exclusive_and_fencing() {
 
 #[tokio::test]
 async fn test_distributed_lock_ttl_auto_expiration() {
-    tokio::time::pause();
-    let lock_service = MemoryDistributedLock::new();
-    let ttl = Duration::from_millis(20);
+    let (_node, lock_service, _elector) = start_redis_coordination().await;
+    let ttl = Duration::from_millis(200);
 
     // Client A acquires short lock
     let guard_a = lock_service
@@ -48,8 +70,8 @@ async fn test_distributed_lock_ttl_auto_expiration() {
         .unwrap();
     assert_eq!(guard_a.fencing_token, 1);
 
-    // Fast-forward virtual clock past TTL deterministically
-    tokio::time::advance(Duration::from_millis(30)).await;
+    // Wait past TTL for Redis expiration
+    tokio::time::sleep(Duration::from_millis(350)).await;
 
     // Client B acquires expired lock
     let guard_b = lock_service.acquire("cache-rebuild", ttl).await.unwrap();
@@ -66,9 +88,9 @@ async fn test_distributed_lock_ttl_auto_expiration() {
 
 #[tokio::test]
 async fn test_leader_election_lifecycle() {
-    let elector = MemoryLeaderElector::new();
+    let (_node, _lock_service, elector) = start_redis_coordination().await;
     let role = "scheduler-primary";
-    let ttl = Duration::from_millis(50);
+    let ttl = Duration::from_millis(1500);
 
     // 1. Candidate 1 acquires leadership with initial term 1
     let lease_a = elector

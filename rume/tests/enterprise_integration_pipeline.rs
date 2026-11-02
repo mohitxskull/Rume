@@ -15,7 +15,7 @@ use rume::app::state::{Availability, AvailabilityState};
 use rume::auth::identity::AuthUser;
 use rume::auth::policy::{RequirePermission, authorize};
 use rume::events::Event;
-use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, MemoryJobQueue};
+use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, PostgresJobQueue};
 use rume::metrics::MetricsRegistry;
 use rume::outbox::{
     OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus, TransactionalOutbox,
@@ -25,6 +25,8 @@ use rume::persistence::{
     SqliteBackend,
 };
 use rume::tenant::{Tenant, TenantContext};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderBilledEvent {
@@ -82,7 +84,22 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     .unwrap();
 
     let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
-    let queue = Arc::new(MemoryJobQueue::new());
+    
+    let pg_node = Postgres::default().start().await.expect("start postgres");
+    let pg_port = pg_node.get_host_port_ipv4(5432).await.expect("port");
+    let pg_url = format!("postgresql://postgres:postgres@127.0.0.1:{pg_port}/postgres");
+    let pool_cfg = deadpool_postgres::Config {
+        url: Some(pg_url),
+        ..Default::default()
+    };
+    let pg_pool = pool_cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
+    let client = pg_pool.get().await.expect("pg conn");
+    client
+        .batch_execute(PostgresJobQueue::SCHEMA)
+        .await
+        .expect("init jobs schema");
+    let queue = Arc::new(PostgresJobQueue::new(pg_pool));
+
     let metrics = Arc::new(MetricsRegistry::new());
 
     // 2. Authentication & Tenant Resolution

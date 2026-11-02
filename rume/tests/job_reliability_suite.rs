@@ -2,14 +2,52 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rume::jobs::{
-    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, JobQueue, MemoryHeartbeatRegistry,
-    MemoryIdempotencyStore,
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, JobQueue, PostgresJobQueue,
+    RedisHeartbeatRegistry, RedisIdempotencyStore,
 };
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::time::sleep;
+
+async fn start_redis_pool() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
+    deadpool_redis::Pool,
+) {
+    let node = Redis::default().start().await.expect("start redis node");
+    let port = node
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("get redis port");
+    let url = format!("redis://127.0.0.1:{port}");
+    let pool_cfg = deadpool_redis::Config::from_url(&url);
+    let pool = pool_cfg
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .expect("create redis pool");
+    (node, pool)
+}
+
+async fn start_postgres_queue() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    Arc<PostgresJobQueue>,
+) {
+    let node = Postgres::default().start().await.expect("start postgres");
+    let port = node.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool_cfg = deadpool_postgres::Config {
+        url: Some(url),
+        ..Default::default()
+    };
+    let pool = pool_cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
+    let client = pool.get().await.expect("conn");
+    client.batch_execute(PostgresJobQueue::SCHEMA).await.expect("schema");
+    (node, Arc::new(PostgresJobQueue::new(pool)))
+}
 
 #[tokio::test]
 async fn idempotency_store_lifecycle() {
-    let store = MemoryIdempotencyStore::new();
+    let (_node, pool) = start_redis_pool().await;
+    let store = RedisIdempotencyStore::new(pool);
 
     // 1. Initial attempt: New
     let status = store
@@ -59,11 +97,12 @@ async fn idempotency_store_lifecycle() {
 
 #[tokio::test]
 async fn worker_heartbeat_tracking_and_reaping() {
-    let tracker = MemoryHeartbeatRegistry::new();
+    let (_node, pool) = start_redis_pool().await;
+    let tracker = RedisHeartbeatRegistry::new(pool);
 
-    // Worker 1 alive with 20ms TTL
+    // Worker 1 alive with 100ms TTL
     tracker
-        .record_heartbeat("worker_1", Duration::from_millis(20))
+        .record_heartbeat("worker_1", Duration::from_millis(100))
         .await
         .unwrap();
 
@@ -77,7 +116,7 @@ async fn worker_heartbeat_tracking_and_reaping() {
     assert!(tracker.is_alive("worker_2").await.unwrap());
 
     // Sleep past Worker 1 TTL
-    sleep(Duration::from_millis(30)).await;
+    sleep(Duration::from_millis(150)).await;
 
     assert!(!tracker.is_alive("worker_1").await.unwrap());
     assert!(tracker.is_alive("worker_2").await.unwrap());
@@ -124,15 +163,16 @@ impl rume::jobs::JobHandler<IdempotentPaymentJob> for PaymentHandler {
 
 #[tokio::test]
 async fn test_worker_idempotency_deduplication() {
-    let queue = std::sync::Arc::new(rume::jobs::MemoryJobQueue::new());
+    let (_pg_node, queue) = start_postgres_queue().await;
+    let (_redis_node, redis_pool) = start_redis_pool().await;
+    let idempotency_store = Arc::new(RedisIdempotencyStore::new(redis_pool));
+
     let mut registry = rume::jobs::JobRegistry::new();
     let executed_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
     registry.register(PaymentHandler {
         executed: std::sync::Arc::clone(&executed_counter),
     });
-
-    let idempotency_store = std::sync::Arc::new(MemoryIdempotencyStore::new());
 
     let worker =
         rume::jobs::JobWorker::new(std::sync::Arc::clone(&queue), std::sync::Arc::new(registry))
@@ -175,28 +215,29 @@ async fn test_worker_idempotency_deduplication() {
 
 #[tokio::test]
 async fn test_worker_heartbeat_and_abandoned_job_recovery() {
-    let queue = Arc::new(rume::jobs::MemoryJobQueue::new());
+    let (_pg_node, queue) = start_postgres_queue().await;
+    let (_redis_node, redis_pool) = start_redis_pool().await;
+    let heartbeats: Arc<dyn HeartbeatRegistry> = Arc::new(RedisHeartbeatRegistry::new(redis_pool));
     let registry = Arc::new(rume::jobs::JobRegistry::new());
-    let heartbeats: Arc<dyn HeartbeatRegistry> = Arc::new(MemoryHeartbeatRegistry::new());
 
     // Worker 1 starts with heartbeat and abandoned recovery
     let worker1 = rume::jobs::JobWorker::new(Arc::clone(&queue), registry)
         .with_worker_id("worker-active-1")
         .with_heartbeat(
             Arc::clone(&heartbeats),
-            Duration::from_millis(40),
-            Duration::from_millis(10),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
         )
-        .with_abandoned_recovery(Duration::from_millis(20));
+        .with_abandoned_recovery(Duration::from_millis(200));
     worker1.start();
 
     // Verify worker 1 registered heartbeat
-    sleep(Duration::from_millis(25)).await;
+    sleep(Duration::from_millis(150)).await;
     assert!(heartbeats.is_alive("worker-active-1").await.unwrap());
 
     // Simulate an abandoned job belonging to a crashed worker
     heartbeats
-        .record_heartbeat("crashed-worker-99", Duration::from_millis(10))
+        .record_heartbeat("crashed-worker-99", Duration::from_millis(100))
         .await
         .unwrap();
 
@@ -213,7 +254,7 @@ async fn test_worker_heartbeat_and_abandoned_job_recovery() {
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // Sleep past crashed-worker-99 TTL so worker1 recovery loop detects it and reclaims
-    sleep(Duration::from_millis(50)).await;
+    sleep(Duration::from_millis(400)).await;
 
     // The abandoned job should now be reclaimed back into pending
     assert_eq!(queue.pending_count().await.unwrap(), 1);

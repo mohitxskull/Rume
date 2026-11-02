@@ -4,10 +4,29 @@ use std::time::Duration;
 
 use rume::jobs::{
     BoxFuture, Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker,
-    MemoryJobQueue, RetryPolicy,
+    PostgresJobQueue, RetryPolicy,
 };
 use serde::{Deserialize, Serialize};
+use testcontainers_modules::postgres::Postgres;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::time::sleep;
+
+async fn start_postgres_queue() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    Arc<PostgresJobQueue>,
+) {
+    let node = Postgres::default().start().await.expect("start postgres");
+    let port = node.get_host_port_ipv4(5432).await.expect("port");
+    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let pool_cfg = deadpool_postgres::Config {
+        url: Some(url),
+        ..Default::default()
+    };
+    let pool = pool_cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
+    let client = pool.get().await.expect("conn");
+    client.batch_execute(PostgresJobQueue::SCHEMA).await.expect("schema");
+    (node, Arc::new(PostgresJobQueue::new(pool)))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SendEmailJob {
@@ -49,7 +68,7 @@ impl JobHandler<SendEmailJob> for SendEmailHandler {
 
 #[tokio::test]
 async fn job_success_and_retry_backoff() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
 
     let attempts = Arc::new(AtomicU32::new(0));
@@ -110,7 +129,7 @@ impl JobHandler<FatalFailingJob> for FatalHandler {
 
 #[tokio::test]
 async fn fatal_failure_moves_immediately_to_dlq() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
     registry.register(FatalHandler);
 
@@ -169,7 +188,7 @@ impl JobHandler<AlwaysFailingJob> for AlwaysFailHandler {
 
 #[tokio::test]
 async fn max_retries_exhausted_moves_to_dlq() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
 
     let attempts = Arc::new(AtomicU32::new(0));
@@ -226,7 +245,7 @@ impl JobHandler<SlowJob> for SlowJobHandler {
 
 #[tokio::test]
 async fn worker_graceful_drain_waits_for_in_flight_jobs() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
 
     let finished = Arc::new(AtomicU32::new(0));
@@ -273,7 +292,7 @@ impl JobHandler<PanickingJob> for PanickingJobHandler {
 
 #[tokio::test]
 async fn worker_panic_does_not_leak_in_flight_count() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
     registry.register(PanickingJobHandler);
 
@@ -322,7 +341,7 @@ impl JobHandler<TimeoutJob> for TimeoutJobHandler {
 
 #[tokio::test]
 async fn job_timeout_is_enforced() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
     registry.register(TimeoutJobHandler);
 
@@ -345,7 +364,7 @@ async fn job_timeout_is_enforced() {
 
 #[tokio::test]
 async fn worker_concurrency_is_bounded() {
-    let queue = Arc::new(MemoryJobQueue::new());
+    let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
 
     let concurrent_running = Arc::new(AtomicU32::new(0));

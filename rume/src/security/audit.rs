@@ -4,7 +4,6 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -107,47 +106,98 @@ pub enum AuditError {
 /// Boxed future alias for async audit logging.
 pub type AuditFuture<'a> = Pin<Box<dyn Future<Output = Result<(), AuditError>> + Send + 'a>>;
 
-/// Trait implemented by audit log sinks (in-memory, database, syslog, Kafka).
+use crate::persistence::backend::DatabaseBackend;
+
+/// Trait implemented by audit log sinks (database, syslog, Kafka).
 pub trait AuditLogger: Debug + Send + Sync + 'static {
     /// Records an audit log event.
     fn record<'a>(&'a self, record: AuditRecord) -> AuditFuture<'a>;
 }
 
-/// Thread-safe in-memory audit logger for testing and development.
-#[derive(Debug, Clone, Default)]
-pub struct MemoryAuditLogger {
-    records: Arc<RwLock<Vec<AuditRecord>>>,
+/// Persistent audit logger storing events in a relational database table via any [`DatabaseBackend`].
+#[derive(Debug, Clone)]
+pub struct SqlAuditLogger<B: DatabaseBackend> {
+    backend: B,
 }
 
-impl MemoryAuditLogger {
-    /// Creates an empty in-memory audit store.
-    pub fn new() -> Self {
-        Self {
-            records: Arc::new(RwLock::new(Vec::new())),
-        }
+impl<B: DatabaseBackend> SqlAuditLogger<B> {
+    /// Schema DDL for audit log table.
+    pub const SCHEMA: &'static str = r#"
+CREATE TABLE IF NOT EXISTS rume_audit_log (
+    id VARCHAR(64) PRIMARY KEY,
+    action VARCHAR(255) NOT NULL,
+    resource VARCHAR(255) NOT NULL,
+    status VARCHAR(32) NOT NULL,
+    actor_id VARCHAR(255),
+    target_id VARCHAR(255),
+    ip_address VARCHAR(64),
+    metadata TEXT,
+    created_at BIGINT NOT NULL
+);
+"#;
+
+    /// Creates a new SQL audit logger.
+    pub fn new(backend: B) -> Self {
+        Self { backend }
     }
 
-    /// Returns a copy of all recorded audit events.
-    pub fn records(&self) -> Vec<AuditRecord> {
-        self.records.read().map(|r| r.clone()).unwrap_or_default()
+    /// Initializes the audit log database table.
+    pub async fn init_table(&self) -> Result<(), AuditError> {
+        self.backend
+            .execute(Self::SCHEMA)
+            .await
+            .map_err(|e| AuditError::Sink(e.to_string()))?;
+        Ok(())
     }
 
-    /// Clears all recorded events.
-    pub fn clear(&self) {
-        if let Ok(mut r) = self.records.write() {
-            r.clear();
-        }
+    /// Returns the underlying database backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Queries the total number of recorded audit logs.
+    pub async fn count(&self) -> Result<usize, AuditError> {
+        let count_str = self
+            .backend
+            .query_scalar("SELECT count(*) FROM rume_audit_log")
+            .await
+            .map_err(|e| AuditError::Sink(e.to_string()))?
+            .unwrap_or_else(|| "0".to_string());
+        count_str.parse().map_err(|e| AuditError::Sink(format!("{e}")))
     }
 }
 
-impl AuditLogger for MemoryAuditLogger {
+impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
     fn record<'a>(&'a self, record: AuditRecord) -> AuditFuture<'a> {
         Box::pin(async move {
-            let mut list = self
-                .records
-                .write()
+            let id = uuid::Uuid::new_v4().to_string();
+            let status_str = match record.status {
+                AuditStatus::Success => "success",
+                AuditStatus::Denied => "denied",
+                AuditStatus::Failure => "failure",
+            };
+            let meta_json = serde_json::to_string(&record.metadata)
                 .map_err(|e| AuditError::Sink(e.to_string()))?;
-            list.push(record);
+            let actor = record.actor_id.as_deref().unwrap_or("NULL");
+            let target = record.target_id.as_deref().unwrap_or("NULL");
+            let ip = record.ip_address.as_deref().unwrap_or("NULL");
+
+            let actor_val = if actor == "NULL" { "NULL".to_string() } else { format!("'{}'", actor.replace('\'', "''")) };
+            let target_val = if target == "NULL" { "NULL".to_string() } else { format!("'{}'", target.replace('\'', "''")) };
+            let ip_val = if ip == "NULL" { "NULL".to_string() } else { format!("'{}'", ip.replace('\'', "''")) };
+            let meta_val = format!("'{}'", meta_json.replace('\'', "''"));
+
+            let stmt = format!(
+                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ('{id}', '{}', '{}', '{status_str}', {actor_val}, {target_val}, {ip_val}, {meta_val}, {})",
+                record.action.replace('\'', "''"),
+                record.target_type.replace('\'', "''"),
+                record.timestamp_ms
+            );
+
+            self.backend
+                .execute(&stmt)
+                .await
+                .map_err(|e| AuditError::Sink(e.to_string()))?;
             Ok(())
         })
     }

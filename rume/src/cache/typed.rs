@@ -10,24 +10,17 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::cache::backend::{CacheBackend, MemoryCacheBackend};
+use crate::cache::backend::CacheBackend;
 use crate::cache::config::CacheConfig;
 use crate::cache::error::CacheError;
 use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 
 /// High-level typed cache interface providing JSON serialization, cache-aside patterns, and tag invalidation.
-pub struct Cache<B: CacheBackend = MemoryCacheBackend> {
+pub struct Cache<B: CacheBackend> {
     backend: Arc<B>,
     config: CacheConfig,
     is_closed: Arc<AtomicBool>,
     singleflight: Arc<tokio::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>>,
-}
-
-impl Cache<MemoryCacheBackend> {
-    /// Creates a default in-memory cache instance.
-    pub fn memory() -> Self {
-        Self::new(MemoryCacheBackend::new(), CacheConfig::default())
-    }
 }
 
 impl<B: CacheBackend> Clone for Cache<B> {
@@ -194,7 +187,15 @@ impl<B: CacheBackend> Cache<B> {
         // Leader execution: compute fresh value
         let result = f().await;
 
-        // Clean up flight slot and notify all awaiting stampede requests
+        let output = match result {
+            Ok(fresh) => {
+                self.set_json_with_tags(key, &fresh, tags, ttl).await?;
+                Ok(fresh)
+            }
+            Err(e) => Err(e),
+        };
+
+        // Clean up flight slot and notify all awaiting stampede requests AFTER cache write completes
         let to_wake = {
             let mut flights = self.singleflight.lock().await;
             flights.remove(&full_key)
@@ -203,13 +204,7 @@ impl<B: CacheBackend> Cache<B> {
             notify.notify_waiters();
         }
 
-        match result {
-            Ok(fresh) => {
-                self.set_json_with_tags(key, &fresh, tags, ttl).await?;
-                Ok(fresh)
-            }
-            Err(e) => Err(e),
-        }
+        output
     }
 
     /// Deletes a key from the cache.

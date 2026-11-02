@@ -4,9 +4,16 @@ use std::time::Duration;
 
 use rume::events::Event;
 use rume::outbox::{
-    MemoryOutboxRepository, OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
 };
+use rume::persistence::SqliteBackend;
 use serde::{Deserialize, Serialize};
+
+async fn setup_real_outbox() -> Arc<SqliteBackend> {
+    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    backend.init_outbox_table().await.expect("init outbox table");
+    Arc::new(backend)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 struct OrderPaidEvent {
@@ -36,7 +43,7 @@ async fn outbox_message_creation_and_payload_serialization() {
 
 #[tokio::test]
 async fn outbox_relay_drains_and_dispatches_pending_messages() {
-    let repo = Arc::new(MemoryOutboxRepository::new());
+    let repo = setup_real_outbox().await;
     let dispatched_counter = Arc::new(AtomicUsize::new(0));
 
     // Save 3 messages to the repository
@@ -72,7 +79,7 @@ async fn outbox_relay_drains_and_dispatches_pending_messages() {
 
 #[tokio::test]
 async fn outbox_relay_tracks_failures_and_exhaustion() {
-    let repo = Arc::new(MemoryOutboxRepository::new());
+    let repo = setup_real_outbox().await;
 
     let event = OrderPaidEvent {
         order_id: "failing_ord".into(),
@@ -116,7 +123,7 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
 
 #[tokio::test]
 async fn outbox_relay_graceful_drain_on_shutdown() {
-    let repo = Arc::new(MemoryOutboxRepository::new());
+    let repo = setup_real_outbox().await;
     let dispatched = Arc::new(AtomicUsize::new(0));
 
     // Queue 2 messages
@@ -147,7 +154,7 @@ async fn outbox_relay_graceful_drain_on_shutdown() {
 
 #[tokio::test]
 async fn concurrent_relays_claim_disjoint_batches() {
-    let repo = Arc::new(MemoryOutboxRepository::new());
+    let repo = setup_real_outbox().await;
 
     for i in 1..=10 {
         let event = OrderPaidEvent {
@@ -358,7 +365,7 @@ async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
 
 #[tokio::test]
 async fn outbox_claim_lease_recovery_of_abandoned_messages() {
-    let repo = Arc::new(MemoryOutboxRepository::new());
+    let repo = setup_real_outbox().await;
 
     let event = OrderPaidEvent {
         order_id: "order_abandoned".into(),

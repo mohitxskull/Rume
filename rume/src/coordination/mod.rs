@@ -11,7 +11,7 @@ pub mod redis;
 #[cfg(feature = "redis")]
 pub use self::redis::{RedisDistributedLock, RedisLeaderElector};
 pub use error::CoordinationError;
-pub use leader::{LeaderElector, LeaderLease, MemoryLeaderElector};
-pub use lock::{CoordinationFuture, DistributedLock, LockGuard, MemoryDistributedLock};
+pub use leader::{LeaderElector, LeaderLease};
+pub use lock::{CoordinationFuture, DistributedLock, LockGuard};
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresDistributedLock, PostgresLeaderElector};

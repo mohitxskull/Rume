@@ -23,4 +23,4 @@ pub use policy::{
     authorize,
 };
 pub use schemes::{ApiKeyScheme, AuthenticationScheme, BearerTokenScheme, SessionScheme};
-pub use session::{MemorySessionStore, Session, SessionStore};
+pub use session::{Session, SessionStore};

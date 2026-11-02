@@ -1,9 +1,8 @@
-//! Secure session management and in-memory store.
+//! Secure session management and storage contract.
 
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::auth::error::AuthError;
@@ -48,27 +47,33 @@ impl Session {
         }
     }
 
-    /// Checks if the session has expired.
+    /// Checks if this session has passed its expiration timestamp.
     pub fn is_expired(&self) -> bool {
         current_timestamp() >= self.expires_at
     }
 
-    /// Adds a role to the session.
+    /// Appends a role to this session.
     pub fn with_role(mut self, role: impl Into<String>) -> Self {
         self.roles.push(role.into());
         self
     }
 
-    /// Adds a permission to the session.
-    pub fn with_permission(mut self, perm: impl Into<String>) -> Self {
-        self.permissions.push(perm.into());
+    /// Appends a permission to this session.
+    pub fn with_permission(mut self, permission: impl Into<String>) -> Self {
+        self.permissions.push(permission.into());
+        self
+    }
+
+    /// Inserts a key-value pair into arbitrary session data.
+    pub fn with_data(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.data.insert(key.into(), value.into());
         self
     }
 }
 
-/// Trait for storing, retrieving, and destroying authenticated sessions.
+/// Interface for session persistence drivers.
 pub trait SessionStore: Send + Sync + 'static {
-    /// Retrieves a session by its identifier.
+    /// Loads a session by identifier. Returns `None` if absent or expired.
     fn load(&self, id: &str) -> BoxFuture<'_, Result<Option<Session>, AuthError>>;
 
     /// Saves or updates a session.
@@ -76,73 +81,4 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// Invalidates and removes a session.
     fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>>;
-}
-
-/// Thread-safe in-memory session store for development, testing, and single-node setups.
-#[derive(Debug, Default, Clone)]
-pub struct MemorySessionStore {
-    sessions: Arc<RwLock<BTreeMap<String, Session>>>,
-}
-
-impl MemorySessionStore {
-    /// Creates a new in-memory session store.
-    pub fn new() -> Self {
-        Self {
-            sessions: Arc::new(RwLock::new(BTreeMap::new())),
-        }
-    }
-
-    /// Returns the number of currently active non-expired sessions.
-    pub fn active_count(&self) -> usize {
-        if let Ok(sessions) = self.sessions.read() {
-            sessions.values().filter(|s| !s.is_expired()).count()
-        } else {
-            0
-        }
-    }
-}
-
-impl SessionStore for MemorySessionStore {
-    fn load(&self, id: &str) -> BoxFuture<'_, Result<Option<Session>, AuthError>> {
-        let sid = id.to_string();
-        Box::pin(async move {
-            let sessions = self
-                .sessions
-                .read()
-                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
-
-            if let Some(session) = sessions.get(&sid) {
-                if session.is_expired() {
-                    Ok(None)
-                } else {
-                    Ok(Some(session.clone()))
-                }
-            } else {
-                Ok(None)
-            }
-        })
-    }
-
-    fn save(&self, session: Session) -> BoxFuture<'_, Result<(), AuthError>> {
-        Box::pin(async move {
-            let mut sessions = self
-                .sessions
-                .write()
-                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
-            sessions.insert(session.id.clone(), session);
-            Ok(())
-        })
-    }
-
-    fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>> {
-        let sid = id.to_string();
-        Box::pin(async move {
-            let mut sessions = self
-                .sessions
-                .write()
-                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
-            sessions.remove(&sid);
-            Ok(())
-        })
-    }
 }

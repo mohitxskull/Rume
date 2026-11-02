@@ -43,16 +43,15 @@ pub use app::{
 pub use auth::RedisSessionStore;
 pub use auth::{
     ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
-    Identity, MemorySessionStore, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
+    Identity, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
     RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
     authorize,
 };
 #[cfg(feature = "redis")]
 pub use cache::RedisCacheBackend;
-pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
+pub use cache::{Cache, CacheBackend, CacheConfig, CacheError};
 pub use coordination::{
     CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
-    MemoryDistributedLock, MemoryLeaderElector,
 };
 #[cfg(feature = "postgres")]
 pub use coordination::{PostgresDistributedLock, PostgresLeaderElector};
@@ -74,8 +73,7 @@ pub use helpers::{
 pub use jobs::PostgresJobQueue;
 pub use jobs::{
     HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, Job, JobContext, JobError, JobHandler,
-    JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
-    MemoryJobQueue, QueuedJob, RetryPolicy,
+    JobQueue, JobRegistry, JobWorker, QueuedJob, RetryPolicy,
 };
 #[cfg(feature = "redis")]
 pub use jobs::{RedisHeartbeatRegistry, RedisIdempotencyStore};
@@ -88,13 +86,17 @@ pub use openapi::{
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
 };
 pub use outbox::{
-    MemoryOutboxRepository, OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
 };
 pub use persistence::{
-    DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
+    DatabaseConfig, DatabasePool, Migration, Migrator, PersistenceError,
 };
 #[cfg(feature = "sqlite")]
 pub use persistence::{SqliteBackend, SqliteTransaction};
+#[cfg(feature = "postgres")]
+pub use persistence::{PostgresBackend, PostgresTransaction};
+#[cfg(feature = "mysql")]
+pub use persistence::{MysqlBackend, MysqlTransaction};
 #[cfg(feature = "redis")]
 pub use resilience::RedisRateLimiter;
 pub use resilience::{
@@ -108,13 +110,13 @@ pub use routing::{
 };
 pub use saga::{FunctionalStep, Saga, SagaError, SagaFuture, SagaReport, SagaStatus, Step};
 pub use security::{
-    AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
+    AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, SqlAuditLogger,
     SecurityHeadersConfig, SecurityHeadersLayer,
 };
 #[cfg(feature = "redis")]
 pub use tenant::RedisTenantQuotaStore;
 pub use tenant::{
-    HeaderTenantResolver, MemoryTenantQuotaStore, OptionalTenant, SubdomainTenantResolver, Tenant,
+    HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant,
     TenantContext, TenantError, TenantLayer, TenantQuotaStore, TenantResolver, TenantScopedCache,
 };
 pub use testing::{TestApp, TestAppBuilder};

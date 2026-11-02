@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::persistence::backend::{BoxFuture, DatabaseBackend, MemoryDatabase};
+use crate::persistence::backend::{BoxFuture, DatabaseBackend};
 use crate::persistence::error::PersistenceError;
 
 /// Function signature for dynamic migration execution.
@@ -90,82 +90,56 @@ impl Migrator {
         &self.migrations
     }
 
-    /// Finds all registered migrations that have not yet been applied to the given memory database.
-    pub fn pending_migrations(&self, db: &MemoryDatabase) -> Vec<&Migration> {
-        self.migrations
-            .iter()
-            .filter(|m| !db.has_migration(&m.id))
-            .collect()
-    }
-
-    /// Executes all unapplied pending migrations in order.
-    pub async fn run_pending(
+    /// Finds all registered migrations that have not yet been applied to the given database backend.
+    pub async fn pending_migrations<B: DatabaseBackend>(
         &self,
-        db: &MemoryDatabase,
-    ) -> Result<MigrationSummary, PersistenceError> {
-        let mut applied = Vec::new();
+        backend: &B,
+    ) -> Result<Vec<String>, PersistenceError> {
+        backend
+            .execute(
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+            )
+            .await?;
 
+        let mut pending = Vec::new();
         for migration in &self.migrations {
-            if !db.has_migration(&migration.id) {
-                if let Some(sql) = &migration.up_sql {
-                    db.execute(sql)
-                        .await
-                        .map_err(|err| PersistenceError::MigrationError {
-                            migration: migration.id.clone(),
-                            message: err.to_string(),
-                        })?;
-                }
-                db.mark_migration(&migration.id);
-                applied.push(migration.id.clone());
+            let check_sql = format!(
+                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                migration.id.replace('\'', "''")
+            );
+            let exists = backend.query_scalar(&check_sql).await?;
+            if exists.is_none() {
+                pending.push(migration.id.clone());
             }
         }
-
-        Ok(MigrationSummary { applied })
+        Ok(pending)
     }
 
-    /// Rolls back the most recently applied migration.
+    /// Executes all unapplied pending migrations in order on any [`DatabaseBackend`].
+    pub async fn run_pending<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<MigrationSummary, PersistenceError> {
+        self.run_pending_backend(backend).await
+    }
+
+    /// Rolls back the most recently applied migration on any [`DatabaseBackend`].
     ///
     /// Fails closed with [`PersistenceError::IrreversibleMigration`] if the target
     /// migration lacks a `down_sql` rollback script, preserving executed state.
-    pub async fn rollback_last(
+    pub async fn rollback_last<B: DatabaseBackend>(
         &self,
-        db: &MemoryDatabase,
+        backend: &B,
     ) -> Result<Option<String>, PersistenceError> {
-        // Find the last applied migration in reverse registration order
-        for migration in self.migrations.iter().rev() {
-            if db.has_migration(&migration.id) {
-                let Some(sql) = &migration.down_sql else {
-                    return Err(PersistenceError::IrreversibleMigration(
-                        migration.id.clone(),
-                    ));
-                };
-
-                db.execute(sql)
-                    .await
-                    .map_err(|err| PersistenceError::MigrationError {
-                        migration: migration.id.clone(),
-                        message: err.to_string(),
-                    })?;
-                db.unmark_migration(&migration.id);
-                return Ok(Some(migration.id.clone()));
-            }
-        }
-        Ok(None)
+        self.rollback_last_backend(backend).await
     }
 
-    /// Preflight verification: fails closed if any registered migrations have not been applied.
-    pub fn verify_no_pending(&self, db: &MemoryDatabase) -> Result<(), PersistenceError> {
-        let pending: Vec<String> = self
-            .pending_migrations(db)
-            .into_iter()
-            .map(|m| m.id.clone())
-            .collect();
-
-        if pending.is_empty() {
-            Ok(())
-        } else {
-            Err(PersistenceError::PendingMigrations(pending))
-        }
+    /// Preflight verification on any [`DatabaseBackend`]: fails closed if any registered migrations have not been applied.
+    pub async fn verify_no_pending<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<(), PersistenceError> {
+        self.verify_no_pending_backend(backend).await
     }
 
     /// Executes all unapplied pending migrations in order on any [`DatabaseBackend`].

@@ -1,5 +1,6 @@
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::{get, post};
+use rume::persistence::{DatabaseBackend, SqliteBackend};
 use rume::prelude::*;
 use rume::security::*;
 
@@ -235,7 +236,9 @@ async fn test_csrf_signed_tokens_and_cookie_tossing_protection() {
 
 #[tokio::test]
 async fn test_audit_logging() {
-    let logger = MemoryAuditLogger::new();
+    let backend = SqliteBackend::in_memory().unwrap();
+    let logger = SqlAuditLogger::new(backend);
+    logger.init_table().await.unwrap();
 
     let record = AuditRecord::new("user.login", "user", AuditStatus::Success)
         .with_actor("user-999")
@@ -252,21 +255,21 @@ async fn test_audit_logging() {
 
     logger.record(failed_record).await.unwrap();
 
-    let records = logger.records();
-    assert_eq!(records.len(), 2);
+    assert_eq!(logger.count().await.unwrap(), 2);
 
-    assert_eq!(records[0].action, "user.login");
-    assert_eq!(records[0].actor_id.as_deref(), Some("user-999"));
-    assert_eq!(records[0].status, AuditStatus::Success);
-    assert_eq!(records[0].metadata.get("device").unwrap(), "firefox");
+    let action = logger
+        .backend()
+        .query_scalar("SELECT action FROM rume_audit_log WHERE actor_id = 'user-999' ORDER BY created_at ASC LIMIT 1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(action, "user.login");
 
-    assert_eq!(records[1].action, "payment.charge");
-    assert_eq!(records[1].status, AuditStatus::Denied);
-    assert_eq!(
-        records[1].metadata.get("reason").unwrap(),
-        "insufficient_funds"
-    );
-
-    logger.clear();
-    assert!(logger.records().is_empty());
+    let status = logger
+        .backend()
+        .query_scalar("SELECT status FROM rume_audit_log WHERE resource = 'invoice'")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, "denied");
 }

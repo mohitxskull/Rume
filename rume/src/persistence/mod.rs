@@ -12,8 +12,10 @@ pub mod pool;
 pub mod postgres;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+#[cfg(feature = "mysql")]
+pub mod mysql;
 
-pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, MemoryDatabase};
+pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction};
 pub use config::DatabaseConfig;
 pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator};
@@ -22,3 +24,5 @@ pub use pool::{ConnectionLease, DatabaseHealthCheck, DatabasePool, PoolStatus};
 pub use postgres::{PostgresBackend, PostgresTransaction};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteTransaction};
+#[cfg(feature = "mysql")]
+pub use mysql::{MysqlBackend, MysqlTransaction};

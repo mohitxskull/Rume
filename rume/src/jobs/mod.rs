@@ -17,10 +17,9 @@ pub use error::JobError;
 pub use job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
 #[cfg(feature = "postgres")]
 pub use postgres::PostgresJobQueue;
-pub use queue::{JobQueue, MemoryJobQueue};
+pub use queue::{JobQueue};
 pub use reliability::{
-    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, MemoryHeartbeatRegistry,
-    MemoryIdempotencyStore,
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore,
 };
 pub use retry::RetryPolicy;
 pub use worker::{JobRegistry, JobWorker};

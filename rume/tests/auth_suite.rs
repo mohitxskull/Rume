@@ -4,6 +4,26 @@ use axum::routing::{get, post};
 use rume::auth::*;
 use rume::error::AppError;
 use rume::prelude::*;
+use testcontainers_modules::redis::Redis;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+async fn start_redis_session_store() -> (
+    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
+    RedisSessionStore,
+) {
+    let node = Redis::default().start().await.expect("start redis node");
+    let port = node
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("get redis port");
+    let url = format!("redis://127.0.0.1:{port}");
+    let pool_cfg = deadpool_redis::Config::from_url(&url);
+    let pool = pool_cfg
+        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+        .expect("create redis pool");
+    let store = RedisSessionStore::new(pool);
+    (node, store)
+}
 
 async fn get_me(Authenticated(user): Authenticated<AuthUser>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
@@ -124,7 +144,7 @@ async fn api_key_authentication_flow() {
 
 #[tokio::test]
 async fn session_cookie_lifecycle_and_expiration() {
-    let store = MemorySessionStore::new();
+    let (_node, store) = start_redis_session_store().await;
 
     // Create session for Bob (expires in 3600 seconds)
     let session = Session::new("sess_bob_active", "user_bob", 3600)
@@ -210,7 +230,8 @@ async fn optional_auth_guest_and_authenticated() {
 
 #[tokio::test]
 async fn optional_auth_succeeds_as_guest_when_session_cookie_expired() {
-    let session_scheme = SessionScheme::new(MemorySessionStore::new());
+    let (_node, store) = start_redis_session_store().await;
+    let session_scheme = SessionScheme::new(store);
     let router = rume::routing::Router::new()
         .route("/optional", get(optional_profile))
         .layer(AuthLayer::optional().scheme(session_scheme));
@@ -338,7 +359,7 @@ async fn test_auth_provider_error_maps_to_500() {
 
 #[tokio::test]
 async fn test_stale_session_cookie_falls_back_to_bearer_token() {
-    let session_store = MemorySessionStore::new();
+    let (_node, session_store) = start_redis_session_store().await;
     let session_scheme = SessionScheme::new(session_store);
 
     let bearer_scheme = BearerTokenScheme::new(|token| async move {
