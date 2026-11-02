@@ -50,11 +50,22 @@ impl Gauge {
     }
 }
 
+const HISTOGRAM_BUCKETS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+#[derive(Debug, Clone, Default)]
+struct LatencySummary {
+    count: u64,
+    sum: f64,
+    buckets: [u64; 11],
+}
+
 /// Standard HTTP request metrics registry with Prometheus text-format exporter.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
     requests_total: Arc<RwLock<BTreeMap<(String, u16), u64>>>,
-    request_latencies: Arc<RwLock<BTreeMap<String, Vec<f64>>>>,
+    request_latencies: Arc<RwLock<BTreeMap<String, LatencySummary>>>,
     in_flight: Arc<AtomicI64>,
 }
 
@@ -72,10 +83,14 @@ impl MetricsRegistry {
 
         let secs = duration.as_secs_f64();
         if let Ok(mut latencies) = self.request_latencies.write() {
-            latencies
-                .entry(method.to_uppercase())
-                .or_default()
-                .push(secs);
+            let summary = latencies.entry(method.to_uppercase()).or_default();
+            summary.count += 1;
+            summary.sum += secs;
+            for (idx, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
+                if secs <= boundary {
+                    summary.buckets[idx] += 1;
+                }
+            }
         }
     }
 
@@ -124,25 +139,39 @@ impl MetricsRegistry {
             }
         }
 
-        // 3. request_duration_seconds summary
+        // 3. request_duration_seconds summary & histogram
         writeln!(
             out,
             "# HELP http_request_duration_seconds Latency of HTTP requests in seconds."
         )
         .unwrap();
-        writeln!(out, "# TYPE http_request_duration_seconds summary").unwrap();
+        writeln!(out, "# TYPE http_request_duration_seconds histogram").unwrap();
         if let Ok(latencies) = self.request_latencies.read() {
-            for (method, samples) in latencies.iter() {
-                let count = samples.len();
-                let sum: f64 = samples.iter().sum();
+            for (method, summary) in latencies.iter() {
+                for (idx, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
+                    let bucket_count = summary.buckets[idx];
+                    writeln!(
+                        out,
+                        "http_request_duration_seconds_bucket{{method=\"{method}\",le=\"{boundary}\"}} {bucket_count}"
+                    )
+                    .unwrap();
+                }
                 writeln!(
                     out,
-                    "http_request_duration_seconds_count{{method=\"{method}\"}} {count}"
+                    "http_request_duration_seconds_bucket{{method=\"{method}\",le=\"+Inf\"}} {}",
+                    summary.count
                 )
                 .unwrap();
                 writeln!(
                     out,
-                    "http_request_duration_seconds_sum{{method=\"{method}\"}} {sum:.6}"
+                    "http_request_duration_seconds_count{{method=\"{method}\"}} {}",
+                    summary.count
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "http_request_duration_seconds_sum{{method=\"{method}\"}} {:.6}",
+                    summary.sum
                 )
                 .unwrap();
             }

@@ -31,9 +31,9 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group B — Operational Outbox & Metrics Integrity (solve together)
 > Root cause: Unbounded in-memory collections and missing distributed concurrency controls.
 
-- [ ] **Enterprise-Reliability C1 — Prometheus metrics recording stores unbounded raw float samples** (`enterprise-reliability.md` C1).
+- [x] **Enterprise-Reliability C1 — Prometheus metrics recording stores unbounded raw float samples** (`enterprise-reliability.md` C1).
       `rume/src/metrics/registry.rs:81–89`: Latencies are stored in an unbounded heap `Vec<f64>`, causing process OOM crashes and O(N) scrape timeouts. Replace raw sample buffer with fixed histogram buckets or ring buffers.
-- [ ] **Enterprise-Reliability C2 — Concurrent `OutboxRelay` instances lack claiming locks in HA deployments** (`enterprise-reliability.md` C2).
+- [x] **Enterprise-Reliability C2 — Concurrent `OutboxRelay` instances lack claiming locks in HA deployments** (`enterprise-reliability.md` C2).
       `rume/src/outbox/relay.rs:90–112`: Multiple replicas simultaneously call `fetch_pending` and process identical outbox messages without row locking or `InFlight` status transitions. Implement distributed lock guards or atomic claiming states (`InFlight`).
 
 ### Group C — Worker Panic Safety & Concurrency Bounds (solve together)

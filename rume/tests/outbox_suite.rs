@@ -133,3 +133,41 @@ async fn outbox_relay_graceful_drain_on_shutdown() {
     assert_eq!(dispatched.load(Ordering::SeqCst), 2);
     assert_eq!(repo.pending_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn concurrent_relays_claim_disjoint_batches() {
+    let repo = Arc::new(MemoryOutboxRepository::new());
+
+    for i in 1..=10 {
+        let event = OrderPaidEvent {
+            order_id: format!("claim_{i}"),
+            amount_cents: 100 * i,
+        };
+        let msg = OutboxMessage::from_event(&event).unwrap();
+        repo.save(msg).await.unwrap();
+    }
+
+    // Two concurrent claims of 5 messages each
+    let repo1 = Arc::clone(&repo);
+    let repo2 = Arc::clone(&repo);
+
+    let h1 = tokio::spawn(async move { repo1.claim_pending(5).await.unwrap() });
+    let h2 = tokio::spawn(async move { repo2.claim_pending(5).await.unwrap() });
+
+    let (res1, res2) = tokio::join!(h1, h2);
+    let batch1 = res1.unwrap();
+    let batch2 = res2.unwrap();
+
+    assert_eq!(batch1.len(), 5);
+    assert_eq!(batch2.len(), 5);
+
+    // Confirm disjoint set of IDs
+    let set1: std::collections::HashSet<_> = batch1.iter().map(|m| &m.id).collect();
+    for msg in &batch2 {
+        assert!(!set1.contains(&msg.id), "batch2 must not contain message already claimed by batch1");
+    }
+
+    // Nothing pending left to claim
+    let remaining = repo.claim_pending(10).await.unwrap();
+    assert_eq!(remaining.len(), 0);
+}

@@ -55,9 +55,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         }
     }
 
-    /// Fetches pending messages and dispatches them in order.
+    /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
-        let pending = self.repository.fetch_pending(batch_size).await?;
+        let pending = self.repository.claim_pending(batch_size).await?;
         let mut published_count = 0;
 
         for message in pending {

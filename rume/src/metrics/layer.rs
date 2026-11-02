@@ -33,6 +33,14 @@ impl<S> Layer<S> for MetricsLayer {
     }
 }
 
+struct InFlightGuard(MetricsRegistry);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.dec_in_flight();
+    }
+}
+
 /// Tower service recording execution metrics.
 #[derive(Clone)]
 pub struct MetricsService<S> {
@@ -67,11 +75,12 @@ where
         let start = Instant::now();
 
         registry.inc_in_flight();
+        let guard = InFlightGuard(registry.clone());
 
         Box::pin(async move {
+            let _guard = guard;
             let response = inner.call(req).await;
             let duration = start.elapsed();
-            registry.dec_in_flight();
 
             match response {
                 Ok(res) => {

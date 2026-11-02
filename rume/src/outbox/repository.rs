@@ -21,6 +21,11 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     fn fetch_pending(&self, limit: usize)
     -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
 
+    /// Atomically claims up to `limit` pending outbox messages, transitioning their status
+    /// to `InFlight` and ordering by creation timestamp.
+    fn claim_pending(&self, limit: usize)
+    -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
+
     /// Marks a message as successfully published.
     fn mark_published(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
 
@@ -71,14 +76,44 @@ impl OutboxRepository for MemoryOutboxRepository {
                 .read()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-            let pending = messages
+            let mut pending: Vec<OutboxMessage> = messages
                 .values()
                 .filter(|m| m.status == OutboxStatus::Pending)
-                .take(limit)
                 .cloned()
                 .collect();
+            pending.sort_by_key(|m| m.created_at);
+            pending.truncate(limit);
 
             Ok(pending)
+        })
+    }
+
+    fn claim_pending(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let mut messages = self
+                .messages
+                .write()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let mut pending_keys: Vec<(u64, String)> = messages
+                .values()
+                .filter(|m| m.status == OutboxStatus::Pending)
+                .map(|m| (m.created_at, m.id.clone()))
+                .collect();
+            pending_keys.sort_by_key(|(ts, _)| *ts);
+
+            let mut claimed = Vec::new();
+            for (_, id) in pending_keys.into_iter().take(limit) {
+                if let Some(msg) = messages.get_mut(&id) {
+                    msg.status = OutboxStatus::InFlight;
+                    claimed.push(msg.clone());
+                }
+            }
+
+            Ok(claimed)
         })
     }
 
@@ -112,6 +147,8 @@ impl OutboxRepository for MemoryOutboxRepository {
                 msg.last_error = Some(error);
                 if msg.retry_count >= 5 {
                     msg.status = OutboxStatus::Failed;
+                } else {
+                    msg.status = OutboxStatus::Pending;
                 }
             }
 
@@ -128,7 +165,7 @@ impl OutboxRepository for MemoryOutboxRepository {
 
             Ok(messages
                 .values()
-                .filter(|m| m.status == OutboxStatus::Pending)
+                .filter(|m| m.status == OutboxStatus::Pending || m.status == OutboxStatus::InFlight)
                 .count())
         })
     }

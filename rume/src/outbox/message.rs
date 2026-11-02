@@ -21,6 +21,8 @@ fn current_timestamp() -> u64 {
 pub enum OutboxStatus {
     /// Message is waiting to be published by the relay.
     Pending,
+    /// Message has been claimed by a relay worker and is actively in flight.
+    InFlight,
     /// Message was successfully published to the event bus or broker.
     Published,
     /// Message failed to publish and exceeded retry thresholds.
