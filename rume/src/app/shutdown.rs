@@ -49,10 +49,11 @@ pub(crate) async fn shutdown_signal() {
 ///
 /// # Example
 ///
-/// ```ignore
-/// use rume::app::{AppContext, ops_router};
+/// ```
+/// use rume::app::ops_router;
+/// use axum::Router;
 ///
-/// let router = ops_router(router, availability.clone());
+/// let router = ops_router(Router::new());
 /// ```
 pub fn ops_router(router: Router<Availability>) -> Router<Availability> {
     router

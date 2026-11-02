@@ -33,11 +33,11 @@ pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```
 /// use rume::app::RequestId;
 ///
 /// async fn my_handler(request_id: RequestId) -> String {
-///     format!("processing request {request_id}")
+///     format!("processing request {}", request_id.0)
 /// }
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]

@@ -30,22 +30,14 @@ use crate::routing::matchers::Matcher;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use rume::routing::{RouteSpec, Matcher};
-/// use rume::prelude::*;
+/// ```
+/// use rume::routing::{RouteSpec, Matcher, Router};
 ///
-/// let (path, method, _, _) = RouteSpec::get("/users/{id}")
+/// let spec = RouteSpec::get("/users/{id}")
 ///     .where_param("id", Matcher::Number)
-///     .as("users.show")
-///     .build();
+///     .r#as("users.show");
 ///
-/// let router = Router::new()
-///     .route(&path, match method {
-///         Method::GET => axum::routing::get(handlers::get_user),
-///         _ => axum::routing::any(handlers::get_user),
-///     });
-///
-/// Rume::builder(ctx).router(router).run().await?;
+/// let router = Router::<()>::new().route_spec(spec, || async { "ok" });
 /// ```
 pub struct RouteSpec {
     path: String,
@@ -182,20 +174,21 @@ impl RouteSpec {
     ///
     /// # Example
     ///
-    /// ```ignore
+    /// ```
     /// use rume::routing::{RouteSpec, Matcher};
     /// use axum::Router;
     ///
     /// let spec = RouteSpec::get("/users/{id}")
     ///     .where_param("id", Matcher::Number)
-    ///     .as("users.show");
+    ///     .r#as("users.show");
     ///
-    /// let (path, _, params, _) = spec.build();
+    /// let layer = spec.validation_layer();
+    /// let (path, _, _, _) = spec.build();
     ///
-    /// let router = Router::new()
+    /// let router = Router::<()>::new()
     ///     .route(
     ///         &path,
-    ///         axum::routing::get(get_user).layer(spec.validation_layer()),
+    ///         axum::routing::get(|| async { "ok" }).layer(layer),
     ///     );
     /// ```
     pub fn validation_layer(&self) -> ParamValidationLayer {

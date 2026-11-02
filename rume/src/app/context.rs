@@ -14,14 +14,17 @@ use crate::routing::{HealthChecks, RouteRegistry};
 ///
 /// # Example
 ///
-/// ```ignore
-/// use rume::app::{AppContext, Rume};
-/// use rume::prelude::*;
+/// ```no_run
+/// use rume::app::{AppContext, Availability, ProjectPaths, Rume};
+/// use rume::routing::{HealthChecks, Router};
 ///
-/// let ctx = AppContext::new(env, config, paths, availability, health_checks, state);
-/// let router = routes::router(ctx.clone());
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let ctx = AppContext::new((), (), ProjectPaths::from_current_dir(), Availability::new(), HealthChecks::new(), ());
+/// let router = Router::new();
 ///
 /// Rume::builder(ctx).router(router).run().await?;
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Clone, Debug)]
 pub struct AppContext<E, C, S = ()>

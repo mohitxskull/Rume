@@ -5,22 +5,14 @@
 //!
 //! # Example
 //!
-//! ```ignore
-//! use rume::routing::{RouteSpec, Matcher};
-//! use rume::prelude::*;
+//! ```
+//! use rume::routing::{RouteSpec, Matcher, Router};
 //!
-//! let (path, method, _, _) = RouteSpec::get("/users/{id}")
+//! let spec = RouteSpec::get("/users/{id}")
 //!     .where_param("id", Matcher::Number)
-//!     .as("users.show")
-//!     .build();
+//!     .r#as("users.show");
 //!
-//! let router = Router::new()
-//!     .route(&path, match method {
-//!         Method::GET => axum::routing::get(handlers::get_user),
-//!         _ => axum::routing::any(handlers::get_user),
-//!     });
-//!
-//! Rume::builder(ctx).router(router).run().await?;
+//! let router = Router::<()>::new().route_spec(spec, || async { "ok" });
 //! ```
 
 pub mod group;

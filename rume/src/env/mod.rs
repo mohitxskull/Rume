@@ -4,7 +4,7 @@
 //! a project declares its environment as an ordinary Rust struct deriving
 //! `serde::Deserialize`, and [`load`] validates it at boot using `figment`.
 //!
-//! ```ignore
+//! ```no_run
 //! #[derive(Debug, serde::Deserialize)]
 //! #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 //! struct Env {
@@ -13,7 +13,10 @@
 //!     pub app_key: secrecy::SecretBox<String>,
 //! }
 //!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let env: Env = rume::env::load()?;
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod error;

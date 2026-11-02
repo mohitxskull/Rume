@@ -12,24 +12,21 @@ use crate::error::{AppError, ValidationErrorDetail};
 /// Use it in place of `Json<T>` when you want declarative field validation via
 /// [`garde::Validate`]:
 ///
-/// ```ignore
+/// ```
 /// use rume::validation::Validated;
-/// use rume::prelude::*;
 /// use garde::Validate;
+/// use serde::Deserialize;
 ///
 /// #[derive(Deserialize, Validate)]
-/// #[serde(rename_all = "camelCase")]
 /// struct CreateUser {
 ///     #[garde(length(min = 3, max = 50))]
 ///     username: String,
 ///     #[garde(email)]
 ///     email: String,
-///     #[garde(range(min = 18, max = 120))]
-///     age: u32,
 /// }
 ///
-/// pub async fn create_user(Validated(payload): Validated<CreateUser>) -> Json<...> {
-///     // payload is guaranteed valid
+/// async fn create_user(Validated(_payload): Validated<CreateUser>) -> &'static str {
+///     "ok"
 /// }
 /// ```
 pub struct Validated<T>(pub T);

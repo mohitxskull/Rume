@@ -16,10 +16,11 @@ use crate::routing::matchers::Matcher;
 ///
 /// # Example
 ///
-/// ```ignore
-/// use rume::routing::{ValidatedParam, Matcher};
-/// use rume::error::AppError;
+/// ```
+/// use rume::routing::{ValidatedParam, Matcher, validated_param::matchers};
+/// use std::collections::BTreeMap;
 ///
+/// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let params: BTreeMap<String, String> = BTreeMap::from([("id".to_string(), "42".to_string())]);
 /// let validated = ValidatedParam::<matchers::Number>::from_value(
 ///     "id",
@@ -27,6 +28,8 @@ use crate::routing::matchers::Matcher;
 ///     Matcher::Number,
 /// )?;
 /// assert_eq!(validated.value, "42");
+/// # Ok(())
+/// # }
 /// ```
 #[derive(Debug, Clone)]
 pub struct ValidatedParam<M> {
