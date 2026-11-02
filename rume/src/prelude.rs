@@ -5,6 +5,12 @@ pub use crate::app::{
     IntoBindAddr, Lifecycle, LifecycleState, MiddlewareConfigError, ProjectPaths, RequestId, Rume,
     RumeBuilder, init_tracing, ops_router,
 };
+pub use crate::auth::{
+    ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
+    Identity, MemorySessionStore, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
+    RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
+    authorize,
+};
 pub use crate::config;
 pub use crate::config::ConfigError;
 pub use crate::env;

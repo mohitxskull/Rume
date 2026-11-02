@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
+pub mod auth;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -22,6 +23,12 @@ pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle,
     LifecycleState, MiddlewareConfigError, ObservabilityLayer, ProjectPaths, RequestId, Rume,
     RumeBuilder, X_REQUEST_ID, init_tracing, ops_router,
+};
+pub use auth::{
+    ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
+    Identity, MemorySessionStore, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
+    RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
+    authorize,
 };
 pub use error::AppError;
 pub use helpers::{
