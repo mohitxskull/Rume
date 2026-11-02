@@ -28,7 +28,9 @@ pub use crate::jobs::{
     MemoryJobQueue, QueuedJob, RetryPolicy,
 };
 pub use crate::metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
-pub use crate::module::{Module, ModuleContext, ModuleError};
+pub use crate::module::{
+    ArchitectureRules, ArchitectureViolation, Module, ModuleContext, ModuleError, ModuleHarness,
+};
 pub use crate::openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,

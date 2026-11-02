@@ -51,7 +51,9 @@ pub use jobs::{
     MemoryJobQueue, QueuedJob, RetryPolicy,
 };
 pub use metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
-pub use module::{Module, ModuleContext, ModuleError};
+pub use module::{
+    ArchitectureRules, ArchitectureViolation, Module, ModuleContext, ModuleError, ModuleHarness,
+};
 pub use openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
