@@ -45,8 +45,8 @@ impl Matcher {
                 }
             }
             Matcher::Uuid => {
-                if is_valid_uuid(value) {
-                    Ok(value.to_lowercase())
+                if let Ok(parsed) = uuid::Uuid::parse_str(value) {
+                    Ok(parsed.to_string())
                 } else {
                     Err("value is not a valid UUID".to_string())
                 }
@@ -60,26 +60,6 @@ impl Matcher {
             }
         }
     }
-}
-
-fn is_valid_uuid(value: &str) -> bool {
-    if value.len() != 36 {
-        return false;
-    }
-    let parts: Vec<&str> = value.split('-').collect();
-    if parts.len() != 5 {
-        return false;
-    }
-    let expected_lens = [8, 4, 4, 4, 12];
-    for (part, &expected_len) in parts.iter().zip(expected_lens.iter()) {
-        if part.len() != expected_len {
-            return false;
-        }
-        if !part.chars().all(|c| c.is_ascii_hexdigit()) {
-            return false;
-        }
-    }
-    true
 }
 
 fn is_valid_slug(value: &str) -> bool {
