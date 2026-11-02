@@ -118,6 +118,19 @@ where
     }
 }
 
+type ReadyHook<E, C, S> = Box<
+    dyn FnOnce(
+            AppContext<E, C, S>,
+        ) -> Pin<
+            Box<
+                dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
+            >,
+        > + Send,
+>;
+
+type ShutdownHook<E, C, S> =
+    Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
 /// Builder for a [`Rume`] application.
 #[allow(clippy::type_complexity)]
 pub struct RumeBuilder<E, C, S = ()>
@@ -135,22 +148,8 @@ where
     bind: String,
     mode: ApplicationMode,
     environment: Environment,
-    on_ready: Vec<
-        Box<
-            dyn FnOnce(
-                    AppContext<E, C, S>,
-                ) -> Pin<
-                    Box<
-                        dyn Future<
-                                Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
-                            > + Send,
-                    >,
-                > + Send,
-        >,
-    >,
-    on_shutdown: Vec<
-        Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
-    >,
+    on_ready: Vec<ReadyHook<E, C, S>>,
+    on_shutdown: Vec<ShutdownHook<E, C, S>>,
     /// Named middleware registered by alias. The closure wraps the router as a
     /// Tower layer; it is applied only after `use_middleware` marks it.
     middleware: BTreeMap<
@@ -500,7 +499,16 @@ where
     }
 
     /// Run the application until a shutdown signal is received.
-    pub async fn run(mut self) -> Result<(), std::io::Error> {
+    pub async fn run(self) -> Result<(), std::io::Error> {
+        self.run_with_signal(crate::app::shutdown::shutdown_signal())
+            .await
+    }
+
+    /// Run the application with an injectable shutdown signal.
+    pub async fn run_with_signal<F>(mut self, signal: F) -> Result<(), std::io::Error>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         // Pass the builder's route registry into the app context so the
         // application's routes are observable from `AppContext::route_registry`
         // (e.g. by `rume list:routes`).
@@ -551,31 +559,97 @@ where
             )
         })?;
 
+        Self::run_with_bound_listener(
+            serve_ctx,
+            listener,
+            router,
+            on_ready,
+            on_shutdown,
+            shutdown_timeout,
+            signal,
+        )
+        .await
+    }
+
+    /// Run the application with a pre-bound listener and an injectable shutdown signal.
+    pub async fn run_with_listener_and_signal<F>(
+        mut self,
+        listener: TcpListener,
+        signal: F,
+    ) -> Result<(), std::io::Error>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        self.ctx.route_registry = self.route_registry.clone();
+
+        let mode = self.mode;
+        if mode == ApplicationMode::Inspect {
+            let ctx = self.ctx.clone();
+            ctx.lifecycle.set(LifecycleState::Booted);
+            ctx.availability.set(AvailabilityState::Live);
+
+            return Ok(());
+        }
+
+        let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
+        let shutdown_timeout = self.shutdown_timeout;
+        let serve_ctx = self.ctx.clone();
+
+        let router = match self.build_router(serve_ctx.clone()) {
+            Ok(router) => router,
+            Err(err) => return Err(err.into()),
+        };
+
+        Self::run_with_bound_listener(
+            serve_ctx,
+            listener,
+            router,
+            on_ready,
+            on_shutdown,
+            shutdown_timeout,
+            signal,
+        )
+        .await
+    }
+
+    async fn run_with_bound_listener<F>(
+        serve_ctx: AppContext<E, C, S>,
+        listener: TcpListener,
+        router: Router<AppContext<E, C, S>>,
+        on_ready: Vec<ReadyHook<E, C, S>>,
+        on_shutdown: Vec<ShutdownHook<E, C, S>>,
+        shutdown_timeout: Duration,
+        signal: F,
+    ) -> Result<(), std::io::Error>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let addr = listener.local_addr()?;
+
         // --- Step 3: Booted & Live ---
         serve_ctx.lifecycle.set(LifecycleState::Booted);
         serve_ctx.availability.set(AvailabilityState::Live);
 
         // --- Step 4: Startup hooks with cleanup on failure ---
-        if mode == ApplicationMode::Run {
-            for hook in on_ready {
-                if let Err(err) = hook(serve_ctx.clone()).await {
-                    tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
-                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                    serve_ctx.availability.set(AvailabilityState::Broken);
+        for hook in on_ready {
+            if let Err(err) = hook(serve_ctx.clone()).await {
+                tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
+                serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                serve_ctx.availability.set(AvailabilityState::Broken);
 
-                    let cleanup_ctx = serve_ctx.clone();
-                    let cleanup_fut = async {
-                        for hook in on_shutdown {
-                            hook(cleanup_ctx.clone()).await;
-                        }
-                    };
-                    let _ = timeout(shutdown_timeout, cleanup_fut).await;
+                let cleanup_ctx = serve_ctx.clone();
+                let cleanup_fut = async {
+                    for hook in on_shutdown {
+                        hook(cleanup_ctx.clone()).await;
+                    }
+                };
+                let _ = timeout(shutdown_timeout, cleanup_fut).await;
 
-                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                    return Err(std::io::Error::other(format!(
-                        "startup hook failed: {err}"
-                    )));
-                }
+                serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                return Err(std::io::Error::other(format!(
+                    "startup hook failed: {err}"
+                )));
             }
         }
 
@@ -585,20 +659,22 @@ where
 
         println!("listening on http://{addr}");
 
-        // --- Step 6: Serve traffic ---
+        // --- Step 6: Serve traffic with immediate lifecycle & availability transition on shutdown ---
+        let shutdown_lifecycle = serve_ctx.lifecycle.clone();
+        let shutdown_availability = serve_ctx.availability.clone();
+
+        let graceful_signal = async move {
+            signal.await;
+            tracing::info!("shutdown signal received: transitioning to Terminating / RefusingTraffic");
+            shutdown_lifecycle.set(LifecycleState::Terminating);
+            shutdown_availability.set(AvailabilityState::RefusingTraffic);
+        };
+
         let result = axum::serve(listener, router.with_state(serve_ctx.clone()))
-            .with_graceful_shutdown(crate::app::shutdown::shutdown_signal())
+            .with_graceful_shutdown(graceful_signal)
             .await;
 
-        // --- Step 7: Shutdown ---
-        serve_ctx.lifecycle.set(LifecycleState::Terminating);
-        serve_ctx
-            .availability
-            .set(AvailabilityState::RefusingTraffic);
-
-        // Shutdown timeout applies to the aggregate of all shutdown hooks,
-        // not to each hook individually. With several slow hooks, the total
-        // shutdown time must not exceed the configured limit.
+        // --- Step 7: Post-drain shutdown hooks ---
         let on_shutdown_fut = async {
             for hook in on_shutdown {
                 hook(serve_ctx.clone()).await;
