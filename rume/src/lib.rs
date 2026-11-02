@@ -13,6 +13,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod helpers;
+pub mod jobs;
 pub mod module;
 pub mod persistence;
 pub mod prelude;
@@ -37,6 +38,10 @@ pub use helpers::{
     camel_case, condense_whitespace, dot_case, escape_html, excerpt, format_bytes, format_duration,
     kebab_case, mask_email, mask_secret, ordinal, parse_bytes, parse_duration, pascal_case,
     safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
+};
+pub use jobs::{
+    Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker, MemoryJobQueue,
+    QueuedJob, RetryPolicy,
 };
 pub use module::{Module, ModuleContext, ModuleError};
 pub use persistence::{

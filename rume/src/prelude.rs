@@ -21,6 +21,10 @@ pub use crate::helpers::{
     condense_whitespace, escape_html, format_bytes, format_duration, mask_email, mask_secret,
     safe_equal, slug, truncate,
 };
+pub use crate::jobs::{
+    Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker, MemoryJobQueue,
+    QueuedJob, RetryPolicy,
+};
 pub use crate::module::{Module, ModuleContext, ModuleError};
 pub use crate::persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
