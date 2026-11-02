@@ -318,3 +318,38 @@ async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
         Err(rume::cache::CacheError::QuotaExceeded(_))
     ));
 }
+
+#[tokio::test]
+async fn test_tenant_cache_delimiter_isolation() {
+    let base_cache = Cache::new(MemoryCacheBackend::new(), CacheConfig::default());
+    let scoped_cache = TenantScopedCache::new(base_cache);
+
+    // Tenant "a:b" with key "c"
+    scoped_cache
+        .set("a:b", "c", &"value_ab_c", None)
+        .await
+        .unwrap();
+
+    // Tenant "a" with key "b:c"
+    scoped_cache
+        .set("a", "b:c", &"value_a_bc", None)
+        .await
+        .unwrap();
+
+    // Verify no collision occurs due to length-prefixed formatting:
+    // "tenant:3:a:b:c" vs "tenant:1:a:b:c"
+    let val1: Option<String> = scoped_cache.get("a:b", "c").await.unwrap();
+    let val2: Option<String> = scoped_cache.get("a", "b:c").await.unwrap();
+
+    assert_eq!(val1.as_deref(), Some("value_ab_c"));
+    assert_eq!(val2.as_deref(), Some("value_a_bc"));
+
+    // Invalidation of tenant "a:b" must not touch tenant "a"
+    scoped_cache.invalidate_tenant("a:b").await.unwrap();
+
+    let val1_after: Option<String> = scoped_cache.get("a:b", "c").await.unwrap();
+    let val2_after: Option<String> = scoped_cache.get("a", "b:c").await.unwrap();
+
+    assert!(val1_after.is_none());
+    assert_eq!(val2_after.as_deref(), Some("value_a_bc"));
+}

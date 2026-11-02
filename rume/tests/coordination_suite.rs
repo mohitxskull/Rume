@@ -36,6 +36,7 @@ async fn test_distributed_lock_exclusive_and_fencing() {
 
 #[tokio::test]
 async fn test_distributed_lock_ttl_auto_expiration() {
+    tokio::time::pause();
     let lock_service = MemoryDistributedLock::new();
     let ttl = Duration::from_millis(20);
 
@@ -47,8 +48,8 @@ async fn test_distributed_lock_ttl_auto_expiration() {
         .unwrap();
     assert_eq!(guard_a.fencing_token, 1);
 
-    // Sleep past TTL
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Fast-forward virtual clock past TTL deterministically
+    tokio::time::advance(Duration::from_millis(30)).await;
 
     // Client B acquires expired lock
     let guard_b = lock_service.acquire("cache-rebuild", ttl).await.unwrap();

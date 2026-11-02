@@ -7,7 +7,7 @@ pub mod rate_limiter;
 pub mod timeout;
 
 pub use circuit_breaker::{
-    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitState,
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitBreakerService, CircuitState,
 };
 pub use concurrency::{ConcurrencyLimitLayer, ConcurrencyLimiter, ConcurrencyPermit};
 pub use error::ResilienceError;

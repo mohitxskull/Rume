@@ -209,6 +209,28 @@ async fn optional_auth_guest_and_authenticated() {
 }
 
 #[tokio::test]
+async fn optional_auth_succeeds_as_guest_when_session_cookie_expired() {
+    let session_scheme = SessionScheme::new(MemorySessionStore::new());
+    let router = rume::routing::Router::new()
+        .route("/optional", get(optional_profile))
+        .layer(AuthLayer::optional().scheme(session_scheme));
+
+    let app = TestApp::new(router);
+
+    let req = axum::http::Request::builder()
+        .uri("/optional")
+        .header("cookie", "rume_session=expired_or_invalid_token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(val["authenticated"], false);
+    assert!(val["user_id"].is_null());
+}
+
+#[tokio::test]
 async fn declarative_authorization_policies() {
     let api_key = ApiKeyScheme::new()
         .add_key(

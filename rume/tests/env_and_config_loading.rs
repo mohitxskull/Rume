@@ -7,15 +7,46 @@ use tempfile::TempDir;
 
 static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn set_env(key: &str, value: &str) {
-    unsafe {
-        std::env::set_var(key, value);
+struct EnvVarGuard {
+    saved: Vec<(String, Option<String>)>,
+}
+
+impl EnvVarGuard {
+    fn new() -> Self {
+        Self { saved: Vec::new() }
+    }
+
+    fn set(&mut self, key: &str, value: &str) {
+        if !self.saved.iter().any(|(k, _)| k == key) {
+            let prev = std::env::var(key).ok();
+            self.saved.push((key.to_string(), prev));
+        }
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+
+    fn remove(&mut self, key: &str) {
+        if !self.saved.iter().any(|(k, _)| k == key) {
+            let prev = std::env::var(key).ok();
+            self.saved.push((key.to_string(), prev));
+        }
+        unsafe {
+            std::env::remove_var(key);
+        }
     }
 }
 
-fn remove_env(key: &str) {
-    unsafe {
-        std::env::remove_var(key);
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        for (key, prev) in self.saved.drain(..).rev() {
+            unsafe {
+                match prev {
+                    Some(val) => std::env::set_var(key, val),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
     }
 }
 
@@ -26,9 +57,10 @@ fn write(path: &std::path::Path, content: &str) {
 #[test]
 fn loads_layered_env_files() {
     let _guard = ENV_LOCK.lock().unwrap();
-    remove_env("HOST");
-    remove_env("PORT");
-    set_env("RUME_ENV", "development");
+    let mut env = EnvVarGuard::new();
+    env.remove("HOST");
+    env.remove("PORT");
+    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -54,8 +86,9 @@ fn loads_layered_env_files() {
 #[test]
 fn skips_local_files_in_test_env() {
     let _guard = ENV_LOCK.lock().unwrap();
-    remove_env("PORT");
-    set_env("RUME_ENV", "test");
+    let mut env = EnvVarGuard::new();
+    env.remove("PORT");
+    env.set("RUME_ENV", "test");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -72,8 +105,9 @@ fn skips_local_files_in_test_env() {
 #[test]
 fn resolves_file_values() {
     let _guard = ENV_LOCK.lock().unwrap();
-    remove_env("SECRET");
-    set_env("RUME_ENV", "development");
+    let mut env = EnvVarGuard::new();
+    env.remove("SECRET");
+    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -100,7 +134,8 @@ struct TestApp {
 #[test]
 fn loads_merged_config() {
     let _guard = ENV_LOCK.lock().unwrap();
-    set_env("RUME_ENV", "development");
+    let mut env = EnvVarGuard::new();
+    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -135,19 +170,20 @@ struct TypedEnv {
 #[test]
 fn loads_typed_env() {
     let _guard = ENV_LOCK.lock().unwrap();
-    remove_env("HOST");
-    remove_env("PORT");
-    remove_env("LOG_LEVEL");
-    set_env("RUME_ENV", "development");
+    let mut env = EnvVarGuard::new();
+    env.remove("HOST");
+    env.remove("PORT");
+    env.remove("LOG_LEVEL");
+    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
     write(&root.join(".env"), "HOST=127.0.0.1\nPORT=3333\n");
 
-    let env: TypedEnv = rume::env::load_in(root).unwrap();
+    let env_res: TypedEnv = rume::env::load_in(root).unwrap();
 
-    assert_eq!(env.host, std::net::IpAddr::from([127, 0, 0, 1]));
-    assert_eq!(env.port, 3333);
-    assert_eq!(env.log_level, None);
+    assert_eq!(env_res.host, std::net::IpAddr::from([127, 0, 0, 1]));
+    assert_eq!(env_res.port, 3333);
+    assert_eq!(env_res.log_level, None);
 }

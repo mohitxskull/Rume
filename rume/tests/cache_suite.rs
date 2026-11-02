@@ -50,6 +50,7 @@ async fn cache_crud_and_prefix_namespaces() {
 
 #[tokio::test]
 async fn cache_ttl_expiration() {
+    tokio::time::pause();
     let cache = Cache::memory();
 
     let product = Product {
@@ -67,8 +68,8 @@ async fn cache_ttl_expiration() {
     // Immediately available
     assert!(cache.exists("prod_ttl").await.unwrap());
 
-    // Sleep past TTL
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Advance virtual clock past TTL deterministically
+    tokio::time::advance(Duration::from_millis(30)).await;
 
     // Now expired and returns None
     assert!(!cache.exists("prod_ttl").await.unwrap());

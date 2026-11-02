@@ -64,6 +64,76 @@ async fn module_harness_isolated_lifecycle_and_testing() {
     // 3. Run shutdown hook
     harness.shutdown().await;
     assert!(shutdown.load(Ordering::SeqCst));
+    // Repeated shutdown is safe and idempotent
+    harness.shutdown().await;
+}
+
+#[derive(Debug)]
+struct FailingDbCheck;
+
+impl rume::routing::HealthCheck for FailingDbCheck {
+    fn name(&self) -> &str {
+        "failing_db"
+    }
+
+    fn run(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = rume::routing::HealthCheckResult> + Send>>
+    {
+        Box::pin(async {
+            rume::routing::HealthCheckResult {
+                name: "failing_db".to_string(),
+                status: rume::routing::HealthStatus::Failed,
+                message: "database unavailable".to_string(),
+                meta: std::collections::BTreeMap::new(),
+                cached: false,
+            }
+        })
+    }
+}
+
+struct FailingModule;
+
+impl Module for FailingModule {
+    fn name(&self) -> &'static str {
+        "failing"
+    }
+
+    fn on_start<'a>(
+        &'a self,
+        _ctx: &'a ModuleContext,
+    ) -> rume::module::BoxFuture<'a, rume::module::ModuleHookResult> {
+        Box::pin(async { Err("db connection refused".into()) })
+    }
+
+    fn register_health_checks(&self, checks: &mut rume::routing::HealthChecks) {
+        checks.add(FailingDbCheck);
+    }
+}
+
+#[tokio::test]
+async fn module_harness_health_checks_and_error_paths() {
+    let harness = ModuleHarness::for_module(FailingModule);
+
+    // Health check inspection before start
+    let report = harness.run_health_checks().await;
+    assert_eq!(report.status, "error");
+    assert_eq!(report.checks.len(), 1);
+    assert_eq!(report.checks[0].name, "failing_db");
+    assert_eq!(report.checks[0].status, rume::routing::HealthStatus::Failed);
+
+    // Startup failure returns ModuleError::StartupFailed
+    let err = harness.start().await.unwrap_err();
+    match err {
+        rume::module::ModuleError::StartupFailed { module, message } => {
+            assert_eq!(module, "failing");
+            assert!(message.contains("db connection refused"));
+        }
+        other => panic!("expected StartupFailed, got {other:?}"),
+    }
+
+    // Shutdown when start failed or never called is a no-op
+    harness.shutdown().await;
 }
 
 struct BillingModule {

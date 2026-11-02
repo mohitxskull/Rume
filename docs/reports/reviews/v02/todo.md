@@ -141,15 +141,15 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 
 ### Group K — Testing Oracle & Deterministic Clocks (solve together)
 
-- [ ] **Testing M1 — Happy-path test bias across newly introduced subsystems fails to verify failure modes** (`testing.md` M1).
+- [x] **Testing M1 — Happy-path test bias across newly introduced subsystems fails to verify failure modes** (`testing.md` M1).
       `rume/tests/`: Subsystems (outbox, jobs, resilience, sagas, coordination) test only success paths. Add test cases for handler panics, broker down, timeout triggers, and delimiter collisions.
-- [ ] **Testing M3 — Widespread non-deterministic wall-clock sleeps across async tests** (`testing.md` M3).
+- [x] **Testing M3 — Widespread non-deterministic wall-clock sleeps across async tests** (`testing.md` M3).
       `rume/tests/coordination_suite.rs`, `resilience_suite.rs`: Tests use `tokio::time::sleep(Duration::from_millis(30))`, causing flakiness in CI. Use `tokio::time::pause()` to fast-forward simulated virtual clocks deterministically.
-- [ ] **Testing m1 — `ModuleHarness` lacks health check inspection and error-path coverage** (`testing.md` m1).
+- [x] **Testing m1 — `ModuleHarness` lacks health check inspection and error-path coverage** (`testing.md` m1).
       `rume/src/module/harness.rs:35–60`: Harness tests route execution but does not expose registered module health checks. Add `harness.health_check()` assertion helper.
-- [ ] **Testing m2 — Process environment mutation in `env_and_config_loading.rs` is not hermetically restored** (`testing.md` m2).
+- [x] **Testing m2 — Process environment mutation in `env_and_config_loading.rs` is not hermetically restored** (`testing.md` m2).
       `rume/tests/env_and_config_loading.rs:50–75`: Test mutates process environment variables without restoring prior state. Use RAII env-guard or isolated subprocess runners.
-- [ ] **Testing m3 — Config unit tests use hardcoded `/tmp` paths rather than isolated `tempfile::tempdir()`** (`testing.md` m3).
+- [x] **Testing m3 — Config unit tests use hardcoded `/tmp` paths rather than isolated `tempfile::tempdir()`** (`testing.md` m3).
       `rume/src/config/loader.rs:85–110`: Concurrent tests sharing `/tmp/app.toml` risk race conditions. Replace with `tempfile::tempdir()`.
 
 ---

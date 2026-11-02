@@ -2,7 +2,8 @@
 
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use axum::body::Body;
 use axum::http::{Request, Response};
@@ -192,6 +193,12 @@ impl<S> Layer<S> for CircuitBreakerLayer {
 pub struct CircuitBreakerService<S> {
     inner: S,
     breaker: CircuitBreaker,
+}
+
+impl<S> CircuitBreakerService<S> {
+    pub fn new(inner: S, breaker: CircuitBreaker) -> Self {
+        Self { inner, breaker }
+    }
 }
 
 impl<S> Service<Request<Body>> for CircuitBreakerService<S>

@@ -9,6 +9,7 @@ use tokio::time::sleep;
 
 #[tokio::test]
 async fn circuit_breaker_state_transitions_and_trip() {
+    tokio::time::pause();
     let config = CircuitBreakerConfig {
         failure_threshold: 3,
         success_threshold: 2,
@@ -55,8 +56,8 @@ async fn circuit_breaker_state_transitions_and_trip() {
     let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
     assert_eq!(val["code"], "CIRCUIT_BREAKER_OPEN");
 
-    // Wait past reset timeout (50ms) -> transitions to HalfOpen
-    sleep(Duration::from_millis(60)).await;
+    // Fast-forward past reset timeout (50ms) -> transitions to HalfOpen
+    tokio::time::advance(Duration::from_millis(60)).await;
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
     // Restore downstream service
@@ -131,10 +132,22 @@ async fn rate_limiting_sliding_window_and_headers() {
 async fn concurrency_limiting_and_load_shedding() {
     let _limiter = ConcurrencyLimiter::new(2);
 
+    let (in_flight_tx, mut in_flight_rx) = tokio::sync::mpsc::channel::<()>(2);
+    let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+
     let router = rume::routing::Router::new()
-        .get("/compute", || async {
-            sleep(Duration::from_millis(60)).await;
-            "computed"
+        .get("/compute", {
+            let in_flight_tx = in_flight_tx.clone();
+            let release_rx = release_rx.clone();
+            move || {
+                let tx = in_flight_tx.clone();
+                let mut rx = release_rx.clone();
+                async move {
+                    let _ = tx.send(()).await;
+                    let _ = rx.wait_for(|&released| released).await;
+                    "computed"
+                }
+            }
         })
         .layer(ConcurrencyLimitLayer::new(2));
 
@@ -147,14 +160,18 @@ async fn concurrency_limiting_and_load_shedding() {
     let app2 = Arc::clone(&app);
     let h2 = tokio::spawn(async move { app2.get("/compute").await });
 
-    // Brief sleep to let both acquire permits
-    sleep(Duration::from_millis(15)).await;
+    // Deterministically wait until both requests have acquired their concurrency permits
+    in_flight_rx.recv().await.unwrap();
+    in_flight_rx.recv().await.unwrap();
 
     // 3rd concurrent request exceeds limit of 2 -> 503 SHED_LOAD
     let res3 = app.get("/compute").await;
     assert_eq!(res3.status(), StatusCode::SERVICE_UNAVAILABLE);
     let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res3).await).unwrap();
     assert_eq!(val["code"], "SHED_LOAD");
+
+    // Release in-flight requests
+    release_tx.send(true).unwrap();
 
     // Wait for in-flight requests to complete
     let (r1, r2) = tokio::join!(h1, h2);
@@ -191,6 +208,7 @@ async fn request_timeout_middleware() {
 
 #[tokio::test]
 async fn test_circuit_breaker_half_open_single_trial_probe() {
+    tokio::time::pause();
     let config = CircuitBreakerConfig {
         failure_threshold: 2,
         success_threshold: 2,
@@ -203,8 +221,8 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
     breaker.on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
 
-    // Sleep past reset timeout -> HalfOpen
-    sleep(Duration::from_millis(50)).await;
+    // Fast-forward past reset timeout -> HalfOpen
+    tokio::time::advance(Duration::from_millis(50)).await;
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
     // First request is allowed as trial probe
@@ -224,6 +242,7 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
 
 #[tokio::test]
 async fn test_rate_limiter_prune_expired_clients() {
+    tokio::time::pause();
     let limiter = RateLimiter::new(RateLimitConfig {
         max_requests: 5,
         window: Duration::from_millis(30),
@@ -232,8 +251,8 @@ async fn test_rate_limiter_prune_expired_clients() {
     assert!(limiter.check("client_temp_1").is_ok());
     assert!(limiter.check("client_temp_2").is_ok());
 
-    // Sleep past sliding window
-    sleep(Duration::from_millis(40)).await;
+    // Fast-forward past sliding window
+    tokio::time::advance(Duration::from_millis(40)).await;
 
     // Pruning should clean up inactive entries
     limiter.prune_expired();
@@ -241,4 +260,38 @@ async fn test_rate_limiter_prune_expired_clients() {
     // Fresh requests start with full quota
     let status = limiter.check("client_temp_1").unwrap();
     assert_eq!(status.remaining, 4);
+}
+
+#[tokio::test]
+async fn circuit_breaker_trips_on_service_transport_errors() {
+    use axum::body::Body;
+    use axum::http::{Request, Response};
+    use tower::Service;
+    use tower::service_fn;
+
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 1,
+        reset_timeout: Duration::from_secs(60),
+    };
+    let breaker = CircuitBreaker::new(config);
+
+    let failing_service = service_fn(|_req: Request<Body>| async {
+        Err::<Response<Body>, _>(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "transport drop",
+        ))
+    });
+
+    let mut cb_service = CircuitBreakerService::new(failing_service, breaker.clone());
+
+    assert_eq!(breaker.state(), CircuitState::Closed);
+
+    let req1 = Request::builder().body(Body::empty()).unwrap();
+    let _ = cb_service.call(req1).await;
+    assert_eq!(breaker.state(), CircuitState::Closed);
+
+    let req2 = Request::builder().body(Body::empty()).unwrap();
+    let _ = cb_service.call(req2).await;
+    assert_eq!(breaker.state(), CircuitState::Open);
 }

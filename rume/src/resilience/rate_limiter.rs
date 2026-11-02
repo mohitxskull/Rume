@@ -3,7 +3,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use axum::body::Body;
 use axum::http::header::HeaderName;

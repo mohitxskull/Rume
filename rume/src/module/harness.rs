@@ -72,4 +72,17 @@ impl<M: Module> ModuleHarness<M> {
         let router = self.module.register_routes(Router::new());
         TestApp::new(router)
     }
+
+    /// Collects all health checks registered by this module.
+    pub fn health_checks(&self) -> crate::routing::HealthChecks {
+        let mut checks = crate::routing::HealthChecks::new();
+        self.module.register_health_checks(&mut checks);
+        checks
+    }
+
+    /// Runs all health checks registered by this module and returns their report.
+    pub async fn run_health_checks(&self) -> crate::routing::HealthReport {
+        let checks = self.health_checks();
+        checks.run().await
+    }
 }
