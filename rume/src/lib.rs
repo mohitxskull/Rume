@@ -22,7 +22,11 @@ pub use app::{
     ops_router,
 };
 pub use error::AppError;
-pub use helpers::{camel_case, kebab_case, pascal_case, safe_equal, slug, snake_case};
+pub use helpers::{
+    camel_case, condense_whitespace, dot_case, escape_html, excerpt, format_bytes, format_duration,
+    kebab_case, mask_email, mask_secret, ordinal, parse_bytes, parse_duration, pascal_case,
+    safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
+};
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, ValidatedParam,
