@@ -51,13 +51,13 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
 #[derive(Debug, Default)]
 struct MemoryDbState {
     kv_store: BTreeMap<String, String>,
-    tables: BTreeSet<String>,
+    executed_statements: Vec<String>,
     applied_migrations: BTreeSet<String>,
     outbox: BTreeMap<String, OutboxMessage>,
     alive: bool,
 }
 
-/// An in-memory key-value test double providing zero-dependency persistence for unit tests.
+/// An in-memory key-value test double and statement spy for unit tests.
 ///
 /// > [!NOTE]
 /// > `MemoryDatabase` is an in-memory test double designed for fast unit testing and interface
@@ -81,12 +81,43 @@ impl MemoryDatabase {
         Self {
             state: Arc::new(RwLock::new(MemoryDbState {
                 kv_store: BTreeMap::new(),
-                tables: BTreeSet::new(),
+                executed_statements: Vec::new(),
                 applied_migrations: BTreeSet::new(),
                 outbox: BTreeMap::new(),
                 alive: true,
             })),
         }
+    }
+
+    /// Sets a key-value pair directly in the in-memory test double.
+    pub fn insert(&self, key: impl Into<String>, value: impl Into<String>) {
+        if let Ok(mut state) = self.state.write() {
+            state.kv_store.insert(key.into(), value.into());
+        }
+    }
+
+    /// Gets a value by key directly from the in-memory test double.
+    pub fn get(&self, key: &str) -> Option<String> {
+        self.state
+            .read()
+            .ok()
+            .and_then(|s| s.kv_store.get(key).cloned())
+    }
+
+    /// Removes a key from the in-memory test double.
+    pub fn remove(&self, key: &str) -> Option<String> {
+        self.state
+            .write()
+            .ok()
+            .and_then(|mut s| s.kv_store.remove(key))
+    }
+
+    /// Returns a copy of all statements executed against this test double.
+    pub fn executed_statements(&self) -> Vec<String> {
+        self.state
+            .read()
+            .map(|s| s.executed_statements.clone())
+            .unwrap_or_default()
     }
 
     /// Sets the alive flag, enabling simulation of database connection failures in health tests.
@@ -144,7 +175,7 @@ impl DatabaseBackend for MemoryDatabase {
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.trim().to_string();
+        let stmt = statement.to_string();
         Box::pin(async move {
             let mut state = self
                 .state
@@ -153,35 +184,8 @@ impl DatabaseBackend for MemoryDatabase {
             if !state.alive {
                 return Err(PersistenceError::Closed);
             }
-
-            if stmt.starts_with("CREATE TABLE") {
-                let name = stmt
-                    .strip_prefix("CREATE TABLE")
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("unknown");
-                state.tables.insert(name.to_string());
-                Ok(1)
-            } else if stmt.starts_with("SET ") {
-                let rest = stmt.strip_prefix("SET ").unwrap_or("");
-                if let Some((k, v)) = rest.split_once('=') {
-                    state
-                        .kv_store
-                        .insert(k.trim().to_string(), v.trim().to_string());
-                    Ok(1)
-                } else {
-                    Err(PersistenceError::QueryFailed(
-                        "invalid SET statement".into(),
-                    ))
-                }
-            } else if stmt.starts_with("DELETE ") {
-                let rest = stmt.strip_prefix("DELETE ").unwrap_or("");
-                state.kv_store.remove(rest.trim());
-                Ok(1)
-            } else {
-                Ok(1)
-            }
+            state.executed_statements.push(stmt);
+            Ok(1)
         })
     }
 
@@ -195,16 +199,7 @@ impl DatabaseBackend for MemoryDatabase {
             if !state.alive {
                 return Err(PersistenceError::Closed);
             }
-
-            if q.starts_with("GET ") {
-                let key = q.strip_prefix("GET ").unwrap_or("").trim();
-                Ok(state.kv_store.get(key).cloned())
-            } else if q.starts_with("EXISTS TABLE ") {
-                let tbl = q.strip_prefix("EXISTS TABLE ").unwrap_or("").trim();
-                Ok(Some(state.tables.contains(tbl).to_string()))
-            } else {
-                Ok(None)
-            }
+            Ok(state.kv_store.get(&q).cloned())
         })
     }
 
@@ -230,11 +225,11 @@ impl DatabaseBackend for MemoryDatabase {
 #[derive(Debug, Default)]
 struct MemoryStagedState {
     kv: BTreeMap<String, Option<String>>,
-    tables: BTreeSet<String>,
+    executed_statements: Vec<String>,
     outbox: BTreeMap<String, Option<OutboxMessage>>,
 }
 
-/// Active transaction for the in-memory database.
+/// Active transaction for the in-memory database test double.
 #[derive(Debug, Clone)]
 pub struct MemoryTransaction {
     state: Arc<RwLock<MemoryDbState>>,
@@ -264,7 +259,7 @@ impl MemoryTransaction {
 
 impl DatabaseTransaction for MemoryTransaction {
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.trim().to_string();
+        let stmt = statement.to_string();
         Box::pin(async move {
             if self.status.load(Ordering::SeqCst) != 0 {
                 return Err(PersistenceError::TransactionError(
@@ -277,34 +272,8 @@ impl DatabaseTransaction for MemoryTransaction {
                 .write()
                 .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
 
-            if stmt.starts_with("CREATE TABLE") {
-                let name = stmt
-                    .strip_prefix("CREATE TABLE")
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or("unknown");
-                staged.tables.insert(name.to_string());
-                Ok(1)
-            } else if stmt.starts_with("SET ") {
-                let rest = stmt.strip_prefix("SET ").unwrap_or("");
-                if let Some((k, v)) = rest.split_once('=') {
-                    staged
-                        .kv
-                        .insert(k.trim().to_string(), Some(v.trim().to_string()));
-                    Ok(1)
-                } else {
-                    Err(PersistenceError::QueryFailed(
-                        "invalid SET statement".into(),
-                    ))
-                }
-            } else if stmt.starts_with("DELETE ") {
-                let rest = stmt.strip_prefix("DELETE ").unwrap_or("");
-                staged.kv.insert(rest.trim().to_string(), None);
-                Ok(1)
-            } else {
-                Ok(1)
-            }
+            staged.executed_statements.push(stmt);
+            Ok(1)
         })
     }
 
@@ -317,23 +286,18 @@ impl DatabaseTransaction for MemoryTransaction {
                 ));
             }
 
-            if q.starts_with("GET ") {
-                let key = q.strip_prefix("GET ").unwrap_or("").trim();
-                let staged = self
-                    .staged
-                    .read()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                if let Some(val_opt) = staged.kv.get(key) {
-                    return Ok(val_opt.clone());
-                }
-                let state = self
-                    .state
-                    .read()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                Ok(state.kv_store.get(key).cloned())
-            } else {
-                Ok(None)
+            let staged = self
+                .staged
+                .read()
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            if let Some(val_opt) = staged.kv.get(&q) {
+                return Ok(val_opt.clone());
             }
+            let state = self
+                .state
+                .read()
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(state.kv_store.get(&q).cloned())
         })
     }
 
@@ -368,9 +332,9 @@ impl DatabaseTransaction for MemoryTransaction {
                     }
                 }
             }
-            for tbl in std::mem::take(&mut staged.tables) {
-                state.tables.insert(tbl);
-            }
+            state
+                .executed_statements
+                .extend(std::mem::take(&mut staged.executed_statements));
             for (id, opt_msg) in std::mem::take(&mut staged.outbox) {
                 match opt_msg {
                     Some(msg) => {
@@ -389,7 +353,7 @@ impl DatabaseTransaction for MemoryTransaction {
         Box::pin(async move {
             if let Ok(mut staged) = self.staged.write() {
                 staged.kv.clear();
-                staged.tables.clear();
+                staged.executed_statements.clear();
                 staged.outbox.clear();
             }
             let _ = self
@@ -405,7 +369,7 @@ impl Drop for MemoryTransaction {
         if Arc::strong_count(&self.status) <= 1 && self.status.load(Ordering::SeqCst) == 0 {
             if let Ok(mut staged) = self.staged.write() {
                 staged.kv.clear();
-                staged.tables.clear();
+                staged.executed_statements.clear();
                 staged.outbox.clear();
             }
             let _ = self

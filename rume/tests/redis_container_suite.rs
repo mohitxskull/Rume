@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use rume::auth::{RedisSessionStore, Session, SessionStore};
 use rume::cache::redis::RedisCacheBackend;
 use rume::cache::{Cache, CacheBackend, CacheConfig, CacheError};
 use rume::coordination::{
@@ -547,4 +548,51 @@ async fn test_redis_idempotency_store() {
         .await
         .expect("acquire 4");
     assert_eq!(s4, IdempotencyStatus::New);
+}
+
+#[tokio::test]
+async fn test_redis_session_store_save_load_ttl_and_destroy() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let server_1 = RedisSessionStore::new(pool.clone());
+    let server_2 = RedisSessionStore::new(pool.clone());
+
+    let mut session = Session::new("session_xyz", "user_admin", 10)
+        .with_role("admin")
+        .with_permission("users:write");
+    session
+        .data
+        .insert("ip".to_string(), "192.168.1.1".to_string());
+
+    // 1. Server 1 saves session
+    server_1.save(session.clone()).await.expect("save session");
+
+    // 2. Server 2 loads session (multi-instance session sharing)
+    let loaded = server_2
+        .load("session_xyz")
+        .await
+        .expect("load session")
+        .expect("session present");
+
+    assert_eq!(loaded.id, "session_xyz");
+    assert_eq!(loaded.user_id, "user_admin");
+    assert_eq!(loaded.roles, vec!["admin"]);
+    assert_eq!(loaded.permissions, vec!["users:write"]);
+    assert_eq!(loaded.data.get("ip").unwrap(), "192.168.1.1");
+
+    // 3. Server 2 destroys session
+    server_2
+        .destroy("session_xyz")
+        .await
+        .expect("destroy session");
+    assert!(server_1.load("session_xyz").await.unwrap().is_none());
+
+    // 4. Session TTL expiration: 1s TTL
+    let short_session = Session::new("session_temp", "user_guest", 1);
+    server_1.save(short_session).await.expect("save temp");
+    assert!(server_2.load("session_temp").await.unwrap().is_some());
+
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(server_2.load("session_temp").await.unwrap().is_none());
 }

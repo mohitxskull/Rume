@@ -46,7 +46,7 @@ redis = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 
 [features]
-default = []
+default = ["sqlite"]
 postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 redis = ["dep:deadpool-redis", "dep:redis"]
 sqlite = ["dep:rusqlite"]

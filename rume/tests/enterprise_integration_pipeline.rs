@@ -21,8 +21,8 @@ use rume::outbox::{
     OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus, TransactionalOutbox,
 };
 use rume::persistence::{
-    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase,
-    PersistenceError,
+    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError,
+    SqliteBackend,
 };
 use rume::tenant::{Tenant, TenantContext};
 
@@ -73,7 +73,14 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
 #[tokio::test]
 async fn realistic_enterprise_pipeline_end_to_end() {
     // 1. Setup Framework Subsystems
-    let db = Arc::new(MemoryDatabase::new());
+    let db = Arc::new(SqliteBackend::in_memory().unwrap());
+    db.init_outbox_table().await.unwrap();
+    db.execute(
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL);",
+    )
+    .await
+    .unwrap();
+
     let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
     let queue = Arc::new(MemoryJobQueue::new());
     let metrics = Arc::new(MetricsRegistry::new());
@@ -108,8 +115,10 @@ async fn realistic_enterprise_pipeline_end_to_end() {
             let db = Arc::clone(&db);
             let tenant_key = tenant_id.clone();
             async move {
-                tx.execute(&format!("SET {tenant_key}:order:{order_id} = paid"))
-                    .await?;
+                tx.execute(&format!(
+                    "INSERT INTO orders (id, tenant_id, status) VALUES ('{order_id}', '{tenant_key}', 'paid');"
+                ))
+                .await?;
                 db.save_tx(&tx, outbox_msg).await.unwrap();
                 Ok::<(), PersistenceError>(())
             }
@@ -120,7 +129,9 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     // Verify database state
     let state_val = pool
         .backend()
-        .query_scalar(&format!("GET {tenant_id}:order:{order_id}"))
+        .query_scalar(&format!(
+            "SELECT status FROM orders WHERE id = '{order_id}';"
+        ))
         .await
         .unwrap();
     assert_eq!(state_val.as_deref(), Some("paid"));
@@ -187,7 +198,14 @@ async fn realistic_enterprise_pipeline_end_to_end() {
 
 #[tokio::test]
 async fn pipeline_failure_recovery_and_atomicity_invariants() {
-    let db = Arc::new(MemoryDatabase::new());
+    let db = Arc::new(SqliteBackend::in_memory().unwrap());
+    db.init_outbox_table().await.unwrap();
+    db.execute(
+        "CREATE TABLE orders (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL);",
+    )
+    .await
+    .unwrap();
+
     let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
     let availability = Availability::new();
 
@@ -203,8 +221,10 @@ async fn pipeline_failure_recovery_and_atomicity_invariants() {
         .transaction(|tx| {
             let db = Arc::clone(&db);
             async move {
-                tx.execute("SET tenant-fail:order:ord_fail = corrupted")
-                    .await?;
+                tx.execute(
+                    "INSERT INTO orders (id, tenant_id, status) VALUES ('ord_fail', 'tenant-fail', 'corrupted');",
+                )
+                .await?;
                 db.save_tx(&tx, failed_msg).await.unwrap();
                 Err::<(), PersistenceError>(PersistenceError::QueryFailed(
                     "constraint failed".into(),
@@ -217,7 +237,7 @@ async fn pipeline_failure_recovery_and_atomicity_invariants() {
     // Zero mutations persisted
     assert_eq!(
         pool.backend()
-            .query_scalar("GET tenant-fail:order:ord_fail")
+            .query_scalar("SELECT status FROM orders WHERE id = 'ord_fail';")
             .await
             .unwrap(),
         None

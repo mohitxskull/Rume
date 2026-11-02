@@ -39,6 +39,8 @@ pub use app::{
     LifecycleState, MiddlewareConfigError, ObservabilityLayer, ProjectPaths, RequestId, Rume,
     RumeBuilder, X_REQUEST_ID, init_tracing, try_init_tracing,
 };
+#[cfg(feature = "redis")]
+pub use auth::RedisSessionStore;
 pub use auth::{
     ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
     Identity, MemorySessionStore, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,

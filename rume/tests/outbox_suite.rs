@@ -253,11 +253,18 @@ async fn outbox_relay_drain_fails_closed_when_pending_count_errors() {
 async fn transactional_outbox_commits_atomically_with_business_mutation() {
     use rume::outbox::TransactionalOutbox;
     use rume::persistence::{
-        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase,
+        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError,
+        SqliteBackend,
     };
 
-    let db = Arc::new(MemoryDatabase::new());
-    let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
+    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    backend.init_outbox_table().await.unwrap();
+    backend
+        .execute("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT NOT NULL);")
+        .await
+        .unwrap();
+
+    let pool = DatabasePool::new((*backend).clone(), DatabaseConfig::default());
 
     let event = OrderPaidEvent {
         order_id: "order_tx_success".into(),
@@ -268,11 +275,12 @@ async fn transactional_outbox_commits_atomically_with_business_mutation() {
 
     // Execute atomic business update + outbox enlistment
     pool.transaction(|tx| {
-        let db = Arc::clone(&db);
+        let b = Arc::clone(&backend);
         async move {
-            tx.execute("SET order:order_tx_success = completed").await?;
-            db.save_tx(&tx, msg).await.unwrap();
-            Ok::<(), rume::persistence::PersistenceError>(())
+            tx.execute("INSERT INTO orders (id, status) VALUES ('order_tx_success', 'completed');")
+                .await?;
+            b.save_tx(&tx, msg).await.unwrap();
+            Ok::<(), PersistenceError>(())
         }
     })
     .await
@@ -281,12 +289,12 @@ async fn transactional_outbox_commits_atomically_with_business_mutation() {
     // Verify both business data AND outbox message committed
     let order_status = pool
         .backend()
-        .query_scalar("GET order:order_tx_success")
+        .query_scalar("SELECT status FROM orders WHERE id = 'order_tx_success';")
         .await
         .unwrap();
     assert_eq!(order_status.as_deref(), Some("completed"));
 
-    let pending = db.fetch_pending(10).await.unwrap();
+    let pending = backend.fetch_pending(10).await.unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].id, msg_id);
     assert_eq!(pending[0].event_type, "order.paid");
@@ -296,12 +304,18 @@ async fn transactional_outbox_commits_atomically_with_business_mutation() {
 async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
     use rume::outbox::TransactionalOutbox;
     use rume::persistence::{
-        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase,
-        PersistenceError,
+        DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError,
+        SqliteBackend,
     };
 
-    let db = Arc::new(MemoryDatabase::new());
-    let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
+    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    backend.init_outbox_table().await.unwrap();
+    backend
+        .execute("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT NOT NULL);")
+        .await
+        .unwrap();
+
+    let pool = DatabasePool::new((*backend).clone(), DatabaseConfig::default());
 
     let event = OrderPaidEvent {
         order_id: "order_tx_fail".into(),
@@ -312,10 +326,11 @@ async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
     // Transaction fails after enlisting outbox message
     let tx_res = pool
         .transaction(|tx| {
-            let db = Arc::clone(&db);
+            let b = Arc::clone(&backend);
             async move {
-                tx.execute("SET order:order_tx_fail = pending").await?;
-                db.save_tx(&tx, msg).await.unwrap();
+                tx.execute("INSERT INTO orders (id, status) VALUES ('order_tx_fail', 'pending');")
+                    .await?;
+                b.save_tx(&tx, msg).await.unwrap();
                 Err::<(), PersistenceError>(PersistenceError::TransactionError(
                     "simulated database abort".into(),
                 ))
@@ -328,12 +343,12 @@ async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
     // Both the business mutation AND the outbox message must be rolled back!
     let order_status = pool
         .backend()
-        .query_scalar("GET order:order_tx_fail")
+        .query_scalar("SELECT status FROM orders WHERE id = 'order_tx_fail';")
         .await
         .unwrap();
     assert_eq!(order_status, None);
 
-    let pending = db.fetch_pending(10).await.unwrap();
+    let pending = backend.fetch_pending(10).await.unwrap();
     assert_eq!(
         pending.len(),
         0,

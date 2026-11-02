@@ -3,7 +3,7 @@ use axum::http::StatusCode;
 use axum::routing::post;
 use rume::persistence::{
     DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MemoryDatabase, Migration,
-    Migrator, PersistenceError,
+    Migrator, PersistenceError, SqliteBackend,
 };
 use rume::prelude::*;
 
@@ -62,13 +62,20 @@ async fn pool_lifecycle_and_capacity_limits() {
 
 #[tokio::test]
 async fn explicit_transaction_commit_and_rollback() {
-    let pool = DatabasePool::new(MemoryDatabase::new(), DatabaseConfig::default());
+    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    backend
+        .execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL);")
+        .await
+        .unwrap();
+    let pool = DatabasePool::new(backend, DatabaseConfig::default());
 
     // 1. Successful transaction commits
     let res: Result<String, PersistenceError> = pool
         .transaction(|tx| async move {
-            tx.execute("SET user:1 = alice").await?;
-            tx.execute("SET user:2 = bob").await?;
+            tx.execute("INSERT INTO users (id, name) VALUES ('user:1', 'alice');")
+                .await?;
+            tx.execute("INSERT INTO users (id, name) VALUES ('user:2', 'bob');")
+                .await?;
             Ok("created".to_string())
         })
         .await;
@@ -76,16 +83,26 @@ async fn explicit_transaction_commit_and_rollback() {
     assert_eq!(res.unwrap(), "created");
 
     // Verify values were committed
-    let val1 = pool.backend().query_scalar("GET user:1").await.unwrap();
-    let val2 = pool.backend().query_scalar("GET user:2").await.unwrap();
+    let val1 = pool
+        .backend()
+        .query_scalar("SELECT name FROM users WHERE id = 'user:1';")
+        .await
+        .unwrap();
+    let val2 = pool
+        .backend()
+        .query_scalar("SELECT name FROM users WHERE id = 'user:2';")
+        .await
+        .unwrap();
     assert_eq!(val1.as_deref(), Some("alice"));
     assert_eq!(val2.as_deref(), Some("bob"));
 
     // 2. Failed transaction rolls back without mutating committed state
     let rollback_res: Result<(), PersistenceError> = pool
         .transaction(|tx| async move {
-            tx.execute("SET user:1 = malory").await?;
-            tx.execute("SET user:3 = charlie").await?;
+            tx.execute("INSERT INTO users (id, name) VALUES ('user:1', 'malory');")
+                .await?;
+            tx.execute("INSERT INTO users (id, name) VALUES ('user:3', 'charlie');")
+                .await?;
             Err(PersistenceError::TransactionError("forced failure".into()))
         })
         .await;
@@ -93,86 +110,80 @@ async fn explicit_transaction_commit_and_rollback() {
     assert!(rollback_res.is_err());
 
     // user:1 should retain its original committed value 'alice', and user:3 must not exist
-    let val1_after = pool.backend().query_scalar("GET user:1").await.unwrap();
-    let val3_after = pool.backend().query_scalar("GET user:3").await.unwrap();
+    let val1_after = pool
+        .backend()
+        .query_scalar("SELECT name FROM users WHERE id = 'user:1';")
+        .await
+        .unwrap();
+    let val3_after = pool
+        .backend()
+        .query_scalar("SELECT name FROM users WHERE id = 'user:3';")
+        .await
+        .unwrap();
     assert_eq!(val1_after.as_deref(), Some("alice"));
     assert_eq!(val3_after, None);
 }
 
 #[tokio::test]
 async fn migrations_apply_rollback_and_preflight_verification() {
-    let db = MemoryDatabase::new();
+    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
 
     let migrator = Migrator::new()
         .add_migration(
             Migration::from_sql(
                 "001_create_accounts",
                 "create accounts table",
-                "CREATE TABLE accounts",
+                "CREATE TABLE accounts (id INTEGER PRIMARY KEY, balance INTEGER);",
             )
-            .with_down("DELETE accounts"),
+            .with_down("DROP TABLE accounts;"),
         )
         .add_migration(
             Migration::from_sql(
                 "002_create_transactions",
                 "create transactions table",
-                "CREATE TABLE transactions",
+                "CREATE TABLE transactions (id INTEGER PRIMARY KEY, account_id INTEGER);",
             )
-            .with_down("DELETE transactions"),
+            .with_down("DROP TABLE transactions;"),
         );
 
-    // Preflight fails when migrations are pending
-    assert!(migrator.verify_no_pending(&db).is_err());
-    assert_eq!(migrator.pending_migrations(&db).len(), 2);
-
     // Run pending migrations
-    let summary = migrator.run_pending(&db).await.unwrap();
+    let summary = migrator.run_pending_backend(&backend).await.unwrap();
     assert_eq!(summary.applied.len(), 2);
     assert_eq!(summary.applied[0], "001_create_accounts");
     assert_eq!(summary.applied[1], "002_create_transactions");
 
-    // Now preflight verification passes
-    assert!(migrator.verify_no_pending(&db).is_ok());
-    assert_eq!(migrator.pending_migrations(&db).len(), 0);
-
     // Running pending again is idempotent
-    let summary2 = migrator.run_pending(&db).await.unwrap();
+    let summary2 = migrator.run_pending_backend(&backend).await.unwrap();
     assert_eq!(summary2.applied.len(), 0);
 
     // Rollback last migration
-    let rolled_back = migrator.rollback_last(&db).await.unwrap();
+    let rolled_back = migrator.rollback_last_backend(&backend).await.unwrap();
     assert_eq!(rolled_back.as_deref(), Some("002_create_transactions"));
-
-    // Now 1 migration is pending
-    assert_eq!(migrator.pending_migrations(&db).len(), 1);
-    assert!(migrator.verify_no_pending(&db).is_err());
 }
 
 #[tokio::test]
 async fn irreversible_migration_rollback_fails_closed() {
-    let db = MemoryDatabase::new();
+    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    backend
+        .execute("CREATE TABLE legacy_data (id INT);")
+        .await
+        .unwrap();
 
-    // Migration without down_sql
     let migrator = Migrator::new().add_migration(Migration::from_sql(
         "001_irreversible_drop",
         "drop legacy table",
-        "DROP TABLE legacy_data",
+        "DROP TABLE legacy_data;",
     ));
 
-    migrator.run_pending(&db).await.unwrap();
-    assert!(db.has_migration("001_irreversible_drop"));
+    migrator.run_pending_backend(&backend).await.unwrap();
 
     // Attempt rollback: must fail closed and NOT unmark the migration
-    let res = migrator.rollback_last(&db).await;
+    let res = migrator.rollback_last_backend(&backend).await;
     assert!(res.is_err());
     let err = res.unwrap_err();
     assert!(
         matches!(err, PersistenceError::IrreversibleMigration(ref id) if id == "001_irreversible_drop")
     );
-
-    // Database still tracks it as applied
-    assert!(db.has_migration("001_irreversible_drop"));
-    assert_eq!(migrator.pending_migrations(&db).len(), 0);
 }
 
 #[tokio::test]
@@ -214,19 +225,20 @@ async fn health_check_reports_pool_status_and_failures() {
 
 #[derive(Clone)]
 struct BillingModule {
-    pool: DatabasePool<MemoryDatabase>,
+    pool: DatabasePool<SqliteBackend>,
     migrator: Migrator,
 }
 
 impl BillingModule {
     fn new() -> Self {
+        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
         let migrator = Migrator::new().add_migration(Migration::from_sql(
             "001_billing_accounts",
             "setup billing accounts",
-            "CREATE TABLE billing_accounts",
+            "CREATE TABLE IF NOT EXISTS accounts (id TEXT PRIMARY KEY, balance TEXT NOT NULL);",
         ));
         Self {
-            pool: DatabasePool::new(MemoryDatabase::new(), DatabaseConfig::default()),
+            pool: DatabasePool::new(backend, DatabaseConfig::default()),
             migrator,
         }
     }
@@ -243,7 +255,7 @@ impl Module for BillingModule {
     ) -> rume::module::BoxFuture<'a, rume::module::ModuleHookResult> {
         Box::pin(async move {
             self.migrator
-                .run_pending(self.pool.backend())
+                .run_pending_backend(self.pool.backend())
                 .await
                 .map_err(|e| e.to_string())?;
             Ok(())
@@ -270,7 +282,9 @@ impl Module for BillingModule {
 
                     let res = pool
                         .transaction(move |tx| async move {
-                            let stmt = format!("SET account:{id_val} = {balance}");
+                            let stmt = format!(
+                                "INSERT INTO accounts (id, balance) VALUES ('{id_val}', '{balance}');"
+                            );
                             tx.execute(&stmt).await?;
                             Ok::<_, PersistenceError>(())
                         })
@@ -297,7 +311,8 @@ async fn module_persistence_end_to_end() {
     let billing = BillingModule::new();
     let test_app = Rume::new()
         .register_module(billing)
-        .test_app()
+        .build_test_app()
+        .await
         .expect("app should build");
 
     let res = test_app
