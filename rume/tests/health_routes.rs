@@ -3,7 +3,7 @@
 //! `HealthChecks::run` against an actual router (not a bare handler).
 
 use axum::http::StatusCode;
-use rume::app::{AppContext, Availability, ProjectPaths};
+use rume::app::{AppContext, Availability, AvailabilityState, ProjectPaths};
 use rume::prelude::{TestApp, TestAppBuilder};
 use rume::routing::{HealthCheck, HealthCheckResult, HealthChecks, HealthStatus, health_routes};
 use std::collections::BTreeMap;
@@ -108,6 +108,7 @@ async fn health_ready_returns_ok_when_all_checks_ok() {
     )
     .health_checks(HealthChecks::new().register(OkCheck))
     .build();
+    ctx.availability.set(AvailabilityState::Ready);
 
     let app = TestAppBuilder::new(ctx.clone())
         .router(health_routes())
@@ -132,6 +133,7 @@ async fn health_ready_returns_503_on_warning() {
     )
     .health_checks(HealthChecks::new().register(WarningCheck))
     .build();
+    ctx.availability.set(AvailabilityState::Ready);
 
     let app = TestAppBuilder::new(ctx.clone())
         .router(health_routes())
@@ -152,6 +154,7 @@ async fn health_ready_returns_503_on_failed() {
     )
     .health_checks(HealthChecks::new().register(FailedCheck))
     .build();
+    ctx.availability.set(AvailabilityState::Ready);
 
     let app = TestAppBuilder::new(ctx.clone())
         .router(health_routes())
@@ -173,6 +176,7 @@ async fn health_ready_excludes_debug_info() {
     )
     .health_checks(HealthChecks::new().register(OkCheck))
     .build();
+    ctx.availability.set(AvailabilityState::Ready);
 
     let app = TestAppBuilder::new(ctx.clone())
         .router(health_routes())

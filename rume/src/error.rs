@@ -9,12 +9,37 @@
 //! All responses use the RFC 9457 Problem Details format
 //! (<https://www.rfc-editor.org/rfc/rfc9457>).
 
-use axum::Json;
+use axum::body::Body;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use thiserror::Error;
 use tracing::{error, warn};
+
+/// The RFC 9457 problem type URI.
+const PROBLEM_TYPE_URI: &str = "about:blank";
+
+/// The RFC 9457 media type for Problem Details responses.
+const PROBLEM_JSON_MEDIA_TYPE: &str = "application/problem+json";
+
+/// Build an RFC 9457 Problem Details response with the correct media type.
+fn problem_details_response(status: StatusCode, details: &ProblemDetails) -> Response {
+    let body = serde_json::to_string(details).unwrap_or_else(|_| {
+        serde_json::json!({
+            "type": PROBLEM_TYPE_URI,
+            "title": "Error",
+            "status": status.as_u16(),
+            "detail": "An error occurred.",
+            "code": "ERROR",
+        })
+        .to_string()
+    });
+
+    let builder = Response::builder()
+        .status(status)
+        .header(axum::http::header::CONTENT_TYPE, PROBLEM_JSON_MEDIA_TYPE);
+    builder.body(Body::from(body)).unwrap()
+}
 
 /// A single validation error detail, with the field path and message.
 #[derive(Debug, Serialize)]
@@ -92,7 +117,7 @@ pub enum AppError {
 
 impl AppError {
     /// The HTTP status code for this error.
-    fn status_code(&self) -> StatusCode {
+    pub fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
@@ -149,92 +174,82 @@ impl IntoResponse for AppError {
         let status = self.status_code();
 
         match self {
-            Self::NotFound => {
-                // Safe generic message; nothing to log — NotFound is an
-                // expected client outcome, not an internal error.
-                (
+            Self::NotFound => problem_details_response(
+                status,
+                &problem(
                     status,
-                    Json(problem(
-                        status,
-                        "Not Found",
-                        "The requested resource was not found.",
-                        "NOT_FOUND",
-                        None,
-                        None,
-                    )),
-                )
-                    .into_response()
-            }
+                    "Not Found",
+                    "The requested resource was not found.",
+                    "NOT_FOUND",
+                    None,
+                    None,
+                ),
+            ),
             Self::BadRequest { code, message } => {
                 // S-M4: log the detail server-side; clients get a generic
                 // message. The raw message must never be echoed to clients.
                 warn!("bad request: {}", message);
-                (
+                problem_details_response(
                     status,
-                    Json(problem(
+                    &problem(
                         status,
                         "Bad Request",
                         "The request could not be processed.",
                         code,
                         None,
                         None,
-                    )),
+                    ),
                 )
-                    .into_response()
             }
-            Self::Unauthorized => (
+            Self::Unauthorized => problem_details_response(
                 status,
-                Json(problem(
+                &problem(
                     status,
                     "Unauthorized",
                     "The request requires authentication.",
                     "UNAUTHORIZED",
                     None,
                     None,
-                )),
-            )
-                .into_response(),
-            Self::Forbidden => (
+                ),
+            ),
+            Self::Forbidden => problem_details_response(
                 status,
-                Json(problem(
+                &problem(
                     status,
                     "Forbidden",
                     "The request is forbidden.",
                     "FORBIDDEN",
                     None,
                     None,
-                )),
-            )
-                .into_response(),
-            Self::Validation { details } => (
+                ),
+            ),
+            Self::Validation { details } => problem_details_response(
                 status,
-                Json(problem(
+                &problem(
                     status,
                     "Validation Failed",
                     "One or more fields failed validation.",
                     "VALIDATION_FAILED",
                     None,
                     Some(details),
-                )),
-            )
-                .into_response(),
+                ),
+            ),
             Self::Internal { source, request_id } => {
                 // S-M4: log the source server-side; clients get a generic
                 // message. The request_id is echoed so the client can
                 // reference it when contacting support.
                 error!(%source, "internal server error");
-                (
+                problem_details_response(
                     status,
-                    Json(problem(
+                    &problem(
                         status,
                         "Internal Server Error",
                         "An unexpected error occurred.",
                         "INTERNAL_ERROR",
                         request_id,
                         None,
-                    )),
+                    ),
                 )
-                    .into_response()
             }
             Self::Public {
                 status: custom_status,
@@ -243,10 +258,10 @@ impl IntoResponse for AppError {
             } => {
                 // Developer-intentional client error: render as-is. Not
                 // logged — it is intentional, not an internal failure.
-                (
+                problem_details_response(
                     custom_status,
-                    Json(ProblemDetails {
-                        r#type: "about:blank".to_string(),
+                    &ProblemDetails {
+                        r#type: PROBLEM_TYPE_URI.to_string(),
                         title: title_for(custom_status).to_string(),
                         status: custom_status.as_u16(),
                         detail: message,
@@ -254,9 +269,8 @@ impl IntoResponse for AppError {
                         code: code.to_string(),
                         request_id: None,
                         details: None,
-                    }),
+                    },
                 )
-                    .into_response()
             }
         }
     }

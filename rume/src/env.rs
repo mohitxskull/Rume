@@ -202,8 +202,20 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
         }
     }
 
-    // The merged variable map is the interpolation context: every file-sourced
-    // variable can reference any other, including ones defined in later files.
+    // Process environment always wins. Overlay process env on top of the
+    // merged file values so process variables participate in interpolation
+    // (they can reference file-sourced variables) and take precedence over
+    // file values. Process env keys are not added to `file_keys` because they
+    // did not originate from an env file.
+    for (key, value) in std::env::vars() {
+        merged.insert(key.clone(), (value, "process env".to_string()));
+    }
+
+    // The final merged variable map (files + process env) is the interpolation
+    // context: every variable can reference any other, including
+    // process-overridden variables. Interpolation runs against this final map
+    // rather than against file-only values, so a file variable referencing a
+    // process-overridden variable resolves to the process value.
     let vars: BTreeMap<String, String> = merged
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
@@ -213,7 +225,7 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
-    // Interpolate file-sourced values against the merged map, then route to
+    // Interpolate all values against the final merged map, then route to
     // secrets vs plain values based on the key (not the interpolated value).
     for (key, (value, source)) in &merged {
         let interpolated = interpolate_value(value, &vars)?;
@@ -223,18 +235,6 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
             values.insert(key.clone(), interpolated);
         }
         sources.insert(key.clone(), source.clone());
-    }
-
-    // Process environment always wins. Its values are interpolated too, so they
-    // can reference file-sourced variables.
-    for (key, value) in std::env::vars() {
-        let interpolated = interpolate_value(&value, &vars)?;
-        if is_secret_key(&key) {
-            secrets.insert(key.clone(), SecretBox::new(Box::new(interpolated)));
-        } else {
-            values.insert(key.clone(), interpolated);
-        }
-        sources.insert(key, "process env".to_string());
     }
 
     Ok(ResolvedEnv {
@@ -654,5 +654,90 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test content");
         std::fs::remove_file(&file_path).ok();
+    }
+
+    // --- Sprint 2: environment resolution precedence tests ---
+
+    #[test]
+    fn interpolation_uses_process_overridden_value() {
+        // Simulates the final merged map where process env has overridden a
+        // file variable. A reference to that key resolves to the process
+        // value, not the file value.
+        let mut vars = BTreeMap::new();
+        vars.insert("HOST".to_string(), "file-host".to_string());
+        // Process env overrides HOST:
+        vars.insert("HOST".to_string(), "process-host".to_string());
+
+        assert_eq!(
+            interpolate_value("https://${HOST}/api", &vars).unwrap(),
+            "https://process-host/api"
+        );
+    }
+
+    #[test]
+    fn interpolation_process_refs_file_variable() {
+        // A value can reference another variable in the same merged map,
+        // simulating a process env variable referencing a file variable.
+        let mut vars = BTreeMap::new();
+        vars.insert("FILE_HOST".to_string(), "file-host".to_string());
+        vars.insert(
+            "PROCESS_URL".to_string(),
+            "http://${FILE_HOST}:8080".to_string(),
+        );
+
+        assert_eq!(
+            interpolate_value("${PROCESS_URL}", &vars).unwrap(),
+            "http://file-host:8080"
+        );
+    }
+
+    #[test]
+    fn interpolation_file_refs_process_overridden_variable() {
+        // A file variable referencing a process-overridden variable resolves
+        // to the process value since both are in the same interpolation map.
+        let mut vars = BTreeMap::new();
+        vars.insert("BASE_HOST".to_string(), "file-host".to_string());
+        // Process env override:
+        vars.insert("BASE_HOST".to_string(), "process-host".to_string());
+        vars.insert("URL".to_string(), "https://${BASE_HOST}/api".to_string());
+
+        assert_eq!(
+            interpolate_value("${URL}", &vars).unwrap(),
+            "https://process-host/api"
+        );
+    }
+
+    #[test]
+    fn interpolation_file_refs_another_file_variable() {
+        // Two file-sourced variables in the same .env file can reference each
+        // other.
+        let mut vars = BTreeMap::new();
+        vars.insert("HOST".to_string(), "localhost".to_string());
+        vars.insert("URL".to_string(), "http://${HOST}:3000".to_string());
+
+        assert_eq!(
+            interpolate_value("${URL}", &vars).unwrap(),
+            "http://localhost:3000"
+        );
+    }
+
+    #[test]
+    fn load_merged_map_routes_secret_to_secrets_map() {
+        // A secret key written to a .env file must be routed to the secrets
+        // map (SecretBox), not the plain values map, avoiding plaintext
+        // exposure.
+        let dir = std::env::temp_dir().join("rume_secret_route_test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let env_file = dir.join(".env");
+        std::fs::write(&env_file, "APP_KEY=super-secret-value\nHOST=localhost\n").unwrap();
+
+        let resolved = load_merged_map_in(&dir).unwrap();
+
+        assert!(!resolved.values.contains_key("APP_KEY"));
+        assert!(resolved.secrets.contains_key("APP_KEY"));
+        assert_eq!(resolved.values.get("HOST"), Some(&"localhost".to_string()));
+        assert!(!resolved.secrets.contains_key("HOST"));
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
