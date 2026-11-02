@@ -45,9 +45,13 @@ where
         req: Request<axum::body::Body>,
         state: &S,
     ) -> Result<Self, Self::Rejection> {
-        let json = Json::<T>::from_request(req, state)
-            .await
-            .map_err(|err| AppError::BadRequest(err.to_string()))?;
+        let json =
+            Json::<T>::from_request(req, state)
+                .await
+                .map_err(|err| AppError::BadRequest {
+                    code: "BAD_REQUEST",
+                    message: err.to_string(),
+                })?;
 
         json.0.validate().map_err(|report| {
             let details: Vec<ValidationErrorDetail> = report
@@ -114,7 +118,7 @@ mod tests {
         let body_text = TestApp::body_text(response).await;
         let value: serde_json::Value = serde_json::from_str(&body_text).unwrap();
 
-        assert_eq!(value["error"], "validation failed");
+        assert_eq!(value["code"], "VALIDATION_FAILED");
         let details = value["details"].as_array().unwrap();
         assert!(!details.is_empty());
 

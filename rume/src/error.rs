@@ -1,4 +1,13 @@
 //! Application error type and HTTP response mapping.
+//!
+//! Errors are split into two concerns:
+//! - client-visible, developer-intentional errors ([`AppError::Public`] and
+//!   the safe generic variants), rendered to the client as-is;
+//! - internal diagnostic errors ([`AppError::Internal`]), whose source is
+//!   logged server-side while clients receive a generic message.
+//!
+//! All responses use the RFC 9457 Problem Details format
+//! (<https://www.rfc-editor.org/rfc/rfc9457>).
 
 use axum::Json;
 use axum::http::StatusCode;
@@ -14,14 +23,49 @@ pub struct ValidationErrorDetail {
     pub message: String,
 }
 
+/// RFC 9457 Problem Details response body.
+///
+/// `details` is a Rume extension carrying structured validation errors; it
+/// is omitted entirely when absent. `instance` and `request_id` serialize
+/// as `null` when absent, matching the RFC's optional treatment.
+#[derive(Serialize)]
+struct ProblemDetails {
+    r#type: String,
+    title: String,
+    status: u16,
+    detail: String,
+    instance: Option<String>,
+    code: String,
+    request_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details: Option<Vec<ValidationErrorDetail>>,
+}
+
+/// The diagnostic source of an [`AppError::Internal`], kept as a string.
+///
+/// Wrapped in a newtype so thiserror treats it as the chained error
+/// source (`String` itself does not implement `std::error::Error`). The
+/// source is logged server-side via tracing rather than surfaced to
+/// clients.
+#[derive(Debug)]
+pub struct InternalSource(String);
+
+impl std::fmt::Display for InternalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl std::error::Error for InternalSource {}
+
 /// Errors that can be returned from a Rume handler.
 #[derive(Debug, Error)]
 pub enum AppError {
     #[error("not found")]
     NotFound,
 
-    #[error("bad request: {0}")]
-    BadRequest(String),
+    #[error("bad request: {message}")]
+    BadRequest { code: &'static str, message: String },
 
     #[error("unauthorized")]
     Unauthorized,
@@ -32,64 +76,187 @@ pub enum AppError {
     #[error("validation failed")]
     Validation { details: Vec<ValidationErrorDetail> },
 
-    #[error("internal error: {0}")]
-    Internal(String),
+    #[error("internal server error")]
+    Internal {
+        source: InternalSource,
+        request_id: Option<String>,
+    },
+
+    #[error("{message}")]
+    Public {
+        status: StatusCode,
+        code: &'static str,
+        message: String,
+    },
 }
 
 impl AppError {
+    /// The HTTP status code for this error.
     fn status_code(&self) -> StatusCode {
         match self {
             Self::NotFound => StatusCode::NOT_FOUND,
-            Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::Public { status, .. } => *status,
         }
     }
 }
 
-#[derive(Serialize)]
-struct ErrorBody {
-    error: String,
+/// A Problem Details body with the standard fields filled in.
+///
+/// `title` and `detail` are static because they describe the *class* of
+/// error, not the triggering request; the raw request-specific detail is
+/// never echoed here — that is the job of [`AppError::Public`] (which
+/// passes a developer-intentional message) or the server-side logs.
+fn problem(
+    status: StatusCode,
+    title: &'static str,
+    detail: &'static str,
+    code: &'static str,
+    request_id: Option<String>,
+    details: Option<Vec<ValidationErrorDetail>>,
+) -> ProblemDetails {
+    ProblemDetails {
+        r#type: "about:blank".to_string(),
+        title: title.to_string(),
+        status: status.as_u16(),
+        detail: detail.to_string(),
+        instance: None,
+        code: code.to_string(),
+        request_id,
+        details,
+    }
+}
+
+/// Human-readable title for a status code, used by [`AppError::Public`].
+///
+/// 422 renders as "Validation Failed" rather than the canonical
+/// "Unprocessable Entity", since validation failures are reported to the
+/// client in that form. Non-standard codes without a canonical reason fall
+/// back to "Error".
+fn title_for(status: StatusCode) -> &'static str {
+    if status == StatusCode::UNPROCESSABLE_ENTITY {
+        return "Validation Failed";
+    }
+    status.canonical_reason().unwrap_or("Error")
 }
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let status = self.status_code();
 
-        match &self {
-            Self::Validation { details } => {
-                let body = Json(serde_json::json!({
-                    "error": "validation failed",
-                    "details": details,
-                }));
-                (status, body).into_response()
+        match self {
+            Self::NotFound => {
+                // Safe generic message; nothing to log — NotFound is an
+                // expected client outcome, not an internal error.
+                (
+                    status,
+                    Json(problem(
+                        status,
+                        "Not Found",
+                        "The requested resource was not found.",
+                        "NOT_FOUND",
+                        None,
+                        None,
+                    )),
+                )
+                    .into_response()
             }
-            Self::Internal(detail) => {
-                // S-M4: never echo internal detail to clients; log server-side
-                // instead. Clients receive a generic message.
-                error!(error = %detail, "internal server error");
-                let body = Json(ErrorBody {
-                    error: "internal server error".to_string(),
-                });
-                (status, body).into_response()
+            Self::BadRequest { code, message } => {
+                // S-M4: log the detail server-side; clients get a generic
+                // message. The raw message must never be echoed to clients.
+                warn!("bad request: {}", message);
+                (
+                    status,
+                    Json(problem(
+                        status,
+                        "Bad Request",
+                        "The request could not be processed.",
+                        code,
+                        None,
+                        None,
+                    )),
+                )
+                    .into_response()
             }
-            Self::BadRequest(detail) => {
-                // S-M4: generic message to clients; detail logged server-side.
-                warn!(error = %detail, "bad request");
-                let body = Json(ErrorBody {
-                    error: "bad request".to_string(),
-                });
-                (status, body).into_response()
+            Self::Unauthorized => (
+                status,
+                Json(problem(
+                    status,
+                    "Unauthorized",
+                    "The request requires authentication.",
+                    "UNAUTHORIZED",
+                    None,
+                    None,
+                )),
+            )
+                .into_response(),
+            Self::Forbidden => (
+                status,
+                Json(problem(
+                    status,
+                    "Forbidden",
+                    "The request is forbidden.",
+                    "FORBIDDEN",
+                    None,
+                    None,
+                )),
+            )
+                .into_response(),
+            Self::Validation { details } => (
+                status,
+                Json(problem(
+                    status,
+                    "Validation Failed",
+                    "One or more fields failed validation.",
+                    "VALIDATION_FAILED",
+                    None,
+                    Some(details),
+                )),
+            )
+                .into_response(),
+            Self::Internal { source, request_id } => {
+                // S-M4: log the source server-side; clients get a generic
+                // message. The request_id is echoed so the client can
+                // reference it when contacting support.
+                error!(%source, "internal server error");
+                (
+                    status,
+                    Json(problem(
+                        status,
+                        "Internal Server Error",
+                        "An unexpected error occurred.",
+                        "INTERNAL_ERROR",
+                        request_id,
+                        None,
+                    )),
+                )
+                    .into_response()
             }
-            _ => {
-                // NotFound, Unauthorized, Forbidden all render safe, generic
-                // messages via their Display impls.
-                let body = Json(ErrorBody {
-                    error: self.to_string(),
-                });
-                (status, body).into_response()
+            Self::Public {
+                status: custom_status,
+                code,
+                message,
+            } => {
+                // Developer-intentional client error: render as-is. Not
+                // logged — it is intentional, not an internal failure.
+                (
+                    custom_status,
+                    Json(ProblemDetails {
+                        r#type: "about:blank".to_string(),
+                        title: title_for(custom_status).to_string(),
+                        status: custom_status.as_u16(),
+                        detail: message,
+                        instance: None,
+                        code: code.to_string(),
+                        request_id: None,
+                        details: None,
+                    }),
+                )
+                    .into_response()
             }
         }
     }
@@ -105,12 +272,38 @@ mod tests {
     async fn maps_status_codes() {
         assert_eq!(AppError::NotFound.status_code(), StatusCode::NOT_FOUND);
         assert_eq!(
+            AppError::BadRequest {
+                code: "BAD_REQUEST",
+                message: "x".into(),
+            }
+            .status_code(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            AppError::Unauthorized.status_code(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(AppError::Forbidden.status_code(), StatusCode::FORBIDDEN);
+        assert_eq!(
             AppError::Validation { details: vec![] }.status_code(),
             StatusCode::UNPROCESSABLE_ENTITY
         );
         assert_eq!(
-            AppError::Internal("x".into()).status_code(),
+            AppError::Internal {
+                source: InternalSource("x".into()),
+                request_id: None,
+            }
+            .status_code(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            AppError::Public {
+                status: StatusCode::IM_A_TEAPOT,
+                code: "TEAPOT",
+                message: "x".into(),
+            }
+            .status_code(),
+            StatusCode::IM_A_TEAPOT
         );
     }
 
@@ -122,42 +315,80 @@ mod tests {
         String::from_utf8_lossy(&bytes).to_string()
     }
 
+    /// Extract and parse the JSON body from an IntoResponse.
+    async fn body_json<T: IntoResponse>(resp: T) -> serde_json::Value {
+        serde_json::from_str(&body_of(resp).await).expect("error body is valid JSON")
+    }
+
     #[tokio::test]
     async fn not_found_body_is_safe() {
-        // S-M4: NotFound renders a safe generic message.
-        let body = body_of(AppError::NotFound).await;
-        assert!(body.contains("\"error\":\"not found\""));
+        // S-M4: NotFound renders a safe generic Problem Details body.
+        let value = body_json(AppError::NotFound).await;
+        assert_eq!(value["type"].as_str(), Some("about:blank"));
+        assert_eq!(value["title"].as_str(), Some("Not Found"));
+        assert_eq!(value["status"].as_u64(), Some(404));
+        assert_eq!(
+            value["detail"].as_str(),
+            Some("The requested resource was not found.")
+        );
+        assert_eq!(value["code"].as_str(), Some("NOT_FOUND"));
+        assert!(value["instance"].is_null());
+        assert!(value["request_id"].is_null());
     }
 
     #[tokio::test]
     async fn unauthorized_body_is_safe() {
-        let body = body_of(AppError::Unauthorized).await;
-        assert!(body.contains("\"error\":\"unauthorized\""));
+        let value = body_json(AppError::Unauthorized).await;
+        assert_eq!(value["status"].as_u64(), Some(401));
+        assert_eq!(value["code"].as_str(), Some("UNAUTHORIZED"));
+        assert_eq!(value["title"].as_str(), Some("Unauthorized"));
     }
 
     #[tokio::test]
     async fn forbidden_body_is_safe() {
-        let body = body_of(AppError::Forbidden).await;
-        assert!(body.contains("\"error\":\"forbidden\""));
+        let value = body_json(AppError::Forbidden).await;
+        assert_eq!(value["status"].as_u64(), Some(403));
+        assert_eq!(value["code"].as_str(), Some("FORBIDDEN"));
+        assert_eq!(value["title"].as_str(), Some("Forbidden"));
     }
 
     #[tokio::test]
     async fn bad_request_generic_message_to_client() {
         // S-M4: BadRequest detail must NOT be echoed to clients.
-        let body = body_of(AppError::BadRequest("leaky detail: password=xyz".into())).await;
-        assert!(body.contains("\"error\":\"bad request\""));
+        let body = body_of(AppError::BadRequest {
+            code: "BAD_REQUEST",
+            message: "leaky detail: password=xyz".into(),
+        })
+        .await;
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(400));
+        assert_eq!(value["code"].as_str(), Some("BAD_REQUEST"));
+        assert_eq!(
+            value["detail"].as_str(),
+            Some("The request could not be processed.")
+        );
         assert!(!body.contains("password=xyz"));
         assert!(!body.contains("leaky detail"));
     }
 
     #[tokio::test]
     async fn internal_generic_message_to_client() {
-        // S-M4: Internal detail must NOT be echoed to clients.
-        let body = body_of(AppError::Internal(
-            "connection string: postgresql://user:pass@db".into(),
-        ))
+        // S-M4: Internal source must NOT be echoed to clients; request_id
+        // is echoed so the client can reference it in support.
+        let request_id = "req-123".to_string();
+        let body = body_of(AppError::Internal {
+            source: InternalSource("connection string: postgresql://user:pass@db".into()),
+            request_id: Some(request_id.clone()),
+        })
         .await;
-        assert!(body.contains("\"error\":\"internal server error\""));
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(500));
+        assert_eq!(value["code"].as_str(), Some("INTERNAL_ERROR"));
+        assert_eq!(
+            value["detail"].as_str(),
+            Some("An unexpected error occurred.")
+        );
+        assert_eq!(value["request_id"].as_str(), Some("req-123"));
         assert!(!body.contains("postgresql://"));
         assert!(!body.contains("connection string"));
     }
@@ -171,8 +402,52 @@ mod tests {
             }],
         })
         .await;
-        assert!(body.contains("\"error\":\"validation failed\""));
-        assert!(body.contains("\"field\":\"email\""));
-        assert!(body.contains("\"message\":\"invalid format\""));
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(422));
+        assert_eq!(value["code"].as_str(), Some("VALIDATION_FAILED"));
+        assert_eq!(value["title"].as_str(), Some("Validation Failed"));
+        let details = value["details"].as_array().expect("details array present");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["field"].as_str(), Some("email"));
+        assert_eq!(details[0]["message"].as_str(), Some("invalid format"));
+    }
+
+    #[tokio::test]
+    async fn public_error_uses_custom_status_and_message() {
+        // Public errors are developer-intentional: custom status and message
+        // are rendered to the client as-is, and nothing is logged server-side.
+        let body = body_of(AppError::Public {
+            status: StatusCode::IM_A_TEAPOT,
+            code: "TEAPOT_ERROR",
+            message: "I am a teapot.".into(),
+        })
+        .await;
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(418));
+        assert_eq!(value["code"].as_str(), Some("TEAPOT_ERROR"));
+        assert_eq!(value["detail"].as_str(), Some("I am a teapot."));
+    }
+
+    #[tokio::test]
+    async fn problem_details_has_standard_fields() {
+        // Every Problem Details body carries the standard RFC 9457 fields.
+        let value = body_json(AppError::NotFound).await;
+        for field in [
+            "type",
+            "title",
+            "status",
+            "detail",
+            "instance",
+            "code",
+            "request_id",
+        ] {
+            assert!(
+                value.get(field).is_some(),
+                "Problem Details body missing field {field}"
+            );
+        }
+        assert_eq!(value["type"].as_str(), Some("about:blank"));
+        assert!(value["instance"].is_null());
+        assert!(value["request_id"].is_null());
     }
 }
