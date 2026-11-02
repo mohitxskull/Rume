@@ -18,6 +18,11 @@
 
 # Local-only tooling
 opencode.sh
+pack.sh
 
 # Local experiments and generated projects
 /lab/
+
+# pack.sh output
+repomix-output.*
+.repomixignore
