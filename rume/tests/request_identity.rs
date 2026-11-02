@@ -156,7 +156,10 @@ async fn attaches_request_id_to_problem_details_responses() {
         json.get("request_id").and_then(|v| v.as_str()),
         Some(custom_id)
     );
-    assert_eq!(json.get("code").and_then(|v| v.as_str()), Some("INVALID_INPUT"));
+    assert_eq!(
+        json.get("code").and_then(|v| v.as_str()),
+        Some("INVALID_INPUT")
+    );
 }
 
 #[tokio::test]

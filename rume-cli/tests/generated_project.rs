@@ -71,8 +71,8 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
     assert!(status.success(), "`rume new {project_name}` should succeed");
 
     // Verify local development path override was injected into Cargo.toml
-    let cargo_toml = fs::read_to_string(project_path.join("Cargo.toml"))
-        .expect("read generated Cargo.toml");
+    let cargo_toml =
+        fs::read_to_string(project_path.join("Cargo.toml")).expect("read generated Cargo.toml");
     assert!(
         cargo_toml.contains("path ="),
         "Cargo.toml must contain path override"
@@ -85,7 +85,10 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
             .arg("--check")
             .current_dir(&project_path),
     );
-    assert!(fmt_ok, "`cargo fmt --check` should pass in generated project");
+    assert!(
+        fmt_ok,
+        "`cargo fmt --check` should pass in generated project"
+    );
 
     // 3. Run `cargo check` in the generated project
     let check_ok = run_command(
@@ -96,11 +99,7 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
     assert!(check_ok, "`cargo check` should pass in generated project");
 
     // 4. Run `cargo test` in the generated project
-    let test_ok = run_command(
-        Command::new("cargo")
-            .arg("test")
-            .current_dir(&project_path),
-    );
+    let test_ok = run_command(Command::new("cargo").arg("test").current_dir(&project_path));
     assert!(test_ok, "`cargo test` should pass in generated project");
 
     // 5. Exercise ALL supported generators:
@@ -150,11 +149,7 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
     );
 
     // 8. Run tests in the generated project after running all generators
-    let test_after_gen = run_command(
-        Command::new("cargo")
-            .arg("test")
-            .current_dir(&project_path),
-    );
+    let test_after_gen = run_command(Command::new("cargo").arg("test").current_dir(&project_path));
     assert!(
         test_after_gen,
         "`cargo test` should pass after running all generators"

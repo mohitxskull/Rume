@@ -1,5 +1,5 @@
-use std::fs;
 use serde::Deserialize;
+use std::fs;
 use tempfile::tempdir;
 
 #[derive(Debug, Deserialize)]
@@ -105,11 +105,7 @@ fn typed_config_with_credential_url_does_not_disclose_password() {
 
     let password = "secret_mysql_pass_456";
     let url = format!("mysql://root:{password}@127.0.0.1:3306/db");
-    fs::write(
-        config_dir.join("app.toml"),
-        format!("db_url = \"{url}\"\n"),
-    )
-    .unwrap();
+    fs::write(config_dir.join("app.toml"), format!("db_url = \"{url}\"\n")).unwrap();
 
     let err = rume::config::load_in::<TypedConfigDbUrl>(dir.path()).unwrap_err();
     let msg = err.to_string();

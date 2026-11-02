@@ -104,7 +104,9 @@ pub fn excerpt(input: &str, limit: usize) -> Cow<'_, str> {
     let stripped = strip_html_tags(input);
     let condensed = condense_whitespace(&stripped);
     match truncate(&condensed, limit) {
-        Cow::Borrowed(_) if matches!(stripped, Cow::Borrowed(_)) && matches!(condensed, Cow::Borrowed(_)) => {
+        Cow::Borrowed(_)
+            if matches!(stripped, Cow::Borrowed(_)) && matches!(condensed, Cow::Borrowed(_)) =>
+        {
             Cow::Borrowed(input)
         }
         res => Cow::Owned(res.into_owned()),

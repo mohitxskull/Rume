@@ -1,12 +1,12 @@
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::State;
 use axum::response::IntoResponse;
 use axum::routing::get;
-use axum::Router;
 use rume::app::state::{AvailabilityState, LifecycleState};
 use rume::app::{AppContext, Rume};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -56,23 +56,21 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
         }
     };
 
-    let router = Router::new()
-        .route("/slow", get(slow_handler))
-        .route(
-            "/health/ready",
-            get(|State(app_ctx): State<AppContext<(), (), ()>>| async move {
-                let avail = app_ctx.availability.state();
-                if avail == AvailabilityState::Ready {
-                    (axum::http::StatusCode::OK, "ready").into_response()
-                } else {
-                    (
-                        axum::http::StatusCode::SERVICE_UNAVAILABLE,
-                        "refusing_traffic",
-                    )
-                        .into_response()
-                }
-            }),
-        );
+    let router = Router::new().route("/slow", get(slow_handler)).route(
+        "/health/ready",
+        get(|State(app_ctx): State<AppContext<(), (), ()>>| async move {
+            let avail = app_ctx.availability.state();
+            if avail == AvailabilityState::Ready {
+                (axum::http::StatusCode::OK, "ready").into_response()
+            } else {
+                (
+                    axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                    "refusing_traffic",
+                )
+                    .into_response()
+            }
+        }),
+    );
 
     let shutdown_hook_executed = Arc::new(AtomicBool::new(false));
     let hook_flag = shutdown_hook_executed.clone();
@@ -83,14 +81,12 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
     let addr = listener.local_addr().unwrap();
 
     let server_ctx = ctx.clone();
-    let builder = Rume::builder(ctx)
-        .router(router)
-        .on_shutdown(move |_| {
-            let hook_flag = hook_flag.clone();
-            async move {
-                hook_flag.store(true, Ordering::SeqCst);
-            }
-        });
+    let builder = Rume::builder(ctx).router(router).on_shutdown(move |_| {
+        let hook_flag = hook_flag.clone();
+        async move {
+            hook_flag.store(true, Ordering::SeqCst);
+        }
+    });
 
     let shutdown_fut = async move {
         let _ = shutdown_rx.await;

@@ -212,10 +212,7 @@ mod tests {
 
     #[test]
     fn parse_duration_simple() {
-        assert_eq!(
-            parse_duration("500ms").unwrap(),
-            Duration::from_millis(500)
-        );
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
         assert_eq!(parse_duration("10s").unwrap(), Duration::from_secs(10));
         assert_eq!(parse_duration("15m").unwrap(), Duration::from_secs(15 * 60));
         assert_eq!(parse_duration("2h").unwrap(), Duration::from_secs(2 * 3600));
@@ -227,14 +224,8 @@ mod tests {
 
     #[test]
     fn parse_duration_compound_and_decimals() {
-        assert_eq!(
-            parse_duration("1.5s").unwrap(),
-            Duration::from_millis(1500)
-        );
-        assert_eq!(
-            parse_duration("1m 30s").unwrap(),
-            Duration::from_secs(90)
-        );
+        assert_eq!(parse_duration("1.5s").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_duration("1m 30s").unwrap(), Duration::from_secs(90));
         assert_eq!(
             parse_duration("2h 15m 10s").unwrap(),
             Duration::from_secs(2 * 3600 + 15 * 60 + 10)

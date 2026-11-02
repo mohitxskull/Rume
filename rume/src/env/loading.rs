@@ -105,7 +105,8 @@ where
 
     let figment = Figment::from(Serialized::defaults(parsed));
     figment.extract::<T>().map_err(|err| {
-        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+        let redacted =
+            crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
         EnvError::Validation(redacted)
     })
 }

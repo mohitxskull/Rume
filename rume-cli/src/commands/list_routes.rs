@@ -8,10 +8,10 @@
 //! nested, grouped, resource, and merged routes are represented with 100%
 //! runtime fidelity.
 
-use std::process::Command;
+use crate::ui::table::TableBuilder;
 use comfy_table::Color;
 use rume::routing::RouteInfo;
-use crate::ui::table::TableBuilder;
+use std::process::Command;
 
 pub fn run(json_output: bool) {
     let output = match Command::new("cargo")
@@ -39,7 +39,9 @@ pub fn run(json_output: bool) {
 
     let json_str = match stdout.find(start_tag).and_then(|start| {
         let after_start = &stdout[start + start_tag.len()..];
-        after_start.find(end_tag).map(|end| after_start[..end].trim())
+        after_start
+            .find(end_tag)
+            .map(|end| after_start[..end].trim())
     }) {
         Some(s) => s,
         None => {
@@ -57,7 +59,10 @@ pub fn run(json_output: bool) {
     };
 
     if json_output {
-        println!("{}", serde_json::to_string_pretty(&routes).unwrap_or_else(|_| "[]".to_string()));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&routes).unwrap_or_else(|_| "[]".to_string())
+        );
         return;
     }
 

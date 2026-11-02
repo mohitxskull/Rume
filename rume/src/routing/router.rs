@@ -10,7 +10,7 @@ use axum::http::Method;
 use axum::routing::MethodRouter;
 use tower::Layer;
 
-use crate::routing::registry::{extract_path_params, join_path, RouteInfo, RouteRegistry};
+use crate::routing::registry::{RouteInfo, RouteRegistry, extract_path_params, join_path};
 use crate::routing::resource::Resource;
 use crate::routing::spec::RouteSpec;
 
@@ -339,6 +339,19 @@ where
     /// Return all registered routes.
     pub fn routes(&self) -> &[RouteInfo] {
         self.registry.routes()
+    }
+
+    /// Merge a stateless [`Router<()>`] into this router.
+    ///
+    /// The stateless router's routes and metadata are merged into this router.
+    /// This enables domain modules that encapsulate their own state via `.with_state(my_state)`
+    /// (or stateless modules) to be merged cleanly into an application router carrying any state type `S`.
+    pub fn merge_stateless(mut self, stateless: Router<()>) -> Self {
+        let (axum_router, registry) = stateless.into_parts();
+        let adapted: axum::Router<S> = axum_router.with_state(());
+        self.inner = self.inner.merge(adapted);
+        self.registry.extend(registry);
+        self
     }
 }
 

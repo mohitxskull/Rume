@@ -7,7 +7,7 @@ use axum::handler::Handler;
 use axum::http::Method;
 use axum::routing::MethodRouter;
 
-use crate::routing::registry::{join_path, RouteInfo};
+use crate::routing::registry::{RouteInfo, join_path};
 use crate::routing::resource::Resource;
 use crate::routing::router::Router;
 use crate::routing::spec::RouteSpec;

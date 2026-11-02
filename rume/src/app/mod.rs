@@ -8,7 +8,7 @@ pub mod shutdown;
 pub mod state;
 
 // Re-export the public app surface at the module root for convenience.
-pub use builder::{MiddlewareConfigError, Rume, RumeBuilder};
+pub use builder::{BuildError, IntoBindAddr, MiddlewareConfigError, Rume, RumeBuilder};
 pub use context::{AppContext, AppContextBuilder};
 pub use observability::{ObservabilityLayer, RequestId, X_REQUEST_ID};
 pub use paths::ProjectPaths;

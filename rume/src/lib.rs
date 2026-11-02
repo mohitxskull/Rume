@@ -11,6 +11,7 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod helpers;
+pub mod module;
 pub mod prelude;
 pub mod routing;
 pub mod testing;
@@ -27,6 +28,7 @@ pub use helpers::{
     kebab_case, mask_email, mask_secret, ordinal, parse_bytes, parse_duration, pascal_case,
     safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
 };
+pub use module::{Module, ModuleContext, ModuleError};
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,

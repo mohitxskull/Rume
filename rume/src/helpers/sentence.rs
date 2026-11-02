@@ -86,10 +86,7 @@ mod tests {
     #[test]
     fn to_sentence_three_or_more() {
         assert_eq!(to_sentence(&["one", "two", "three"]), "one, two and three");
-        assert_eq!(
-            to_sentence(&["a", "b", "c", "d"]),
-            "a, b, c and d"
-        );
+        assert_eq!(to_sentence(&["a", "b", "c", "d"]), "a, b, c and d");
     }
 
     #[test]

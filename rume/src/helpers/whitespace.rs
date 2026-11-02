@@ -63,7 +63,10 @@ mod tests {
     #[test]
     fn condense_removes_extra_spaces() {
         assert_eq!(condense_whitespace("  hello   world  "), "hello world");
-        assert_eq!(condense_whitespace("one\n\n\ttwo\r\nthree"), "one two three");
+        assert_eq!(
+            condense_whitespace("one\n\n\ttwo\r\nthree"),
+            "one two three"
+        );
         assert_eq!(condense_whitespace("   "), "");
     }
 }

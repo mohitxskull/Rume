@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -71,6 +72,97 @@ impl From<MiddlewareConfigError> for std::io::Error {
     }
 }
 
+/// Errors that can occur during router construction or application preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BuildError {
+    /// Middleware configuration error.
+    Middleware(MiddlewareConfigError),
+    /// Module registration or dependency error.
+    Module(crate::module::ModuleError),
+}
+
+impl std::fmt::Display for BuildError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Middleware(err) => write!(f, "{err}"),
+            Self::Module(err) => write!(f, "{err}"),
+        }
+    }
+}
+
+impl std::error::Error for BuildError {}
+
+impl From<MiddlewareConfigError> for BuildError {
+    fn from(err: MiddlewareConfigError) -> Self {
+        Self::Middleware(err)
+    }
+}
+
+impl From<crate::module::ModuleError> for BuildError {
+    fn from(err: crate::module::ModuleError) -> Self {
+        Self::Module(err)
+    }
+}
+
+impl From<BuildError> for std::io::Error {
+    fn from(err: BuildError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+    }
+}
+
+/// Types that can be converted into an address string for server binding.
+pub trait IntoBindAddr {
+    fn into_bind_string(self) -> String;
+}
+
+impl IntoBindAddr for SocketAddr {
+    fn into_bind_string(self) -> String {
+        self.to_string()
+    }
+}
+
+impl IntoBindAddr for &str {
+    fn into_bind_string(self) -> String {
+        self.to_string()
+    }
+}
+
+impl IntoBindAddr for String {
+    fn into_bind_string(self) -> String {
+        self
+    }
+}
+
+impl IntoBindAddr for (&str, u16) {
+    fn into_bind_string(self) -> String {
+        format!("{}:{}", self.0, self.1)
+    }
+}
+
+impl IntoBindAddr for (std::net::IpAddr, u16) {
+    fn into_bind_string(self) -> String {
+        SocketAddr::new(self.0, self.1).to_string()
+    }
+}
+
+impl IntoBindAddr for (std::net::Ipv4Addr, u16) {
+    fn into_bind_string(self) -> String {
+        SocketAddr::new(self.0.into(), self.1).to_string()
+    }
+}
+
+impl IntoBindAddr for (std::net::Ipv6Addr, u16) {
+    fn into_bind_string(self) -> String {
+        SocketAddr::new(self.0.into(), self.1).to_string()
+    }
+}
+
+impl IntoBindAddr for ([u8; 4], u16) {
+    fn into_bind_string(self) -> String {
+        SocketAddr::new(std::net::Ipv4Addr::from(self.0).into(), self.1).to_string()
+    }
+}
+
 /// Trait for return types of `on_ready` startup hooks.
 ///
 /// Implemented for `()` (infallible hooks) and `Result<(), E>` (fallible hooks).
@@ -97,8 +189,24 @@ where
 ///
 /// `Rume` is a marker type for the builder API. Every Rume application carries
 /// an [`AppContext`] as its Axum state.
-pub struct Rume<E, C, S = ()> {
+pub struct Rume<E = (), C = (), S = ()> {
     _state: std::marker::PhantomData<(E, C, S)>,
+}
+
+impl Rume<(), (), ()> {
+    /// Create a new progressive Rume application with default configuration.
+    ///
+    /// The application starts with default paths, availability, lifecycle,
+    /// and health checks, and state `()`. Additional modules, state, routes,
+    /// and middleware can be composed progressively.
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new() -> RumeBuilder<(), (), ()> {
+        let paths = ProjectPaths::from_current_dir();
+        let availability = crate::app::state::Availability::new();
+        let health_checks = crate::routing::HealthChecks::new();
+        let ctx = AppContext::new((), (), paths, availability, health_checks, ());
+        RumeBuilder::new(ctx)
+    }
 }
 
 impl<E, C, S> Rume<E, C, S>
@@ -109,10 +217,8 @@ where
 {
     /// Create a builder initialized with an [`AppContext`] as Axum state.
     ///
-    /// This is the only public way to build a Rume application. `RumeBuilder::new`
-    /// is intentionally `pub(crate)` so `Rume::builder` is the sole entry point.
-    /// Every app carries an [`AppContext`] so handlers can access env, config,
-    /// paths, availability, health checks, and application state through [`State`].
+    /// This is the entry point for fully configured applications carrying
+    /// custom environment, configuration, and state.
     pub fn builder(ctx: AppContext<E, C, S>) -> RumeBuilder<E, C, S> {
         RumeBuilder::new(ctx)
     }
@@ -122,9 +228,7 @@ type ReadyHook<E, C, S> = Box<
     dyn FnOnce(
             AppContext<E, C, S>,
         ) -> Pin<
-            Box<
-                dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send,
-            >,
+            Box<dyn Future<Output = Result<(), Box<dyn std::error::Error + Send + Sync>>> + Send>,
         > + Send,
 >;
 
@@ -145,6 +249,8 @@ where
     /// Application-scoped route registry. Cloned from the [`AppContext`] at
     /// construction; [`run`](Self::run) passes it back into the context.
     route_registry: RouteRegistry,
+    /// Registered first-class application modules.
+    modules: Vec<Arc<dyn crate::module::Module>>,
     bind: String,
     mode: ApplicationMode,
     environment: Environment,
@@ -194,6 +300,7 @@ where
             state,
             router: Router::new(),
             route_registry,
+            modules: Vec::new(),
             bind: "127.0.0.1:3000".to_string(),
             mode: ApplicationMode::Run,
             environment: Environment::from_env(),
@@ -207,6 +314,225 @@ where
             applied_groups: BTreeSet::new(),
             shutdown_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Register a first-class application module.
+    ///
+    /// The module's routes and health checks are registered during router
+    /// preflight. Startup hooks run in topological dependency order during
+    /// application boot, and shutdown hooks run in reverse topological order.
+    pub fn module(mut self, module: impl crate::module::Module) -> Self {
+        self.modules.push(Arc::new(module));
+        self
+    }
+
+    /// Mount a `GET` route and register its metadata.
+    pub fn get<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::get(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::GET,
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a `POST` route and register its metadata.
+    pub fn post<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::post(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::POST,
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a `PUT` route and register its metadata.
+    pub fn put<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::put(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::PUT,
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a `PATCH` route and register its metadata.
+    pub fn patch<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::patch(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::PATCH,
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a `DELETE` route and register its metadata.
+    pub fn delete<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::delete(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::DELETE,
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount an `ANY` route and register its metadata.
+    pub fn any<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.route(path, axum::routing::any(handler));
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a RESTful [`crate::routing::Resource`].
+    pub fn resource(mut self, resource: crate::routing::Resource<AppContext<E, C, S>>) -> Self {
+        for r in resource.routes() {
+            self.router = self.router.route(&r.path, r.router.clone());
+            self.route_registry.register(crate::routing::RouteInfo {
+                method: r.method.clone(),
+                path: r.path.clone(),
+                name: Some(r.name.clone()),
+                params: r.params.clone(),
+            });
+        }
+        self
+    }
+
+    /// Nest a child [`crate::routing::Router`] under a path prefix.
+    pub fn nest(
+        mut self,
+        path: &str,
+        router: impl Into<crate::routing::Router<AppContext<E, C, S>>>,
+    ) -> Self {
+        let (axum_router, registry) = router.into().into_parts();
+        self.router = self.router.nest(path, axum_router);
+        for r in registry.routes() {
+            self.route_registry.register(crate::routing::RouteInfo {
+                method: r.method.clone(),
+                path: crate::routing::registry::join_path(path, &r.path),
+                name: r.name.clone(),
+                params: r.params.clone(),
+            });
+        }
+        self
+    }
+
+    /// Merge another [`crate::routing::Router`] into this application.
+    pub fn merge(mut self, router: impl Into<crate::routing::Router<AppContext<E, C, S>>>) -> Self {
+        let (axum_router, registry) = router.into().into_parts();
+        self.router = self.router.merge(axum_router);
+        self.route_registry.extend(registry);
+        self
+    }
+
+    /// Apply a Tower layer to the entire router.
+    pub fn layer<L>(mut self, layer: L) -> Self
+    where
+        L: tower::Layer<axum::routing::Route> + Clone + Send + Sync + 'static,
+        L::Service: tower::Service<axum::extract::Request> + Clone + Send + Sync + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Response:
+            axum::response::IntoResponse + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Error:
+            Into<std::convert::Infallible> + 'static,
+        <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
+    {
+        self.router = self.router.layer(layer);
+        self
+    }
+
+    /// Mount a fallback handler for unmatched requests.
+    pub fn fallback<H, T>(mut self, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        self.router = self.router.fallback(handler);
+        self
+    }
+
+    /// Mount a fallback service for unmatched requests.
+    pub fn fallback_service<T>(mut self, service: T) -> Self
+    where
+        T: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        T::Response: axum::response::IntoResponse + 'static,
+        T::Future: Send + 'static,
+    {
+        self.router = self.router.fallback_service(service);
+        self
+    }
+
+    /// Mount an arbitrary service under a path.
+    pub fn route_service<T>(mut self, path: &str, service: T) -> Self
+    where
+        T: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        T::Response: axum::response::IntoResponse + 'static,
+        T::Future: Send + 'static,
+    {
+        self.router = self.router.route_service(path, service);
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Build the application router and return a lightweight [`crate::testing::TestApp`]
+    /// for integration and unit testing without binding a network port.
+    pub fn test_app(self) -> Result<crate::testing::TestApp, std::io::Error> {
+        let ctx = self.ctx.clone();
+        ctx.lifecycle.set(crate::app::state::LifecycleState::Ready);
+        ctx.availability
+            .set(crate::app::state::AvailabilityState::Ready);
+        let app_router = self.build_router(ctx.clone())?;
+        Ok(crate::testing::TestApp::new(app_router.with_state(ctx)))
     }
 
     /// Add a route to the application.
@@ -251,7 +577,10 @@ where
     ///
     /// Accepts a [`crate::routing::Router`] (carrying both the Axum router and
     /// route registry) or an [`axum::Router`] via [`From`].
-    pub fn router(mut self, router: impl Into<crate::routing::Router<AppContext<E, C, S>>>) -> Self {
+    pub fn router(
+        mut self,
+        router: impl Into<crate::routing::Router<AppContext<E, C, S>>>,
+    ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = axum_router;
         self.route_registry = registry;
@@ -259,11 +588,8 @@ where
     }
 
     /// Set the address to bind.
-    pub fn bind<T>(mut self, addr: T) -> Self
-    where
-        T: Into<SocketAddr>,
-    {
-        self.bind = addr.into().to_string();
+    pub fn bind(mut self, addr: impl IntoBindAddr) -> Self {
+        self.bind = addr.into_bind_string();
         self
     }
 
@@ -417,7 +743,7 @@ where
         self
     }
 
-    /// Build the router with all applied named middleware and groups wrapped
+    /// Build the router with all applied named middleware, groups, and modules wrapped
     /// around the routes, without binding a port. Intended for tests;
     /// [`run`](Self::run) calls this before serving.
     ///
@@ -425,8 +751,8 @@ where
     /// on `Router<AppContext<E, C, S>>`.
     pub fn build_router(
         self,
-        ctx: AppContext<E, C, S>,
-    ) -> Result<Router<AppContext<E, C, S>>, MiddlewareConfigError> {
+        mut ctx: AppContext<E, C, S>,
+    ) -> Result<Router<AppContext<E, C, S>>, BuildError> {
         let RumeBuilder {
             router,
             middleware,
@@ -435,33 +761,54 @@ where
             groups_order,
             applied_middleware,
             applied_groups,
+            modules,
+            mut route_registry,
             ..
         } = self;
 
-        // --- Validation phase (fail closed, before any middleware wraps) ---
+        // --- Step 1: Module preflight & route mounting ---
+        let mut module_registry = crate::module::ModuleRegistry::new();
+        for m in &modules {
+            module_registry.register(Arc::clone(m))?;
+        }
+        let startup_modules = module_registry.resolve_startup_modules()?;
+
+        let mut module_router = crate::routing::Router::new();
+        for m in &startup_modules {
+            module_router = m.register_routes(module_router);
+            m.register_health_checks(&mut ctx.health_checks);
+        }
+        let (module_axum, module_routes) = module_router.into_parts();
+        let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
+        let router = router.merge(adapted);
+        route_registry.extend(module_routes);
+
+        // --- Step 2: Validation phase (fail closed, before any middleware wraps) ---
         let mut seen_middleware: HashSet<&str> = HashSet::new();
         for name in &middleware_order {
             if !seen_middleware.insert(name.as_str()) {
-                return Err(MiddlewareConfigError::DuplicateMiddleware { name: name.clone() });
+                return Err(
+                    MiddlewareConfigError::DuplicateMiddleware { name: name.clone() }.into(),
+                );
             }
         }
 
         let mut seen_groups: HashSet<&str> = HashSet::new();
         for name in &groups_order {
             if !seen_groups.insert(name.as_str()) {
-                return Err(MiddlewareConfigError::DuplicateGroup { name: name.clone() });
+                return Err(MiddlewareConfigError::DuplicateGroup { name: name.clone() }.into());
             }
         }
 
         for name in &applied_middleware {
             if !middleware.contains_key(name.as_str()) {
-                return Err(MiddlewareConfigError::UnknownMiddleware { name: name.clone() });
+                return Err(MiddlewareConfigError::UnknownMiddleware { name: name.clone() }.into());
             }
         }
 
         for name in &applied_groups {
             if !groups.contains_key(name.as_str()) {
-                return Err(MiddlewareConfigError::UnknownGroup { name: name.clone() });
+                return Err(MiddlewareConfigError::UnknownGroup { name: name.clone() }.into());
             }
         }
 
@@ -474,12 +821,13 @@ where
                     return Err(MiddlewareConfigError::UnknownGroupMember {
                         group: group_name.clone(),
                         member: member.clone(),
-                    });
+                    }
+                    .into());
                 }
             }
         }
 
-        // --- Application phase: all references are now known valid ---
+        // --- Step 3: Application phase: all references are now known valid ---
         //
         // Middleware execution follows the standard onion model:
         // 1. Group middleware members execute on entry in declaration order.
@@ -552,11 +900,7 @@ where
         };
 
         // In Inspect mode, boot the application context without serving HTTP
-        // and without running any hooks (on_ready or on_shutdown). Hooks may
-        // perform side effects (DB connections, external calls, etc.) that
-        // should only happen during normal application startup or shutdown.
-        // Inspect mode is for tooling (config check, env check, migrations, list:routes)
-        // that needs a booted app context but no side effects.
+        // and without running any hooks (on_ready or on_shutdown).
         if mode == ApplicationMode::Inspect {
             let ctx = self.ctx.clone();
             ctx.lifecycle.set(LifecycleState::Booted);
@@ -565,6 +909,13 @@ where
             if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
                 || std::env::args().any(|a| a == "--rume-inspect-routes")
             {
+                let mut module_router = crate::routing::Router::new();
+                for m in &self.modules {
+                    module_router = m.register_routes(module_router);
+                }
+                let (_, module_routes) = module_router.into_parts();
+                self.route_registry.extend(module_routes);
+
                 let json = serde_json::to_string(self.route_registry.routes())
                     .unwrap_or_else(|_| "[]".to_string());
                 println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
@@ -574,12 +925,13 @@ where
         }
 
         // --- Step 1: Preflight validation and router construction ---
-        //
-        // Middleware validation happens here, before binding sockets or running
-        // any startup hooks. A misconfigured middleware stack (unknown name,
-        // duplicate, or group with unknown member) causes `run()` to return an
-        // error immediately before any startup side effects (DB pools, workers,
-        // files) execute.
+        let mut module_registry = crate::module::ModuleRegistry::new();
+        for m in &self.modules {
+            module_registry.register(Arc::clone(m))?;
+        }
+        let startup_modules = module_registry.resolve_startup_modules()?;
+        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
+
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
@@ -602,6 +954,8 @@ where
             serve_ctx,
             listener,
             router,
+            startup_modules,
+            shutdown_modules,
             on_ready,
             on_shutdown,
             shutdown_timeout,
@@ -637,6 +991,13 @@ where
             if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
                 || std::env::args().any(|a| a == "--rume-inspect-routes")
             {
+                let mut module_router = crate::routing::Router::new();
+                for m in &self.modules {
+                    module_router = m.register_routes(module_router);
+                }
+                let (_, module_routes) = module_router.into_parts();
+                self.route_registry.extend(module_routes);
+
                 let json = serde_json::to_string(self.route_registry.routes())
                     .unwrap_or_else(|_| "[]".to_string());
                 println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
@@ -644,6 +1005,13 @@ where
 
             return Ok(());
         }
+
+        let mut module_registry = crate::module::ModuleRegistry::new();
+        for m in &self.modules {
+            module_registry.register(Arc::clone(m))?;
+        }
+        let startup_modules = module_registry.resolve_startup_modules()?;
+        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
 
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
@@ -659,6 +1027,8 @@ where
             serve_ctx,
             listener,
             router,
+            startup_modules,
+            shutdown_modules,
             on_ready,
             on_shutdown,
             shutdown_timeout,
@@ -667,10 +1037,13 @@ where
         .await
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_with_bound_listener<F>(
         serve_ctx: AppContext<E, C, S>,
         listener: TcpListener,
         router: Router<AppContext<E, C, S>>,
+        startup_modules: Vec<Arc<dyn crate::module::Module>>,
+        shutdown_modules: Vec<Arc<dyn crate::module::Module>>,
         on_ready: Vec<ReadyHook<E, C, S>>,
         on_shutdown: Vec<ShutdownHook<E, C, S>>,
         shutdown_timeout: Duration,
@@ -685,15 +1058,69 @@ where
         serve_ctx.lifecycle.set(LifecycleState::Booted);
         serve_ctx.availability.set(AvailabilityState::Live);
 
-        // --- Step 4: Startup hooks with cleanup on failure ---
+        // --- Step 4: Module startup hooks in topological dependency order ---
+        let mut started_modules: Vec<Arc<dyn crate::module::Module>> = Vec::new();
+        for m in startup_modules {
+            let mod_ctx = crate::module::ModuleContext::new(
+                m.name(),
+                serve_ctx.paths.clone(),
+                serve_ctx.availability.clone(),
+                serve_ctx.lifecycle.clone(),
+            );
+            if let Err(err) = m.on_start(&mod_ctx).await {
+                tracing::error!(
+                    "module '{}' failed to start: {err}; executing cleanup",
+                    m.name()
+                );
+                serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                serve_ctx.availability.set(AvailabilityState::Broken);
+
+                started_modules.reverse();
+                let cleanup_ctx = serve_ctx.clone();
+                let rollback_fut = async {
+                    for sm in started_modules {
+                        let sm_ctx = crate::module::ModuleContext::new(
+                            sm.name(),
+                            cleanup_ctx.paths.clone(),
+                            cleanup_ctx.availability.clone(),
+                            cleanup_ctx.lifecycle.clone(),
+                        );
+                        sm.on_shutdown(&sm_ctx).await;
+                    }
+                    for hook in on_shutdown {
+                        hook(cleanup_ctx.clone()).await;
+                    }
+                };
+                let _ = timeout(shutdown_timeout, rollback_fut).await;
+
+                serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                return Err(std::io::Error::other(format!(
+                    "module '{}' failed to start: {err}",
+                    m.name()
+                )));
+            }
+            started_modules.push(m);
+        }
+
+        // --- Step 5: Application startup hooks with cleanup on failure ---
         for hook in on_ready {
             if let Err(err) = hook(serve_ctx.clone()).await {
                 tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
                 serve_ctx.lifecycle.set(LifecycleState::Terminating);
                 serve_ctx.availability.set(AvailabilityState::Broken);
 
+                started_modules.reverse();
                 let cleanup_ctx = serve_ctx.clone();
                 let cleanup_fut = async {
+                    for sm in started_modules {
+                        let sm_ctx = crate::module::ModuleContext::new(
+                            sm.name(),
+                            cleanup_ctx.paths.clone(),
+                            cleanup_ctx.availability.clone(),
+                            cleanup_ctx.lifecycle.clone(),
+                        );
+                        sm.on_shutdown(&sm_ctx).await;
+                    }
                     for hook in on_shutdown {
                         hook(cleanup_ctx.clone()).await;
                     }
@@ -701,25 +1128,25 @@ where
                 let _ = timeout(shutdown_timeout, cleanup_fut).await;
 
                 serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                return Err(std::io::Error::other(format!(
-                    "startup hook failed: {err}"
-                )));
+                return Err(std::io::Error::other(format!("startup hook failed: {err}")));
             }
         }
 
-        // --- Step 5: Declare Ready ---
+        // --- Step 6: Declare Ready ---
         serve_ctx.lifecycle.set(LifecycleState::Ready);
         serve_ctx.availability.set(AvailabilityState::Ready);
 
         println!("listening on http://{addr}");
 
-        // --- Step 6: Serve traffic with immediate lifecycle & availability transition on shutdown ---
+        // --- Step 7: Serve traffic with immediate lifecycle & availability transition on shutdown ---
         let shutdown_lifecycle = serve_ctx.lifecycle.clone();
         let shutdown_availability = serve_ctx.availability.clone();
 
         let graceful_signal = async move {
             signal.await;
-            tracing::info!("shutdown signal received: transitioning to Terminating / RefusingTraffic");
+            tracing::info!(
+                "shutdown signal received: transitioning to Terminating / RefusingTraffic"
+            );
             shutdown_lifecycle.set(LifecycleState::Terminating);
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
         };
@@ -728,10 +1155,19 @@ where
             .with_graceful_shutdown(graceful_signal)
             .await;
 
-        // --- Step 7: Post-drain shutdown hooks ---
+        // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
         let on_shutdown_fut = async {
             for hook in on_shutdown {
                 hook(serve_ctx.clone()).await;
+            }
+            for sm in shutdown_modules {
+                let sm_ctx = crate::module::ModuleContext::new(
+                    sm.name(),
+                    serve_ctx.paths.clone(),
+                    serve_ctx.availability.clone(),
+                    serve_ctx.lifecycle.clone(),
+                );
+                sm.on_shutdown(&sm_ctx).await;
             }
         };
         match timeout(shutdown_timeout, on_shutdown_fut).await {
@@ -806,7 +1242,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::UnknownMiddleware { name }
+            BuildError::Middleware(MiddlewareConfigError::UnknownMiddleware { name })
             if name == "auth"
         ));
     }
@@ -821,7 +1257,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::DuplicateMiddleware { name }
+            BuildError::Middleware(MiddlewareConfigError::DuplicateMiddleware { name })
             if name == "auth"
         ));
     }
@@ -834,7 +1270,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::UnknownGroup { name }
+            BuildError::Middleware(MiddlewareConfigError::UnknownGroup { name })
             if name == "admins"
         ));
     }
@@ -850,7 +1286,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::UnknownGroupMember { group, member }
+            BuildError::Middleware(MiddlewareConfigError::UnknownGroupMember { group, member })
             if group == "admins" && member == "missing"
         ));
     }
@@ -866,7 +1302,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::DuplicateGroup { name }
+            BuildError::Middleware(MiddlewareConfigError::DuplicateGroup { name })
             if name == "admins"
         ));
     }
@@ -912,7 +1348,7 @@ mod tests {
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(
             err,
-            MiddlewareConfigError::UnknownMiddleware { .. }
+            BuildError::Middleware(MiddlewareConfigError::UnknownMiddleware { .. })
         ));
     }
 
@@ -1082,7 +1518,10 @@ mod tests {
         let builder = RumeBuilder::new(ctx)
             .route("/hello", axum::routing::get(|| async { "ok" }))
             .middleware("first", recording_mw("first", std::sync::Arc::clone(&log)))
-            .middleware("second", recording_mw("second", std::sync::Arc::clone(&log)))
+            .middleware(
+                "second",
+                recording_mw("second", std::sync::Arc::clone(&log)),
+            )
             .use_middleware("first")
             .use_middleware("second");
 
@@ -1124,7 +1563,9 @@ mod tests {
         let events = log.lock().unwrap().clone();
         assert_eq!(
             events,
-            vec!["a:enter", "b:enter", "c:enter", "c:exit", "b:exit", "a:exit"],
+            vec![
+                "a:enter", "b:enter", "c:enter", "c:exit", "b:exit", "a:exit"
+            ],
             "group members must enter in declaration order and exit in reverse"
         );
     }
@@ -1138,7 +1579,10 @@ mod tests {
 
         let builder = RumeBuilder::new(ctx)
             .route("/hello", axum::routing::get(|| async { "ok" }))
-            .middleware("global_mw", recording_mw("global_mw", std::sync::Arc::clone(&log)))
+            .middleware(
+                "global_mw",
+                recording_mw("global_mw", std::sync::Arc::clone(&log)),
+            )
             .middleware("auth", recording_mw("auth", std::sync::Arc::clone(&log)))
             .middleware("audit", recording_mw("audit", std::sync::Arc::clone(&log)))
             .group("api", &["auth", "audit"])

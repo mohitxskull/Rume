@@ -78,7 +78,9 @@ pub fn redact_credential_urls_in_text(text: &str) -> String {
 
         // Find the boundary of the authority/URL
         let end_authority = rest
-            .find(['/', ' ', '"', '\'', '\n', '\r', '\t', '>', '<', ')', ']', '}'])
+            .find([
+                '/', ' ', '"', '\'', '\n', '\r', '\t', '>', '<', ')', ']', '}',
+            ])
             .unwrap_or(rest.len());
         let authority = &rest[..end_authority];
 

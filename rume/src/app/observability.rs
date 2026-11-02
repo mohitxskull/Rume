@@ -16,9 +16,9 @@ use std::time::Instant;
 
 use axum::body::{Body, HttpBody};
 use axum::extract::FromRequestParts;
+use axum::http::Request;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::request::Parts;
-use axum::http::Request;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -239,7 +239,9 @@ where
                         .and_then(|val| val.to_str().ok())
                         .and_then(|val| val.parse::<usize>().ok())
                         .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
-                        .unwrap_or_else(|| body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64));
+                        .unwrap_or_else(|| {
+                            body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64)
+                        });
 
                     if is_oversized {
                         // Never destroy or truncate oversized responses! Return untouched.
@@ -255,8 +257,10 @@ where
                                 serde_json::from_slice::<serde_json::Value>(&final_bytes)
                                 && let Some(obj) = json.as_object_mut()
                             {
-                                let should_inject =
-                                    matches!(obj.get("request_id"), None | Some(serde_json::Value::Null));
+                                let should_inject = matches!(
+                                    obj.get("request_id"),
+                                    None | Some(serde_json::Value::Null)
+                                );
                                 if should_inject {
                                     obj.insert(
                                         "request_id".to_string(),

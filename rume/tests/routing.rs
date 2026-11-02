@@ -96,8 +96,8 @@ async fn route_invalid_uuid_returns_400() {
 
 #[tokio::test]
 async fn route_malformed_percent_encoding_fails_closed_and_does_not_invoke_handler() {
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     let handler_called = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&handler_called);

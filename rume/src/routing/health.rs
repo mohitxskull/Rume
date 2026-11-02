@@ -98,12 +98,21 @@ impl HealthChecks {
     /// check names must be unique because the result cache keys on name —
     /// a duplicate name would let one check's result overwrite another's.
     pub fn register(mut self, check: impl HealthCheck + 'static) -> Self {
+        self.add(check);
+        self
+    }
+
+    /// Add a health check by mutable reference.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a check with the same name is already registered.
+    pub fn add(&mut self, check: impl HealthCheck + 'static) {
         let name = check.name().to_string();
         if !self.names.insert(name.clone()) {
             panic!("health check '{name}' is registered more than once");
         }
         self.checks.push(Arc::new(check));
-        self
     }
 
     /// Set the per-check timeout. A check that does not complete within this
