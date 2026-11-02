@@ -17,6 +17,7 @@ pub use crate::config::ConfigError;
 pub use crate::env;
 pub use crate::env::EnvError;
 pub use crate::error::AppError;
+pub use crate::events::{Event, EventBus, EventError, EventHandler};
 pub use crate::helpers::{
     condense_whitespace, escape_html, format_bytes, format_duration, mask_email, mask_secret,
     safe_equal, slug, truncate,

@@ -12,6 +12,7 @@ pub mod cache;
 pub mod config;
 pub mod env;
 pub mod error;
+pub mod events;
 pub mod helpers;
 pub mod jobs;
 pub mod module;
@@ -34,6 +35,7 @@ pub use auth::{
 };
 pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use error::AppError;
+pub use events::{Event, EventBus, EventError, EventHandler};
 pub use helpers::{
     camel_case, condense_whitespace, dot_case, escape_html, excerpt, format_bytes, format_duration,
     kebab_case, mask_email, mask_secret, ordinal, parse_bytes, parse_duration, pascal_case,
