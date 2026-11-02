@@ -27,6 +27,19 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Dequeues the next available job whose `available_at` time has passed.
     fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
 
+    /// Dequeues the next available job, recording the worker identifier that claimed it.
+    fn dequeue_for(&self, _worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue()
+    }
+
+    /// Reclaims jobs belonging to dead workers, returning them to the pending queue.
+    fn reclaim_abandoned_jobs(
+        &self,
+        _dead_workers: &[String],
+    ) -> BoxFuture<'_, Result<usize, JobError>> {
+        Box::pin(async move { Ok(0) })
+    }
+
     /// Acknowledges successful execution, removing the job from the queue.
     fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>>;
 
@@ -82,6 +95,7 @@ impl JobQueue for MemoryJobQueue {
         let name = J::NAME.to_string();
         let retry_policy = job.retry_policy();
         let timeout = job.timeout();
+        let idempotency_key = job.idempotency_key();
         let id = Uuid::new_v4().to_string();
 
         Box::pin(async move {
@@ -104,6 +118,8 @@ impl JobQueue for MemoryJobQueue {
                 attempt: 0,
                 retry_policy,
                 timeout,
+                idempotency_key,
+                assigned_worker: None,
                 available_at: Instant::now() + delay,
             };
 
@@ -113,6 +129,15 @@ impl JobQueue for MemoryJobQueue {
     }
 
     fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for("")
+    }
+
+    fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        let wid = if worker_id.is_empty() {
+            None
+        } else {
+            Some(worker_id.to_string())
+        };
         Box::pin(async move {
             let mut state = self
                 .state
@@ -136,11 +161,44 @@ impl JobQueue for MemoryJobQueue {
             if let Some(idx) = found_idx {
                 let mut job = state.pending.remove(idx).unwrap();
                 job.attempt += 1;
+                job.assigned_worker = wid;
                 state.in_flight.push(job.clone());
                 Ok(Some(job))
             } else {
                 Ok(None)
             }
+        })
+    }
+
+    fn reclaim_abandoned_jobs(
+        &self,
+        dead_workers: &[String],
+    ) -> BoxFuture<'_, Result<usize, JobError>> {
+        let dead: std::collections::HashSet<String> = dead_workers.iter().cloned().collect();
+        Box::pin(async move {
+            let mut state = self
+                .state
+                .write()
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let mut reclaimed_jobs = Vec::new();
+            let mut still_in_flight = Vec::new();
+
+            for mut job in std::mem::take(&mut state.in_flight) {
+                if let Some(ref wid) = job.assigned_worker
+                    && dead.contains(wid)
+                {
+                    job.assigned_worker = None;
+                    reclaimed_jobs.push(job);
+                    continue;
+                }
+                still_in_flight.push(job);
+            }
+
+            let reclaimed = reclaimed_jobs.len();
+            state.pending.extend(reclaimed_jobs);
+            state.in_flight = still_in_flight;
+            Ok(reclaimed)
         })
     }
 

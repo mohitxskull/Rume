@@ -44,7 +44,7 @@ pub use auth::{
 };
 pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use coordination::{
-    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LockGuard,
+    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
     MemoryDistributedLock, MemoryLeaderElector,
 };
 pub use enterprise::{

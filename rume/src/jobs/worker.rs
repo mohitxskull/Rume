@@ -7,10 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
 use tokio::time::sleep;
+use uuid::Uuid;
 
 use crate::jobs::error::JobError;
 use crate::jobs::job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
 use crate::jobs::queue::JobQueue;
+use crate::jobs::reliability::{HeartbeatRegistry, IdempotencyStatus, IdempotencyStore};
 
 type ErasedHandler =
     Arc<dyn Fn(&JobContext, &[u8]) -> BoxFuture<'static, Result<(), JobError>> + Send + Sync>;
@@ -94,23 +96,35 @@ impl Drop for InFlightGuard {
 
 /// Background worker managing queue polling, retries, and graceful shutdown drain.
 pub struct JobWorker<Q: JobQueue> {
+    worker_id: String,
     queue: Arc<Q>,
     registry: Arc<JobRegistry>,
     is_stopping: Arc<AtomicBool>,
     in_flight_count: Arc<AtomicU32>,
     concurrency_limit: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
+    heartbeat_registry: Option<Arc<dyn HeartbeatRegistry>>,
+    heartbeat_ttl: Duration,
+    heartbeat_interval: Duration,
+    abandoned_recovery_interval: Option<Duration>,
+    idempotency_store: Option<Arc<dyn IdempotencyStore>>,
 }
 
 impl<Q: JobQueue> Clone for JobWorker<Q> {
     fn clone(&self) -> Self {
         Self {
+            worker_id: self.worker_id.clone(),
             queue: Arc::clone(&self.queue),
             registry: Arc::clone(&self.registry),
             is_stopping: Arc::clone(&self.is_stopping),
             in_flight_count: Arc::clone(&self.in_flight_count),
             concurrency_limit: self.concurrency_limit,
             semaphore: Arc::clone(&self.semaphore),
+            heartbeat_registry: self.heartbeat_registry.clone(),
+            heartbeat_ttl: self.heartbeat_ttl,
+            heartbeat_interval: self.heartbeat_interval,
+            abandoned_recovery_interval: self.abandoned_recovery_interval,
+            idempotency_store: self.idempotency_store.clone(),
         }
     }
 }
@@ -118,6 +132,7 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
 impl<Q: JobQueue> Debug for JobWorker<Q> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JobWorker")
+            .field("worker_id", &self.worker_id)
             .field("is_stopping", &self.is_stopping.load(Ordering::Relaxed))
             .field(
                 "in_flight_jobs",
@@ -145,12 +160,18 @@ impl<Q: JobQueue> JobWorker<Q> {
     ) -> Self {
         let limit = concurrency_limit.max(1);
         Self {
+            worker_id: format!("worker-{}", Uuid::new_v4()),
             queue,
             registry,
             is_stopping: Arc::new(AtomicBool::new(false)),
             in_flight_count: Arc::new(AtomicU32::new(0)),
             concurrency_limit: limit,
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            heartbeat_registry: None,
+            heartbeat_ttl: Duration::from_secs(30),
+            heartbeat_interval: Duration::from_secs(10),
+            abandoned_recovery_interval: None,
+            idempotency_store: None,
         }
     }
 
@@ -162,12 +183,79 @@ impl<Q: JobQueue> JobWorker<Q> {
         self
     }
 
+    /// Sets a custom unique worker identifier.
+    pub fn with_worker_id(mut self, id: impl Into<String>) -> Self {
+        self.worker_id = id.into();
+        self
+    }
+
+    /// Configures heartbeat registration with custom TTL and renewal interval.
+    pub fn with_heartbeat(
+        mut self,
+        registry: Arc<dyn HeartbeatRegistry>,
+        ttl: Duration,
+        interval: Duration,
+    ) -> Self {
+        self.heartbeat_registry = Some(registry);
+        self.heartbeat_ttl = ttl;
+        self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Configures background abandoned job recovery running at the specified interval.
+    pub fn with_abandoned_recovery(mut self, interval: Duration) -> Self {
+        self.abandoned_recovery_interval = Some(interval);
+        self
+    }
+
+    /// Configures an idempotency store for deduplicating execution.
+    pub fn with_idempotency_store(mut self, store: Arc<dyn IdempotencyStore>) -> Self {
+        self.idempotency_store = Some(store);
+        self
+    }
+
+    /// Returns the unique worker identifier.
+    pub fn worker_id(&self) -> &str {
+        &self.worker_id
+    }
+
     /// Spawns the background execution loop into the current async runtime.
     pub fn start(&self) {
         let worker = self.clone();
         tokio::spawn(async move {
             worker.run_loop().await;
         });
+
+        if let Some(heartbeat) = self.heartbeat_registry.clone() {
+            let worker_id = self.worker_id.clone();
+            let is_stopping = Arc::clone(&self.is_stopping);
+            let ttl = self.heartbeat_ttl;
+            let interval = self.heartbeat_interval;
+            let hb_loop = Arc::clone(&heartbeat);
+
+            tokio::spawn(async move {
+                while !is_stopping.load(Ordering::Relaxed) {
+                    let _ = hb_loop.record_heartbeat(&worker_id, ttl).await;
+                    sleep(interval).await;
+                }
+            });
+
+            if let Some(recovery_interval) = self.abandoned_recovery_interval {
+                let queue = Arc::clone(&self.queue);
+                let is_stopping = Arc::clone(&self.is_stopping);
+                let hb_reap = Arc::clone(&heartbeat);
+                tokio::spawn(async move {
+                    while !is_stopping.load(Ordering::Relaxed) {
+                        sleep(recovery_interval).await;
+                        if let Ok(dead) = hb_reap.reap_dead_workers().await
+                            && !dead.is_empty()
+                        {
+                            let _ = queue.reclaim_abandoned_jobs(&dead).await;
+                        }
+                    }
+                });
+            }
+        }
     }
 
     /// Internal worker execution loop.
@@ -178,17 +266,18 @@ impl<Q: JobQueue> JobWorker<Q> {
                 Err(_) => break,
             };
 
-            match self.queue.dequeue().await {
+            match self.queue.dequeue_for(&self.worker_id).await {
                 Ok(Some(job)) => {
                     self.in_flight_count.fetch_add(1, Ordering::SeqCst);
                     let queue = Arc::clone(&self.queue);
                     let registry = Arc::clone(&self.registry);
                     let in_flight = Arc::clone(&self.in_flight_count);
+                    let idempotency = self.idempotency_store.clone();
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _guard = InFlightGuard(in_flight);
-                        Self::execute_job(queue, registry, job).await;
+                        Self::execute_job(queue, registry, job, idempotency).await;
                     });
                 }
                 Ok(None) => {
@@ -204,16 +293,44 @@ impl<Q: JobQueue> JobWorker<Q> {
     }
 
     /// Executes a single dequeued job, handling acknowledgments, retries, and dead-lettering.
-    async fn execute_job(queue: Arc<Q>, registry: Arc<JobRegistry>, job: QueuedJob) {
+    async fn execute_job(
+        queue: Arc<Q>,
+        registry: Arc<JobRegistry>,
+        job: QueuedJob,
+        idempotency_store: Option<Arc<dyn IdempotencyStore>>,
+    ) {
         let job_id = job.id.clone();
+
+        if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+            match store.try_acquire(key, Duration::from_secs(300)).await {
+                Ok(IdempotencyStatus::Completed(_)) => {
+                    let _ = queue.ack(&job_id).await;
+                    return;
+                }
+                Ok(IdempotencyStatus::InProgress) => {
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match registry.dispatch(&job).await {
             Ok(()) => {
                 let _ = queue.ack(&job_id).await;
+                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+                    let _ = store.complete(key, None).await;
+                }
             }
             Err(JobError::Fatal(msg)) => {
+                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+                    let _ = store.release(key).await;
+                }
                 let _ = queue.dead_letter(job, msg).await;
             }
             Err(err) => {
+                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+                    let _ = store.release(key).await;
+                }
                 // Retryable failure: check remaining attempts
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
                     let _ = queue.nack(job, backoff).await;

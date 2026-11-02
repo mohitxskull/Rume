@@ -55,9 +55,9 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group D — Distributed Coordination & Recovery Wiring (solve together)
 > Root cause: Disconnected background recovery routines and unversioned leadership leases.
 
-- [ ] **Enterprise-Reliability M2 — Distributed worker heartbeats and abandoned job recovery are disconnected dead code** (`enterprise-reliability.md` M2).
+- [x] **Enterprise-Reliability M2 — Distributed worker heartbeats and abandoned job recovery are disconnected dead code** (`enterprise-reliability.md` M2).
       `rume/src/jobs/reliability.rs:115–145`: `HeartbeatRegistry` and dead worker job reclamation exist in isolation and are never invoked by `JobWorker`. Wire periodic heartbeats and recovery into the worker loop.
-- [ ] **Enterprise-Reliability M6 — `LeaderElector` lacks monotonic fencing tokens or epoch tracking** (`enterprise-reliability.md` M6).
+- [x] **Enterprise-Reliability M6 — `LeaderElector` lacks monotonic fencing tokens or epoch tracking** (`enterprise-reliability.md` M6).
       `rume/src/coordination/leader.rs:65–95`: Leadership election returns a boolean without lease fencing tokens or epoch counters, risking split-brain execution during network partitions. Add monotonic lease terms/fencing tokens to leader leases.
 
 ### Group E — Resilience & Error Mapping Robustness (solve together)

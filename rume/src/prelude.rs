@@ -15,7 +15,7 @@ pub use crate::cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCache
 pub use crate::config;
 pub use crate::config::ConfigError;
 pub use crate::coordination::{
-    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LockGuard,
+    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
     MemoryDistributedLock, MemoryLeaderElector,
 };
 pub use crate::enterprise::{

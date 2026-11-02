@@ -9,26 +9,37 @@ use crate::coordination::error::CoordinationError;
 use crate::coordination::lock::CoordinationFuture;
 use crate::helpers::safe_equal;
 
+/// A lease granted to an elected leader, containing a monotonic term to prevent split-brain mutations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderLease {
+    /// Target leadership role.
+    pub role: String,
+    /// Candidate identifier holding the lease.
+    pub candidate_id: String,
+    /// Monotonically increasing election term / fencing token.
+    pub term: u64,
+}
+
 /// Interface for distributed leader election.
 pub trait LeaderElector: Debug + Send + Sync + 'static {
-    /// Attempts to acquire leadership for a role. Returns true if candidate became leader.
+    /// Attempts to acquire leadership for a role. Returns `Some(LeaderLease)` if acquired.
     fn try_acquire<'a>(
         &'a self,
         role: &'a str,
         candidate_id: &'a str,
         ttl: Duration,
-    ) -> CoordinationFuture<'a, bool>;
+    ) -> CoordinationFuture<'a, Option<LeaderLease>>;
 
-    /// Renews an actively held leadership lease.
+    /// Renews an actively held leadership lease. Returns `Some(LeaderLease)` on success.
     fn renew<'a>(
         &'a self,
         role: &'a str,
         candidate_id: &'a str,
         ttl: Duration,
-    ) -> CoordinationFuture<'a, bool>;
+    ) -> CoordinationFuture<'a, Option<LeaderLease>>;
 
     /// Returns the current active leader for `role`, or `None` if no valid lease exists.
-    fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<String>>;
+    fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<LeaderLease>>;
 
     /// Voluntarily resigns leadership.
     fn resign<'a>(&'a self, role: &'a str, candidate_id: &'a str) -> CoordinationFuture<'a, bool>;
@@ -37,6 +48,7 @@ pub trait LeaderElector: Debug + Send + Sync + 'static {
 #[derive(Debug, Clone)]
 struct ActiveLeader {
     candidate_id: String,
+    term: u64,
     expires_at: Instant,
 }
 
@@ -44,6 +56,7 @@ struct ActiveLeader {
 #[derive(Debug, Clone, Default)]
 pub struct MemoryLeaderElector {
     leaders: Arc<RwLock<BTreeMap<String, ActiveLeader>>>,
+    term_counter: Arc<RwLock<u64>>,
 }
 
 impl MemoryLeaderElector {
@@ -51,6 +64,7 @@ impl MemoryLeaderElector {
     pub fn new() -> Self {
         Self {
             leaders: Arc::new(RwLock::new(BTreeMap::new())),
+            term_counter: Arc::new(RwLock::new(0)),
         }
     }
 }
@@ -61,7 +75,7 @@ impl LeaderElector for MemoryLeaderElector {
         role: &'a str,
         candidate_id: &'a str,
         ttl: Duration,
-    ) -> CoordinationFuture<'a, bool> {
+    ) -> CoordinationFuture<'a, Option<LeaderLease>> {
         Box::pin(async move {
             let mut leaders = self
                 .leaders
@@ -70,34 +84,44 @@ impl LeaderElector for MemoryLeaderElector {
 
             let now = Instant::now();
 
-            if let Some(current) = leaders.get(role)
+            if let Some(current) = leaders.get_mut(role)
                 && current.expires_at > now
             {
                 // Current leader's lease is still active
                 if safe_equal(current.candidate_id.as_bytes(), candidate_id.as_bytes()) {
                     // Same candidate renewing via acquire
-                    leaders.insert(
-                        role.to_string(),
-                        ActiveLeader {
-                            candidate_id: candidate_id.to_string(),
-                            expires_at: now + ttl,
-                        },
-                    );
-                    return Ok(true);
+                    current.expires_at = now + ttl;
+                    return Ok(Some(LeaderLease {
+                        role: role.to_string(),
+                        candidate_id: candidate_id.to_string(),
+                        term: current.term,
+                    }));
                 }
-                return Ok(false);
+                return Ok(None);
             }
 
-            // Unclaimed or expired: grant to candidate
+            // Unclaimed or expired: allocate next monotonic term and grant to candidate
+            let mut term_guard = self
+                .term_counter
+                .write()
+                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+            *term_guard += 1;
+            let term = *term_guard;
+
             leaders.insert(
                 role.to_string(),
                 ActiveLeader {
                     candidate_id: candidate_id.to_string(),
+                    term,
                     expires_at: now + ttl,
                 },
             );
 
-            Ok(true)
+            Ok(Some(LeaderLease {
+                role: role.to_string(),
+                candidate_id: candidate_id.to_string(),
+                term,
+            }))
         })
     }
 
@@ -106,7 +130,7 @@ impl LeaderElector for MemoryLeaderElector {
         role: &'a str,
         candidate_id: &'a str,
         ttl: Duration,
-    ) -> CoordinationFuture<'a, bool> {
+    ) -> CoordinationFuture<'a, Option<LeaderLease>> {
         Box::pin(async move {
             let mut leaders = self
                 .leaders
@@ -115,21 +139,25 @@ impl LeaderElector for MemoryLeaderElector {
 
             let now = Instant::now();
             let Some(current) = leaders.get_mut(role) else {
-                return Ok(false);
+                return Ok(None);
             };
 
             if current.expires_at > now
                 && safe_equal(current.candidate_id.as_bytes(), candidate_id.as_bytes())
             {
                 current.expires_at = now + ttl;
-                return Ok(true);
+                return Ok(Some(LeaderLease {
+                    role: role.to_string(),
+                    candidate_id: candidate_id.to_string(),
+                    term: current.term,
+                }));
             }
 
-            Ok(false)
+            Ok(None)
         })
     }
 
-    fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<String>> {
+    fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<LeaderLease>> {
         Box::pin(async move {
             let leaders = self
                 .leaders
@@ -140,7 +168,11 @@ impl LeaderElector for MemoryLeaderElector {
             if let Some(current) = leaders.get(role)
                 && current.expires_at > now
             {
-                return Ok(Some(current.candidate_id.clone()));
+                return Ok(Some(LeaderLease {
+                    role: role.to_string(),
+                    candidate_id: current.candidate_id.clone(),
+                    term: current.term,
+                }));
             }
 
             Ok(None)

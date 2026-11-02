@@ -69,16 +69,24 @@ async fn test_leader_election_lifecycle() {
     let role = "scheduler-primary";
     let ttl = Duration::from_millis(50);
 
-    // 1. Candidate 1 acquires leadership
-    let acquired = elector
+    // 1. Candidate 1 acquires leadership with initial term 1
+    let lease_a = elector
         .try_acquire(role, "worker-node-1", ttl)
         .await
         .unwrap();
-    assert!(acquired);
+    assert!(lease_a.is_some());
+    let lease_a = lease_a.unwrap();
+    assert_eq!(lease_a.role, role);
+    assert_eq!(lease_a.candidate_id, "worker-node-1");
+    assert_eq!(lease_a.term, 1);
 
     assert_eq!(
         elector.get_leader(role).await.unwrap(),
-        Some("worker-node-1".to_string())
+        Some(LeaderLease {
+            role: role.to_string(),
+            candidate_id: "worker-node-1".to_string(),
+            term: 1,
+        })
     );
 
     // 2. Candidate 2 attempts to acquire - rejected while active
@@ -86,25 +94,33 @@ async fn test_leader_election_lifecycle() {
         .try_acquire(role, "worker-node-2", ttl)
         .await
         .unwrap();
-    assert!(!rejected);
+    assert!(rejected.is_none());
 
-    // 3. Candidate 1 renews lease
+    // 3. Candidate 1 renews lease - term remains 1
     let renewed = elector.renew(role, "worker-node-1", ttl).await.unwrap();
-    assert!(renewed);
+    assert!(renewed.is_some());
+    assert_eq!(renewed.unwrap().term, 1);
 
     // 4. Candidate 1 resigns leadership
     let resigned = elector.resign(role, "worker-node-1").await.unwrap();
     assert!(resigned);
     assert_eq!(elector.get_leader(role).await.unwrap(), None);
 
-    // 5. Candidate 2 now becomes leader
-    let acquired_b = elector
+    // 5. Candidate 2 now becomes leader, receiving next monotonic term 2
+    let lease_b = elector
         .try_acquire(role, "worker-node-2", ttl)
         .await
         .unwrap();
-    assert!(acquired_b);
+    assert!(lease_b.is_some());
+    let lease_b = lease_b.unwrap();
+    assert_eq!(lease_b.candidate_id, "worker-node-2");
+    assert_eq!(lease_b.term, 2);
     assert_eq!(
         elector.get_leader(role).await.unwrap(),
-        Some("worker-node-2".to_string())
+        Some(LeaderLease {
+            role: role.to_string(),
+            candidate_id: "worker-node-2".to_string(),
+            term: 2,
+        })
     );
 }

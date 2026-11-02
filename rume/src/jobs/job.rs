@@ -28,6 +28,11 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn timeout(&self) -> Option<Duration> {
         Some(Duration::from_secs(60))
     }
+
+    /// Optional idempotency key ensuring deduplication and at-most-once execution.
+    fn idempotency_key(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Execution context provided to a job handler.
@@ -62,6 +67,10 @@ pub struct QueuedJob {
     pub retry_policy: RetryPolicy,
     /// Execution timeout for a single attempt.
     pub timeout: Option<Duration>,
+    /// Optional idempotency key for deduplication.
+    pub idempotency_key: Option<String>,
+    /// Identifier of the worker node actively executing this job.
+    pub assigned_worker: Option<String>,
     /// Earliest time when this job is eligible for execution.
     pub available_at: Instant,
 }
