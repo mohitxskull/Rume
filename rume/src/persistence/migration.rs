@@ -1,0 +1,163 @@
+//! Database migration definitions, runner, and preflight verification.
+
+use std::sync::Arc;
+
+use crate::persistence::backend::{BoxFuture, DatabaseBackend, MemoryDatabase};
+use crate::persistence::error::PersistenceError;
+
+/// Function signature for dynamic migration execution.
+pub type MigrationFn = Arc<
+    dyn Fn(Arc<dyn std::any::Any + Send + Sync>) -> BoxFuture<'static, Result<(), PersistenceError>>
+        + Send
+        + Sync,
+>;
+
+/// A single versioned database migration step.
+#[derive(Clone)]
+pub struct Migration {
+    /// Unique identifier for this migration (e.g., "20261102_001_create_users").
+    pub id: String,
+    /// Human-readable description of changes in this migration.
+    pub description: String,
+    /// Up statement to execute.
+    pub up_sql: Option<String>,
+    /// Down statement to execute on rollback.
+    pub down_sql: Option<String>,
+}
+
+impl std::fmt::Debug for Migration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Migration")
+            .field("id", &self.id)
+            .field("description", &self.description)
+            .field("up_sql", &self.up_sql)
+            .field("down_sql", &self.down_sql)
+            .finish()
+    }
+}
+
+impl Migration {
+    /// Creates a new migration with an up statement.
+    pub fn from_sql(
+        id: impl Into<String>,
+        description: impl Into<String>,
+        up_sql: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            description: description.into(),
+            up_sql: Some(up_sql.into()),
+            down_sql: None,
+        }
+    }
+
+    /// Attaches a down statement for rollback support.
+    pub fn with_down(mut self, down_sql: impl Into<String>) -> Self {
+        self.down_sql = Some(down_sql.into());
+        self
+    }
+}
+
+/// Summary report of executed migrations.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct MigrationSummary {
+    /// Identifiers of applied migrations in order of execution.
+    pub applied: Vec<String>,
+}
+
+/// Migration registry and execution runner.
+#[derive(Debug, Default, Clone)]
+pub struct Migrator {
+    migrations: Vec<Migration>,
+}
+
+impl Migrator {
+    /// Creates an empty migrator registry.
+    pub fn new() -> Self {
+        Self {
+            migrations: Vec::new(),
+        }
+    }
+
+    /// Registers a migration.
+    pub fn add_migration(mut self, migration: Migration) -> Self {
+        self.migrations.push(migration);
+        self
+    }
+
+    /// Returns registered migrations.
+    pub fn migrations(&self) -> &[Migration] {
+        &self.migrations
+    }
+
+    /// Finds all registered migrations that have not yet been applied to the given memory database.
+    pub fn pending_migrations(&self, db: &MemoryDatabase) -> Vec<&Migration> {
+        self.migrations
+            .iter()
+            .filter(|m| !db.has_migration(&m.id))
+            .collect()
+    }
+
+    /// Executes all unapplied pending migrations in order.
+    pub async fn run_pending(
+        &self,
+        db: &MemoryDatabase,
+    ) -> Result<MigrationSummary, PersistenceError> {
+        let mut applied = Vec::new();
+
+        for migration in &self.migrations {
+            if !db.has_migration(&migration.id) {
+                if let Some(sql) = &migration.up_sql {
+                    db.execute(sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                }
+                db.mark_migration(&migration.id);
+                applied.push(migration.id.clone());
+            }
+        }
+
+        Ok(MigrationSummary { applied })
+    }
+
+    /// Rolls back the most recently applied migration.
+    pub async fn rollback_last(
+        &self,
+        db: &MemoryDatabase,
+    ) -> Result<Option<String>, PersistenceError> {
+        // Find the last applied migration in reverse registration order
+        for migration in self.migrations.iter().rev() {
+            if db.has_migration(&migration.id) {
+                if let Some(sql) = &migration.down_sql {
+                    db.execute(sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                }
+                db.unmark_migration(&migration.id);
+                return Ok(Some(migration.id.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Preflight verification: fails closed if any registered migrations have not been applied.
+    pub fn verify_no_pending(&self, db: &MemoryDatabase) -> Result<(), PersistenceError> {
+        let pending: Vec<String> = self
+            .pending_migrations(db)
+            .into_iter()
+            .map(|m| m.id.clone())
+            .collect();
+
+        if pending.is_empty() {
+            Ok(())
+        } else {
+            Err(PersistenceError::PendingMigrations(pending))
+        }
+    }
+}

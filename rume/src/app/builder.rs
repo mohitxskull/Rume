@@ -326,6 +326,13 @@ where
         self
     }
 
+    /// Register an application module.
+    ///
+    /// Alias for [`Self::module`].
+    pub fn register_module(self, module: impl crate::module::Module) -> Self {
+        self.module(module)
+    }
+
     /// Mount a `GET` route and register its metadata.
     pub fn get<H, T>(mut self, path: &str, handler: H) -> Self
     where

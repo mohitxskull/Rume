@@ -12,6 +12,7 @@ pub mod env;
 pub mod error;
 pub mod helpers;
 pub mod module;
+pub mod persistence;
 pub mod prelude;
 pub mod routing;
 pub mod testing;
@@ -29,6 +30,9 @@ pub use helpers::{
     safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
 };
 pub use module::{Module, ModuleContext, ModuleError};
+pub use persistence::{
+    DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
+};
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,

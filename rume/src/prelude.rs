@@ -15,6 +15,9 @@ pub use crate::helpers::{
     safe_equal, slug, truncate,
 };
 pub use crate::module::{Module, ModuleContext, ModuleError};
+pub use crate::persistence::{
+    DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
+};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
