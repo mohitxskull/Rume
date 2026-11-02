@@ -458,30 +458,16 @@ where
             .parse()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
-        // In Inspect mode, boot and run ready hooks but do NOT serve HTTP.
-        // This allows tooling (config check, env check, migrations) to run
-        // with a fully initialized app context without binding a port.
+        // In Inspect mode, boot the application context without serving HTTP
+        // and without running any hooks (on_ready or on_shutdown). Hooks may
+        // perform side effects (DB connections, external calls, etc.) that
+        // should only happen during normal application startup or shutdown.
+        // Inspect mode is for tooling (config check, env check, migrations)
+        // that needs a booted app context but no side effects.
         if self.mode == ApplicationMode::Inspect {
             let ctx = self.ctx.clone();
             ctx.lifecycle.set(LifecycleState::Booted);
             ctx.availability.set(AvailabilityState::Live);
-
-            for hook in self.on_ready.drain(..) {
-                hook(ctx.clone()).await;
-            }
-
-            ctx.lifecycle.set(LifecycleState::Ready);
-            ctx.availability.set(AvailabilityState::Ready);
-
-            for hook in self.on_shutdown.drain(..) {
-                hook(ctx.clone()).await;
-            }
-
-            ctx.lifecycle.set(LifecycleState::Terminating);
-            ctx.availability.set(AvailabilityState::RefusingTraffic);
-
-            ctx.lifecycle.set(LifecycleState::Terminated);
-            ctx.availability.set(AvailabilityState::Unknown);
 
             return Ok(());
         }
@@ -536,15 +522,21 @@ where
             .availability
             .set(AvailabilityState::RefusingTraffic);
 
-        for hook in on_shutdown {
-            match timeout(shutdown_timeout, hook(serve_ctx.clone())).await {
-                Ok(()) => {}
-                Err(_) => {
-                    tracing::warn!(
-                        "shutdown hook exceeded {}s timeout, aborting",
-                        shutdown_timeout.as_secs()
-                    );
-                }
+        // Shutdown timeout applies to the aggregate of all shutdown hooks,
+        // not to each hook individually. With several slow hooks, the total
+        // shutdown time must not exceed the configured limit.
+        let on_shutdown_fut = async {
+            for hook in on_shutdown {
+                hook(serve_ctx.clone()).await;
+            }
+        };
+        match timeout(shutdown_timeout, on_shutdown_fut).await {
+            Ok(()) => {}
+            Err(_) => {
+                tracing::warn!(
+                    "shutdown hooks exceeded {}s timeout in aggregate, aborting remaining hooks",
+                    shutdown_timeout.as_secs()
+                );
             }
         }
 
@@ -562,7 +554,7 @@ mod tests {
     use super::*;
     use crate::app::context::AppContext;
     use crate::app::paths::ProjectPaths;
-    use crate::app::state::Availability;
+    use crate::app::state::{ApplicationMode, Availability, AvailabilityState, LifecycleState};
     use crate::routing::HealthChecks;
 
     fn test_ctx() -> AppContext<(), (), ()> {
@@ -736,5 +728,63 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("admins"));
         assert!(msg.contains("auth"));
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_does_not_run_on_ready_hooks() {
+        // Inspect mode must not run startup hooks — they may have side effects.
+        let ready_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_ran_clone = ready_ran.clone();
+
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .mode(ApplicationMode::Inspect)
+            .on_ready(move |_| async move {
+                ready_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+        builder.run().await.expect("inspect mode should succeed");
+
+        assert!(
+            !ready_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "on_ready hooks must not run in Inspect mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_does_not_run_on_shutdown_hooks() {
+        // Inspect mode must not run shutdown hooks either.
+        let shutdown_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_ran_clone = shutdown_ran.clone();
+
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .mode(ApplicationMode::Inspect)
+            .on_shutdown(move |_| async move {
+                shutdown_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+        builder.run().await.expect("inspect mode should succeed");
+
+        assert!(
+            !shutdown_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "on_shutdown hooks must not run in Inspect mode"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_sets_booted_live_then_returns() {
+        // Inspect mode boots to Booted/Live and returns without serving.
+        let ctx = test_ctx();
+        let lifecycle = ctx.lifecycle.clone();
+        let availability = ctx.availability.clone();
+
+        let builder = RumeBuilder::new(ctx).mode(ApplicationMode::Inspect);
+
+        builder.run().await.expect("inspect mode should succeed");
+
+        // Lifecycle should be Booted (not Ready — not serving traffic).
+        assert_eq!(lifecycle.state(), LifecycleState::Booted);
+        assert!(availability.state() == AvailabilityState::Live);
     }
 }
