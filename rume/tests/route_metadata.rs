@@ -230,3 +230,19 @@ async fn route_registry_serialization_round_trip() {
     assert_eq!(route.name.as_deref(), Some("webhooks.receive"));
     assert_eq!(route.params, vec!["id".to_string()]);
 }
+
+#[tokio::test]
+async fn fallback_and_service_routing() {
+    let router = Router::new()
+        .get("/hello", dummy_handler)
+        .fallback(|| async { (StatusCode::NOT_FOUND, "custom 404") });
+
+    let app = TestApp::new(router.into_inner());
+
+    let res = app.get("/hello").await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res404 = app.get("/unmatched-path").await;
+    assert_eq!(res404.status(), StatusCode::NOT_FOUND);
+    assert_eq!(TestApp::body_text(res404).await, "custom 404");
+}

@@ -131,11 +131,57 @@ where
     {
         self.inner = self.inner.route(path, axum::routing::any(handler));
         self.registry.register(RouteInfo {
-            method: Method::from_bytes(b"ANY").unwrap(),
+            method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
         });
+        self
+    }
+
+    /// Mount an arbitrary service under a path.
+    pub fn route_service<T>(mut self, path: &str, service: T) -> Self
+    where
+        T: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        T::Response: axum::response::IntoResponse + 'static,
+        T::Future: Send + 'static,
+    {
+        self.inner = self.inner.route_service(path, service);
+        self.registry.register(RouteInfo {
+            method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
+            path: path.to_string(),
+            name: None,
+            params: extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a fallback handler for unmatched requests.
+    pub fn fallback<H, T>(mut self, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        self.inner = self.inner.fallback(handler);
+        self
+    }
+
+    /// Mount a fallback service for unmatched requests.
+    pub fn fallback_service<T>(mut self, service: T) -> Self
+    where
+        T: tower::Service<axum::extract::Request, Error = std::convert::Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        T::Response: axum::response::IntoResponse + 'static,
+        T::Future: Send + 'static,
+    {
+        self.inner = self.inner.fallback_service(service);
         self
     }
 
@@ -148,7 +194,7 @@ where
     pub fn route(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
         self.inner = self.inner.route(path, method_router);
         self.registry.register(RouteInfo {
-            method: Method::from_bytes(b"ANY").unwrap(),
+            method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),
