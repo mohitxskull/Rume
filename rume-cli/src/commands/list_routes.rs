@@ -2,6 +2,7 @@
 //!
 //! Reads `src/routes.rs` and extracts route path strings from `.route()`
 //! calls. This avoids booting the full application just to inspect routes.
+//! Multiline `.route()` calls are joined before parsing.
 
 use std::fs;
 
@@ -17,10 +18,26 @@ pub fn run() {
 
     let mut routes: Vec<(String, String)> = Vec::new();
 
-    // Simple extraction: find .route("/path", ...) patterns.
+    // Join multiline .route() calls: accumulate lines until a line ends
+    // with ')' (the closing of .route(...)). This handles routes spread
+    // across multiple lines, e.g. composed routers.
+    let mut accumulator = String::new();
     for line in content.lines() {
-        if let Some((method, path)) = extract_route(line) {
-            routes.push((method.to_string(), path.to_string()));
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            continue;
+        }
+        if !accumulator.is_empty() {
+            accumulator.push(' ');
+        }
+        accumulator.push_str(trimmed);
+
+        // When we see a complete .route(...) call, extract it.
+        if accumulator.contains(".route(") && accumulator.ends_with(')') {
+            if let Some((method, path)) = extract_route(&accumulator) {
+                routes.push((method.to_string(), path.to_string()));
+            }
+            accumulator.clear();
         }
     }
 
@@ -41,11 +58,11 @@ pub fn run() {
 ///
 /// Returns `(method, path)` where method is derived from the router variant
 /// (e.g. `get` → `GET`, `post` → `POST`) or `"ANY"` if unrecognized.
-fn extract_route(line: &str) -> Option<(&str, &str)> {
+fn extract_route(call: &str) -> Option<(&str, &str)> {
     // Match patterns like: router.route("/users", axum::routing::get(handler))
     // or: router = router.route("/posts", get(handler))
-    let route_idx = line.find(".route(")?;
-    let after_route = &line[route_idx + 6..]; // skip ".route("
+    let route_idx = call.find(".route(")?;
+    let after_route = &call[route_idx + 7..]; // skip ".route("
 
     // Find the first string literal (the path)
     let path_start = after_route.find('"')?;

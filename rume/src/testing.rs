@@ -114,7 +114,7 @@ where
         self
     }
 
-    pub fn route<M>(mut self, path: &str, method_router: axum::routing::MethodRouter<S>) -> Self {
+    pub fn route(mut self, path: &str, method_router: axum::routing::MethodRouter<S>) -> Self {
         self.router = self.router.route(path, method_router);
         self
     }
