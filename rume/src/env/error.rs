@@ -26,6 +26,9 @@ pub enum EnvError {
     #[error("circular reference detected while interpolating ${{variable}}")]
     CircularReference { variable: String },
 
+    #[error("maximum interpolation depth ({depth}) exceeded while interpolating ${{{variable}}}")]
+    MaxDepthExceeded { variable: String, depth: usize },
+
     #[error("failed to validate environment: {0}")]
     Validation(String),
 }

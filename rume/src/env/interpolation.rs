@@ -18,8 +18,9 @@ const MAX_INTERPOLATION_DEPTH: usize = 10;
 ///   contains `${...}`, it is resolved again.
 /// - Missing variables return [`EnvError::Interpolation`].
 /// - Circular references return [`EnvError::CircularReference`].
+/// - Exceeding maximum recursion depth returns [`EnvError::MaxDepthExceeded`].
 pub fn interpolate_value(value: &str, vars: &BTreeMap<String, String>) -> Result<String, EnvError> {
-    interpolate_recursive(value, vars, &mut HashSet::new(), 0)
+    interpolate_recursive(value, vars, &mut HashSet::new(), 0, None)
 }
 
 fn interpolate_recursive(
@@ -27,10 +28,12 @@ fn interpolate_recursive(
     vars: &BTreeMap<String, String>,
     visiting: &mut HashSet<String>,
     depth: usize,
+    current_var: Option<&str>,
 ) -> Result<String, EnvError> {
     if depth > MAX_INTERPOLATION_DEPTH {
-        return Err(EnvError::CircularReference {
-            variable: value.to_string(),
+        return Err(EnvError::MaxDepthExceeded {
+            variable: current_var.unwrap_or("<root>").to_string(),
+            depth: MAX_INTERPOLATION_DEPTH,
         });
     }
 
@@ -71,7 +74,7 @@ fn interpolate_recursive(
                 }
             };
             visiting.insert(var.clone());
-            let expanded = interpolate_recursive(resolved, vars, visiting, depth + 1);
+            let expanded = interpolate_recursive(resolved, vars, visiting, depth + 1, Some(&var));
             visiting.remove(&var);
             out.push_str(&expanded?);
             i += end;
@@ -159,6 +162,29 @@ mod tests {
         ]);
         let err = interpolate_value("${A}", &vars).unwrap_err();
         assert!(matches!(err, EnvError::CircularReference { .. }));
+    }
+
+    #[test]
+    fn deep_nesting_exceeding_max_depth_does_not_disclose_secret() {
+        let secret = "super-secret-token-xyz-123";
+        let mut vars = BTreeMap::new();
+        // Create a chain of 15 variables: V0 -> V1 -> ... -> V14 -> secret
+        for i in 0..14 {
+            vars.insert(format!("V{i}"), format!("${{V{}}}", i + 1));
+        }
+        vars.insert("V14".to_string(), secret.to_string());
+
+        let err = interpolate_value("${V0}", &vars).unwrap_err();
+        assert!(matches!(err, EnvError::MaxDepthExceeded { .. }));
+
+        let err_msg = err.to_string();
+        // The error message must NEVER disclose the secret value
+        assert!(
+            !err_msg.contains(secret),
+            "error message disclosed secret value: {err_msg}"
+        );
+        // The error message identifies the variable name, not the value
+        assert!(err_msg.contains("maximum interpolation depth"));
     }
 
     #[test]

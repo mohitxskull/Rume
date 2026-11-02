@@ -234,24 +234,37 @@ where
             // Axum's route matcher populates extensions with path params before
             // the middleware/service stack runs. Extract them and validate
             // against each declared matcher.
-            if let Ok(Path(params)) =
-                Path::<BTreeMap<String, String>>::from_request_parts(&mut parts, &()).await
-            {
-                for (name, matcher) in &*matchers {
-                    let value = match params.get(name) {
-                        Some(v) => v,
-                        None => {
-                            return Ok(AppError::BadRequest {
-                                code: "MISSING_PARAM",
-                                message: format!("missing parameter: {name}"),
+            //
+            // S-r2: If parameter extraction fails (e.g. malformed percent-encoding
+            // or invalid UTF-8), the layer must fail closed and return 400 Problem
+            // Details, rather than silently letting the request pass unvalidated.
+            if !matchers.is_empty() {
+                match Path::<BTreeMap<String, String>>::from_request_parts(&mut parts, &()).await {
+                    Ok(Path(params)) => {
+                        for (name, matcher) in &*matchers {
+                            let value = match params.get(name) {
+                                Some(v) => v,
+                                None => {
+                                    return Ok(AppError::BadRequest {
+                                        code: "MISSING_PARAM",
+                                        message: format!("missing parameter: {name}"),
+                                    }
+                                    .into_response());
+                                }
+                            };
+                            if let Err(msg) = matcher.validate(value) {
+                                return Ok(AppError::BadRequest {
+                                    code: "INVALID_PARAM",
+                                    message: msg,
+                                }
+                                .into_response());
                             }
-                            .into_response());
                         }
-                    };
-                    if let Err(msg) = matcher.validate(value) {
+                    }
+                    Err(_) => {
                         return Ok(AppError::BadRequest {
                             code: "INVALID_PARAM",
-                            message: msg,
+                            message: "invalid path parameters".to_string(),
                         }
                         .into_response());
                     }

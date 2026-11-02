@@ -71,6 +71,28 @@ impl From<MiddlewareConfigError> for std::io::Error {
     }
 }
 
+/// Trait for return types of `on_ready` startup hooks.
+///
+/// Implemented for `()` (infallible hooks) and `Result<(), E>` (fallible hooks).
+pub trait IntoHookResult: Send {
+    fn into_hook_result(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+impl IntoHookResult for () {
+    fn into_hook_result(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
+impl<E> IntoHookResult for Result<(), E>
+where
+    E: Into<Box<dyn std::error::Error + Send + Sync>> + Send,
+{
+    fn into_hook_result(self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.map_err(Into::into)
+    }
+}
+
 /// A configured Rume application.
 ///
 /// `Rume` is a marker type for the builder API. Every Rume application carries
@@ -114,7 +136,17 @@ where
     mode: ApplicationMode,
     environment: Environment,
     on_ready: Vec<
-        Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
+        Box<
+            dyn FnOnce(
+                    AppContext<E, C, S>,
+                ) -> Pin<
+                    Box<
+                        dyn Future<
+                                Output = Result<(), Box<dyn std::error::Error + Send + Sync>>,
+                            > + Send,
+                    >,
+                > + Send,
+        >,
     >,
     on_shutdown: Vec<
         Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
@@ -241,12 +273,19 @@ where
     }
 
     /// Register a startup task.
-    pub fn on_ready<F, Fut>(mut self, f: F) -> Self
+    ///
+    /// The hook may return `()` or `Result<(), E>`. If a hook returns `Err`,
+    /// application startup aborts, registered shutdown hooks run to clean up
+    /// resources, and [`run`](Self::run) returns an error.
+    pub fn on_ready<F, Fut, R>(mut self, f: F) -> Self
     where
         F: FnOnce(AppContext<E, C, S>) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoHookResult + 'static,
     {
-        self.on_ready.push(Box::new(move |ctx| Box::pin(f(ctx))));
+        self.on_ready.push(Box::new(move |ctx| {
+            Box::pin(async move { f(ctx).await.into_hook_result() })
+        }));
         self
     }
 
@@ -418,28 +457,37 @@ where
         }
 
         // --- Application phase: all references are now known valid ---
+        //
+        // Middleware execution follows the standard onion model:
+        // 1. Group middleware members execute on entry in declaration order.
+        // 2. Individual middleware execute outside of groups, in registration order.
+        //
+        // In Tower / Axum, layers wrap around the inner router, so the layer
+        // applied LAST wraps on the OUTSIDE and runs FIRST on request entry.
+        // To achieve:
+        //   Request Entry: Individual (first -> last) -> Group (first -> last) -> Handler
+        //   Response Exit: Handler -> Group (last -> first) -> Individual (last -> first)
+        // we wrap the inner router with group members in reverse order, then wrap
+        // with individual middleware in reverse order.
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx);
 
-        // Apply named middleware in registration order, only those marked
-        // with `use_middleware`.
-        for name in middleware_order {
-            if applied_middleware.contains(&name)
-                && let Some(mw) = middleware.get(&name)
-            {
-                router = mw(router);
-            }
-        }
-
-        // Apply named groups in registration order; each group's members run
-        // in declaration order. All members are known to exist (validated
-        // above), so unwrapping is safe.
-        for name in groups_order {
-            if applied_groups.contains(&name) {
-                let members = groups.get(&name).expect("group validated above");
-                for member in members {
+        // 1. Apply group middleware (innermost middleware layers)
+        for name in groups_order.iter().rev() {
+            if applied_groups.contains(name) {
+                let members = groups.get(name).expect("group validated above");
+                for member in members.iter().rev() {
                     let mw = middleware.get(member).expect("member validated above");
                     router = mw(router);
                 }
+            }
+        }
+
+        // 2. Apply individual middleware (outermost middleware layers)
+        for name in middleware_order.iter().rev() {
+            if applied_middleware.contains(name)
+                && let Some(mw) = middleware.get(name)
+            {
+                router = mw(router);
             }
         }
 
@@ -458,13 +506,14 @@ where
             .parse()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
+        let mode = self.mode;
         // In Inspect mode, boot the application context without serving HTTP
         // and without running any hooks (on_ready or on_shutdown). Hooks may
         // perform side effects (DB connections, external calls, etc.) that
         // should only happen during normal application startup or shutdown.
         // Inspect mode is for tooling (config check, env check, migrations)
         // that needs a booted app context but no side effects.
-        if self.mode == ApplicationMode::Inspect {
+        if mode == ApplicationMode::Inspect {
             let ctx = self.ctx.clone();
             ctx.lifecycle.set(LifecycleState::Booted);
             ctx.availability.set(AvailabilityState::Live);
@@ -472,37 +521,15 @@ where
             return Ok(());
         }
 
-        let listener = TcpListener::bind(addr).await.map_err(|err| {
-            std::io::Error::new(
-                err.kind(),
-                format!("failed to bind {addr}: {err} (is the port already in use?)"),
-            )
-        })?;
-
-        let ctx = self.ctx.clone();
-        ctx.lifecycle.set(LifecycleState::Booted);
-        ctx.availability.set(AvailabilityState::Live);
-
-        if self.mode == ApplicationMode::Run {
-            for hook in self.on_ready.drain(..) {
-                hook(ctx.clone()).await;
-            }
-        }
-
-        ctx.lifecycle.set(LifecycleState::Ready);
-        ctx.availability.set(AvailabilityState::Ready);
-
-        println!("listening on http://{addr}");
-
-        // Apply named middleware and groups before serving. `build_router`
-        // consumes `self`, so take the shutdown hooks and timeout first:
-        // they must still run after the server stops.
+        // --- Step 1: Preflight validation and router construction ---
         //
-        // Middleware validation happens here, before the server accepts any
-        // connections. A misconfigured middleware stack (unknown name,
+        // Middleware validation happens here, before binding sockets or running
+        // any startup hooks. A misconfigured middleware stack (unknown name,
         // duplicate, or group with unknown member) causes `run()` to return an
-        // error instead of serving traffic with silently-misspelled middleware.
+        // error immediately before any startup side effects (DB pools, workers,
+        // files) execute.
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let serve_ctx = self.ctx.clone();
 
@@ -511,12 +538,55 @@ where
             Err(err) => return Err(err.into()),
         };
 
-        // `build_router` returns `Router<AppContext<E, C, S>>`; serving requires
-        // `Router<()>`, so capture the state one final time at serve time.
+        // --- Step 2: Bind listener ---
+        let listener = TcpListener::bind(addr).await.map_err(|err| {
+            std::io::Error::new(
+                err.kind(),
+                format!("failed to bind {addr}: {err} (is the port already in use?)"),
+            )
+        })?;
+
+        // --- Step 3: Booted & Live ---
+        serve_ctx.lifecycle.set(LifecycleState::Booted);
+        serve_ctx.availability.set(AvailabilityState::Live);
+
+        // --- Step 4: Startup hooks with cleanup on failure ---
+        if mode == ApplicationMode::Run {
+            for hook in on_ready {
+                if let Err(err) = hook(serve_ctx.clone()).await {
+                    tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
+                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                    serve_ctx.availability.set(AvailabilityState::Broken);
+
+                    let cleanup_ctx = serve_ctx.clone();
+                    let cleanup_fut = async {
+                        for hook in on_shutdown {
+                            hook(cleanup_ctx.clone()).await;
+                        }
+                    };
+                    let _ = timeout(shutdown_timeout, cleanup_fut).await;
+
+                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("startup hook failed: {err}"),
+                    ));
+                }
+            }
+        }
+
+        // --- Step 5: Declare Ready ---
+        serve_ctx.lifecycle.set(LifecycleState::Ready);
+        serve_ctx.availability.set(AvailabilityState::Ready);
+
+        println!("listening on http://{addr}");
+
+        // --- Step 6: Serve traffic ---
         let result = axum::serve(listener, router.with_state(serve_ctx.clone()))
             .with_graceful_shutdown(crate::app::shutdown::shutdown_signal())
             .await;
 
+        // --- Step 7: Shutdown ---
         serve_ctx.lifecycle.set(LifecycleState::Terminating);
         serve_ctx
             .availability
@@ -786,5 +856,179 @@ mod tests {
         // Lifecycle should be Booted (not Ready — not serving traffic).
         assert_eq!(lifecycle.state(), LifecycleState::Booted);
         assert!(availability.state() == AvailabilityState::Live);
+    }
+
+    #[tokio::test]
+    async fn preflight_failure_aborts_before_startup_hooks_run() {
+        // Preflight validation must fail closed BEFORE any startup hooks run.
+        let ready_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ready_ran_clone = ready_ran.clone();
+
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .use_middleware("nonexistent")
+            .on_ready(move |_| async move {
+                ready_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+        let err = builder.run().await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(
+            !ready_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "on_ready hook must NOT run when preflight validation fails"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallible_startup_hook_failure_triggers_cleanup_hooks() {
+        // If an on_ready hook fails, registered shutdown hooks must be executed
+        // to clean up already-acquired resources.
+        let cleanup_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cleanup_ran_clone = cleanup_ran.clone();
+
+        let ctx = test_ctx();
+        let _availability = ctx.availability.clone();
+        let lifecycle = ctx.lifecycle.clone();
+
+        let builder = RumeBuilder::new(ctx)
+            .on_ready(|_| async move {
+                Err::<(), _>(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    "database unreachable",
+                ))
+            })
+            .on_shutdown(move |_| async move {
+                cleanup_ran_clone.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+
+        let err = builder.run().await.unwrap_err();
+        assert!(err.to_string().contains("database unreachable"));
+
+        assert!(
+            cleanup_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "on_shutdown cleanup hooks must run when a startup hook fails"
+        );
+        assert_eq!(lifecycle.state(), LifecycleState::Terminated);
+    }
+
+    fn recording_mw(
+        name: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> Box<
+        dyn Fn(
+                Router<AppContext<(), (), ()>>,
+            ) -> Router<AppContext<(), (), ()>>
+            + Send
+            + Sync
+            + 'static,
+    > {
+        Box::new(move |router| {
+            let log = std::sync::Arc::clone(&log);
+            router.layer(axum::middleware::from_fn(
+                move |req: axum::extract::Request, next: axum::middleware::Next| {
+                    let log = std::sync::Arc::clone(&log);
+                    async move {
+                        log.lock().unwrap().push(format!("{name}:enter"));
+                        let res = next.run(req).await;
+                        log.lock().unwrap().push(format!("{name}:exit"));
+                        res
+                    }
+                },
+            ))
+        })
+    }
+
+    #[tokio::test]
+    async fn middleware_individual_execution_order_during_request() {
+        use crate::testing::TestApp;
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = test_ctx();
+
+        let builder = RumeBuilder::new(ctx)
+            .route("/hello", axum::routing::get(|| async { "ok" }))
+            .middleware("first", recording_mw("first", std::sync::Arc::clone(&log)))
+            .middleware("second", recording_mw("second", std::sync::Arc::clone(&log)))
+            .use_middleware("first")
+            .use_middleware("second");
+
+        let app_router = builder.build_router(test_ctx()).unwrap();
+        let app = TestApp::new(app_router.with_state(test_ctx()));
+
+        let res = app.get("/hello").await;
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["first:enter", "second:enter", "second:exit", "first:exit"],
+            "individual middleware must enter in registration order and exit in reverse"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_group_execution_order_during_request() {
+        use crate::testing::TestApp;
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = test_ctx();
+
+        let builder = RumeBuilder::new(ctx)
+            .route("/hello", axum::routing::get(|| async { "ok" }))
+            .middleware("a", recording_mw("a", std::sync::Arc::clone(&log)))
+            .middleware("b", recording_mw("b", std::sync::Arc::clone(&log)))
+            .middleware("c", recording_mw("c", std::sync::Arc::clone(&log)))
+            .group("stack", &["a", "b", "c"])
+            .use_group("stack");
+
+        let app_router = builder.build_router(test_ctx()).unwrap();
+        let app = TestApp::new(app_router.with_state(test_ctx()));
+
+        let res = app.get("/hello").await;
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec!["a:enter", "b:enter", "c:enter", "c:exit", "b:exit", "a:exit"],
+            "group members must enter in declaration order and exit in reverse"
+        );
+    }
+
+    #[tokio::test]
+    async fn middleware_combined_individual_and_groups_execution_order() {
+        use crate::testing::TestApp;
+
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = test_ctx();
+
+        let builder = RumeBuilder::new(ctx)
+            .route("/hello", axum::routing::get(|| async { "ok" }))
+            .middleware("global_mw", recording_mw("global_mw", std::sync::Arc::clone(&log)))
+            .middleware("auth", recording_mw("auth", std::sync::Arc::clone(&log)))
+            .middleware("audit", recording_mw("audit", std::sync::Arc::clone(&log)))
+            .group("api", &["auth", "audit"])
+            .use_middleware("global_mw")
+            .use_group("api");
+
+        let app_router = builder.build_router(test_ctx()).unwrap();
+        let app = TestApp::new(app_router.with_state(test_ctx()));
+
+        let res = app.get("/hello").await;
+        assert_eq!(res.status(), axum::http::StatusCode::OK);
+
+        let events = log.lock().unwrap().clone();
+        assert_eq!(
+            events,
+            vec![
+                "global_mw:enter",
+                "auth:enter",
+                "audit:enter",
+                "audit:exit",
+                "auth:exit",
+                "global_mw:exit"
+            ],
+            "individual middleware must wrap outside groups: global -> group -> handler -> group -> global"
+        );
     }
 }

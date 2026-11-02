@@ -95,6 +95,46 @@ async fn route_invalid_uuid_returns_400() {
 }
 
 #[tokio::test]
+async fn route_malformed_percent_encoding_fails_closed_and_does_not_invoke_handler() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    let handler_called = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&handler_called);
+
+    let spec = RouteSpec::get("/items/{id}")
+        .where_param("id", Matcher::Number)
+        .r#as("items.show");
+
+    let layer = spec.validation_layer();
+    let (path, _, _, _) = spec.build();
+
+    let router = axum::Router::new().route(
+        &path,
+        get(move || {
+            flag.store(true, Ordering::SeqCst);
+            async { "ok" }
+        })
+        .layer(layer),
+    );
+
+    let app = TestApp::new(router);
+
+    // %FF is invalid UTF-8 in percent-encoding
+    let response = app.get("/items/%FF").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Verify handler was never executed
+    assert!(
+        !handler_called.load(Ordering::SeqCst),
+        "handler should not have been called on extraction failure"
+    );
+
+    let body = TestApp::body_text(response).await;
+    assert!(body.contains("INVALID_PARAM"));
+}
+
+#[tokio::test]
 async fn route_registry_metadata_is_correct() {
     let spec = RouteSpec::get("/users/{id}")
         .where_param("id", Matcher::Number)
