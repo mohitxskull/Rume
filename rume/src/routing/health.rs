@@ -4,7 +4,7 @@
 //! result caching (shared across clones via `Arc`), and the `/health/live`
 //! and `/health/ready` HTTP routes.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -69,6 +69,8 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Debug)]
 pub struct HealthChecks {
     checks: Vec<Arc<dyn HealthCheck>>,
+    /// Track registered check names to reject duplicates.
+    names: HashSet<String>,
     timeout: Duration,
     cache_ttl: Option<Duration>,
     cache: Arc<RwLock<BTreeMap<String, (Instant, HealthCheckResult)>>>,
@@ -81,6 +83,7 @@ impl HealthChecks {
     pub fn new() -> Self {
         Self {
             checks: Vec::new(),
+            names: HashSet::new(),
             timeout: DEFAULT_TIMEOUT,
             cache_ttl: None,
             cache: Arc::new(RwLock::new(BTreeMap::new())),
@@ -88,7 +91,17 @@ impl HealthChecks {
     }
 
     /// Register a health check.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a check with the same name is already registered. Health
+    /// check names must be unique because the result cache keys on name —
+    /// a duplicate name would let one check's result overwrite another's.
     pub fn register(mut self, check: impl HealthCheck + 'static) -> Self {
+        let name = check.name().to_string();
+        if !self.names.insert(name.clone()) {
+            panic!("health check '{name}' is registered more than once");
+        }
         self.checks.push(Arc::new(check));
         self
     }
@@ -243,6 +256,7 @@ impl Clone for HealthChecks {
     fn clone(&self) -> Self {
         Self {
             checks: self.checks.clone(),
+            names: self.names.clone(),
             timeout: self.timeout,
             cache_ttl: self.cache_ttl,
             cache: Arc::clone(&self.cache),
@@ -310,26 +324,27 @@ where
                     || ctx.availability.state() == AvailabilityState::Unknown
                     || ctx.availability.state() == AvailabilityState::Broken
                 {
-                    let report = HealthReport {
-                        is_healthy: false,
-                        status: "error".to_string(),
-                        finished_at: current_timestamp(),
-                        debug_info: BTreeMap::new(),
-                        checks: vec![],
-                    };
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
-                        Json(serde_json::to_value(&report).unwrap()),
+                        Json(json!({"status": "error"})),
                     )
                         .into_response();
                 }
                 let report = ctx.health_checks.run().await;
-                let json = serde_json::to_value(&report).unwrap();
-                if report.is_healthy {
-                    (StatusCode::OK, Json(json)).into_response()
+
+                // S-m5: the public readiness response is minimal and safe —
+                // only the overall status. Detailed check results (including
+                // `message` and `meta`, which may contain database errors,
+                // infrastructure details, or credentials) are not exposed over
+                // HTTP. Use `HealthChecks::run()` programmatically for full
+                // diagnostics.
+                let status = if report.is_healthy { "ok" } else { "error" };
+                let code = if report.is_healthy {
+                    StatusCode::OK
                 } else {
-                    (StatusCode::SERVICE_UNAVAILABLE, Json(json)).into_response()
-                }
+                    StatusCode::SERVICE_UNAVAILABLE
+                };
+                (code, Json(json!({"status": status}))).into_response()
             }),
         )
 }
@@ -628,5 +643,218 @@ mod tests {
             .unwrap();
         let response = router.oneshot(request).await.expect("request failed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// A check that includes sensitive data in its message and meta.
+    #[derive(Debug)]
+    struct SensitiveCheck;
+
+    impl HealthCheck for SensitiveCheck {
+        fn name(&self) -> &str {
+            "database"
+        }
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            Box::pin(async move {
+                HealthCheckResult {
+                    name: "database".to_string(),
+                    status: HealthStatus::Ok,
+                    message: "connected to postgres://admin:secret@db.internal:5432/app"
+                        .to_string(),
+                    meta: BTreeMap::from([
+                        (
+                            "connection_string".to_string(),
+                            serde_json::json!("postgres://admin:secret@db.internal:5432/app"),
+                        ),
+                        ("password".to_string(), serde_json::json!("secret")),
+                    ]),
+                    cached: false,
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    #[should_panic(expected = "is registered more than once")]
+    async fn health_check_duplicate_name_panics() {
+        // S-m6: registering two checks with the same name must panic — the
+        // cache keys on name, so a duplicate would let one result overwrite
+        // the other and be reused for both checks.
+        HealthChecks::new().register(OkCheck).register(OkCheck);
+    }
+
+    #[tokio::test]
+    async fn health_check_duplicate_name_panics_with_message() {
+        let result = std::panic::catch_unwind(|| {
+            HealthChecks::new().register(OkCheck).register(OkCheck);
+        });
+        assert!(
+            result.is_err(),
+            "registering duplicate health check names must panic"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_ready_returns_minimal_safe_response() {
+        // S-m5: /health/ready returns only the overall status — no check
+        // names, messages, or meta that could leak sensitive information.
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new().register(OkCheck),
+            (),
+        );
+        ctx.availability.set(AvailabilityState::Ready);
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx);
+
+        let request = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("ok"));
+        // Must not contain check-level details.
+        assert!(json.get("checks").is_none());
+        assert!(json.get("message").is_none());
+        assert!(json.get("meta").is_none());
+    }
+
+    #[tokio::test]
+    async fn health_ready_hides_sensitive_metadata() {
+        // S-m5: even when a check reports sensitive data in message/meta,
+        // /health/ready must not expose it.
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new().register(SensitiveCheck),
+            (),
+        );
+        ctx.availability.set(AvailabilityState::Ready);
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx);
+
+        let request = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(!text.contains("secret"));
+        assert!(!text.contains("password"));
+        assert!(!text.contains("connection_string"));
+        assert!(!text.contains("postgres://"));
+        // Only the minimal status field.
+        assert!(text.contains("\"status\":\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn health_ready_returns_error_when_unhealthy() {
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new().register(FailedCheck),
+            (),
+        );
+        ctx.availability.set(AvailabilityState::Ready);
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx);
+
+        let request = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json.get("status").and_then(|v| v.as_str()), Some("error"));
+        assert!(json.get("checks").is_none());
+    }
+
+    #[tokio::test]
+    async fn health_ready_concurrent_requests() {
+        // Multiple concurrent /health/ready requests must all get consistent
+        // results without panicking or deadlocking.
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new().register(OkCheck),
+            (),
+        );
+        ctx.availability.set(AvailabilityState::Ready);
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx);
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let r = router.clone();
+            handles.push(tokio::spawn(async move {
+                let request = axum::http::Request::builder()
+                    .uri("/health/ready")
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+                r.oneshot(request).await.expect("request failed")
+            }));
+        }
+
+        for handle in handles {
+            let response = handle.await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[tokio::test]
+    async fn health_check_caching_avoids_rerun_with_ttl() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let checks = HealthChecks::new()
+            .cache_ttl(Some(Duration::from_secs(60)))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&runs),
+            });
+
+        let _ = checks.run().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let _ = checks.run().await;
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "second run within TTL must not re-execute"
+        );
     }
 }

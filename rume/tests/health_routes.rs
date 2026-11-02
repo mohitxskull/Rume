@@ -119,7 +119,10 @@ async fn health_ready_returns_ok_when_all_checks_ok() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = TestApp::body_text(response).await;
     assert!(body.contains("\"status\":\"ok\""));
-    assert!(body.contains("\"name\":\"database\""));
+    // Minimal response: no check-level details (name, message, meta).
+    assert!(!body.contains("\"name\":\"database\""));
+    assert!(!body.contains("\"message\""));
+    assert!(!body.contains("\"meta\""));
     assert!(!body.contains("\"pid\""));
     assert!(!body.contains("\"platform\""));
 }
@@ -143,7 +146,10 @@ async fn health_ready_returns_503_on_warning() {
     let response = app.get("/health/ready").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = TestApp::body_text(response).await;
-    assert!(body.contains("\"status\":\"warning\""));
+    // Minimal response: Warning maps to "error" (not healthy).
+    assert!(body.contains("\"status\":\"error\""));
+    assert!(!body.contains("\"name\":\"cache\""));
+    assert!(!body.contains("\"message\""));
 }
 
 #[tokio::test]
@@ -165,6 +171,9 @@ async fn health_ready_returns_503_on_failed() {
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = TestApp::body_text(response).await;
     assert!(body.contains("\"status\":\"error\""));
+    // Minimal response: no check-level details.
+    assert!(!body.contains("\"name\":\"s3\""));
+    assert!(!body.contains("\"message\""));
 }
 
 #[tokio::test]
