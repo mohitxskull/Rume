@@ -36,27 +36,36 @@ Rume follows four development phases:
 ## Phase 2 — Complete Application Capabilities
 
 > **Priority:** P1 · Framework Capabilities  
-> **Status:** Next Phase
+> **Status:** Completed & Verified
 
 This phase transitions Rume into a complete application framework providing integrated capabilities by default while preserving architectural freedom.
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
-| **CAP-01** | Complete Typed Request Validation | JSON body, path params, query strings, headers, and form inputs share unified, sanitized RFC 9457 Problem Details rejection behavior. | Upcoming |
-| **CAP-02** | First-Party Persistence Integration | Connection pool lifecycle management, automated migrations, health checks, and explicit transaction boundaries integrate seamlessly with Rume. | Upcoming |
-| **CAP-03** | Authentication Foundation | Pluggable identity providers, secure session management, API key handling, and token authentication middleware. | Upcoming |
-| **CAP-04** | Authorization Foundation | Declarative policies, role/permission checks, and explicit enforcement at handler and service boundaries. | Upcoming |
-| **CAP-05** | Cache Integration | Typed cache interface with memory and Redis adapters, TTL caching, tag invalidation, and lifecycle integration. | Upcoming |
-| **CAP-06** | Background Job Contracts | Typed background job declarations, execution runners, retry semantics, failure handling, and graceful worker drain during shutdown. | Upcoming |
-| **CAP-07** | Application Events | Typed inter-module domain events with explicit synchronous dispatch and asynchronous delivery contracts. | Upcoming |
-| **CAP-08** | API Schema Integration | Automatic OpenAPI / JSON Schema generation reflecting canonical route registry metadata and validated parameter types. | Upcoming |
+| **CAP-01** | Complete Typed Request Validation | JSON body, path params, query strings, headers, and form inputs share unified, sanitized RFC 9457 Problem Details rejection behavior. | **Completed** |
+| **CAP-02** | First-Party Persistence Integration | Connection pool lifecycle management, automated migrations, health checks, and explicit transaction boundaries integrate seamlessly with Rume. | **Completed** |
+| **CAP-03** | Authentication Foundation | Pluggable identity providers, secure session management, API key handling, and token authentication middleware. | **Completed** |
+| **CAP-04** | Authorization Foundation | Declarative policies, role/permission checks, and explicit enforcement at handler and service boundaries. | **Completed** |
+| **CAP-05** | Cache Integration | Typed cache interface with memory and Redis adapters, TTL caching, tag invalidation, and lifecycle integration. | **Completed** |
+| **CAP-06** | Background Job Contracts | Typed background job declarations, execution runners, retry semantics, failure handling, and graceful worker drain during shutdown. | **Completed** |
+| **CAP-07** | Application Events | Typed inter-module domain events with explicit synchronous dispatch and asynchronous delivery contracts. | **Completed** |
+| **CAP-08** | API Schema Integration | Automatic OpenAPI / JSON Schema generation reflecting canonical route registry metadata and validated parameter types. | **Completed** |
+
+**Verification Suites:**
+- [`rume/tests/validation_suite.rs`](../../../rume/tests/validation_suite.rs)
+- [`rume/tests/persistence_integration.rs`](../../../rume/tests/persistence_integration.rs)
+- [`rume/tests/auth_suite.rs`](../../../rume/tests/auth_suite.rs)
+- [`rume/tests/cache_suite.rs`](../../../rume/tests/cache_suite.rs)
+- [`rume/tests/jobs_suite.rs`](../../../rume/tests/jobs_suite.rs)
+- [`rume/tests/events_suite.rs`](../../../rume/tests/events_suite.rs)
+- [`rume/tests/openapi_suite.rs`](../../../rume/tests/openapi_suite.rs)
 
 ---
 
 ## Phase 3 — Enterprise Reliability
 
 > **Priority:** P1 · Scale and Maintainability  
-> **Status:** Planned
+> **Status:** Next Phase
 
 This phase provides enterprise-grade reliability, data consistency, and architectural enforcement.
 
