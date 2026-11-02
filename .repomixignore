@@ -1,0 +1,11 @@
+# What pack.sh ships: source plus the frozen v1 vision.
+# Repomix uses gitignore semantics, so every ignored level has to be
+# un-ignored before the next one can be re-included.
+/.opencode/
+
+/.zed/
+
+/docs/*
+!/docs/specs/
+/docs/specs/*
+!/docs/specs/vision/
