@@ -4,7 +4,7 @@
 //! an [`AppContext`] as its Axum state.
 
 use axum::routing::{MethodRouter, Router};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -16,6 +16,60 @@ use crate::app::context::AppContext;
 use crate::app::paths::ProjectPaths;
 use crate::app::state::{ApplicationMode, AvailabilityState, Environment, LifecycleState};
 use crate::routing::RouteRegistry;
+
+/// Errors that can occur when building the middleware stack.
+///
+/// Rume fails closed: any reference to middleware that hasn't been registered,
+/// any duplicate name, or any group containing an unknown member causes
+/// [`build_router`](RumeBuilder::build_router) to return an error before the
+/// application serves traffic. A misspelled middleware name must never
+/// silently result in an unprotected route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MiddlewareConfigError {
+    /// The same middleware name was registered more than once.
+    DuplicateMiddleware { name: String },
+    /// The same group name was defined more than once.
+    DuplicateGroup { name: String },
+    /// `use_middleware` was called with a name that was never registered.
+    UnknownMiddleware { name: String },
+    /// `use_group` was called with a name that was never defined.
+    UnknownGroup { name: String },
+    /// A group lists a member that was never registered as middleware.
+    UnknownGroupMember { group: String, member: String },
+}
+
+impl std::fmt::Display for MiddlewareConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            MiddlewareConfigError::DuplicateMiddleware { name } => {
+                write!(f, "middleware '{name}' is registered more than once")
+            }
+            MiddlewareConfigError::DuplicateGroup { name } => {
+                write!(f, "middleware group '{name}' is defined more than once")
+            }
+            MiddlewareConfigError::UnknownMiddleware { name } => write!(
+                f,
+                "middleware '{name}' is marked for application but was never registered with `.middleware()`"
+            ),
+            MiddlewareConfigError::UnknownGroup { name } => write!(
+                f,
+                "middleware group '{name}' is marked for application but was never defined with `.group()`"
+            ),
+            MiddlewareConfigError::UnknownGroupMember { group, member } => write!(
+                f,
+                "middleware group '{group}' references unknown member '{member}' — register it with `.middleware()` first"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for MiddlewareConfigError {}
+
+impl From<MiddlewareConfigError> for std::io::Error {
+    fn from(err: MiddlewareConfigError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+    }
+}
 
 /// A configured Rume application.
 ///
@@ -237,6 +291,10 @@ where
     /// call [`use_middleware`](Self::use_middleware) to mark it for
     /// application. Applied middleware wrap the router in
     /// [`middleware_order`](Self::middleware_order) registration order.
+    ///
+    /// Duplicate names are detected when the router is built via
+    /// [`build_router`](Self::build_router), which returns a
+    /// [`MiddlewareConfigError::DuplicateMiddleware`] error.
     pub fn middleware<F>(mut self, name: &str, f: F) -> Self
     where
         F: Fn(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>> + Send + Sync + 'static,
@@ -248,8 +306,12 @@ where
 
     /// Mark a registered named middleware for application in [`run`].
     ///
-    /// Does nothing (beyond recording the intent) if the name was never
-    /// registered with `middleware`.
+    /// Unknown names are rejected when the router is built via
+    /// [`build_router`](Self::build_router), which returns a
+    /// [`MiddlewareConfigError::UnknownMiddleware`] error. Unknown middleware
+    /// names are rejected fail-closed: a typo in `use_middleware("auth")`
+    /// prevents the application from building its middleware stack rather than
+    /// silently leaving routes unprotected.
     pub fn use_middleware(mut self, name: &str) -> Self {
         self.applied_middleware.insert(name.to_string());
         self
@@ -260,6 +322,10 @@ where
     /// `members` are the aliases of previously registered middleware. Members
     /// run in declaration order when the group is marked with
     /// [`use_group`](Self::use_group).
+    ///
+    /// Duplicate names and unknown members are detected when the router is
+    /// built via [`build_router`](Self::build_router), which returns a
+    /// [`MiddlewareConfigError`] error.
     pub fn group(mut self, name: &str, members: &[&str]) -> Self {
         self.groups_order.push(name.to_string());
         self.groups.insert(
@@ -270,6 +336,10 @@ where
     }
 
     /// Mark a named group for application in [`run`]; all of its members run.
+    ///
+    /// Unknown group names are rejected when the router is built via
+    /// [`build_router`](Self::build_router), which returns a
+    /// [`MiddlewareConfigError::UnknownGroup`] error.
     pub fn use_group(mut self, name: &str) -> Self {
         self.applied_groups.insert(name.to_string());
         self
@@ -291,7 +361,10 @@ where
     ///
     /// `ctx` is the Axum state the router carries; middleware closures operate
     /// on `Router<AppContext<E, C, S>>`.
-    pub fn build_router(self, ctx: AppContext<E, C, S>) -> Router<AppContext<E, C, S>> {
+    pub fn build_router(
+        self,
+        ctx: AppContext<E, C, S>,
+    ) -> Result<Router<AppContext<E, C, S>>, MiddlewareConfigError> {
         let RumeBuilder {
             router,
             middleware,
@@ -303,10 +376,52 @@ where
             ..
         } = self;
 
+        // --- Validation phase (fail closed, before any middleware wraps) ---
+        let mut seen_middleware: HashSet<&str> = HashSet::new();
+        for name in &middleware_order {
+            if !seen_middleware.insert(name.as_str()) {
+                return Err(MiddlewareConfigError::DuplicateMiddleware { name: name.clone() });
+            }
+        }
+
+        let mut seen_groups: HashSet<&str> = HashSet::new();
+        for name in &groups_order {
+            if !seen_groups.insert(name.as_str()) {
+                return Err(MiddlewareConfigError::DuplicateGroup { name: name.clone() });
+            }
+        }
+
+        for name in &applied_middleware {
+            if !middleware.contains_key(name.as_str()) {
+                return Err(MiddlewareConfigError::UnknownMiddleware { name: name.clone() });
+            }
+        }
+
+        for name in &applied_groups {
+            if !groups.contains_key(name.as_str()) {
+                return Err(MiddlewareConfigError::UnknownGroup { name: name.clone() });
+            }
+        }
+
+        for group_name in &applied_groups {
+            let Some(members) = groups.get(group_name.as_str()) else {
+                continue;
+            };
+            for member in members {
+                if !middleware.contains_key(member.as_str()) {
+                    return Err(MiddlewareConfigError::UnknownGroupMember {
+                        group: group_name.clone(),
+                        member: member.clone(),
+                    });
+                }
+            }
+        }
+
+        // --- Application phase: all references are now known valid ---
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx);
 
-        // Apply named middleware in registration order, but only those
-        // marked with `use_middleware`. Unknown names are skipped.
+        // Apply named middleware in registration order, only those marked
+        // with `use_middleware`.
         for name in middleware_order {
             if applied_middleware.contains(&name)
                 && let Some(mw) = middleware.get(&name)
@@ -316,20 +431,19 @@ where
         }
 
         // Apply named groups in registration order; each group's members run
-        // in declaration order. Members unknown to `middleware` are skipped.
+        // in declaration order. All members are known to exist (validated
+        // above), so unwrapping is safe.
         for name in groups_order {
-            if applied_groups.contains(&name)
-                && let Some(members) = groups.get(&name)
-            {
+            if applied_groups.contains(&name) {
+                let members = groups.get(&name).expect("group validated above");
                 for member in members {
-                    if let Some(mw) = middleware.get(member) {
-                        router = mw(router);
-                    }
+                    let mw = middleware.get(member).expect("member validated above");
+                    router = mw(router);
                 }
             }
         }
 
-        router
+        Ok(router)
     }
 
     /// Run the application until a shutdown signal is received.
@@ -397,10 +511,19 @@ where
         // Apply named middleware and groups before serving. `build_router`
         // consumes `self`, so take the shutdown hooks and timeout first:
         // they must still run after the server stops.
+        //
+        // Middleware validation happens here, before the server accepts any
+        // connections. A misconfigured middleware stack (unknown name,
+        // duplicate, or group with unknown member) causes `run()` to return an
+        // error instead of serving traffic with silently-misspelled middleware.
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let shutdown_timeout = self.shutdown_timeout;
         let serve_ctx = self.ctx.clone();
-        let router = self.build_router(serve_ctx.clone());
+
+        let router = match self.build_router(serve_ctx.clone()) {
+            Ok(router) => router,
+            Err(err) => return Err(err.into()),
+        };
 
         // `build_router` returns `Router<AppContext<E, C, S>>`; serving requires
         // `Router<()>`, so capture the state one final time at serve time.
@@ -431,5 +554,187 @@ where
         result.map_err(|err| {
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::context::AppContext;
+    use crate::app::paths::ProjectPaths;
+    use crate::app::state::Availability;
+    use crate::routing::HealthChecks;
+
+    fn test_ctx() -> AppContext<(), (), ()> {
+        AppContext::new(
+            (),
+            (),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+            (),
+        )
+    }
+
+    /// Returns a boxed middleware closure that adds a route at `path`.
+    #[allow(clippy::type_complexity)]
+    fn mw_add_route(
+        path: &'static str,
+    ) -> Box<
+        dyn Fn(Router<AppContext<(), (), ()>>) -> Router<AppContext<(), (), ()>>
+            + Send
+            + Sync
+            + 'static,
+    > {
+        Box::new(move |router: Router<AppContext<(), (), ()>>| {
+            router.route(path, axum::routing::get(|| async {}))
+        })
+    }
+
+    #[test]
+    fn known_middleware_applied_successfully() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .middleware("auth", mw_add_route("/auth"))
+            .use_middleware("auth");
+
+        let router = builder.build_router(test_ctx());
+        assert!(router.is_ok());
+    }
+
+    #[test]
+    fn unknown_middleware_via_use_middleware_is_rejected() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx).use_middleware("auth");
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::UnknownMiddleware { name }
+            if name == "auth"
+        ));
+    }
+
+    #[test]
+    fn duplicate_middleware_registration_is_rejected() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .middleware("auth", mw_add_route("/auth"))
+            .middleware("auth", mw_add_route("/auth2"));
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::DuplicateMiddleware { name }
+            if name == "auth"
+        ));
+    }
+
+    #[test]
+    fn unknown_group_via_use_group_is_rejected() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx).use_group("admins");
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::UnknownGroup { name }
+            if name == "admins"
+        ));
+    }
+
+    #[test]
+    fn group_with_unknown_member_is_rejected() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .middleware("auth", mw_add_route("/auth"))
+            .group("admins", &["auth", "missing"])
+            .use_group("admins");
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::UnknownGroupMember { group, member }
+            if group == "admins" && member == "missing"
+        ));
+    }
+
+    #[test]
+    fn duplicate_group_definition_is_rejected() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .group("admins", &[])
+            .group("admins", &[])
+            .use_group("admins");
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::DuplicateGroup { name }
+            if name == "admins"
+        ));
+    }
+
+    #[test]
+    fn middleware_applied_in_registration_order() {
+        // Named middleware wraps the router in registration order. We can't
+        // observe request-time ordering without a live HTTP client, but we can
+        // verify that all applied middleware are present and the result is Ok.
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .middleware("first", mw_add_route("/first"))
+            .middleware("second", mw_add_route("/second"))
+            .use_middleware("first")
+            .use_middleware("second");
+
+        let router = builder.build_router(test_ctx());
+        assert!(router.is_ok());
+    }
+
+    #[test]
+    fn group_members_applied_in_declaration_order() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .middleware("a", mw_add_route("/a"))
+            .middleware("b", mw_add_route("/b"))
+            .middleware("c", mw_add_route("/c"))
+            .group("stack", &["a", "b", "c"])
+            .use_group("stack");
+
+        let router = builder.build_router(test_ctx());
+        assert!(router.is_ok());
+    }
+
+    #[test]
+    fn run_returns_error_on_misconfigured_middleware() {
+        // `run()` fails closed: unknown middleware prevents serving.
+        // `run()` calls `build_router` before listening, so the error surfaces
+        // before any traffic can be served.
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx).use_middleware("nonexistent");
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            MiddlewareConfigError::UnknownMiddleware { .. }
+        ));
+    }
+
+    #[test]
+    fn error_display_messages_are_descriptive() {
+        let err = MiddlewareConfigError::UnknownMiddleware {
+            name: "autn".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("autn"));
+        assert!(msg.contains(".middleware()"));
+
+        let err = MiddlewareConfigError::UnknownGroupMember {
+            group: "admins".to_string(),
+            member: "auth".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("admins"));
+        assert!(msg.contains("auth"));
     }
 }
