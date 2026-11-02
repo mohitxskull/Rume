@@ -35,10 +35,8 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Reclaims jobs belonging to dead workers, returning them to the pending queue.
     fn reclaim_abandoned_jobs(
         &self,
-        _dead_workers: &[String],
-    ) -> BoxFuture<'_, Result<usize, JobError>> {
-        Box::pin(async move { Ok(0) })
-    }
+        dead_workers: &[String],
+    ) -> BoxFuture<'_, Result<usize, JobError>>;
 
     /// Acknowledges successful execution, removing the job from the queue.
     fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>>;

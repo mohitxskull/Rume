@@ -25,6 +25,22 @@ pub enum SamlError {
     /// Digital signature verification failed.
     #[error("signature verification failed: {0}")]
     InvalidSignature(String),
+
+    /// Missing mandatory digital signature verifier.
+    #[error("signature verification required: missing signature verifier")]
+    MissingSignatureVerifier,
+
+    /// Identity provider issuer mismatch.
+    #[error("issuer mismatch: expected '{expected}', received '{received}'")]
+    IssuerMismatch { expected: String, received: String },
+
+    /// SAML destination endpoint mismatch.
+    #[error("destination mismatch: expected '{expected}', received '{received}'")]
+    DestinationMismatch { expected: String, received: String },
+
+    /// Possible XML signature wrapping attack detected.
+    #[error("signature wrapping attack detected: {0}")]
+    SignatureWrappingDetected(String),
 }
 
 /// Interface for verifying cryptographic signatures on SAML assertions.
@@ -44,6 +60,8 @@ pub struct SamlAssertion {
     pub subject: String,
     /// Audience restriction URI.
     pub audience: Option<String>,
+    /// Destination endpoint URI.
+    pub destination: Option<String>,
     /// NotBefore epoch seconds condition.
     pub not_before: Option<u64>,
     /// NotOnOrAfter epoch seconds condition.
@@ -153,6 +171,14 @@ impl SamlParser {
         Self::parse_with_verifier(xml, None)
     }
 
+    /// Parses an XML string containing a SAML 2.0 Assertion with mandatory cryptographic signature verification.
+    pub fn parse_signed(
+        xml: &str,
+        verifier: &dyn SamlSignatureVerifier,
+    ) -> Result<SamlAssertion, SamlError> {
+        Self::parse_with_verifier(xml, Some(verifier))
+    }
+
     /// Parses an XML string containing a SAML 2.0 Assertion and verifies its digital signature if a verifier is provided.
     pub fn parse_with_verifier(
         xml: &str,
@@ -164,6 +190,43 @@ impl SamlParser {
 
         let clean_xml = strip_comments(xml);
         let xml = clean_xml.as_str();
+
+        // Security check: Guard against XML Signature Wrapping (XSW) attacks
+        // Reject messages with multiple assertion tags.
+        let assertion_count = xml.match_indices("<saml2:Assertion").count()
+            + xml.match_indices("<saml:Assertion").count()
+            + xml.match_indices("<Assertion").count();
+        if assertion_count > 1 {
+            return Err(SamlError::SignatureWrappingDetected(format!(
+                "multiple ({assertion_count}) Assertion elements detected; possible XML signature wrapping attack"
+            )));
+        }
+
+        // Optional Assertion ID
+        let id = if let Some(pos) = xml.find("ID=\"") {
+            let rest = &xml[pos + 4..];
+            if let Some(end) = rest.find('"') {
+                rest[..end].to_string()
+            } else {
+                "assertion".to_string()
+            }
+        } else {
+            "assertion".to_string()
+        };
+
+        // Security check: Signature Reference URI must match Assertion ID if present
+        let ref_pattern = "<ds:Reference URI=\"#";
+        if let Some(pos) = xml.find(ref_pattern) {
+            let rest = &xml[pos + ref_pattern.len()..];
+            if let Some(end) = rest.find('"') {
+                let ref_id = &rest[..end];
+                if ref_id != id {
+                    return Err(SamlError::SignatureWrappingDetected(format!(
+                        "signature reference URI '#{ref_id}' does not match assertion ID '{id}'"
+                    )));
+                }
+            }
+        }
 
         // Find Issuer
         let issuer = Self::extract_tag(xml, "saml:Issuer")
@@ -185,16 +248,12 @@ impl SamlParser {
             .or_else(|| Self::extract_tag(xml, "Audience"))
             .map(str::to_string);
 
-        // Optional Assertion ID
-        let id = if let Some(pos) = xml.find("ID=\"") {
-            let rest = &xml[pos + 4..];
-            if let Some(end) = rest.find('"') {
-                rest[..end].to_string()
-            } else {
-                "assertion".to_string()
-            }
+        // Optional Destination endpoint
+        let destination = if let Some(pos) = xml.find("Destination=\"") {
+            let rest = &xml[pos + "Destination=\"".len()..];
+            rest.find('"').map(|end| rest[..end].to_string())
         } else {
-            "assertion".to_string()
+            None
         };
 
         // Parse Conditions NotBefore and NotOnOrAfter
@@ -268,6 +327,7 @@ impl SamlParser {
             issuer,
             subject,
             audience,
+            destination,
             not_before,
             not_on_or_after,
             attributes,
@@ -309,6 +369,46 @@ impl SamlParser {
                 }
                 None => {
                     return Err(SamlError::AudienceMismatch {
+                        expected: expected.to_string(),
+                        received: "<none>".to_string(),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Strictly validates time conditions, audience, issuer, and destination against the assertion.
+    pub fn validate_strict(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        expected_audience: Option<&str>,
+        expected_issuer: Option<&str>,
+        expected_destination: Option<&str>,
+    ) -> Result<(), SamlError> {
+        Self::validate(assertion, current_epoch_sec, expected_audience)?;
+
+        if let Some(expected) = expected_issuer
+            && assertion.issuer != expected
+        {
+            return Err(SamlError::IssuerMismatch {
+                expected: expected.to_string(),
+                received: assertion.issuer.clone(),
+            });
+        }
+
+        if let Some(expected) = expected_destination {
+            match &assertion.destination {
+                Some(received) if received == expected => {}
+                Some(received) => {
+                    return Err(SamlError::DestinationMismatch {
+                        expected: expected.to_string(),
+                        received: received.clone(),
+                    });
+                }
+                None => {
+                    return Err(SamlError::DestinationMismatch {
                         expected: expected.to_string(),
                         received: "<none>".to_string(),
                     });

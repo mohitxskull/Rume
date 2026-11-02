@@ -151,4 +151,99 @@ fn test_saml_signature_verifier() {
     let invalid_verifier = MockVerifier { should_pass: false };
     let res = SamlParser::parse_with_verifier(saml_xml, Some(&invalid_verifier));
     assert!(matches!(res, Err(SamlError::InvalidSignature(_))));
+
+    // parse_signed convenience
+    let signed_res = SamlParser::parse_signed(saml_xml, &valid_verifier);
+    assert!(signed_res.is_ok());
+}
+
+#[test]
+fn test_saml_signature_wrapping_and_strict_validation() {
+    // 1. Detect Signature Wrapping Attack: multiple assertions
+    let xsw_xml = r#"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" Destination="https://sp.myapp.io/saml/acs">
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_legit">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_forged">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>attacker@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "#;
+
+    let res = SamlParser::parse(xsw_xml);
+    assert!(matches!(res, Err(SamlError::SignatureWrappingDetected(_))));
+
+    // 2. Detect Reference URI mismatch
+    let ref_mismatch_xml = r##"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_actual123">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#_differentId" />
+            </ds:SignedInfo>
+        </ds:Signature>
+    </saml2:Assertion>
+    "##;
+
+    let res_ref = SamlParser::parse(ref_mismatch_xml);
+    assert!(matches!(
+        res_ref,
+        Err(SamlError::SignatureWrappingDetected(_))
+    ));
+
+    // 3. Strict validation: checks issuer and destination
+    let valid_xml = r#"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" Destination="https://sp.myapp.io/saml/acs">
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_single123">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
+            <saml2:Conditions>
+                <saml2:Audience>https://sp.myapp.io</saml2:Audience>
+            </saml2:Conditions>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "#;
+
+    let assertion = SamlParser::parse(valid_xml).unwrap();
+    assert_eq!(
+        assertion.destination.as_deref(),
+        Some("https://sp.myapp.io/saml/acs")
+    );
+
+    // Strict validation pass
+    let ok = SamlParser::validate_strict(
+        &assertion,
+        1700000000,
+        Some("https://sp.myapp.io"),
+        Some("https://idp.enterprise.com"),
+        Some("https://sp.myapp.io/saml/acs"),
+    );
+    assert!(ok.is_ok());
+
+    // Issuer mismatch rejection
+    let bad_issuer = SamlParser::validate_strict(
+        &assertion,
+        1700000000,
+        Some("https://sp.myapp.io"),
+        Some("https://malicious-idp.com"),
+        Some("https://sp.myapp.io/saml/acs"),
+    );
+    assert!(matches!(bad_issuer, Err(SamlError::IssuerMismatch { .. })));
+
+    // Destination mismatch rejection
+    let bad_dest = SamlParser::validate_strict(
+        &assertion,
+        1700000000,
+        Some("https://sp.myapp.io"),
+        Some("https://idp.enterprise.com"),
+        Some("https://other-sp.com/acs"),
+    );
+    assert!(matches!(
+        bad_dest,
+        Err(SamlError::DestinationMismatch { .. })
+    ));
 }
