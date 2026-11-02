@@ -12,7 +12,7 @@ pub use crate::error::AppError;
 pub use crate::helpers::{safe_equal, slug};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
-    RouteSpec, ValidatedParam, registered_routes,
+    RouteRegistry, RouteSpec, ValidatedParam,
 };
 pub use crate::testing::{TestApp, TestAppBuilder};
 pub use crate::validation::Validated;

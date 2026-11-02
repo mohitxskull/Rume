@@ -260,6 +260,8 @@ where
     pub lifecycle: Lifecycle,
     /// Health check registry.
     pub health_checks: crate::routing::HealthChecks,
+    /// Application-scoped route registry (for `rume list:routes`).
+    pub route_registry: crate::routing::RouteRegistry,
     /// Application state (db pool, redis, HTTP client, …). Defaults to `()`.
     pub state: S,
 }
@@ -286,6 +288,7 @@ where
             availability,
             lifecycle: Lifecycle::new(),
             health_checks,
+            route_registry: crate::routing::RouteRegistry::new(),
             state,
         }
     }
@@ -301,6 +304,7 @@ where
             paths: None,
             availability: None,
             health_checks: None,
+            route_registry: None,
             state: None,
         }
     }
@@ -318,6 +322,7 @@ where
     paths: Option<ProjectPaths>,
     availability: Option<Availability>,
     health_checks: Option<crate::routing::HealthChecks>,
+    route_registry: Option<crate::routing::RouteRegistry>,
     state: Option<S>,
 }
 
@@ -345,6 +350,12 @@ where
         self
     }
 
+    /// Set the route registry (default: `RouteRegistry::new()`).
+    pub fn route_registry(mut self, route_registry: crate::routing::RouteRegistry) -> Self {
+        self.route_registry = Some(route_registry);
+        self
+    }
+
     /// Set the application state (db pool, redis, HTTP client, …).
     /// Defaults to `S::default()` (`()` when `S = ()`).
     pub fn state(mut self, state: S) -> Self {
@@ -367,6 +378,7 @@ where
             availability: self.availability.unwrap_or_default(),
             lifecycle: Lifecycle::new(),
             health_checks: self.health_checks.unwrap_or_default(),
+            route_registry: self.route_registry.unwrap_or_default(),
             state: self.state.unwrap_or_default(),
         }
     }
@@ -408,6 +420,9 @@ where
     ctx: AppContext<E, C, S>,
     state: S,
     router: Router<AppContext<E, C, S>>,
+    /// Application-scoped route registry. Cloned from the [`AppContext`] at
+    /// construction; [`run`](Self::run) passes it back into the context.
+    route_registry: crate::routing::RouteRegistry,
     bind: String,
     mode: ApplicationMode,
     environment: Environment,
@@ -453,10 +468,12 @@ where
     /// point for building a Rume application.
     pub(crate) fn new(ctx: AppContext<E, C, S>) -> Self {
         let state = ctx.state.clone();
+        let route_registry = ctx.route_registry.clone();
         Self {
             ctx,
             state,
             router: Router::new(),
+            route_registry,
             bind: "127.0.0.1:3000".to_string(),
             mode: ApplicationMode::Run,
             environment: Environment::from_env(),
@@ -472,6 +489,19 @@ where
     }
 
     /// Add a route to the application.
+    ///
+    /// The route is mounted on the router but not recorded in the route
+    /// registry: a [`MethodRouter`] does not expose its HTTP method, so
+    /// recording a [`RouteInfo`] here would require fabricating one (likely
+    /// `GET`), which would produce incorrect `rume list:routes` output.
+    /// Registration stays explicit: construct a [`RouteInfo`] from
+    /// [`RouteSpec::build`] metadata and call [`RouteRegistry::register`] on
+    /// [`AppContext::route_registry`].
+    ///
+    /// Why: a wrongly registered method is a real bug for `rume list:routes`,
+    /// whereas an empty registry is obvious and easy to populate explicitly.
+    /// Revisit if `MethodRouter` exposes its method or `route()` gains method
+    /// information.
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
         self
@@ -658,6 +688,11 @@ where
 
     /// Run the application until a shutdown signal is received.
     pub async fn run(mut self) -> Result<(), std::io::Error> {
+        // Pass the builder's route registry into the app context so the
+        // application's routes are observable from `AppContext::route_registry`
+        // (e.g. by `rume list:routes`).
+        self.ctx.route_registry = self.route_registry.clone();
+
         let addr: SocketAddr = self
             .bind
             .parse()

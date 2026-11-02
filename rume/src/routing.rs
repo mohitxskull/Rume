@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::{Method, StatusCode};
@@ -262,35 +262,43 @@ pub struct RouteInfo {
     pub params: Vec<String>,
 }
 
-/// Global registry of all routes (for `rume list:routes`).
-static ROUTE_REGISTRY: OnceLock<Mutex<Vec<RouteInfo>>> = OnceLock::new();
-
-fn route_registry() -> &'static Mutex<Vec<RouteInfo>> {
-    ROUTE_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+/// Application-scoped route registry. Each Rume application owns its own
+/// registry; route metadata is tied to the application that registered it,
+/// not to a process-global singleton.
+#[derive(Debug, Default, Clone)]
+pub struct RouteRegistry {
+    routes: Vec<RouteInfo>,
 }
 
-/// Register a route in the global registry.
-fn register_route(info: RouteInfo) {
-    if let Ok(mut registry) = route_registry().lock() {
-        registry.push(info);
+impl RouteRegistry {
+    /// Create an empty registry.
+    pub fn new() -> Self {
+        Self::default()
     }
-}
 
-/// Get all registered routes (for `rume list:routes`).
-pub fn registered_routes() -> Vec<RouteInfo> {
-    route_registry()
-        .lock()
-        .map(|r| r.clone())
-        .unwrap_or_default()
-}
+    /// Register a route.
+    pub fn register(&mut self, info: RouteInfo) {
+        self.routes.push(info);
+    }
 
-/// Reset the global route registry (for testing only).
-///
-/// Clears all registrations so each test starts from a clean slate.
-/// This is needed because `ROUTE_REGISTRY` is a process-global `OnceLock`.
-pub fn reset_route_registry() {
-    if let Ok(mut registry) = route_registry().lock() {
-        registry.clear();
+    /// Return all registered routes.
+    pub fn routes(&self) -> &[RouteInfo] {
+        &self.routes
+    }
+
+    /// Number of registered routes.
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Whether the registry is empty.
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    /// Remove all registered routes.
+    pub fn clear(&mut self) {
+        self.routes.clear();
     }
 }
 
@@ -394,25 +402,19 @@ impl RouteSpec {
         self
     }
 
-    /// Register the route and build route metadata.
+    /// Build the route specification into route metadata.
     ///
     /// Returns `(path, method, params, name)` suitable for `Router::route()`.
     ///
     /// # Registration
     ///
-    /// The route is registered in the global [`ROUTE_REGISTRY`] at build time
-    /// (this is intentional — it powers `rume list:routes`). If a route is
-    /// built but never mounted, it still appears in the registry. Use
-    /// [`reset_route_registry`] in tests to isolate registry state.
+    /// `build()` does NOT register the route anywhere. Registration is
+    /// explicit: the caller constructs a [`RouteInfo`] from the returned
+    /// metadata and calls [`RouteRegistry::register`] on their
+    /// application-scoped [`RouteRegistry`] (available via
+    /// [`AppContext::route_registry`]) when the route is mounted. Building a
+    /// route without mounting it therefore never pollutes any registry.
     pub fn build(self) -> (String, Method, Vec<(String, Matcher)>, Option<String>) {
-        let info = RouteInfo {
-            method: self.method.clone(),
-            path: self.path.clone(),
-            name: self.name.clone(),
-            params: self.params.iter().map(|(n, _)| n.clone()).collect(),
-        };
-        register_route(info);
-
         (self.path, self.method, self.params, self.name)
     }
 }
@@ -928,22 +930,38 @@ mod tests {
         assert_eq!(RouteGroup::<()>::join_path("/api", ""), "/api");
     }
 
-    // --- C-m3 / T-T9: RouteSpec::build() + ROUTE_REGISTRY ---
+    // --- RouteRegistry (application-scoped; replaces the ROUTE_REGISTRY global) ---
 
     #[test]
-    fn route_spec_build_registers_in_registry() {
-        let _ = RouteSpec::get("/users/:id")
-            .where_param("id", Matcher::Number)
-            .r#as("users.show")
-            .build();
+    fn route_registry_register_routes_len_is_empty() {
+        let mut registry = RouteRegistry::new();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
 
-        let routes = registered_routes();
-        assert!(
-            routes
-                .iter()
-                .any(|r| r.path == "/users/:id" && r.name.as_deref() == Some("users.show")),
-            "expected /users/:id named users.show in registry, got {routes:?}"
-        );
+        registry.register(RouteInfo {
+            method: Method::GET,
+            path: "/users".to_string(),
+            name: Some("users.index".to_string()),
+            params: vec![],
+        });
+        assert!(!registry.is_empty());
+        assert_eq!(registry.len(), 1);
+
+        let routes = registry.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/users");
+        assert_eq!(routes[0].name.as_deref(), Some("users.index"));
+
+        registry.clear();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
+    }
+
+    #[test]
+    fn route_registry_default_is_empty() {
+        let registry = RouteRegistry::default();
+        assert!(registry.is_empty());
+        assert_eq!(registry.len(), 0);
     }
 
     #[test]
@@ -961,15 +979,28 @@ mod tests {
     }
 
     #[test]
-    fn route_registry_is_isolated_between_tests() {
-        // T-T9: ROUTE_REGISTRY is a global OnceLock; tests must not leak
-        // registrations into each other. This test registers a route and the
-        // next test should see a clean slate (registry is process-global, so
-        // we just verify registration works deterministically).
-        let count_before = registered_routes().len();
-        let _ = RouteSpec::get("/isolated").build();
-        let count_after = registered_routes().len();
-        assert_eq!(count_after, count_before + 1);
+    fn route_spec_build_has_no_side_effects() {
+        // build() returns metadata only; it does not register into any
+        // registry (the process-global ROUTE_REGISTRY no longer exists).
+        let (path, method, _, name) = RouteSpec::get("/users/:id")
+            .where_param("id", Matcher::Number)
+            .r#as("users.show")
+            .build();
+
+        assert_eq!(path, "/users/:id");
+        assert_eq!(method, Method::GET);
+        assert_eq!(name.as_deref(), Some("users.show"));
+
+        // Explicit registration is the caller's job, into their own registry.
+        let mut registry = RouteRegistry::new();
+        registry.register(RouteInfo {
+            method,
+            path: path.to_string(),
+            name,
+            params: vec!["id".to_string()],
+        });
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.routes()[0].path, "/users/:id");
     }
 
     // --- HealthChecks::run() with mixed statuses ---
@@ -1059,33 +1090,6 @@ mod tests {
         // C-m4: Warning → not fully healthy (503 on /health/ready)
         assert!(!report.is_healthy);
         assert_eq!(report.status, "warning");
-    }
-
-    // --- T-T9: ROUTE_REGISTRY isolation ---
-
-    #[test]
-    fn route_registry_reset_clears_registrations() {
-        // T-T9: reset_route_registry must clear the global registry between tests.
-        reset_route_registry();
-        assert!(registered_routes().is_empty());
-
-        let _ = RouteSpec::get("/temp").build();
-        assert!(!registered_routes().is_empty());
-
-        reset_route_registry();
-        assert!(registered_routes().is_empty());
-    }
-
-    #[test]
-    fn route_spec_build_without_mount_still_registers() {
-        // C-m3: build() registers in the registry even if never mounted.
-        // This is intentional (powers `rume list:routes`).
-        reset_route_registry();
-        let _ = RouteSpec::get("/unmounted").build();
-        assert!(
-            registered_routes().iter().any(|r| r.path == "/unmounted"),
-            "build-then-unmounted route should still be in registry"
-        );
     }
 
     // --- Resourceful routing ---
