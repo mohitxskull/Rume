@@ -41,5 +41,5 @@ pub use matchers::Matcher;
 pub use registry::{RouteInfo, RouteRegistry};
 pub use rejection::Rejection;
 pub use resource::Resource;
-pub use spec::RouteSpec;
+pub use spec::{ParamValidationLayer, RouteSpec};
 pub use validated_param::ValidatedParam;

@@ -1,8 +1,7 @@
 //! Route groups.
 //!
 //! Provides [`RouteGroup`], a builder for applying shared configuration
-//! (prefix, name prefix) to multiple routes before mounting them on an Axum
-//! router.
+//! (URL prefix) to multiple routes before mounting them on an Axum router.
 
 use axum::Router;
 use axum::routing::MethodRouter;
@@ -11,7 +10,6 @@ use axum::routing::MethodRouter;
 pub struct RouteGroup<S> {
     inner: Router<S>,
     prefix: String,
-    name_prefix: String,
 }
 
 impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
@@ -20,19 +18,12 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
         Self {
             inner: Router::new(),
             prefix: String::new(),
-            name_prefix: String::new(),
         }
     }
 
     /// Set a URL prefix for all routes in the group.
     pub fn prefix(mut self, prefix: &str) -> Self {
         self.prefix = prefix.to_string();
-        self
-    }
-
-    /// Set a name prefix for all named routes in the group.
-    pub fn r#as(mut self, name: &str) -> Self {
-        self.name_prefix = name.to_string();
         self
     }
 
