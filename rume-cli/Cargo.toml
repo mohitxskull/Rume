@@ -22,3 +22,4 @@ inquire = "0.9.4"
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true

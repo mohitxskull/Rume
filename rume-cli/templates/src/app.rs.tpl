@@ -1,9 +1,10 @@
 use crate::config::Config;
 use crate::env::Env;
 use crate::routes;
-use rume::app::{AppContext, Environment, ProjectPaths, Rume, Availability, init_tracing};
+use rume::app::{AppContext, Availability, ProjectPaths, Rume, init_tracing};
 use rume::routing::health_routes;
 
+#[derive(Clone)]
 pub struct AppState;
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -19,7 +20,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     println!("starting {}...", config.app.name);
 
     // Application context: handlers access env/config/state via `State<AppContext<Env, Config, AppState>>`.
-    let ctx = AppContext::new(env.clone(), config.clone(), paths, availability.clone(), health_checks, app_state);
+    let ctx = AppContext::new(
+        env.clone(),
+        config.clone(),
+        paths,
+        availability.clone(),
+        health_checks,
+        app_state,
+    );
 
     let router = routes::router(ctx.clone());
     let router = health_routes::<Env, Config, AppState>().merge(router);
