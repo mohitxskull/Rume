@@ -10,6 +10,8 @@ pub mod migration;
 pub mod pool;
 #[cfg(feature = "postgres")]
 pub mod postgres;
+#[cfg(feature = "sqlite")]
+pub mod sqlite;
 
 pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, MemoryDatabase};
 pub use config::DatabaseConfig;
@@ -18,3 +20,5 @@ pub use migration::{Migration, MigrationSummary, Migrator};
 pub use pool::{ConnectionLease, DatabaseHealthCheck, DatabasePool, PoolStatus};
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresBackend, PostgresTransaction};
+#[cfg(feature = "sqlite")]
+pub use sqlite::{SqliteBackend, SqliteTransaction};

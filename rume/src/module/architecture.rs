@@ -1,7 +1,15 @@
-//! CI architecture verification rules and boundary enforcement.
+//! CI module dependency graph verification and architectural boundary assertions.
 //!
-//! Provides static verification of module boundaries and dependencies (inspired by ArchUnit and
-//! Spring Modulith), ensuring that forbidden cross-domain calls and architecture violations fail in CI.
+//! Provides verification of declared module dependency graphs (inspired by ArchUnit
+//! and Spring Modulith).
+//!
+//! ### Boundary Enforcement Model
+//! - **Declared graph validation**: [`ArchitectureRules`] checks declared relationships
+//!   from [`Module::dependencies()`], verifying transitive closure reachability, forbidden
+//!   domain couplings, and required core modules.
+//! - **Source-level call enforcement**: Checking declared dependencies does not prevent
+//!   unregistered direct source calls. True physical encapsulation in Rust must be enforced
+//!   using module visibility (`pub(crate)`, private sub-modules) or separate Cargo crate boundaries.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;

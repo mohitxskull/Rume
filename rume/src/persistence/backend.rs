@@ -57,7 +57,13 @@ struct MemoryDbState {
     alive: bool,
 }
 
-/// An in-memory database backend providing zero-dependency persistence for tests and prototyping.
+/// An in-memory key-value test double providing zero-dependency persistence for unit tests.
+///
+/// > [!NOTE]
+/// > `MemoryDatabase` is an in-memory test double designed for fast unit testing and interface
+/// > validation. It does not parse full SQL or enforce relational constraints. For production
+/// > workloads and genuine ANSI SQL testing, use `PostgresBackend` (with testcontainers) or
+/// > `SqliteBackend`.
 #[derive(Debug, Clone)]
 pub struct MemoryDatabase {
     state: Arc<RwLock<MemoryDbState>>,

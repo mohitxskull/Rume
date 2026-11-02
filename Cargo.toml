@@ -36,4 +36,5 @@ tokio-postgres = "0.7.18"
 deadpool-postgres = "0.14.2"
 deadpool-redis = "0.23.1"
 redis = { version = "1.8", default-features = false, features = ["tokio-comp", "script"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis"] }

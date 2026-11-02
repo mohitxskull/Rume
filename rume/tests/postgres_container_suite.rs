@@ -881,3 +881,176 @@ async fn test_postgres_job_queue_idempotency_deduplication() {
         "only 1 job should exist in queue"
     );
 }
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+struct EnterpriseOrderCreatedEvent {
+    order_id: String,
+    tenant_id: String,
+    amount: u32,
+}
+
+impl Event for EnterpriseOrderCreatedEvent {
+    const TYPE: &'static str = "enterprise.order.created";
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct FulfillOrderJob {
+    order_id: String,
+    tenant_id: String,
+}
+
+impl Job for FulfillOrderJob {
+    const NAME: &'static str = "fulfill_order";
+}
+
+#[tokio::test]
+async fn test_postgres_realistic_enterprise_transaction_pipeline() {
+    let (_container, pool) = setup_postgres_pool(6).await;
+    let backend = pool.backend();
+
+    // 1. Initialize schema
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox failed");
+
+    let queue = Arc::new(PostgresJobQueue::from_backend(backend));
+    queue.init_schema().await.expect("init job schema failed");
+
+    backend
+        .execute(
+            "CREATE TABLE IF NOT EXISTS enterprise_orders (
+                id VARCHAR(255) PRIMARY KEY,
+                tenant_id VARCHAR(255) NOT NULL,
+                amount INT NOT NULL
+            );",
+        )
+        .await
+        .expect("create orders table failed");
+
+    // 2. Setup event bus and outbox relay
+    let event_bus = Arc::new(EventBus::new());
+    let queue_clone = Arc::clone(&queue);
+
+    // Event subscriber enqueues background fulfillment job upon OrderCreated event
+    event_bus.subscribe_fn(move |event: &EnterpriseOrderCreatedEvent| {
+        let q = Arc::clone(&queue_clone);
+        let order_id = event.order_id.clone();
+        let tenant_id = event.tenant_id.clone();
+        async move {
+            q.enqueue(FulfillOrderJob {
+                order_id,
+                tenant_id,
+            })
+            .await
+            .map_err(|e| rume::events::EventError::Bus(e.to_string()))?;
+            Ok(())
+        }
+    });
+
+    let event_bus_clone = Arc::clone(&event_bus);
+    let relay = OutboxRelay::new(Arc::new(backend.clone()), move |msg| {
+        let bus = Arc::clone(&event_bus_clone);
+        let msg_clone = msg.clone();
+        async move {
+            let ev: EnterpriseOrderCreatedEvent = msg_clone
+                .deserialize_payload()
+                .map_err(|e| rume::outbox::OutboxError::Repository(e.to_string()))?;
+            bus.publish_sync(&ev)
+                .await
+                .map_err(|e| rume::outbox::OutboxError::Repository(e.to_string()))?;
+            Ok(())
+        }
+    });
+
+    // 3. Execution: Successful enterprise transaction
+    let tenant = "tenant-enterprise-alpha";
+    let order_id = "order-tx-8888";
+
+    let tx = backend.begin_transaction().await.expect("begin tx failed");
+    tx.execute(&format!(
+        "INSERT INTO enterprise_orders (id, tenant_id, amount) VALUES ('{order_id}', '{tenant}', 499);"
+    ))
+    .await
+    .expect("insert order failed");
+
+    let ev = EnterpriseOrderCreatedEvent {
+        order_id: order_id.to_string(),
+        tenant_id: tenant.to_string(),
+        amount: 499,
+    };
+    let outbox_msg = OutboxMessage::from_event(&ev).expect("outbox message from event failed");
+    backend
+        .save_tx(&tx, outbox_msg)
+        .await
+        .expect("save outbox failed");
+
+    tx.commit().await.expect("tx commit failed");
+
+    // 4. Verify order is persisted in PostgreSQL
+    let saved_order = backend
+        .query_scalar(&format!(
+            "SELECT id FROM enterprise_orders WHERE id = '{order_id}';"
+        ))
+        .await
+        .expect("query scalar failed")
+        .expect("order should exist");
+    assert_eq!(saved_order, order_id);
+
+    // 5. Drain outbox relay and dispatch event
+    let dispatched_count = relay
+        .poll_and_dispatch(10)
+        .await
+        .expect("relay dispatch failed");
+    assert_eq!(dispatched_count, 1);
+    assert_eq!(backend.pending_count().await.unwrap(), 0);
+    assert_eq!(backend.published_count().await.unwrap(), 1);
+
+    // 6. Verify job was enqueued in PostgreSQL job queue
+    assert_eq!(queue.pending_count().await.unwrap(), 1);
+
+    // 7. Worker claims job via SKIP LOCKED
+    let queued_job = queue
+        .dequeue_for("worker-node-1")
+        .await
+        .expect("dequeue failed")
+        .expect("job should be dequeued");
+
+    let job_payload: FulfillOrderJob = serde_json::from_slice(&queued_job.payload).unwrap();
+    assert_eq!(job_payload.order_id, order_id);
+    assert_eq!(job_payload.tenant_id, tenant);
+
+    // Acknowledge job completion
+    queue.ack(&queued_job.id).await.expect("ack failed");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // 8. Injected Failure Scenario: Rollback aborts both business write and outbox message
+    let fail_tx = backend.begin_transaction().await.expect("begin fail tx");
+    fail_tx
+        .execute("INSERT INTO enterprise_orders (id, tenant_id, amount) VALUES ('order-fail-999', 'tenant-enterprise-alpha', 999);")
+        .await
+        .expect("insert fail order");
+
+    let fail_ev = EnterpriseOrderCreatedEvent {
+        order_id: "order-fail-999".to_string(),
+        tenant_id: "tenant-enterprise-alpha".to_string(),
+        amount: 999,
+    };
+    let fail_outbox = OutboxMessage::from_event(&fail_ev).expect("fail outbox");
+    backend
+        .save_tx(&fail_tx, fail_outbox)
+        .await
+        .expect("save fail outbox");
+
+    fail_tx.rollback().await.expect("rollback failed");
+
+    // Verify aborted order does NOT exist
+    let aborted_order = backend
+        .query_scalar("SELECT id FROM enterprise_orders WHERE id = 'order-fail-999';")
+        .await
+        .expect("query scalar");
+    assert_eq!(aborted_order, None);
+
+    // Outbox pending count remains 0
+    assert_eq!(backend.pending_count().await.unwrap(), 0);
+}

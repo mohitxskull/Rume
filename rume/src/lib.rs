@@ -54,6 +54,8 @@ pub use coordination::{
 };
 #[cfg(feature = "postgres")]
 pub use coordination::{PostgresDistributedLock, PostgresLeaderElector};
+#[cfg(feature = "redis")]
+pub use coordination::{RedisDistributedLock, RedisLeaderElector};
 pub use enterprise::{
     SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
     SamlError, SamlParser, SamlSignatureVerifier, ScimEmail, ScimErrorResponse, ScimGroup,
@@ -73,6 +75,8 @@ pub use jobs::{
     JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
     MemoryJobQueue, QueuedJob, RetryPolicy,
 };
+#[cfg(feature = "redis")]
+pub use jobs::{RedisHeartbeatRegistry, RedisIdempotencyStore};
 pub use metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
 pub use module::{
     ArchitectureRules, ArchitectureViolation, Module, ModuleContext, ModuleError, ModuleHarness,
@@ -87,13 +91,15 @@ pub use outbox::{
 pub use persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
 };
+#[cfg(feature = "sqlite")]
+pub use persistence::{SqliteBackend, SqliteTransaction};
+#[cfg(feature = "redis")]
+pub use resilience::RedisRateLimiter;
 pub use resilience::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitState, ConcurrencyLimitLayer,
     ConcurrencyLimiter, RateLimitConfig, RateLimitLayer, RateLimitStatus, RateLimiter,
     ResilienceError, TimeoutLayer,
 };
-#[cfg(feature = "redis")]
-pub use resilience::RedisRateLimiter;
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
@@ -103,11 +109,11 @@ pub use security::{
     AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
     SecurityHeadersConfig, SecurityHeadersLayer,
 };
+#[cfg(feature = "redis")]
+pub use tenant::RedisTenantQuotaStore;
 pub use tenant::{
     HeaderTenantResolver, MemoryTenantQuotaStore, OptionalTenant, SubdomainTenantResolver, Tenant,
     TenantContext, TenantError, TenantLayer, TenantQuotaStore, TenantResolver, TenantScopedCache,
 };
-#[cfg(feature = "redis")]
-pub use tenant::RedisTenantQuotaStore;
 pub use testing::{TestApp, TestAppBuilder};
 pub use validation::{Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery};

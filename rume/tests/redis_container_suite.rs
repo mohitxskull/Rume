@@ -14,6 +14,13 @@ use std::time::Duration;
 
 use rume::cache::redis::RedisCacheBackend;
 use rume::cache::{Cache, CacheBackend, CacheConfig, CacheError};
+use rume::coordination::{
+    DistributedLock, LeaderElector, RedisDistributedLock, RedisLeaderElector,
+};
+use rume::jobs::{
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, RedisHeartbeatRegistry,
+    RedisIdempotencyStore,
+};
 use rume::resilience::{RateLimitConfig, RedisRateLimiter, ResilienceError};
 use rume::tenant::{RedisTenantQuotaStore, TenantScopedCache};
 use serde::{Deserialize, Serialize};
@@ -338,14 +345,206 @@ async fn test_redis_sliding_window_rate_limiter() {
     }
 
     // A different client is NOT affected
-    let other_client = limiter.check("client-10.0.0.2").await.expect("other client");
+    let other_client = limiter
+        .check("client-10.0.0.2")
+        .await
+        .expect("other client");
     assert_eq!(other_client.remaining, 2);
 
     // Wait for sliding window to elapse (550ms)
     tokio::time::sleep(Duration::from_millis(550)).await;
 
     // First client can make requests again!
-    let s_after = limiter.check("client-10.0.0.1").await.expect("check after window");
+    let s_after = limiter
+        .check("client-10.0.0.1")
+        .await
+        .expect("check after window");
     assert_eq!(s_after.remaining, 2);
 }
 
+#[tokio::test]
+async fn test_redis_distributed_lock_mutual_exclusion_and_fencing() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let node_a = RedisDistributedLock::new(pool.clone());
+    let node_b = RedisDistributedLock::new(pool.clone());
+
+    // 1. Node A acquires lock on "report-generator"
+    let guard_a = node_a
+        .acquire("report-generator", Duration::from_secs(5))
+        .await
+        .expect("acquire node_a")
+        .expect("should acquire guard");
+
+    assert_eq!(guard_a.resource, "report-generator");
+    assert_eq!(guard_a.fencing_token, 1);
+
+    // 2. Node B attempts acquisition on same resource -> returns None
+    let guard_b = node_b
+        .acquire("report-generator", Duration::from_secs(5))
+        .await
+        .expect("acquire node_b");
+    assert!(guard_b.is_none());
+
+    // 3. Node A renews active lock
+    node_a
+        .renew(&guard_a, Duration::from_secs(5))
+        .await
+        .expect("renewal should succeed");
+
+    // 4. Node A releases lock
+    let released = node_a.release(guard_a).await.expect("release");
+    assert!(released);
+
+    // 5. Node B can now acquire, receiving monotonically increased fencing token
+    let guard_b_new = node_b
+        .acquire("report-generator", Duration::from_secs(5))
+        .await
+        .expect("acquire node_b after release")
+        .expect("guard present");
+
+    assert_eq!(guard_b_new.fencing_token, 2);
+    node_b.release(guard_b_new).await.expect("release b");
+}
+
+#[tokio::test]
+async fn test_redis_leader_election_failover_and_terms() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let elector_a = RedisLeaderElector::new(pool.clone());
+    let elector_b = RedisLeaderElector::new(pool.clone());
+
+    // 1. Elector A acquires leadership for "scheduler"
+    let lease_a = elector_a
+        .try_acquire("scheduler", "worker-1", Duration::from_secs(5))
+        .await
+        .expect("acquire a")
+        .expect("lease present");
+
+    assert_eq!(lease_a.role, "scheduler");
+    assert_eq!(lease_a.candidate_id, "worker-1");
+    assert_eq!(lease_a.term, 1);
+
+    // 2. Elector B fails to acquire active leadership
+    let lease_b = elector_b
+        .try_acquire("scheduler", "worker-2", Duration::from_secs(5))
+        .await
+        .expect("acquire b");
+    assert!(lease_b.is_none());
+
+    // 3. Query active leader returns Elector A
+    let leader = elector_b
+        .get_leader("scheduler")
+        .await
+        .expect("get leader")
+        .expect("leader present");
+    assert_eq!(leader.candidate_id, "worker-1");
+    assert_eq!(leader.term, 1);
+
+    // 4. Elector A renews
+    let renewed = elector_a
+        .renew("scheduler", "worker-1", Duration::from_secs(5))
+        .await
+        .expect("renew")
+        .expect("renewed lease");
+    assert_eq!(renewed.term, 1);
+
+    // 5. Elector A resigns
+    let resigned = elector_a
+        .resign("scheduler", "worker-1")
+        .await
+        .expect("resign");
+    assert!(resigned);
+
+    // 6. Elector B acquires with next term
+    let lease_b_new = elector_b
+        .try_acquire("scheduler", "worker-2", Duration::from_secs(5))
+        .await
+        .expect("acquire b new")
+        .expect("lease b present");
+
+    assert_eq!(lease_b_new.candidate_id, "worker-2");
+    assert_eq!(lease_b_new.term, 2);
+}
+
+#[tokio::test]
+async fn test_redis_heartbeat_registry_and_dead_worker_reaping() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let registry = RedisHeartbeatRegistry::new(pool);
+
+    // Record worker-1 with short TTL (100ms) and worker-2 with long TTL (10s)
+    registry
+        .record_heartbeat("worker-1", Duration::from_millis(100))
+        .await
+        .expect("record 1");
+    registry
+        .record_heartbeat("worker-2", Duration::from_secs(10))
+        .await
+        .expect("record 2");
+
+    assert!(registry.is_alive("worker-1").await.expect("is alive 1"));
+    assert!(registry.is_alive("worker-2").await.expect("is alive 2"));
+
+    // Wait for worker-1 to expire
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    assert!(!registry.is_alive("worker-1").await.expect("is alive 1"));
+    assert!(registry.is_alive("worker-2").await.expect("is alive 2"));
+
+    // Reap dead workers
+    let reaped = registry.reap_dead_workers().await.expect("reap");
+    assert_eq!(reaped, vec!["worker-1"]);
+
+    // Verify worker-2 remains active
+    assert!(registry.is_alive("worker-2").await.expect("is alive 2"));
+}
+
+#[tokio::test]
+async fn test_redis_idempotency_store() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let store = RedisIdempotencyStore::new(pool);
+
+    // 1. Initial attempt -> New
+    let s1 = store
+        .try_acquire("tx-uuid-999", Duration::from_secs(10))
+        .await
+        .expect("acquire");
+    assert_eq!(s1, IdempotencyStatus::New);
+
+    // 2. Concurrent attempt while in progress -> InProgress
+    let s2 = store
+        .try_acquire("tx-uuid-999", Duration::from_secs(10))
+        .await
+        .expect("acquire 2");
+    assert_eq!(s2, IdempotencyStatus::InProgress);
+
+    // 3. Mark completed with payload
+    store
+        .complete("tx-uuid-999", Some(b"order-id:456".to_vec()))
+        .await
+        .expect("complete");
+
+    // 4. Subsequent attempt -> Completed with cached payload
+    let s3 = store
+        .try_acquire("tx-uuid-999", Duration::from_secs(10))
+        .await
+        .expect("acquire 3");
+    assert_eq!(
+        s3,
+        IdempotencyStatus::Completed(Some(b"order-id:456".to_vec()))
+    );
+
+    // 5. Release key -> allows new execution
+    store.release("tx-uuid-999").await.expect("release");
+    let s4 = store
+        .try_acquire("tx-uuid-999", Duration::from_secs(10))
+        .await
+        .expect("acquire 4");
+    assert_eq!(s4, IdempotencyStatus::New);
+}
