@@ -3,6 +3,7 @@ mod config;
 mod doctor;
 mod env;
 mod generate;
+mod list_routes;
 mod new;
 
 use crate::cli::{Cli, Commands};
@@ -54,6 +55,10 @@ pub fn run(cli: Cli) {
         Some(Commands::Doctor { format }) => {
             require_rume_project();
             doctor::run(&format);
+        }
+        Some(Commands::ListRoutes) => {
+            require_rume_project();
+            list_routes::run();
         }
         Some(Commands::Codegen) => {
             require_rume_project();

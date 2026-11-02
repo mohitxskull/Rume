@@ -33,6 +33,8 @@ pub enum Commands {
         #[arg(long, default_value = "human")]
         format: String,
     },
+    /// List registered routes.
+    ListRoutes,
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]
@@ -60,6 +62,11 @@ pub enum EnvCommands {
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,
+    },
+    /// Explain how a single environment variable was resolved.
+    Explain {
+        /// Environment variable name to explain.
+        key: String,
     },
 }
 

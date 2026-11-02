@@ -96,16 +96,28 @@ pub fn run(format: &str) {
     });
 
     // Port availability
-    let port = std::env::var("PORT")
-        .ok()
-        .and_then(|value| value.parse::<u16>().ok())
-        .unwrap_or(3333);
+    let port_result = match env::ResolvedEnv::load() {
+        Ok(resolved) => {
+            let port = resolved
+                .get("PORT")
+                .and_then(|value| value.parse::<u16>().ok())
+                .unwrap_or(3333);
+            let host = resolved
+                .get("HOST")
+                .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+                .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
 
-    let port_result = match std::net::TcpListener::bind(("127.0.0.1", port)) {
-        Ok(_) => format!("port {port} is available"),
+            match std::net::TcpListener::bind((host, port)) {
+                Ok(_) => format!("port {port} is available"),
+                Err(err) => {
+                    ok = false;
+                    format!("port {port} is in use: {err} (stop the process or change PORT)")
+                }
+            }
+        }
         Err(err) => {
             ok = false;
-            format!("port {port} is in use: {err} (stop the process or change PORT)")
+            format!("error: {err}")
         }
     };
     let port_ok = port_result.starts_with("port ");

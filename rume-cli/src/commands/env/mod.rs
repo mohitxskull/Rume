@@ -1,4 +1,5 @@
 mod check;
+mod explain;
 
 use crate::cli::EnvCommands;
 
@@ -9,5 +10,6 @@ pub fn run(command: EnvCommands) {
             unredacted,
             format,
         } => check::run(all, unredacted, &format),
+        EnvCommands::Explain { key } => explain::run(&key),
     }
 }
