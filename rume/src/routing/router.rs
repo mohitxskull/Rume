@@ -341,6 +341,21 @@ where
         self.registry.routes()
     }
 
+    /// Generates an OpenAPI v3.1 specification for all registered routes on this router.
+    pub fn openapi_spec(&self, info: crate::openapi::OpenApiInfo) -> crate::openapi::OpenApiSpec {
+        self.registry.to_openapi(info)
+    }
+
+    /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
+    pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
+        let spec = self.openapi_spec(info);
+        let json_value = spec.to_json_value();
+        self.get(path, move || {
+            let val = json_value.clone();
+            async move { axum::Json(val) }
+        })
+    }
+
     /// Merge a stateless [`Router<()>`] into this router.
     ///
     /// The stateless router's routes and metadata are merged into this router.

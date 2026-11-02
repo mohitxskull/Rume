@@ -27,6 +27,10 @@ pub use crate::jobs::{
     QueuedJob, RetryPolicy,
 };
 pub use crate::module::{Module, ModuleContext, ModuleError};
+pub use crate::openapi::{
+    OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
+    OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
+};
 pub use crate::persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
 };

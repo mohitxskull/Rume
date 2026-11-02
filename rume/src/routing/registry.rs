@@ -79,6 +79,11 @@ impl RouteRegistry {
     pub fn clear(&mut self) {
         self.routes.clear();
     }
+
+    /// Generate an OpenAPI v3.1 document reflecting all routes in this registry.
+    pub fn to_openapi(&self, info: crate::openapi::OpenApiInfo) -> crate::openapi::OpenApiSpec {
+        crate::openapi::generate_openapi(self, info)
+    }
 }
 
 /// Extract path parameter names from a route template string (e.g. `/{id}` or `/:id`).

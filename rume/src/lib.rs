@@ -16,6 +16,7 @@ pub mod events;
 pub mod helpers;
 pub mod jobs;
 pub mod module;
+pub mod openapi;
 pub mod persistence;
 pub mod prelude;
 pub mod routing;
@@ -46,6 +47,10 @@ pub use jobs::{
     QueuedJob, RetryPolicy,
 };
 pub use module::{Module, ModuleContext, ModuleError};
+pub use openapi::{
+    OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
+    OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
+};
 pub use persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
 };
