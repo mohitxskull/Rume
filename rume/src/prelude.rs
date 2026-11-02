@@ -14,6 +14,15 @@ pub use crate::auth::{
 pub use crate::cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use crate::config;
 pub use crate::config::ConfigError;
+pub use crate::coordination::{
+    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LockGuard,
+    MemoryDistributedLock, MemoryLeaderElector,
+};
+pub use crate::enterprise::{
+    SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
+    SamlError, SamlParser, ScimEmail, ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember,
+    ScimMeta, ScimName, ScimUser,
+};
 pub use crate::env;
 pub use crate::env::EnvError;
 pub use crate::error::AppError;
@@ -50,6 +59,7 @@ pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
+pub use crate::saga::{FunctionalStep, Saga, SagaError, SagaFuture, SagaReport, SagaStatus, Step};
 pub use crate::security::{
     AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
     SecurityHeadersConfig, SecurityHeadersLayer,

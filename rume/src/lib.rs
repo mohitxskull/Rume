@@ -10,6 +10,8 @@ pub mod app;
 pub mod auth;
 pub mod cache;
 pub mod config;
+pub mod coordination;
+pub mod enterprise;
 pub mod env;
 pub mod error;
 pub mod events;
@@ -23,6 +25,7 @@ pub mod persistence;
 pub mod prelude;
 pub mod resilience;
 pub mod routing;
+pub mod saga;
 pub mod security;
 pub mod tenant;
 pub mod testing;
@@ -40,6 +43,15 @@ pub use auth::{
     authorize,
 };
 pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
+pub use coordination::{
+    CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LockGuard,
+    MemoryDistributedLock, MemoryLeaderElector,
+};
+pub use enterprise::{
+    SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
+    SamlError, SamlParser, ScimEmail, ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember,
+    ScimMeta, ScimName, ScimUser,
+};
 pub use error::AppError;
 pub use events::{Event, EventBus, EventError, EventHandler};
 pub use helpers::{
@@ -75,6 +87,7 @@ pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
+pub use saga::{FunctionalStep, Saga, SagaError, SagaFuture, SagaReport, SagaStatus, Step};
 pub use security::{
     AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
     SecurityHeadersConfig, SecurityHeadersLayer,
