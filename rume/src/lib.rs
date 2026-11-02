@@ -50,6 +50,8 @@ pub use coordination::{
     CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
     MemoryDistributedLock, MemoryLeaderElector,
 };
+#[cfg(feature = "postgres")]
+pub use coordination::{PostgresDistributedLock, PostgresLeaderElector};
 pub use enterprise::{
     SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
     SamlError, SamlParser, SamlSignatureVerifier, ScimEmail, ScimErrorResponse, ScimGroup,
@@ -62,6 +64,8 @@ pub use helpers::{
     kebab_case, mask_email, mask_secret, ordinal, parse_bytes, parse_duration, pascal_case,
     safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
 };
+#[cfg(feature = "postgres")]
+pub use jobs::PostgresJobQueue;
 pub use jobs::{
     HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, Job, JobContext, JobError, JobHandler,
     JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,

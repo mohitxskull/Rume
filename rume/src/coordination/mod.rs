@@ -3,7 +3,11 @@
 pub mod error;
 pub mod leader;
 pub mod lock;
+#[cfg(feature = "postgres")]
+pub mod postgres;
 
 pub use error::CoordinationError;
 pub use leader::{LeaderElector, LeaderLease, MemoryLeaderElector};
 pub use lock::{CoordinationFuture, DistributedLock, LockGuard, MemoryDistributedLock};
+#[cfg(feature = "postgres")]
+pub use postgres::{PostgresDistributedLock, PostgresLeaderElector};

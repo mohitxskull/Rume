@@ -15,7 +15,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use rume::coordination::{
+    CoordinationError, DistributedLock, LeaderElector, PostgresDistributedLock,
+    PostgresLeaderElector,
+};
 use rume::events::{Event, EventBus};
+use rume::jobs::{Job, JobQueue, PostgresJobQueue};
 use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRepository, TransactionalOutbox};
 use rume::persistence::config::DatabaseConfig;
 use rume::persistence::error::PersistenceError;
@@ -482,4 +487,397 @@ async fn test_postgres_pool_connection_limits_and_timeout() {
 
     drop(lease2);
     drop(lease3);
+}
+
+#[tokio::test]
+async fn test_postgres_distributed_lock_mutual_exclusion_and_fencing() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let lock_svc = PostgresDistributedLock::from_backend(pool.backend());
+    lock_svc
+        .init_schema()
+        .await
+        .expect("init lock schema failed");
+
+    // Worker 1 acquires lock
+    let guard1 = lock_svc
+        .acquire("billing-reconciliation", Duration::from_secs(3))
+        .await
+        .expect("acquire call failed")
+        .expect("worker 1 should acquire lock");
+
+    assert_eq!(guard1.resource, "billing-reconciliation");
+    assert!(
+        guard1.fencing_token >= 1,
+        "fencing token must be at least 1"
+    );
+
+    // Worker 2 attempts to acquire same resource while held -> must return None
+    let attempt2 = lock_svc
+        .acquire("billing-reconciliation", Duration::from_secs(3))
+        .await
+        .expect("acquire call failed");
+    assert!(
+        attempt2.is_none(),
+        "worker 2 must not acquire active lock held by worker 1"
+    );
+
+    // Worker 1 renews lease
+    lock_svc
+        .renew(&guard1, Duration::from_secs(3))
+        .await
+        .expect("renewal should succeed");
+
+    // Worker 1 releases lock
+    let released = lock_svc
+        .release(guard1.clone())
+        .await
+        .expect("release call failed");
+    assert!(released, "lock release should report true");
+
+    // Now Worker 2 acquires lock -> receives strictly higher monotonic fencing token
+    let guard2 = lock_svc
+        .acquire("billing-reconciliation", Duration::from_secs(3))
+        .await
+        .expect("acquire call failed")
+        .expect("worker 2 should now acquire lock");
+
+    assert!(
+        guard2.fencing_token > guard1.fencing_token,
+        "fencing token must strictly increase: {} > {}",
+        guard2.fencing_token,
+        guard1.fencing_token
+    );
+
+    lock_svc.release(guard2).await.expect("release failed");
+}
+
+#[tokio::test]
+async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let lock_svc = PostgresDistributedLock::from_backend(pool.backend());
+    lock_svc
+        .init_schema()
+        .await
+        .expect("init lock schema failed");
+
+    // Acquire with short 100ms TTL
+    let guard1 = lock_svc
+        .acquire("ephemeral-job", Duration::from_millis(100))
+        .await
+        .expect("acquire failed")
+        .expect("guard1");
+
+    // Immediately after, acquisition fails
+    let immediate = lock_svc
+        .acquire("ephemeral-job", Duration::from_millis(100))
+        .await
+        .expect("acquire failed");
+    assert!(immediate.is_none(), "lock is currently held");
+
+    // Wait 150ms for TTL to expire
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    // A competing worker acquires expired lock
+    let guard2 = lock_svc
+        .acquire("ephemeral-job", Duration::from_secs(2))
+        .await
+        .expect("acquire failed")
+        .expect("worker 2 should acquire expired lock");
+
+    assert!(
+        guard2.fencing_token > guard1.fencing_token,
+        "fencing token must increase on expired lock steal"
+    );
+
+    // Original worker tries to renew expired guard -> fails with LockExpired
+    let renew_attempt = lock_svc.renew(&guard1, Duration::from_secs(2)).await;
+    match renew_attempt {
+        Err(CoordinationError::LockExpired { resource }) => {
+            assert_eq!(resource, "ephemeral-job");
+        }
+        other => panic!("expected LockExpired error, got: {other:?}"),
+    }
+
+    lock_svc.release(guard2).await.expect("release failed");
+}
+
+#[tokio::test]
+async fn test_postgres_leader_election_failover_and_resignation() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let elector = PostgresLeaderElector::from_backend(pool.backend());
+    elector
+        .init_schema()
+        .await
+        .expect("init leader schema failed");
+
+    // Candidate A acquires leadership
+    let lease_a = elector
+        .try_acquire("cluster-coordinator", "node-alpha", Duration::from_secs(3))
+        .await
+        .expect("acquire failed")
+        .expect("node-alpha should become leader");
+
+    assert_eq!(lease_a.role, "cluster-coordinator");
+    assert_eq!(lease_a.candidate_id, "node-alpha");
+    assert!(lease_a.term >= 1);
+
+    // Candidate B attempts to acquire -> returns None
+    let lease_b_fail = elector
+        .try_acquire("cluster-coordinator", "node-beta", Duration::from_secs(3))
+        .await
+        .expect("acquire failed");
+    assert!(
+        lease_b_fail.is_none(),
+        "node-beta cannot acquire while alpha is leader"
+    );
+
+    // Query active leader
+    let active = elector
+        .get_leader("cluster-coordinator")
+        .await
+        .expect("get_leader failed")
+        .expect("leader should exist");
+    assert_eq!(active.candidate_id, "node-alpha");
+    assert_eq!(active.term, lease_a.term);
+
+    // Alpha renews leadership
+    let renewed = elector
+        .renew("cluster-coordinator", "node-alpha", Duration::from_secs(3))
+        .await
+        .expect("renew failed")
+        .expect("renew should succeed");
+    assert_eq!(renewed.term, lease_a.term);
+
+    // Alpha voluntarily resigns
+    let resigned = elector
+        .resign("cluster-coordinator", "node-alpha")
+        .await
+        .expect("resign failed");
+    assert!(resigned, "resignation should succeed");
+
+    // Beta immediately acquires leadership with strictly higher term
+    let lease_b = elector
+        .try_acquire("cluster-coordinator", "node-beta", Duration::from_secs(3))
+        .await
+        .expect("acquire failed")
+        .expect("node-beta should now become leader");
+
+    assert_eq!(lease_b.candidate_id, "node-beta");
+    assert!(
+        lease_b.term > lease_a.term,
+        "new term must be strictly greater: {} > {}",
+        lease_b.term,
+        lease_a.term
+    );
+
+    let active_after = elector
+        .get_leader("cluster-coordinator")
+        .await
+        .expect("get_leader failed")
+        .expect("leader should exist");
+    assert_eq!(active_after.candidate_id, "node-beta");
+    assert_eq!(active_after.term, lease_b.term);
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SendInvoiceJob {
+    invoice_id: String,
+    amount: u32,
+}
+
+impl Job for SendInvoiceJob {
+    const NAME: &'static str = "send_invoice";
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_enqueue_dequeue_and_ack() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    // Enqueue a job
+    let job_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-101".into(),
+            amount: 500,
+        })
+        .await
+        .expect("enqueue failed");
+
+    assert_eq!(queue.pending_count().await.unwrap(), 1);
+
+    // Dequeue with specific worker ID
+    let dequeued = queue
+        .dequeue_for("worker-alpha")
+        .await
+        .expect("dequeue failed")
+        .expect("job should be dequeued");
+
+    assert_eq!(dequeued.id, job_id);
+    assert_eq!(dequeued.name, "send_invoice");
+    assert_eq!(dequeued.assigned_worker.as_deref(), Some("worker-alpha"));
+    assert_eq!(dequeued.attempt, 1);
+
+    // In-flight job is no longer pending
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // Ack removes job
+    queue.ack(&job_id).await.expect("ack failed");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_concurrency_skip_locked() {
+    let (_container, pool) = setup_postgres_pool(8).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    // Enqueue 10 jobs
+    for i in 0..10 {
+        queue
+            .enqueue(SendInvoiceJob {
+                invoice_id: format!("inv-{i}"),
+                amount: i * 100,
+            })
+            .await
+            .expect("enqueue failed");
+    }
+
+    assert_eq!(queue.pending_count().await.unwrap(), 10);
+
+    let q1 = queue.clone();
+    let q2 = queue.clone();
+
+    // Two concurrent workers claiming 5 jobs each
+    let worker1 = tokio::spawn(async move {
+        let mut claimed = Vec::new();
+        while claimed.len() < 5 {
+            if let Some(job) = q1.dequeue_for("worker-1").await.unwrap() {
+                claimed.push(job.id);
+            }
+        }
+        claimed
+    });
+
+    let worker2 = tokio::spawn(async move {
+        let mut claimed = Vec::new();
+        while claimed.len() < 5 {
+            if let Some(job) = q2.dequeue_for("worker-2").await.unwrap() {
+                claimed.push(job.id);
+            }
+        }
+        claimed
+    });
+
+    let (batch1, batch2) = tokio::try_join!(worker1, worker2).expect("workers failed");
+
+    assert_eq!(batch1.len(), 5);
+    assert_eq!(batch2.len(), 5);
+
+    let ids1: HashSet<String> = batch1.into_iter().collect();
+    let ids2: HashSet<String> = batch2.into_iter().collect();
+
+    // Assert zero overlap due to FOR UPDATE SKIP LOCKED
+    let overlap: HashSet<_> = ids1.intersection(&ids2).collect();
+    assert!(
+        overlap.is_empty(),
+        "job claiming must not overlap, got: {overlap:?}"
+    );
+
+    // Ack all claimed jobs
+    for id in ids1.union(&ids2) {
+        queue.ack(id).await.expect("ack failed");
+    }
+
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_abandoned_worker_reclaim_and_dlq() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    let job_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-crash".into(),
+            amount: 999,
+        })
+        .await
+        .expect("enqueue failed");
+
+    // Dequeued by worker that crashes
+    let claimed = queue
+        .dequeue_for("crashed-worker-node")
+        .await
+        .expect("dequeue failed")
+        .expect("job");
+    assert_eq!(claimed.id, job_id);
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // Reclaim dead worker's jobs
+    let dead_workers = vec!["crashed-worker-node".to_string()];
+    let reclaimed = queue
+        .reclaim_abandoned_jobs(&dead_workers)
+        .await
+        .expect("reclaim failed");
+    assert_eq!(reclaimed, 1);
+
+    // Job is now pending again
+    assert_eq!(queue.pending_count().await.unwrap(), 1);
+
+    // A healthy worker picks it up -> attempt count increments to 2
+    let retried = queue
+        .dequeue_for("healthy-worker-node")
+        .await
+        .expect("dequeue failed")
+        .expect("job");
+    assert_eq!(retried.id, job_id);
+    assert_eq!(retried.attempt, 2);
+
+    // Move to Dead-Letter Queue
+    queue
+        .dead_letter(retried, "database unrecoverable error".into())
+        .await
+        .expect("dead_letter failed");
+
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+    assert_eq!(queue.dead_letter_count().await.unwrap(), 1);
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct IdempotentChargeJob {
+    charge_id: String,
+}
+
+impl Job for IdempotentChargeJob {
+    const NAME: &'static str = "charge_card";
+
+    fn idempotency_key(&self) -> Option<String> {
+        Some(format!("idemp:{}", self.charge_id))
+    }
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_idempotency_deduplication() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    let job = IdempotentChargeJob {
+        charge_id: "charge-unique-42".into(),
+    };
+
+    // First enqueue succeeds
+    let id1 = queue.enqueue(job.clone()).await.expect("enqueue 1 failed");
+
+    // Second enqueue with identical idempotency key returns the existing job ID
+    let id2 = queue.enqueue(job).await.expect("enqueue 2 failed");
+
+    assert_eq!(id1, id2, "idempotent job must deduplicate to same ID");
+    assert_eq!(
+        queue.pending_count().await.unwrap(),
+        1,
+        "only 1 job should exist in queue"
+    );
 }
