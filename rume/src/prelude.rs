@@ -20,8 +20,8 @@ pub use crate::coordination::{
 };
 pub use crate::enterprise::{
     SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
-    SamlError, SamlParser, ScimEmail, ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember,
-    ScimMeta, ScimName, ScimUser,
+    SamlError, SamlParser, SamlSignatureVerifier, ScimEmail, ScimErrorResponse, ScimGroup,
+    ScimListResponse, ScimMember, ScimMeta, ScimName, ScimUser,
 };
 pub use crate::env;
 pub use crate::env::EnvError;

@@ -49,8 +49,8 @@ pub use coordination::{
 };
 pub use enterprise::{
     SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
-    SamlError, SamlParser, ScimEmail, ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember,
-    ScimMeta, ScimName, ScimUser,
+    SamlError, SamlParser, SamlSignatureVerifier, ScimEmail, ScimErrorResponse, ScimGroup,
+    ScimListResponse, ScimMember, ScimMeta, ScimName, ScimUser,
 };
 pub use error::AppError;
 pub use events::{Event, EventBus, EventError, EventHandler};

@@ -19,13 +19,13 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group A — Multi-Tenant Boundary & Protocol Integrity (solve together)
 > Root cause: Delimiter collisions and unanchored suffix matching allow cross-tenant spoofing and cache contamination.
 
-- [ ] **Security C2 — Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning** (`security.md` C2).
+- [x] **Security C2 — Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning** (`security.md` C2).
       `rume/src/tenant/cache.rs:23–29`: Scoped keys use naive format `tenant:{tenant_id}:{key}`; tenant ID `"a:b"` with key `"c"` produces `tenant:a:b:c`, colliding with tenant `"a"` and key `"b:c"`. Disallow `:` in tenant IDs and keys or length-prefix/escape delimiters.
-- [ ] **Security M1 — Subdomain tenant resolver permits suffix-matching domain spoofing** (`security.md` M1).
+- [x] **Security M1 — Subdomain tenant resolver permits suffix-matching domain spoofing** (`security.md` M1).
       `rume/src/tenant/resolver.rs:126–140`: `host_no_port.strip_suffix(&self.base_domain)` permits `evilapp.platform.io` to match `app.platform.io`. Require strict `.` separator (`.{base_domain}`) when matching subdomains.
-- [ ] **Security M2 — `HeaderTenantResolver` shares a single map for IDs and slugs** (`security.md` M2).
+- [x] **Security M2 — `HeaderTenantResolver` shares a single map for IDs and slugs** (`security.md` M2).
       `rume/src/tenant/resolver.rs:47–53`: Registering both ID and slug into one `BTreeMap` allows an attacker tenant whose slug matches another tenant's ID to hijack requests. Separate ID and slug lookups into distinct maps or qualify keys (`id:`, `slug:`).
-- [ ] **Security C1 — SAML 2.0 assertion parser hardcodes expiration timestamps and lacks signature verification** (`security.md` C1).
+- [x] **Security C1 — SAML 2.0 assertion parser hardcodes expiration timestamps and lacks signature verification** (`security.md` C1).
       `rume/src/enterprise/saml.rs:149–155`: `SamlParser::parse` hardcodes `not_before: None` and `not_on_or_after: None`, leaving assertions perpetually valid regardless of XML conditions. Parse `NotBefore` and `NotOnOrAfter` from `<saml2:Conditions>` and verify XML digital signatures.
 
 ### Group B — Operational Outbox & Metrics Integrity (solve together)

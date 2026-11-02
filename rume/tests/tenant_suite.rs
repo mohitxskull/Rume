@@ -86,6 +86,7 @@ async fn test_subdomain_tenant_resolver() {
 
     let test_app = TestApp::new(app);
 
+    // Valid subdomain
     let req = Request::builder()
         .uri("/whoami")
         .header("host", "globex.app.platform.io:8080")
@@ -95,6 +96,71 @@ async fn test_subdomain_tenant_resolver() {
     let res = test_app.request(req).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(TestApp::body_text(res).await, "globex");
+
+    // Suffix spoofing attempt (evilapp.platform.io instead of .app.platform.io)
+    let req_spoof = Request::builder()
+        .uri("/whoami")
+        .header("host", "evilglobexapp.platform.io")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = test_app.request(req_spoof).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Multi-level internal dot subdomain
+    let req_multi = Request::builder()
+        .uri("/whoami")
+        .header("host", "sub.globex.app.platform.io")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = test_app.request(req_multi).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_header_tenant_resolver_id_and_slug_namespace_isolation() {
+    // Tenant 1 has slug "acme" with id "t-100"
+    // Tenant 2 has id "acme" with slug "globex"
+    let resolver = HeaderTenantResolver::new()
+        .add_tenant(Tenant::new("t-100", "acme"))
+        .add_tenant(Tenant::new("acme", "globex"));
+
+    let app = Router::new()
+        .route(
+            "/tenant",
+            get(|TenantContext(tenant): TenantContext| async move {
+                Json(serde_json::json!({
+                    "id": tenant.id,
+                    "slug": tenant.slug,
+                }))
+            }),
+        )
+        .layer(TenantLayer::required(resolver));
+
+    let test_app = TestApp::new(app);
+
+    // Request with x-tenant-id: acme should match Tenant 2 by ID first
+    let req = Request::builder()
+        .uri("/tenant")
+        .header("x-tenant-id", "acme")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = test_app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(body["id"], "acme");
+    assert_eq!(body["slug"], "globex");
+
+    // Request with x-tenant-id: t-100 matches Tenant 1 by ID
+    let req = Request::builder()
+        .uri("/tenant")
+        .header("x-tenant-id", "t-100")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = test_app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(body["id"], "t-100");
+    assert_eq!(body["slug"], "acme");
 }
 
 #[tokio::test]

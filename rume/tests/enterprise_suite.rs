@@ -80,3 +80,75 @@ fn test_saml_assertion_parsing_and_validation() {
     let mismatch = SamlParser::validate(&assertion, 1700000000, Some("https://other-sp.com"));
     assert!(matches!(mismatch, Err(SamlError::AudienceMismatch { .. })));
 }
+
+#[test]
+fn test_saml_condition_timestamps_and_comment_injection() {
+    let saml_xml = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_time123">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <!-- Injected comment trying to spoof NameID:
+        <saml2:NameID>ceo@enterprise.com</saml2:NameID>
+        -->
+        <saml2:Subject>
+            <saml2:NameID>contractor@enterprise.com</saml2:NameID>
+        </saml2:Subject>
+        <saml2:Conditions NotBefore="2026-11-02T10:00:00Z" NotOnOrAfter="2026-11-02T14:00:00Z">
+            <saml2:Audience>https://sp.myapp.io</saml2:Audience>
+        </saml2:Conditions>
+    </saml2:Assertion>
+    "#;
+
+    let assertion = SamlParser::parse(saml_xml).unwrap();
+    // Comment was stripped, subject is contractor, not ceo
+    assert_eq!(assertion.subject, "contractor@enterprise.com");
+    assert!(assertion.not_before.is_some());
+    assert!(assertion.not_on_or_after.is_some());
+
+    let nb = assertion.not_before.unwrap();
+    let noa = assertion.not_on_or_after.unwrap();
+    assert!(nb < noa);
+
+    // Before NotBefore: returns NotYetValid
+    let res = SamlParser::validate(&assertion, nb - 100, Some("https://sp.myapp.io"));
+    assert!(matches!(res, Err(SamlError::NotYetValid { .. })));
+
+    // After NotOnOrAfter: returns Expired
+    let res = SamlParser::validate(&assertion, noa + 100, Some("https://sp.myapp.io"));
+    assert!(matches!(res, Err(SamlError::Expired { .. })));
+
+    // Within window: returns Ok
+    let res = SamlParser::validate(&assertion, nb + 100, Some("https://sp.myapp.io"));
+    assert!(res.is_ok());
+}
+
+#[test]
+fn test_saml_signature_verifier() {
+    struct MockVerifier {
+        should_pass: bool,
+    }
+
+    impl SamlSignatureVerifier for MockVerifier {
+        fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
+            if self.should_pass {
+                Ok(())
+            } else {
+                Err(SamlError::InvalidSignature("bad digest".into()))
+            }
+        }
+    }
+
+    let saml_xml = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_sig123">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@test.org</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+
+    let valid_verifier = MockVerifier { should_pass: true };
+    let res = SamlParser::parse_with_verifier(saml_xml, Some(&valid_verifier));
+    assert!(res.is_ok());
+
+    let invalid_verifier = MockVerifier { should_pass: false };
+    let res = SamlParser::parse_with_verifier(saml_xml, Some(&invalid_verifier));
+    assert!(matches!(res, Err(SamlError::InvalidSignature(_))));
+}

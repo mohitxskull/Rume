@@ -21,6 +21,16 @@ pub enum SamlError {
     /// The recipient audience did not match this service provider.
     #[error("audience mismatch: expected '{expected}', received '{received}'")]
     AudienceMismatch { expected: String, received: String },
+
+    /// Digital signature verification failed.
+    #[error("signature verification failed: {0}")]
+    InvalidSignature(String),
+}
+
+/// Interface for verifying cryptographic signatures on SAML assertions.
+pub trait SamlSignatureVerifier: Send + Sync {
+    /// Verifies the digital signature on the raw XML assertion.
+    fn verify_signature(&self, raw_xml: &str) -> Result<(), SamlError>;
 }
 
 /// A validated SAML 2.0 authentication assertion.
@@ -45,6 +55,79 @@ pub struct SamlAssertion {
 /// Parser and validator for SAML 2.0 assertions.
 pub struct SamlParser;
 
+fn strip_comments(xml: &str) -> String {
+    let mut out = String::with_capacity(xml.len());
+    let mut rest = xml;
+    while let Some(start) = rest.find("<!--") {
+        out.push_str(&rest[..start]);
+        if let Some(end) = rest[start..].find("-->") {
+            rest = &rest[start + end + 3..];
+        } else {
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn parse_iso8601_or_epoch(s: &str) -> Option<u64> {
+    if let Ok(epoch) = s.trim().parse::<u64>() {
+        return Some(epoch);
+    }
+    let s = s.trim().trim_end_matches('Z');
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: u64 = date_parts.next()?.parse().ok()?;
+    let month: u64 = date_parts.next()?.parse().ok()?;
+    let day: u64 = date_parts.next()?.parse().ok()?;
+
+    let mut time_parts = time.split(':');
+    let hour: u64 = time_parts.next()?.parse().ok()?;
+    let min: u64 = time_parts.next()?.parse().ok()?;
+    let sec_str = time_parts.next()?;
+    let sec: u64 = sec_str.split('.').next()?.parse().ok()?;
+
+    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let mut days: u64 = 0;
+    for y in 1970..year {
+        let is_leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
+        days += if is_leap { 366 } else { 365 };
+    }
+    let is_leap_year =
+        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let days_in_months = [
+        31,
+        if is_leap_year { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    for m in 1..month {
+        days += days_in_months[(m - 1) as usize];
+    }
+    days += day - 1;
+
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+fn extract_attribute(tag_slice: &str, attr: &str) -> Option<String> {
+    let pattern = format!("{attr}=\"");
+    let pos = tag_slice.find(&pattern)?;
+    let rest = &tag_slice[pos + pattern.len()..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
 impl SamlParser {
     fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
         let close_tag = format!("</{tag}>");
@@ -67,6 +150,21 @@ impl SamlParser {
 
     /// Parses an XML string containing a SAML 2.0 Assertion.
     pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {
+        Self::parse_with_verifier(xml, None)
+    }
+
+    /// Parses an XML string containing a SAML 2.0 Assertion and verifies its digital signature if a verifier is provided.
+    pub fn parse_with_verifier(
+        xml: &str,
+        verifier: Option<&dyn SamlSignatureVerifier>,
+    ) -> Result<SamlAssertion, SamlError> {
+        if let Some(v) = verifier {
+            v.verify_signature(xml)?;
+        }
+
+        let clean_xml = strip_comments(xml);
+        let xml = clean_xml.as_str();
+
         // Find Issuer
         let issuer = Self::extract_tag(xml, "saml:Issuer")
             .or_else(|| Self::extract_tag(xml, "saml2:Issuer"))
@@ -98,6 +196,27 @@ impl SamlParser {
         } else {
             "assertion".to_string()
         };
+
+        // Parse Conditions NotBefore and NotOnOrAfter
+        let mut not_before = None;
+        let mut not_on_or_after = None;
+
+        let cond_tags = ["<saml2:Conditions", "<saml:Conditions", "<Conditions"];
+        for cond_tag in cond_tags {
+            if let Some(pos) = xml.find(cond_tag) {
+                let rest = &xml[pos..];
+                if let Some(close_bracket) = rest.find('>') {
+                    let tag_slice = &rest[..close_bracket];
+                    if let Some(nb) = extract_attribute(tag_slice, "NotBefore") {
+                        not_before = parse_iso8601_or_epoch(&nb);
+                    }
+                    if let Some(noa) = extract_attribute(tag_slice, "NotOnOrAfter") {
+                        not_on_or_after = parse_iso8601_or_epoch(&noa);
+                    }
+                }
+                break;
+            }
+        }
 
         // Extract Attributes
         let mut attributes: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -149,8 +268,8 @@ impl SamlParser {
             issuer,
             subject,
             audience,
-            not_before: None,
-            not_on_or_after: None,
+            not_before,
+            not_on_or_after,
             attributes,
         })
     }
