@@ -1,11 +1,15 @@
-//! Embedded SQLite database backend integration using rusqlite.
+//! Embedded SQLite database backend integration using SQLx.
 
 use std::fmt::Debug;
-use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Mutex};
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 
-use rusqlite::params;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
+use crate::outbox::message::current_timestamp;
 use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     TransactionalOutbox,
@@ -14,457 +18,317 @@ use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransactio
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 
-/// Embedded SQLite database backend backed by rusqlite.
+const OUTBOX_SCHEMA: &str = include_str!("sql/sqlite/outbox_schema.sql");
+const OUTBOX_CLAIM_SQL: &str = include_str!("sql/sqlite/outbox_claim.sql");
+const MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
+const INSERT_OUTBOX_SQL: &str = include_str!("sql/sqlite/outbox_insert.sql");
+
+/// Embedded SQLite database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]
 pub struct SqliteBackend {
-    conn: Arc<Mutex<rusqlite::Connection>>,
+    pool: SqlitePool,
 }
 
 impl Debug for SqliteBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteBackend").finish()
+        f.debug_struct("SqliteBackend")
+            .field("size", &self.pool.size())
+            .finish()
     }
 }
 
 impl SqliteBackend {
     /// Creates a new in-memory SQLite backend.
-    pub fn in_memory() -> Result<Self, PersistenceError> {
-        let conn = rusqlite::Connection::open_in_memory()
+    pub async fn in_memory() -> Result<Self, PersistenceError> {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_millis(5000));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
             .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-        let backend = Self {
-            conn: Arc::new(Mutex::new(conn)),
-        };
-        backend.configure_pragmas()?;
-        Ok(backend)
+
+        Ok(Self { pool })
     }
 
     /// Opens an SQLite database at the given file path.
-    pub fn open(path: &str) -> Result<Self, PersistenceError> {
-        let conn = rusqlite::Connection::open(path)
-            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-        let backend = Self {
-            conn: Arc::new(Mutex::new(conn)),
+    pub async fn open(path: &str) -> Result<Self, PersistenceError> {
+        let url = if path.starts_with("sqlite://") || path.starts_with("sqlite:") {
+            path.to_string()
+        } else {
+            format!("sqlite://{path}")
         };
-        backend.configure_pragmas()?;
-        Ok(backend)
+        let opts = SqliteConnectOptions::from_str(&url)
+            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .busy_timeout(Duration::from_millis(5000));
+
+        let pool = SqlitePoolOptions::new()
+            .max_connections(10)
+            .connect_with(opts)
+            .await
+            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
+
+        Ok(Self { pool })
     }
 
     /// Creates an SQLite backend from a [`DatabaseConfig`].
-    pub fn new(config: &DatabaseConfig) -> Result<Self, PersistenceError> {
+    pub async fn new(config: &DatabaseConfig) -> Result<Self, PersistenceError> {
         let url = config.url.trim();
-        if url == "sqlite::memory:" || url == ":memory:" || url == "memory://" {
-            Self::in_memory()
+        if url == "sqlite::memory:" || url == ":memory:" || url == "memory://" || url.is_empty() {
+            Self::in_memory().await
         } else {
-            let path = url.strip_prefix("sqlite://").unwrap_or(url);
-            Self::open(path)
+            Self::open(url).await
         }
     }
 
-    fn configure_pragmas(&self) -> Result<(), PersistenceError> {
-        let conn = self
-            .conn
-            .lock()
-            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-        conn.execute_batch(
-            "PRAGMA foreign_keys = ON;
-             PRAGMA busy_timeout = 5000;",
-        )
-        .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-        Ok(())
+    /// Creates a backend directly from an existing `SqlitePool`.
+    pub fn from_pool(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    /// Returns a reference to the underlying `SqlitePool`.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
     }
 
     /// Initializes the `rume_outbox` table if it does not already exist.
     pub async fn init_outbox_table(&self) -> Result<(), PersistenceError> {
-        self.execute(
-            "CREATE TABLE IF NOT EXISTS rume_outbox (
-                id TEXT PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                payload BLOB NOT NULL,
-                status TEXT NOT NULL,
-                retry_count INTEGER NOT NULL DEFAULT 0,
-                created_at INTEGER NOT NULL,
-                last_error TEXT,
-                next_retry_at INTEGER,
-                lease_token TEXT,
-                lease_expires_at INTEGER
-            );
-            CREATE INDEX IF NOT EXISTS idx_rume_outbox_status_retry ON rume_outbox (status, next_retry_at, created_at);",
-        )
-        .await
-        .map(|_| ())
+        self.execute(OUTBOX_SCHEMA).await?;
+        Ok(())
     }
 
     /// Initializes the `rume_migrations` table if it does not already exist.
     pub async fn init_migrations_table(&self) -> Result<(), PersistenceError> {
-        self.execute(
-            "CREATE TABLE IF NOT EXISTS rume_migrations (
-                version TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                applied_at INTEGER NOT NULL
-            );",
-        )
-        .await
-        .map(|_| ())
+        self.execute(MIGRATIONS_SCHEMA).await?;
+        Ok(())
     }
+}
+
+fn extract_sqlite_scalar(row: &SqliteRow) -> Option<String> {
+    if let Ok(val) = row.try_get::<String, _>(0) {
+        return Some(val);
+    }
+    if let Ok(val) = row.try_get::<i64, _>(0) {
+        return Some(val.to_string());
+    }
+    if let Ok(val) = row.try_get::<i32, _>(0) {
+        return Some(val.to_string());
+    }
+    if let Ok(val) = row.try_get::<f64, _>(0) {
+        return Some(val.to_string());
+    }
+    if let Ok(val) = row.try_get::<bool, _>(0) {
+        return Some(val.to_string());
+    }
+    None
 }
 
 impl DatabaseBackend for SqliteBackend {
     type Transaction = SqliteTransaction;
 
     fn ping(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-                conn.query_row("SELECT 1", [], |_| Ok(()))
-                    .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))
-            })
-            .await
-            .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?
+            sqlx::query("SELECT 1")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
+            Ok(())
         })
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
         let stmt = statement.to_string();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                conn.execute_batch(&stmt)
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                Ok(conn.changes())
-            })
-            .await
-            .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
+            let res = sqlx::query(&stmt)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(res.rows_affected())
         })
     }
 
     fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
-        let q = query.to_string();
+        let q = query.trim().to_string();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                let mut stmt = conn
-                    .prepare(&q)
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                let mut rows = stmt
-                    .query([])
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                if let Some(row) = rows
-                    .next()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
-                {
-                    let val: rusqlite::types::Value = row
-                        .get(0)
-                        .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                    let res = match val {
-                        rusqlite::types::Value::Null => None,
-                        rusqlite::types::Value::Integer(i) => Some(i.to_string()),
-                        rusqlite::types::Value::Real(r) => Some(r.to_string()),
-                        rusqlite::types::Value::Text(s) => Some(s),
-                        rusqlite::types::Value::Blob(b) => {
-                            Some(String::from_utf8_lossy(&b).to_string())
-                        }
-                    };
-                    Ok(res)
-                } else {
-                    Ok(None)
-                }
-            })
-            .await
-            .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
+            let row: Option<SqliteRow> = sqlx::query(&q)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+
+            Ok(row.and_then(|r| extract_sqlite_scalar(&r)))
         })
     }
 
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let guard = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-                guard
-                    .execute("BEGIN IMMEDIATE", [])
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-                drop(guard);
-                Ok(SqliteTransaction {
-                    conn,
-                    status: Arc::new(AtomicU8::new(0)),
-                })
+            let tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
+            Ok(SqliteTransaction {
+                tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })
-            .await
-            .map_err(|e| PersistenceError::TransactionError(e.to_string()))?
         })
     }
 }
 
-/// An active SQLite transaction.
+/// Active transaction handle for SQLite.
 #[derive(Clone)]
 pub struct SqliteTransaction {
-    conn: Arc<Mutex<rusqlite::Connection>>,
-    // 0: active, 1: committed, 2: rolled_back
-    status: Arc<AtomicU8>,
+    tx: Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Sqlite>>>>,
 }
 
 impl Debug for SqliteTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SqliteTransaction")
-            .field("status", &self.status.load(Ordering::Relaxed))
-            .finish()
+        f.debug_struct("SqliteTransaction").finish()
     }
 }
 
 impl DatabaseTransaction for SqliteTransaction {
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
         let stmt = statement.to_string();
-        let status = Arc::clone(&self.status);
+        let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
-            if status.load(Ordering::SeqCst) != 0 {
-                return Err(PersistenceError::TransactionError(
-                    "transaction is already resolved".into(),
-                ));
-            }
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                conn.execute_batch(&stmt)
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                Ok(conn.changes())
-            })
-            .await
-            .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .as_mut()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let res = sqlx::query(&stmt)
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(res.rows_affected())
         })
     }
 
     fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
-        let q = query.to_string();
-        let status = Arc::clone(&self.status);
+        let q = query.trim().to_string();
+        let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
-            if status.load(Ordering::SeqCst) != 0 {
-                return Err(PersistenceError::TransactionError(
-                    "transaction is already resolved".into(),
-                ));
-            }
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                let mut stmt = conn
-                    .prepare(&q)
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                let mut rows = stmt
-                    .query([])
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                if let Some(row) = rows
-                    .next()
-                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
-                {
-                    let val: rusqlite::types::Value = row
-                        .get(0)
-                        .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-                    let res = match val {
-                        rusqlite::types::Value::Null => None,
-                        rusqlite::types::Value::Integer(i) => Some(i.to_string()),
-                        rusqlite::types::Value::Real(r) => Some(r.to_string()),
-                        rusqlite::types::Value::Text(s) => Some(s),
-                        rusqlite::types::Value::Blob(b) => {
-                            Some(String::from_utf8_lossy(&b).to_string())
-                        }
-                    };
-                    Ok(res)
-                } else {
-                    Ok(None)
-                }
-            })
-            .await
-            .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .as_mut()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let row: Option<SqliteRow> = sqlx::query(&q)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(row.and_then(|r| extract_sqlite_scalar(&r)))
         })
     }
 
     fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
-        let status = Arc::clone(&self.status);
+        let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
-            if status
-                .compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Err(PersistenceError::TransactionError(
-                    "transaction is already resolved".into(),
-                ));
-            }
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-                conn.execute("COMMIT", [])
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| PersistenceError::TransactionError(e.to_string()))?
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .take()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            tx.commit()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
+            Ok(())
         })
     }
 
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
-        let conn = Arc::clone(&self.conn);
-        let status = Arc::clone(&self.status);
+        let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
-            if status
-                .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_err()
-            {
-                return Ok(());
-            }
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
+            let mut guard = tx_arc.lock().await;
+            if let Some(tx) = guard.take() {
+                tx.rollback()
+                    .await
                     .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-                let _ = conn.execute("ROLLBACK", []);
-                Ok(())
-            })
-            .await
-            .map_err(|e| PersistenceError::TransactionError(e.to_string()))?
+            }
+            Ok(())
         })
     }
 }
 
-impl Drop for SqliteTransaction {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.status) <= 1 && self.status.load(Ordering::SeqCst) == 0 {
-            let conn = Arc::clone(&self.conn);
-            let status = Arc::clone(&self.status);
-            if status
-                .compare_exchange(0, 2, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-                && let Ok(guard) = conn.lock()
-            {
-                let _ = guard.execute("ROLLBACK", []);
-            }
-        }
-    }
+fn parse_sqlite_outbox_row(row: &SqliteRow) -> Result<OutboxMessage, OutboxError> {
+    let id: String = row.try_get("id").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let event_type: String = row.try_get("event_type").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let payload: Vec<u8> = row.try_get("payload").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let status_str: String = row.try_get("status").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let status = match status_str.as_str() {
+        "pending" => OutboxStatus::Pending,
+        "inflight" | "in_flight" => OutboxStatus::InFlight,
+        "published" => OutboxStatus::Published,
+        "failed" => OutboxStatus::Failed,
+        _ => OutboxStatus::Pending,
+    };
+    let retry_count: i32 = row.try_get("retry_count").unwrap_or(0);
+    let last_error: Option<String> = row.try_get("last_error").ok();
+    let created_at: i64 = row.try_get("created_at").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let next_retry_at: Option<i64> = row.try_get("next_retry_at").ok();
+    let lease_token: Option<String> = row.try_get("lease_token").ok();
+    let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").ok();
+
+    Ok(OutboxMessage {
+        id,
+        event_type,
+        payload,
+        status,
+        retry_count: retry_count as u32,
+        last_error,
+        created_at: created_at as u64,
+        next_retry_at: next_retry_at.map(|v| v as u64),
+        lease_token,
+        lease_expires_at: lease_expires_at.map(|v| v as u64),
+    })
 }
 
 impl OutboxRepository for SqliteBackend {
     fn save(&self, msg: OutboxMessage) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let status_str = match msg.status {
-                    OutboxStatus::Pending => "pending",
-                    OutboxStatus::InFlight => "inflight",
-                    OutboxStatus::Published => "published",
-                    OutboxStatus::Failed => "failed",
-                };
-                let retry_count = msg.retry_count as i64;
-                let created_at = msg.created_at as i64;
-                let next_retry_at = msg.next_retry_at.map(|t| t as i64);
-                let lease_expires_at = msg.lease_expires_at.map(|t| t as i64);
-
-                conn.execute(
-                    "INSERT INTO rume_outbox (id, event_type, payload, status, retry_count, created_at, next_retry_at, lease_token, lease_expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        &msg.id,
-                        &msg.event_type,
-                        &msg.payload,
-                        &status_str,
-                        &retry_count,
-                        &created_at,
-                        &next_retry_at,
-                        &msg.lease_token,
-                        &lease_expires_at,
-                    ],
-                )
+            let status = match msg.status {
+                OutboxStatus::Pending => "pending",
+                OutboxStatus::InFlight => "inflight",
+                OutboxStatus::Published => "published",
+                OutboxStatus::Failed => "failed",
+            };
+            sqlx::query(INSERT_OUTBOX_SQL)
+                .bind(&msg.id)
+                .bind(&msg.event_type)
+                .bind(&msg.payload)
+                .bind(status)
+                .bind(msg.retry_count as i32)
+                .bind(msg.created_at as i64)
+                .bind(&msg.last_error)
+                .bind(msg.next_retry_at.map(|v| v as i64))
+                .bind(&msg.lease_token)
+                .bind(msg.lease_expires_at.map(|v| v as i64))
+                .execute(&self.pool)
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            Ok(())
         })
     }
 
-    fn fetch_pending(
-        &self,
-        limit: usize,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        let conn = Arc::clone(&self.conn);
+    fn fetch_pending(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let now = crate::outbox::message::current_timestamp() as i64;
-                let mut stmt = conn
-                    .prepare(
-                        "SELECT id, event_type, payload, status, retry_count, created_at, last_error, next_retry_at, lease_token, lease_expires_at
-                         FROM rume_outbox
-                         WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-                         ORDER BY created_at
-                         LIMIT ?2",
-                    )
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let now = current_timestamp();
+            let rows = sqlx::query(OUTBOX_CLAIM_SQL)
+                .bind(now as i64)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                let rows = stmt
-                    .query_map(params![now, limit as i64], |row| {
-                        let id: String = row.get(0)?;
-                        let event_type: String = row.get(1)?;
-                        let payload: Vec<u8> = row.get(2)?;
-                        let status_str: String = row.get(3)?;
-                        let retry_count: i64 = row.get(4)?;
-                        let created_at: i64 = row.get(5)?;
-                        let last_error: Option<String> = row.get(6)?;
-                        let next_retry_at: Option<i64> = row.get(7)?;
-                        let lease_token: Option<String> = row.get(8)?;
-                        let lease_expires_at: Option<i64> = row.get(9)?;
-
-                        let status = match status_str.as_str() {
-                            "inflight" => OutboxStatus::InFlight,
-                            "published" => OutboxStatus::Published,
-                            "failed" => OutboxStatus::Failed,
-                            _ => OutboxStatus::Pending,
-                        };
-
-                        Ok(OutboxMessage {
-                            id,
-                            event_type,
-                            payload,
-                            status,
-                            retry_count: retry_count as u32,
-                            created_at: created_at as u64,
-                            last_error,
-                            next_retry_at: next_retry_at.map(|t| t as u64),
-                            lease_token,
-                            lease_expires_at: lease_expires_at.map(|t| t as u64),
-                        })
-                    })
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
-
-                let mut out = Vec::new();
-                for r in rows {
-                    out.push(r.map_err(|e| OutboxError::Repository(e.to_string()))?);
-                }
-                Ok(out)
-            })
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            let mut messages = Vec::with_capacity(rows.len());
+            for row in &rows {
+                messages.push(parse_sqlite_outbox_row(row)?);
+            }
+            Ok(messages)
         })
-    }
-
-    fn claim_pending(
-        &self,
-        batch_size: usize,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        self.claim_pending_with_lease(batch_size, 30)
     }
 
     fn claim_pending_with_lease(
@@ -472,200 +336,137 @@ impl OutboxRepository for SqliteBackend {
         limit: usize,
         lease_duration_secs: u64,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let now = crate::outbox::message::current_timestamp() as i64;
-                let lease_expires_at = now + (lease_duration_secs as i64);
-                let lease_token = uuid::Uuid::new_v4().to_string();
+            let now = current_timestamp();
+            let expires_at = now + lease_duration_secs;
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                conn.execute("BEGIN IMMEDIATE", [])
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let rows = sqlx::query(OUTBOX_CLAIM_SQL)
+                .bind(now as i64)
+                .bind(limit as i64)
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                let claim_result: Result<Vec<OutboxMessage>, OutboxError> = (|| {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT id, event_type, payload, retry_count, created_at
-                             FROM rume_outbox
-                             WHERE status = 'pending' AND (next_retry_at IS NULL OR next_retry_at <= ?1)
-                             ORDER BY created_at
-                             LIMIT ?2",
-                        )
-                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let mut claimed = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let mut msg = parse_sqlite_outbox_row(row)?;
+                let token = Uuid::new_v4().to_string();
+                sqlx::query(
+                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?1, lease_expires_at = ?2 WHERE id = ?3"
+                )
+                .bind(&token)
+                .bind(expires_at as i64)
+                .bind(&msg.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                    let rows = stmt
-                        .query_map(params![now, limit as i64], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, Vec<u8>>(2)?,
-                                row.get::<_, i64>(3)?,
-                                row.get::<_, i64>(4)?,
-                            ))
-                        })
-                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+                msg.status = OutboxStatus::InFlight;
+                msg.lease_token = Some(token);
+                msg.lease_expires_at = Some(expires_at);
+                claimed.push(msg);
+            }
 
-                    let mut candidates = Vec::new();
-                    for r in rows {
-                        candidates.push(r.map_err(|e| OutboxError::Repository(e.to_string()))?);
-                    }
-                    drop(stmt);
+            tx.commit()
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                    let mut claimed = Vec::new();
-                    for (id, event_type, payload, retry_count, created_at) in candidates {
-                        conn.execute(
-                            "UPDATE rume_outbox
-                             SET status = 'inflight', lease_token = ?1, lease_expires_at = ?2
-                             WHERE id = ?3 AND status = 'pending'",
-                            params![&lease_token, lease_expires_at, &id],
-                        )
-                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
-
-                        claimed.push(OutboxMessage {
-                            id,
-                            event_type,
-                            payload,
-                            status: OutboxStatus::InFlight,
-                            retry_count: retry_count as u32,
-                            created_at: created_at as u64,
-                            last_error: None,
-                            next_retry_at: None,
-                            lease_token: Some(lease_token.clone()),
-                            lease_expires_at: Some(lease_expires_at as u64),
-                        });
-                    }
-
-                    Ok(claimed)
-                })();
-
-                match claim_result {
-                    Ok(msgs) => {
-                        conn.execute("COMMIT", [])
-                            .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                        Ok(msgs)
-                    }
-                    Err(err) => {
-                        let _ = conn.execute("ROLLBACK", []);
-                        Err(err)
-                    }
-                }
-            })
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            Ok(claimed)
         })
     }
 
-    fn mark_published(&self, message_id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let conn = Arc::clone(&self.conn);
-        let mid = message_id.to_string();
+    fn mark_published(&self, id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                conn.execute(
-                    "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = ?1",
-                    params![&mid],
-                )
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(())
-            })
+            sqlx::query(
+                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = ?1"
+            )
+            .bind(&id_str)
+            .execute(&self.pool)
             .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            Ok(())
         })
     }
 
-    fn mark_failed(
-        &self,
-        message_id: &str,
-        error: String,
-    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let conn = Arc::clone(&self.conn);
-        let mid = message_id.to_string();
+    fn mark_failed(&self, id: &str, error: String) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let now = crate::outbox::message::current_timestamp() as i64;
-                conn.execute(
-                    "UPDATE rume_outbox
-                     SET retry_count = retry_count + 1,
-                         status = CASE WHEN retry_count + 1 >= 5 THEN 'failed' ELSE 'pending' END,
-                         last_error = ?1,
-                         next_retry_at = CASE WHEN retry_count + 1 >= 5 THEN NULL ELSE ?2 + ((retry_count + 1) * 2) END,
-                         lease_token = NULL,
-                         lease_expires_at = NULL
-                     WHERE id = ?3",
-                    params![&error, now, &mid],
-                )
+            let now = current_timestamp();
+            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ?1")
+                .bind(&id_str)
+                .fetch_optional(&self.pool)
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(())
-            })
+
+            let retry_count: i32 = row.and_then(|r| r.try_get(0).ok()).unwrap_or(0) + 1;
+            let status = if retry_count >= 5 { "failed" } else { "pending" };
+            let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
+            let next_retry = now + backoff_secs;
+
+            sqlx::query(
+                "UPDATE rume_outbox SET status = ?1, retry_count = ?2, last_error = ?3, next_retry_at = ?4, lease_token = NULL, lease_expires_at = NULL WHERE id = ?5"
+            )
+            .bind(status)
+            .bind(retry_count)
+            .bind(&error)
+            .bind(next_retry as i64)
+            .bind(&id_str)
+            .execute(&self.pool)
             .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            Ok(())
         })
     }
 
-    fn recover_expired_claims(
-        &self,
-        max_lease_age_secs: u64,
-    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        let conn = Arc::clone(&self.conn);
+    fn recover_expired_claims(&self, max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let now = crate::outbox::message::current_timestamp() as i64;
-                let max_age = max_lease_age_secs as i64;
-
-                let affected = conn.execute(
-                    "UPDATE rume_outbox
-                     SET status = 'pending', lease_token = NULL, lease_expires_at = NULL
-                     WHERE status = 'inflight' AND (lease_expires_at <= ?1 OR created_at + ?2 <= ?1)",
-                    params![now, max_age],
-                )
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(affected)
-            })
+            let now = current_timestamp();
+            let res = sqlx::query(
+                "UPDATE rume_outbox SET status = 'pending', lease_token = NULL, lease_expires_at = NULL
+                 WHERE status = 'inflight' AND (lease_expires_at <= ?1 OR (?1 - created_at) >= ?2)"
+            )
+            .bind(now as i64)
+            .bind(max_lease_age_secs as i64)
+            .execute(&self.pool)
             .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            Ok(res.rows_affected() as usize)
         })
     }
 
     fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT count(*) FROM rume_outbox WHERE status = 'pending' OR status = 'inflight'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(count as usize)
-            })
+            let row = sqlx::query(
+                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'pending' OR status = 'inflight'"
+            )
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let count: i64 = row.try_get(0).unwrap_or(0);
+            Ok(count as usize)
         })
     }
 
     fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        let conn = Arc::clone(&self.conn);
         Box::pin(async move {
-            tokio::task::spawn_blocking(move || {
-                let conn = conn
-                    .lock()
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let count: i64 = conn
-                    .query_row(
-                        "SELECT count(*) FROM rume_outbox WHERE status = 'published'",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(count as usize)
-            })
+            let row = sqlx::query(
+                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'published'"
+            )
+            .fetch_one(&self.pool)
             .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            let count: i64 = row.try_get(0).unwrap_or(0);
+            Ok(count as usize)
         })
     }
 }
@@ -674,49 +475,36 @@ impl TransactionalOutbox<SqliteTransaction> for SqliteBackend {
     fn save_tx<'a>(
         &'a self,
         tx: &'a SqliteTransaction,
-        message: OutboxMessage,
+        msg: OutboxMessage,
     ) -> OutboxFuture<'a, Result<(), OutboxError>> {
-        let conn = Arc::clone(&tx.conn);
-        let status = Arc::clone(&tx.status);
         Box::pin(async move {
-            if status.load(Ordering::SeqCst) != 0 {
-                return Err(OutboxError::Repository(
-                    "transaction is already resolved".into(),
-                ));
-            }
-            tokio::task::spawn_blocking(move || {
-                let conn = conn.lock().map_err(|e| OutboxError::Repository(e.to_string()))?;
-                let status_str = match message.status {
-                    OutboxStatus::Pending => "pending",
-                    OutboxStatus::InFlight => "inflight",
-                    OutboxStatus::Published => "published",
-                    OutboxStatus::Failed => "failed",
-                };
-                let retry_count = message.retry_count as i64;
-                let created_at = message.created_at as i64;
-                let next_retry_at = message.next_retry_at.map(|t| t as i64);
-                let lease_expires_at = message.lease_expires_at.map(|t| t as i64);
+            let status = match msg.status {
+                OutboxStatus::Pending => "pending",
+                OutboxStatus::InFlight => "inflight",
+                OutboxStatus::Published => "published",
+                OutboxStatus::Failed => "failed",
+            };
+            let mut guard = tx.tx.lock().await;
+            let active_tx = guard
+                .as_mut()
+                .ok_or_else(|| OutboxError::Repository("transaction already resolved".into()))?;
 
-                conn.execute(
-                    "INSERT INTO rume_outbox (id, event_type, payload, status, retry_count, created_at, next_retry_at, lease_token, lease_expires_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    params![
-                        &message.id,
-                        &message.event_type,
-                        &message.payload,
-                        &status_str,
-                        &retry_count,
-                        &created_at,
-                        &next_retry_at,
-                        &message.lease_token,
-                        &lease_expires_at,
-                    ],
-                )
+            sqlx::query(INSERT_OUTBOX_SQL)
+                .bind(&msg.id)
+                .bind(&msg.event_type)
+                .bind(&msg.payload)
+                .bind(status)
+                .bind(msg.retry_count as i32)
+                .bind(msg.created_at as i64)
+                .bind(&msg.last_error)
+                .bind(msg.next_retry_at.map(|v| v as i64))
+                .bind(&msg.lease_token)
+                .bind(msg.lease_expires_at.map(|v| v as i64))
+                .execute(&mut **active_tx)
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
-                Ok(())
-            })
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?
+
+            Ok(())
         })
     }
 }

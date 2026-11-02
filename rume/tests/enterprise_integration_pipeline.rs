@@ -75,7 +75,7 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
 #[tokio::test]
 async fn realistic_enterprise_pipeline_end_to_end() {
     // 1. Setup Framework Subsystems
-    let db = Arc::new(SqliteBackend::in_memory().unwrap());
+    let db = Arc::new(SqliteBackend::in_memory().await.unwrap());
     db.init_outbox_table().await.unwrap();
     db.execute(
         "CREATE TABLE orders (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL);",
@@ -88,17 +88,13 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     let pg_node = Postgres::default().start().await.expect("start postgres");
     let pg_port = pg_node.get_host_port_ipv4(5432).await.expect("port");
     let pg_url = format!("postgresql://postgres:postgres@127.0.0.1:{pg_port}/postgres");
-    let pool_cfg = deadpool_postgres::Config {
-        url: Some(pg_url),
-        ..Default::default()
-    };
-    let pg_pool = pool_cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
-    let client = pg_pool.get().await.expect("pg conn");
-    client
-        .batch_execute(PostgresJobQueue::SCHEMA)
+    let pg_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&pg_url)
         .await
-        .expect("init jobs schema");
+        .expect("pg pool");
     let queue = Arc::new(PostgresJobQueue::new(pg_pool));
+    queue.init_schema().await.expect("init jobs schema");
 
     let metrics = Arc::new(MetricsRegistry::new());
 
@@ -215,7 +211,7 @@ async fn realistic_enterprise_pipeline_end_to_end() {
 
 #[tokio::test]
 async fn pipeline_failure_recovery_and_atomicity_invariants() {
-    let db = Arc::new(SqliteBackend::in_memory().unwrap());
+    let db = Arc::new(SqliteBackend::in_memory().await.unwrap());
     db.init_outbox_table().await.unwrap();
     db.execute(
         "CREATE TABLE orders (id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, status TEXT NOT NULL);",

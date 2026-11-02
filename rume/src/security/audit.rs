@@ -122,19 +122,7 @@ pub struct SqlAuditLogger<B: DatabaseBackend> {
 
 impl<B: DatabaseBackend> SqlAuditLogger<B> {
     /// Schema DDL for audit log table.
-    pub const SCHEMA: &'static str = r#"
-CREATE TABLE IF NOT EXISTS rume_audit_log (
-    id VARCHAR(64) PRIMARY KEY,
-    action VARCHAR(255) NOT NULL,
-    resource VARCHAR(255) NOT NULL,
-    status VARCHAR(32) NOT NULL,
-    actor_id VARCHAR(255),
-    target_id VARCHAR(255),
-    ip_address VARCHAR(64),
-    metadata TEXT,
-    created_at BIGINT NOT NULL
-);
-"#;
+    pub const SCHEMA: &'static str = include_str!("../persistence/sql/postgres/audit_schema.sql");
 
     /// Creates a new SQL audit logger.
     pub fn new(backend: B) -> Self {

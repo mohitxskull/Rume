@@ -1,14 +1,9 @@
-//! Production PostgreSQL-backed distributed locking and leader election.
-//!
-//! Provides:
-//! - Atomic lock acquisition and TTL expiration backed by database rows
-//! - Monotonically increasing 64-bit fencing tokens backed by PostgreSQL sequences (`rume_lock_fencing_seq`)
-//! - Leader election with term fencing tokens across independent processes/nodes
+//! Production PostgreSQL-backed distributed locking and leader election using SQLx.
 
 use std::fmt::Debug;
 use std::time::Duration;
 
-use deadpool_postgres::Pool;
+use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::coordination::error::CoordinationError;
@@ -23,15 +18,17 @@ fn current_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
+const LOCKS_SCHEMA: &str = include_str!("../persistence/sql/postgres/locks_schema.sql");
+const LEADER_SCHEMA: &str = include_str!("../persistence/sql/postgres/leader_schema.sql");
+const LOCK_ACQUIRE_SQL: &str = include_str!("../persistence/sql/postgres/lock_acquire.sql");
+const LOCK_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/lock_renew.sql");
+const LEADER_ACQUIRE_SQL: &str = include_str!("../persistence/sql/postgres/leader_acquire.sql");
+const LEADER_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/leader_renew.sql");
+
 /// PostgreSQL-backed implementation of [`DistributedLock`].
-///
-/// Guarantees:
-/// - Mutual exclusion across separate OS processes and machines connected to the same database.
-/// - Strictly monotonically increasing `fencing_token` issued via PostgreSQL sequence.
-/// - Automatic TTL lease expiration without requiring manual dead worker cleanup.
 #[derive(Clone)]
 pub struct PostgresDistributedLock {
-    pool: Pool,
+    pool: PgPool,
 }
 
 impl Debug for PostgresDistributedLock {
@@ -42,18 +39,10 @@ impl Debug for PostgresDistributedLock {
 
 impl PostgresDistributedLock {
     /// Schema DDL for distributed lock storage and fencing token sequence.
-    pub const SCHEMA: &'static str = r#"
-CREATE TABLE IF NOT EXISTS rume_locks (
-    resource TEXT PRIMARY KEY,
-    lease_id TEXT NOT NULL,
-    fencing_token BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS rume_lock_fencing_seq START 1;
-"#;
+    pub const SCHEMA: &'static str = LOCKS_SCHEMA;
 
-    /// Creates a new distributed lock service from a `deadpool_postgres::Pool`.
-    pub fn new(pool: Pool) -> Self {
+    /// Creates a new distributed lock service from a `PgPool`.
+    pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -66,13 +55,8 @@ CREATE SEQUENCE IF NOT EXISTS rume_lock_fencing_seq START 1;
 
     /// Initializes the `rume_locks` table and sequence if not already present.
     pub async fn init_schema(&self) -> Result<(), CoordinationError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-        client
-            .batch_execute(Self::SCHEMA)
+        sqlx::raw_sql(Self::SCHEMA)
+            .execute(&self.pool)
             .await
             .map_err(|e| CoordinationError::Backend(e.to_string()))?;
         Ok(())
@@ -87,33 +71,21 @@ impl DistributedLock for PostgresDistributedLock {
     ) -> CoordinationFuture<'a, Option<LockGuard>> {
         let res = resource.to_string();
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let now = current_epoch_millis();
             let expires_at = now.saturating_add(ttl.as_millis() as i64);
             let lease_id = Uuid::new_v4().to_string();
 
-            let stmt = r#"
-INSERT INTO rume_locks (resource, lease_id, fencing_token, expires_at)
-VALUES ($1, $2, nextval('rume_lock_fencing_seq'), $3)
-ON CONFLICT (resource) DO UPDATE
-SET lease_id = EXCLUDED.lease_id,
-    fencing_token = nextval('rume_lock_fencing_seq'),
-    expires_at = EXCLUDED.expires_at
-WHERE rume_locks.expires_at <= $4
-RETURNING fencing_token;
-"#;
-            let rows = client
-                .query(stmt, &[&res, &lease_id, &expires_at, &now])
+            let row = sqlx::query(LOCK_ACQUIRE_SQL)
+                .bind(&res)
+                .bind(&lease_id)
+                .bind(expires_at)
+                .bind(now)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(row) = rows.first() {
-                let fencing_token: i64 = row.get(0);
+            if let Some(r) = row {
+                let fencing_token: i64 = r.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LockGuard {
                     resource: res,
                     lease_id,
@@ -127,29 +99,19 @@ RETURNING fencing_token;
 
     fn renew<'a>(&'a self, guard: &'a LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let now = current_epoch_millis();
             let new_expires_at = now.saturating_add(ttl.as_millis() as i64);
 
-            let stmt = r#"
-UPDATE rume_locks
-SET expires_at = $1
-WHERE resource = $2 AND lease_id = $3 AND expires_at > $4;
-"#;
-            let affected = client
-                .execute(
-                    stmt,
-                    &[&new_expires_at, &guard.resource, &guard.lease_id, &now],
-                )
+            let res = sqlx::query(LOCK_RENEW_SQL)
+                .bind(new_expires_at)
+                .bind(&guard.resource)
+                .bind(&guard.lease_id)
+                .bind(now)
+                .execute(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if affected == 0 {
+            if res.rows_affected() == 0 {
                 Err(CoordinationError::LockExpired {
                     resource: guard.resource.clone(),
                 })
@@ -161,32 +123,23 @@ WHERE resource = $2 AND lease_id = $3 AND expires_at > $4;
 
     fn release<'a>(&'a self, guard: LockGuard) -> CoordinationFuture<'a, bool> {
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let stmt = "DELETE FROM rume_locks WHERE resource = $1 AND lease_id = $2";
-            let affected = client
-                .execute(stmt, &[&guard.resource, &guard.lease_id])
+            let res = sqlx::query(stmt)
+                .bind(&guard.resource)
+                .bind(&guard.lease_id)
+                .execute(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            Ok(affected > 0)
+            Ok(res.rows_affected() > 0)
         })
     }
 }
 
 /// PostgreSQL-backed implementation of [`LeaderElector`].
-///
-/// Guarantees:
-/// - Single active leader per role across independent processes.
-/// - Strictly monotonically increasing `term` issued via PostgreSQL sequence.
-/// - Graceful resignation and automatic failover upon lease expiry.
 #[derive(Clone)]
 pub struct PostgresLeaderElector {
-    pool: Pool,
+    pool: PgPool,
 }
 
 impl Debug for PostgresLeaderElector {
@@ -197,18 +150,10 @@ impl Debug for PostgresLeaderElector {
 
 impl PostgresLeaderElector {
     /// Schema DDL for leader election storage and term sequence.
-    pub const SCHEMA: &'static str = r#"
-CREATE TABLE IF NOT EXISTS rume_leaders (
-    role TEXT PRIMARY KEY,
-    candidate_id TEXT NOT NULL,
-    term BIGINT NOT NULL,
-    expires_at BIGINT NOT NULL
-);
-CREATE SEQUENCE IF NOT EXISTS rume_leader_term_seq START 1;
-"#;
+    pub const SCHEMA: &'static str = LEADER_SCHEMA;
 
-    /// Creates a new leader election service from a `deadpool_postgres::Pool`.
-    pub fn new(pool: Pool) -> Self {
+    /// Creates a new leader election service from a `PgPool`.
+    pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
@@ -221,13 +166,8 @@ CREATE SEQUENCE IF NOT EXISTS rume_leader_term_seq START 1;
 
     /// Initializes the `rume_leaders` table and sequence if not already present.
     pub async fn init_schema(&self) -> Result<(), CoordinationError> {
-        let client = self
-            .pool
-            .get()
-            .await
-            .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-        client
-            .batch_execute(Self::SCHEMA)
+        sqlx::raw_sql(Self::SCHEMA)
+            .execute(&self.pool)
             .await
             .map_err(|e| CoordinationError::Backend(e.to_string()))?;
         Ok(())
@@ -242,37 +182,25 @@ impl LeaderElector for PostgresLeaderElector {
         ttl: Duration,
     ) -> CoordinationFuture<'a, Option<LeaderLease>> {
         let r = role.to_string();
-        let c = candidate_id.to_string();
+        let cid = candidate_id.to_string();
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let now = current_epoch_millis();
             let expires_at = now.saturating_add(ttl.as_millis() as i64);
 
-            let stmt = r#"
-INSERT INTO rume_leaders (role, candidate_id, term, expires_at)
-VALUES ($1, $2, nextval('rume_leader_term_seq'), $3)
-ON CONFLICT (role) DO UPDATE
-SET candidate_id = EXCLUDED.candidate_id,
-    term = nextval('rume_leader_term_seq'),
-    expires_at = EXCLUDED.expires_at
-WHERE rume_leaders.expires_at <= $4
-RETURNING term;
-"#;
-            let rows = client
-                .query(stmt, &[&r, &c, &expires_at, &now])
+            let row = sqlx::query(LEADER_ACQUIRE_SQL)
+                .bind(&r)
+                .bind(&cid)
+                .bind(expires_at)
+                .bind(now)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(row) = rows.first() {
-                let term: i64 = row.get(0);
+            if let Some(row_data) = row {
+                let term: i64 = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
                     role: r,
-                    candidate_id: c,
+                    candidate_id: cid,
                     term: term as u64,
                 }))
             } else {
@@ -288,33 +216,25 @@ RETURNING term;
         ttl: Duration,
     ) -> CoordinationFuture<'a, Option<LeaderLease>> {
         let r = role.to_string();
-        let c = candidate_id.to_string();
+        let cid = candidate_id.to_string();
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let now = current_epoch_millis();
             let new_expires_at = now.saturating_add(ttl.as_millis() as i64);
 
-            let stmt = r#"
-UPDATE rume_leaders
-SET expires_at = $1
-WHERE role = $2 AND candidate_id = $3 AND expires_at > $4
-RETURNING term;
-"#;
-            let rows = client
-                .query(stmt, &[&new_expires_at, &r, &c, &now])
+            let row = sqlx::query(LEADER_RENEW_SQL)
+                .bind(new_expires_at)
+                .bind(&r)
+                .bind(&cid)
+                .bind(now)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(row) = rows.first() {
-                let term: i64 = row.get(0);
+            if let Some(row_data) = row {
+                let term: i64 = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
                     role: r,
-                    candidate_id: c,
+                    candidate_id: cid,
                     term: term as u64,
                 }))
             } else {
@@ -326,25 +246,21 @@ RETURNING term;
     fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<LeaderLease>> {
         let r = role.to_string();
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let now = current_epoch_millis();
-            let stmt =
-                "SELECT candidate_id, term FROM rume_leaders WHERE role = $1 AND expires_at > $2";
-            let rows = client
-                .query(stmt, &[&r, &now])
+            let stmt = "SELECT role, candidate_id, term FROM rume_leaders WHERE role = $1 AND expires_at > $2";
+            let row = sqlx::query(stmt)
+                .bind(&r)
+                .bind(now)
+                .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(row) = rows.first() {
-                let candidate_id: String = row.get(0);
-                let term: i64 = row.get(1);
+            if let Some(row_data) = row {
+                let role: String = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let candidate_id: String = row_data.try_get(1).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let term: i64 = row_data.try_get(2).map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
-                    role: r,
+                    role,
                     candidate_id,
                     term: term as u64,
                 }))
@@ -356,21 +272,17 @@ RETURNING term;
 
     fn resign<'a>(&'a self, role: &'a str, candidate_id: &'a str) -> CoordinationFuture<'a, bool> {
         let r = role.to_string();
-        let c = candidate_id.to_string();
+        let cid = candidate_id.to_string();
         Box::pin(async move {
-            let client = self
-                .pool
-                .get()
-                .await
-                .map_err(|e| CoordinationError::Backend(e.to_string()))?;
-
             let stmt = "DELETE FROM rume_leaders WHERE role = $1 AND candidate_id = $2";
-            let affected = client
-                .execute(stmt, &[&r, &c])
+            let res = sqlx::query(stmt)
+                .bind(&r)
+                .bind(&cid)
+                .execute(&self.pool)
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            Ok(affected > 0)
+            Ok(res.rows_affected() > 0)
         })
     }
 }

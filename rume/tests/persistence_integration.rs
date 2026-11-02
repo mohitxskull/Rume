@@ -13,7 +13,7 @@ async fn pool_lifecycle_and_capacity_limits() {
         .with_min_connections(2)
         .with_max_connections(2);
 
-    let db = SqliteBackend::in_memory().unwrap();
+    let db = SqliteBackend::in_memory().await.unwrap();
     let pool = DatabasePool::new(db, config);
 
     let status = pool.status();
@@ -62,7 +62,7 @@ async fn pool_lifecycle_and_capacity_limits() {
 
 #[tokio::test]
 async fn explicit_transaction_commit_and_rollback() {
-    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
     backend
         .execute("CREATE TABLE users (id TEXT PRIMARY KEY, name TEXT NOT NULL);")
         .await
@@ -126,7 +126,7 @@ async fn explicit_transaction_commit_and_rollback() {
 
 #[tokio::test]
 async fn migrations_apply_rollback_and_preflight_verification() {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
 
     let migrator = Migrator::new()
         .add_migration(
@@ -163,7 +163,7 @@ async fn migrations_apply_rollback_and_preflight_verification() {
 
 #[tokio::test]
 async fn irreversible_migration_rollback_fails_closed() {
-    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
     backend
         .execute("CREATE TABLE legacy_data (id INT);")
         .await
@@ -188,7 +188,7 @@ async fn irreversible_migration_rollback_fails_closed() {
 
 #[tokio::test]
 async fn health_check_reports_pool_status_and_failures() {
-    let db = SqliteBackend::in_memory().unwrap();
+    let db = SqliteBackend::in_memory().await.unwrap();
     let pool = DatabasePool::new(db.clone(), DatabaseConfig::default());
     let hc = pool.health_check("primary_db");
 
@@ -215,8 +215,8 @@ struct BillingModule {
 }
 
 impl BillingModule {
-    fn new() -> Self {
-        let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    async fn new() -> Self {
+        let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
         let migrator = Migrator::new().add_migration(Migration::from_sql(
             "001_billing_accounts",
             "setup billing accounts",
@@ -293,7 +293,7 @@ impl Module for BillingModule {
 
 #[tokio::test]
 async fn module_persistence_end_to_end() {
-    let billing = BillingModule::new();
+    let billing = BillingModule::new().await;
     let test_app = Rume::new()
         .register_module(billing)
         .build_test_app()
@@ -318,7 +318,7 @@ async fn pool_acquire_timeout_and_graceful_drain() {
         .with_max_connections(1)
         .with_connect_timeout(1);
 
-    let pool = DatabasePool::new(SqliteBackend::in_memory().unwrap(), config);
+    let pool = DatabasePool::new(SqliteBackend::in_memory().await.unwrap(), config);
 
     // Hold the single available connection permit
     let lease1 = pool

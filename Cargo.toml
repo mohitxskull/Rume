@@ -32,10 +32,7 @@ serde_json = "1.0.139"
 
 clap = { version = "4.6.7", features = ["derive"] }
 tempfile = "3.15.0"
-tokio-postgres = "0.7.18"
-deadpool-postgres = "0.14.2"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
 deadpool-redis = "0.23.1"
 redis = { version = "1.8", default-features = false, features = ["tokio-comp", "script"] }
-rusqlite = { version = "0.41.1", features = ["bundled"] }
-mysql_async = { version = "0.37", default-features = false, features = ["default"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "mysql"] }

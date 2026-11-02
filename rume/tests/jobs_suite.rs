@@ -18,14 +18,14 @@ async fn start_postgres_queue() -> (
     let node = Postgres::default().start().await.expect("start postgres");
     let port = node.get_host_port_ipv4(5432).await.expect("port");
     let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
-    let pool_cfg = deadpool_postgres::Config {
-        url: Some(url),
-        ..Default::default()
-    };
-    let pool = pool_cfg.builder(tokio_postgres::NoTls).unwrap().build().unwrap();
-    let client = pool.get().await.expect("conn");
-    client.batch_execute(PostgresJobQueue::SCHEMA).await.expect("schema");
-    (node, Arc::new(PostgresJobQueue::new(pool)))
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .expect("pg pool");
+    let queue = Arc::new(PostgresJobQueue::new(pool));
+    queue.init_schema().await.expect("schema");
+    (node, queue)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -39,19 +39,16 @@ garde = { version = "0.23.0", features = ["derive", "email", "url"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 sha2 = "0.10.9"
 hmac = "0.12.1"
-tokio-postgres = { workspace = true, optional = true }
-deadpool-postgres = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
-rusqlite = { workspace = true, optional = true }
-mysql_async = { workspace = true, optional = true }
 
 [features]
 default = ["sqlite"]
-postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
+postgres = ["dep:sqlx", "sqlx/postgres"]
 redis = ["dep:deadpool-redis", "dep:redis"]
-sqlite = ["dep:rusqlite"]
-mysql = ["dep:mysql_async"]
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
 
 [dev-dependencies]
 tempfile = "3.27.0"

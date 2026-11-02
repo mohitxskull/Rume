@@ -10,7 +10,7 @@ use rume::persistence::SqliteBackend;
 use serde::{Deserialize, Serialize};
 
 async fn setup_real_outbox() -> Arc<SqliteBackend> {
-    let backend = SqliteBackend::in_memory().expect("sqlite in memory");
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
     backend.init_outbox_table().await.expect("init outbox table");
     Arc::new(backend)
 }
@@ -264,7 +264,7 @@ async fn transactional_outbox_commits_atomically_with_business_mutation() {
         SqliteBackend,
     };
 
-    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
     backend.init_outbox_table().await.unwrap();
     backend
         .execute("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT NOT NULL);")
@@ -315,7 +315,7 @@ async fn transactional_outbox_rolls_back_atomically_on_transaction_failure() {
         SqliteBackend,
     };
 
-    let backend = Arc::new(SqliteBackend::in_memory().unwrap());
+    let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
     backend.init_outbox_table().await.unwrap();
     backend
         .execute("CREATE TABLE orders (id TEXT PRIMARY KEY, status TEXT NOT NULL);")

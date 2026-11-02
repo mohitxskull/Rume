@@ -236,7 +236,7 @@ async fn test_csrf_signed_tokens_and_cookie_tossing_protection() {
 
 #[tokio::test]
 async fn test_audit_logging() {
-    let backend = SqliteBackend::in_memory().unwrap();
+    let backend = SqliteBackend::in_memory().await.unwrap();
     let logger = SqlAuditLogger::new(backend);
     logger.init_table().await.unwrap();
 

@@ -10,7 +10,7 @@ use rume::persistence::{
 
 #[tokio::test]
 async fn sqlite_pool_lifecycle_and_ping() {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite should initialize");
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite should initialize");
     let pool = DatabasePool::new(
         backend,
         DatabaseConfig::new("sqlite::memory:")
@@ -35,7 +35,7 @@ async fn sqlite_pool_lifecycle_and_ping() {
 
 #[tokio::test]
 async fn sqlite_migrations_and_rollback() {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
 
     let migrator = Migrator::new()
         .add_migration(
@@ -87,7 +87,7 @@ async fn sqlite_migrations_and_rollback() {
 
 #[tokio::test]
 async fn sqlite_explicit_transaction_commit_and_rollback() {
-    let backend = SqliteBackend::in_memory().expect("in-memory sqlite");
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
     backend
         .execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL);")
         .await
@@ -141,7 +141,7 @@ async fn sqlite_explicit_transaction_commit_and_rollback() {
 
 #[tokio::test]
 async fn sqlite_transactional_outbox_atomicity_and_relay() {
-    let backend = Arc::new(SqliteBackend::in_memory().expect("in-memory sqlite"));
+    let backend = Arc::new(SqliteBackend::in_memory().await.expect("in-memory sqlite"));
     backend
         .init_outbox_table()
         .await
