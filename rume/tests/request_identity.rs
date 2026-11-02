@@ -310,3 +310,50 @@ async fn concurrent_requests_have_independent_os_csprng_uuids() {
     }
     assert_eq!(ids.len(), 50);
 }
+
+#[tokio::test]
+async fn tracing_context_preserved_across_async_yields() {
+    let ctx = test_ctx();
+
+    async fn yielding_handler(request_id: RequestId) -> String {
+        let initial_id = request_id.to_string();
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
+        let final_id = request_id.to_string();
+        assert_eq!(initial_id, final_id);
+        final_id
+    }
+
+    let builder = Rume::builder(ctx).route("/yield", get(yielding_handler));
+    let router = builder.build_router(test_ctx()).unwrap();
+
+    let mut handles = Vec::new();
+    for i in 0..20 {
+        let router_clone = router.clone();
+        let custom_id = format!("yield-trace-req-{i}");
+        handles.push(tokio::spawn(async move {
+            let app = TestApp::new(router_clone.with_state(test_ctx()));
+            let req = axum::http::Request::builder()
+                .uri("/yield")
+                .header("x-request-id", &custom_id)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            let resp = app.request(req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            let hdr_id = resp
+                .headers()
+                .get(&X_REQUEST_ID)
+                .and_then(|v| v.to_str().ok())
+                .unwrap()
+                .to_string();
+            let body = TestApp::body_text(resp).await;
+            assert_eq!(hdr_id, custom_id);
+            assert_eq!(body, custom_id);
+        }));
+    }
+
+    for handle in handles {
+        handle.await.unwrap();
+    }
+}

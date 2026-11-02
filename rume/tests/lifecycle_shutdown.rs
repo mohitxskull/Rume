@@ -30,7 +30,7 @@ async fn send_get(addr: SocketAddr, path: &str) -> (u16, String) {
 
 #[tokio::test]
 async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flight() {
-    let ctx = AppContext::builder((), ()).build();
+    let ctx: AppContext<(), (), ()> = AppContext::builder((), ()).build();
 
     let (slow_started_tx, slow_started_rx) = oneshot::channel::<()>();
     let (slow_finish_tx, slow_finish_rx) = oneshot::channel::<()>();
@@ -151,4 +151,98 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
     // Final state must be Terminated
     assert_eq!(server_ctx.lifecycle.state(), LifecycleState::Terminated);
     assert_eq!(server_ctx.availability.state(), AvailabilityState::Unknown);
+}
+
+#[tokio::test]
+async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
+    let ctx: AppContext<(), (), ()> = AppContext::builder((), ()).build();
+    let server_ctx = ctx.clone();
+
+    let hook1_finished = Arc::new(AtomicBool::new(false));
+    let hook2_finished = Arc::new(AtomicBool::new(false));
+
+    let h1_flag = hook1_finished.clone();
+    let h2_flag = hook2_finished.clone();
+
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let builder = Rume::builder(ctx)
+        .router(Router::new())
+        .shutdown_timeout(Duration::from_millis(80))
+        .on_shutdown(move |_| {
+            let flag = h1_flag.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                flag.store(true, Ordering::SeqCst);
+            }
+        })
+        .on_shutdown(move |_| {
+            let flag = h2_flag.clone();
+            async move {
+                // This hook takes 250ms, exceeding the aggregate timeout
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+    let server_task = tokio::spawn(async move {
+        builder
+            .run_with_listener_and_signal(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+            .unwrap();
+    });
+
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let start = std::time::Instant::now();
+    shutdown_tx.send(()).unwrap();
+
+    server_task.await.unwrap();
+    let elapsed = start.elapsed();
+
+    // Must terminate around the 80ms timeout, well below the combined 280ms hooks duration
+    assert!(
+        elapsed < Duration::from_millis(180),
+        "shutdown took too long: {:?}",
+        elapsed
+    );
+    assert!(hook1_finished.load(Ordering::SeqCst));
+    assert!(
+        !hook2_finished.load(Ordering::SeqCst),
+        "second slow hook should have been aborted by aggregate timeout"
+    );
+    assert_eq!(server_ctx.lifecycle.state(), LifecycleState::Terminated);
+}
+
+#[tokio::test]
+async fn startup_hook_failure_executes_cleanup_hooks_and_fails_run() {
+    let ctx: AppContext<(), (), ()> = AppContext::builder((), ()).build();
+    let server_ctx = ctx.clone();
+
+    let cleanup_ran = Arc::new(AtomicBool::new(false));
+    let cleanup_flag = cleanup_ran.clone();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+
+    let builder = Rume::builder(ctx)
+        .router(Router::new())
+        .on_ready(|_| async move { Err::<(), _>("database connection refused") })
+        .on_shutdown(move |_| {
+            let flag = cleanup_flag.clone();
+            async move {
+                flag.store(true, Ordering::SeqCst);
+            }
+        });
+
+    let result = builder
+        .run_with_listener_and_signal(listener, std::future::pending::<()>())
+        .await;
+
+    assert!(result.is_err());
+    let err_msg = result.unwrap_err().to_string();
+    assert!(err_msg.contains("database connection refused"));
+    assert!(cleanup_ran.load(Ordering::SeqCst));
+    assert_eq!(server_ctx.lifecycle.state(), LifecycleState::Terminated);
 }
