@@ -55,6 +55,22 @@ pub struct OutboxMessage {
 }
 
 impl OutboxMessage {
+    /// Creates an outbox message from raw ID, event type, and payload.
+    pub fn new(id: impl Into<String>, event_type: impl Into<String>, payload: Vec<u8>) -> Self {
+        Self {
+            id: id.into(),
+            event_type: event_type.into(),
+            payload,
+            status: OutboxStatus::Pending,
+            retry_count: 0,
+            created_at: current_timestamp(),
+            last_error: None,
+            next_retry_at: None,
+            lease_token: None,
+            lease_expires_at: None,
+        }
+    }
+
     /// Creates a new outbox message from a serializable event.
     pub fn from_event<E>(event: &E) -> Result<Self, OutboxError>
     where

@@ -34,3 +34,4 @@ clap = { version = "4.6.7", features = ["derive"] }
 tempfile = "3.15.0"
 tokio-postgres = "0.7.18"
 deadpool-postgres = "0.14.2"
+testcontainers-modules = { version = "0.15", features = ["postgres"] }

@@ -48,3 +48,4 @@ postgres = ["dep:tokio-postgres", "dep:deadpool-postgres"]
 
 [dev-dependencies]
 tempfile = "3.27.0"
+testcontainers-modules = { workspace = true }

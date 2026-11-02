@@ -65,6 +65,28 @@ impl PostgresBackend {
     pub fn pool(&self) -> &Pool {
         &self.pool
     }
+
+    /// Schema DDL for the transactional outbox table in PostgreSQL.
+    pub const OUTBOX_TABLE_SCHEMA: &'static str = r#"
+CREATE TABLE IF NOT EXISTS rume_outbox (
+    id TEXT PRIMARY KEY,
+    event_type TEXT NOT NULL,
+    payload BYTEA NOT NULL,
+    status TEXT NOT NULL,
+    retry_count INT NOT NULL DEFAULT 0,
+    created_at BIGINT NOT NULL,
+    last_error TEXT,
+    next_retry_at BIGINT,
+    lease_token TEXT,
+    lease_expires_at BIGINT
+);
+"#;
+
+    /// Initializes the `rume_outbox` table if it does not already exist.
+    pub async fn init_outbox_table(&self) -> Result<(), PersistenceError> {
+        self.execute(Self::OUTBOX_TABLE_SCHEMA).await?;
+        Ok(())
+    }
 }
 
 impl DatabaseBackend for PostgresBackend {

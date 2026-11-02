@@ -167,4 +167,123 @@ impl Migrator {
             Err(PersistenceError::PendingMigrations(pending))
         }
     }
+
+    /// Executes all unapplied pending migrations in order on any [`DatabaseBackend`].
+    pub async fn run_pending_backend<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<MigrationSummary, PersistenceError> {
+        backend
+            .execute(
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+            )
+            .await?;
+
+        let mut applied = Vec::new();
+        for migration in &self.migrations {
+            let check_sql = format!(
+                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                migration.id.replace('\'', "''")
+            );
+            let exists = backend.query_scalar(&check_sql).await?;
+            if exists.is_none() {
+                if let Some(sql) = &migration.up_sql {
+                    backend
+                        .execute(sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                }
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let insert_sql = format!(
+                    "INSERT INTO rume_migrations (id, applied_at) VALUES ('{}', {})",
+                    migration.id.replace('\'', "''"),
+                    now
+                );
+                backend.execute(&insert_sql).await?;
+                applied.push(migration.id.clone());
+            }
+        }
+
+        Ok(MigrationSummary { applied })
+    }
+
+    /// Rolls back the most recently applied migration on any [`DatabaseBackend`].
+    pub async fn rollback_last_backend<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<Option<String>, PersistenceError> {
+        backend
+            .execute(
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+            )
+            .await?;
+
+        for migration in self.migrations.iter().rev() {
+            let check_sql = format!(
+                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                migration.id.replace('\'', "''")
+            );
+            let exists = backend.query_scalar(&check_sql).await?;
+            if exists.is_some() {
+                let Some(sql) = &migration.down_sql else {
+                    return Err(PersistenceError::IrreversibleMigration(
+                        migration.id.clone(),
+                    ));
+                };
+
+                backend
+                    .execute(sql)
+                    .await
+                    .map_err(|err| PersistenceError::MigrationError {
+                        migration: migration.id.clone(),
+                        message: err.to_string(),
+                    })?;
+
+                let delete_sql = format!(
+                    "DELETE FROM rume_migrations WHERE id = '{}'",
+                    migration.id.replace('\'', "''")
+                );
+                backend.execute(&delete_sql).await?;
+                return Ok(Some(migration.id.clone()));
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Preflight verification on any [`DatabaseBackend`]: fails closed if any registered migrations have not been applied.
+    pub async fn verify_no_pending_backend<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<(), PersistenceError> {
+        backend
+            .execute(
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+            )
+            .await?;
+
+        let mut pending = Vec::new();
+        for migration in &self.migrations {
+            let check_sql = format!(
+                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                migration.id.replace('\'', "''")
+            );
+            let exists = backend.query_scalar(&check_sql).await?;
+            if exists.is_none() {
+                pending.push(migration.id.clone());
+            }
+        }
+
+        if pending.is_empty() {
+            Ok(())
+        } else {
+            Err(PersistenceError::PendingMigrations(pending))
+        }
+    }
 }
