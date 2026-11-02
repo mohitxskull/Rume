@@ -1,0 +1,28 @@
+// `sourceLanguages` is required by CodeLLDB for Rust (not by GDB): without it
+// the adapter will not map frames back to .rs sources.
+[
+  {
+    "label": "Debug rume (bin)",
+    "adapter": "CodeLLDB",
+    "request": "launch",
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "rume-cli", "--bin", "rume"]
+    },
+    "program": "$ZED_WORKTREE_ROOT/target/debug/rume",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["rust"]
+  },
+  {
+    "label": "Debug rume (bin, GDB)",
+    "adapter": "GDB",
+    "request": "launch",
+    "build": {
+      "command": "cargo",
+      "args": ["build", "-p", "rume-cli", "--bin", "rume"]
+    },
+    "program": "$ZED_WORKTREE_ROOT/target/debug/rume",
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "sourceLanguages": ["rust"]
+  }
+]

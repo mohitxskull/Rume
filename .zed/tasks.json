@@ -1,0 +1,49 @@
+// One task per verification subject, plus the combined gate.
+// Why: `.opencode/rules/40-verification.md` requires the whole check — fmt,
+// clippy (zero warnings), build, test — as one runnable command per subject,
+// and rejects a targeted check standing in for it. `verify` is that gate.
+[
+  {
+    "label": "rume: fmt (check)",
+    "command": "cargo",
+    "args": ["fmt", "--all", "--", "--check"],
+    "reveal": "no_focus"
+  },
+  {
+    "label": "rume: clippy",
+    "command": "cargo",
+    "args": ["clippy", "--workspace", "--all-targets", "--", "-D", "warnings"],
+    "reveal": "always"
+  },
+  {
+    "label": "rume: build",
+    "command": "cargo",
+    "args": ["build", "--workspace", "--all-targets"],
+    "reveal": "always"
+  },
+  {
+    "label": "rume: test",
+    "command": "cargo",
+    "args": ["test", "--workspace"],
+    "reveal": "always"
+  },
+  {
+    // Why one command rather than a task chain: a chain reports the last exit
+    // code, so a clippy failure would be masked by a later passing test.
+    "label": "rume: verify",
+    "command": "sh",
+    "args": [
+      "-c",
+      "cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo build --workspace --all-targets && cargo test --workspace"
+    ],
+    "reveal": "always",
+    "save": "all"
+  },
+  {
+    "label": "rume: run server",
+    "command": "cargo",
+    "args": ["run", "-p", "rume-cli"],
+    "reveal": "always",
+    "save": "all"
+  }
+]
