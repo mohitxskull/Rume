@@ -44,8 +44,9 @@ pub use helpers::{
     safe_equal, sentence_case, slug, snake_case, title_case, to_sentence, truncate,
 };
 pub use jobs::{
-    Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker, MemoryJobQueue,
-    QueuedJob, RetryPolicy,
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, Job, JobContext, JobError, JobHandler,
+    JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
+    MemoryJobQueue, QueuedJob, RetryPolicy,
 };
 pub use module::{Module, ModuleContext, ModuleError};
 pub use openapi::{

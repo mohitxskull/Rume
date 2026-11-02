@@ -23,8 +23,9 @@ pub use crate::helpers::{
     safe_equal, slug, truncate,
 };
 pub use crate::jobs::{
-    Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker, MemoryJobQueue,
-    QueuedJob, RetryPolicy,
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, Job, JobContext, JobError, JobHandler,
+    JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
+    MemoryJobQueue, QueuedJob, RetryPolicy,
 };
 pub use crate::module::{Module, ModuleContext, ModuleError};
 pub use crate::openapi::{
