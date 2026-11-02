@@ -39,11 +39,11 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group C — Worker Panic Safety & Concurrency Bounds (solve together)
 > Root cause: Missing task tracking guards and task spawn concurrency controls.
 
-- [ ] **Correctness C1 — Panic during job execution permanently leaks `in_flight_count` and hangs `drain()`** (`correctness.md` C1).
+- [x] **Correctness C1 — Panic during job execution permanently leaks `in_flight_count` and hangs `drain()`** (`correctness.md` C1).
       `rume/src/jobs/worker.rs:133–141`: `in_flight.fetch_sub` is called only at the end of the spawned task; an unhandled panic bypasses decrement, causing `drain()` to hang indefinitely during shutdown. Use an RAII drop guard for `in_flight_count` decrement.
-- [ ] **Correctness M2 — `Job::timeout()` is never enforced during job execution** (`correctness.md` M2).
+- [x] **Correctness M2 — `Job::timeout()` is never enforced during job execution** (`correctness.md` M2).
       `rume/src/jobs/worker.rs:154–173`: Worker executes `handler.execute(ctx)` without wrapping in `tokio::time::timeout`, leaving `JobError::Timeout` as dead code and allowing hung handlers to block worker drain. Wrap execution in `tokio::time::timeout`.
-- [ ] **Enterprise-Reliability M1 — `JobWorker` lacks shed-load concurrency bounds** (`enterprise-reliability.md` M1).
+- [x] **Enterprise-Reliability M1 — `JobWorker` lacks shed-load concurrency bounds** (`enterprise-reliability.md` M1).
       `rume/src/jobs/worker.rs:120–135`: Queue poll loop spawns unbounded Tokio tasks for every fetched job without a semaphore or concurrency permit limit. Introduce a configurable concurrency limiter (`tokio::sync::Semaphore`).
 
 ---

@@ -60,6 +60,8 @@ pub struct QueuedJob {
     pub attempt: u32,
     /// Job retry strategy.
     pub retry_policy: RetryPolicy,
+    /// Execution timeout for a single attempt.
+    pub timeout: Option<Duration>,
     /// Earliest time when this job is eligible for execution.
     pub available_at: Instant,
 }

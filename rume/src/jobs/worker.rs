@@ -71,7 +71,24 @@ impl JobRegistry {
             max_attempts: job.retry_policy.max_attempts,
         };
 
-        handler(&ctx, &job.payload).await
+        let fut = handler(&ctx, &job.payload);
+        if let Some(timeout) = job.timeout {
+            match tokio::time::timeout(timeout, fut).await {
+                Ok(res) => res,
+                Err(_) => Err(JobError::Timeout),
+            }
+        } else {
+            fut.await
+        }
+    }
+}
+
+/// RAII drop guard ensuring in-flight job counter is decremented even if the worker panics.
+struct InFlightGuard(Arc<AtomicU32>);
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -81,6 +98,8 @@ pub struct JobWorker<Q: JobQueue> {
     registry: Arc<JobRegistry>,
     is_stopping: Arc<AtomicBool>,
     in_flight_count: Arc<AtomicU32>,
+    concurrency_limit: usize,
+    semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 impl<Q: JobQueue> Clone for JobWorker<Q> {
@@ -90,6 +109,8 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             registry: Arc::clone(&self.registry),
             is_stopping: Arc::clone(&self.is_stopping),
             in_flight_count: Arc::clone(&self.in_flight_count),
+            concurrency_limit: self.concurrency_limit,
+            semaphore: Arc::clone(&self.semaphore),
         }
     }
 }
@@ -102,19 +123,43 @@ impl<Q: JobQueue> Debug for JobWorker<Q> {
                 "in_flight_jobs",
                 &self.in_flight_count.load(Ordering::Relaxed),
             )
+            .field("concurrency_limit", &self.concurrency_limit)
             .finish()
     }
 }
 
 impl<Q: JobQueue> JobWorker<Q> {
-    /// Creates a new background worker.
+    /// Default concurrent job execution limit.
+    pub const DEFAULT_CONCURRENCY: usize = 50;
+
+    /// Creates a new background worker with default concurrency limit.
     pub fn new(queue: Arc<Q>, registry: Arc<JobRegistry>) -> Self {
+        Self::with_concurrency_limit(queue, registry, Self::DEFAULT_CONCURRENCY)
+    }
+
+    /// Creates a new background worker with a custom concurrency limit.
+    pub fn with_concurrency_limit(
+        queue: Arc<Q>,
+        registry: Arc<JobRegistry>,
+        concurrency_limit: usize,
+    ) -> Self {
+        let limit = concurrency_limit.max(1);
         Self {
             queue,
             registry,
             is_stopping: Arc::new(AtomicBool::new(false)),
             in_flight_count: Arc::new(AtomicU32::new(0)),
+            concurrency_limit: limit,
+            semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
         }
+    }
+
+    /// Sets the worker's concurrent task capacity.
+    pub fn with_concurrency(mut self, limit: usize) -> Self {
+        let limit = limit.max(1);
+        self.concurrency_limit = limit;
+        self.semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+        self
     }
 
     /// Spawns the background execution loop into the current async runtime.
@@ -128,6 +173,11 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Internal worker execution loop.
     async fn run_loop(&self) {
         while !self.is_stopping.load(Ordering::Relaxed) {
+            let permit = match self.semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(_) => break,
+            };
+
             match self.queue.dequeue().await {
                 Ok(Some(job)) => {
                     self.in_flight_count.fetch_add(1, Ordering::SeqCst);
@@ -136,14 +186,17 @@ impl<Q: JobQueue> JobWorker<Q> {
                     let in_flight = Arc::clone(&self.in_flight_count);
 
                     tokio::spawn(async move {
+                        let _permit = permit;
+                        let _guard = InFlightGuard(in_flight);
                         Self::execute_job(queue, registry, job).await;
-                        in_flight.fetch_sub(1, Ordering::SeqCst);
                     });
                 }
                 Ok(None) => {
+                    drop(permit);
                     sleep(Duration::from_millis(25)).await;
                 }
                 Err(_) => {
+                    drop(permit);
                     sleep(Duration::from_millis(50)).await;
                 }
             }

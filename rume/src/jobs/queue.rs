@@ -81,6 +81,7 @@ impl JobQueue for MemoryJobQueue {
     ) -> BoxFuture<'_, Result<String, JobError>> {
         let name = J::NAME.to_string();
         let retry_policy = job.retry_policy();
+        let timeout = job.timeout();
         let id = Uuid::new_v4().to_string();
 
         Box::pin(async move {
@@ -102,6 +103,7 @@ impl JobQueue for MemoryJobQueue {
                 payload,
                 attempt: 0,
                 retry_policy,
+                timeout,
                 available_at: Instant::now() + delay,
             };
 

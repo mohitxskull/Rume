@@ -249,3 +249,154 @@ async fn worker_graceful_drain_waits_for_in_flight_jobs() {
     assert!(drained);
     assert_eq!(finished.load(Ordering::SeqCst), 1);
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PanickingJob;
+
+impl Job for PanickingJob {
+    const NAME: &'static str = "panicking_job";
+}
+
+struct PanickingJobHandler;
+
+impl JobHandler<PanickingJob> for PanickingJobHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a JobContext,
+        _job: PanickingJob,
+    ) -> BoxFuture<'a, Result<(), JobError>> {
+        Box::pin(async move {
+            panic!("unhandled handler panic");
+        })
+    }
+}
+
+#[tokio::test]
+async fn worker_panic_does_not_leak_in_flight_count() {
+    let queue = Arc::new(MemoryJobQueue::new());
+    let mut registry = JobRegistry::new();
+    registry.register(PanickingJobHandler);
+
+    let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
+    worker.start();
+
+    queue.enqueue(PanickingJob).await.unwrap();
+
+    // Give time for worker to dequeue and panic
+    sleep(Duration::from_millis(50)).await;
+
+    // Drain should succeed without hanging because RAII guard decremented in_flight_count
+    let drained = worker.drain(Duration::from_millis(200)).await;
+    assert!(drained);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TimeoutJob;
+
+impl Job for TimeoutJob {
+    const NAME: &'static str = "timeout_job";
+
+    fn timeout(&self) -> Option<Duration> {
+        Some(Duration::from_millis(30))
+    }
+
+    fn retry_policy(&self) -> RetryPolicy {
+        RetryPolicy::new().with_max_attempts(1)
+    }
+}
+
+struct TimeoutJobHandler;
+
+impl JobHandler<TimeoutJob> for TimeoutJobHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a JobContext,
+        _job: TimeoutJob,
+    ) -> BoxFuture<'a, Result<(), JobError>> {
+        Box::pin(async move {
+            sleep(Duration::from_millis(200)).await;
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn job_timeout_is_enforced() {
+    let queue = Arc::new(MemoryJobQueue::new());
+    let mut registry = JobRegistry::new();
+    registry.register(TimeoutJobHandler);
+
+    let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
+    worker.start();
+
+    queue.enqueue(TimeoutJob).await.unwrap();
+
+    // Wait for execution and DLQ after timeout
+    for _ in 0..50 {
+        if queue.dead_letter_count().await.unwrap() >= 1 {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    assert_eq!(queue.dead_letter_count().await.unwrap(), 1);
+    let _ = worker.drain(Duration::from_millis(100)).await;
+}
+
+#[tokio::test]
+async fn worker_concurrency_is_bounded() {
+    let queue = Arc::new(MemoryJobQueue::new());
+    let mut registry = JobRegistry::new();
+
+    let concurrent_running = Arc::new(AtomicU32::new(0));
+    let max_observed = Arc::new(AtomicU32::new(0));
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BoundJob;
+    impl Job for BoundJob {
+        const NAME: &'static str = "bound_job";
+    }
+
+    struct BoundHandler {
+        running: Arc<AtomicU32>,
+        max_seen: Arc<AtomicU32>,
+    }
+
+    impl JobHandler<BoundJob> for BoundHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: BoundJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let running = Arc::clone(&self.running);
+            let max_seen = Arc::clone(&self.max_seen);
+            Box::pin(async move {
+                let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
+                max_seen.fetch_max(cur, Ordering::SeqCst);
+                sleep(Duration::from_millis(50)).await;
+                running.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    registry.register(BoundHandler {
+        running: Arc::clone(&concurrent_running),
+        max_seen: Arc::clone(&max_observed),
+    });
+
+    let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry)).with_concurrency(2);
+    worker.start();
+
+    for _ in 0..6 {
+        queue.enqueue(BoundJob).await.unwrap();
+    }
+
+    let drained = worker.drain(Duration::from_millis(600)).await;
+    assert!(drained);
+    assert!(
+        max_observed.load(Ordering::SeqCst) <= 2,
+        "max concurrent observed was {}",
+        max_observed.load(Ordering::SeqCst)
+    );
+}
