@@ -22,11 +22,17 @@ const MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.sql");
 const INSERT_OUTBOX_SQL: &str = include_str!("sql/mysql/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/mysql/outbox_recover.sql");
 
-/// Production MySQL database backend backed by an asynchronous SQLx connection pool.
+/// Production MySQL and MariaDB database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]
 pub struct MysqlBackend {
     pool: MySqlPool,
 }
+
+/// Type alias for [`MysqlBackend`], which natively supports MariaDB 10.6+ via SQLx.
+pub type MariadbBackend = MysqlBackend;
+
+/// Type alias for [`MysqlTransaction`].
+pub type MariadbTransaction = MysqlTransaction;
 
 impl Debug for MysqlBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

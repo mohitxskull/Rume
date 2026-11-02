@@ -25,4 +25,4 @@ pub use postgres::{PostgresBackend, PostgresTransaction};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteTransaction};
 #[cfg(feature = "mysql")]
-pub use mysql::{MysqlBackend, MysqlTransaction};
+pub use mysql::{MariadbBackend, MariadbTransaction, MysqlBackend, MysqlTransaction};
