@@ -60,22 +60,17 @@ fn generated_project_compiles_and_tests_pass() {
             .arg("--check")
             .current_dir(&tmp_dir),
     );
-    assert!(fmt_ok, "`cargo fmt --check` should pass in generated project");
+    assert!(
+        fmt_ok,
+        "`cargo fmt --check` should pass in generated project"
+    );
 
     // 3. Run `cargo check` in the project dir
-    let check_ok = run_command(
-        Command::new("cargo")
-            .arg("check")
-            .current_dir(&tmp_dir),
-    );
+    let check_ok = run_command(Command::new("cargo").arg("check").current_dir(&tmp_dir));
     assert!(check_ok, "`cargo check` should pass in generated project");
 
     // 4. Run `cargo test` in the project dir
-    let test_ok = run_command(
-        Command::new("cargo")
-            .arg("test")
-            .current_dir(&tmp_dir),
-    );
+    let test_ok = run_command(Command::new("cargo").arg("test").current_dir(&tmp_dir));
     assert!(test_ok, "`cargo test` should pass in generated project");
 
     // Cleanup

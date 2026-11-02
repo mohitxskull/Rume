@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::time::Duration;
 use tokio::net::TcpListener;
+use tokio::time::timeout;
 
 /// Runtime environment, normalized from `RUME_ENV`/`NODE_ENV`.
 #[derive(Debug, Clone)]
@@ -454,6 +456,8 @@ where
     applied_middleware: BTreeSet<String>,
     /// Group names marked for application via `use_group`.
     applied_groups: BTreeSet<String>,
+    /// Maximum time to wait for all shutdown hooks before force-terminating.
+    shutdown_timeout: Duration,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -485,6 +489,7 @@ where
             groups_order: Vec::new(),
             applied_middleware: BTreeSet::new(),
             applied_groups: BTreeSet::new(),
+            shutdown_timeout: Duration::from_secs(30),
         }
     }
 
@@ -639,6 +644,16 @@ where
         self
     }
 
+    /// Set the maximum time to wait for all shutdown hooks before
+    /// force-terminating.
+    ///
+    /// A shutdown hook that exceeds this duration is aborted with a warning
+    /// so a slow hook cannot block process termination indefinitely.
+    pub fn shutdown_timeout(mut self, duration: Duration) -> Self {
+        self.shutdown_timeout = duration;
+        self
+    }
+
     /// Build the router with all applied named middleware and groups wrapped
     /// around the routes, without binding a port. Intended for tests;
     /// [`run`](Self::run) calls this before serving.
@@ -749,9 +764,10 @@ where
         println!("listening on http://{addr}");
 
         // Apply named middleware and groups before serving. `build_router`
-        // consumes `self`, so take the shutdown hooks first: they must still
-        // run after the server stops.
+        // consumes `self`, so take the shutdown hooks and timeout first:
+        // they must still run after the server stops.
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let shutdown_timeout = self.shutdown_timeout;
         let serve_ctx = self.ctx.clone();
         let router = self.build_router(serve_ctx.clone());
 
@@ -767,7 +783,15 @@ where
             .set(AvailabilityState::RefusingTraffic);
 
         for hook in on_shutdown {
-            hook(serve_ctx.clone()).await;
+            match timeout(shutdown_timeout, hook(serve_ctx.clone())).await {
+                Ok(()) => {}
+                Err(_) => {
+                    tracing::warn!(
+                        "shutdown hook exceeded {}s timeout, aborting",
+                        shutdown_timeout.as_secs()
+                    );
+                }
+            }
         }
 
         serve_ctx.lifecycle.set(LifecycleState::Terminated);
