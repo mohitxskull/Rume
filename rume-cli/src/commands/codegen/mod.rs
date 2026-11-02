@@ -13,15 +13,42 @@ pub fn run() {
         std::process::exit(1);
     }
 
-    let mut modules: Vec<String> = Vec::new();
-    let entries = match fs::read_dir(handlers_dir) {
+    regenerate_dir(handlers_dir, "handler");
+    regenerate_dir(Path::new("src/models"), "model");
+    regenerate_dir(Path::new("src/services"), "service");
+    regenerate_dir(Path::new("src/middleware"), "middleware");
+
+    // Validate routes.rs marker.
+    let routes_path = Path::new("src/routes.rs");
+    if routes_path.is_file() {
+        match fs::read_to_string(routes_path) {
+            Ok(content) if content.contains("// rume:routes") => {
+                println!("  routes.rs marker present");
+            }
+            Ok(_) => {
+                println!("  warning: src/routes.rs is missing the `// rume:routes` marker");
+            }
+            Err(err) => {
+                eprintln!("  warning: could not read src/routes.rs: {err}");
+            }
+        }
+    }
+}
+
+fn regenerate_dir(dir: &Path, label: &str) {
+    if !dir.is_dir() {
+        return;
+    }
+
+    let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) => {
-            eprintln!("error: failed to read src/handlers: {err}");
-            std::process::exit(1);
+            eprintln!("error: failed to read {}: {err}", dir.display());
+            return;
         }
     };
 
+    let mut modules: Vec<String> = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
@@ -43,28 +70,12 @@ pub fn run() {
         content.push_str(&format!("pub mod {module};\n"));
     }
 
-    let mod_path = handlers_dir.join("mod.rs");
+    let mod_path = dir.join("mod.rs");
     if let Err(err) = fs::write(&mod_path, content) {
         eprintln!("error: failed to write {}: {err}", mod_path.display());
         std::process::exit(1);
     }
 
     println!("Regenerated {}", mod_path.display());
-    println!("  {} handler module(s)", modules.len());
-
-    // Validate routes.rs marker.
-    let routes_path = Path::new("src/routes.rs");
-    if routes_path.is_file() {
-        match fs::read_to_string(routes_path) {
-            Ok(content) if content.contains("// rume:routes") => {
-                println!("  routes.rs marker present");
-            }
-            Ok(_) => {
-                println!("  warning: src/routes.rs is missing the `// rume:routes` marker");
-            }
-            Err(err) => {
-                eprintln!("  warning: could not read src/routes.rs: {err}");
-            }
-        }
-    }
+    println!("  {} {} module(s)", modules.len(), label);
 }
