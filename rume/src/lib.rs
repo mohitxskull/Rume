@@ -45,6 +45,8 @@ pub use auth::{
     RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
     authorize,
 };
+#[cfg(feature = "redis")]
+pub use cache::RedisCacheBackend;
 pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use coordination::{
     CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
