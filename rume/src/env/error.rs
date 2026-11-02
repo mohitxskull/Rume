@@ -34,13 +34,16 @@ pub enum EnvError {
 }
 
 impl EnvError {
+    #[allow(dead_code)]
     pub(crate) fn from_figment(err: figment::Error) -> Self {
-        Self::Validation(err.to_string())
+        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &[]);
+        Self::Validation(redacted)
     }
 }
 
 impl From<figment::Error> for EnvError {
     fn from(err: figment::Error) -> Self {
-        Self::Validation(err.to_string())
+        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &[]);
+        Self::Validation(redacted)
     }
 }

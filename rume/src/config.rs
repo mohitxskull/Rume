@@ -24,7 +24,8 @@ pub enum ConfigError {
 
 impl From<figment::Error> for ConfigError {
     fn from(err: figment::Error) -> Self {
-        Self::Validation(err.to_string())
+        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &[]);
+        Self::Validation(redacted)
     }
 }
 

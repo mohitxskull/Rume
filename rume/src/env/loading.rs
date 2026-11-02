@@ -85,6 +85,7 @@ where
         let value = value
             .parse::<figment::value::Value>()
             .map_err(|err| EnvError::Validation(err.to_string()))?;
+        parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
     for (key, secret) in &resolved.secrets {
@@ -92,11 +93,21 @@ where
             .expose_secret()
             .parse::<figment::value::Value>()
             .map_err(|err| EnvError::Validation(err.to_string()))?;
+        parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key.clone(), value);
     }
 
+    let known_secrets: Vec<&str> = resolved
+        .secrets
+        .values()
+        .map(|s| s.expose_secret().as_str())
+        .collect();
+
     let figment = Figment::from(Serialized::defaults(parsed));
-    figment.extract::<T>().map_err(EnvError::from_figment)
+    figment.extract::<T>().map_err(|err| {
+        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+        EnvError::Validation(redacted)
+    })
 }
 
 /// Load the merged environment map for the current directory.
