@@ -8,6 +8,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod cache;
 pub mod config;
 pub mod env;
 pub mod error;
@@ -30,6 +31,7 @@ pub use auth::{
     RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
     authorize,
 };
+pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use error::AppError;
 pub use helpers::{
     camel_case, condense_whitespace, dot_case, escape_html, excerpt, format_bytes, format_duration,

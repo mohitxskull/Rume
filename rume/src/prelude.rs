@@ -11,6 +11,7 @@ pub use crate::auth::{
     RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
     authorize,
 };
+pub use crate::cache::{Cache, CacheBackend, CacheConfig, CacheError, MemoryCacheBackend};
 pub use crate::config;
 pub use crate::config::ConfigError;
 pub use crate::env;
