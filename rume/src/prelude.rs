@@ -50,6 +50,10 @@ pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
+pub use crate::tenant::{
+    HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant, TenantContext,
+    TenantError, TenantLayer, TenantResolver, TenantScopedCache,
+};
 pub use crate::testing::{TestApp, TestAppBuilder};
 pub use crate::validation::{
     Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery,
