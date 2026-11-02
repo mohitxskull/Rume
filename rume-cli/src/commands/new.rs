@@ -54,6 +54,7 @@ struct TemplateContext<'a> {
 
 const TEMPLATES: &[(&str, &str)] = &[
     ("Cargo.toml", include_str!("../../templates/Cargo.toml.tpl")),
+    ("src/lib.rs", include_str!("../../templates/src/lib.rs.tpl")),
     (
         "src/main.rs",
         include_str!("../../templates/src/main.rs.tpl"),
@@ -192,8 +193,10 @@ fn validate_name(name: &str) -> Result<(), NewError> {
 }
 
 fn render(template: &str, context: &TemplateContext<'_>) -> String {
+    let crate_name = context.name.replace('-', "_");
     template
         .replace("{{name}}", context.name)
+        .replace("{{crate_name}}", &crate_name)
         .replace("{{rume_dependency}}", context.rume_dependency)
 }
 

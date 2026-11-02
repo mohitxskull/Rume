@@ -56,9 +56,10 @@ pub fn run(cli: Cli) {
             require_rume_project();
             config::run(command);
         }
-        Some(Commands::Doctor { format }) => {
+        Some(Commands::Doctor { format, json }) => {
             require_rume_project();
-            doctor::run(&format);
+            let fmt = if json { "json" } else { &format };
+            doctor::run(fmt);
         }
         Some(Commands::ListRoutes { json }) => {
             require_rume_project();

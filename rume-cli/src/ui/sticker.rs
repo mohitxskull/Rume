@@ -1,6 +1,7 @@
 //! Sticker / boxed content for highlighting important info.
 
 use console::Style;
+use unicode_width::UnicodeWidthStr;
 
 /// Render boxed content (sticker).
 pub struct Sticker {
@@ -21,15 +22,27 @@ impl Sticker {
         self
     }
 
-    pub fn render(&self) {
-        let max_len = self.lines.iter().map(|l| l.len()).max().unwrap_or(0);
-        let border = "─".repeat(max_len + 2);
-        println!("┌{}┐", border);
+    pub fn render_to_string(&self) -> String {
+        let max_width = self
+            .lines
+            .iter()
+            .map(|l| UnicodeWidthStr::width(l.as_str()))
+            .max()
+            .unwrap_or(0);
+        let border = "─".repeat(max_width + 2);
+        let mut out = String::new();
+        out.push_str(&format!("┌{}┐\n", border));
         for line in &self.lines {
-            let padding = " ".repeat(max_len - line.len());
-            println!("│ {}{} │", line, padding);
+            let line_width = UnicodeWidthStr::width(line.as_str());
+            let padding = " ".repeat(max_width.saturating_sub(line_width));
+            out.push_str(&format!("│ {}{} │\n", line, padding));
         }
-        println!("└{}┘", border);
+        out.push_str(&format!("└{}┘\n", border));
+        out
+    }
+
+    pub fn render(&self) {
+        print!("{}", self.render_to_string());
     }
 }
 
@@ -64,5 +77,27 @@ impl Instructions {
 impl Default for Instructions {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sticker_aligns_with_unicode_characters() {
+        let mut sticker = Sticker::new();
+        sticker.add("Hello World");
+        sticker.add("🚀 Launch");
+        sticker.add("café ☕");
+        let rendered = sticker.render_to_string();
+        for line in rendered.lines() {
+            // Every box line should have the exact same terminal display width
+            assert_eq!(
+                UnicodeWidthStr::width(line),
+                UnicodeWidthStr::width("┌─────────────┐"),
+                "Line display width should match top border: {line}"
+            );
+        }
     }
 }

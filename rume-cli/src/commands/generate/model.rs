@@ -13,7 +13,7 @@ pub fn run(name: &str) {
     }
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
-    let struct_name = capitalize(&module_name);
+    let struct_name = rume::helpers::pascal_case(&module_name);
 
     let dir = "src/models";
     let _ = std::fs::create_dir_all(dir);
@@ -52,12 +52,4 @@ pub fn run(name: &str) {
     println!("Generated model `{name}`");
     println!("  created {model_path}");
     println!("  updated {mod_path}");
-}
-
-fn capitalize(value: &str) -> String {
-    let mut chars = value.chars();
-    match chars.next() {
-        Some(first) => first.to_ascii_uppercase().to_string() + chars.as_str(),
-        None => String::new(),
-    }
 }

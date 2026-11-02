@@ -59,14 +59,24 @@ pub fn run(kind: Option<&str>, name: Option<&str>) {
 }
 
 pub(crate) fn ensure_main_mod(module_name: &str) {
-    let main_path = "src/main.rs";
-    if let Ok(content) = std::fs::read_to_string(main_path) {
-        let mod_stmt = format!("mod {module_name};");
+    let (target_path, is_pub) = if std::path::Path::new("src/lib.rs").is_file() {
+        ("src/lib.rs", true)
+    } else {
+        ("src/main.rs", false)
+    };
+    if let Ok(content) = std::fs::read_to_string(target_path) {
+        let mod_stmt = if is_pub {
+            format!("pub mod {module_name};")
+        } else {
+            format!("mod {module_name};")
+        };
         if !content.lines().any(|l| l.trim() == mod_stmt) {
             let lines: Vec<&str> = content.lines().collect();
-            let last_mod_pos = lines
-                .iter()
-                .rposition(|l| l.trim().starts_with("mod ") && l.trim().ends_with(';'));
+            let last_mod_pos = lines.iter().rposition(|l| {
+                let trimmed = l.trim();
+                (trimmed.starts_with("mod ") || trimmed.starts_with("pub mod "))
+                    && trimmed.ends_with(';')
+            });
             let new_content = match last_mod_pos {
                 Some(pos) => {
                     let mut res = String::new();
@@ -82,7 +92,7 @@ pub(crate) fn ensure_main_mod(module_name: &str) {
                 }
                 None => format!("{mod_stmt}\n{content}"),
             };
-            let _ = std::fs::write(main_path, new_content);
+            let _ = std::fs::write(target_path, new_content);
         }
     }
 }

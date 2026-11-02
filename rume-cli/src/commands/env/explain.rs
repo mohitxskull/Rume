@@ -5,11 +5,19 @@
 
 use rume::env::{ResolvedEnv, is_secret_key, redact_value};
 
-pub fn run(key: &str) {
+pub fn run(key: &str, json: bool) {
     let resolved = match ResolvedEnv::load() {
         Ok(r) => r,
         Err(err) => {
-            eprintln!("error: failed to load environment: {err}");
+            if json {
+                let err_json = serde_json::json!({ "error": err.to_string() });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&err_json).unwrap_or_default()
+                );
+            } else {
+                eprintln!("error: failed to load environment: {err}");
+            }
             std::process::exit(1);
         }
     };
@@ -18,8 +26,18 @@ pub fn run(key: &str) {
     let raw_value = match resolved.get(key) {
         Some(v) => v.to_string(),
         None => {
-            eprintln!("error: environment variable '{key}' is not defined");
-            eprintln!("hint: check your .env files or process environment");
+            if json {
+                let err_json = serde_json::json!({
+                    "error": format!("environment variable '{key}' is not defined")
+                });
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&err_json).unwrap_or_default()
+                );
+            } else {
+                eprintln!("error: environment variable '{key}' is not defined");
+                eprintln!("hint: check your .env files or process environment");
+            }
             std::process::exit(1);
         }
     };
@@ -35,6 +53,18 @@ pub fn run(key: &str) {
 
     let from_file = resolved.file_keys.contains(key);
     let source_type = if from_file { "env file" } else { "process env" };
+
+    if json {
+        let out = serde_json::json!({
+            "key": key,
+            "value": display_value,
+            "is_secret": is_secret,
+            "source": source,
+            "source_type": source_type,
+        });
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+        return;
+    }
 
     println!("KEY: {key}");
     println!("Resolved value: {display_value}");

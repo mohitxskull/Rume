@@ -41,6 +41,9 @@ pub enum Commands {
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// List registered routes.
     #[command(name = "list:routes", alias = "list-routes")]
@@ -76,11 +79,17 @@ pub enum EnvCommands {
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Explain how a single environment variable was resolved.
     Explain {
         /// Environment variable name to explain.
         key: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -94,5 +103,16 @@ pub enum ConfigCommands {
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Explain how a configuration key was resolved and its source provenance.
+    Explain {
+        /// Config key to explain (e.g. app.name or database.url).
+        key: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }

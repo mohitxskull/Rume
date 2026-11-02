@@ -262,4 +262,57 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
         parsed_config.get("config").is_some(),
         "config check JSON must have 'config' field"
     );
+
+    //    e. Standardized --json flag across commands:
+    //       - rume doctor --json
+    let doctor_json_flag = Command::new(rume_binary())
+        .arg("doctor")
+        .arg("--json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute doctor --json");
+    assert!(doctor_json_flag.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&doctor_json_flag.stdout)
+        .expect("doctor --json output must be valid JSON");
+    assert!(parsed.get("checks").is_some());
+
+    //       - rume env check --json
+    let env_json_flag = Command::new(rume_binary())
+        .arg("env")
+        .arg("check")
+        .arg("--json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute env check --json");
+    assert!(env_json_flag.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&env_json_flag.stdout)
+        .expect("env check --json output must be valid JSON");
+    assert!(parsed.get("resolved").is_some());
+
+    //       - rume config check --json
+    let config_json_flag = Command::new(rume_binary())
+        .arg("config")
+        .arg("check")
+        .arg("--json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute config check --json");
+    assert!(config_json_flag.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&config_json_flag.stdout)
+        .expect("config check --json output must be valid JSON");
+    assert!(parsed.get("config").is_some());
+
+    //       - rume config explain app.name --json
+    let explain_json = Command::new(rume_binary())
+        .arg("config")
+        .arg("explain")
+        .arg("app.name")
+        .arg("--json")
+        .current_dir(&project_path)
+        .output()
+        .expect("execute config explain app.name --json");
+    assert!(explain_json.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&explain_json.stdout)
+        .expect("config explain --json output must be valid JSON");
+    assert_eq!(parsed.get("key").and_then(|k| k.as_str()), Some("app.name"));
 }

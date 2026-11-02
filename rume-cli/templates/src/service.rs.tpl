@@ -1,5 +1,3 @@
-use rume::prelude::*;
-
 #[derive(Debug, Default, Clone)]
 pub struct {{Name}}Service;
 

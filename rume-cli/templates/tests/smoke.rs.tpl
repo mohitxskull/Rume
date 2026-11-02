@@ -1,15 +1,8 @@
-use rume::config;
+use rume::app::AppContext;
 use rume::prelude::*;
-
-#[derive(Deserialize)]
-struct Config {
-    app: AppConfig,
-}
-
-#[derive(Deserialize)]
-struct AppConfig {
-    name: String,
-}
+use {{crate_name}}::app::{AppState, build_router};
+use {{crate_name}}::config::Config;
+use {{crate_name}}::env::Env;
 
 #[test]
 fn config_loads() {
@@ -23,22 +16,17 @@ fn config_loads() {
 
 #[tokio::test]
 async fn health_endpoint_returns_ok() {
-    use axum::{Json, Router, routing::get};
-
-    #[derive(Serialize)]
-    struct Health {
-        status: &'static str,
+    unsafe {
+        std::env::set_var("RUME_ENV", "test");
     }
-
-    async fn health() -> Json<Health> {
-        Json(Health { status: "ok" })
-    }
-
-    let router = Router::new().route("/health", get(health));
+    let env = rume::env::load::<Env>().expect("env should load");
+    let config = rume::config::load::<Config>().expect("config should load");
+    let ctx = AppContext::builder(env, config).state(AppState).build();
+    let router = build_router(ctx.clone()).with_state(ctx);
     let app = TestApp::new(router);
 
     let response = app.get("/health").await;
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     let body = TestApp::body_text(response).await;
-    assert_eq!(body, r#"{"status":"ok"}"#);
+    assert!(body.contains("\"status\":\"ok\""));
 }

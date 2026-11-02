@@ -128,15 +128,15 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 
 ### Group J — Scaffolding, CLI & Template Alignment (solve together)
 
-- [ ] **DX M5 — Scaffolding template README advertises non-existent `/health` route** (`dx-tooling.md` M5).
+- [x] **DX M5 — Scaffolding template README advertises non-existent `/health` route** (`dx-tooling.md` M5).
       `rume-cli/templates/README.md.tpl`: Documents `GET /health`, but scaffolded `routes.rs.tpl` only registers `/users` and `/posts`. Align template routes with documented operational endpoints.
-- [ ] **DX m2 — Inconsistent JSON CLI flags across inspection commands** (`dx-tooling.md` m2).
+- [x] **DX m2 — Inconsistent JSON CLI flags across inspection commands** (`dx-tooling.md` m2).
       `rume-cli/src/cli.rs:40–60`: `env check` accepts `--all`, `doctor` accepts `--format json`, `config check` lacks JSON. Standardize on `--json` across all CLI diagnostic commands.
-- [ ] **DX m3 — CLI generators use naive first-letter `capitalize` rather than `pascal_case`** (`dx-tooling.md` m3).
+- [x] **DX m3 — CLI generators use naive first-letter `capitalize` rather than `pascal_case`** (`dx-tooling.md` m3).
       `rume-cli/src/commands/generate/mod.rs:30–50`: Generating `user_profile` produces `User_profile` instead of `UserProfile`. Use `rume::helpers::pascal_case`.
-- [ ] **DX m7 — Generated project `tests/smoke.rs.tpl` tests throwaway inline router** (`dx-tooling.md` m7).
+- [x] **DX m7 — Generated project `tests/smoke.rs.tpl` tests throwaway inline router** (`dx-tooling.md` m7).
       `rume-cli/templates/tests/smoke.rs.tpl`: Test constructs a dummy router instead of testing the generated app. Update smoke test template to exercise the actual scaffolded router.
-- [ ] **DX m8 — Terminal UI `Sticker` calculates box padding using byte length instead of display width** (`dx-tooling.md` m8).
+- [x] **DX m8 — Terminal UI `Sticker` calculates box padding using byte length instead of display width** (`dx-tooling.md` m8).
       `rume-cli/src/ui/sticker.rs:40–60`: Non-ASCII characters in terminal banners skew border alignment. Use `unicode-width` for visual column calculations.
 
 ### Group K — Testing Oracle & Deterministic Clocks (solve together)
