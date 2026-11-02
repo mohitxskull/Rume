@@ -175,9 +175,7 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
             };
 
             let Ok(cookie_str) = cookie_header.to_str() else {
-                return Err(AuthError::InvalidCredentials(
-                    "malformed cookie header".into(),
-                ));
+                return Ok(None);
             };
 
             // Parse cookies: name=val; name2=val2
@@ -185,16 +183,15 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
                 if let Some((name, val)) = cookie.trim().split_once('=')
                     && name == self.cookie_name
                 {
-                    let session_opt = self.store.load(val).await?;
-                    if let Some(session) = session_opt {
+                    if let Ok(Some(session)) = self.store.load(val).await {
                         let mut user = AuthUser::new(session.user_id)
                             .with_roles(session.roles)
                             .with_permissions(session.permissions);
                         user.metadata = session.data;
                         return Ok(Some(user));
-                    } else {
-                        return Err(AuthError::Expired);
                     }
+                    // Stale or expired cookie: allow fallback to subsequent schemes in the chain
+                    return Ok(None);
                 }
             }
 

@@ -187,3 +187,57 @@ async fn request_timeout_middleware() {
     let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res_slow).await).unwrap();
     assert_eq!(val["code"], "TIMEOUT");
 }
+
+#[tokio::test]
+async fn test_circuit_breaker_half_open_single_trial_probe() {
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 2,
+        reset_timeout: Duration::from_millis(40),
+    };
+    let breaker = CircuitBreaker::new(config);
+
+    // Trip the breaker to Open
+    breaker.on_failure();
+    breaker.on_failure();
+    assert_eq!(breaker.state(), CircuitState::Open);
+
+    // Sleep past reset timeout -> HalfOpen
+    sleep(Duration::from_millis(50)).await;
+    assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+    // First request is allowed as trial probe
+    assert!(breaker.allow_request());
+
+    // Concurrent second request during probe must be rejected!
+    assert!(!breaker.allow_request());
+
+    // Once probe succeeds, subsequent trial can proceed
+    breaker.on_success();
+    assert!(breaker.allow_request());
+    breaker.on_success();
+
+    // Closed after 2 successes
+    assert_eq!(breaker.state(), CircuitState::Closed);
+}
+
+#[tokio::test]
+async fn test_rate_limiter_prune_expired_clients() {
+    let limiter = RateLimiter::new(RateLimitConfig {
+        max_requests: 5,
+        window: Duration::from_millis(30),
+    });
+
+    assert!(limiter.check("client_temp_1").is_ok());
+    assert!(limiter.check("client_temp_2").is_ok());
+
+    // Sleep past sliding window
+    sleep(Duration::from_millis(40)).await;
+
+    // Pruning should clean up inactive entries
+    limiter.prune_expired();
+
+    // Fresh requests start with full quota
+    let status = limiter.check("client_temp_1").unwrap();
+    assert_eq!(status.remaining, 4);
+}

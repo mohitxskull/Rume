@@ -63,15 +63,15 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 ### Group E — Resilience & Error Mapping Robustness (solve together)
 > Root cause: Missing transport error observation and uncollected state entries.
 
-- [ ] **Correctness M1 — `CircuitBreakerService` skips failure recording on downstream Tower / network `Err` responses** (`correctness.md` M1).
+- [x] **Correctness M1 — `CircuitBreakerService` skips failure recording on downstream Tower / network `Err` responses** (`correctness.md` M1).
       `rume/src/resilience/circuit_breaker.rs:189–209`: `match inner.call(req).await` matches `Err(e)` and immediately returns without calling `breaker.record_failure()`, rendering the breaker blind to network drops. Record failures on `Err(e)` prior to returning.
-- [ ] **Enterprise-Reliability M3 — `RateLimiter` permanently leaks memory for inactive clients** (`enterprise-reliability.md` M3).
+- [x] **Enterprise-Reliability M3 — `RateLimiter` permanently leaks memory for inactive clients** (`enterprise-reliability.md` M3).
       `rume/src/resilience/rate_limiter.rs:40–75`: Client entries in `BTreeMap` are never purged, leaking memory monotonically under randomized client IPs. Implement background TTL cleanup or LRU eviction.
-- [ ] **Correctness m2 — `CircuitBreaker` permits unbounded concurrency during `HalfOpen` recovery probe** (`correctness.md` m2).
+- [x] **Correctness m2 — `CircuitBreaker` permits unbounded concurrency during `HalfOpen` recovery probe** (`correctness.md` m2).
       `rume/src/resilience/circuit_breaker.rs:96–101`: `CircuitState::HalfOpen` allows all concurrent requests through instead of permitting a single trial probe. Restrict `HalfOpen` to a single trial permit.
-- [ ] **Security m1 — `AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500** (`security.md` m1).
+- [x] **Security m1 — `AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500** (`security.md` m1).
       `rume/src/auth/error.rs:25–35`: Downstream identity provider internal failures are mapped to `StatusCode::BAD_REQUEST`, falsely blaming the client. Map `ProviderError` to `StatusCode::INTERNAL_SERVER_ERROR`.
-- [ ] **Security m2 — Stale session cookie in `SessionScheme` immediately aborts authentication chain** (`security.md` m2).
+- [x] **Security m2 — Stale session cookie in `SessionScheme` immediately aborts authentication chain** (`security.md` m2).
       `rume/src/auth/scheme.rs:175–195`: If an expired or invalid session cookie is presented alongside a valid API key or Bearer token, `SessionScheme` returns an error, halting multi-scheme fallback. Allow fallback to subsequent schemes on invalid session cookies.
 
 ### Group F — Cache Invalidation, Concurrency & Eviction (solve together)

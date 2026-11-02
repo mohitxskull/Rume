@@ -305,3 +305,47 @@ async fn policy_layer_guards_router_branch() {
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(TestApp::body_text(res).await, "VIP Access Granted");
 }
+
+#[tokio::test]
+async fn test_auth_provider_error_maps_to_500() {
+    let err = AuthError::ProviderError("downstream OIDC timeout".into());
+    let app_err = AppError::from(err);
+    assert_eq!(app_err.status_code(), StatusCode::INTERNAL_SERVER_ERROR);
+}
+
+#[tokio::test]
+async fn test_stale_session_cookie_falls_back_to_bearer_token() {
+    let session_store = MemorySessionStore::new();
+    let session_scheme = SessionScheme::new(session_store);
+
+    let bearer_scheme = BearerTokenScheme::new(|token| async move {
+        if token == "valid_bearer_token" {
+            Ok(Some(AuthUser::new("user_fallback")))
+        } else {
+            Ok(None)
+        }
+    });
+
+    let router = rume::routing::Router::new()
+        .route("/profile", get(get_me))
+        .layer(
+            AuthLayer::required()
+                .scheme(session_scheme)
+                .scheme(bearer_scheme),
+        );
+
+    let app = TestApp::new(router);
+
+    // Request carries stale session cookie AND valid bearer token
+    let req = axum::http::Request::builder()
+        .uri("/profile")
+        .header("cookie", "rume_session=expired_session_cookie_abc")
+        .header("authorization", "Bearer valid_bearer_token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(val["id"], "user_fallback");
+}

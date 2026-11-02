@@ -87,11 +87,30 @@ impl RateLimiter {
             .max_requests
             .saturating_sub(entry.timestamps.len() as u32);
 
+        // Passive eviction of inactive clients to bound memory usage
+        if clients.len() > 256 {
+            clients.retain(|_, e| {
+                e.timestamps.retain(|&t| t > window_start);
+                !e.timestamps.is_empty()
+            });
+        }
+
         Ok(RateLimitStatus {
             limit: self.config.max_requests,
             remaining,
             reset_after_secs: self.config.window.as_secs(),
         })
+    }
+
+    /// Prunes expired client entries whose recorded requests fall outside the sliding window.
+    pub fn prune_expired(&self) {
+        let mut clients = self.clients.write().unwrap();
+        let now = Instant::now();
+        let window_start = now.checked_sub(self.config.window).unwrap_or(now);
+        clients.retain(|_, entry| {
+            entry.timestamps.retain(|&t| t > window_start);
+            !entry.timestamps.is_empty()
+        });
     }
 }
 

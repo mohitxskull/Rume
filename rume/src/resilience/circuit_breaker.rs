@@ -50,6 +50,7 @@ struct CircuitInner {
     consecutive_failures: u32,
     consecutive_successes: u32,
     opened_at: Option<Instant>,
+    half_open_in_flight: bool,
 }
 
 /// A circuit breaker tracking execution outcomes and preventing cascading failures.
@@ -75,6 +76,7 @@ impl CircuitBreaker {
                 consecutive_failures: 0,
                 consecutive_successes: 0,
                 opened_at: None,
+                half_open_in_flight: false,
             })),
         }
     }
@@ -88,14 +90,33 @@ impl CircuitBreaker {
         {
             inner.state = CircuitState::HalfOpen;
             inner.consecutive_successes = 0;
+            inner.half_open_in_flight = false;
         }
         inner.state
     }
 
     /// Evaluates whether a new request is permitted to execute.
     pub fn allow_request(&self) -> bool {
-        match self.state() {
-            CircuitState::Closed | CircuitState::HalfOpen => true,
+        let mut inner = self.inner.write().unwrap();
+        if inner.state == CircuitState::Open
+            && let Some(opened) = inner.opened_at
+            && opened.elapsed() >= self.config.reset_timeout
+        {
+            inner.state = CircuitState::HalfOpen;
+            inner.consecutive_successes = 0;
+            inner.half_open_in_flight = false;
+        }
+
+        match inner.state {
+            CircuitState::Closed => true,
+            CircuitState::HalfOpen => {
+                if inner.half_open_in_flight {
+                    false
+                } else {
+                    inner.half_open_in_flight = true;
+                    true
+                }
+            }
             CircuitState::Open => false,
         }
     }
@@ -103,6 +124,7 @@ impl CircuitBreaker {
     /// Records a successful execution.
     pub fn on_success(&self) {
         let mut inner = self.inner.write().unwrap();
+        inner.half_open_in_flight = false;
         match inner.state {
             CircuitState::HalfOpen => {
                 inner.consecutive_successes += 1;
@@ -123,6 +145,7 @@ impl CircuitBreaker {
     /// Records a failed execution.
     pub fn on_failure(&self) {
         let mut inner = self.inner.write().unwrap();
+        inner.half_open_in_flight = false;
         match inner.state {
             CircuitState::Closed => {
                 inner.consecutive_failures += 1;
@@ -196,7 +219,13 @@ where
                 return Ok(err.into_response());
             }
 
-            let response = inner.call(req).await?;
+            let response = match inner.call(req).await {
+                Ok(res) => res,
+                Err(err) => {
+                    breaker.on_failure();
+                    return Err(err);
+                }
+            };
 
             if response.status().is_server_error() {
                 breaker.on_failure();

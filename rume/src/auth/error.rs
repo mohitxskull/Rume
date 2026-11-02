@@ -35,10 +35,7 @@ impl From<AuthError> for AppError {
             AuthError::MissingCredentials
             | AuthError::InvalidCredentials(_)
             | AuthError::Expired => AppError::Unauthorized,
-            AuthError::ProviderError(msg) => AppError::BadRequest {
-                code: "AUTH_ERROR",
-                message: msg,
-            },
+            AuthError::ProviderError(msg) => AppError::internal(msg),
         }
     }
 }

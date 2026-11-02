@@ -73,7 +73,20 @@ struct ProblemDetails {
 /// source is logged server-side via tracing rather than surfaced to
 /// clients.
 #[derive(Debug)]
-pub struct InternalSource(String);
+pub struct InternalSource(pub(crate) String);
+
+impl InternalSource {
+    /// Creates a new internal diagnostic error source.
+    pub fn new(source: impl Into<String>) -> Self {
+        Self(source.into())
+    }
+}
+
+impl From<String> for InternalSource {
+    fn from(s: String) -> Self {
+        Self(s)
+    }
+}
 
 impl std::fmt::Display for InternalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -116,6 +129,14 @@ pub enum AppError {
 }
 
 impl AppError {
+    /// Creates an internal server error from a diagnostic message.
+    pub fn internal(msg: impl Into<String>) -> Self {
+        Self::Internal {
+            source: InternalSource(msg.into()),
+            request_id: None,
+        }
+    }
+
     /// The HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
