@@ -224,10 +224,11 @@ impl ProjectPaths {
 }
 
 /// Application context holding env, config, paths, availability, lifecycle,
-/// and health checks.
+/// health checks, and application state.
 ///
 /// Every Rume application is built with an [`AppContext`]. Handlers access env,
-/// config, paths, availability, and health checks through [`State<AppContext<E, C>>`].
+/// config, paths, availability, health checks, and application state through
+/// [`State<AppContext<E, C, S>>`].
 ///
 /// # Example
 ///
@@ -235,16 +236,17 @@ impl ProjectPaths {
 /// use rume::app::{AppContext, Rume};
 /// use rume::prelude::*;
 ///
-/// let ctx = AppContext::new(env, config, paths, availability, health_checks);
+/// let ctx = AppContext::new(env, config, paths, availability, health_checks, state);
 /// let router = routes::router(ctx.clone());
 ///
 /// Rume::builder(ctx).router(router).run().await?;
 /// ```
 #[derive(Clone, Debug)]
-pub struct AppContext<E, C>
+pub struct AppContext<E, C, S = ()>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Loaded environment variables.
     pub env: E,
@@ -258,12 +260,15 @@ where
     pub lifecycle: Lifecycle,
     /// Health check registry.
     pub health_checks: crate::routing::HealthChecks,
+    /// Application state (db pool, redis, HTTP client, …). Defaults to `()`.
+    pub state: S,
 }
 
-impl<E, C> AppContext<E, C>
+impl<E, C, S> AppContext<E, C, S>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Create a new application context with all required fields.
     pub fn new(
@@ -272,6 +277,7 @@ where
         paths: ProjectPaths,
         availability: Availability,
         health_checks: crate::routing::HealthChecks,
+        state: S,
     ) -> Self {
         Self {
             env,
@@ -280,41 +286,46 @@ where
             availability,
             lifecycle: Lifecycle::new(),
             health_checks,
+            state,
         }
     }
 
     /// Start building an `AppContext` with sensible defaults.
     ///
-    /// Required: `env` and `config`. Optional: `paths`, `availability`, `health_checks`.
+    /// Required: `env` and `config`. Optional: `paths`, `availability`, `health_checks`, `state`.
     /// Defaults: `ProjectPaths::from_current_dir()`, `Availability::new()`, `HealthChecks::new()`.
-    pub fn builder(env: E, config: C) -> AppContextBuilder<E, C> {
+    pub fn builder(env: E, config: C) -> AppContextBuilder<E, C, S> {
         AppContextBuilder {
             env,
             config,
             paths: None,
             availability: None,
             health_checks: None,
+            state: None,
         }
     }
 }
 
 /// Builder for [`AppContext`] with optional defaults.
-pub struct AppContextBuilder<E, C>
+pub struct AppContextBuilder<E, C, S = ()>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     env: E,
     config: C,
     paths: Option<ProjectPaths>,
     availability: Option<Availability>,
     health_checks: Option<crate::routing::HealthChecks>,
+    state: Option<S>,
 }
 
-impl<E, C> AppContextBuilder<E, C>
+impl<E, C, S> AppContextBuilder<E, C, S>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Set the project paths (default: `ProjectPaths::from_current_dir()`).
     pub fn paths(mut self, paths: ProjectPaths) -> Self {
@@ -334,8 +345,21 @@ where
         self
     }
 
+    /// Set the application state (db pool, redis, HTTP client, …).
+    /// Defaults to `S::default()` (`()` when `S = ()`).
+    pub fn state(mut self, state: S) -> Self {
+        self.state = Some(state);
+        self
+    }
+
     /// Build the `AppContext`.
-    pub fn build(self) -> AppContext<E, C> {
+    ///
+    /// Requires `S: Default` so the state field can fall back to `S::default()`
+    /// when `.state()` was not called.
+    pub fn build(self) -> AppContext<E, C, S>
+    where
+        S: Default,
+    {
         AppContext {
             env: self.env,
             config: self.config,
@@ -343,6 +367,7 @@ where
             availability: self.availability.unwrap_or_default(),
             lifecycle: Lifecycle::new(),
             health_checks: self.health_checks.unwrap_or_default(),
+            state: self.state.unwrap_or_default(),
         }
     }
 }
@@ -351,47 +376,57 @@ where
 ///
 /// `Rume` is a marker type for the builder API. Every Rume application carries
 /// an [`AppContext`] as its Axum state.
-pub struct Rume<E, C> {
-    _state: std::marker::PhantomData<(E, C)>,
+pub struct Rume<E, C, S = ()> {
+    _state: std::marker::PhantomData<(E, C, S)>,
 }
 
-impl<E, C> Rume<E, C>
+impl<E, C, S> Rume<E, C, S>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Create a builder initialized with an [`AppContext`] as Axum state.
     ///
     /// This is the only public way to build a Rume application. `RumeBuilder::new`
     /// is intentionally `pub(crate)` so `Rume::builder` is the sole entry point.
     /// Every app carries an [`AppContext`] so handlers can access env, config,
-    /// paths, availability, and health checks through [`State`].
-    pub fn builder(ctx: AppContext<E, C>) -> RumeBuilder<E, C> {
+    /// paths, availability, health checks, and application state through [`State`].
+    pub fn builder(ctx: AppContext<E, C, S>) -> RumeBuilder<E, C, S> {
         RumeBuilder::new(ctx)
     }
 }
 
 /// Builder for a [`Rume`] application.
 #[allow(clippy::type_complexity)]
-pub struct RumeBuilder<E, C>
+pub struct RumeBuilder<E, C, S = ()>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
-    ctx: AppContext<E, C>,
-    router: Router<AppContext<E, C>>,
+    ctx: AppContext<E, C, S>,
+    state: S,
+    router: Router<AppContext<E, C, S>>,
     bind: String,
     mode: ApplicationMode,
     environment: Environment,
-    on_ready:
-        Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
-    on_shutdown:
-        Vec<Box<dyn FnOnce(AppContext<E, C>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>,
+    on_ready: Vec<
+        Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
+    >,
+    on_shutdown: Vec<
+        Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>,
+    >,
     /// Named middleware registered by alias. The closure wraps the router as a
     /// Tower layer; it is applied only after `use_middleware` marks it.
     middleware: BTreeMap<
         String,
-        Box<dyn Fn(Router<AppContext<E, C>>) -> Router<AppContext<E, C>> + Send + Sync + 'static>,
+        Box<
+            dyn Fn(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>>
+                + Send
+                + Sync
+                + 'static,
+        >,
     >,
     /// Insertion order of registered middleware names — this is the order in
     /// which applied middleware wraps the router.
@@ -406,18 +441,21 @@ where
     applied_groups: BTreeSet<String>,
 }
 
-impl<E, C> RumeBuilder<E, C>
+impl<E, C, S> RumeBuilder<E, C, S>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     /// Construct a [`RumeBuilder`] from an [`AppContext`].
     ///
     /// Intentionally `pub(crate)`: `Rume::builder` is the only public entry
     /// point for building a Rume application.
-    pub(crate) fn new(ctx: AppContext<E, C>) -> Self {
+    pub(crate) fn new(ctx: AppContext<E, C, S>) -> Self {
+        let state = ctx.state.clone();
         Self {
             ctx,
+            state,
             router: Router::new(),
             bind: "127.0.0.1:3000".to_string(),
             mode: ApplicationMode::Run,
@@ -434,13 +472,13 @@ where
     }
 
     /// Add a route to the application.
-    pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C>>) -> Self {
+    pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
         self
     }
 
     /// Replace the application router.
-    pub fn router(mut self, router: Router<AppContext<E, C>>) -> Self {
+    pub fn router(mut self, router: Router<AppContext<E, C, S>>) -> Self {
         self.router = router;
         self
     }
@@ -466,6 +504,16 @@ where
         self
     }
 
+    /// Set the application state (db pool, redis, HTTP client, …).
+    ///
+    /// This is synced into the [`AppContext`] that Axum serves as state, so
+    /// handlers observe it through [`State<AppContext<E, C, S>>`].
+    pub fn state(mut self, state: S) -> Self {
+        self.ctx.state = state.clone();
+        self.state = state;
+        self
+    }
+
     /// Override the project paths.
     pub fn paths(mut self, paths: ProjectPaths) -> Self {
         self.ctx.paths = paths;
@@ -475,7 +523,7 @@ where
     /// Register a startup task.
     pub fn on_ready<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnOnce(AppContext<E, C>) -> Fut + Send + 'static,
+        F: FnOnce(AppContext<E, C, S>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_ready.push(Box::new(move |ctx| Box::pin(f(ctx))));
@@ -485,7 +533,7 @@ where
     /// Register a shutdown task.
     pub fn on_shutdown<F, Fut>(mut self, f: F) -> Self
     where
-        F: FnOnce(AppContext<E, C>) -> Fut + Send + 'static,
+        F: FnOnce(AppContext<E, C, S>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_shutdown.push(Box::new(move |ctx| Box::pin(f(ctx))));
@@ -525,7 +573,7 @@ where
     /// [`middleware_order`](Self::middleware_order) registration order.
     pub fn middleware<F>(mut self, name: &str, f: F) -> Self
     where
-        F: Fn(Router<AppContext<E, C>>) -> Router<AppContext<E, C>> + Send + Sync + 'static,
+        F: Fn(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>> + Send + Sync + 'static,
     {
         self.middleware_order.push(name.to_string());
         self.middleware.insert(name.to_string(), Box::new(f));
@@ -566,8 +614,8 @@ where
     /// [`run`](Self::run) calls this before serving.
     ///
     /// `ctx` is the Axum state the router carries; middleware closures operate
-    /// on `Router<AppContext<E, C>>`.
-    pub fn build_router(self, ctx: AppContext<E, C>) -> Router<AppContext<E, C>> {
+    /// on `Router<AppContext<E, C, S>>`.
+    pub fn build_router(self, ctx: AppContext<E, C, S>) -> Router<AppContext<E, C, S>> {
         let RumeBuilder {
             router,
             middleware,
@@ -579,7 +627,7 @@ where
             ..
         } = self;
 
-        let mut router: Router<AppContext<E, C>> = router.with_state(ctx);
+        let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx);
 
         // Apply named middleware in registration order, but only those
         // marked with `use_middleware`. Unknown names are skipped.
@@ -672,7 +720,7 @@ where
         let serve_ctx = self.ctx.clone();
         let router = self.build_router(serve_ctx.clone());
 
-        // `build_router` returns `Router<AppContext<E, C>>`; serving requires
+        // `build_router` returns `Router<AppContext<E, C, S>>`; serving requires
         // `Router<()>`, so capture the state one final time at serve time.
         let result = axum::serve(listener, router.with_state(serve_ctx.clone()))
             .with_graceful_shutdown(shutdown_signal())
@@ -761,6 +809,7 @@ mod tests {
             ProjectPaths::from_current_dir(),
             Availability::new(),
             HealthChecks::new(),
+            (),
         );
 
         let builder = crate::Rume::builder(ctx)
@@ -781,7 +830,7 @@ mod tests {
         // D-M1 fix: AppContext::builder() provides ergonomic construction with defaults.
         use crate::AppContext;
 
-        let ctx = AppContext::builder(
+        let ctx: AppContext<_, _, ()> = AppContext::builder(
             std::net::IpAddr::from([127, 0, 0, 1]),
             std::collections::BTreeMap::<String, String>::new(),
         )
@@ -800,7 +849,7 @@ mod tests {
 
         let custom_paths = ProjectPaths::from_root("/custom/root");
 
-        let ctx = AppContext::builder(
+        let ctx: AppContext<_, _, ()> = AppContext::builder(
             std::net::IpAddr::from([127, 0, 0, 1]),
             std::collections::BTreeMap::<String, String>::new(),
         )
@@ -872,6 +921,7 @@ mod tests {
             ProjectPaths::from_current_dir(),
             Availability::new(),
             HealthChecks::new(),
+            (),
         );
 
         let base_router = Router::<AppContext<_, _>>::new()
@@ -923,6 +973,7 @@ mod tests {
             ProjectPaths::from_current_dir(),
             Availability::new(),
             HealthChecks::new(),
+            (),
         );
 
         let base_router = Router::<AppContext<_, _>>::new()
@@ -991,6 +1042,7 @@ mod tests {
             ProjectPaths::from_current_dir(),
             Availability::new(),
             HealthChecks::new(),
+            (),
         );
 
         let base_router = Router::<AppContext<_, _>>::new()
@@ -1045,7 +1097,7 @@ pub fn init_tracing() {
 /// use rume::app::{AppContext, ops_router};
 /// use rume::prelude::*;
 ///
-/// let ctx = AppContext::new(env, config, paths, availability.clone(), health_checks.clone());
+/// let ctx = AppContext::new(env, config, paths, availability.clone(), health_checks.clone(), state);
 /// let router = routes::router(ctx.clone());
 ///
 /// let router = ops_router(router, availability.clone());

@@ -1,3 +1,4 @@
+use crate::app::AppState;
 use crate::config::Config;
 use crate::env::Env;
 use rume::app::AppContext;
@@ -14,7 +15,7 @@ pub struct Health {
 /// Note: `/health/live` and `/health/ready` are already handled by
 /// `rume::routing::health_routes()` in `src/app.rs`. This handler is an
 /// example of a custom health endpoint you can add.
-pub async fn health(State(ctx): State<AppContext<Env, Config>>) -> Json<Health> {
+pub async fn health(State(ctx): State<AppContext<Env, Config, AppState>>) -> Json<Health> {
     Json(Health {
         status: "ok",
         app_name: ctx.config.app.name.clone(),

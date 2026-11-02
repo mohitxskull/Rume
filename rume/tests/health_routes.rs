@@ -82,6 +82,7 @@ fn build_ctx() -> AppContext<std::net::IpAddr, std::collections::BTreeMap<String
         ProjectPaths::from_current_dir(),
         Availability::new(),
         HealthChecks::new(),
+        (),
     )
 }
 
@@ -101,7 +102,7 @@ async fn health_live_returns_ok_when_not_broken() {
 
 #[tokio::test]
 async fn health_ready_returns_ok_when_all_checks_ok() {
-    let ctx = AppContext::builder(
+    let ctx: AppContext<_, _, ()> = AppContext::builder(
         std::net::IpAddr::from([127, 0, 0, 1]),
         std::collections::BTreeMap::<String, String>::new(),
     )
@@ -125,7 +126,7 @@ async fn health_ready_returns_ok_when_all_checks_ok() {
 #[tokio::test]
 async fn health_ready_returns_503_on_warning() {
     // C-m4: Warning status triggers 503 — readiness requires all Ok.
-    let ctx = AppContext::builder(
+    let ctx: AppContext<_, _, ()> = AppContext::builder(
         std::net::IpAddr::from([127, 0, 0, 1]),
         std::collections::BTreeMap::<String, String>::new(),
     )
@@ -145,7 +146,7 @@ async fn health_ready_returns_503_on_warning() {
 
 #[tokio::test]
 async fn health_ready_returns_503_on_failed() {
-    let ctx = AppContext::builder(
+    let ctx: AppContext<_, _, ()> = AppContext::builder(
         std::net::IpAddr::from([127, 0, 0, 1]),
         std::collections::BTreeMap::<String, String>::new(),
     )
@@ -166,7 +167,7 @@ async fn health_ready_returns_503_on_failed() {
 #[tokio::test]
 async fn health_ready_excludes_debug_info() {
     // S-m2: pid/platform must not appear in /health/ready response.
-    let ctx = AppContext::builder(
+    let ctx: AppContext<_, _, ()> = AppContext::builder(
         std::net::IpAddr::from([127, 0, 0, 1]),
         std::collections::BTreeMap::<String, String>::new(),
     )

@@ -746,17 +746,18 @@ fn debug_info() -> BTreeMap<String, serde_json::Value> {
 /// - `GET /health/ready` — readiness probe: runs all registered health checks.
 ///   Returns 200 when healthy, 503 when any check fails.
 ///
-/// Both routes use [`State<AppContext<E, C>>`] to access availability and
+/// Both routes use [`State<AppContext<E, C, S>>`] to access availability and
 /// health checks from the application context.
-pub fn health_routes<E, C>() -> Router<AppContext<E, C>>
+pub fn health_routes<E, C, S>() -> Router<AppContext<E, C, S>>
 where
     E: Clone + Send + Sync + 'static,
     C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
 {
     Router::new()
         .route(
             "/health/live",
-            axum::routing::get(move |State(ctx): State<AppContext<E, C>>| async move {
+            axum::routing::get(move |State(ctx): State<AppContext<E, C, S>>| async move {
                 if ctx.availability.state() == crate::app::AvailabilityState::Broken {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -770,7 +771,7 @@ where
         )
         .route(
             "/health/ready",
-            axum::routing::get(move |State(ctx): State<AppContext<E, C>>| async move {
+            axum::routing::get(move |State(ctx): State<AppContext<E, C, S>>| async move {
                 let report = ctx.health_checks.run().await;
                 let json = serde_json::to_value(&report).unwrap();
                 if report.is_healthy {
@@ -856,13 +857,14 @@ mod tests {
 
     #[tokio::test]
     async fn validated_param_works_with_appcontext_state() {
-        // C1 fix: ValidatedParam must work with AppContext<E, C> state, not just ().
+        // C1 fix: ValidatedParam must work with AppContext<E, C, S> state, not just ().
         let ctx = AppContext::new(
             std::net::IpAddr::from([127, 0, 0, 1]),
             std::collections::BTreeMap::<String, String>::new(),
             ProjectPaths::from_current_dir(),
             Availability::new(),
             crate::routing::HealthChecks::new(),
+            (),
         );
 
         let (mut parts, _) = axum::http::Request::builder()
