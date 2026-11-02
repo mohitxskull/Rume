@@ -918,13 +918,7 @@ async fn test_postgres_realistic_enterprise_transaction_pipeline() {
     queue.init_schema().await.expect("init job schema failed");
 
     backend
-        .execute(
-            "CREATE TABLE IF NOT EXISTS enterprise_orders (
-                id VARCHAR(255) PRIMARY KEY,
-                tenant_id VARCHAR(255) NOT NULL,
-                amount INT NOT NULL
-            );",
-        )
+        .execute("CREATE TABLE IF NOT EXISTS enterprise_orders (id VARCHAR(255) PRIMARY KEY, tenant_id VARCHAR(255) NOT NULL, amount INT NOT NULL);")
         .await
         .expect("create orders table failed");
 

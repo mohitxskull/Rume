@@ -22,6 +22,7 @@ const OUTBOX_SCHEMA: &str = include_str!("sql/sqlite/outbox_schema.sql");
 const OUTBOX_CLAIM_SQL: &str = include_str!("sql/sqlite/outbox_claim.sql");
 const MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
 const INSERT_OUTBOX_SQL: &str = include_str!("sql/sqlite/outbox_insert.sql");
+const OUTBOX_RECOVER_SQL: &str = include_str!("sql/sqlite/outbox_recover.sql");
 
 /// Embedded SQLite database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]
@@ -428,15 +429,12 @@ impl OutboxRepository for SqliteBackend {
     fn recover_expired_claims(&self, max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let now = current_timestamp();
-            let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'pending', lease_token = NULL, lease_expires_at = NULL
-                 WHERE status = 'inflight' AND (lease_expires_at <= ?1 OR (?1 - created_at) >= ?2)"
-            )
-            .bind(now as i64)
-            .bind(max_lease_age_secs as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(OUTBOX_RECOVER_SQL)
+                .bind(now as i64)
+                .bind(max_lease_age_secs as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             Ok(res.rows_affected() as usize)
         })

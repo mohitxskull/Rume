@@ -23,6 +23,7 @@ fn current_epoch_millis() -> i64 {
 const JOBS_SCHEMA: &str = include_str!("../persistence/sql/postgres/jobs_schema.sql");
 const JOBS_CLAIM_SQL: &str = include_str!("../persistence/sql/postgres/jobs_claim.sql");
 const INSERT_JOB_SQL: &str = include_str!("../persistence/sql/postgres/jobs_insert.sql");
+const JOBS_REAP_SQL: &str = include_str!("../persistence/sql/postgres/jobs_reap.sql");
 
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]
@@ -257,15 +258,12 @@ impl JobQueue for PostgresJobQueue {
         let workers = dead_workers.to_vec();
         Box::pin(async move {
             let now = current_epoch_millis();
-            let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL
-                 WHERE status = 'in_flight' AND (assigned_worker = ANY($1) OR lease_expires_at <= $2)"
-            )
-            .bind(&workers)
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_REAP_SQL)
+                .bind(&workers)
+                .bind(now)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             Ok(res.rows_affected() as usize)
         })
