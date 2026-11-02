@@ -29,7 +29,7 @@ Rume follows four development phases:
 | **ARCH-06** | Topological Lifecycle Orchestration | Modules start in topological dependency order (`on_start`); shut down and roll back on failure in reverse topological order (`on_shutdown`). | **Completed** |
 | **ARCH-07** | Module-Scoped Middleware & Health | Modules register domain-owned Tower layers and diagnostic health checks without global coupling. | **Completed** |
 
-**Verification Suite:** [`rume/tests/progressive_composition.rs`](rume/tests/progressive_composition.rs) (8/8 integration tests passing).
+**Verification Suite:** [`rume/tests/progressive_composition.rs`](../../../rume/tests/progressive_composition.rs) (8/8 integration tests passing).
 
 ---
 

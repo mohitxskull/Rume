@@ -179,3 +179,13 @@ Rume defines production readiness through strict, verifiable guarantees:
 * **Traceable Request Identity:** Every request carries an OS CSPRNG-backed UUID v4 (RFC 9562) that propagates across async tasks, tracing spans, and RFC 9457 responses.
 * **Portable Scaffolding:** CLI-generated projects format cleanly, compile cleanly, and pass all tests out of the box without local framework path dependencies.
 * **Canonical Runtime Inventory:** Route listing reflects actual mounted runtime handlers and specs, never heuristic source-code regexes.
+
+---
+
+## 9. Engineering Roadmap
+
+The phased engineering execution plan for this vision is detailed in **[`ROADMAP.md`](ROADMAP.md)**:
+* **Phase 1: Progressive Application Architecture** (`ARCH-01` through `ARCH-07`) — *Completed & verified*
+* **Phase 2: Complete Application Capabilities** (`CAP-01` through `CAP-08`) — *Next phase*
+* **Phase 3: Enterprise Reliability** (`ENT-01` through `ENT-08`) — *Planned*
+* **Phase 4: Framework Maturation** — *Future consideration*
