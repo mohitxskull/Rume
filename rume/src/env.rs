@@ -16,7 +16,7 @@
 //! let env: Env = rume::env::load()?;
 //! ```
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -86,6 +86,15 @@ pub enum EnvError {
         #[source]
         source: dotenvy::Error,
     },
+
+    #[error("failed to interpolate ${{variable}} in {source_value}")]
+    Interpolation {
+        variable: String,
+        source_value: String,
+    },
+
+    #[error("circular reference detected while interpolating ${{variable}}")]
+    CircularReference { variable: String },
 
     #[error("failed to validate environment: {0}")]
     Validation(String),
@@ -164,9 +173,10 @@ pub fn load_merged_map() -> Result<ResolvedEnv> {
 fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
     let env_name = resolve_env_name();
 
-    let mut values: BTreeMap<String, String> = BTreeMap::new();
-    let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
-    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    // Collect raw values from all file sources, lowest to highest priority.
+    // Later files override earlier ones. `file:` resolution happens here, per
+    // value, before interpolation.
+    let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
 
     for (path, label) in dotenv_candidates(dir, &env_name) {
@@ -190,22 +200,42 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv> {
                 source,
             })?;
 
-            if is_secret_key(&key) {
-                secrets.insert(key.clone(), SecretBox::new(Box::new(value)));
-            } else {
-                values.insert(key.clone(), value);
-            }
-            sources.insert(key.clone(), label.clone());
+            merged.insert(key.clone(), (value, label.clone()));
             file_keys.insert(key);
         }
     }
 
-    // Process environment always wins.
-    for (key, value) in std::env::vars() {
-        if is_secret_key(&key) {
-            secrets.insert(key.clone(), SecretBox::new(Box::new(value)));
+    // The merged variable map is the interpolation context: every file-sourced
+    // variable can reference any other, including ones defined in later files.
+    let vars: BTreeMap<String, String> = merged
+        .iter()
+        .map(|(key, (value, _))| (key.clone(), value.clone()))
+        .collect();
+
+    let mut values: BTreeMap<String, String> = BTreeMap::new();
+    let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+
+    // Interpolate file-sourced values against the merged map, then route to
+    // secrets vs plain values based on the key (not the interpolated value).
+    for (key, (value, source)) in &merged {
+        let interpolated = interpolate_value(value, &vars)?;
+        if is_secret_key(key) {
+            secrets.insert(key.clone(), SecretBox::new(Box::new(interpolated)));
         } else {
-            values.insert(key.clone(), value);
+            values.insert(key.clone(), interpolated);
+        }
+        sources.insert(key.clone(), source.clone());
+    }
+
+    // Process environment always wins. Its values are interpolated too, so they
+    // can reference file-sourced variables.
+    for (key, value) in std::env::vars() {
+        let interpolated = interpolate_value(&value, &vars)?;
+        if is_secret_key(&key) {
+            secrets.insert(key.clone(), SecretBox::new(Box::new(interpolated)));
+        } else {
+            values.insert(key.clone(), interpolated);
         }
         sources.insert(key, "process env".to_string());
     }
@@ -285,6 +315,111 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
     }
 }
 
+/// Maximum recursion depth for interpolating `${VAR}` references, guarding
+/// against infinitely recursive or circular references.
+const MAX_INTERPOLATION_DEPTH: usize = 10;
+
+/// Interpolate `${VAR}` references in `value` using the merged variable map.
+///
+/// - `\${VAR}` is escaped to a literal `${VAR}` (no substitution).
+/// - References are resolved recursively: if a substituted value itself
+///   contains `${...}`, it is resolved again.
+/// - Missing variables return [`EnvError::Interpolation`].
+/// - Circular references return [`EnvError::CircularReference`].
+pub fn interpolate_value(value: &str, vars: &BTreeMap<String, String>) -> Result<String> {
+    interpolate_recursive(value, vars, &mut HashSet::new(), 0)
+}
+
+fn interpolate_recursive(
+    value: &str,
+    vars: &BTreeMap<String, String>,
+    visiting: &mut HashSet<String>,
+    depth: usize,
+) -> Result<String> {
+    if depth > MAX_INTERPOLATION_DEPTH {
+        return Err(EnvError::CircularReference {
+            variable: value.to_string(),
+        });
+    }
+
+    let mut out = String::new();
+    let chars: Vec<char> = value.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '$' {
+            // Escaped substitution: \${VAR} -> literal ${VAR}
+            if let Some((end, var)) = read_substitution(&chars[i + 1..]) {
+                out.push_str("${");
+                out.push_str(&var);
+                out.push('}');
+                i += 1 + end;
+                continue;
+            }
+            out.push('\\');
+            i += 1;
+            continue;
+        }
+
+        if chars[i] == '$'
+            && i + 1 < chars.len()
+            && chars[i + 1] == '{'
+            && let Some((end, var)) = read_substitution(&chars[i..])
+        {
+            if visiting.contains(&var) {
+                return Err(EnvError::CircularReference {
+                    variable: var.clone(),
+                });
+            }
+            let resolved = match vars.get(&var) {
+                Some(v) => v,
+                None => {
+                    return Err(EnvError::Interpolation {
+                        variable: var.clone(),
+                        source_value: value.to_string(),
+                    });
+                }
+            };
+            visiting.insert(var.clone());
+            let expanded = interpolate_recursive(resolved, vars, visiting, depth + 1);
+            visiting.remove(&var);
+            out.push_str(&expanded?);
+            i += end;
+            continue;
+        }
+
+        out.push(chars[i]);
+        i += 1;
+    }
+
+    Ok(out)
+}
+
+/// Read a `${VAR}` substitution starting at `chars[0]` (which must be `$`).
+///
+/// Returns the index (relative to `chars`) just after the closing `}` and the
+/// variable name. Returns `None` if the text is not a well-formed substitution.
+fn read_substitution(chars: &[char]) -> Option<(usize, String)> {
+    if chars.len() < 2 || chars[0] != '$' || chars[1] != '{' {
+        return None;
+    }
+
+    let mut var = String::new();
+    let mut i = 2;
+    while i < chars.len() {
+        if chars[i] == '}' {
+            return Some((i + 1, var));
+        }
+        if chars[i].is_alphanumeric() || chars[i] == '_' {
+            var.push(chars[i]);
+        } else {
+            return None;
+        }
+        i += 1;
+    }
+
+    None
+}
+
 /// Heuristic: is this key likely to hold a secret?
 ///
 /// Covers common secret suffixes/prefixes (`SECRET`, `PASSWORD`, `TOKEN`,
@@ -329,8 +464,14 @@ pub fn value_looks_sensitive(value: &str) -> bool {
     false
 }
 
-/// Redact a value for display when appropriate.
-pub fn redact(key: &str, value: &str) -> String {
+/// Redact a value for display when either the key or the value looks
+/// sensitive.
+///
+/// Uses both key-based detection ([`is_secret_key`]) and value-based
+/// detection ([`value_looks_sensitive`]), so a value like
+/// `postgres://admin:password@localhost/db` is redacted even when the key
+/// does not match the secret heuristics.
+pub fn redact_value(key: &str, value: &str) -> String {
     if is_secret_key(key) || value_looks_sensitive(value) {
         "[redacted]".to_string()
     } else {
@@ -344,20 +485,20 @@ mod tests {
 
     #[test]
     fn redacts_secret_keys() {
-        assert_eq!(redact("APP_KEY", "secret"), "[redacted]");
-        assert_eq!(redact("PASSWORD", "x"), "[redacted]");
-        assert_eq!(redact("API_TOKEN", "x"), "[redacted]");
-        assert_eq!(redact("HOST", "localhost"), "localhost");
+        assert_eq!(redact_value("APP_KEY", "secret"), "[redacted]");
+        assert_eq!(redact_value("PASSWORD", "x"), "[redacted]");
+        assert_eq!(redact_value("API_TOKEN", "x"), "[redacted]");
+        assert_eq!(redact_value("HOST", "localhost"), "localhost");
     }
 
     #[test]
     fn redacts_credential_urls() {
         assert_eq!(
-            redact("DATABASE_URL", "postgres://user:pass@host/db"),
+            redact_value("DATABASE_URL", "postgres://user:pass@host/db"),
             "[redacted]"
         );
         assert_eq!(
-            redact("DATABASE_URL", "postgres://host/db"),
+            redact_value("DATABASE_URL", "postgres://host/db"),
             "postgres://host/db"
         );
     }
@@ -372,18 +513,95 @@ mod tests {
     }
 
     #[test]
-    fn redact_broadened_catches_more_secret_keys() {
+    fn redact_value_redacts_secret_keys() {
         // S-m1: broadened detection must catch keys the old heuristic missed.
         // These must be redacted, not printed as plaintext.
-        assert_eq!(redact("APP_PASS", "s3cret"), "[redacted]");
-        assert_eq!(redact("DB_PWD", "s3cret"), "[redacted]");
-        assert_eq!(redact("STRIPE_SECRET_KEY", "sk_live_xxx"), "[redacted]");
-        assert_eq!(redact("APP_CRED", "s3cret"), "[redacted]");
-        assert_eq!(redact("MY_SECRET_VALUE", "s3cret"), "[redacted]");
-        assert_eq!(redact("ACCESS_TOKEN", "tok123"), "[redacted]");
+        assert_eq!(redact_value("APP_PASS", "s3cret"), "[redacted]");
+        assert_eq!(redact_value("DB_PWD", "s3cret"), "[redacted]");
+        assert_eq!(
+            redact_value("STRIPE_SECRET_KEY", "sk_live_xxx"),
+            "[redacted]"
+        );
+        assert_eq!(redact_value("APP_CRED", "s3cret"), "[redacted]");
+        assert_eq!(redact_value("MY_SECRET_VALUE", "s3cret"), "[redacted]");
+        assert_eq!(redact_value("ACCESS_TOKEN", "tok123"), "[redacted]");
         // Non-secret keys must not be redacted.
-        assert_eq!(redact("HOST", "localhost"), "localhost");
-        assert_eq!(redact("PORT", "3000"), "3000");
+        assert_eq!(redact_value("HOST", "localhost"), "localhost");
+        assert_eq!(redact_value("PORT", "3000"), "3000");
+    }
+
+    #[test]
+    fn redact_value_redacts_credential_urls_regardless_of_key() {
+        // A value with user:pass@host is redacted even when the key is not a
+        // secret key.
+        assert_eq!(
+            redact_value("DATABASE_URL", "postgres://admin:password@localhost/db"),
+            "[redacted]"
+        );
+        assert_eq!(
+            redact_value("DATABASE_URL", "postgres://localhost/db"),
+            "postgres://localhost/db"
+        );
+        assert_eq!(
+            redact_value("NOT_A_SECRET_KEY", "postgres://admin:password@localhost/db"),
+            "[redacted]"
+        );
+    }
+
+    #[test]
+    fn interpolates_basic_variable() {
+        let vars = BTreeMap::from([("DATABASE_HOST".to_string(), "localhost".to_string())]);
+        assert_eq!(
+            interpolate_value("postgres://${DATABASE_HOST}:5432/app", &vars).unwrap(),
+            "postgres://localhost:5432/app"
+        );
+    }
+
+    #[test]
+    fn interpolates_escaped_variable() {
+        let vars = BTreeMap::from([("NOT_AN_ENV_VARIABLE".to_string(), "ignored".to_string())]);
+        // \${VAR} is a literal, no substitution.
+        assert_eq!(
+            interpolate_value("\\${NOT_AN_ENV_VARIABLE}", &vars).unwrap(),
+            "${NOT_AN_ENV_VARIABLE}"
+        );
+    }
+
+    #[test]
+    fn interpolates_recursive_references() {
+        let vars = BTreeMap::from([
+            ("A".to_string(), "${B}".to_string()),
+            ("B".to_string(), "${C}".to_string()),
+            ("C".to_string(), "hello".to_string()),
+        ]);
+        assert_eq!(interpolate_value("${A}", &vars).unwrap(), "hello");
+    }
+
+    #[test]
+    fn interpolates_missing_variable_errors() {
+        let vars = BTreeMap::new();
+        let err = interpolate_value("${MISSING}", &vars).unwrap_err();
+        assert!(matches!(err, EnvError::Interpolation { .. }));
+    }
+
+    #[test]
+    fn interpolates_circular_reference_errors() {
+        let vars = BTreeMap::from([
+            ("A".to_string(), "${B}".to_string()),
+            ("B".to_string(), "${A}".to_string()),
+        ]);
+        let err = interpolate_value("${A}", &vars).unwrap_err();
+        assert!(matches!(err, EnvError::CircularReference { .. }));
+    }
+
+    #[test]
+    fn interpolates_leaves_unknown_brace_content_intact() {
+        let vars = BTreeMap::new();
+        // `${not-valid}` (hyphen) is not a valid variable name, left as-is.
+        assert_eq!(
+            interpolate_value("${not-valid}", &vars).unwrap(),
+            "${not-valid}"
+        );
     }
 
     #[test]

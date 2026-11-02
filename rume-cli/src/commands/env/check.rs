@@ -47,7 +47,7 @@ pub fn run(all: bool, unredacted: bool, format: &str) {
                 let display = if unredacted {
                     value.to_string()
                 } else {
-                    rume::env::redact(&key, value)
+                    rume::env::redact_value(&key, value)
                 };
                 output.resolved.push(EnvVarEntry {
                     key,
@@ -74,7 +74,7 @@ pub fn run(all: bool, unredacted: bool, format: &str) {
                     let display = if unredacted {
                         value.to_string()
                     } else {
-                        rume::env::redact(&key, value)
+                        rume::env::redact_value(&key, value)
                     };
                     output.process.push(EnvVarEntry {
                         key,

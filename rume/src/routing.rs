@@ -23,15 +23,18 @@
 //! Rume::builder(ctx).router(router).run().await?;
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::extract::{FromRequestParts, Path, State};
 use axum::http::{Method, StatusCode};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{MethodRouter, Router};
+
+use tokio::time::timeout;
 
 use crate::app::AppContext;
 
@@ -665,16 +668,35 @@ pub struct HealthReport {
     pub checks: Vec<HealthCheckResult>,
 }
 
+/// Default per-check timeout: 5 seconds.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Registry of health checks.
+///
+/// Checks run concurrently on each [`run`](Self::run) call. Each check is
+/// wrapped in a [`tokio::time::timeout`]; a check that exceeds the timeout is
+/// marked [`HealthStatus::Failed`]. When a `cache_ttl` is set, results are
+/// cached internally (interior mutability via [`RwLock`]) so subsequent runs
+/// within the TTL return cached results without re-running the checks.
 #[derive(Debug)]
 pub struct HealthChecks {
     checks: Vec<Arc<dyn HealthCheck>>,
+    timeout: Duration,
+    cache_ttl: Option<Duration>,
+    cache: RwLock<HashMap<String, (Instant, HealthCheckResult)>>,
 }
 
 impl HealthChecks {
     /// Create a new empty health checks registry.
+    ///
+    /// Default timeout is [`DEFAULT_TIMEOUT`] (5s) and caching is disabled.
     pub fn new() -> Self {
-        Self { checks: Vec::new() }
+        Self {
+            checks: Vec::new(),
+            timeout: DEFAULT_TIMEOUT,
+            cache_ttl: None,
+            cache: RwLock::new(HashMap::new()),
+        }
     }
 
     /// Register a health check.
@@ -683,24 +705,140 @@ impl HealthChecks {
         self
     }
 
-    /// Run all registered checks and produce a report.
+    /// Set the per-check timeout. A check that does not complete within this
+    /// duration is marked [`HealthStatus::Failed`].
+    ///
+    /// Default: [`DEFAULT_TIMEOUT`] (5 seconds).
+    pub fn timeout(mut self, duration: Duration) -> Self {
+        self.timeout = duration;
+        self
+    }
+
+    /// Set the optional result cache TTL.
+    ///
+    /// When `Some(ttl)`, check results are cached and subsequent [`run`](Self::run)
+    /// calls within the TTL return cached results (with `cached: true`) without
+    /// re-running the checks. When `None`, caching is disabled.
+    pub fn cache_ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.cache_ttl = ttl;
+        self
+    }
+
+    /// Run all registered checks concurrently and produce a report.
+    ///
+    /// Each check is spawned on a task and wrapped in a per-check timeout.
+    /// Results are aggregated: any [`HealthStatus::Failed`] → overall `Failed`
+    /// (503 on `/health/ready`); any [`HealthStatus::Warning`] with no
+    /// `Failed` → overall `Warning` (degraded, 503); all [`HealthStatus::Ok`]
+    /// → overall `Ok` (200).
     pub async fn run(&self) -> HealthReport {
-        let mut checks = Vec::new();
+        // Serve from cache when a TTL is configured and every check has a
+        // fresh cached result.
+        if let Some(ttl) = self.cache_ttl {
+            let now = Instant::now();
+            let cache = self.cache.read().unwrap();
+            let all_cached = !self.checks.is_empty()
+                && self.checks.iter().all(|check| {
+                    cache
+                        .get(check.name())
+                        .is_some_and(|(instant, _)| now.duration_since(*instant) < ttl)
+                });
+            drop(cache);
+            if all_cached {
+                let checks = self
+                    .checks
+                    .iter()
+                    .map(|check| {
+                        let mut result = self
+                            .cache
+                            .read()
+                            .unwrap()
+                            .get(check.name())
+                            .expect("cached result present")
+                            .1
+                            .clone();
+                        result.cached = true;
+                        result
+                    })
+                    .collect::<Vec<_>>();
+                return Self::build_report(checks);
+            }
+        }
+
+        // Run all checks concurrently, each wrapped in a per-check timeout.
+        let mut handles: Vec<(String, tokio::task::JoinHandle<HealthCheckResult>)> =
+            Vec::with_capacity(self.checks.len());
+        for check in &self.checks {
+            let name = check.name().to_string();
+            let check = Arc::clone(check);
+            let timeout_duration = self.timeout;
+            handles.push((
+                name.clone(),
+                tokio::spawn(async move {
+                    match timeout(timeout_duration, check.run()).await {
+                        Ok(result) => result,
+                        Err(_elapsed) => HealthCheckResult {
+                            name,
+                            status: HealthStatus::Failed,
+                            message: format!("health check timed out after {:?}", timeout_duration),
+                            meta: BTreeMap::new(),
+                            cached: false,
+                        },
+                    }
+                }),
+            ));
+        }
+
+        let mut checks = Vec::with_capacity(handles.len());
+        for (name, handle) in handles {
+            // A join error means the check task itself panicked; treat as Failed.
+            checks.push(handle.await.unwrap_or_else(move |_| HealthCheckResult {
+                name,
+                status: HealthStatus::Failed,
+                message: "health check task panicked".to_string(),
+                meta: BTreeMap::new(),
+                cached: false,
+            }));
+        }
+
+        // Persist fresh results to the cache. TTL validity is enforced at
+        // read time; we just record the instant now.
+        if self.cache_ttl.is_some() {
+            let mut cache = self.cache.write().unwrap();
+            for result in &checks {
+                cache.insert(result.name.clone(), (Instant::now(), result.clone()));
+            }
+        }
+
+        Self::build_report(checks)
+    }
+
+    /// Aggregate check results into a [`HealthReport`].
+    ///
+    /// Any `Failed` → overall `Failed` (`"error"`, `is_healthy = false`);
+    /// any `Warning` with no `Failed` → overall `Warning` (`"warning"`,
+    /// `is_healthy = false`, degraded); all `Ok` → overall `Ok` (`"ok"`,
+    /// `is_healthy = true`).
+    fn build_report(checks: Vec<HealthCheckResult>) -> HealthReport {
         let mut is_healthy = true;
         let mut status = "ok".to_string();
 
-        for check in &self.checks {
-            let result = check.run().await;
+        for result in &checks {
             let healthy = matches!(result.status, HealthStatus::Ok);
             if !healthy {
                 is_healthy = false;
             }
-            if matches!(result.status, HealthStatus::Failed) {
-                status = "error".to_string();
-            } else if matches!(result.status, HealthStatus::Warning) && status == "ok" {
-                status = "warning".to_string();
+            match result.status {
+                HealthStatus::Ok => {}
+                HealthStatus::Warning => {
+                    // Warning only upgrades "ok" to "warning"; a Failed check
+                    // (already "error") takes precedence and wins overall.
+                    if status == "ok" {
+                        status = "warning".to_string();
+                    }
+                }
+                HealthStatus::Failed => status = "error".to_string(),
             }
-            checks.push(result);
         }
 
         HealthReport {
@@ -715,8 +853,12 @@ impl HealthChecks {
 
 impl Clone for HealthChecks {
     fn clone(&self) -> Self {
+        let cache = self.cache.read().unwrap();
         Self {
             checks: self.checks.clone(),
+            timeout: self.timeout,
+            cache_ttl: self.cache_ttl,
+            cache: RwLock::new(cache.clone()),
         }
     }
 }
@@ -815,6 +957,8 @@ impl IntoResponse for Rejection {
 mod tests {
     use super::*;
     use crate::{AppContext, Availability, ProjectPaths};
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Debug, Clone)]
     #[expect(dead_code)]
@@ -1045,6 +1189,87 @@ mod tests {
         }
     }
 
+    /// A check that sleeps for `delay` then records its name in `order`.
+    #[derive(Debug)]
+    struct TimingCheck {
+        name: &'static str,
+        delay: Duration,
+        order: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl HealthCheck for TimingCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            let name = self.name.to_string();
+            let delay = self.delay;
+            let order = Arc::clone(&self.order);
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                order.lock().unwrap().push(name.clone());
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Ok,
+                    message: "ok".to_string(),
+                    meta: BTreeMap::new(),
+                    cached: false,
+                }
+            })
+        }
+    }
+
+    /// A check that always reports Warning.
+    #[derive(Debug)]
+    struct WarningCheck;
+
+    impl HealthCheck for WarningCheck {
+        fn name(&self) -> &str {
+            "cache"
+        }
+
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            Box::pin(async move {
+                HealthCheckResult {
+                    name: "cache".to_string(),
+                    status: HealthStatus::Warning,
+                    message: "high latency".to_string(),
+                    meta: BTreeMap::new(),
+                    cached: false,
+                }
+            })
+        }
+    }
+
+    /// A check that counts how many times `run` is invoked.
+    #[derive(Debug)]
+    struct CountingCheck {
+        name: &'static str,
+        runs: Arc<AtomicUsize>,
+    }
+
+    impl HealthCheck for CountingCheck {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+            let name = self.name.to_string();
+            let runs = Arc::clone(&self.runs);
+            Box::pin(async move {
+                runs.fetch_add(1, Ordering::SeqCst);
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Ok,
+                    message: "ok".to_string(),
+                    meta: BTreeMap::new(),
+                    cached: false,
+                }
+            })
+        }
+    }
+
     #[tokio::test]
     async fn health_checks_run_all_ok() {
         let checks = HealthChecks::new().register(OkCheck);
@@ -1090,6 +1315,94 @@ mod tests {
         // C-m4: Warning → not fully healthy (503 on /health/ready)
         assert!(!report.is_healthy);
         assert_eq!(report.status, "warning");
+    }
+
+    #[tokio::test]
+    async fn health_checks_run_concurrently() {
+        // A slow check must not block a fast check: both run concurrently.
+        let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let checks = HealthChecks::new()
+            .register(TimingCheck {
+                name: "slow",
+                delay: Duration::from_millis(150),
+                order: Arc::clone(&order),
+            })
+            .register(TimingCheck {
+                name: "fast",
+                delay: Duration::from_millis(0),
+                order: Arc::clone(&order),
+            });
+
+        let start = Instant::now();
+        let report = checks.run().await;
+        let elapsed = start.elapsed();
+
+        assert!(report.is_healthy);
+        // Fast check completed before the slow one → they ran concurrently,
+        // not sequentially (sequential slow-first would finish slow first).
+        let order = order.lock().unwrap();
+        assert_eq!(order[0], "fast");
+        // Concurrent wall-clock is bounded by the slowest check, not the sum.
+        assert!(elapsed < Duration::from_millis(300));
+    }
+
+    #[tokio::test]
+    async fn health_check_timeout_marks_failed() {
+        // A check that sleeps longer than the per-check timeout is Failed.
+        let checks = HealthChecks::new()
+            .timeout(Duration::from_millis(50))
+            .register(TimingCheck {
+                name: "slow",
+                delay: Duration::from_millis(250),
+                order: Arc::new(Mutex::new(Vec::new())),
+            });
+
+        let report = checks.run().await;
+        assert!(!report.is_healthy);
+        assert_eq!(report.status, "error");
+
+        let result = report
+            .checks
+            .iter()
+            .find(|r| r.name == "slow")
+            .expect("slow check");
+        assert_eq!(result.status, HealthStatus::Failed);
+        assert!(result.message.contains("timed out"));
+        assert!(!result.cached);
+    }
+
+    #[tokio::test]
+    async fn health_check_caching_returns_cached() {
+        let runs = Arc::new(AtomicUsize::new(0));
+        let checks = HealthChecks::new()
+            .cache_ttl(Some(Duration::from_secs(60)))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&runs),
+            });
+
+        // First run executes the check.
+        let report1 = checks.run().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert!(!report1.checks[0].cached);
+
+        // Second run within TTL returns cached results without re-running.
+        let report2 = checks.run().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(report2.checks.len(), 1);
+        assert!(report2.checks[0].cached);
+        assert_eq!(report2.checks[0].status, HealthStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn health_check_degraded_when_warning() {
+        // Warning without any Failed → overall Warning (degraded), not healthy.
+        let checks = HealthChecks::new().register(WarningCheck);
+        let report = checks.run().await;
+        assert!(!report.is_healthy);
+        assert_eq!(report.status, "warning");
+        assert_eq!(report.checks[0].status, HealthStatus::Warning);
     }
 
     // --- Resourceful routing ---
