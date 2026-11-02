@@ -50,6 +50,10 @@ pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
+pub use crate::security::{
+    AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
+    SecurityHeadersConfig, SecurityHeadersLayer,
+};
 pub use crate::tenant::{
     HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant, TenantContext,
     TenantError, TenantLayer, TenantResolver, TenantScopedCache,

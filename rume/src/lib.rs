@@ -23,6 +23,7 @@ pub mod persistence;
 pub mod prelude;
 pub mod resilience;
 pub mod routing;
+pub mod security;
 pub mod tenant;
 pub mod testing;
 pub mod validation;
@@ -73,6 +74,10 @@ pub use resilience::{
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
+};
+pub use security::{
+    AuditError, AuditLogger, AuditRecord, AuditStatus, CsrfConfig, CsrfLayer, MemoryAuditLogger,
+    SecurityHeadersConfig, SecurityHeadersLayer,
 };
 pub use tenant::{
     HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant, TenantContext,
