@@ -36,6 +36,8 @@ pub struct SecurityHeadersConfig {
     pub x_xss_protection: Option<String>,
     /// Arbitrary additional security headers.
     pub custom_headers: BTreeMap<String, String>,
+    /// Whether HSTS injection strictly requires HTTPS or `x-forwarded-proto: https` (default: `true`).
+    pub hsts_require_tls: bool,
 }
 
 impl Default for SecurityHeadersConfig {
@@ -49,6 +51,7 @@ impl Default for SecurityHeadersConfig {
             permissions_policy: Some("geolocation=(), camera=(), microphone=()".to_string()),
             x_xss_protection: Some("0".to_string()),
             custom_headers: BTreeMap::new(),
+            hsts_require_tls: true,
         }
     }
 }
@@ -74,6 +77,12 @@ impl SecurityHeadersConfig {
     /// Sets Strict-Transport-Security.
     pub fn with_hsts(mut self, hsts: impl Into<String>) -> Self {
         self.strict_transport_security = Some(hsts.into());
+        self
+    }
+
+    /// Configures whether HSTS injection requires HTTPS or `x-forwarded-proto: https` (default: `true`).
+    pub fn with_hsts_require_tls(mut self, require: bool) -> Self {
+        self.hsts_require_tls = require;
         self
     }
 
@@ -144,6 +153,14 @@ where
         let config = Arc::clone(&self.config);
         let mut inner = self.inner.clone();
 
+        let is_https = req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
+            || req
+                .headers()
+                .get("x-forwarded-proto")
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.eq_ignore_ascii_case("https"))
+                .unwrap_or(false);
+
         Box::pin(async move {
             let mut response = inner.call(req).await?;
             let headers = response.headers_mut();
@@ -156,6 +173,7 @@ where
             }
 
             if let Some(hsts) = &config.strict_transport_security
+                && (!config.hsts_require_tls || is_https)
                 && !headers.contains_key(STRICT_TRANSPORT_SECURITY)
                 && let Ok(val) = HeaderValue::from_str(hsts)
             {

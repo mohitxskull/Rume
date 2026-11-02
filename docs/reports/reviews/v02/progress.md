@@ -6,3 +6,4 @@ Group D: complete (2 findings closed: Enterprise-Reliability M2, Enterprise-Reli
 Group E: complete (5 findings closed: Correctness M1, Enterprise-Reliability M3, Correctness m2, Security m1, Security m2)
 Group F: complete (3 findings closed: Enterprise-Reliability M4, Enterprise-Reliability M5, Enterprise-Reliability m4)
 Group G: complete (3 findings closed: Architecture M2 / Testing M2, Architecture M3, Testing M4)
+Group H: complete (4 findings closed: Security M3, Security M4, Security m3, Correctness M3)

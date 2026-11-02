@@ -124,6 +124,9 @@ impl Migrator {
     }
 
     /// Rolls back the most recently applied migration.
+    ///
+    /// Fails closed with [`PersistenceError::IrreversibleMigration`] if the target
+    /// migration lacks a `down_sql` rollback script, preserving executed state.
     pub async fn rollback_last(
         &self,
         db: &MemoryDatabase,
@@ -131,14 +134,18 @@ impl Migrator {
         // Find the last applied migration in reverse registration order
         for migration in self.migrations.iter().rev() {
             if db.has_migration(&migration.id) {
-                if let Some(sql) = &migration.down_sql {
-                    db.execute(sql)
-                        .await
-                        .map_err(|err| PersistenceError::MigrationError {
-                            migration: migration.id.clone(),
-                            message: err.to_string(),
-                        })?;
-                }
+                let Some(sql) = &migration.down_sql else {
+                    return Err(PersistenceError::IrreversibleMigration(
+                        migration.id.clone(),
+                    ));
+                };
+
+                db.execute(sql)
+                    .await
+                    .map_err(|err| PersistenceError::MigrationError {
+                        migration: migration.id.clone(),
+                        message: err.to_string(),
+                    })?;
                 db.unmark_migration(&migration.id);
                 return Ok(Some(migration.id.clone()));
             }

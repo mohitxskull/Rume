@@ -29,6 +29,10 @@ pub enum PersistenceError {
     #[error("unapplied pending migrations detected: {0:?}")]
     PendingMigrations(Vec<String>),
 
+    /// Attempted to rollback a migration that has no down migration script.
+    #[error("cannot rollback irreversible migration '{0}': missing down_sql")]
+    IrreversibleMigration(String),
+
     /// Database pool or connection is already closed.
     #[error("database is closed")]
     Closed,

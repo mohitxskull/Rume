@@ -149,6 +149,33 @@ async fn migrations_apply_rollback_and_preflight_verification() {
 }
 
 #[tokio::test]
+async fn irreversible_migration_rollback_fails_closed() {
+    let db = MemoryDatabase::new();
+
+    // Migration without down_sql
+    let migrator = Migrator::new().add_migration(Migration::from_sql(
+        "001_irreversible_drop",
+        "drop legacy table",
+        "DROP TABLE legacy_data",
+    ));
+
+    migrator.run_pending(&db).await.unwrap();
+    assert!(db.has_migration("001_irreversible_drop"));
+
+    // Attempt rollback: must fail closed and NOT unmark the migration
+    let res = migrator.rollback_last(&db).await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(
+        matches!(err, PersistenceError::IrreversibleMigration(ref id) if id == "001_irreversible_drop")
+    );
+
+    // Database still tracks it as applied
+    assert!(db.has_migration("001_irreversible_drop"));
+    assert_eq!(migrator.pending_migrations(&db).len(), 0);
+}
+
+#[tokio::test]
 async fn health_check_reports_pool_status_and_failures() {
     let db = MemoryDatabase::new();
     let pool = DatabasePool::new(db.clone(), DatabaseConfig::default());

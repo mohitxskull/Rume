@@ -1,15 +1,15 @@
 //! Pluggable authentication schemes (Bearer tokens, API keys, session cookies).
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::http::header::{AUTHORIZATION, COOKIE};
 use axum::http::request::Parts;
+use sha2::{Digest, Sha256};
 
 use crate::auth::error::AuthError;
 use crate::auth::identity::AuthUser;
 use crate::auth::session::{BoxFuture, SessionStore};
-use crate::helpers::safe_equal;
 
 /// An authentication scheme that extracts and verifies credentials from request parts.
 pub trait AuthenticationScheme: Send + Sync + 'static {
@@ -83,7 +83,7 @@ impl AuthenticationScheme for BearerTokenScheme {
 #[derive(Clone)]
 pub struct ApiKeyScheme {
     header_name: String,
-    keys: Arc<BTreeMap<String, AuthUser>>,
+    keys: Arc<HashMap<[u8; 32], AuthUser>>,
 }
 
 impl ApiKeyScheme {
@@ -91,7 +91,7 @@ impl ApiKeyScheme {
     pub fn new() -> Self {
         Self {
             header_name: "x-api-key".to_string(),
-            keys: Arc::new(BTreeMap::new()),
+            keys: Arc::new(HashMap::new()),
         }
     }
 
@@ -102,8 +102,14 @@ impl ApiKeyScheme {
     }
 
     /// Registers a known API key mapped to an [`AuthUser`].
-    pub fn add_key(mut self, key: impl Into<String>, user: AuthUser) -> Self {
-        Arc::make_mut(&mut self.keys).insert(key.into(), user);
+    ///
+    /// Cryptographically hashes the key using SHA-256 before storing it,
+    /// preventing plaintext keys from sitting in heap memory.
+    pub fn add_key(mut self, key: impl AsRef<[u8]>, user: AuthUser) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(key.as_ref());
+        let hash: [u8; 32] = hasher.finalize().into();
+        Arc::make_mut(&mut self.keys).insert(hash, user);
         self
     }
 }
@@ -130,10 +136,12 @@ impl AuthenticationScheme for ApiKeyScheme {
                 ));
             };
 
-            for (known_key, user) in self.keys.iter() {
-                if safe_equal(key_str, known_key) {
-                    return Ok(Some(user.clone()));
-                }
+            let mut hasher = Sha256::new();
+            hasher.update(key_str.as_bytes());
+            let incoming_hash: [u8; 32] = hasher.finalize().into();
+
+            if let Some(user) = self.keys.get(&incoming_hash) {
+                return Ok(Some(user.clone()));
             }
 
             Err(AuthError::InvalidCredentials("unrecognized api key".into()))

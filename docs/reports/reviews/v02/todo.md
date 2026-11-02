@@ -96,13 +96,13 @@ Ordered by priority tier (`P0` critical unblockers → `P3` minor hardening), wi
 
 ### Group H — Security & Persistence Hardening (solve together)
 
-- [ ] **Security M3 — `ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan** (`security.md` M3).
+- [x] **Security M3 — `ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan** (`security.md` M3).
       `rume/src/auth/scheme.rs:105–125`: Keys are stored as plaintext and checked with `==` in a linear loop, creating timing leaks. Store hashed keys (`sha256`) and verify using constant-time `safe_equal`.
-- [ ] **Security M4 — Double-submit CSRF layer lacks token issuance and is vulnerable to subdomain tossing** (`security.md` M4).
+- [x] **Security M4 — Double-submit CSRF layer lacks token issuance and is vulnerable to subdomain tossing** (`security.md` M4).
       `rume/src/security/csrf.rs:158–180`: Layer verifies cookies but provides no endpoint or helper to issue cryptographically signed tokens. Add CSRF token generator and optional `SameSite=Strict` cookie injector.
-- [ ] **Security m3 — `SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP** (`security.md` m3).
+- [x] **Security m3 — `SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP** (`security.md` m3).
       `rume/src/security/headers.rs:155–165`: Strict-Transport-Security is injected even over plain HTTP connections, violating RFC 6797. Gate HSTS injection behind TLS/HTTPS connection state or `x-forwarded-proto: https`.
-- [ ] **Correctness M3 — `Migrator::rollback_last` silently unmarks migrations when `down_sql` is `None`** (`correctness.md` M3).
+- [x] **Correctness M3 — `Migrator::rollback_last` silently unmarks migrations when `down_sql` is `None`** (`correctness.md` M3).
       `rume/src/persistence/migrator.rs:132–145`: If a migration has no `down_sql`, it is deleted from the executed tracker without running any rollback. Reject irreversible rollback attempts with `PersistenceError::IrreversibleMigration`.
 
 ---
