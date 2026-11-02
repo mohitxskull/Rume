@@ -8,7 +8,7 @@ use tower::ServiceExt;
 /// A lightweight test application backed by an Axum router.
 pub struct TestApp {
     router: Router<()>,
-    cleanup: Option<Box<dyn FnOnce() + Send>>,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl TestApp {
@@ -21,7 +21,7 @@ impl TestApp {
     }
 
     /// Create a test app with a cleanup hook for DB-backed tests.
-    pub fn with_cleanup(router: Router<()>, cleanup: impl FnOnce() + Send + 'static) -> Self {
+    pub fn with_cleanup(router: Router<()>, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
         Self {
             router,
             cleanup: Some(Box::new(cleanup)),
@@ -63,7 +63,7 @@ impl TestApp {
     /// Read the response body as bytes.
     pub async fn body_bytes(response: Response<Body>) -> Vec<u8> {
         use axum::body::to_bytes;
-        to_bytes(response.into_body(), 1024 * 1024)
+        to_bytes(response.into_body(), 16 * 1024 * 1024)
             .await
             .expect("failed to read body")
             .to_vec()
@@ -94,7 +94,7 @@ impl Drop for TestApp {
 pub struct TestAppBuilder<S> {
     state: S,
     router: Router<S>,
-    cleanup: Option<Box<dyn FnOnce() + Send>>,
+    cleanup: Option<Box<dyn FnOnce() + Send + Sync>>,
 }
 
 impl<S> TestAppBuilder<S>
@@ -120,7 +120,7 @@ where
     }
 
     /// Register a cleanup hook for DB-backed tests.
-    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + 'static) -> Self {
+    pub fn with_cleanup(mut self, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
         self.cleanup = Some(Box::new(cleanup));
         self
     }

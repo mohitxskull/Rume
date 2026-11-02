@@ -11,22 +11,20 @@ use std::fmt::{self, Display};
 use std::future::Future;
 use std::ops::Deref;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::FromRequestParts;
-use axum::http::header::{CONTENT_TYPE, HeaderName, HeaderValue};
+use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::request::Parts;
 use axum::http::Request;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
+use tracing::Instrument;
 
 /// The standard HTTP header name for request identity: `x-request-id`.
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
-
-static COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// A unique identifier for an HTTP request.
 ///
@@ -46,34 +44,9 @@ static COUNTER: AtomicU64 = AtomicU64::new(1);
 pub struct RequestId(pub String);
 
 impl RequestId {
-    /// Generate a new, unique UUID v4 formatted request ID.
+    /// Generate a new, unique UUID v4 formatted request ID backed by the OS CSPRNG.
     pub fn generate() -> Self {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default();
-        let nanos = now.as_nanos();
-        let count = COUNTER.fetch_add(1, Ordering::Relaxed);
-
-        // Mix timestamp nanos, counter, and constant seed with splitmix64
-        let mut r1 = splitmix64((nanos as u64) ^ count);
-        let mut r2 = splitmix64((nanos >> 64) as u64 ^ count.rotate_left(32) ^ 0x9e3779b97f4a7c15);
-
-        // UUID v4 format: set version (4) and variant (RFC 4122)
-        r1 = (r1 & 0xffffffffffff0fff) | 0x0000000000004000;
-        r2 = (r2 & 0x3fffffffffffffff) | 0x8000000000000000;
-
-        let b1 = r1.to_be_bytes();
-        let b2 = r2.to_be_bytes();
-
-        let id = format!(
-            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
-            b1[0], b1[1], b1[2], b1[3],
-            b1[4], b1[5],
-            b1[6], b1[7],
-            b2[0], b2[1],
-            b2[2], b2[3], b2[4], b2[5], b2[6], b2[7],
-        );
-        RequestId(id)
+        RequestId(uuid::Uuid::new_v4().to_string())
     }
 
     /// Access the underlying string slice.
@@ -127,13 +100,6 @@ where
             Ok(RequestId::generate())
         }
     }
-}
-
-fn splitmix64(mut x: u64) -> u64 {
-    x = x.wrapping_add(0x9e3779b97f4a7c15);
-    x = (x ^ (x >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-    x = (x ^ (x >> 27)).wrapping_mul(0x94d049bb133111eb);
-    x ^ (x >> 31)
 }
 
 /// Validate an incoming `X-Request-ID` value.
@@ -202,80 +168,130 @@ where
         req.extensions_mut().insert(request_id.clone());
 
         let method = req.method().clone();
-        let path = req.uri().path().to_string();
+        let matched_path = req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .map(|mp| mp.as_str().to_string());
 
-        let span = tracing::info_span!(
-            "http_request",
-            request_id = %request_id,
-            method = %method,
-            path = %path,
-            status = tracing::field::Empty,
-            latency_ms = tracing::field::Empty,
-        );
+        let span = if let Some(ref route) = matched_path {
+            tracing::info_span!(
+                "http_request",
+                request_id = %request_id,
+                method = %method,
+                route = %route,
+                status = tracing::field::Empty,
+                latency_ms = tracing::field::Empty,
+            )
+        } else {
+            tracing::info_span!(
+                "http_request",
+                request_id = %request_id,
+                method = %method,
+                status = tracing::field::Empty,
+                latency_ms = tracing::field::Empty,
+            )
+        };
 
         let mut inner = self.inner.clone();
         let req_id_str = request_id.0.clone();
+        let span_clone = span.clone();
 
-        Box::pin(async move {
-            let start = Instant::now();
-            let _enter = span.enter();
+        Box::pin(
+            async move {
+                let start = Instant::now();
 
-            let mut response = inner.call(req).await?;
-            let elapsed = start.elapsed();
-            let latency_ms = elapsed.as_millis() as u64;
-            let status = response.status();
+                let mut response = inner.call(req).await?;
+                let elapsed = start.elapsed();
+                let latency_ms = elapsed.as_millis() as u64;
+                let status = response.status();
 
-            span.record("status", status.as_u16());
-            span.record("latency_ms", latency_ms);
+                span_clone.record("status", status.as_u16());
+                span_clone.record("latency_ms", latency_ms);
 
-            if status.is_server_error() {
-                tracing::error!(status = status.as_u16(), latency_ms, "request failed");
-            } else if status.is_client_error() {
-                tracing::warn!(status = status.as_u16(), latency_ms, "request error");
-            } else {
-                tracing::info!(status = status.as_u16(), latency_ms, "request completed");
-            }
+                if status.is_server_error() {
+                    tracing::error!(status = status.as_u16(), latency_ms, "request failed");
+                } else if status.is_client_error() {
+                    tracing::warn!(status = status.as_u16(), latency_ms, "request error");
+                } else {
+                    tracing::info!(status = status.as_u16(), latency_ms, "request completed");
+                }
 
-            // Always add X-Request-ID to response headers
-            if let Ok(hdr_val) = HeaderValue::from_str(&req_id_str) {
-                response.headers_mut().insert(X_REQUEST_ID.clone(), hdr_val);
-            }
+                // Always add X-Request-ID to response headers
+                if let Ok(hdr_val) = HeaderValue::from_str(&req_id_str) {
+                    response.headers_mut().insert(X_REQUEST_ID.clone(), hdr_val);
+                }
 
-            // If response is RFC 9457 Problem Details, ensure request_id is populated
-            let is_problem_json = response
-                .headers()
-                .get(&CONTENT_TYPE)
-                .and_then(|v| v.to_str().ok())
-                .map(|ct| ct.starts_with("application/problem+json"))
-                .unwrap_or(false);
+                // If response is RFC 9457 Problem Details, ensure request_id is populated safely.
+                let is_problem_json = response
+                    .headers()
+                    .get(&CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|ct| ct.starts_with("application/problem+json"))
+                    .unwrap_or(false);
 
-            if is_problem_json {
-                let (parts, body) = response.into_parts();
-                if let Ok(bytes) = axum::body::to_bytes(body, 64 * 1024).await {
-                    if let Ok(mut json) = serde_json::from_slice::<serde_json::Value>(&bytes)
-                        && let Some(obj) = json.as_object_mut()
-                    {
-                        let should_inject = obj
-                            .get("request_id")
-                            .map(|v| v.is_null())
-                            .unwrap_or(true);
-                        if should_inject {
-                            obj.insert(
-                                "request_id".to_string(),
-                                serde_json::Value::String(req_id_str),
-                            );
-                            if let Ok(new_bytes) = serde_json::to_vec(&obj) {
-                                return Ok(Response::from_parts(parts, Body::from(new_bytes)));
+                if is_problem_json {
+                    const MAX_PROBLEM_DETAILS_INSPECT: usize = 1024 * 1024; // 1 MiB
+                    let (mut parts, body) = response.into_parts();
+
+                    let is_oversized = parts
+                        .headers
+                        .get(CONTENT_LENGTH)
+                        .and_then(|val| val.to_str().ok())
+                        .and_then(|val| val.parse::<usize>().ok())
+                        .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
+                        .unwrap_or_else(|| body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64));
+
+                    if is_oversized {
+                        // Never destroy or truncate oversized responses! Return untouched.
+                        return Ok(Response::from_parts(parts, body));
+                    }
+
+                    match axum::body::to_bytes(body, MAX_PROBLEM_DETAILS_INSPECT).await {
+                        Ok(bytes) => {
+                            let mut final_bytes = bytes;
+                            let mut body_modified = false;
+
+                            if let Ok(mut json) =
+                                serde_json::from_slice::<serde_json::Value>(&final_bytes)
+                                && let Some(obj) = json.as_object_mut()
+                            {
+                                let should_inject =
+                                    matches!(obj.get("request_id"), None | Some(serde_json::Value::Null));
+                                if should_inject {
+                                    obj.insert(
+                                        "request_id".to_string(),
+                                        serde_json::Value::String(req_id_str),
+                                    );
+                                    if let Ok(new_bytes) = serde_json::to_vec(&obj) {
+                                        final_bytes = axum::body::Bytes::from(new_bytes);
+                                        body_modified = true;
+                                    }
+                                }
                             }
+
+                            if body_modified {
+                                // If Content-Length was present, update it to match new body length
+                                if parts.headers.contains_key(CONTENT_LENGTH)
+                                    && let Ok(len_val) =
+                                        HeaderValue::from_str(&final_bytes.len().to_string())
+                                {
+                                    parts.headers.insert(CONTENT_LENGTH, len_val);
+                                }
+                            }
+
+                            return Ok(Response::from_parts(parts, Body::from(final_bytes)));
+                        }
+                        Err(_) => {
+                            parts.headers.remove(CONTENT_LENGTH);
+                            return Ok(Response::from_parts(parts, Body::empty()));
                         }
                     }
-                    return Ok(Response::from_parts(parts, Body::from(bytes)));
                 }
-                return Ok(Response::from_parts(parts, Body::empty()));
-            }
 
-            Ok(response)
-        })
+                Ok(response)
+            }
+            .instrument(span),
+        )
     }
 }
 
@@ -291,6 +307,9 @@ mod tests {
         assert_ne!(id1, id2);
         assert_eq!(id1.len(), 36);
         assert_eq!(id1.chars().filter(|c| *c == '-').count(), 4);
+
+        let parsed = uuid::Uuid::parse_str(id1.as_str()).expect("must be valid uuid");
+        assert_eq!(parsed.get_version_num(), 4);
     }
 
     #[test]

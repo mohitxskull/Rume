@@ -158,3 +158,155 @@ async fn attaches_request_id_to_problem_details_responses() {
     );
     assert_eq!(json.get("code").and_then(|v| v.as_str()), Some("INVALID_INPUT"));
 }
+
+#[tokio::test]
+async fn oversized_problem_details_preserves_body() {
+    let ctx = test_ctx();
+    // 2 MiB payload exceeds MAX_PROBLEM_DETAILS_INSPECT (1 MiB)
+    let large_body = format!(
+        r#"{{"title":"large error","detail":"{}"}}"#,
+        "x".repeat(2 * 1024 * 1024)
+    );
+    let large_body_clone = large_body.clone();
+
+    let handler = move || {
+        let b = large_body_clone.clone();
+        async move {
+            axum::response::Response::builder()
+                .status(StatusCode::INTERNAL_SERVER_ERROR)
+                .header("content-type", "application/problem+json")
+                .header("content-length", b.len().to_string())
+                .body(axum::body::Body::from(b))
+                .unwrap()
+        }
+    };
+
+    let builder = Rume::builder(ctx).route("/large-problem", get(handler));
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let response = app.get("/large-problem").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = TestApp::body_text(response).await;
+    // The oversized body must NOT be truncated or replaced with empty body!
+    assert_eq!(body.len(), large_body.len());
+    assert_eq!(body, large_body);
+}
+
+#[tokio::test]
+async fn explicit_content_length_is_accurately_updated_on_injection() {
+    let ctx = test_ctx();
+    let original_json = r#"{"type":"about:blank","title":"Bad Request"}"#;
+    let original_len = original_json.len();
+
+    let handler = move || async move {
+        axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/problem+json")
+            .header("content-length", original_len.to_string())
+            .body(axum::body::Body::from(original_json))
+            .unwrap()
+    };
+
+    let builder = Rume::builder(ctx).route("/explicit-len", get(handler));
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let response = app.get("/explicit-len").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let content_len_hdr: usize = response
+        .headers()
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let body = TestApp::body_text(response).await;
+    // Header must match the actual body length after injection
+    assert_eq!(content_len_hdr, body.len());
+    assert!(body.contains("request_id"));
+}
+
+#[tokio::test]
+async fn malformed_json_problem_details_preserves_body() {
+    let ctx = test_ctx();
+    let malformed = "this is not valid json {{{";
+
+    let handler = move || async move {
+        axum::response::Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header("content-type", "application/problem+json")
+            .body(axum::body::Body::from(malformed))
+            .unwrap()
+    };
+
+    let builder = Rume::builder(ctx).route("/malformed", get(handler));
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let response = app.get("/malformed").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let body = TestApp::body_text(response).await;
+    // Malformed body must remain intact, not dropped or replaced
+    assert_eq!(body, malformed);
+}
+
+#[tokio::test]
+async fn ordinary_error_response_remains_untouched() {
+    let ctx = test_ctx();
+    let plain_error = "500 Internal Server Error: Database failure";
+
+    let handler = move || async move {
+        axum::response::Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "text/plain; charset=utf-8")
+            .body(axum::body::Body::from(plain_error))
+            .unwrap()
+    };
+
+    let builder = Rume::builder(ctx).route("/plain-error", get(handler));
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let response = app.get("/plain-error").await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+    let body = TestApp::body_text(response).await;
+    assert_eq!(body, plain_error);
+}
+
+#[tokio::test]
+async fn concurrent_requests_have_independent_os_csprng_uuids() {
+    let ctx = test_ctx();
+    let builder = Rume::builder(ctx).route("/echo", get(echo_request_id));
+    let router = builder.build_router(test_ctx()).unwrap();
+
+    let mut handles = Vec::new();
+    for _ in 0..50 {
+        let router_clone = router.clone();
+        handles.push(tokio::spawn(async move {
+            let app = TestApp::new(router_clone.with_state(test_ctx()));
+            let resp = app.get("/echo").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            resp.headers()
+                .get(&X_REQUEST_ID)
+                .and_then(|v| v.to_str().ok())
+                .unwrap()
+                .to_string()
+        }));
+    }
+
+    let mut ids = std::collections::HashSet::new();
+    for handle in handles {
+        let id = handle.await.unwrap();
+        // Each ID must be 36 chars long (UUID format)
+        assert_eq!(id.len(), 36);
+        // Each ID must be unique
+        assert!(ids.insert(id), "duplicate request ID generated");
+    }
+    assert_eq!(ids.len(), 50);
+}
