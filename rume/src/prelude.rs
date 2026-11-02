@@ -38,6 +38,11 @@ pub use crate::outbox::{
 pub use crate::persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
 };
+pub use crate::resilience::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitState, ConcurrencyLimitLayer,
+    ConcurrencyLimiter, RateLimitConfig, RateLimitLayer, RateLimitStatus, RateLimiter,
+    ResilienceError, TimeoutLayer,
+};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,

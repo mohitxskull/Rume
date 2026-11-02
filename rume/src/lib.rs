@@ -20,6 +20,7 @@ pub mod openapi;
 pub mod outbox;
 pub mod persistence;
 pub mod prelude;
+pub mod resilience;
 pub mod routing;
 pub mod testing;
 pub mod validation;
@@ -58,6 +59,11 @@ pub use outbox::{
 };
 pub use persistence::{
     DatabaseConfig, DatabasePool, MemoryDatabase, Migration, Migrator, PersistenceError,
+};
+pub use resilience::{
+    CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitState, ConcurrencyLimitLayer,
+    ConcurrencyLimiter, RateLimitConfig, RateLimitLayer, RateLimitStatus, RateLimiter,
+    ResilienceError, TimeoutLayer,
 };
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
