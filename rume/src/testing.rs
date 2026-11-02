@@ -13,17 +13,20 @@ pub struct TestApp {
 
 impl TestApp {
     /// Create a test app from an already-built router.
-    pub fn new(router: Router<()>) -> Self {
+    pub fn new(router: impl Into<Router<()>>) -> Self {
         Self {
-            router,
+            router: router.into(),
             cleanup: None,
         }
     }
 
     /// Create a test app with a cleanup hook for DB-backed tests.
-    pub fn with_cleanup(router: Router<()>, cleanup: impl FnOnce() + Send + Sync + 'static) -> Self {
+    pub fn with_cleanup(
+        router: impl Into<Router<()>>,
+        cleanup: impl FnOnce() + Send + Sync + 'static,
+    ) -> Self {
         Self {
-            router,
+            router: router.into(),
             cleanup: Some(Box::new(cleanup)),
         }
     }
@@ -109,8 +112,8 @@ where
         }
     }
 
-    pub fn router(mut self, router: Router<S>) -> Self {
-        self.router = router;
+    pub fn router(mut self, router: impl Into<Router<S>>) -> Self {
+        self.router = router.into();
         self
     }
 

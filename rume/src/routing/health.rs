@@ -12,12 +12,12 @@ use std::time::{Duration, Instant};
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
-use axum::routing::{Router, get};
 use serde::Serialize;
 use serde_json::json;
 use tokio::time::timeout;
 
 use crate::app::{AppContext, AvailabilityState};
+use crate::routing::Router;
 
 /// Health check result status.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -300,9 +300,9 @@ where
     S: Clone + Send + Sync + 'static,
 {
     Router::new()
-        .route(
+        .get(
             "/health/live",
-            get(move |State(ctx): State<AppContext<E, C, S>>| async move {
+            move |State(ctx): State<AppContext<E, C, S>>| async move {
                 if ctx.availability.state() == AvailabilityState::Broken {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
@@ -312,11 +312,11 @@ where
                 } else {
                     (StatusCode::OK, Json(json!({"status": "alive"}))).into_response()
                 }
-            }),
+            },
         )
-        .route(
+        .get(
             "/health/ready",
-            get(move |State(ctx): State<AppContext<E, C, S>>| async move {
+            move |State(ctx): State<AppContext<E, C, S>>| async move {
                 // S-m4: readiness also respects lifecycle state — refuse
                 // traffic when the application is terminating or
                 // refusing traffic, even if all health checks pass.
@@ -345,7 +345,7 @@ where
                     StatusCode::SERVICE_UNAVAILABLE
                 };
                 (code, Json(json!({"status": status}))).into_response()
-            }),
+            },
         )
 }
 

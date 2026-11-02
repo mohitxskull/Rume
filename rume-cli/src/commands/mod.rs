@@ -56,9 +56,9 @@ pub fn run(cli: Cli) {
             require_rume_project();
             doctor::run(&format);
         }
-        Some(Commands::ListRoutes) => {
+        Some(Commands::ListRoutes { json }) => {
             require_rume_project();
-            list_routes::run();
+            list_routes::run(json);
         }
         Some(Commands::Codegen) => {
             require_rume_project();

@@ -225,12 +225,36 @@ where
     /// information.
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
+        self.route_registry.register(crate::routing::RouteInfo {
+            method: axum::http::Method::from_bytes(b"ANY").unwrap(),
+            path: path.to_string(),
+            name: None,
+            params: crate::routing::registry::extract_path_params(path),
+        });
+        self
+    }
+
+    /// Mount a [`crate::routing::RouteSpec`] with its parameter validation layer and metadata.
+    pub fn route_spec<H, T>(mut self, spec: crate::routing::RouteSpec, handler: H) -> Self
+    where
+        H: axum::handler::Handler<T, AppContext<E, C, S>>,
+        T: 'static,
+    {
+        let rume_router = crate::routing::Router::new().route_spec(spec, handler);
+        let (axum_router, registry) = rume_router.into_parts();
+        self.router = self.router.merge(axum_router);
+        self.route_registry.extend(registry);
         self
     }
 
     /// Replace the application router.
-    pub fn router(mut self, router: Router<AppContext<E, C, S>>) -> Self {
-        self.router = router;
+    ///
+    /// Accepts a [`crate::routing::Router`] (carrying both the Axum router and
+    /// route registry) or an [`axum::Router`] via [`From`].
+    pub fn router(mut self, router: impl Into<crate::routing::Router<AppContext<E, C, S>>>) -> Self {
+        let (axum_router, registry) = router.into().into_parts();
+        self.router = axum_router;
+        self.route_registry = registry;
         self
     }
 
@@ -519,17 +543,32 @@ where
             .parse()
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
 
-        let mode = self.mode;
+        let mode = if std::env::var("RUME_INSPECT").is_ok()
+            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
+        {
+            ApplicationMode::Inspect
+        } else {
+            self.mode
+        };
+
         // In Inspect mode, boot the application context without serving HTTP
         // and without running any hooks (on_ready or on_shutdown). Hooks may
         // perform side effects (DB connections, external calls, etc.) that
         // should only happen during normal application startup or shutdown.
-        // Inspect mode is for tooling (config check, env check, migrations)
+        // Inspect mode is for tooling (config check, env check, migrations, list:routes)
         // that needs a booted app context but no side effects.
         if mode == ApplicationMode::Inspect {
             let ctx = self.ctx.clone();
             ctx.lifecycle.set(LifecycleState::Booted);
             ctx.availability.set(AvailabilityState::Live);
+
+            if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
+                || std::env::args().any(|a| a == "--rume-inspect-routes")
+            {
+                let json = serde_json::to_string(self.route_registry.routes())
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
+            }
 
             return Ok(());
         }
@@ -582,11 +621,26 @@ where
     {
         self.ctx.route_registry = self.route_registry.clone();
 
-        let mode = self.mode;
+        let mode = if std::env::var("RUME_INSPECT").is_ok()
+            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
+        {
+            ApplicationMode::Inspect
+        } else {
+            self.mode
+        };
+
         if mode == ApplicationMode::Inspect {
             let ctx = self.ctx.clone();
             ctx.lifecycle.set(LifecycleState::Booted);
             ctx.availability.set(AvailabilityState::Live);
+
+            if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
+                || std::env::args().any(|a| a == "--rume-inspect-routes")
+            {
+                let json = serde_json::to_string(self.route_registry.routes())
+                    .unwrap_or_else(|_| "[]".to_string());
+                println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
+            }
 
             return Ok(());
         }

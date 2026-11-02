@@ -34,7 +34,11 @@ pub enum Commands {
         format: String,
     },
     /// List registered routes.
-    ListRoutes,
+    ListRoutes {
+        /// Output routes as JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Generate shell completions.
     Completions {
         #[arg(value_enum)]

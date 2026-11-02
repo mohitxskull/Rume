@@ -122,6 +122,37 @@ impl RouteSpec {
         self
     }
 
+    /// Access the route's path template.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// Access the route's HTTP method.
+    pub fn method(&self) -> &Method {
+        &self.method
+    }
+
+    /// Access the route's optional name.
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Access the declared parameter matchers.
+    pub fn params(&self) -> &[(String, Matcher)] {
+        &self.params
+    }
+
+    /// Get all parameter names (both declared matchers and template parameters).
+    pub fn param_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.params.iter().map(|(p, _)| p.clone()).collect();
+        for p in crate::routing::registry::extract_path_params(&self.path) {
+            if !names.contains(&p) {
+                names.push(p);
+            }
+        }
+        names
+    }
+
     /// Build the route specification into route metadata.
     ///
     /// Returns `(path, method, params, name)` suitable for `Router::route()`.

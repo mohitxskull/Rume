@@ -1,14 +1,20 @@
 //! Route groups.
 //!
 //! Provides [`RouteGroup`], a builder for applying shared configuration
-//! (URL prefix) to multiple routes before mounting them on an Axum router.
+//! (URL prefix) to multiple routes before mounting them on a [`Router`].
 
-use axum::Router;
+use axum::handler::Handler;
+use axum::http::Method;
 use axum::routing::MethodRouter;
+
+use crate::routing::registry::{join_path, RouteInfo};
+use crate::routing::resource::Resource;
+use crate::routing::router::Router;
+use crate::routing::spec::RouteSpec;
 
 /// Route group builder for applying shared configuration to multiple routes.
 pub struct RouteGroup<S> {
-    inner: Router<S>,
+    router: Router<S>,
     prefix: String,
 }
 
@@ -16,7 +22,7 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
     /// Create a new route group.
     pub fn new() -> Self {
         Self {
-            inner: Router::new(),
+            router: Router::new(),
             prefix: String::new(),
         }
     }
@@ -27,75 +33,125 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
         self
     }
 
-    /// Add a route method router to the group.
-    ///
-    /// Joins `prefix` and `path` with exactly one `/` separator, so
-    /// `prefix("/api/").add("/users")` → `/api/users` and
-    /// `prefix("api").add("users")` → `/api/users`.
-    pub fn add(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
-        let full_path = Self::join_path(&self.prefix, path);
-        self.inner = self.inner.route(&full_path, method_router);
+    /// Mount a `GET` route under this group's prefix.
+    pub fn get<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.get(&full_path, handler);
         self
     }
 
-    /// Add multiple `(path, method_router)` routes to the group, applying the
-    /// group's [`prefix`](RouteGroup::prefix) to each path via [`join_path`].
-    ///
-    /// This is how a [`crate::routing::Resource`]'s routes are mounted under a
-    /// group prefix:
-    ///
-    /// ```ignore
-    /// use axum::routing::get;
-    /// use rume::routing::{Resource, RouteGroup};
-    ///
-    /// async fn index() {}
-    ///
-    /// let routes = Resource::new("posts").index(get(index)).into_routes();
-    /// let group = RouteGroup::<()>::new().prefix("/api").add_routes(routes);
-    /// ```
+    /// Mount a `POST` route under this group's prefix.
+    pub fn post<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.post(&full_path, handler);
+        self
+    }
+
+    /// Mount a `PUT` route under this group's prefix.
+    pub fn put<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.put(&full_path, handler);
+        self
+    }
+
+    /// Mount a `PATCH` route under this group's prefix.
+    pub fn patch<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.patch(&full_path, handler);
+        self
+    }
+
+    /// Mount a `DELETE` route under this group's prefix.
+    pub fn delete<H, T>(mut self, path: &str, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.delete(&full_path, handler);
+        self
+    }
+
+    /// Add a route method router to the group.
+    pub fn add(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
+        let full_path = join_path(&self.prefix, path);
+        self.router = self.router.route(&full_path, method_router);
+        self
+    }
+
+    /// Mount a [`RouteSpec`] under this group's prefix.
+    pub fn route_spec<H, T>(mut self, spec: RouteSpec, handler: H) -> Self
+    where
+        H: Handler<T, S>,
+        T: 'static,
+    {
+        let full_path = join_path(&self.prefix, spec.path());
+        let mut new_spec = match *spec.method() {
+            Method::GET => RouteSpec::get(&full_path),
+            Method::POST => RouteSpec::post(&full_path),
+            Method::PUT => RouteSpec::put(&full_path),
+            Method::PATCH => RouteSpec::patch(&full_path),
+            Method::DELETE => RouteSpec::delete(&full_path),
+            _ => RouteSpec::get(&full_path),
+        };
+        for (param, matcher) in spec.params() {
+            new_spec = new_spec.where_param(param, matcher.clone());
+        }
+        if let Some(name) = spec.name() {
+            new_spec = new_spec.r#as(name);
+        }
+        self.router = self.router.route_spec(new_spec, handler);
+        self
+    }
+
+    /// Mount a [`Resource`] under this group's prefix.
+    pub fn resource(mut self, resource: Resource<S>) -> Self {
+        for r in resource.routes() {
+            let full_path = join_path(&self.prefix, &r.path);
+            let mut sub_router = Router::new().route(&full_path, r.router.clone());
+            sub_router.registry_mut().clear();
+            sub_router.registry_mut().register(RouteInfo {
+                method: r.method.clone(),
+                path: full_path,
+                name: Some(r.name.clone()),
+                params: r.params.clone(),
+            });
+            self.router = self.router.merge(sub_router);
+        }
+        self
+    }
+
+    /// Add multiple `(path, method_router)` routes to the group.
     pub fn add_routes(
         mut self,
         routes: impl IntoIterator<Item = (String, MethodRouter<S>)>,
     ) -> Self {
         for (path, router) in routes.into_iter() {
-            let full_path = Self::join_path(&self.prefix, &path);
-            self.inner = self.inner.route(&full_path, router);
+            let full_path = join_path(&self.prefix, &path);
+            self.router = self.router.route(&full_path, router);
         }
         self
     }
 
-    /// Join a prefix and path with exactly one `/` separator.
-    ///
-    /// Handles leading/trailing slashes on both sides so that
-    /// `join_path("/api/", "/users")` → `/api/users`,
-    /// `join_path("api", "users")` → `/api/users`, and
-    /// `join_path("", "/users")` → `/users`.
-    fn join_path(prefix: &str, path: &str) -> String {
-        let prefix = prefix.trim_end_matches('/');
-        let path = path.trim_start_matches('/');
-        match (prefix.is_empty(), path.is_empty()) {
-            (true, true) => "/".to_string(),
-            (true, false) => format!("/{path}"),
-            (false, true) => {
-                if prefix.starts_with('/') {
-                    prefix.to_string()
-                } else {
-                    format!("/{prefix}")
-                }
-            }
-            (false, false) => {
-                if prefix.starts_with('/') {
-                    format!("{prefix}/{path}")
-                } else {
-                    format!("/{prefix}/{path}")
-                }
-            }
-        }
-    }
-
-    /// Build into an Axum `Router`.
+    /// Build into a [`Router`].
     pub fn build(self) -> Router<S> {
-        self.inner
+        self.router
     }
 }
 
@@ -105,33 +161,37 @@ impl<S: Clone + Send + Sync + 'static> Default for RouteGroup<S> {
     }
 }
 
+impl<S: Clone + Send + Sync + 'static> From<RouteGroup<S>> for Router<S> {
+    fn from(group: RouteGroup<S>) -> Self {
+        group.build()
+    }
+}
+
+impl<S: Clone + Send + Sync + 'static> From<RouteGroup<S>> for axum::Router<S> {
+    fn from(group: RouteGroup<S>) -> Self {
+        group.build().into_inner()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::get;
 
-    #[test]
-    fn route_group_joins_prefix_and_path_with_single_slash() {
-        async fn handler() {}
-
-        let group = RouteGroup::<()>::new()
-            .prefix("/api")
-            .add("/users", get(handler))
-            .add("posts", get(handler));
-
-        let routes = group.build();
-        // Just verify it builds without panicking; path normalization is
-        // covered by join_path unit tests below.
-        let _ = routes;
+    async fn dummy_handler() -> &'static str {
+        "ok"
     }
 
     #[test]
-    fn route_group_join_path_normalizes_slashes() {
-        assert_eq!(RouteGroup::<()>::join_path("/api/", "/users"), "/api/users");
-        assert_eq!(RouteGroup::<()>::join_path("api", "users"), "/api/users");
-        assert_eq!(RouteGroup::<()>::join_path("", "/users"), "/users");
-        assert_eq!(RouteGroup::<()>::join_path("/api/", ""), "/api");
-        assert_eq!(RouteGroup::<()>::join_path("api", ""), "/api");
-        assert_eq!(RouteGroup::<()>::join_path("", ""), "/");
+    fn route_group_applies_prefix() {
+        let group = RouteGroup::<()>::new()
+            .prefix("/api/v1")
+            .get("/users", dummy_handler)
+            .get("/users/{id}", dummy_handler);
+
+        let router = group.build();
+        assert_eq!(router.routes().len(), 2);
+        assert_eq!(router.routes()[0].path, "/api/v1/users");
+        assert_eq!(router.routes()[1].path, "/api/v1/users/{id}");
+        assert_eq!(router.routes()[1].params, vec!["id"]);
     }
 }

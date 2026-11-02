@@ -1,95 +1,99 @@
 //! List registered routes for `rume list:routes`.
 //!
-//! Reads `src/routes.rs` and extracts route path strings from `.route()`
-//! calls. This avoids booting the full application just to inspect routes.
-//! Multiline `.route()` calls are joined before parsing.
+//! Boots the application in `Inspect` mode with `RUME_INSPECT=routes`
+//! and extracts the canonical route inventory from the application's
+//! [`rume::routing::RouteRegistry`].
+//!
+//! This completely eliminates source-code heuristic parsing and ensures
+//! nested, grouped, resource, and merged routes are represented with 100%
+//! runtime fidelity.
 
-use std::fs;
+use std::process::Command;
+use comfy_table::Color;
+use rume::routing::RouteInfo;
+use crate::ui::table::TableBuilder;
 
-pub fn run() {
-    let routes_path = "src/routes.rs";
-    let content = match fs::read_to_string(routes_path) {
-        Ok(c) => c,
+pub fn run(json_output: bool) {
+    let output = match Command::new("cargo")
+        .args(["run", "--quiet", "--", "--rume-inspect-routes"])
+        .env("RUME_INSPECT", "routes")
+        .output()
+    {
+        Ok(o) => o,
         Err(err) => {
-            eprintln!("error: could not read {routes_path}: {err}");
+            eprintln!("error: failed to execute cargo to inspect routes: {err}");
             std::process::exit(1);
         }
     };
 
-    let mut routes: Vec<(String, String)> = Vec::new();
-
-    // Join multiline .route() calls: accumulate lines until a line ends
-    // with ')' (the closing of .route(...)). This handles routes spread
-    // across multiple lines, e.g. composed routers.
-    let mut accumulator = String::new();
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("//") {
-            continue;
-        }
-        if !accumulator.is_empty() {
-            accumulator.push(' ');
-        }
-        accumulator.push_str(trimmed);
-
-        // When we see a complete .route(...) call, extract it.
-        if accumulator.contains(".route(") && accumulator.ends_with(')') {
-            if let Some((method, path)) = extract_route(&accumulator) {
-                routes.push((method.to_string(), path.to_string()));
-            }
-            accumulator.clear();
-        }
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        eprintln!("error: failed to inspect application routes.\n{stderr}\n{stdout}");
+        std::process::exit(output.status.code().unwrap_or(1));
     }
 
-    if routes.is_empty() {
-        println!("No routes found in {routes_path}.");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let start_tag = "__RUME_ROUTES_JSON_START__";
+    let end_tag = "__RUME_ROUTES_JSON_END__";
+
+    let json_str = match stdout.find(start_tag).and_then(|start| {
+        let after_start = &stdout[start + start_tag.len()..];
+        after_start.find(end_tag).map(|end| after_start[..end].trim())
+    }) {
+        Some(s) => s,
+        None => {
+            eprintln!("error: application did not produce route inspection metadata.\n{stdout}");
+            std::process::exit(1);
+        }
+    };
+
+    let routes: Vec<RouteInfo> = match serde_json::from_str(json_str) {
+        Ok(r) => r,
+        Err(err) => {
+            eprintln!("error: failed to parse route inspection JSON: {err}\nPayload: {json_str}");
+            std::process::exit(1);
+        }
+    };
+
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&routes).unwrap_or_else(|_| "[]".to_string()));
         return;
     }
 
-    println!("Registered routes:");
-    println!("{:<10} PATH", "METHOD");
-    println!("{:-<10} {:-<40}", "", "");
-    for (method, path) in &routes {
-        println!("{:<10} {}", method, path);
+    if routes.is_empty() {
+        println!("No routes registered in application.");
+        return;
     }
-}
 
-/// Extract an HTTP method and path from a `.route("/path", method_router)` call.
-///
-/// Returns `(method, path)` where method is derived from the router variant
-/// (e.g. `get` → `GET`, `post` → `POST`) or `"ANY"` if unrecognized.
-fn extract_route(call: &str) -> Option<(&str, &str)> {
-    // Match patterns like: router.route("/users", axum::routing::get(handler))
-    // or: router = router.route("/posts", get(handler))
-    let route_idx = call.find(".route(")?;
-    let after_route = &call[route_idx + 7..]; // skip ".route("
+    let mut table = TableBuilder::new();
+    table.head(&["METHOD", "NAME", "PARAMS", "PATH"]);
 
-    // Find the first string literal (the path)
-    let path_start = after_route.find('"')?;
-    let path_end = after_route[path_start + 1..].find('"')?;
-    let path = &after_route[path_start + 1..path_start + 1 + path_end];
+    for route in &routes {
+        let method_str = route.method.as_str();
+        let color = match method_str {
+            "GET" => Some(Color::Green),
+            "POST" => Some(Color::Blue),
+            "PUT" => Some(Color::Yellow),
+            "PATCH" => Some(Color::Cyan),
+            "DELETE" => Some(Color::Red),
+            _ => None,
+        };
 
-    // After the path, find the router call to determine the method
-    let after_path = &after_route[path_start + 1 + path_end + 1..]; // skip closing quote and comma/space
-    let method = extract_method(after_path);
+        let name = route.name.as_deref().unwrap_or("-");
+        let params = if route.params.is_empty() {
+            "[]".to_string()
+        } else {
+            format!("[{}]", route.params.join(", "))
+        };
 
-    Some((method, path))
-}
-
-/// Determine the HTTP method from the router expression after the path.
-fn extract_method(after_path: &str) -> &str {
-    let trimmed = after_path.trim();
-    if trimmed.starts_with("axum::routing::get") || trimmed.starts_with("get(") {
-        "GET"
-    } else if trimmed.starts_with("axum::routing::post") || trimmed.starts_with("post(") {
-        "POST"
-    } else if trimmed.starts_with("axum::routing::put") || trimmed.starts_with("put(") {
-        "PUT"
-    } else if trimmed.starts_with("axum::routing::patch") || trimmed.starts_with("patch(") {
-        "PATCH"
-    } else if trimmed.starts_with("axum::routing::delete") || trimmed.starts_with("delete(") {
-        "DELETE"
-    } else {
-        "ANY"
+        table.row_colored(&[
+            (method_str, color),
+            (name, None),
+            (&params, None),
+            (&route.path, None),
+        ]);
     }
+
+    table.render();
 }

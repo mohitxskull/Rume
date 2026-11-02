@@ -29,7 +29,7 @@ pub use helpers::{
 };
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
-    RouteRegistry, RouteSpec, ValidatedParam,
+    RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
 pub use testing::{TestApp, TestAppBuilder};
 pub use validation::Validated;

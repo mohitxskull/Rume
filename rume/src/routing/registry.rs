@@ -1,13 +1,35 @@
 //! Route information and registry.
 //!
 //! Provides [`RouteInfo`] and the application-scoped [`RouteRegistry`] used
-//! by [`crate::routing::RouteSpec`] metadata when routes are mounted.
+//! by [`crate::routing::RouteSpec`] and [`crate::routing::Router`] when routes
+//! are mounted.
 
 use axum::http::Method;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+mod method_serde {
+    use super::*;
+
+    pub fn serialize<S>(method: &Method, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(method.as_str())
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Method, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Method::from_bytes(s.as_bytes()).map_err(serde::de::Error::custom)
+    }
+}
 
 /// Information about a registered route (for `rume list:routes`).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteInfo {
+    #[serde(with = "method_serde")]
     pub method: Method,
     pub path: String,
     pub name: Option<String>,
@@ -17,7 +39,7 @@ pub struct RouteInfo {
 /// Application-scoped route registry. Each Rume application owns its own
 /// registry; route metadata is tied to the application that registered it,
 /// not to a process-global singleton.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RouteRegistry {
     routes: Vec<RouteInfo>,
 }
@@ -31,6 +53,11 @@ impl RouteRegistry {
     /// Register a route.
     pub fn register(&mut self, info: RouteInfo) {
         self.routes.push(info);
+    }
+
+    /// Append all routes from another registry.
+    pub fn extend(&mut self, other: RouteRegistry) {
+        self.routes.extend(other.routes);
     }
 
     /// Return all registered routes.
@@ -54,10 +81,52 @@ impl RouteRegistry {
     }
 }
 
+/// Extract path parameter names from a route template string (e.g. `/{id}` or `/:id`).
+pub fn extract_path_params(path: &str) -> Vec<String> {
+    let mut params = Vec::new();
+    for segment in path.split('/') {
+        let segment = segment.trim();
+        if segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2 {
+            params.push(segment[1..segment.len() - 1].to_string());
+        } else if let Some(stripped) = segment.strip_prefix(':').filter(|s| !s.is_empty()) {
+            params.push(stripped.to_string());
+        }
+    }
+    params
+}
+
+/// Join a prefix and path with exactly one `/` separator.
+///
+/// Handles leading/trailing slashes on both sides so that
+/// `join_path("/api/", "/users")` → `/api/users`,
+/// `join_path("api", "users")` → `/api/users`, and
+/// `join_path("", "/users")` → `/users`.
+pub fn join_path(prefix: &str, path: &str) -> String {
+    let prefix = prefix.trim_end_matches('/');
+    let path = path.trim_start_matches('/');
+    match (prefix.is_empty(), path.is_empty()) {
+        (true, true) => "/".to_string(),
+        (true, false) => format!("/{path}"),
+        (false, true) => {
+            if prefix.starts_with('/') {
+                prefix.to_string()
+            } else {
+                format!("/{prefix}")
+            }
+        }
+        (false, false) => {
+            if prefix.starts_with('/') {
+                format!("{prefix}/{path}")
+            } else {
+                format!("/{prefix}/{path}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::Method;
 
     #[test]
     fn route_registry_register_and_list() {
@@ -85,5 +154,24 @@ mod tests {
 
         registry.clear();
         assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn extracts_path_parameters() {
+        assert_eq!(extract_path_params("/users"), Vec::<String>::new());
+        assert_eq!(extract_path_params("/users/{id}"), vec!["id"]);
+        assert_eq!(extract_path_params("/users/:id"), vec!["id"]);
+        assert_eq!(
+            extract_path_params("/orgs/{org_id}/teams/:team_id"),
+            vec!["org_id", "team_id"]
+        );
+    }
+
+    #[test]
+    fn joins_paths_cleanly() {
+        assert_eq!(join_path("/api/", "/users"), "/api/users");
+        assert_eq!(join_path("api", "users"), "/api/users");
+        assert_eq!(join_path("", "/users"), "/users");
+        assert_eq!(join_path("/v1", ""), "/v1");
     }
 }

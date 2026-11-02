@@ -16,11 +16,11 @@ pub use crate::helpers::{
 };
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
-    RouteRegistry, RouteSpec, ValidatedParam,
+    RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
 pub use crate::testing::{TestApp, TestAppBuilder};
 pub use crate::validation::Validated;
 pub use axum::extract::Path;
 pub use axum::extract::State;
-pub use axum::{Json, Router};
+pub use axum::Json;
 pub use serde::{Deserialize, Serialize};
