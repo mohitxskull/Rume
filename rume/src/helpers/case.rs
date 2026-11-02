@@ -213,10 +213,10 @@ pub fn sentence_case(input: &str) -> String {
         out.pop();
     }
 
-    if let Some(first) = out.chars().next() {
-        if first.is_ascii_lowercase() {
-            out.replace_range(..1, &first.to_ascii_uppercase().to_string());
-        }
+    if let Some(first) = out.chars().next()
+        && first.is_ascii_lowercase()
+    {
+        out.replace_range(..1, &first.to_ascii_uppercase().to_string());
     }
 
     out

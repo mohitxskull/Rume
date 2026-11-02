@@ -18,8 +18,8 @@ pub mod validation;
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle,
-    LifecycleState, MiddlewareConfigError, ProjectPaths, Rume, RumeBuilder, init_tracing,
-    ops_router,
+    LifecycleState, MiddlewareConfigError, ObservabilityLayer, ProjectPaths, RequestId, Rume,
+    RumeBuilder, X_REQUEST_ID, init_tracing, ops_router,
 };
 pub use error::AppError;
 pub use helpers::{

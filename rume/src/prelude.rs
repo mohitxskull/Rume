@@ -2,8 +2,8 @@
 
 pub use crate::app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle,
-    LifecycleState, MiddlewareConfigError, ProjectPaths, Rume, RumeBuilder, init_tracing,
-    ops_router,
+    LifecycleState, MiddlewareConfigError, ProjectPaths, RequestId, Rume, RumeBuilder,
+    init_tracing, ops_router,
 };
 pub use crate::config;
 pub use crate::config::ConfigError;

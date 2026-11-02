@@ -482,7 +482,7 @@ where
             }
         }
 
-        // 2. Apply individual middleware (outermost middleware layers)
+        // 2. Apply individual middleware (outermost user middleware layers)
         for name in middleware_order.iter().rev() {
             if applied_middleware.contains(name)
                 && let Some(mw) = middleware.get(name)
@@ -490,6 +490,11 @@ where
                 router = mw(router);
             }
         }
+
+        // 3. Apply the automatic ObservabilityLayer (outermost framework layer).
+        // Attaches RequestId, creates tracing spans, includes X-Request-ID header,
+        // and attaches request_id to Problem Details error responses.
+        router = router.layer(crate::app::observability::ObservabilityLayer::new());
 
         Ok(router)
     }
@@ -567,10 +572,9 @@ where
                     let _ = timeout(shutdown_timeout, cleanup_fut).await;
 
                     serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!("startup hook failed: {err}"),
-                    ));
+                    return Err(std::io::Error::other(format!(
+                        "startup hook failed: {err}"
+                    )));
                 }
             }
         }
@@ -911,17 +915,17 @@ mod tests {
         assert_eq!(lifecycle.state(), LifecycleState::Terminated);
     }
 
-    fn recording_mw(
-        name: &'static str,
-        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-    ) -> Box<
-        dyn Fn(
-                Router<AppContext<(), (), ()>>,
-            ) -> Router<AppContext<(), (), ()>>
+    type TestMiddleware = Box<
+        dyn Fn(Router<AppContext<(), (), ()>>) -> Router<AppContext<(), (), ()>>
             + Send
             + Sync
             + 'static,
-    > {
+    >;
+
+    fn recording_mw(
+        name: &'static str,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> TestMiddleware {
         Box::new(move |router| {
             let log = std::sync::Arc::clone(&log);
             router.layer(axum::middleware::from_fn(

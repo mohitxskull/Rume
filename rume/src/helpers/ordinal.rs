@@ -16,7 +16,7 @@
 /// ```
 pub fn ordinal_suffix(n: u64) -> &'static str {
     let rem100 = n % 100;
-    if rem100 >= 11 && rem100 <= 13 {
+    if (11..=13).contains(&rem100) {
         return "th";
     }
 
