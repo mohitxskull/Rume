@@ -27,6 +27,7 @@ pub use crate::jobs::{
     JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
     MemoryJobQueue, QueuedJob, RetryPolicy,
 };
+pub use crate::metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
 pub use crate::module::{Module, ModuleContext, ModuleError};
 pub use crate::openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,

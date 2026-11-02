@@ -15,6 +15,7 @@ pub mod error;
 pub mod events;
 pub mod helpers;
 pub mod jobs;
+pub mod metrics;
 pub mod module;
 pub mod openapi;
 pub mod outbox;
@@ -49,6 +50,7 @@ pub use jobs::{
     JobQueue, JobRegistry, JobWorker, MemoryHeartbeatRegistry, MemoryIdempotencyStore,
     MemoryJobQueue, QueuedJob, RetryPolicy,
 };
+pub use metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
 pub use module::{Module, ModuleContext, ModuleError};
 pub use openapi::{
     OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
