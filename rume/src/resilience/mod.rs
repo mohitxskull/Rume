@@ -4,6 +4,8 @@ pub mod circuit_breaker;
 pub mod concurrency;
 pub mod error;
 pub mod rate_limiter;
+#[cfg(feature = "redis")]
+pub mod redis;
 pub mod timeout;
 
 pub use circuit_breaker::{
@@ -12,4 +14,6 @@ pub use circuit_breaker::{
 pub use concurrency::{ConcurrencyLimitLayer, ConcurrencyLimiter, ConcurrencyPermit};
 pub use error::ResilienceError;
 pub use rate_limiter::{RateLimitConfig, RateLimitLayer, RateLimitStatus, RateLimiter};
+#[cfg(feature = "redis")]
+pub use self::redis::RedisRateLimiter;
 pub use timeout::TimeoutLayer;

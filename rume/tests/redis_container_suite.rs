@@ -13,7 +13,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rume::cache::redis::RedisCacheBackend;
-use rume::cache::{Cache, CacheBackend};
+use rume::cache::{Cache, CacheBackend, CacheConfig, CacheError};
+use rume::resilience::{RateLimitConfig, RedisRateLimiter, ResilienceError};
+use rume::tenant::{RedisTenantQuotaStore, TenantScopedCache};
 use serde::{Deserialize, Serialize};
 
 use testcontainers_modules::redis::{REDIS_PORT, Redis};
@@ -232,3 +234,118 @@ async fn test_redis_cache_typed_wrapper_cache_aside() {
         "loader closure must not be executed on cache hit"
     );
 }
+
+#[tokio::test]
+async fn test_redis_cluster_wide_tenant_quota_coordination() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    // Two independent app server instances sharing the same distributed Redis quota store
+    let shared_quota_store: Arc<dyn rume::tenant::TenantQuotaStore> =
+        Arc::new(RedisTenantQuotaStore::new(pool.clone()));
+
+    let server_a = TenantScopedCache::new(Cache::new(backend.clone(), CacheConfig::default()))
+        .with_max_keys_per_tenant(3)
+        .with_quota_store(Arc::clone(&shared_quota_store));
+
+    let server_b = TenantScopedCache::new(Cache::new(backend.clone(), CacheConfig::default()))
+        .with_max_keys_per_tenant(3)
+        .with_quota_store(Arc::clone(&shared_quota_store));
+
+    // Server A caches 2 keys for tenant "tenant-corp"
+    server_a
+        .set("tenant-corp", "doc:1", &"data 1", None)
+        .await
+        .expect("server A set doc:1 failed");
+    server_a
+        .set("tenant-corp", "doc:2", &"data 2", None)
+        .await
+        .expect("server A set doc:2 failed");
+
+    assert_eq!(server_a.active_key_count("tenant-corp").await.unwrap(), 2);
+
+    // Server B caches 1 key for tenant "tenant-corp" (now total 3, hitting quota limit of 3)
+    server_b
+        .set("tenant-corp", "doc:3", &"data 3", None)
+        .await
+        .expect("server B set doc:3 failed");
+
+    assert_eq!(server_b.active_key_count("tenant-corp").await.unwrap(), 3);
+
+    // Now Server A attempts to cache a 4th key -> REJECTED cluster-wide by Redis quota store!
+    let attempt_overflow = server_a
+        .set("tenant-corp", "doc:4", &"overflow", None)
+        .await;
+    match attempt_overflow {
+        Err(CacheError::QuotaExceeded(msg)) => {
+            assert!(msg.contains("tenant 'tenant-corp' exceeded quota of 3 keys"));
+        }
+        other => panic!("expected QuotaExceeded error, got: {other:?}"),
+    }
+
+    // Server B deletes one key
+    server_b
+        .delete("tenant-corp", "doc:3")
+        .await
+        .expect("delete failed");
+    assert_eq!(server_a.active_key_count("tenant-corp").await.unwrap(), 2);
+
+    // Server A can now store doc:4
+    server_a
+        .set("tenant-corp", "doc:4", &"data 4", None)
+        .await
+        .expect("server A should now store doc:4");
+
+    // Invalidate full tenant -> resets quota count to 0 in Redis
+    server_b
+        .invalidate_tenant("tenant-corp")
+        .await
+        .expect("invalidate_tenant failed");
+    assert_eq!(server_a.active_key_count("tenant-corp").await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_redis_sliding_window_rate_limiter() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    let config = RateLimitConfig {
+        max_requests: 3,
+        window: Duration::from_millis(500),
+    };
+
+    let limiter = RedisRateLimiter::new(pool, config);
+
+    // 1st request -> remaining = 2
+    let s1 = limiter.check("client-10.0.0.1").await.expect("check 1");
+    assert_eq!(s1.remaining, 2);
+
+    // 2nd request -> remaining = 1
+    let s2 = limiter.check("client-10.0.0.1").await.expect("check 2");
+    assert_eq!(s2.remaining, 1);
+
+    // 3rd request -> remaining = 0
+    let s3 = limiter.check("client-10.0.0.1").await.expect("check 3");
+    assert_eq!(s3.remaining, 0);
+
+    // 4th request -> RateLimited
+    let err = limiter.check("client-10.0.0.1").await;
+    match err {
+        Err(ResilienceError::RateLimited { retry_after_secs }) => {
+            assert!(retry_after_secs >= 1);
+        }
+        other => panic!("expected RateLimited error, got: {other:?}"),
+    }
+
+    // A different client is NOT affected
+    let other_client = limiter.check("client-10.0.0.2").await.expect("other client");
+    assert_eq!(other_client.remaining, 2);
+
+    // Wait for sliding window to elapse (550ms)
+    tokio::time::sleep(Duration::from_millis(550)).await;
+
+    // First client can make requests again!
+    let s_after = limiter.check("client-10.0.0.1").await.expect("check after window");
+    assert_eq!(s_after.remaining, 2);
+}
+

@@ -7,34 +7,40 @@ use std::time::Duration;
 use crate::cache::backend::CacheBackend;
 use crate::cache::error::CacheError;
 use crate::cache::typed::Cache;
+use crate::tenant::quota::{MemoryTenantQuotaStore, TenantQuotaStore};
 
-use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// A cache wrapper that automatically isolates data per tenant using key prefixes, namespaced tags, and quotas.
 #[derive(Clone)]
 pub struct TenantScopedCache<B: CacheBackend> {
     cache: Cache<B>,
     max_keys_per_tenant: usize,
-    tenant_key_counts: Arc<RwLock<BTreeMap<String, usize>>>,
+    quota_store: Arc<dyn TenantQuotaStore>,
 }
 
 impl<B: CacheBackend> TenantScopedCache<B> {
     /// Default maximum cached keys per tenant.
     pub const DEFAULT_MAX_KEYS_PER_TENANT: usize = 5_000;
 
-    /// Creates a new tenant-scoped cache wrapper with default quotas.
+    /// Creates a new tenant-scoped cache wrapper with default quotas and in-memory quota tracking.
     pub fn new(cache: Cache<B>) -> Self {
         Self {
             cache,
             max_keys_per_tenant: Self::DEFAULT_MAX_KEYS_PER_TENANT,
-            tenant_key_counts: Arc::new(RwLock::new(BTreeMap::new())),
+            quota_store: Arc::new(MemoryTenantQuotaStore::new()),
         }
     }
 
     /// Sets the maximum number of keys permitted per tenant.
     pub fn with_max_keys_per_tenant(mut self, max_keys: usize) -> Self {
         self.max_keys_per_tenant = max_keys.max(1);
+        self
+    }
+
+    /// Configures a custom [`TenantQuotaStore`] (e.g. [`RedisTenantQuotaStore`] for distributed quotas).
+    pub fn with_quota_store(mut self, quota_store: Arc<dyn TenantQuotaStore>) -> Self {
+        self.quota_store = quota_store;
         self
     }
 
@@ -90,18 +96,16 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         let exists = self.cache.exists(&full_key).await?;
 
         if !exists {
-            let mut counts = self
-                .tenant_key_counts
-                .write()
-                .map_err(|e| CacheError::Backend(e.to_string()))?;
-            let current = counts.entry(tenant_id.to_string()).or_insert(0);
-            if *current >= self.max_keys_per_tenant {
+            let acquired = self
+                .quota_store
+                .acquire(tenant_id, self.max_keys_per_tenant)
+                .await?;
+            if !acquired {
                 return Err(CacheError::QuotaExceeded(format!(
                     "tenant '{tenant_id}' exceeded quota of {} keys",
                     self.max_keys_per_tenant
                 )));
             }
-            *current += 1;
         }
 
         let tenant_tag = Self::tenant_tag(tenant_id);
@@ -120,11 +124,8 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     pub async fn delete(&self, tenant_id: &str, key: &str) -> Result<bool, CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
         let deleted = self.cache.delete(&full_key).await?;
-        if deleted
-            && let Ok(mut counts) = self.tenant_key_counts.write()
-            && let Some(count) = counts.get_mut(tenant_id)
-        {
-            *count = count.saturating_sub(1);
+        if deleted {
+            let _ = self.quota_store.release(tenant_id).await;
         }
         Ok(deleted)
     }
@@ -133,10 +134,8 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     pub async fn invalidate_tag(&self, tenant_id: &str, tag: &str) -> Result<usize, CacheError> {
         let scoped = Self::scoped_tag(tenant_id, tag);
         let count = self.cache.invalidate_tag(&scoped).await?;
-        if let Ok(mut counts) = self.tenant_key_counts.write()
-            && let Some(c) = counts.get_mut(tenant_id)
-        {
-            *c = c.saturating_sub(count);
+        for _ in 0..count {
+            let _ = self.quota_store.release(tenant_id).await;
         }
         Ok(count)
     }
@@ -145,10 +144,13 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     pub async fn invalidate_tenant(&self, tenant_id: &str) -> Result<usize, CacheError> {
         let tag = Self::tenant_tag(tenant_id);
         let count = self.cache.invalidate_tag(&tag).await?;
-        if let Ok(mut counts) = self.tenant_key_counts.write() {
-            counts.remove(tenant_id);
-        }
+        let _ = self.quota_store.reset(tenant_id).await;
         Ok(count)
+    }
+
+    /// Returns the active number of cached keys for `tenant_id`.
+    pub async fn active_key_count(&self, tenant_id: &str) -> Result<usize, CacheError> {
+        self.quota_store.count(tenant_id).await
     }
 }
 

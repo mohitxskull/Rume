@@ -92,6 +92,8 @@ pub use resilience::{
     ConcurrencyLimiter, RateLimitConfig, RateLimitLayer, RateLimitStatus, RateLimiter,
     ResilienceError, TimeoutLayer,
 };
+#[cfg(feature = "redis")]
+pub use resilience::RedisRateLimiter;
 pub use routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router, ValidatedParam,
@@ -102,8 +104,10 @@ pub use security::{
     SecurityHeadersConfig, SecurityHeadersLayer,
 };
 pub use tenant::{
-    HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant, TenantContext,
-    TenantError, TenantLayer, TenantResolver, TenantScopedCache,
+    HeaderTenantResolver, MemoryTenantQuotaStore, OptionalTenant, SubdomainTenantResolver, Tenant,
+    TenantContext, TenantError, TenantLayer, TenantQuotaStore, TenantResolver, TenantScopedCache,
 };
+#[cfg(feature = "redis")]
+pub use tenant::RedisTenantQuotaStore;
 pub use testing::{TestApp, TestAppBuilder};
 pub use validation::{Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery};
