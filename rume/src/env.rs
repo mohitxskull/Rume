@@ -87,11 +87,8 @@ pub enum EnvError {
         source: dotenvy::Error,
     },
 
-    #[error("failed to interpolate ${{variable}} in {source_value}")]
-    Interpolation {
-        variable: String,
-        source_value: String,
-    },
+    #[error("failed to interpolate ${{variable}}: variable not found")]
+    Interpolation { variable: String },
 
     #[error("circular reference detected while interpolating ${{variable}}")]
     CircularReference { variable: String },
@@ -375,7 +372,6 @@ fn interpolate_recursive(
                 None => {
                     return Err(EnvError::Interpolation {
                         variable: var.clone(),
-                        source_value: value.to_string(),
                     });
                 }
             };

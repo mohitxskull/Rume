@@ -45,7 +45,7 @@ pub fn run(key: &str) {
     println!(
         "  {}: {}  ({})",
         source,
-        truncate_value(&raw_value, 60),
+        truncate_value(&display_value, 60),
         source_type
     );
     if !from_file {
