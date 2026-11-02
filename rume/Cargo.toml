@@ -35,7 +35,7 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 # Tower utilities for testing and middleware.
 tower = "0.5.3"
 # Request validation.
-garde = { version = "0.23.0", features = ["derive", "email"] }
+garde = { version = "0.23.0", features = ["derive", "email", "url"] }
 uuid = { version = "1.29.0", features = ["v4"] }
 
 [dev-dependencies]

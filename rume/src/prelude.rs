@@ -20,7 +20,9 @@ pub use crate::routing::{
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
 pub use crate::testing::{TestApp, TestAppBuilder};
-pub use crate::validation::Validated;
+pub use crate::validation::{
+    Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery,
+};
 pub use axum::Json;
 pub use axum::extract::Path;
 pub use axum::extract::State;

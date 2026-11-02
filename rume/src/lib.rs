@@ -34,4 +34,4 @@ pub use routing::{
     RouteRegistry, RouteSpec, Router, ValidatedParam,
 };
 pub use testing::{TestApp, TestAppBuilder};
-pub use validation::Validated;
+pub use validation::{Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery};
