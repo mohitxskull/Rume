@@ -1,62 +1,7 @@
-//! Pure, hermetic string helpers.
+//! Case conversion helpers.
 //!
-//! Inspired by AdonisJS `@adonisjs/helpers` (`safeEqual`, `slug`, case
-//! conversions). Everything is implemented in `std` — no new dependencies,
-//! no `unsafe`. Input is treated as ASCII; non-ASCII characters are passed
-//! through unchanged except where lowercasing is explicitly applied.
-
-/// Constant-time comparison of two strings.
-///
-/// Returns `true` only when `a` and `b` are identical. Lengths are compared
-/// first (unequal lengths short-circuit to `false`), then every byte pair is
-/// XOR-accumulated without any early exit, so the elapsed time does not
-/// depend on how many bytes match or where they first differ.
-///
-/// Why: an early-exit byte comparison leaks the position of the first
-/// differing byte through timing. Rejecting different lengths up front is
-/// unavoidable (length itself is public), but beyond that no branch depends
-/// on secret data.
-///
-/// Revisit if: a constant-time length comparison becomes necessary.
-pub fn safe_equal(a: &str, b: &str) -> bool {
-    let a_bytes = a.as_bytes();
-    let b_bytes = b.as_bytes();
-
-    if a_bytes.len() != b_bytes.len() {
-        return false;
-    }
-
-    let mut diff = 0u8;
-    for (x, y) in a_bytes.iter().zip(b_bytes.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
-/// URL-friendly slug.
-///
-/// Lowercases the input, replaces every run of non-alphanumeric characters
-/// with a single `-`, and trims leading and trailing dashes.
-///
-/// `"Hello ♥ World"` → `"hello-world"`.
-pub fn slug(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut prev_was_dash = false;
-
-    for ch in input.chars().map(|ch| ch.to_ascii_lowercase()) {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            prev_was_dash = false;
-        } else if !prev_was_dash && !out.is_empty() {
-            out.push('-');
-            prev_was_dash = true;
-        }
-    }
-
-    out.trim_start_matches('-')
-        .trim_end_matches('-')
-        .to_string()
-}
+//! Converts between camelCase, PascalCase, snake_case, and kebab-case.
+//! Simple and ASCII-only.
 
 /// Convert camelCase / PascalCase to snake_case.
 ///
@@ -158,36 +103,6 @@ pub fn kebab_case(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn safe_equal_identical_returns_true() {
-        assert!(safe_equal("", ""));
-        assert!(safe_equal("abc", "abc"));
-        assert!(safe_equal(
-            "a very long secret value",
-            "a very long secret value"
-        ));
-    }
-
-    #[test]
-    fn safe_equal_different_returns_false() {
-        assert!(!safe_equal("abc", "abd"));
-        assert!(!safe_equal("same prefix", "same suffix"));
-    }
-
-    #[test]
-    fn safe_equal_different_length_returns_false() {
-        assert!(!safe_equal("abc", "abcd"));
-        assert!(!safe_equal("", "a"));
-        assert!(!safe_equal("aaaa", "aaab"));
-    }
-
-    #[test]
-    fn slug_produces_url_friendly_slug() {
-        assert_eq!(slug("Hello World!"), "hello-world");
-        assert_eq!(slug("Hello ♥ World"), "hello-world");
-        assert_eq!(slug("---Multiple---dashes---"), "multiple-dashes");
-    }
 
     #[test]
     fn snake_case_converts_camel_case() {

@@ -1,0 +1,43 @@
+//! Environment error types.
+
+use std::path::PathBuf;
+use thiserror::Error;
+
+/// Errors that can occur while loading and resolving the environment.
+#[derive(Debug, Error)]
+pub enum EnvError {
+    #[error("I/O error while reading {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+
+    #[error("failed to parse environment file {path}: {source}")]
+    Dotenv {
+        path: PathBuf,
+        #[source]
+        source: dotenvy::Error,
+    },
+
+    #[error("failed to interpolate ${{variable}}: variable not found")]
+    Interpolation { variable: String },
+
+    #[error("circular reference detected while interpolating ${{variable}}")]
+    CircularReference { variable: String },
+
+    #[error("failed to validate environment: {0}")]
+    Validation(String),
+}
+
+impl EnvError {
+    pub(crate) fn from_figment(err: figment::Error) -> Self {
+        Self::Validation(err.to_string())
+    }
+}
+
+impl From<figment::Error> for EnvError {
+    fn from(err: figment::Error) -> Self {
+        Self::Validation(err.to_string())
+    }
+}
