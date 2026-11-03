@@ -7,7 +7,6 @@ use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
-use crate::outbox::message::current_timestamp;
 use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     TransactionalOutbox,
@@ -454,7 +453,6 @@ impl OutboxRepository for PostgresBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let now = current_timestamp();
             let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
                 .bind(&id_str)
                 .bind(&token_str)
@@ -470,16 +468,15 @@ impl OutboxRepository for PostgresBackend {
 
             let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
             let status = if retry_count >= max_retries as i32 { "failed" } else { "pending" };
-            let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
-            let next_retry = now + backoff_secs;
+            let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32) as i64;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
+                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
             )
             .bind(status)
             .bind(retry_count)
             .bind(&error)
-            .bind(next_retry as i64)
+            .bind(backoff_secs)
             .bind(&id_str)
             .bind(&token_str)
             .execute(&self.pool)

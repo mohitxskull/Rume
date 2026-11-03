@@ -30,5 +30,5 @@ pub mod jobs;
 pub mod job_reliability;
 
 #[path = "containers/pipeline.rs"]
-#[cfg(all(feature = "postgres", feature = "sqlite"))]
+#[cfg(feature = "postgres")]
 pub mod pipeline;

@@ -5,29 +5,45 @@
 //! Atomic Database Transaction + Outbox Enlistment -> Relay Event Dispatch ->
 //! Background Worker Execution -> Tracing & Metrics -> Failure Recovery & Graceful Drain.
 
-#![cfg(all(feature = "postgres", feature = "sqlite"))]
+#![cfg(feature = "postgres")]
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::body::Body;
+use axum::extract::{Json, State};
+use axum::http::{Request, StatusCode};
+use axum::response::IntoResponse;
+use axum::routing::post;
+use axum::Router;
 use serde::{Deserialize, Serialize};
+use tower::ServiceExt;
 
 use rume::app::state::{Availability, AvailabilityState};
-use rume::auth::identity::AuthUser;
+use rume::auth::identity::{AuthUser, Authenticated};
+use rume::auth::layer::{AuthLayer, PolicyLayer};
 use rume::auth::policy::{RequirePermission, authorize};
+use rume::auth::schemes::BearerTokenScheme;
+use rume::error::AppError;
 use rume::events::Event;
 use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, PostgresJobQueue};
 use rume::metrics::MetricsRegistry;
 use rume::outbox::{
-    OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus, TransactionalOutbox,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, OutboxStatus,
+    TransactionalOutbox,
 };
+use rume::persistence::postgres::PostgresBackend;
 use rume::persistence::{
     DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError,
-    SqliteBackend,
 };
+#[cfg(feature = "sqlite")]
+use rume::persistence::SqliteBackend;
+use rume::tenant::layer::TenantLayer;
+use rume::tenant::resolver::HeaderTenantResolver;
 use rume::tenant::{Tenant, TenantContext};
 
+use crate::common;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderBilledEvent {
@@ -76,9 +92,8 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
     }
 }
 
-use crate::common;
-
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn realistic_enterprise_pipeline_end_to_end() {
     // 1. Setup Framework Subsystems
     let db = Arc::new(SqliteBackend::in_memory().await.unwrap());
@@ -211,6 +226,7 @@ async fn realistic_enterprise_pipeline_end_to_end() {
 }
 
 #[tokio::test]
+#[cfg(feature = "sqlite")]
 async fn pipeline_failure_recovery_and_atomicity_invariants() {
     let db = Arc::new(SqliteBackend::in_memory().await.unwrap());
     db.init_outbox_table().await.unwrap();
@@ -301,4 +317,473 @@ async fn pipeline_failure_recovery_and_atomicity_invariants() {
 
     let drained = pool.close_and_drain(Duration::from_millis(50)).await;
     assert!(drained, "pool must cleanly drain during shutdown");
+}
+
+#[derive(Clone)]
+struct UnifiedAppState {
+    pool: Arc<DatabasePool<PostgresBackend>>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CreateEnterpriseOrderRequest {
+    order_id: String,
+    amount_cents: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EnterpriseOrderCreatedEvent {
+    tenant_id: String,
+    order_id: String,
+    amount_cents: i64,
+}
+
+impl Event for EnterpriseOrderCreatedEvent {
+    const TYPE: &'static str = "enterprise.order_created";
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FulfillEnterpriseOrderJob {
+    tenant_id: String,
+    order_id: String,
+}
+
+impl Job for FulfillEnterpriseOrderJob {
+    const NAME: &'static str = "enterprise.fulfill_order";
+}
+
+async fn enterprise_create_order_endpoint(
+    TenantContext(tenant): TenantContext,
+    Authenticated(user): Authenticated<AuthUser>,
+    State(state): State<UnifiedAppState>,
+    Json(payload): Json<CreateEnterpriseOrderRequest>,
+) -> Result<impl IntoResponse, AppError> {
+    let event = EnterpriseOrderCreatedEvent {
+        tenant_id: tenant.id.clone(),
+        order_id: payload.order_id.clone(),
+        amount_cents: payload.amount_cents,
+    };
+    let outbox_msg = OutboxMessage::from_event(&event)
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    let pool_for_tx = Arc::clone(&state.pool);
+    let order_id = payload.order_id.clone();
+    let tenant_id = tenant.id.clone();
+    let amount = payload.amount_cents;
+
+    state
+        .pool
+        .transaction(move |tx| {
+            let pool = Arc::clone(&pool_for_tx);
+            let order_id = order_id.clone();
+            let tenant_id = tenant_id.clone();
+            let outbox_msg = outbox_msg.clone();
+            async move {
+                let sql = format!(
+                    "INSERT INTO enterprise_orders (id, tenant_id, amount_cents, status) VALUES ('{}', '{}', {}, 'created');",
+                    order_id, tenant_id, amount
+                );
+                tx.execute(&sql).await?;
+                pool.save_tx(&tx, outbox_msg)
+                    .await
+                    .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+                Ok::<(), PersistenceError>(())
+            }
+        })
+        .await
+        .map_err(|e| AppError::internal(e.to_string()))?;
+
+    Ok((
+        StatusCode::CREATED,
+        Json(serde_json::json!({
+            "order_id": payload.order_id,
+            "status": "created",
+            "created_by": user.id,
+        })),
+    ))
+}
+
+struct IdempotentFulfillmentHandler {
+    backend: Arc<PostgresBackend>,
+    executions: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl rume::jobs::JobHandler<FulfillEnterpriseOrderJob> for IdempotentFulfillmentHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a JobContext,
+        job: FulfillEnterpriseOrderJob,
+    ) -> rume::jobs::BoxFuture<'a, Result<(), JobError>> {
+        let backend = Arc::clone(&self.backend);
+        let executions = Arc::clone(&self.executions);
+        let notify = Arc::clone(&self.notify);
+        Box::pin(async move {
+            let sql = format!(
+                "INSERT INTO enterprise_fulfillments (order_id, tenant_id, dispatch_count) VALUES ('{}', '{}', 1) \
+                 ON CONFLICT (order_id) DO UPDATE SET dispatch_count = enterprise_fulfillments.dispatch_count + 1;",
+                job.order_id, job.tenant_id
+            );
+            backend.execute(&sql).await.map_err(|e| JobError::Retryable(e.to_string()))?;
+            executions.fetch_add(1, Ordering::SeqCst);
+            notify.notify_one();
+            Ok(())
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlowDrainJob {
+    job_id: String,
+}
+
+impl Job for SlowDrainJob {
+    const NAME: &'static str = "enterprise.slow_drain";
+}
+
+struct SlowDrainHandler {
+    completed: Arc<AtomicBool>,
+    started: Arc<tokio::sync::Notify>,
+}
+
+impl rume::jobs::JobHandler<SlowDrainJob> for SlowDrainHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a JobContext,
+        _job: SlowDrainJob,
+    ) -> rume::jobs::BoxFuture<'a, Result<(), JobError>> {
+        let completed = Arc::clone(&self.completed);
+        let started = Arc::clone(&self.started);
+        Box::pin(async move {
+            started.notify_one();
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            completed.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_postgres_unified_enterprise_failure_pipeline() {
+    // =========================================================================
+    // 1. Single PostgreSQL Database Setup
+    // =========================================================================
+    let (_db_name, pg_config) = common::containers::create_isolated_postgres_db().await;
+    let pg_backend = Arc::new(
+        PostgresBackend::connect(&pg_config)
+            .await
+            .expect("connect to unified postgres instance"),
+    );
+
+    // Initialize transactional outbox table
+    pg_backend.init_outbox_table().await.expect("init outbox table");
+
+    // Initialize business domain tables
+    pg_backend
+        .execute(
+            "CREATE TABLE enterprise_orders (
+                id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                amount_cents BIGINT NOT NULL,
+                status TEXT NOT NULL
+            );",
+        )
+        .await
+        .expect("create enterprise_orders table");
+
+    pg_backend
+        .execute(
+            "CREATE TABLE enterprise_fulfillments (
+                order_id TEXT PRIMARY KEY,
+                tenant_id TEXT NOT NULL,
+                dispatch_count INT NOT NULL DEFAULT 1
+            );",
+        )
+        .await
+        .expect("create enterprise_fulfillments table");
+
+    // Initialize PostgreSQL job queue sharing the EXACT same database pool
+    let pg_pool = pg_backend.pool().clone();
+    let queue = Arc::new(
+        PostgresJobQueue::new(pg_pool)
+            .with_lease_duration(Duration::from_millis(1500)),
+    );
+    queue.init_schema().await.expect("init jobs schema");
+
+    let pool = Arc::new(DatabasePool::new((*pg_backend).clone(), DatabaseConfig::default()));
+
+    // =========================================================================
+    // 2. Axum Application Shell with Full Middleware Pipeline
+    // =========================================================================
+    let tenant_resolver = HeaderTenantResolver::new()
+        .add_tenant(Tenant::new("acme-corp", "acme-corp"));
+
+    let auth_scheme = BearerTokenScheme::new(|token: String| async move {
+        match token.as_str() {
+            "valid-admin-token" => Ok(Some(
+                AuthUser::new("admin_user_42")
+                    .with_role("operator")
+                    .with_permission("orders:create"),
+            )),
+            "viewer-token" => Ok(Some(
+                AuthUser::new("viewer_user_7")
+                    .with_role("viewer")
+                    .with_permission("orders:view"),
+            )),
+            _ => Ok(None),
+        }
+    });
+
+    let app = Router::new()
+        .route("/api/v1/orders", post(enterprise_create_order_endpoint))
+        .layer(PolicyLayer::new(RequirePermission("orders:create")))
+        .layer(AuthLayer::required().scheme(auth_scheme))
+        .layer(TenantLayer::required(tenant_resolver))
+        .with_state(UnifiedAppState {
+            pool: Arc::clone(&pool),
+        });
+
+    // =========================================================================
+    // 3. HTTP Request Validation Through Full Middleware Stack
+    // =========================================================================
+    // Case 3a: Missing tenant header -> 400 Bad Request
+    {
+        let req = Request::builder()
+            .uri("/api/v1/orders")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer valid-admin-token")
+            .body(Body::from(r#"{"order_id":"test_1","amount_cents":1000}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // Case 3b: Missing or invalid authentication token -> 401 Unauthorized
+    {
+        let req = Request::builder()
+            .uri("/api/v1/orders")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer bogus-token")
+            .body(Body::from(r#"{"order_id":"test_2","amount_cents":1000}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // Case 3c: Authenticated user lacks required permission -> 403 Forbidden
+    {
+        let req = Request::builder()
+            .uri("/api/v1/orders")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer viewer-token")
+            .body(Body::from(r#"{"order_id":"test_3","amount_cents":1000}"#))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    // Case 3d: Valid request passes all middleware layers -> 201 Created
+    let order_id = "ord_pg_unified_001";
+    {
+        let payload = serde_json::json!({
+            "order_id": order_id,
+            "amount_cents": 25000
+        });
+        let req = Request::builder()
+            .uri("/api/v1/orders")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer valid-admin-token")
+            .body(Body::from(payload.to_string()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    // Verify transactional consistency: both business order and outbox message committed
+    let order_status = pg_backend
+        .query_scalar(&format!(
+            "SELECT status FROM enterprise_orders WHERE id = '{order_id}';"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(order_status.as_deref(), Some("created"));
+    assert_eq!(pool.pending_count().await.unwrap(), 1);
+
+    // =========================================================================
+    // 4. Failure-Injected Relay Dispatch & Consumer-Side Idempotency
+    // =========================================================================
+    let queue_for_relay = Arc::clone(&queue);
+    let simulated_drop_occurred = Arc::new(AtomicBool::new(false));
+    let sim_drop_clone = Arc::clone(&simulated_drop_occurred);
+
+    let relay = OutboxRelay::new(Arc::clone(&pg_backend), move |msg| {
+        let q = Arc::clone(&queue_for_relay);
+        let sim_drop = Arc::clone(&sim_drop_clone);
+        let event: EnterpriseOrderCreatedEvent = msg.deserialize_payload().unwrap();
+        async move {
+            // Broker publish: Enqueue background fulfillment job
+            let job = FulfillEnterpriseOrderJob {
+                tenant_id: event.tenant_id,
+                order_id: event.order_id,
+            };
+            q.enqueue(job)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            // Simulate network disconnect AFTER successful broker enqueue on first attempt
+            if !sim_drop.swap(true, Ordering::SeqCst) {
+                return Err(OutboxError::Dispatch(
+                    "simulated broker connection drop immediately post-enqueue".into(),
+                ));
+            }
+
+            Ok(())
+        }
+    })
+    .with_config(OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 2,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    });
+
+    // Pass 1: Fails after publish -> schedules retry with 1s backoff
+    let poll1 = relay.poll_and_dispatch(5).await.unwrap();
+    assert_eq!(poll1.published, 0);
+    assert_eq!(poll1.retried, 1);
+    assert!(simulated_drop_occurred.load(Ordering::SeqCst));
+
+    // Wait for the 1-second backoff duration to elapse
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // Pass 2: Retry succeeds -> enqueues second job (duplicate) and completes outbox
+    let poll2 = relay.poll_and_dispatch(5).await.unwrap();
+    assert_eq!(poll2.published, 1);
+    assert_eq!(pool.pending_count().await.unwrap(), 0);
+
+    // Verify background worker processes both duplicate jobs idempotently
+    let fulfillment_executions = Arc::new(AtomicUsize::new(0));
+    let notify_fulfillment = Arc::new(tokio::sync::Notify::new());
+
+    let mut registry = JobRegistry::new();
+    registry.register(IdempotentFulfillmentHandler {
+        backend: Arc::clone(&pg_backend),
+        executions: Arc::clone(&fulfillment_executions),
+        notify: Arc::clone(&notify_fulfillment),
+    });
+
+    let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
+    worker.start();
+
+    // Await both duplicate job deliveries
+    notify_fulfillment.notified().await;
+    notify_fulfillment.notified().await;
+
+    assert!(worker.drain(Duration::from_secs(3)).await);
+    assert_eq!(fulfillment_executions.load(Ordering::SeqCst), 2);
+
+    // Verify database state: Exactly ONE fulfillment record exists despite duplicate delivery!
+    let fulfillment_count = pg_backend
+        .query_scalar(&format!(
+            "SELECT COUNT(*)::TEXT FROM enterprise_fulfillments WHERE order_id = '{order_id}';"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(fulfillment_count.as_deref(), Some("1"));
+
+    let dispatch_count = pg_backend
+        .query_scalar(&format!(
+            "SELECT dispatch_count::TEXT FROM enterprise_fulfillments WHERE order_id = '{order_id}';"
+        ))
+        .await
+        .unwrap();
+    assert_eq!(dispatch_count.as_deref(), Some("2"));
+
+    // =========================================================================
+    // 5. Worker Crash Simulation & Peer Lease Reclaim
+    // =========================================================================
+    let crash_test_job = FulfillEnterpriseOrderJob {
+        tenant_id: "acme-corp".into(),
+        order_id: "ord_crash_simulation_99".into(),
+    };
+    queue.enqueue(crash_test_job).await.unwrap();
+
+    // Worker 1 claims the job with a 1500ms lease
+    let job1 = queue
+        .dequeue_for("worker_node_crash_1")
+        .await
+        .unwrap()
+        .expect("job should be dequeued by worker 1");
+    assert_eq!(job1.name, FulfillEnterpriseOrderJob::NAME);
+    let token1 = job1.lease_token.clone().expect("lease token present");
+
+    // Peer Worker 2 attempts to claim immediately -> must NOT steal active lease
+    let premature_claim = queue.dequeue_for("worker_node_peer_2").await.unwrap();
+    assert!(
+        premature_claim.is_none(),
+        "peer worker cannot claim a job under an active unexpired lease"
+    );
+
+    // Simulate Worker 1 crashing: sleep past the 1500ms lease duration
+    tokio::time::sleep(Duration::from_millis(1700)).await;
+
+    // Worker 2 reclaims the expired job
+    let job2 = queue
+        .dequeue_for("worker_node_peer_2")
+        .await
+        .unwrap()
+        .expect("peer worker must reclaim the expired job");
+    assert_eq!(job2.id, job1.id);
+    let token2 = job2.lease_token.clone().expect("new lease token present");
+    assert_ne!(token1, token2, "reclaimed job must be assigned a new lease token");
+
+    // Crashed Worker 1 attempts to ack with its stale lease -> must be rejected
+    let stale_ack_res = queue.ack(&job1.id, &token1).await;
+    assert!(
+        stale_ack_res.is_err(),
+        "crashed worker must not be permitted to ack after lease reclaim"
+    );
+
+    // Worker 2 acks successfully
+    queue.ack(&job2.id, &token2).await.expect("worker 2 ack must succeed");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // =========================================================================
+    // 6. Graceful Drain & Shutdown Under Active In-Flight Requests
+    // =========================================================================
+    let slow_job = SlowDrainJob {
+        job_id: "slow_drain_001".into(),
+    };
+    queue.enqueue(slow_job).await.unwrap();
+
+    let drain_completed = Arc::new(AtomicBool::new(false));
+    let drain_started = Arc::new(tokio::sync::Notify::new());
+
+    let mut drain_registry = JobRegistry::new();
+    drain_registry.register(SlowDrainHandler {
+        completed: Arc::clone(&drain_completed),
+        started: Arc::clone(&drain_started),
+    });
+
+    let drain_worker = JobWorker::new(Arc::clone(&queue), Arc::new(drain_registry));
+    drain_worker.start();
+
+    // Wait until handler has begun executing in-flight
+    drain_started.notified().await;
+
+    // Initiate graceful worker drain while job is in-flight
+    let worker_drained = drain_worker.drain(Duration::from_secs(3)).await;
+    assert!(worker_drained, "worker must gracefully drain active in-flight jobs");
+    assert!(drain_completed.load(Ordering::SeqCst), "in-flight slow job must complete before drain finishes");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // Cleanly close and drain the database pool
+    let pool_drained = pool.close_and_drain(Duration::from_secs(3)).await;
+    assert!(pool_drained, "database pool must cleanly drain all active connections");
 }
