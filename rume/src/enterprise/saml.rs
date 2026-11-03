@@ -260,30 +260,62 @@ impl SamlParser {
             &xml[assertion_start..]
         };
 
-        // Optional Assertion ID bound to the verified assertion subtree
-        let id = if let Some(pos) = assertion_xml.find("ID=\"") {
-            let rest = &assertion_xml[pos + 4..];
-            if let Some(end) = rest.find('"') {
-                rest[..end].to_string()
-            } else {
-                "assertion".to_string()
+        // Extract Assertion ID and enclosing Response ID using robust attribute parsing
+        let assertion_opening_tag = assertion_xml.split('>').next().unwrap_or(assertion_xml);
+        let assertion_id = extract_attribute(assertion_opening_tag, "ID");
+        let id = assertion_id.clone().unwrap_or_else(|| "assertion".to_string());
+
+        let response_id = {
+            let mut resp_id = None;
+            for token in [":Response", "<Response"] {
+                if let Some(pos) = xml.find(token) {
+                    let start = xml[..pos].rfind('<').unwrap_or(pos);
+                    if let Some(tag_end) = xml[start..].find('>') {
+                        let tag = &xml[start..start + tag_end + 1];
+                        if let Some(id) = extract_attribute(tag, "ID") {
+                            resp_id = Some(id);
+                            break;
+                        }
+                    }
+                }
             }
-        } else {
-            "assertion".to_string()
+            resp_id
         };
 
-        // Security check: Signature Reference URI must match Assertion ID if present
-        let ref_pattern = "<ds:Reference URI=\"#";
-        if let Some(pos) = xml.find(ref_pattern) {
-            let rest = &xml[pos + ref_pattern.len()..];
-            if let Some(end) = rest.find('"') {
-                let ref_id = &rest[..end];
-                if ref_id != id {
+        // Security check: Signature Reference URI must match Assertion ID or enclosing Response ID
+        let mut search_idx = 0;
+        while let Some(pos) = xml[search_idx..].find('<') {
+            let tag_start = search_idx + pos;
+            let tag_content = &xml[tag_start..];
+            let Some(tag_end) = tag_content.find('>') else {
+                break;
+            };
+            let tag_slice = &tag_content[..tag_end + 1];
+            let is_ref = tag_slice.starts_with("<ds:Reference")
+                || tag_slice.starts_with("<Reference")
+                || tag_slice.starts_with("<dsig:Reference");
+
+            if is_ref
+                && let Some(uri) = extract_attribute(tag_slice, "URI")
+                && let Some(ref_id) = uri.strip_prefix('#')
+            {
+                let matches_assertion = assertion_id.as_deref() == Some(ref_id);
+                let matches_response = response_id.as_deref() == Some(ref_id);
+                if !matches_assertion && !matches_response {
+                    let expected = match (&assertion_id, &response_id) {
+                        (Some(a), Some(r)) => {
+                            format!("assertion ID '{a}' or response ID '{r}'")
+                        }
+                        (Some(a), None) => format!("assertion ID '{a}'"),
+                        (None, Some(r)) => format!("response ID '{r}'"),
+                        (None, None) => "known element ID".to_string(),
+                    };
                     return Err(SamlError::SignatureWrappingDetected(format!(
-                        "signature reference URI '#{ref_id}' does not match assertion ID '{id}'"
+                        "signature reference URI '#{ref_id}' does not match {expected}"
                     )));
                 }
             }
+            search_idx = tag_start + tag_end + 1;
         }
 
         // Find Issuer inside isolated assertion subtree

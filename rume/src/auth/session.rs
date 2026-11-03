@@ -88,7 +88,6 @@ pub trait SessionStore: Send + Sync + 'static {
             let existing = self.load(old_id).await?.ok_or_else(|| {
                 AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
             })?;
-            self.destroy(old_id).await?;
             let new_session = Session {
                 id: uuid::Uuid::new_v4().to_string(),
                 user_id: existing.user_id,
@@ -98,6 +97,9 @@ pub trait SessionStore: Send + Sync + 'static {
                 expires_at: existing.expires_at,
             };
             self.save(new_session.clone()).await?;
+            if let Err(err) = self.destroy(old_id).await {
+                tracing::warn!(error = %err, old_id = %old_id, "Failed to destroy old session during id regeneration");
+            }
             Ok(new_session)
         })
     }

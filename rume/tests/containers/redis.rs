@@ -579,4 +579,15 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
 
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(server_2.load("session_temp").await.unwrap().is_none());
+
+    // 5. Session ID regeneration (rotation): preserves data and destroys old key
+    let reg_session = Session::new("session_old", "user_rot", 300)
+        .with_role("editor");
+    server_1.save(reg_session).await.expect("save before regen");
+    let rotated = server_1.regenerate_id("session_old").await.expect("regenerate id");
+    assert_ne!(rotated.id, "session_old");
+    assert_eq!(rotated.user_id, "user_rot");
+    assert_eq!(rotated.roles, vec!["editor"]);
+    assert!(server_2.load("session_old").await.unwrap().is_none(), "old session key destroyed");
+    assert!(server_2.load(&rotated.id).await.unwrap().is_some(), "new session key active");
 }

@@ -49,9 +49,9 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 ### Group D — Security Envelope Signature Binding & CSRF Hardening (solve together)
 > Root cause: Assumption that only child `<Assertion>` tags are signed in SAML responses, and insecure opt-in defaults in `CsrfConfig`.
 
-- [ ] **Security M1 — SAML 2.0 Signature Reference binding in `SamlParser` rejects standard signed Response envelopes and is fragile to namespace variants** (`security-protocols.md` M1).
+- [x] **Security M1 — SAML 2.0 Signature Reference binding in `SamlParser` rejects standard signed Response envelopes and is fragile to namespace variants** (`security-protocols.md` M1).
       `rume/src/enterprise/saml.rs:263–287`: Parser assumes only child `<Assertion>` tags are referenced by `<ds:Reference URI="#...">`, causing valid SAML responses where the `<Response>` envelope is signed (standard in Okta, Azure AD, and ADFS) to fail with `SignatureWrappingDetected`. Update reference target extraction to support both `<Assertion ID="...">` and `<Response ID="...">` root envelopes.
-- [ ] **Security M2 — Insecure defaults in `CsrfConfig` persist: missing mandatory HMAC secret and insecure cookies by default** (`security-protocols.md` M2).
+- [x] **Security M2 — Insecure defaults in `CsrfConfig` persist: missing mandatory HMAC secret and insecure cookies by default** (`security-protocols.md` M2).
       `rume/src/security/csrf.rs:64–77`: Default config sets `secret: None` and `cookie_secure: false`, permitting unauthenticated tokens and subdomain cookie-tossing out of the box unless developers manually configure HMAC secrets. Generate a secure random HMAC secret on startup if none is provided, or make secret configuration mandatory.
 
 ### Group E — Container Test Reliability, Docker Bleed & Verification Depth (solve together)
@@ -86,7 +86,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
       `rume/src/resilience/rate_limiter.rs:260–270`: Rate limiting middleware extracts tenant ID only from headers, ignoring `TenantContext` injected by `SubdomainTenantResolver`.
 - [ ] **Coordination m3 — `RateLimiter` retains global write lock serialization and lacks background eviction scheduling** (`coordination-multi-tenant.md` m3).
       `rume/src/resilience/rate_limiter.rs:45–80`: In-memory rate limiter acquires exclusive `write()` lock on every check; consider sharding with `DashMap`.
-- [ ] **Security m1 — Non-atomic session ID rotation in `SessionStore::regenerate_id` risks session state loss on write failure** (`security-protocols.md` m1).
+- [x] **Security m1 — Non-atomic session ID rotation in `SessionStore::regenerate_id` risks session state loss on write failure** (`security-protocols.md` m1).
       `rume/src/auth/session.rs:77–84`: `regenerate_id` deletes `old_id` before writing `new_id`. If `save(new)` fails, session data is lost.
 - [ ] **Security m2 — Audit logger literal escaping data distortion in Postgres and SQLite** (`security-protocols.md` m2).
       `rume/src/security/audit.rs:188–205`: Unconditional MySQL C-string escaping doubles backslashes and converts newlines to literal `\n` in PostgreSQL and SQLite.

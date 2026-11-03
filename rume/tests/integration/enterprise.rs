@@ -246,6 +246,30 @@ fn test_saml_signature_wrapping_and_strict_validation() {
         bad_dest,
         Err(SamlError::DestinationMismatch { .. })
     ));
+
+    // 4. Legitimate Signed Response Envelope (Reference URI matches Response ID, not Assertion ID)
+    let signed_response_envelope = r##"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp_9999" Destination="https://sp.myapp.io/saml/acs">
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#_resp_9999" />
+            </ds:SignedInfo>
+        </ds:Signature>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assert_1111">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "##;
+
+    let res_signed_envelope = SamlParser::parse_unverified(signed_response_envelope);
+    assert!(
+        res_signed_envelope.is_ok(),
+        "Standard signed Response envelope must be accepted"
+    );
+    let assertion = res_signed_envelope.unwrap();
+    assert_eq!(assertion.id, "_assert_1111");
+    assert_eq!(assertion.subject, "legit@enterprise.com");
 }
 
 #[test]

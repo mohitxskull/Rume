@@ -71,7 +71,7 @@ impl Default for CsrfConfig {
             auto_inject_cookie: false,
             cookie_path: "/".to_string(),
             cookie_same_site: "Strict".to_string(),
-            cookie_secure: false,
+            cookie_secure: true,
             cookie_http_only: false,
         }
     }
@@ -104,6 +104,15 @@ impl CsrfConfig {
     /// Sets an HMAC secret key for token signing and validation, preventing subdomain cookie tossing.
     pub fn with_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
         self.secret = Some(secret.into());
+        self
+    }
+
+    /// Auto-generates a cryptographically strong 32-byte HMAC secret for token signing.
+    pub fn with_random_secret(mut self) -> Self {
+        let mut secret = Vec::with_capacity(32);
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
+        self.secret = Some(secret);
         self
     }
 
@@ -210,6 +219,11 @@ impl CsrfLayer {
 
     /// Creates a CSRF protection layer with custom configuration.
     pub fn with_config(config: CsrfConfig) -> Self {
+        if config.secret.is_none() {
+            tracing::warn!(
+                "CsrfLayer initialized without HMAC secret; tokens will not be protected against subdomain cookie-tossing"
+            );
+        }
         Self {
             config: Arc::new(config),
         }
