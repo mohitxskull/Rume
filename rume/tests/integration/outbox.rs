@@ -582,3 +582,305 @@ async fn outbox_relay_recovers_from_async_dispatcher_panic() {
     assert!(last_error.unwrap_or_default().contains("panicked"));
     assert_eq!(lease_token, None, "lease token cleared on failure");
 }
+
+#[tokio::test]
+async fn outbox_lease_expiry_rejects_completion_before_another_claims() {
+    let repo = setup_real_outbox().await;
+
+    let event = OrderPaidEvent {
+        order_id: "order_expiry_1".into(),
+        amount_cents: 2000,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+    repo.save(msg).await.unwrap();
+
+    // Claim with 0s lease duration -> immediately expired against database clock
+    let claimed = repo.claim_pending_with_lease(1, 0).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.as_ref().unwrap();
+
+    // Worker attempts to mark as published after its lease has expired, but BEFORE any other worker has reclaimed it
+    let res = repo.mark_published(&msg_id, token).await;
+    assert!(
+        res.is_err(),
+        "completion must be rejected when lease is expired, even before peer claims"
+    );
+
+    // Worker attempts to mark as failed after lease expiry
+    let fail_res = repo
+        .mark_failed_with_max_retries(&msg_id, token, "some transient failure".into(), 5)
+        .await;
+    assert!(
+        fail_res.is_err(),
+        "mark_failed must be rejected when lease is expired"
+    );
+
+    // Message remains in flight (or eligible for recovery), not marked published or failed
+    assert_eq!(repo.published_count().await.unwrap(), 0);
+}
+
+/// Faulty outbox repository wrapper that simulates database failure during recovery or acknowledgement.
+#[derive(Debug)]
+struct FaultyOutboxRepo {
+    inner: Arc<SqliteBackend>,
+    fail_recovery: bool,
+    fail_mark_published: bool,
+}
+
+impl OutboxRepository for FaultyOutboxRepo {
+    fn save<'a>(&'a self, message: OutboxMessage) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
+        self.inner.save(message)
+    }
+
+    fn fetch_pending<'a>(&'a self, limit: usize) -> rume::outbox::BoxFuture<'a, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.inner.fetch_pending(limit)
+    }
+
+    fn claim_pending_with_lease<'a>(
+        &'a self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> rume::outbox::BoxFuture<'a, Result<Vec<OutboxMessage>, OutboxError>> {
+        self.inner.claim_pending_with_lease(limit, lease_duration_secs)
+    }
+
+    fn mark_published<'a>(
+        &'a self,
+        id: &str,
+        lease_token: &str,
+    ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
+        if self.fail_mark_published {
+            Box::pin(async move {
+                Err(OutboxError::Repository("database connection drop during mark_published".into()))
+            })
+        } else {
+            self.inner.mark_published(id, lease_token)
+        }
+    }
+
+    fn mark_failed_with_max_retries<'a>(
+        &'a self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+        max_retries: u32,
+    ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
+        self.inner.mark_failed_with_max_retries(id, lease_token, error, max_retries)
+    }
+
+    fn recover_expired_claims<'a>(
+        &'a self,
+        lease_duration_secs: u64,
+    ) -> rume::outbox::BoxFuture<'a, Result<usize, OutboxError>> {
+        if self.fail_recovery {
+            Box::pin(async move {
+                Err(OutboxError::Repository("database connection failure during recovery".into()))
+            })
+        } else {
+            self.inner.recover_expired_claims(lease_duration_secs)
+        }
+    }
+
+    fn pending_count<'a>(&'a self) -> rume::outbox::BoxFuture<'a, Result<usize, OutboxError>> {
+        self.inner.pending_count()
+    }
+
+    fn published_count<'a>(&'a self) -> rume::outbox::BoxFuture<'a, Result<usize, OutboxError>> {
+        self.inner.published_count()
+    }
+
+    fn failed_count<'a>(&'a self) -> rume::outbox::BoxFuture<'a, Result<usize, OutboxError>> {
+        self.inner.failed_count()
+    }
+}
+
+#[tokio::test]
+async fn outbox_relay_database_failure_during_recovery_is_returned_and_visible() {
+    let inner = setup_real_outbox().await;
+    let faulty = Arc::new(FaultyOutboxRepo {
+        inner,
+        fail_recovery: true,
+        fail_mark_published: false,
+    });
+
+    let relay = OutboxRelay::new(Arc::clone(&faulty), |_msg: &OutboxMessage| async { Ok(()) });
+
+    // Calling poll_and_dispatch must return the repository failure rather than logging and returning Ok(0)
+    let res = relay.poll_and_dispatch(10).await;
+    assert!(res.is_err(), "database failure during recovery must return Err");
+    match res {
+        Err(OutboxError::Repository(msg)) => {
+            assert!(msg.contains("database connection failure during recovery"));
+        }
+        other => panic!("expected OutboxError::Repository, got {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn outbox_relay_failed_transition_is_distinguished_and_drain_fails() {
+    let inner = setup_real_outbox().await;
+    let event = OrderPaidEvent {
+        order_id: "order_fail_trans_1".into(),
+        amount_cents: 3500,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    inner.save(msg).await.unwrap();
+
+    let faulty = Arc::new(FaultyOutboxRepo {
+        inner: Arc::clone(&inner),
+        fail_recovery: false,
+        fail_mark_published: true, // simulated failure during state transition / ack
+    });
+
+    let relay = OutboxRelay::new(Arc::clone(&faulty), |_msg: &OutboxMessage| async { Ok(()) });
+
+    // poll_and_dispatch returns RelayPollResult with failed_transitions reported
+    let res = relay.poll_and_dispatch(10).await.unwrap();
+    assert_eq!(res.published, 0);
+    assert_eq!(res.failed_transitions, 1);
+    assert!(!res.is_success());
+    assert_eq!(res.total_processed(), 1);
+
+    // Save a new message to test try_drain encountering a failed transition
+    let event2 = OrderPaidEvent {
+        order_id: "order_fail_trans_2".into(),
+        amount_cents: 4200,
+    };
+    let msg2 = OutboxMessage::from_event(&event2).unwrap();
+    inner.save(msg2).await.unwrap();
+
+    // try_drain immediately propagates the failed transition error rather than reporting success
+    let drain_res = relay.try_drain(Duration::from_millis(500)).await;
+    assert!(drain_res.is_err(), "try_drain must return Err on failed state transitions");
+}
+
+#[derive(Debug, Default)]
+struct MockIdempotencyStore {
+    records: std::sync::Mutex<std::collections::HashMap<String, rume::jobs::reliability::IdempotencyStatus>>,
+}
+
+impl rume::jobs::reliability::IdempotencyStore for MockIdempotencyStore {
+    fn try_acquire(
+        &self,
+        key: &str,
+        _ttl: Duration,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>> {
+        let mut map = self.records.lock().unwrap();
+        if let Some(status) = map.get(key) {
+            let status = status.clone();
+            Box::pin(async move { Ok(status) })
+        } else {
+            map.insert(key.to_string(), rume::jobs::reliability::IdempotencyStatus::InProgress);
+            Box::pin(async move { Ok(rume::jobs::reliability::IdempotencyStatus::New) })
+        }
+    }
+
+    fn try_acquire_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+        ttl: Duration,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>> {
+        self.try_acquire(key, ttl)
+    }
+
+    fn complete(
+        &self,
+        key: &str,
+        payload: Option<Vec<u8>>,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
+        let mut map = self.records.lock().unwrap();
+        map.insert(
+            key.to_string(),
+            rume::jobs::reliability::IdempotencyStatus::Completed(payload),
+        );
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn complete_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+        payload: Option<Vec<u8>>,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
+        self.complete(key, payload)
+    }
+
+    fn release(&self, key: &str) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
+        let mut map = self.records.lock().unwrap();
+        map.remove(key);
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn release_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
+        self.release(key)
+    }
+}
+
+#[tokio::test]
+async fn duplicate_event_delivery_consumer_idempotency_prevents_duplicate_effects() {
+    use rume::jobs::reliability::{IdempotencyStatus, IdempotencyStore, scoped_idempotency_key};
+
+    let idempotency_store = Arc::new(MockIdempotencyStore::default());
+    let business_effects_counter = Arc::new(AtomicUsize::new(0));
+
+    // Simulated consumer event handler with consumer-side idempotency
+    async fn handle_event(
+        event_id: &str,
+        tenant_id: &str,
+        store: &MockIdempotencyStore,
+        counter: &AtomicUsize,
+    ) -> Result<&'static str, &'static str> {
+        let key = scoped_idempotency_key(tenant_id, event_id);
+        let status = store.try_acquire(&key, Duration::from_secs(60)).await.unwrap();
+
+        match status {
+            IdempotencyStatus::Completed(_) => {
+                // Duplicate delivery! Skip business effects completely
+                Ok("skipped_duplicate")
+            }
+            IdempotencyStatus::New => {
+                // First delivery: execute critical business effect (e.g., balance charge, invoice generation)
+                counter.fetch_add(500, Ordering::SeqCst);
+                store.complete(&key, Some(b"processed".to_vec())).await.unwrap();
+                Ok("processed")
+            }
+            IdempotencyStatus::InProgress => Err("concurrent_in_progress"),
+        }
+    }
+
+    // 1. Initial event delivery: processes and executes business effect
+    let res1 = handle_event(
+        "evt_order_12345",
+        "tenant_corp",
+        &idempotency_store,
+        &business_effects_counter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res1, "processed");
+    assert_eq!(business_effects_counter.load(Ordering::SeqCst), 500);
+
+    // 2. Duplicate event delivery arrives (e.g. at-least-once broker redelivery or retry)
+    let res2 = handle_event(
+        "evt_order_12345",
+        "tenant_corp",
+        &idempotency_store,
+        &business_effects_counter,
+    )
+    .await
+    .unwrap();
+    assert_eq!(res2, "skipped_duplicate");
+
+    // Invariant: Business effect must strictly execute exactly once!
+    assert_eq!(
+        business_effects_counter.load(Ordering::SeqCst),
+        500,
+        "consumer idempotency must guarantee duplicate event delivery does not duplicate business effects"
+    );
+}

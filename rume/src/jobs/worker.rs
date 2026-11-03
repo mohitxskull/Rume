@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -107,6 +107,23 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// Runtime status summary of a background job worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerStatus {
+    /// Unique worker identifier.
+    pub worker_id: String,
+    /// Number of jobs currently being executed.
+    pub in_flight: u32,
+    /// Worker concurrency limit.
+    pub concurrency_limit: usize,
+    /// Whether the worker is currently shutting down.
+    pub is_stopping: bool,
+    /// Number of failed job state transitions (ack, nack, dead_letter).
+    pub transition_errors: u64,
+    /// Number of lost leases detected during heartbeat renewal or completion.
+    pub lost_leases: u64,
+}
+
 /// Background worker managing queue polling, retries, and graceful shutdown drain.
 pub struct JobWorker<Q: JobQueue> {
     worker_id: String,
@@ -121,6 +138,8 @@ pub struct JobWorker<Q: JobQueue> {
     heartbeat_interval: Duration,
     abandoned_recovery_interval: Option<Duration>,
     idempotency_store: Option<Arc<dyn IdempotencyStore>>,
+    transition_errors: Arc<AtomicU64>,
+    lost_leases: Arc<AtomicU64>,
 }
 
 impl<Q: JobQueue> Clone for JobWorker<Q> {
@@ -138,6 +157,8 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             heartbeat_interval: self.heartbeat_interval,
             abandoned_recovery_interval: self.abandoned_recovery_interval,
             idempotency_store: self.idempotency_store.clone(),
+            transition_errors: Arc::clone(&self.transition_errors),
+            lost_leases: Arc::clone(&self.lost_leases),
         }
     }
 }
@@ -152,6 +173,11 @@ impl<Q: JobQueue> Debug for JobWorker<Q> {
                 &self.in_flight_count.load(Ordering::Relaxed),
             )
             .field("concurrency_limit", &self.concurrency_limit)
+            .field(
+                "transition_errors",
+                &self.transition_errors.load(Ordering::Relaxed),
+            )
+            .field("lost_leases", &self.lost_leases.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -185,6 +211,8 @@ impl<Q: JobQueue> JobWorker<Q> {
             heartbeat_interval: Duration::from_secs(10),
             abandoned_recovery_interval: None,
             idempotency_store: None,
+            transition_errors: Arc::new(AtomicU64::new(0)),
+            lost_leases: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -230,6 +258,28 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Returns the unique worker identifier.
     pub fn worker_id(&self) -> &str {
         &self.worker_id
+    }
+
+    /// Returns the current runtime status of the worker.
+    pub fn status(&self) -> WorkerStatus {
+        WorkerStatus {
+            worker_id: self.worker_id.clone(),
+            in_flight: self.in_flight_count.load(Ordering::Relaxed),
+            concurrency_limit: self.concurrency_limit,
+            is_stopping: self.is_stopping.load(Ordering::Relaxed),
+            transition_errors: self.transition_errors.load(Ordering::Relaxed),
+            lost_leases: self.lost_leases.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Returns the total count of failed state transitions (ack/nack/dead-letter).
+    pub fn transition_errors(&self) -> u64 {
+        self.transition_errors.load(Ordering::Relaxed)
+    }
+
+    /// Returns the total count of lost leases detected during heartbeat renewal or completion.
+    pub fn lost_leases(&self) -> u64 {
+        self.lost_leases.load(Ordering::Relaxed)
     }
 
     /// Spawns the background execution loop into the current async runtime.
@@ -289,11 +339,22 @@ impl<Q: JobQueue> JobWorker<Q> {
                     let in_flight = Arc::clone(&self.in_flight_count);
                     let idempotency = self.idempotency_store.clone();
                     let stopping = Arc::clone(&self.is_stopping);
+                    let transition_errors = Arc::clone(&self.transition_errors);
+                    let lost_leases = Arc::clone(&self.lost_leases);
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _guard = InFlightGuard(in_flight);
-                        Self::execute_job(queue, registry, job, idempotency, stopping).await;
+                        Self::execute_job(
+                            queue,
+                            registry,
+                            job,
+                            idempotency,
+                            stopping,
+                            transition_errors,
+                            lost_leases,
+                        )
+                        .await;
                     });
                 }
                 Ok(None) => {
@@ -318,6 +379,8 @@ impl<Q: JobQueue> JobWorker<Q> {
         job: QueuedJob,
         idempotency_store: Option<Arc<dyn IdempotencyStore>>,
         stopping: Arc<AtomicBool>,
+        transition_errors: Arc<AtomicU64>,
+        lost_leases: Arc<AtomicU64>,
     ) {
         let job_id = job.id.clone();
         let token = job.lease_token.clone().unwrap_or_default();
@@ -334,16 +397,39 @@ impl<Q: JobQueue> JobWorker<Q> {
                 .await
             {
                 Ok(IdempotencyStatus::Completed(_)) => {
-                    let _ = queue.ack(&job_id, &token).await;
+                    if let Err(err) = queue.ack(&job_id, &token).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %err,
+                            "Failed to ack idempotent completed job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
                     return;
                 }
                 Ok(IdempotencyStatus::InProgress) => {
-                    let _ = queue.nack(job, &token, Duration::from_secs(2)).await;
+                    if let Err(err) = queue.nack(job, &token, Duration::from_secs(2)).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %err,
+                            "Failed to nack in-progress idempotent job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
                     return;
                 }
                 _ => {}
             }
         }
+
+        // Derive heartbeat renewal timing directly from configured lease duration
+        let lease_duration = job.lease_duration;
+        let hb_interval = (lease_duration / 3)
+            .max(Duration::from_millis(20))
+            .min(Duration::from_secs(20));
+        let renew_extension = lease_duration.max(Duration::from_secs(60));
 
         // Spawn background lease heartbeat while job is executing
         let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
@@ -353,9 +439,10 @@ impl<Q: JobQueue> JobWorker<Q> {
         let hb_jid = job_id.clone();
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_stopping = Arc::clone(&stopping);
+        let hb_lost_leases = Arc::clone(&lost_leases);
 
         let heartbeat_handle = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(20));
+            let mut interval = tokio::time::interval(hb_interval);
             interval.tick().await; // tick immediately
             let mut stop_check = tokio::time::interval(Duration::from_millis(50));
             loop {
@@ -367,9 +454,10 @@ impl<Q: JobQueue> JobWorker<Q> {
                         }
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, Duration::from_secs(60)).await {
-                            tracing::warn!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat");
+                        if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension).await {
+                            tracing::error!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat; lost lease");
                             hb_cancelled.store(true, Ordering::SeqCst);
+                            hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                             break;
                         }
                     }
@@ -392,7 +480,15 @@ impl<Q: JobQueue> JobWorker<Q> {
 
         match dispatch_result {
             Ok(()) => {
-                let _ = queue.ack(&job_id, &token).await;
+                if let Err(err) = queue.ack(&job_id, &token).await {
+                    tracing::error!(
+                        job_id = %job_id,
+                        error = %err,
+                        "Failed to ack job; lease may have expired or state mismatch"
+                    );
+                    transition_errors.fetch_add(1, Ordering::SeqCst);
+                    lost_leases.fetch_add(1, Ordering::SeqCst);
+                }
                 if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
                     let _ = store.complete_with_token(key, &token, None).await;
                 }
@@ -403,18 +499,42 @@ impl<Q: JobQueue> JobWorker<Q> {
                 if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
                     let _ = store.release_with_token(key, &token).await;
                 }
-                let _ = queue.dead_letter(job, &token, msg).await;
+                if let Err(err) = queue.dead_letter(job, &token, msg).await {
+                    tracing::error!(
+                        job_id = %job_id,
+                        error = %err,
+                        "Failed to dead-letter job; lease may have expired or state mismatch"
+                    );
+                    transition_errors.fetch_add(1, Ordering::SeqCst);
+                    lost_leases.fetch_add(1, Ordering::SeqCst);
+                }
             }
             Err(err) => {
                 // Retryable failure: check remaining attempts
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
-                    let _ = queue.nack(job, &token, backoff).await;
+                    if let Err(nack_err) = queue.nack(job, &token, backoff).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %nack_err,
+                            "Failed to nack job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
                 } else {
                     if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
                         let _ = store.release_with_token(key, &token).await;
                     }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
-                    let _ = queue.dead_letter(job, &token, reason).await;
+                    if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %dl_err,
+                            "Failed to dead-letter job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
         }

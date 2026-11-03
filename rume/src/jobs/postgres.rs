@@ -209,6 +209,7 @@ impl JobQueue for PostgresJobQueue {
                     assigned_worker,
                     lease_token,
                     available_at,
+                    lease_duration: self.default_lease_duration,
                 }))
             } else {
                 Ok(None)
@@ -222,7 +223,7 @@ impl JobQueue for PostgresJobQueue {
         Box::pin(async move {
             let now = current_epoch_millis();
             let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'completed', completed_at = $1, lease_expires_at = NULL WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
+                "UPDATE rume_jobs SET status = 'completed', completed_at = $1, lease_expires_at = NULL WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
             )
             .bind(now)
             .bind(&jid)
@@ -252,7 +253,7 @@ impl JobQueue for PostgresJobQueue {
             let next_available = now.saturating_add(delay.as_millis() as i64);
 
             let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, available_at = $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
+                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, available_at = $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
             )
             .bind(next_available)
             .bind(&job.id)
@@ -281,7 +282,7 @@ impl JobQueue for PostgresJobQueue {
         let token = lease_token.to_string();
         Box::pin(async move {
             let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'dead_letter', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = $1, dead_lettered_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
+                "UPDATE rume_jobs SET status = 'dead_letter', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = $1, dead_lettered_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
             )
             .bind(&reason)
             .bind(&job.id)
@@ -420,6 +421,7 @@ impl JobQueue for PostgresJobQueue {
                     available_at: Instant::now(),
                     lease_token: None,
                     assigned_worker,
+                    lease_duration: self.default_lease_duration,
                 });
             }
             Ok(jobs)

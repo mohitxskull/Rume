@@ -395,7 +395,7 @@ impl OutboxRepository for PostgresBackend {
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2 AND status = 'inflight'"
+                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)"
             )
             .bind(&id_str)
             .bind(&token_str)
@@ -405,7 +405,7 @@ impl OutboxRepository for PostgresBackend {
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark published: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark published: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             }
             Ok(())
@@ -427,7 +427,7 @@ impl OutboxRepository for PostgresBackend {
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let now = current_timestamp();
-            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1 AND lease_token = $2 AND status = 'inflight'")
+            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)")
                 .bind(&id_str)
                 .bind(&token_str)
                 .fetch_optional(&self.pool)
@@ -436,7 +436,7 @@ impl OutboxRepository for PostgresBackend {
 
             let Some(row) = row else {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark failed: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark failed: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             };
 
@@ -446,7 +446,7 @@ impl OutboxRepository for PostgresBackend {
             let next_retry = now + backoff_secs;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight'"
+                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)"
             )
             .bind(status)
             .bind(retry_count)
@@ -460,7 +460,7 @@ impl OutboxRepository for PostgresBackend {
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark failed: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark failed: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             }
 

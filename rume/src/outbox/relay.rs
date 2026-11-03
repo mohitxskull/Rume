@@ -17,6 +17,49 @@ pub type MessageDispatcher = Arc<
     dyn Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static,
 >;
 
+/// Result of an outbox relay polling pass, reporting counts for published messages,
+/// retry-scheduled messages, and failed state transitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RelayPollResult {
+    /// Number of claimed messages successfully dispatched and transitioned to published status.
+    pub published: usize,
+    /// Number of claimed messages whose dispatch failed and retry/dead-failure was scheduled.
+    pub retried: usize,
+    /// Number of messages where repository state transition failed (e.g. lease expired or database failure).
+    pub failed_transitions: usize,
+}
+
+impl RelayPollResult {
+    /// Returns true if no state transition failures occurred during this polling pass.
+    pub fn is_success(&self) -> bool {
+        self.failed_transitions == 0
+    }
+
+    /// Returns the total number of claimed messages processed during this pass.
+    pub fn total_processed(&self) -> usize {
+        self.published + self.retried + self.failed_transitions
+    }
+}
+
+impl std::ops::Deref for RelayPollResult {
+    type Target = usize;
+    fn deref(&self) -> &Self::Target {
+        &self.published
+    }
+}
+
+impl PartialEq<usize> for RelayPollResult {
+    fn eq(&self, other: &usize) -> bool {
+        self.published == *other && self.failed_transitions == 0
+    }
+}
+
+impl PartialEq<RelayPollResult> for usize {
+    fn eq(&self, other: &RelayPollResult) -> bool {
+        *self == other.published && other.failed_transitions == 0
+    }
+}
+
 /// Configuration for the outbox relay background processor.
 #[derive(Debug, Clone)]
 pub struct OutboxRelayConfig {
@@ -99,27 +142,25 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     }
 
     /// Claims pending messages atomically and dispatches them in order.
-    pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
-        // Automatically reclaim any expired in-flight message leases before polling new items
-        if let Err(err) = self
-            .repository
+    pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<RelayPollResult, OutboxError> {
+        // Automatically reclaim any expired in-flight message leases before polling new items.
+        // Propagate errors directly so callers/operators are aware of database failures.
+        self.repository
             .recover_expired_claims(self.config.lease_duration_secs)
-            .await
-        {
-            tracing::warn!(error = %err, "Failed to recover expired outbox claims");
-        }
+            .await?;
 
         let pending = self
             .repository
             .claim_pending_with_lease(batch_size, self.config.lease_duration_secs)
             .await?;
-        let mut published_count = 0;
+        let mut result = RelayPollResult::default();
 
         for message in pending {
             let token = match message.lease_token.as_deref() {
                 Some(t) => t,
                 None => {
                     tracing::error!(message_id = %message.id, "Claimed outbox message is missing lease token");
+                    result.failed_transitions += 1;
                     continue;
                 }
             };
@@ -138,14 +179,22 @@ impl<R: OutboxRepository> OutboxRelay<R> {
 
             match dispatch_result {
                 Ok(()) => {
-                    if let Err(err) = self.repository.mark_published(&message.id, token).await {
-                        tracing::error!(message_id = %message.id, error = %err, "Failed to mark outbox message as published");
-                    } else {
-                        published_count += 1;
+                    match self.repository.mark_published(&message.id, token).await {
+                        Ok(()) => {
+                            result.published += 1;
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                message_id = %message.id,
+                                error = %err,
+                                "Failed to mark outbox message as published"
+                            );
+                            result.failed_transitions += 1;
+                        }
                     }
                 }
                 Err(err) => {
-                    if let Err(mark_err) = self
+                    match self
                         .repository
                         .mark_failed_with_max_retries(
                             &message.id,
@@ -155,17 +204,23 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         )
                         .await
                     {
-                        tracing::error!(
-                            message_id = %message.id,
-                            error = %mark_err,
-                            "Failed to mark outbox message as failed"
-                        );
+                        Ok(()) => {
+                            result.retried += 1;
+                        }
+                        Err(mark_err) => {
+                            tracing::error!(
+                                message_id = %message.id,
+                                error = %mark_err,
+                                "Failed to mark outbox message as failed"
+                            );
+                            result.failed_transitions += 1;
+                        }
                     }
                 }
             }
         }
 
-        Ok(published_count)
+        Ok(result)
     }
 
     /// Spawns the background polling loop using configured interval and batch size.
@@ -175,8 +230,20 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let interval = relay.config.poll_interval;
             let batch = relay.config.batch_size;
             while !relay.is_stopping.load(Ordering::Relaxed) {
-                if let Err(err) = relay.poll_and_dispatch(batch).await {
-                    tracing::error!(error = %err, "Outbox relay background dispatch error");
+                match relay.poll_and_dispatch(batch).await {
+                    Ok(res) => {
+                        if !res.is_success() {
+                            tracing::error!(
+                                published = res.published,
+                                retried = res.retried,
+                                failed_transitions = res.failed_transitions,
+                                "Outbox relay encountered failed message state transitions"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "Outbox relay background dispatch error");
+                    }
                 }
                 sleep(interval).await;
             }
@@ -189,8 +256,20 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         let batch = relay.config.batch_size;
         tokio::spawn(async move {
             while !relay.is_stopping.load(Ordering::Relaxed) {
-                if let Err(err) = relay.poll_and_dispatch(batch).await {
-                    tracing::error!(error = %err, "Outbox relay background dispatch error");
+                match relay.poll_and_dispatch(batch).await {
+                    Ok(res) => {
+                        if !res.is_success() {
+                            tracing::error!(
+                                published = res.published,
+                                retried = res.retried,
+                                failed_transitions = res.failed_transitions,
+                                "Outbox relay encountered failed message state transitions"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "Outbox relay background dispatch error");
+                    }
                 }
                 sleep(interval).await;
             }
@@ -218,7 +297,13 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 );
                 return Ok(false);
             }
-            self.poll_and_dispatch(50).await?;
+            let res = self.poll_and_dispatch(50).await?;
+            if !res.is_success() {
+                return Err(OutboxError::Repository(format!(
+                    "outbox relay encountered {} failed state transitions during drain",
+                    res.failed_transitions
+                )));
+            }
             sleep(Duration::from_millis(20)).await;
         }
     }

@@ -233,3 +233,43 @@ async fn sqlite_transactional_outbox_atomicity_and_relay() {
     let published = backend.published_count().await.expect("published count");
     assert_eq!(published, 1);
 }
+
+#[tokio::test]
+async fn sqlite_outbox_lease_expiry_rejects_completion_before_another_claims() {
+    let backend = SqliteBackend::in_memory()
+        .await
+        .expect("in-memory sqlite backend");
+    backend
+        .init_outbox_table()
+        .await
+        .expect("outbox table should initialize");
+
+    let msg = OutboxMessage::new("msg-sqlite-exp", "event.user", b"payload".to_vec());
+    backend.save(msg).await.expect("save outbox message");
+
+    // Claim with lease_duration_secs = 0 -> immediately expired against database clock
+    let claimed = backend
+        .claim_pending_with_lease(1, 0)
+        .await
+        .expect("claim message");
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.as_ref().unwrap();
+
+    // Worker attempts mark_published after lease expired -> must be rejected
+    let res = backend.mark_published("msg-sqlite-exp", token).await;
+    assert!(
+        res.is_err(),
+        "mark_published must fail when lease has expired"
+    );
+
+    // Worker attempts mark_failed after lease expired -> must be rejected
+    let fail_res = backend
+        .mark_failed_with_max_retries("msg-sqlite-exp", token, "transient error".into(), 5)
+        .await;
+    assert!(
+        fail_res.is_err(),
+        "mark_failed must fail when lease has expired"
+    );
+
+    assert_eq!(backend.published_count().await.unwrap(), 0);
+}

@@ -73,7 +73,7 @@ pub use helpers::{
 pub use jobs::PostgresJobQueue;
 pub use jobs::{
     HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, Job, JobContext, JobError, JobHandler,
-    JobQueue, JobRegistry, JobWorker, QueuedJob, RetryPolicy,
+    JobQueue, JobRegistry, JobWorker, QueuedJob, RetryPolicy, WorkerStatus,
 };
 #[cfg(feature = "redis")]
 pub use jobs::{RedisHeartbeatRegistry, RedisIdempotencyStore};
@@ -86,7 +86,7 @@ pub use openapi::{
     OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
 };
 pub use outbox::{
-    OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus, RelayPollResult,
 };
 pub use persistence::{
     DatabaseConfig, DatabasePool, Migration, Migrator, PersistenceError,

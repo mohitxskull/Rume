@@ -22,4 +22,4 @@ pub use reliability::{
     HeartbeatRegistry, IdempotencyStatus, IdempotencyStore,
 };
 pub use retry::RetryPolicy;
-pub use worker::{JobRegistry, JobWorker};
+pub use worker::{JobRegistry, JobWorker, WorkerStatus};

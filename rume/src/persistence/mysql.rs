@@ -412,7 +412,7 @@ impl OutboxRepository for MysqlBackend {
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight'"
+                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()"
             )
             .bind(&id_str)
             .bind(&token_str)
@@ -422,7 +422,7 @@ impl OutboxRepository for MysqlBackend {
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark published: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark published: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             }
             Ok(())
@@ -444,7 +444,7 @@ impl OutboxRepository for MysqlBackend {
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let now = current_timestamp();
-            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ? AND lease_token = ? AND status = 'inflight'")
+            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()")
                 .bind(&id_str)
                 .bind(&token_str)
                 .fetch_optional(&self.pool)
@@ -453,7 +453,7 @@ impl OutboxRepository for MysqlBackend {
 
             let Some(row) = row else {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark failed: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark failed: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             };
 
@@ -463,7 +463,7 @@ impl OutboxRepository for MysqlBackend {
             let next_retry = now + backoff_secs;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = ?, retry_count = ?, last_error = ?, next_retry_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight'"
+                "UPDATE rume_outbox SET status = ?, retry_count = ?, last_error = ?, next_retry_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()"
             )
             .bind(status)
             .bind(retry_count)
@@ -477,7 +477,7 @@ impl OutboxRepository for MysqlBackend {
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
-                    "cannot mark failed: message {id_str} not in flight or lease token mismatch"
+                    "cannot mark failed: message {id_str} not in flight, lease expired, or token mismatch"
                 )));
             }
 

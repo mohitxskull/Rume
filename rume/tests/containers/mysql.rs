@@ -274,3 +274,41 @@ async fn test_mysql_outbox_expired_claim_recovery() {
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].id, "msg_timeout");
 }
+
+#[tokio::test]
+async fn test_mysql_outbox_lease_expiry_rejects_completion_before_another_claims() {
+    let (_node, backend, _config) = start_mysql_node().await;
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
+
+    let msg = OutboxMessage::new("msg_mysql_exp", "order.created", b"{}".to_vec());
+    backend.save(msg).await.expect("save outbox message");
+
+    // Claim with lease_duration_secs = 0 -> immediately expired against UNIX_TIMESTAMP()
+    let claimed = backend
+        .claim_pending_with_lease(1, 0)
+        .await
+        .expect("claim message");
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.as_ref().unwrap();
+
+    // Worker attempts mark_published after lease expired -> must be rejected
+    let res = backend.mark_published("msg_mysql_exp", token).await;
+    assert!(
+        res.is_err(),
+        "mark_published must fail when lease has expired in MySQL"
+    );
+
+    // Worker attempts mark_failed after lease expired -> must be rejected
+    let fail_res = backend
+        .mark_failed_with_max_retries("msg_mysql_exp", token, "transient db failure".into(), 5)
+        .await;
+    assert!(
+        fail_res.is_err(),
+        "mark_failed must fail when lease has expired in MySQL"
+    );
+
+    assert_eq!(backend.published_count().await.unwrap(), 0);
+}

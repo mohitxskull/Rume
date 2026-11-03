@@ -20,7 +20,10 @@ use rume::coordination::{
     PostgresLeaderElector,
 };
 use rume::events::{Event, EventBus};
-use rume::jobs::{Job, JobQueue, PostgresJobQueue};
+use rume::jobs::{
+    BoxFuture, Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker,
+    PostgresJobQueue,
+};
 use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRepository, TransactionalOutbox};
 use rume::persistence::error::PersistenceError;
 use rume::persistence::migration::{Migration, Migrator};
@@ -1044,4 +1047,315 @@ async fn test_postgres_realistic_enterprise_transaction_pipeline() {
 
     // Outbox pending count remains 0
     assert_eq!(backend.pending_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_postgres_outbox_lease_expiry_rejects_completion_before_another_claims() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = pool.backend();
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
+
+    let msg = OutboxMessage::new("msg-pg-exp-1", "order.created", b"{}".to_vec());
+    backend.save(msg).await.expect("save outbox message");
+
+    // Claim with 0s lease duration -> immediately expired against EXTRACT(EPOCH FROM clock_timestamp())
+    let claimed = backend
+        .claim_pending_with_lease(1, 0)
+        .await
+        .expect("claim message");
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.as_ref().unwrap();
+
+    // Worker attempts mark_published after lease expired -> must be rejected
+    let res = backend.mark_published("msg-pg-exp-1", token).await;
+    assert!(
+        res.is_err(),
+        "mark_published must fail when lease has expired in PostgreSQL"
+    );
+
+    // Worker attempts mark_failed after lease expired -> must be rejected
+    let fail_res = backend
+        .mark_failed_with_max_retries("msg-pg-exp-1", token, "transient error".into(), 5)
+        .await;
+    assert!(
+        fail_res.is_err(),
+        "mark_failed must fail when lease has expired in PostgreSQL"
+    );
+
+    assert_eq!(backend.published_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn test_postgres_outbox_superseded_worker_cannot_change_state_after_reclaim() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = pool.backend();
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
+
+    let msg = OutboxMessage::new("msg-pg-reclaim-1", "order.created", b"{}".to_vec());
+    backend.save(msg).await.expect("save outbox message");
+
+    // Worker A claims with 0s lease duration
+    let claimed_a = backend
+        .claim_pending_with_lease(1, 0)
+        .await
+        .expect("claim worker a");
+    assert_eq!(claimed_a.len(), 1);
+    let token_a = claimed_a[0].lease_token.as_ref().unwrap().clone();
+
+    // Recovery runs and reclaims expired claim
+    let recovered = backend.recover_expired_claims(0).await.expect("recover");
+    assert_eq!(recovered, 1);
+
+    // Worker B claims the message
+    let claimed_b = backend
+        .claim_pending_with_lease(1, 60)
+        .await
+        .expect("claim worker b");
+    assert_eq!(claimed_b.len(), 1);
+    let token_b = claimed_b[0].lease_token.as_ref().unwrap().clone();
+    assert_ne!(token_a, token_b);
+
+    // Worker A tries to mark published -> MUST be rejected (superseded!)
+    let res_a = backend.mark_published("msg-pg-reclaim-1", &token_a).await;
+    assert!(
+        res_a.is_err(),
+        "superseded worker A must not be allowed to mark published"
+    );
+
+    // Worker B marks published -> SUCCEEDS
+    backend
+        .mark_published("msg-pg-reclaim-1", &token_b)
+        .await
+        .expect("worker b mark published");
+    assert_eq!(backend.published_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_lease_expiry_rejects_ack_nack_dead_letter_before_reclaim() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend())
+        .with_lease_duration(Duration::from_millis(100));
+    queue.init_schema().await.expect("init job schema failed");
+
+    // 1. Test ack rejection on expired lease
+    let job1_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-exp-1".into(),
+            amount: 100,
+        })
+        .await
+        .expect("enqueue job 1");
+    let job1 = queue.dequeue().await.unwrap().unwrap();
+    let token1 = job1.lease_token.clone().unwrap();
+
+    // Wait until lease expires (> 100ms)
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let ack_res = queue.ack(&job1_id, &token1).await;
+    assert!(
+        ack_res.is_err(),
+        "ack must be rejected when lease has expired, even before peer worker claims"
+    );
+
+    // 2. Test nack rejection on expired lease
+    let _job2_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-exp-2".into(),
+            amount: 200,
+        })
+        .await
+        .expect("enqueue job 2");
+    let job2 = queue.dequeue().await.unwrap().unwrap();
+    let token2 = job2.lease_token.clone().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let nack_res = queue.nack(job2, &token2, Duration::from_secs(1)).await;
+    assert!(
+        nack_res.is_err(),
+        "nack must be rejected when lease has expired"
+    );
+
+    // 3. Test dead_letter rejection on expired lease
+    let _job3_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-exp-3".into(),
+            amount: 300,
+        })
+        .await
+        .expect("enqueue job 3");
+    let job3 = queue.dequeue().await.unwrap().unwrap();
+    let token3 = job3.lease_token.clone().unwrap();
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let dl_res = queue.dead_letter(job3, &token3, "expired lease".into()).await;
+    assert!(
+        dl_res.is_err(),
+        "dead_letter must be rejected when lease has expired"
+    );
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_superseded_worker_cannot_ack_after_peer_claims() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend())
+        .with_lease_duration(Duration::from_millis(100));
+    queue.init_schema().await.expect("init job schema failed");
+
+    let job_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-peer-claim".into(),
+            amount: 400,
+        })
+        .await
+        .expect("enqueue job");
+
+    // Worker A dequeues
+    let job_a = queue.dequeue_for("worker-A").await.unwrap().unwrap();
+    let token_a = job_a.lease_token.unwrap();
+
+    // Sleep past lease duration
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    // Worker B dequeues (claims after lease expired)
+    let job_b = queue.dequeue_for("worker-B").await.unwrap().unwrap();
+    let token_b = job_b.lease_token.unwrap();
+    assert_eq!(job_b.id, job_id);
+    assert_ne!(token_a, token_b);
+
+    // Worker A attempts to ack -> rejected
+    let ack_a = queue.ack(&job_id, &token_a).await;
+    assert!(
+        ack_a.is_err(),
+        "superseded worker A must be rejected from acking"
+    );
+
+    // Worker B acks -> succeeds
+    let ack_b = queue.ack(&job_id, &token_b).await;
+    assert!(ack_b.is_ok(), "worker B ack must succeed");
+}
+
+#[tokio::test]
+async fn test_postgres_job_queue_valid_lease_renewal_prevents_recovery() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend())
+        .with_lease_duration(Duration::from_millis(400));
+    queue.init_schema().await.expect("init job schema failed");
+
+    let job_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-renew-prevents-recovery".into(),
+            amount: 750,
+        })
+        .await
+        .expect("enqueue job");
+
+    let job = queue.dequeue_for("worker-renew").await.unwrap().unwrap();
+    let token = job.lease_token.unwrap();
+
+    // Before initial 400ms lease expires, renew it for 5 seconds
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    queue
+        .renew_lease(&job_id, &token, Duration::from_secs(5))
+        .await
+        .expect("renew lease should succeed");
+
+    // Wait until initial 400ms lease would have expired (600ms total)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // Try to dequeue or reclaim abandoned jobs: another worker cannot claim because lease is still active
+    let peer_dequeue = queue.dequeue_for("peer-worker").await.unwrap();
+    assert!(
+        peer_dequeue.is_none(),
+        "renewed job lease must prevent other workers from reclaiming"
+    );
+
+    // Worker can still successfully ack with renewed lease
+    let ack_res = queue.ack(&job_id, &token).await;
+    assert!(ack_res.is_ok(), "ack with active renewed lease must succeed");
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LongRunningWorkerJob {
+    task_id: String,
+}
+
+impl Job for LongRunningWorkerJob {
+    const NAME: &'static str = "long_running_worker_job";
+}
+
+struct LongRunningWorkerHandler {
+    completed: Arc<AtomicUsize>,
+}
+
+impl JobHandler<LongRunningWorkerJob> for LongRunningWorkerHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a JobContext,
+        _job: LongRunningWorkerJob,
+    ) -> BoxFuture<'a, Result<(), JobError>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_postgres_job_worker_heartbeat_renewal_keeps_long_running_job_valid() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    // Configure a short lease of 300ms
+    let queue = Arc::new(
+        PostgresJobQueue::from_backend(pool.backend())
+            .with_lease_duration(Duration::from_millis(300)),
+    );
+    queue.init_schema().await.expect("init job schema failed");
+
+    let mut registry = JobRegistry::new();
+    let job_completed = Arc::new(AtomicUsize::new(0));
+
+    // Handler runs for 600ms (2x longer than the initial 300ms lease duration!)
+    registry.register(LongRunningWorkerHandler {
+        completed: Arc::clone(&job_completed),
+    });
+
+    let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
+    worker.start();
+
+    // Enqueue the long-running job
+    queue
+        .enqueue(LongRunningWorkerJob {
+            task_id: "task-long-600".into(),
+        })
+        .await
+        .expect("enqueue job");
+
+    // Wait for the worker to finish the 600ms job + give a slight margin
+    tokio::time::sleep(Duration::from_millis(900)).await;
+
+    // Verify job handler completed
+    assert_eq!(job_completed.load(Ordering::SeqCst), 1);
+
+    // Verify worker status: no lost leases and no transition errors
+    let status = worker.status();
+    assert_eq!(
+        status.transition_errors, 0,
+        "worker must have 0 transition errors because heartbeat kept lease valid"
+    );
+    assert_eq!(
+        status.lost_leases, 0,
+        "worker must have 0 lost leases during heartbeat renewal"
+    );
+
+    // Verify job was acknowledged and is no longer pending
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+    assert!(worker.drain(Duration::from_secs(1)).await);
 }

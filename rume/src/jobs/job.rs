@@ -113,4 +113,6 @@ pub struct QueuedJob {
     pub lease_token: Option<String>,
     /// Earliest time when this job is eligible for execution.
     pub available_at: Instant,
+    /// Lease duration granted for this execution attempt.
+    pub lease_duration: Duration,
 }
