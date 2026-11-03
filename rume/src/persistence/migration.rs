@@ -97,7 +97,7 @@ impl Migrator {
     ) -> Result<Vec<String>, PersistenceError> {
         backend
             .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
             )
             .await?;
 
@@ -250,7 +250,7 @@ impl Migrator {
     ) -> Result<(), PersistenceError> {
         backend
             .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
             )
             .await?;
 

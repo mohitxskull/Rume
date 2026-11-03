@@ -19,9 +19,9 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 ### Group A — Migration Schema Divergence & Single-Feature Test Matrix (solve together)
 > Root cause: Truncated DDL statements in secondary migration verification functions and feature-gated container imports in shared test utilities.
 
-- [ ] **Pool C1 — Schema divergence in `pending_migrations` and `verify_no_pending_backend` creates truncated 2-column `rume_migrations` table, breaking subsequent migrations** (`pool-lifecycle-persistence.md` C1, `testing-feature-matrix.md` M2).
+- [x] **Pool C1 — Schema divergence in `pending_migrations` and `verify_no_pending_backend` creates truncated 2-column `rume_migrations` table, breaking subsequent migrations** (`pool-lifecycle-persistence.md` C1, `testing-feature-matrix.md` M2).
       `rume/src/persistence/migration.rs:100, 253`: DDL in `pending_migrations` and `verify_no_pending_backend` creates `rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)`. When `run_pending_backend` is subsequently executed, `CREATE TABLE IF NOT EXISTS` is a no-op and `INSERT INTO rume_migrations (id, name, applied_at, checksum)` fails with `column "name" ... does not exist`, breaking `test_postgres_migrations_up_and_rollback`. Unify table creation across all functions to include `name` and `checksum` with defaults.
-- [ ] **Testing C1 — Single-feature cargo check and test builds fail for `mysql` and `redis` due to missing testcontainer imports in `common/containers.rs`** (`testing-feature-matrix.md` C1).
+- [x] **Testing C1 — Single-feature cargo check and test builds fail for `mysql` and `redis` due to missing testcontainer imports in `common/containers.rs`** (`testing-feature-matrix.md` C1).
       `rume/tests/common/containers.rs:11–20, 81–93, 138–151`: Imports for `AsyncRunner` and `ContainerAsync` are gated under `#[cfg(feature = "postgres")]` only. Building tests under `--no-default-features --features mysql` or `--features redis` fails with `cannot find type ContainerAsync in crate testcontainers`. Lift `ContainerAsync` and `runners::AsyncRunner` imports to `#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]`.
 
 ---

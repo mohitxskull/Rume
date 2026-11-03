@@ -5,17 +5,15 @@
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
 use tokio::sync::OnceCell;
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
+use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync};
+#[cfg(any(feature = "postgres", feature = "redis"))]
+use testcontainers_modules::testcontainers::ImageExt;
 
 // ─── PostgreSQL Shared Container & Isolation ─────────────────────────────────
 
 #[cfg(feature = "postgres")]
 use testcontainers_modules::postgres::Postgres;
-#[cfg(feature = "postgres")]
-use testcontainers_modules::testcontainers::ImageExt;
-#[cfg(feature = "postgres")]
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-#[cfg(feature = "postgres")]
-use testcontainers_modules::testcontainers::ContainerAsync;
 
 #[cfg(feature = "postgres")]
 static POSTGRES_NODE: OnceCell<ContainerAsync<Postgres>> = OnceCell::const_new();
