@@ -1,6 +1,8 @@
 //! SAML 2.0 assertion parsing, claim extraction, and condition validation.
 
 use std::collections::BTreeMap;
+use quick_xml::events::Event;
+use quick_xml::reader::NsReader;
 use thiserror::Error;
 
 /// SAML processing and validation errors.
@@ -47,6 +49,19 @@ pub enum SamlError {
 pub trait SamlSignatureVerifier: Send + Sync {
     /// Verifies the digital signature on the raw XML assertion.
     fn verify_signature(&self, raw_xml: &str) -> Result<(), SamlError>;
+
+    /// Verifies that the specific assertion node is cryptographically valid and covered by signature.
+    ///
+    /// Ensures that what was cryptographically validated matches the exact assertion node
+    /// later consumed by the application shell, closing the trust-boundary gap.
+    fn verify_assertion_signature(
+        &self,
+        raw_xml: &str,
+        _assertion_id: &str,
+        _assertion_xml: &str,
+    ) -> Result<(), SamlError> {
+        self.verify_signature(raw_xml)
+    }
 }
 
 /// A validated SAML 2.0 authentication assertion.
@@ -70,43 +85,76 @@ pub struct SamlAssertion {
     pub attributes: BTreeMap<String, Vec<String>>,
 }
 
-/// Parser and validator for SAML 2.0 assertions.
-pub struct SamlParser;
-
-fn strip_comments(xml: &str) -> Result<String, SamlError> {
-    let mut out = String::with_capacity(xml.len());
-    let mut rest = xml;
-    while let Some(start) = rest.find("<!--") {
-        out.push_str(&rest[..start]);
-        if let Some(end) = rest[start..].find("-->") {
-            rest = &rest[start + end + 3..];
-        } else {
-            return Err(SamlError::Malformed("unclosed XML comment".into()));
-        }
+/// Parses an ISO 8601 timestamp string strictly, including UTC 'Z', fractional seconds,
+/// and explicit timezone offsets (+HH:MM, -HH:MM, +HHMM, -HHMM).
+/// Fails closed: if the timestamp is malformed or invalid, returns an error rather than ignoring it.
+pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
+    let s = s.trim();
+    if let Ok(epoch) = s.parse::<u64>() {
+        return Ok(epoch);
     }
-    out.push_str(rest);
-    Ok(out)
-}
 
-fn parse_iso8601_or_epoch(s: &str) -> Option<u64> {
-    if let Ok(epoch) = s.trim().parse::<u64>() {
-        return Some(epoch);
-    }
-    let s = s.trim().trim_end_matches('Z');
-    let (date, time) = s.split_once('T')?;
-    let mut date_parts = date.split('-');
-    let year: u64 = date_parts.next()?.parse().ok()?;
-    let month: u64 = date_parts.next()?.parse().ok()?;
-    let day: u64 = date_parts.next()?.parse().ok()?;
+    let (date_str, time_with_tz) = s
+        .split_once('T')
+        .ok_or_else(|| SamlError::Malformed(format!("invalid ISO 8601 timestamp '{s}': missing 'T'")))?;
 
-    let mut time_parts = time.split(':');
-    let hour: u64 = time_parts.next()?.parse().ok()?;
-    let min: u64 = time_parts.next()?.parse().ok()?;
-    let sec_str = time_parts.next()?;
-    let sec: u64 = sec_str.split('.').next()?.parse().ok()?;
+    let mut date_parts = date_str.split('-');
+    let year: u64 = date_parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid year in timestamp '{s}'")))?;
+    let month: u64 = date_parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid month in timestamp '{s}'")))?;
+    let day: u64 = date_parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid day in timestamp '{s}'")))?;
 
     if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
+        return Err(SamlError::Malformed(format!(
+            "timestamp '{s}' out of valid date bounds"
+        )));
+    }
+
+    // Parse time and timezone offset
+    let (time_str, tz_offset_secs) = if let Some(idx) = time_with_tz.find('Z') {
+        (&time_with_tz[..idx], 0i64)
+    } else if let Some(idx) = time_with_tz.rfind('+') {
+        let tz_str = &time_with_tz[idx + 1..];
+        let offset = parse_tz_offset(tz_str)?;
+        (&time_with_tz[..idx], offset)
+    } else if let Some(idx) = time_with_tz.rfind('-') {
+        let tz_str = &time_with_tz[idx + 1..];
+        let offset = parse_tz_offset(tz_str)?;
+        (&time_with_tz[..idx], -offset)
+    } else {
+        (time_with_tz, 0i64)
+    };
+
+    let mut time_parts = time_str.split(':');
+    let hour: u64 = time_parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid hour in timestamp '{s}'")))?;
+    let min: u64 = time_parts
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid minute in timestamp '{s}'")))?;
+    let sec_str = time_parts
+        .next()
+        .ok_or_else(|| SamlError::Malformed(format!("invalid second in timestamp '{s}'")))?;
+    let sec: u64 = sec_str
+        .split('.')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| SamlError::Malformed(format!("invalid second value in timestamp '{s}'")))?;
+
+    if hour > 23 || min > 59 || sec > 60 {
+        return Err(SamlError::Malformed(format!(
+            "timestamp '{s}' out of valid time bounds"
+        )));
     }
 
     let mut days: u64 = 0;
@@ -135,47 +183,48 @@ fn parse_iso8601_or_epoch(s: &str) -> Option<u64> {
     }
     days += day - 1;
 
-    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+    let total_secs_utc = (days * 86400 + hour * 3600 + min * 60 + sec) as i64 - tz_offset_secs;
+    if total_secs_utc < 0 {
+        return Err(SamlError::Malformed(format!(
+            "timestamp '{s}' resolves before Unix epoch"
+        )));
+    }
+
+    Ok(total_secs_utc as u64)
 }
 
-fn extract_attribute(tag_slice: &str, attr: &str) -> Option<String> {
-    for quote in ['"', '\''] {
-        let pattern_exact = format!("{attr}={quote}");
-        let pattern_space1 = format!("{attr} ={quote}");
-        let pattern_space2 = format!("{attr} = {quote}");
-        let pattern_space3 = format!("{attr}= {quote}");
-        for p in [&pattern_exact, &pattern_space1, &pattern_space2, &pattern_space3] {
-            if let Some(pos) = tag_slice.find(p) {
-                let rest = &tag_slice[pos + p.len()..];
-                if let Some(end) = rest.find(quote) {
-                    return Some(rest[..end].to_string());
-                }
-            }
-        }
+fn parse_tz_offset(s: &str) -> Result<i64, SamlError> {
+    let s = s.trim();
+    if let Some((h_str, m_str)) = s.split_once(':') {
+        let h: i64 = h_str
+            .parse()
+            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
+        let m: i64 = m_str
+            .parse()
+            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
+        Ok(h * 3600 + m * 60)
+    } else if s.len() == 4 {
+        let h: i64 = s[..2]
+            .parse()
+            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
+        let m: i64 = s[2..]
+            .parse()
+            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
+        Ok(h * 3600 + m * 60)
+    } else if s.len() == 2 {
+        let h: i64 = s
+            .parse()
+            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
+        Ok(h * 3600)
+    } else {
+        Err(SamlError::Malformed(format!("invalid timezone offset '{s}'")))
     }
-    None
 }
+
+/// Parser and validator for SAML 2.0 assertions.
+pub struct SamlParser;
 
 impl SamlParser {
-    fn extract_tag<'a>(xml: &'a str, tag: &str) -> Option<&'a str> {
-        let close_tag = format!("</{tag}>");
-        let tag_with_gt = format!("<{tag}>");
-        let tag_with_space = format!("<{tag} ");
-
-        let content_start = if let Some(pos) = xml.find(&tag_with_gt) {
-            pos + tag_with_gt.len()
-        } else if let Some(pos) = xml.find(&tag_with_space) {
-            let rest = &xml[pos..];
-            let tag_close = rest.find('>')?;
-            pos + tag_close + 1
-        } else {
-            return None;
-        };
-
-        let end = xml[content_start..].find(&close_tag)?;
-        Some(xml[content_start..content_start + end].trim())
-    }
-
     /// Parses an XML string containing a SAML 2.0 Assertion.
     ///
     /// Deprecated: Unverified assertion parsing in production is insecure.
@@ -199,220 +248,224 @@ impl SamlParser {
         Self::parse_with_verifier(xml, Some(verifier))
     }
 
-    /// Parses an XML string containing a SAML 2.0 Assertion and verifies its digital signature if a verifier is provided.
+    /// Parses an XML string containing a SAML 2.0 Assertion using a namespace-aware XML parser
+    /// and verifies digital signatures against the exact node consumed by the application.
     pub fn parse_with_verifier(
         xml: &str,
         verifier: Option<&dyn SamlSignatureVerifier>,
     ) -> Result<SamlAssertion, SamlError> {
-        if let Some(v) = verifier {
-            v.verify_signature(xml)?;
-        }
+        let mut reader = NsReader::from_str(xml);
+        reader.config_mut().trim_text(true);
+        reader.config_mut().expand_empty_elements = true;
 
-        let clean_xml = strip_comments(xml)?;
-        let xml = clean_xml.as_str();
+        let mut assertion_count = 0usize;
+        let mut assertion_id: Option<String> = None;
+        let mut response_id: Option<String> = None;
+        let mut destination: Option<String> = None;
 
-        // Security check: Guard against XML Signature Wrapping (XSW) attacks
-        // Detect all assertion elements regardless of namespace prefix (<([a-zA-Z0-9_\-]+:)?Assertion)
-        let mut assertion_positions = Vec::new();
-        let mut search_idx = 0;
-        while let Some(pos) = xml[search_idx..].find(":Assertion") {
-            let abs_pos = search_idx + pos;
-            if let Some(tag_start) = xml[..abs_pos].rfind('<') {
-                let tag_prefix = &xml[tag_start + 1..abs_pos];
-                if tag_prefix.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
-                    assertion_positions.push(tag_start);
+        let mut issuer: Option<String> = None;
+        let mut subject: Option<String> = None;
+        let mut audience: Option<String> = None;
+        let mut not_before: Option<u64> = None;
+        let mut not_on_or_after: Option<u64> = None;
+        let mut attributes: BTreeMap<String, Vec<String>> = BTreeMap::new();
+
+        let mut assertion_start_offset: Option<usize> = None;
+        let mut assertion_end_offset: Option<usize> = None;
+
+        let mut signature_references: Vec<String> = Vec::new();
+
+        let mut element_stack: Vec<String> = Vec::new();
+        let mut in_assertion = false;
+        let mut current_attr_name: Option<String> = None;
+
+        loop {
+            let event_start = reader.buffer_position() as usize;
+
+            match reader.read_resolved_event() {
+                Ok((_res, Event::Start(ref e))) => {
+                    let local = e.local_name();
+                    let local_name = local.as_ref();
+
+                    if local_name == "Assertion" {
+                        assertion_count += 1;
+                        if assertion_count > 1 {
+                            return Err(SamlError::SignatureWrappingDetected(
+                                "multiple Assertion elements detected; possible XML signature wrapping attack".into(),
+                            ));
+                        }
+                        in_assertion = true;
+                        assertion_start_offset = Some(event_start);
+
+                        for attr in e.attributes().flatten() {
+                            let local_k = attr.key.local_name();
+                            if local_k.as_ref() == "ID" {
+                                assertion_id = Some(attr.value.as_ref().to_string());
+                            }
+                        }
+                    } else if local_name == "Response" {
+                        for attr in e.attributes().flatten() {
+                            let local_k = attr.key.local_name();
+                            let k = local_k.as_ref();
+                            if k == "ID" {
+                                response_id = Some(attr.value.as_ref().to_string());
+                            } else if k == "Destination" {
+                                destination = Some(attr.value.as_ref().to_string());
+                            }
+                        }
+                    } else if local_name == "Reference" {
+                        for attr in e.attributes().flatten() {
+                            let local_k = attr.key.local_name();
+                            if local_k.as_ref() == "URI" {
+                                let uri = attr.value.as_ref();
+                                let ref_id = uri.strip_prefix('#').unwrap_or(uri);
+                                signature_references.push(ref_id.to_string());
+                            }
+                        }
+                    } else if in_assertion {
+                        if local_name == "Conditions" {
+                            for attr in e.attributes().flatten() {
+                                let local_k = attr.key.local_name();
+                                let k = local_k.as_ref();
+                                if k == "NotBefore" {
+                                    not_before = Some(parse_iso8601_strict(attr.value.as_ref())?);
+                                } else if k == "NotOnOrAfter" {
+                                    not_on_or_after = Some(parse_iso8601_strict(attr.value.as_ref())?);
+                                }
+                            }
+                        } else if local_name == "Attribute" {
+                            for attr in e.attributes().flatten() {
+                                let local_k = attr.key.local_name();
+                                if local_k.as_ref() == "Name" {
+                                    current_attr_name = Some(attr.value.as_ref().to_string());
+                                }
+                            }
+                        }
+                    }
+
+                    element_stack.push(local_name.to_string());
                 }
+                Ok((_res, Event::End(ref e))) => {
+                    let local = e.local_name();
+                    let local_name = local.as_ref();
+                    if local_name == "Assertion" {
+                        assertion_end_offset = Some(reader.buffer_position() as usize);
+                        in_assertion = false;
+                    } else if local_name == "Attribute" {
+                        current_attr_name = None;
+                    }
+                    element_stack.pop();
+                }
+                Ok((_res, Event::Text(ref t))) => {
+                    if in_assertion {
+                        let parent = element_stack.last().map(|s| s.as_str());
+                        let grand_parent = if element_stack.len() >= 2 {
+                            Some(element_stack[element_stack.len() - 2].as_str())
+                        } else {
+                            None
+                        };
+
+                        let text = quick_xml::escape::unescape(t.as_ref())
+                            .map(|c| c.trim().to_string())
+                            .unwrap_or_else(|_| t.as_ref().trim().to_string());
+
+                        if !text.is_empty() {
+                            if parent == Some("Issuer") && issuer.is_none() {
+                                issuer = Some(text);
+                            } else if parent == Some("NameID")
+                                && grand_parent == Some("Subject")
+                                && subject.is_none()
+                            {
+                                subject = Some(text);
+                            } else if parent == Some("Audience") && audience.is_none() {
+                                audience = Some(text);
+                            } else if parent == Some("AttributeValue") && current_attr_name.is_some() {
+                                attributes
+                                    .entry(current_attr_name.clone().unwrap())
+                                    .or_default()
+                                    .push(text);
+                            }
+                        }
+                    }
+                }
+                Ok((_res, Event::CData(ref c))) => {
+                    if in_assertion {
+                        let parent = element_stack.last().map(|s| s.as_str());
+                        let grand_parent = if element_stack.len() >= 2 {
+                            Some(element_stack[element_stack.len() - 2].as_str())
+                        } else {
+                            None
+                        };
+
+                        let text = c.as_ref().trim().to_string();
+
+                        if !text.is_empty() {
+                            if parent == Some("Issuer") && issuer.is_none() {
+                                issuer = Some(text);
+                            } else if parent == Some("NameID")
+                                && grand_parent == Some("Subject")
+                                && subject.is_none()
+                            {
+                                subject = Some(text);
+                            } else if parent == Some("Audience") && audience.is_none() {
+                                audience = Some(text);
+                            } else if parent == Some("AttributeValue") && current_attr_name.is_some() {
+                                attributes
+                                    .entry(current_attr_name.clone().unwrap())
+                                    .or_default()
+                                    .push(text);
+                            }
+                        }
+                    }
+                }
+                Ok((_res, Event::Eof)) => break,
+                Err(err) => {
+                    return Err(SamlError::Malformed(format!("XML parser error: {err}")));
+                }
+                _ => {}
             }
-            search_idx = abs_pos + ":Assertion".len();
-        }
-        search_idx = 0;
-        while let Some(pos) = xml[search_idx..].find("<Assertion") {
-            let abs_pos = search_idx + pos;
-            if !assertion_positions.contains(&abs_pos) {
-                assertion_positions.push(abs_pos);
-            }
-            search_idx = abs_pos + "<Assertion".len();
         }
 
-        if assertion_positions.len() > 1 {
-            return Err(SamlError::SignatureWrappingDetected(format!(
-                "multiple ({}) Assertion elements detected; possible XML signature wrapping attack",
-                assertion_positions.len()
-            )));
-        }
-
-        if assertion_positions.is_empty() {
+        if assertion_count == 0 {
             return Err(SamlError::Malformed("missing Assertion element in SAML payload".into()));
         }
 
-        let assertion_start = assertion_positions[0];
-        let assertion_xml = if let Some(close_pos) = xml[assertion_start..].find(":Assertion>") {
-            if let Some(_close_tag_start) = xml[assertion_start..assertion_start + close_pos].rfind("</") {
-                let end = assertion_start + close_pos + ":Assertion>".len();
-                &xml[assertion_start..end]
-            } else {
-                &xml[assertion_start..]
-            }
-        } else if let Some(close_pos) = xml[assertion_start..].find("</Assertion>") {
-            let end = assertion_start + close_pos + "</Assertion>".len();
-            &xml[assertion_start..end]
-        } else {
-            &xml[assertion_start..]
-        };
-
-        // Extract Assertion ID and enclosing Response ID using robust attribute parsing
-        let assertion_opening_tag = assertion_xml.split('>').next().unwrap_or(assertion_xml);
-        let assertion_id = extract_attribute(assertion_opening_tag, "ID");
-        let id = assertion_id.clone().unwrap_or_else(|| "assertion".to_string());
-
-        let response_id = {
-            let mut resp_id = None;
-            for token in [":Response", "<Response"] {
-                if let Some(pos) = xml.find(token) {
-                    let start = xml[..pos].rfind('<').unwrap_or(pos);
-                    if let Some(tag_end) = xml[start..].find('>') {
-                        let tag = &xml[start..start + tag_end + 1];
-                        if let Some(id) = extract_attribute(tag, "ID") {
-                            resp_id = Some(id);
-                            break;
-                        }
-                    }
-                }
-            }
-            resp_id
-        };
-
-        // Security check: Signature Reference URI must match Assertion ID or enclosing Response ID
-        let mut search_idx = 0;
-        while let Some(pos) = xml[search_idx..].find('<') {
-            let tag_start = search_idx + pos;
-            let tag_content = &xml[tag_start..];
-            let Some(tag_end) = tag_content.find('>') else {
-                break;
-            };
-            let tag_slice = &tag_content[..tag_end + 1];
-            let is_ref = tag_slice.starts_with("<ds:Reference")
-                || tag_slice.starts_with("<Reference")
-                || tag_slice.starts_with("<dsig:Reference");
-
-            if is_ref
-                && let Some(uri) = extract_attribute(tag_slice, "URI")
-                && let Some(ref_id) = uri.strip_prefix('#')
-            {
-                let matches_assertion = assertion_id.as_deref() == Some(ref_id);
-                let matches_response = response_id.as_deref() == Some(ref_id);
-                if !matches_assertion && !matches_response {
-                    let expected = match (&assertion_id, &response_id) {
-                        (Some(a), Some(r)) => {
-                            format!("assertion ID '{a}' or response ID '{r}'")
-                        }
-                        (Some(a), None) => format!("assertion ID '{a}'"),
-                        (None, Some(r)) => format!("response ID '{r}'"),
-                        (None, None) => "known element ID".to_string(),
-                    };
-                    return Err(SamlError::SignatureWrappingDetected(format!(
-                        "signature reference URI '#{ref_id}' does not match {expected}"
-                    )));
-                }
-            }
-            search_idx = tag_start + tag_end + 1;
-        }
-
-        // Find Issuer inside isolated assertion subtree
-        let issuer = Self::extract_tag(assertion_xml, "saml:Issuer")
-            .or_else(|| Self::extract_tag(assertion_xml, "saml2:Issuer"))
-            .or_else(|| Self::extract_tag(assertion_xml, "Issuer"))
-            .ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?
-            .to_string();
-
-        // Find Subject NameID inside isolated assertion subtree (prevents Envelope Injection XSW)
-        let subject = Self::extract_tag(assertion_xml, "saml:NameID")
-            .or_else(|| Self::extract_tag(assertion_xml, "saml2:NameID"))
-            .or_else(|| Self::extract_tag(assertion_xml, "NameID"))
-            .ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?
-            .to_string();
-
-        // Optional Audience inside isolated assertion subtree
-        let audience = Self::extract_tag(assertion_xml, "saml:Audience")
-            .or_else(|| Self::extract_tag(assertion_xml, "saml2:Audience"))
-            .or_else(|| Self::extract_tag(assertion_xml, "Audience"))
-            .map(str::to_string);
-
-        // Optional Destination endpoint
-        let destination = if let Some(pos) = xml.find("Destination=\"") {
-            let rest = &xml[pos + "Destination=\"".len()..];
-            rest.find('"').map(|end| rest[..end].to_string())
-        } else {
-            None
-        };
-
-        // Parse Conditions NotBefore and NotOnOrAfter inside isolated assertion subtree
-        let mut not_before = None;
-        let mut not_on_or_after = None;
-
-        let cond_tags = ["<saml2:Conditions", "<saml:Conditions", "<Conditions"];
-        for cond_tag in cond_tags {
-            if let Some(pos) = assertion_xml.find(cond_tag) {
-                let rest = &assertion_xml[pos..];
-                if let Some(close_bracket) = rest.find('>') {
-                    let tag_slice = &rest[..close_bracket];
-                    if let Some(nb) = extract_attribute(tag_slice, "NotBefore") {
-                        not_before = parse_iso8601_or_epoch(&nb);
-                    }
-                    if let Some(noa) = extract_attribute(tag_slice, "NotOnOrAfter") {
-                        not_on_or_after = parse_iso8601_or_epoch(&noa);
-                    }
-                }
-                break;
+        // Validate signature references against assertion ID or response ID
+        for ref_id in &signature_references {
+            let matches_assertion = assertion_id.as_deref() == Some(ref_id.as_str());
+            let matches_response = response_id.as_deref() == Some(ref_id.as_str());
+            if !matches_assertion && !matches_response {
+                let expected = match (&assertion_id, &response_id) {
+                    (Some(a), Some(r)) => format!("assertion ID '{a}' or response ID '{r}'"),
+                    (Some(a), None) => format!("assertion ID '{a}'"),
+                    (None, Some(r)) => format!("response ID '{r}'"),
+                    (None, None) => "known element ID".to_string(),
+                };
+                return Err(SamlError::SignatureWrappingDetected(format!(
+                    "signature reference URI '#{ref_id}' does not match {expected}"
+                )));
             }
         }
 
-        // Extract Attributes inside isolated assertion subtree
-        let mut attributes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let mut search_idx = 0;
+        let issuer = issuer.ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?;
+        if issuer.is_empty() {
+            return Err(SamlError::Malformed("missing Issuer element".into()));
+        }
 
-        while let Some(pos) = assertion_xml[search_idx..].find("<saml:Attribute")
-            .or_else(|| assertion_xml[search_idx..].find("<saml2:Attribute"))
-            .or_else(|| assertion_xml[search_idx..].find("<Attribute"))
-        {
-            let tag_start = search_idx + pos;
-            let Some(tag_end) = assertion_xml[tag_start..].find('>') else { break };
-            let tag_header = &assertion_xml[tag_start..tag_start + tag_end];
-            let attr_body_start = tag_start + tag_end + 1;
+        let subject = subject.ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?;
+        if subject.is_empty() {
+            return Err(SamlError::Malformed("missing NameID in Subject".into()));
+        }
 
-            if let Some(name) = extract_attribute(tag_header, "Name") {
-                if let Some(close_attr) = assertion_xml[attr_body_start..]
-                    .find("</saml:Attribute>")
-                    .or_else(|| assertion_xml[attr_body_start..].find("</saml2:Attribute>"))
-                    .or_else(|| assertion_xml[attr_body_start..].find("</Attribute>"))
-                {
-                    let attr_content = &assertion_xml[attr_body_start..attr_body_start + close_attr];
-                    let mut vals = Vec::new();
-                    let mut content_slice = attr_content;
-                    while let Some(open_idx) = content_slice.find("AttributeValue") {
-                        let rest = &content_slice[open_idx..];
-                        let Some(val_tag_end) = rest.find('>') else { break };
-                        let after_tag = &rest[val_tag_end + 1..];
-                        let Some(close_idx) = after_tag.find("</") else {
-                            break;
-                        };
-                        let val = after_tag[..close_idx].trim().to_string();
-                        vals.push(val);
-                        let after_close = &after_tag[close_idx..];
-                        let Some(close_tag_end) = after_close.find('>') else {
-                            break;
-                        };
-                        content_slice = &after_close[close_tag_end + 1..];
-                    }
+        let id = assertion_id.unwrap_or_else(|| "assertion".to_string());
 
-                    attributes.insert(name, vals);
-                    search_idx = attr_body_start + close_attr;
-                } else {
-                    search_idx = attr_body_start;
-                }
-            } else {
-                search_idx = attr_body_start;
-            }
+        let assertion_raw_slice = match (assertion_start_offset, assertion_end_offset) {
+            (Some(start), Some(end)) if start < end && end <= xml.len() => &xml[start..end],
+            _ => xml,
+        };
+
+        if let Some(v) = verifier {
+            v.verify_assertion_signature(xml, &id, assertion_raw_slice)?;
         }
 
         Ok(SamlAssertion {

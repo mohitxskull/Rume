@@ -3,7 +3,9 @@
 pub mod saml;
 pub mod scim;
 
-pub use saml::{SamlAssertion, SamlError, SamlParser, SamlSignatureVerifier};
+pub use saml::{
+    parse_iso8601_strict, SamlAssertion, SamlError, SamlParser, SamlSignatureVerifier,
+};
 pub use scim::{
     SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, ScimEmail,
     ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember, ScimMeta, ScimName, ScimUser,

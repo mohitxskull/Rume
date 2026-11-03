@@ -43,6 +43,7 @@ hmac = "0.12.1"
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+quick-xml = "0.42.0"
 
 [features]
 default = ["sqlite"]

@@ -58,9 +58,9 @@ pub use coordination::{PostgresDistributedLock, PostgresLeaderElector};
 #[cfg(feature = "redis")]
 pub use coordination::{RedisDistributedLock, RedisLeaderElector};
 pub use enterprise::{
-    SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA, SamlAssertion,
-    SamlError, SamlParser, SamlSignatureVerifier, ScimEmail, ScimErrorResponse, ScimGroup,
-    ScimListResponse, ScimMember, ScimMeta, ScimName, ScimUser,
+    parse_iso8601_strict, SamlAssertion, SamlError, SamlParser, SamlSignatureVerifier,
+    ScimEmail, ScimErrorResponse, ScimGroup, ScimListResponse, ScimMember, ScimMeta, ScimName,
+    ScimUser, SCIM_ERROR_SCHEMA, SCIM_GROUP_SCHEMA, SCIM_LIST_SCHEMA, SCIM_USER_SCHEMA,
 };
 pub use error::AppError;
 pub use events::{Event, EventBus, EventError, EventHandler};

@@ -313,3 +313,142 @@ async fn test_enterprise_idp_metadata_wiremock_integration() {
     let body = resp.body_mut().read_to_string().expect("read body");
     assert!(body.contains("mock-idp.example.com"));
 }
+
+#[test]
+fn test_saml_timezone_offset_handling() {
+    // 2026-11-02T12:00:00+02:00 in UTC is 2026-11-02T10:00:00Z
+    // 2026-11-02T16:00:00+02:00 in UTC is 2026-11-02T14:00:00Z
+    let xml_offset = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_tz123">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions NotBefore="2026-11-02T12:00:00+02:00" NotOnOrAfter="2026-11-02T16:00:00+02:00">
+            <saml2:Audience>https://sp.myapp.io</saml2:Audience>
+        </saml2:Conditions>
+    </saml2:Assertion>
+    "#;
+
+    let assertion = SamlParser::parse_unverified(xml_offset).unwrap();
+    let nb = assertion.not_before.unwrap();
+    let noa = assertion.not_on_or_after.unwrap();
+
+    // In UTC: 2026-11-02T10:00:00Z should equal nb
+    // Verify by parsing the UTC equivalent string
+    let expected_utc_nb = parse_iso8601_strict("2026-11-02T10:00:00Z").unwrap();
+    let expected_utc_noa = parse_iso8601_strict("2026-11-02T14:00:00Z").unwrap();
+
+    assert_eq!(nb, expected_utc_nb, "timezone offset must be converted to UTC");
+    assert_eq!(noa, expected_utc_noa, "timezone offset must be converted to UTC");
+}
+
+#[test]
+fn test_saml_malformed_conditions_fail_closed() {
+    // Malformed NotBefore timestamp must NOT be silently ignored as None
+    let xml_bad_time = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_bad_time">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions NotBefore="poisoned-invalid-timestamp" NotOnOrAfter="2026-11-02T14:00:00Z" />
+    </saml2:Assertion>
+    "#;
+
+    let res = SamlParser::parse_unverified(xml_bad_time);
+    assert!(
+        matches!(res, Err(SamlError::Malformed(_))),
+        "malformed NotBefore timestamp must fail closed with Malformed error"
+    );
+
+    // Invalid date out of bounds (month 99)
+    let xml_bad_date = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_bad_date">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions NotBefore="2026-99-99T12:00:00Z" />
+    </saml2:Assertion>
+    "#;
+
+    let res_date = SamlParser::parse_unverified(xml_bad_date);
+    assert!(
+        matches!(res_date, Err(SamlError::Malformed(_))),
+        "out of bounds timestamp must fail closed"
+    );
+}
+
+#[test]
+fn test_saml_trust_boundary_exact_assertion_verified() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct TrustBoundaryVerifier {
+        expected_assertion_id: String,
+        verified_exact_node: Arc<AtomicBool>,
+    }
+
+    impl SamlSignatureVerifier for TrustBoundaryVerifier {
+        fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
+            Ok(())
+        }
+
+        fn verify_assertion_signature(
+            &self,
+            _raw_xml: &str,
+            assertion_id: &str,
+            assertion_xml: &str,
+        ) -> Result<(), SamlError> {
+            if assertion_id == self.expected_assertion_id
+                && assertion_xml.contains(&format!(r#"ID="{}""#, self.expected_assertion_id))
+            {
+                self.verified_exact_node.store(true, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err(SamlError::InvalidSignature("assertion node ID mismatch at trust boundary".into()))
+            }
+        }
+    }
+
+    let saml_xml = r#"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp_bound_1">
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assert_bound_42">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>corp@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "#;
+
+    let verified_flag = Arc::new(AtomicBool::new(false));
+    let verifier = TrustBoundaryVerifier {
+        expected_assertion_id: "_assert_bound_42".to_string(),
+        verified_exact_node: Arc::clone(&verified_flag),
+    };
+
+    let assertion = SamlParser::parse_signed(saml_xml, &verifier).unwrap();
+    assert_eq!(assertion.id, "_assert_bound_42");
+    assert!(
+        verified_flag.load(Ordering::SeqCst),
+        "verifier must verify the exact assertion node consumed by the application"
+    );
+}
+
+#[test]
+fn test_saml_default_namespace_without_prefix() {
+    let raw_xml = r#"
+    <Assertion xmlns="urn:oasis:names:tc:SAML:2.0:assertion" ID="_noprefix_123">
+        <Issuer>https://idp.simple.org</Issuer>
+        <Subject><NameID>plain@simple.org</NameID></Subject>
+        <AttributeStatement>
+            <Attribute Name="role">
+                <AttributeValue><![CDATA[Admin & Architect]]></AttributeValue>
+            </Attribute>
+        </AttributeStatement>
+    </Assertion>
+    "#;
+
+    let assertion = SamlParser::parse_unverified(raw_xml).unwrap();
+    assert_eq!(assertion.id, "_noprefix_123");
+    assert_eq!(assertion.issuer, "https://idp.simple.org");
+    assert_eq!(assertion.subject, "plain@simple.org");
+    assert_eq!(
+        assertion.attributes.get("role").unwrap(),
+        &vec!["Admin & Architect".to_string()]
+    );
+}
