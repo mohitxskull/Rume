@@ -17,6 +17,14 @@ pub type MessageDispatcher = Arc<
     dyn Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static,
 >;
 
+/// Type alias for a cancellable message dispatch callback that observes a lost-lease cancellation flag.
+pub type CancellableMessageDispatcher = Arc<
+    dyn Fn(&OutboxMessage, Arc<AtomicBool>) -> BoxFuture<'static, Result<(), OutboxError>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
 /// Result of an outbox relay polling pass, reporting counts for published messages,
 /// retry-scheduled messages, and failed state transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -95,7 +103,7 @@ impl OutboxRelayConfig {
 /// Background relay that drains pending outbox messages and dispatches them to an external broker or event bus.
 pub struct OutboxRelay<R: OutboxRepository> {
     repository: Arc<R>,
-    dispatcher: MessageDispatcher,
+    dispatcher: CancellableMessageDispatcher,
     is_stopping: Arc<AtomicBool>,
     config: OutboxRelayConfig,
 }
@@ -129,7 +137,22 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     {
         Self {
             repository,
-            dispatcher: Arc::new(move |msg| Box::pin(dispatcher(msg))),
+            dispatcher: Arc::new(move |msg, _cancel| Box::pin(dispatcher(msg))),
+            is_stopping: Arc::new(AtomicBool::new(false)),
+            config: OutboxRelayConfig::default(),
+        }
+    }
+
+    /// Creates a new outbox relay with a cancellable message dispatcher that receives
+    /// an `Arc<AtomicBool>` signal set to true if lease ownership is lost during dispatch.
+    pub fn new_cancellable<F, Fut>(repository: Arc<R>, dispatcher: F) -> Self
+    where
+        F: Fn(&OutboxMessage, Arc<AtomicBool>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<(), OutboxError>> + Send + 'static,
+    {
+        Self {
+            repository,
+            dispatcher: Arc::new(move |msg, cancel| Box::pin(dispatcher(msg, cancel))),
             is_stopping: Arc::new(AtomicBool::new(false)),
             config: OutboxRelayConfig::default(),
         }
@@ -190,6 +213,8 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 (lease_duration_secs * 1000 / 3).clamp(50, 20_000),
             );
             let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+            let lease_lost = Arc::new(AtomicBool::new(false));
+            let lease_lost_hb = Arc::clone(&lease_lost);
 
             let heartbeat_handle = tokio::spawn(async move {
                 let mut interval = tokio::time::interval(hb_interval);
@@ -199,11 +224,12 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         _ = &mut cancel_rx => break,
                         _ = interval.tick() => {
                             if let Err(e) = hb_repo.renew_outbox_lease(&hb_msg_id, &hb_token, renew_extension_secs).await {
-                                tracing::warn!(
+                                tracing::error!(
                                     message_id = %hb_msg_id,
                                     error = %e,
-                                    "Failed to renew outbox lease heartbeat"
+                                    "Failed to renew outbox lease heartbeat; lease ownership lost during dispatch"
                                 );
+                                lease_lost_hb.store(true, Ordering::SeqCst);
                                 break;
                             }
                         }
@@ -211,8 +237,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 }
             });
 
+            let cancel_signal = Arc::clone(&lease_lost);
             let fut_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                (self.dispatcher)(&message)
+                (self.dispatcher)(&message, cancel_signal)
             }));
 
             let dispatch_result = match fut_result {
@@ -225,6 +252,17 @@ impl<R: OutboxRepository> OutboxRelay<R> {
 
             let _ = cancel_tx.send(());
             let _ = heartbeat_handle.await;
+
+            // If heartbeat failed mid-dispatch, ownership was lost. Propagate this failure
+            // to RelayPollResult and skip ack/nack to avoid corrupted state transitions.
+            if lease_lost.load(Ordering::SeqCst) {
+                tracing::error!(
+                    message_id = %message.id,
+                    "Outbox message lease was lost during active dispatch; marking as failed transition"
+                );
+                result.failed_transitions += 1;
+                continue;
+            }
 
             match dispatch_result {
                 Ok(()) => {

@@ -1,7 +1,7 @@
 #![cfg(feature = "sqlite")]
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rume::events::Event;
@@ -626,6 +626,7 @@ struct FaultyOutboxRepo {
     inner: Arc<SqliteBackend>,
     fail_recovery: bool,
     fail_mark_published: bool,
+    fail_renew_outbox_lease: Arc<AtomicBool>,
 }
 
 impl OutboxRepository for FaultyOutboxRepo {
@@ -651,7 +652,13 @@ impl OutboxRepository for FaultyOutboxRepo {
         lease_token: &str,
         extension_secs: u64,
     ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
-        self.inner.renew_outbox_lease(id, lease_token, extension_secs)
+        if self.fail_renew_outbox_lease.load(Ordering::SeqCst) {
+            Box::pin(async move {
+                Err(OutboxError::Repository("database dropped during heartbeat renewal".into()))
+            })
+        } else {
+            self.inner.renew_outbox_lease(id, lease_token, extension_secs)
+        }
     }
 
     fn mark_published<'a>(
@@ -711,6 +718,7 @@ async fn outbox_relay_database_failure_during_recovery_is_returned_and_visible()
         inner,
         fail_recovery: true,
         fail_mark_published: false,
+        fail_renew_outbox_lease: Arc::new(AtomicBool::new(false)),
     });
 
     let relay = OutboxRelay::new(Arc::clone(&faulty), |_msg: &OutboxMessage| async { Ok(()) });
@@ -740,6 +748,7 @@ async fn outbox_relay_failed_transition_is_distinguished_and_drain_fails() {
         inner: Arc::clone(&inner),
         fail_recovery: false,
         fail_mark_published: true, // simulated failure during state transition / ack
+        fail_renew_outbox_lease: Arc::new(AtomicBool::new(false)),
     });
 
     let relay = OutboxRelay::new(Arc::clone(&faulty), |_msg: &OutboxMessage| async { Ok(()) });
@@ -1012,4 +1021,61 @@ async fn database_pool_sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_
     assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     assert_eq!(pool.pending_count().await.unwrap(), 0);
     assert_eq!(pool.published_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_cancellation_and_failed_transition() {
+    let inner = setup_real_outbox().await;
+    let event = OrderPaidEvent {
+        order_id: "order_active_fail_hb".into(),
+        amount_cents: 7700,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    inner.save(msg).await.unwrap();
+
+    let fail_renew = Arc::new(AtomicBool::new(false));
+    let faulty = Arc::new(FaultyOutboxRepo {
+        inner: Arc::clone(&inner),
+        fail_recovery: false,
+        fail_mark_published: false,
+        fail_renew_outbox_lease: Arc::clone(&fail_renew),
+    });
+
+    let config = OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 1, // 1s lease -> heartbeat interval 333ms
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    let observed_cancellation = Arc::new(AtomicBool::new(false));
+    let observed_clone = Arc::clone(&observed_cancellation);
+    let fail_renew_clone = Arc::clone(&fail_renew);
+
+    let relay = OutboxRelay::new_cancellable(Arc::clone(&faulty), move |_msg, cancel_signal| {
+        let observed = Arc::clone(&observed_clone);
+        let fail_renew = Arc::clone(&fail_renew_clone);
+        async move {
+            // Once dispatch starts, simulate database failure for subsequent lease renewal heartbeats
+            fail_renew.store(true, Ordering::SeqCst);
+
+            // Wait until cancel_signal is observed or timeout
+            let start = tokio::time::Instant::now();
+            while start.elapsed() < Duration::from_millis(800) {
+                if cancel_signal.load(Ordering::SeqCst) {
+                    observed.store(true, Ordering::SeqCst);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch should return Ok with failed_transitions");
+    assert_eq!(res.published, 0);
+    assert_eq!(res.failed_transitions, 1, "failed heartbeat must be counted as failed_transitions");
+    assert!(!res.is_success());
+    assert!(observed_cancellation.load(Ordering::SeqCst), "dispatcher must observe cancellation signal when heartbeat fails");
 }
