@@ -5,7 +5,6 @@ use std::time::Duration;
 use axum::http::StatusCode;
 use rume::prelude::*;
 use rume::resilience::*;
-use tokio::time::sleep;
 
 #[tokio::test]
 async fn circuit_breaker_state_transitions_and_trip() {
@@ -188,7 +187,8 @@ async fn request_timeout_middleware() {
     let router = rume::routing::Router::new()
         .get("/fast", || async { "fast" })
         .get("/slow", || async {
-            sleep(Duration::from_millis(80)).await;
+            // An unresolving future will exceed any timeout
+            std::future::pending::<()>().await;
             "slow"
         })
         .layer(TimeoutLayer::new(Duration::from_millis(30)));

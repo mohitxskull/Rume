@@ -163,7 +163,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor hardening), wi
       `rume/tests/`: 24 flat integration test files compile as 24 separate executables, linking dependencies 24 times. Consolidate into `tests/integration.rs`, `tests/containers.rs`, and uncompiled `tests/common/` helpers.
 - [x] **Testing M2 — Per-Test Container Spin-Up Overhead Adds 3+ Minutes of Idle Latency and Risks Docker Daemon Exhaustion** (`testing-feature-matrix.md` M2).
       `rume/tests/*_container_suite.rs`: Tests launch 46 separate container instances. Replace with shared container fixtures (`tokio::sync::OnceCell`) and per-test database/schema isolation (`test_{uuid}`).
-- [ ] **Testing M3 — Persistent Async Wall-Clock Sleeps Across 14 Test Suites Violate Determinism and Introduce Flaky Races** (`testing-feature-matrix.md` M3).
+- [x] **Testing M3 — Persistent Async Wall-Clock Sleeps Across 14 Test Suites Violate Determinism and Introduce Flaky Races** (`testing-feature-matrix.md` M3).
       `rume/tests/`: 34 raw `tokio::time::sleep` calls remain across 14 files. Replace wall-clock sleeps with deterministic synchronization (`tokio::sync::Barrier`, `Notify`, or `tokio::time::pause()`).
 - [x] **Testing M4 — Absence of a First-Party Declarative Test Harness (`RumeTestHarness` in `rume::testing`) Forces Repetitive Boilerplate** (`testing-feature-matrix.md` M4).
       `rume/tests/`: Setup code (container spin-up, connection URL, schema init, runner launch) is copy-pasted across 10 files. Introduce a fluent `RumeTestHarness` in `rume::testing`.

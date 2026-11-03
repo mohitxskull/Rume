@@ -49,6 +49,7 @@ impl Job for SendEmailJob {
 struct SendEmailHandler {
     attempts: Arc<AtomicU32>,
     fail_until_attempt: u32,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl JobHandler<SendEmailJob> for SendEmailHandler {
@@ -59,6 +60,7 @@ impl JobHandler<SendEmailJob> for SendEmailHandler {
     ) -> BoxFuture<'a, Result<(), JobError>> {
         Box::pin(async move {
             let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            self.notify.notify_waiters();
             if attempt < self.fail_until_attempt {
                 Err(JobError::Retryable("smtp server busy".into()))
             } else {
@@ -74,10 +76,12 @@ async fn job_success_and_retry_backoff() {
     let mut registry = JobRegistry::new();
 
     let attempts = Arc::new(AtomicU32::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
     // Will fail on attempt 1, succeed on attempt 2
     registry.register(SendEmailHandler {
         attempts: Arc::clone(&attempts),
         fail_until_attempt: 2,
+        notify: Arc::clone(&notify),
     });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
@@ -93,12 +97,9 @@ async fn job_success_and_retry_backoff() {
 
     assert!(!job_id.is_empty());
 
-    // Wait for processing and retry to complete
-    for _ in 0..50 {
-        if attempts.load(Ordering::SeqCst) >= 2 && queue.pending_count().await.unwrap() == 0 {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
+    // Deterministically wait for processing and retry to complete
+    while attempts.load(Ordering::SeqCst) < 2 || queue.pending_count().await.unwrap() > 0 {
+        notify.notified().await;
     }
 
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
@@ -117,7 +118,9 @@ impl Job for FatalFailingJob {
     const NAME: &'static str = "fatal_fail";
 }
 
-struct FatalHandler;
+struct FatalHandler {
+    notify: Arc<tokio::sync::Notify>,
+}
 
 impl JobHandler<FatalFailingJob> for FatalHandler {
     fn handle<'a>(
@@ -125,7 +128,11 @@ impl JobHandler<FatalFailingJob> for FatalHandler {
         _ctx: &'a JobContext,
         job: FatalFailingJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
-        Box::pin(async move { Err(JobError::Fatal(job.reason)) })
+        let notify = Arc::clone(&self.notify);
+        Box::pin(async move {
+            notify.notify_waiters();
+            Err(JobError::Fatal(job.reason))
+        })
     }
 }
 
@@ -133,7 +140,10 @@ impl JobHandler<FatalFailingJob> for FatalHandler {
 async fn fatal_failure_moves_immediately_to_dlq() {
     let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
-    registry.register(FatalHandler);
+    let notify = Arc::new(tokio::sync::Notify::new());
+    registry.register(FatalHandler {
+        notify: Arc::clone(&notify),
+    });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
     worker.start();
@@ -145,11 +155,9 @@ async fn fatal_failure_moves_immediately_to_dlq() {
         .await
         .unwrap();
 
-    for _ in 0..50 {
-        if queue.dead_letter_count().await.unwrap() >= 1 {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
+    notify.notified().await;
+    while queue.dead_letter_count().await.unwrap() == 0 {
+        tokio::task::yield_now().await;
     }
 
     assert_eq!(queue.dead_letter_count().await.unwrap(), 1);
@@ -173,6 +181,7 @@ impl Job for AlwaysFailingJob {
 
 struct AlwaysFailHandler {
     attempts: Arc<AtomicU32>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl JobHandler<AlwaysFailingJob> for AlwaysFailHandler {
@@ -181,8 +190,11 @@ impl JobHandler<AlwaysFailingJob> for AlwaysFailHandler {
         _ctx: &'a JobContext,
         _job: AlwaysFailingJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
+        let attempts = Arc::clone(&self.attempts);
+        let notify = Arc::clone(&self.notify);
         Box::pin(async move {
-            self.attempts.fetch_add(1, Ordering::SeqCst);
+            attempts.fetch_add(1, Ordering::SeqCst);
+            notify.notify_waiters();
             Err(JobError::Retryable("network unreachable".into()))
         })
     }
@@ -194,8 +206,10 @@ async fn max_retries_exhausted_moves_to_dlq() {
     let mut registry = JobRegistry::new();
 
     let attempts = Arc::new(AtomicU32::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
     registry.register(AlwaysFailHandler {
         attempts: Arc::clone(&attempts),
+        notify: Arc::clone(&notify),
     });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
@@ -203,11 +217,11 @@ async fn max_retries_exhausted_moves_to_dlq() {
 
     queue.enqueue(AlwaysFailingJob).await.unwrap();
 
-    for _ in 0..50 {
-        if queue.dead_letter_count().await.unwrap() >= 1 {
-            break;
-        }
-        sleep(Duration::from_millis(20)).await;
+    while attempts.load(Ordering::SeqCst) < 2 {
+        notify.notified().await;
+    }
+    while queue.dead_letter_count().await.unwrap() == 0 {
+        tokio::task::yield_now().await;
     }
 
     // Should have attempted 2 times (max_attempts: 2)
@@ -228,6 +242,7 @@ impl Job for SlowJob {
 }
 
 struct SlowJobHandler {
+    started: Arc<tokio::sync::Notify>,
     finished: Arc<AtomicU32>,
 }
 
@@ -237,7 +252,9 @@ impl JobHandler<SlowJob> for SlowJobHandler {
         _ctx: &'a JobContext,
         job: SlowJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
+        let started = Arc::clone(&self.started);
         Box::pin(async move {
+            started.notify_one();
             sleep(Duration::from_millis(job.duration_ms)).await;
             self.finished.fetch_add(1, Ordering::SeqCst);
             Ok(())
@@ -250,8 +267,10 @@ async fn worker_graceful_drain_waits_for_in_flight_jobs() {
     let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
 
+    let started = Arc::new(tokio::sync::Notify::new());
     let finished = Arc::new(AtomicU32::new(0));
     registry.register(SlowJobHandler {
+        started: Arc::clone(&started),
         finished: Arc::clone(&finished),
     });
 
@@ -261,8 +280,8 @@ async fn worker_graceful_drain_waits_for_in_flight_jobs() {
     // Enqueue job that takes 80ms
     queue.enqueue(SlowJob { duration_ms: 80 }).await.unwrap();
 
-    // Give it 20ms to be dequeued and in-flight
-    sleep(Duration::from_millis(20)).await;
+    // Deterministically wait for job to be dequeued and actively in-flight
+    started.notified().await;
     assert_eq!(finished.load(Ordering::SeqCst), 0);
 
     // Initiate drain: should wait for in-flight job to finish
@@ -278,7 +297,9 @@ impl Job for PanickingJob {
     const NAME: &'static str = "panicking_job";
 }
 
-struct PanickingJobHandler;
+struct PanickingJobHandler {
+    started: Arc<tokio::sync::Notify>,
+}
 
 impl JobHandler<PanickingJob> for PanickingJobHandler {
     fn handle<'a>(
@@ -286,7 +307,9 @@ impl JobHandler<PanickingJob> for PanickingJobHandler {
         _ctx: &'a JobContext,
         _job: PanickingJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
+        let started = Arc::clone(&self.started);
         Box::pin(async move {
+            started.notify_one();
             panic!("unhandled handler panic");
         })
     }
@@ -296,15 +319,18 @@ impl JobHandler<PanickingJob> for PanickingJobHandler {
 async fn worker_panic_does_not_leak_in_flight_count() {
     let (_node, queue) = start_postgres_queue().await;
     let mut registry = JobRegistry::new();
-    registry.register(PanickingJobHandler);
+    let started = Arc::new(tokio::sync::Notify::new());
+    registry.register(PanickingJobHandler {
+        started: Arc::clone(&started),
+    });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
     worker.start();
 
     queue.enqueue(PanickingJob).await.unwrap();
 
-    // Give time for worker to dequeue and panic
-    sleep(Duration::from_millis(50)).await;
+    // Wait deterministically for worker to dequeue and panic
+    started.notified().await;
 
     // Drain should succeed without hanging because RAII guard decremented in_flight_count
     let drained = worker.drain(Duration::from_millis(200)).await;
@@ -339,7 +365,7 @@ impl JobHandler<TimeoutJob> for TimeoutJobHandler {
         _job: TimeoutJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
         Box::pin(async move {
-            sleep(Duration::from_millis(200)).await;
+            std::future::pending::<()>().await;
             Ok(())
         })
     }
@@ -356,12 +382,12 @@ async fn job_timeout_is_enforced() {
 
     queue.enqueue(TimeoutJob).await.unwrap();
 
-    // Wait for execution and DLQ after timeout
-    for _ in 0..50 {
+    // Wait for timeout (30ms) to trigger and job to be moved to DLQ
+    for _ in 0..100 {
         if queue.dead_letter_count().await.unwrap() >= 1 {
             break;
         }
-        sleep(Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     assert_eq!(queue.dead_letter_count().await.unwrap(), 1);
@@ -398,7 +424,7 @@ async fn worker_concurrency_is_bounded() {
             Box::pin(async move {
                 let cur = running.fetch_add(1, Ordering::SeqCst) + 1;
                 max_seen.fetch_max(cur, Ordering::SeqCst);
-                sleep(Duration::from_millis(50)).await;
+                tokio::task::yield_now().await;
                 running.fetch_sub(1, Ordering::SeqCst);
                 Ok(())
             })

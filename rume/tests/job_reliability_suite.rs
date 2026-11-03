@@ -139,6 +139,7 @@ impl rume::jobs::Job for IdempotentPaymentJob {
 
 struct PaymentHandler {
     executed: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    notify: std::sync::Arc<tokio::sync::Notify>,
 }
 
 impl rume::jobs::JobHandler<IdempotentPaymentJob> for PaymentHandler {
@@ -148,8 +149,10 @@ impl rume::jobs::JobHandler<IdempotentPaymentJob> for PaymentHandler {
         _job: IdempotentPaymentJob,
     ) -> rume::jobs::BoxFuture<'a, Result<(), rume::jobs::JobError>> {
         let executed = std::sync::Arc::clone(&self.executed);
+        let notify = std::sync::Arc::clone(&self.notify);
         Box::pin(async move {
             executed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            notify.notify_one();
             Ok(())
         })
     }
@@ -163,9 +166,11 @@ async fn test_worker_idempotency_deduplication() {
 
     let mut registry = rume::jobs::JobRegistry::new();
     let executed_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
 
     registry.register(PaymentHandler {
         executed: std::sync::Arc::clone(&executed_counter),
+        notify: std::sync::Arc::clone(&notify),
     });
 
     let worker =
@@ -182,7 +187,8 @@ async fn test_worker_idempotency_deduplication() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(50)).await;
+    // Deterministically wait for first execution
+    notify.notified().await;
     assert_eq!(
         executed_counter.load(std::sync::atomic::Ordering::SeqCst),
         1
@@ -197,7 +203,10 @@ async fn test_worker_idempotency_deduplication() {
         .await
         .unwrap();
 
-    sleep(Duration::from_millis(50)).await;
+    // Yield to let worker process duplicate check
+    for _ in 0..50 {
+        tokio::task::yield_now().await;
+    }
     // Execution count must remain 1!
     assert_eq!(
         executed_counter.load(std::sync::atomic::Ordering::SeqCst),

@@ -100,11 +100,11 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
     });
 
     // Wait for server to start and declare Ready
-    for _ in 0..100 {
+    for _ in 0..200 {
         if server_ctx.lifecycle.state() == LifecycleState::Ready {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
     assert_eq!(server_ctx.lifecycle.state(), LifecycleState::Ready);
     assert_eq!(server_ctx.availability.state(), AvailabilityState::Ready);
@@ -124,11 +124,11 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
     shutdown_tx.send(()).unwrap();
 
     // Wait for signal to transition lifecycle & availability to Terminating
-    for _ in 0..100 {
+    for _ in 0..200 {
         if server_ctx.lifecycle.state() == LifecycleState::Terminating {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
 
     // WHILE the slow request is still held open:
@@ -201,11 +201,11 @@ async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
             .unwrap();
     });
 
-    for _ in 0..100 {
+    for _ in 0..200 {
         if server_ctx.lifecycle.state() == LifecycleState::Ready {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::task::yield_now().await;
     }
     let start = std::time::Instant::now();
     shutdown_tx.send(()).unwrap();

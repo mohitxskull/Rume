@@ -405,7 +405,12 @@ async fn independent_module_startup_and_reverse_shutdown() {
             .await
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    for _ in 0..200 {
+        if events.lock().unwrap().contains(&"api:start".to_string()) {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     // Shutdown
     let _ = shutdown_tx.send(());

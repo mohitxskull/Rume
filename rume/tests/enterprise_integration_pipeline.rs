@@ -53,6 +53,7 @@ impl Job for FulfillOrderJob {
 struct FulfillOrderHandler {
     jobs_processed: Arc<AtomicUsize>,
     metrics: Arc<MetricsRegistry>,
+    notify: Arc<tokio::sync::Notify>,
 }
 
 impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
@@ -63,11 +64,13 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
     ) -> rume::jobs::BoxFuture<'a, Result<(), JobError>> {
         let jp = Arc::clone(&self.jobs_processed);
         let m = Arc::clone(&self.metrics);
+        let notify = Arc::clone(&self.notify);
         Box::pin(async move {
             assert_eq!(job.tenant_id, "acme-corp");
             assert_eq!(job.order_id, "ord_9901");
             jp.fetch_add(1, Ordering::SeqCst);
             m.record_http_request("POST", 201, Duration::from_millis(15));
+            notify.notify_one();
             Ok(())
         })
     }
@@ -179,22 +182,19 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     // 6. Background Worker Execution & Metrics Recording
     let mut registry = JobRegistry::new();
     let jobs_processed = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     registry.register(FulfillOrderHandler {
         jobs_processed: Arc::clone(&jobs_processed),
         metrics: Arc::clone(&metrics),
+        notify: Arc::clone(&notify),
     });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
     worker.start();
 
-    // Await background job execution
-    for _ in 0..50 {
-        if jobs_processed.load(Ordering::SeqCst) >= 1 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    // Deterministically await background job execution
+    notify.notified().await;
 
     let drained = worker.drain(Duration::from_millis(200)).await;
     assert!(

@@ -127,8 +127,8 @@ async fn test_mysql_transaction_drop_auto_rollback() {
         // tx dropped here without commit
     }
 
-    // Give background async rollback a moment
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Allow background async rollback to process
+    tokio::task::yield_now().await;
 
     let count = backend
         .query_scalar("SELECT count(*) FROM audit_log")

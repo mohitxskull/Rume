@@ -332,9 +332,9 @@ async fn pool_acquire_timeout_and_graceful_drain() {
     let timeout_res = pool.acquire_lease_timeout(Duration::from_millis(20)).await;
     assert!(matches!(timeout_res, Err(PersistenceError::Timeout)));
 
-    // Spawn async release after 30ms
+    // Spawn async release after yielding to allow acquirer to queue
     tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::task::yield_now().await;
         drop(lease1);
     });
 
