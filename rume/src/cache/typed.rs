@@ -165,20 +165,23 @@ impl<B: CacheBackend> Cache<B> {
         let full_key = self.format_key(key);
 
         // Stampede protection: register singleflight slot
-        let waiter = {
+        let _waiter_arc;
+        let waiter_notified = {
             let mut flights = self.singleflight.lock().await;
             if let Some(existing) = flights.get(&full_key) {
-                Some(Arc::clone(existing))
+                _waiter_arc = Some(Arc::clone(existing));
+                _waiter_arc.as_ref().map(|n| n.notified())
             } else {
                 let notify = Arc::new(tokio::sync::Notify::new());
                 flights.insert(full_key.clone(), Arc::clone(&notify));
+                _waiter_arc = None;
                 None
             }
         };
 
-        if let Some(notify) = waiter {
+        if let Some(notified) = waiter_notified {
             // Concurrent request: wait for the in-flight leader to populate cache
-            notify.notified().await;
+            notified.await;
             if let Some(cached) = self.get_json::<T>(key).await? {
                 return Ok(cached);
             }
@@ -225,13 +228,33 @@ impl<B: CacheBackend> Cache<B> {
         self.backend.exists(&full_key).await
     }
 
-    /// Evicts all cached entries associated with the specified tag.
+    fn strip_prefix(&self, key: &str) -> String {
+        if let Some(prefix) = &self.config.prefix {
+            key.strip_prefix(prefix).unwrap_or(key).to_string()
+        } else {
+            key.to_string()
+        }
+    }
+
+    /// Evicts all cached entries associated with the specified tag and returns the count.
     pub async fn invalidate_tag(&self, tag: &str) -> Result<usize, CacheError> {
+        let keys = self.invalidate_tag_keys(tag).await?;
+        Ok(keys.len())
+    }
+
+    /// Evicts all cached entries associated with the specified tag and returns the deleted keys
+    /// (with the cache's prefix stripped).
+    pub async fn invalidate_tag_keys(&self, tag: &str) -> Result<Vec<String>, CacheError> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Err(CacheError::Closed);
         }
         let full_tag = self.format_tag(tag);
-        self.backend.invalidate_tag(&full_tag).await
+        let raw_keys = self.backend.invalidate_tag_keys(&full_tag).await?;
+        let stripped = raw_keys
+            .into_iter()
+            .map(|k| self.strip_prefix(&k))
+            .collect();
+        Ok(stripped)
     }
 
     /// Clears all entries from the cache.

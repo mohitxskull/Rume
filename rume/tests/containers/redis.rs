@@ -592,3 +592,81 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
     assert!(server_2.load("session_old").await.unwrap().is_none(), "old session key destroyed");
     assert!(server_2.load(&rotated.id).await.unwrap().is_some(), "new session key active");
 }
+
+#[tokio::test]
+async fn test_redis_cache_clear_does_not_wipe_sessions() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+
+    // Session store on the same Redis logical database
+    let session_store = RedisSessionStore::new(pool.clone());
+    let session = Session::new("session_survive_clear", "user_persist", 3600);
+    session_store.save(session).await.expect("save session");
+
+    // Cache operations on the same Redis
+    backend.set("cached_key_1", b"val_1".to_vec(), None).await.expect("set cache 1");
+    backend.set("cached_key_2", b"val_2".to_vec(), None).await.expect("set cache 2");
+
+    // Clear the cache
+    backend.clear().await.expect("clear cache");
+
+    // Cache keys are gone
+    assert!(backend.get("cached_key_1").await.unwrap().is_none());
+    assert!(backend.get("cached_key_2").await.unwrap().is_none());
+
+    // Session key is STILL PRESENT and completely intact
+    let loaded_session = session_store.load("session_survive_clear").await.expect("load session");
+    assert!(loaded_session.is_some(), "cache clear must not wipe sessions from logical database");
+    assert_eq!(loaded_session.unwrap().user_id, "user_persist");
+}
+
+#[tokio::test]
+async fn test_redis_cache_tag_invalidation_does_not_shrink_longer_ttl() {
+    let (_container, backend) = setup_redis_backend().await;
+
+    // Write A with 1-hour TTL
+    backend
+        .set_with_tags(
+            "key_a",
+            b"data_a".to_vec(),
+            &["shared_tag"],
+            Some(Duration::from_secs(3600)),
+        )
+        .await
+        .expect("set key A");
+
+    // Write B with 1-second TTL (same tag)
+    backend
+        .set_with_tags(
+            "key_b",
+            b"data_b".to_vec(),
+            &["shared_tag"],
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .expect("set key B");
+
+    // Write N with no TTL (permanent, same tag)
+    backend
+        .set_with_tags("key_n", b"data_n".to_vec(), &["shared_tag"], None)
+        .await
+        .expect("set key N");
+
+    // Advance 1.2s so B expires, but tag set must NOT shrink below A's or N's lifetime
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+
+    // B has expired
+    assert!(backend.get("key_b").await.unwrap().is_none());
+
+    // A and N are still alive
+    assert!(backend.get("key_a").await.unwrap().is_some());
+    assert!(backend.get("key_n").await.unwrap().is_some());
+
+    // Invalidate tag "shared_tag"
+    let deleted_count = backend.invalidate_tag("shared_tag").await.expect("invalidate shared_tag");
+    assert_eq!(deleted_count, 2, "must delete live members A and N");
+
+    // Both A and N must now be gone
+    assert!(backend.get("key_a").await.unwrap().is_none(), "key A must be invalidated");
+    assert!(backend.get("key_n").await.unwrap().is_none(), "key N must be invalidated");
+}

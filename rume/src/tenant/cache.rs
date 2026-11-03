@@ -145,10 +145,14 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     /// Evicts all cached entries belonging to `tenant_id` matching `tag`.
     pub async fn invalidate_tag(&self, tenant_id: &str, tag: &str) -> Result<usize, CacheError> {
         let scoped = Self::scoped_tag(tenant_id, tag);
-        let count = self.cache.invalidate_tag(&scoped).await?;
+        let deleted_keys = self.cache.invalidate_tag_keys(&scoped).await?;
+        let count = deleted_keys.len();
         if let Some(ref quota) = self.quota_store {
-            for _ in 0..count {
-                let _ = quota.release(tenant_id).await;
+            let prefix = format!("tenant:{}:{}:", tenant_id.len(), tenant_id);
+            for k in &deleted_keys {
+                if let Some(raw_key) = k.strip_prefix(&prefix) {
+                    let _ = quota.remove_key(tenant_id, raw_key).await;
+                }
             }
         }
         Ok(count)
@@ -157,7 +161,8 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     /// Evicts all cached entries belonging to `tenant_id`.
     pub async fn invalidate_tenant(&self, tenant_id: &str) -> Result<usize, CacheError> {
         let tag = Self::tenant_tag(tenant_id);
-        let count = self.cache.invalidate_tag(&tag).await?;
+        let deleted_keys = self.cache.invalidate_tag_keys(&tag).await?;
+        let count = deleted_keys.len();
         if let Some(ref quota) = self.quota_store {
             let _ = quota.reset(tenant_id).await;
         }

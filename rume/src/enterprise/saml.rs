@@ -43,6 +43,10 @@ pub enum SamlError {
     /// Possible XML signature wrapping attack detected.
     #[error("signature wrapping attack detected: {0}")]
     SignatureWrappingDetected(String),
+
+    /// Missing mandatory expiration condition.
+    #[error("missing mandatory NotOnOrAfter condition in SAML assertion")]
+    MissingExpirationCondition,
 }
 
 /// Interface for verifying cryptographic signatures on SAML assertions.
@@ -434,11 +438,12 @@ impl SamlParser {
         for ref_id in &signature_references {
             let matches_assertion = assertion_id.as_deref() == Some(ref_id.as_str());
             let matches_response = response_id.as_deref() == Some(ref_id.as_str());
-            if !matches_assertion && !matches_response {
+            let matches_root_document = ref_id.is_empty() && (response_id.is_some() || assertion_id.is_some());
+            if !matches_assertion && !matches_response && !matches_root_document {
                 let expected = match (&assertion_id, &response_id) {
-                    (Some(a), Some(r)) => format!("assertion ID '{a}' or response ID '{r}'"),
-                    (Some(a), None) => format!("assertion ID '{a}'"),
-                    (None, Some(r)) => format!("response ID '{r}'"),
+                    (Some(a), Some(r)) => format!("assertion ID '{a}', response ID '{r}', or root document URI=''"),
+                    (Some(a), None) => format!("assertion ID '{a}' or root document URI=''"),
+                    (None, Some(r)) => format!("response ID '{r}' or root document URI=''"),
                     (None, None) => "known element ID".to_string(),
                 };
                 return Err(SamlError::SignatureWrappingDetected(format!(
@@ -495,9 +500,11 @@ impl SamlParser {
             });
         }
 
-        if let Some(not_on_or_after) = assertion.not_on_or_after
-            && current_epoch_sec >= not_on_or_after
-        {
+        let not_on_or_after = assertion
+            .not_on_or_after
+            .ok_or(SamlError::MissingExpirationCondition)?;
+
+        if current_epoch_sec >= not_on_or_after {
             return Err(SamlError::Expired {
                 not_on_or_after,
                 current: current_epoch_sec,

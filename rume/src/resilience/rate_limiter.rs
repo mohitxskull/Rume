@@ -188,8 +188,13 @@ where
         // Extract client key (prefer tenant context or header if present for multi-tenant isolation, otherwise trimmed client IP from X-Forwarded-For)
         let tenant_key = req
             .extensions()
-            .get::<crate::tenant::TenantContext>()
-            .map(|tc| format!("tenant:{}", tc.id))
+            .get::<crate::tenant::Tenant>()
+            .map(|t| format!("tenant:{}", t.id))
+            .or_else(|| {
+                req.extensions()
+                    .get::<crate::tenant::TenantContext>()
+                    .map(|tc| format!("tenant:{}", tc.id))
+            })
             .or_else(|| {
                 req.headers()
                     .get("x-tenant-id")

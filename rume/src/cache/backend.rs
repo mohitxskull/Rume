@@ -38,8 +38,17 @@ pub trait CacheBackend: Debug + Send + Sync + 'static {
     /// Checks if a key exists and has not expired.
     fn exists(&self, key: &str) -> BoxFuture<'_, Result<bool, CacheError>>;
 
-    /// Evicts all cached entries associated with a specific tag.
-    fn invalidate_tag(&self, tag: &str) -> BoxFuture<'_, Result<usize, CacheError>>;
+    /// Evicts all cached entries associated with a specific tag and returns the count.
+    fn invalidate_tag(&self, tag: &str) -> BoxFuture<'_, Result<usize, CacheError>> {
+        let tag = tag.to_string();
+        Box::pin(async move {
+            let keys = self.invalidate_tag_keys(&tag).await?;
+            Ok(keys.len())
+        })
+    }
+
+    /// Evicts all cached entries associated with a specific tag and returns the deleted keys.
+    fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>>;
 
     /// Evicts all entries from the cache.
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>>;
@@ -152,19 +161,34 @@ impl CacheBackend for InMemoryCacheBackend {
         })
     }
 
-    fn invalidate_tag(&self, tag: &str) -> BoxFuture<'_, Result<usize, CacheError>> {
+    fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tag = tag.to_string();
         Box::pin(async move {
             let mut tag_map = self.tag_map.write().await;
             let Some(keys) = tag_map.remove(&tag) else {
-                return Ok(0);
+                return Ok(Vec::new());
             };
-            let count = keys.len();
             let mut map = self.entries.write().await;
+            let mut deleted = Vec::new();
             for key in keys {
-                map.remove(&key);
+                if let Some((_, expires_at)) = map.remove(&key) {
+                    if let Some(exp) = expires_at
+                        && std::time::Instant::now() >= exp
+                    {
+                        continue;
+                    }
+                    deleted.push(key);
+                }
             }
-            Ok(count)
+            Ok(deleted)
+        })
+    }
+
+    fn invalidate_tag(&self, tag: &str) -> BoxFuture<'_, Result<usize, CacheError>> {
+        let tag = tag.to_string();
+        Box::pin(async move {
+            let keys = self.invalidate_tag_keys(&tag).await?;
+            Ok(keys.len())
         })
     }
 

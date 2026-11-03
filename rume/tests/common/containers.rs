@@ -168,5 +168,8 @@ pub async fn create_isolated_redis_pool() -> deadpool_redis::Pool {
 #[cfg(feature = "redis")]
 pub async fn create_isolated_redis_backend() -> rume::cache::redis::RedisCacheBackend {
     let url = shared_redis_url().await;
-    rume::cache::redis::RedisCacheBackend::new(&url).expect("create redis backend")
+    let prefix = format!("rume:cache:{}:", uuid::Uuid::new_v4().simple());
+    rume::cache::redis::RedisCacheBackend::new(&url)
+        .expect("create redis backend")
+        .with_prefix(prefix)
 }

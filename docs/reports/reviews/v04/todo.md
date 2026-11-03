@@ -54,23 +54,23 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group E — Redis & Multi-Tenant Coordination Isolation (solve together)
 > Root cause: Unnamespaced Redis keys, destructive full-database flushes, and flawed tag expiration allow cross-tenant and cross-subsystem state corruption.
 
-- [ ] **Coordination M1 — `RateLimitService` reads a tenant extension type never inserted** (`coordination-multi-tenant.md` M1).
+- [x] **Coordination M1 — `RateLimitService` reads a tenant extension type never inserted** (`coordination-multi-tenant.md` M1).
       `rume/src/resilience/rate_limiter.rs:64–72`: Reads `TenantContext` from extensions where it is never inserted, rendering tenant rate limiting inert. Extract `TenantContext` using standard Axum extractor.
-- [ ] **Coordination M2 — `RedisCacheBackend` default prefix `rume:` collides with other subsystems** (`coordination-multi-tenant.md` M2).
+- [x] **Coordination M2 — `RedisCacheBackend` default prefix `rume:` collides with other subsystems** (`coordination-multi-tenant.md` M2).
       `rume/src/cache/redis.rs:88–92`: Collides with session, lock, and idempotency namespaces. Isolate default cache prefix to `rume:cache:`.
-- [ ] **Coordination M3 — `Cache::clear()` executes destructive `FLUSHDB`** (`coordination-multi-tenant.md` M3).
+- [x] **Coordination M3 — `Cache::clear()` executes destructive `FLUSHDB`** (`coordination-multi-tenant.md` M3).
       `rume/src/cache/redis.rs:97–104`: Executes `FLUSHDB`, wiping all keys on the shared logical database. Scan and delete keys matching the configured cache prefix only.
-- [ ] **Coordination M4 — Tag-set `PEXPIRE` unconditionally shortens tag lifetime** (`coordination-multi-tenant.md` M4).
+- [x] **Coordination M4 — Tag-set `PEXPIRE` unconditionally shortens tag lifetime** (`coordination-multi-tenant.md` M4).
       `rume/src/cache/redis.rs:110–125`: Shortens tag set expiry, causing tag invalidations to prematurely no-op. Use `PEXPIRE ... GT` or refresh to maximum constituent key TTL.
-- [ ] **Coordination M5 — `TenantScopedCache::invalidate_tag` releases quota for oldest keys** (`coordination-multi-tenant.md` M5).
+- [x] **Coordination M5 — `TenantScopedCache::invalidate_tag` releases quota for oldest keys** (`coordination-multi-tenant.md` M5).
       `rume/src/tenant/cache.rs:139–158`: Quota release frees permits for the oldest tracked keys rather than the keys actually deleted. Release quota for the exact keys deleted by tag invalidation.
-- [ ] **Coordination M8 — `remember_with_tags` stampede waiters can block forever** (`coordination-multi-tenant.md` M8).
+- [x] **Coordination M8 — `remember_with_tags` stampede waiters can block forever** (`coordination-multi-tenant.md` M8).
       `rume/src/cache/typed.rs:208–225`: Waiter creates `Notify` listener after checking in-flight status, missing notifications if probe completes quickly. Register notification waiter before checking in-flight status.
 
 ### Group F — SAML Hardening & Protocol Conformance (solve together)
 > Root cause: XMLDSig enveloped root document signatures and missing expiration conditions are rejected or improperly accepted.
 
-- [ ] **Security M3 — SAML parser rejects enveloped document signatures (`URI=""`) and fails open on missing expiration** (`security-protocols.md` M3).
+- [x] **Security M3 — SAML parser rejects enveloped document signatures (`URI=""`) and fails open on missing expiration** (`security-protocols.md` M3).
       `rume/src/enterprise/saml.rs:147–185`: Rejects RFC 3275 `URI=""` document signatures, and `validate()` accepts assertions omitting `NotOnOrAfter`. Support `URI=""` for root response signatures; require `NotOnOrAfter` to be present or fail closed in `validate()`.
 
 ---

@@ -295,3 +295,56 @@ async fn circuit_breaker_trips_on_service_transport_errors() {
     let _ = cb_service.call(req2).await;
     assert_eq!(breaker.state(), CircuitState::Open);
 }
+
+#[tokio::test]
+async fn test_tenant_extension_rate_limiting() {
+    use rume::tenant::Tenant;
+
+    let config = RateLimitConfig {
+        max_requests: 2,
+        window: Duration::from_secs(60),
+    };
+    let limiter = RateLimiter::new(config);
+
+    let router = rume::routing::Router::new()
+        .get("/tenant-api", || async { "ok" })
+        .layer(RateLimitLayer::new(limiter));
+
+    let app = TestApp::new(router);
+
+    // Tenant 1 request 1
+    let mut req1 = axum::http::Request::builder()
+        .uri("/tenant-api")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req1.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    let res1 = app.request(req1).await;
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    // Tenant 1 request 2
+    let mut req2 = axum::http::Request::builder()
+        .uri("/tenant-api")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req2.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    let res2 = app.request(req2).await;
+    assert_eq!(res2.status(), StatusCode::OK);
+
+    // Tenant 1 request 3 -> Rate limit exceeded
+    let mut req3 = axum::http::Request::builder()
+        .uri("/tenant-api")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req3.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    let res3 = app.request(req3).await;
+    assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Tenant 2 should NOT be rate limited
+    let mut req_t2 = axum::http::Request::builder()
+        .uri("/tenant-api")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_t2.extensions_mut().insert(Tenant::new("tenant_456", "beta"));
+    let res_t2 = app.request(req_t2).await;
+    assert_eq!(res_t2.status(), StatusCode::OK);
+}

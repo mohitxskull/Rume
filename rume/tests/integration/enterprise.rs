@@ -36,7 +36,7 @@ fn test_saml_assertion_parsing_and_validation() {
         <saml2:Subject>
             <saml2:NameID Format="urn:oasis:names:tc:SAML:1.1:nameid-format:emailAddress">bob@enterprise.com</saml2:NameID>
         </saml2:Subject>
-        <saml2:Conditions>
+        <saml2:Conditions NotOnOrAfter="2026-11-02T13:00:00Z">
             <saml2:AudienceRestriction>
                 <saml2:Audience>https://sp.myapp.io/saml/metadata</saml2:Audience>
             </saml2:AudienceRestriction>
@@ -201,7 +201,7 @@ fn test_saml_signature_wrapping_and_strict_validation() {
         <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_single123">
             <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
             <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
-            <saml2:Conditions>
+            <saml2:Conditions NotOnOrAfter="2026-11-02T13:00:00Z">
                 <saml2:Audience>https://sp.myapp.io</saml2:Audience>
             </saml2:Conditions>
         </saml2:Assertion>
@@ -282,7 +282,7 @@ fn test_saml_xsw_envelope_injection_prevention() {
         <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_legit123">
             <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
             <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
-            <saml2:Conditions>
+            <saml2:Conditions NotOnOrAfter="2026-11-02T13:00:00Z">
                 <saml2:Audience>https://sp.myapp.io</saml2:Audience>
             </saml2:Conditions>
         </saml2:Assertion>
@@ -451,4 +451,43 @@ fn test_saml_default_namespace_without_prefix() {
         assertion.attributes.get("role").unwrap(),
         &vec!["Admin & Architect".to_string()]
     );
+}
+
+#[test]
+fn test_saml_enveloped_document_signature_uri_empty() {
+    let saml_xml = r##"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp_123" Destination="https://sp.myapp.io/saml/acs">
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="" />
+            </ds:SignedInfo>
+        </ds:Signature>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assert_456">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+            <saml2:Conditions NotOnOrAfter="2026-11-02T13:00:00Z" />
+        </saml2:Assertion>
+    </saml2p:Response>
+    "##;
+
+    let assertion = SamlParser::parse_unverified(saml_xml).expect("RFC 3275 URI='' should be accepted for root document");
+    assert_eq!(assertion.id, "_assert_456");
+    assert_eq!(assertion.subject, "user@enterprise.com");
+}
+
+#[test]
+fn test_saml_missing_expiration_fails_closed() {
+    let saml_xml = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_noexp_123">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions>
+            <saml2:Audience>https://sp.myapp.io</saml2:Audience>
+        </saml2:Conditions>
+    </saml2:Assertion>
+    "#;
+
+    let assertion = SamlParser::parse_unverified(saml_xml).unwrap();
+    let res = SamlParser::validate(&assertion, 1700000000, Some("https://sp.myapp.io"));
+    assert!(matches!(res, Err(SamlError::MissingExpirationCondition)));
 }
