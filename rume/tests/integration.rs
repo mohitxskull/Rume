@@ -9,11 +9,9 @@ pub mod common;
 pub mod architecture;
 
 #[path = "integration/auth.rs"]
-#[cfg(feature = "redis")]
 pub mod auth;
 
 #[path = "integration/cache.rs"]
-#[cfg(feature = "redis")]
 pub mod cache;
 
 #[path = "integration/composition.rs"]
@@ -21,10 +19,6 @@ pub mod composition;
 
 #[path = "integration/config.rs"]
 pub mod config;
-
-#[path = "integration/coordination.rs"]
-#[cfg(feature = "redis")]
-pub mod coordination;
 
 #[path = "integration/enterprise.rs"]
 pub mod enterprise;
@@ -85,7 +79,6 @@ pub mod security;
 pub mod sqlite;
 
 #[path = "integration/tenant.rs"]
-#[cfg(feature = "redis")]
 pub mod tenant;
 
 #[path = "integration/validation.rs"]

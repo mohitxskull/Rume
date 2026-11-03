@@ -1,13 +1,8 @@
-#![cfg(feature = "redis")]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use testcontainers_modules::redis::Redis;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
-
-use rume::cache::{Cache, CacheConfig, RedisCacheBackend};
+use rume::cache::{Cache, CacheConfig, InMemoryCacheBackend};
 use rume::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -18,24 +13,13 @@ struct Product {
     price_cents: u64,
 }
 
-async fn start_redis_cache() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
-    RedisCacheBackend,
-    String,
-) {
-    let node = Redis::default().start().await.expect("start redis node");
-    let port = node
-        .get_host_port_ipv4(6379)
-        .await
-        .expect("get redis port");
-    let url = format!("redis://127.0.0.1:{port}");
-    let backend = RedisCacheBackend::new(&url).expect("create redis cache backend");
-    (node, backend, url)
+async fn start_cache() -> (InMemoryCacheBackend, String) {
+    (InMemoryCacheBackend::new(), "memory://test".to_string())
 }
 
 #[tokio::test]
 async fn cache_crud_and_prefix_namespaces() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let config = CacheConfig::new(&url)
         .with_default_ttl(60)
         .with_prefix("app:v1:");
@@ -71,7 +55,7 @@ async fn cache_crud_and_prefix_namespaces() {
 
 #[tokio::test]
 async fn cache_tags_invalidation() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let config = CacheConfig::new(&url).with_default_ttl(60);
     let cache = Cache::new(backend, config);
 
@@ -123,7 +107,7 @@ async fn cache_tags_invalidation() {
 
 #[tokio::test]
 async fn cache_typed_wrapper_convenience() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let config = CacheConfig::new(&url).with_default_ttl(60);
     let cache = Cache::new(backend, config);
 
@@ -159,7 +143,7 @@ async fn cache_typed_wrapper_convenience() {
 
 #[tokio::test]
 async fn cache_expiration_and_refresh() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let config = CacheConfig::new(&url).with_default_ttl(60);
     let cache = Cache::new(backend, config);
 
@@ -180,7 +164,7 @@ async fn cache_expiration_and_refresh() {
 
 #[tokio::test]
 async fn cache_health_check_reports_diagnostics() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let cache = Cache::new(backend, CacheConfig::new(&url));
     let hc = cache.health_check("app_cache");
 
@@ -202,7 +186,7 @@ async fn cache_health_check_reports_diagnostics() {
 
 #[tokio::test]
 async fn cache_remember_stampede_singleflight_protection() {
-    let (_node, backend, url) = start_redis_cache().await;
+    let (backend, url) = start_cache().await;
     let cache = Arc::new(Cache::new(backend, CacheConfig::new(&url)));
     let fetch_count = Arc::new(AtomicUsize::new(0));
 

@@ -78,6 +78,21 @@ async fn test_postgres_pool_lifecycle_and_health() {
     let closed = pool.close_and_drain(Duration::from_millis(500)).await;
     assert!(closed);
     assert!(pool.status().is_closed);
+    assert!(pool.backend().is_closed());
+
+    // Invariant: leases must be rejected after pool closure
+    assert!(matches!(pool.acquire_lease(), Err(PersistenceError::Closed)));
+    assert!(matches!(
+        pool.acquire_lease_timeout(Duration::from_millis(50)).await,
+        Err(PersistenceError::Closed)
+    ));
+
+    // Invariant: direct queries against the closed physical backend pool must fail
+    let query_res = pool.backend().execute("SELECT 1").await;
+    assert!(
+        matches!(query_res, Err(PersistenceError::Closed)),
+        "queries against closed pool must fail with PersistenceError::Closed"
+    );
 }
 
 #[tokio::test]
@@ -550,8 +565,11 @@ async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
         .expect("acquire failed");
     assert!(immediate.is_none(), "lock is currently held");
 
-    // Wait 150ms for TTL to expire
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    // Expire lock TTL deterministically in storage
+    pool.backend()
+        .execute("UPDATE rume_locks SET expires_at = 0 WHERE resource = 'ephemeral-job'")
+        .await
+        .expect("expire lock");
 
     // A competing worker acquires expired lock
     let guard2 = lock_svc

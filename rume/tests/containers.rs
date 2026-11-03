@@ -17,6 +17,10 @@ pub mod mysql;
 #[cfg(feature = "redis")]
 pub mod redis;
 
+#[path = "containers/coordination.rs"]
+#[cfg(feature = "redis")]
+pub mod coordination;
+
 #[path = "containers/jobs.rs"]
 #[cfg(feature = "postgres")]
 pub mod jobs;

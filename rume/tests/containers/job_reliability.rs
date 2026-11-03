@@ -92,7 +92,8 @@ async fn idempotency_store_lifecycle() {
 #[tokio::test]
 async fn worker_heartbeat_tracking_and_reaping() {
     let (_node, pool) = start_redis_pool().await;
-    let tracker = RedisHeartbeatRegistry::new(pool);
+    let tracker = RedisHeartbeatRegistry::new(pool)
+        .with_set_key(format!("test:heartbeats:{}", uuid::Uuid::new_v4()));
 
     // Worker 1 alive with 100ms TTL
     tracker
@@ -220,8 +221,41 @@ async fn test_worker_idempotency_deduplication() {
 async fn test_worker_heartbeat_and_abandoned_job_recovery() {
     let (_pg_node, queue) = start_postgres_queue().await;
     let (_redis_node, redis_pool) = start_redis_pool().await;
-    let heartbeats: Arc<dyn HeartbeatRegistry> = Arc::new(RedisHeartbeatRegistry::new(redis_pool));
-    let registry = Arc::new(rume::jobs::JobRegistry::new());
+    let heartbeats: Arc<dyn HeartbeatRegistry> = Arc::new(
+        RedisHeartbeatRegistry::new(redis_pool)
+            .with_set_key(format!("test:heartbeats:{}", uuid::Uuid::new_v4())),
+    );
+    let mut registry = rume::jobs::JobRegistry::new();
+    let executed_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let notify = std::sync::Arc::new(tokio::sync::Notify::new());
+
+    registry.register(PaymentHandler {
+        executed: std::sync::Arc::clone(&executed_counter),
+        notify: std::sync::Arc::clone(&notify),
+    });
+    let registry = Arc::new(registry);
+
+    // Simulate an abandoned job belonging to a crashed worker
+    heartbeats
+        .record_heartbeat("crashed-worker-99", Duration::from_millis(50))
+        .await
+        .unwrap();
+
+    // Enqueue and claim a job under crashed-worker-99 BEFORE starting active worker
+    queue
+        .enqueue(IdempotentPaymentJob {
+            payment_id: "tx_abandoned".into(),
+            amount: 100,
+        })
+        .await
+        .unwrap();
+    let claimed = queue.dequeue_for("crashed-worker-99").await.unwrap();
+    assert!(claimed.is_some(), "fixture job claimed under crashed worker");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
+
+    // Wait for crashed-worker-99 heartbeat to expire
+    sleep(Duration::from_millis(60)).await;
+    assert!(!heartbeats.is_alive("crashed-worker-99").await.unwrap());
 
     // Worker 1 starts with heartbeat and abandoned recovery
     let worker1 = rume::jobs::JobWorker::new(Arc::clone(&queue), registry)
@@ -231,36 +265,31 @@ async fn test_worker_heartbeat_and_abandoned_job_recovery() {
             Duration::from_millis(400),
             Duration::from_millis(100),
         )
-        .with_abandoned_recovery(Duration::from_millis(200));
+        .with_abandoned_recovery(Duration::from_millis(100));
     worker1.start();
 
     // Verify worker 1 registered heartbeat
-    sleep(Duration::from_millis(150)).await;
-    assert!(heartbeats.is_alive("worker-active-1").await.unwrap());
+    let mut alive = false;
+    for _ in 0..20 {
+        if heartbeats.is_alive("worker-active-1").await.unwrap() {
+            alive = true;
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(alive);
 
-    // Simulate an abandoned job belonging to a crashed worker
-    heartbeats
-        .record_heartbeat("crashed-worker-99", Duration::from_millis(100))
+    // Wait deterministically for worker1 recovery loop to recover and execute the abandoned job
+    tokio::time::timeout(Duration::from_secs(3), notify.notified())
         .await
-        .unwrap();
+        .expect("worker1 should recover and execute the abandoned job");
 
-    // Enqueue and claim a job under crashed-worker-99
-    queue
-        .enqueue(IdempotentPaymentJob {
-            payment_id: "tx_abandoned".into(),
-            amount: 100,
-        })
-        .await
-        .unwrap();
-    let claimed = queue.dequeue_for("crashed-worker-99").await.unwrap();
-    assert!(claimed.is_some());
+    assert_eq!(
+        executed_counter.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     assert_eq!(queue.pending_count().await.unwrap(), 0);
+    assert_eq!(queue.dead_letter_count().await.unwrap(), 0);
 
-    // Sleep past crashed-worker-99 TTL so worker1 recovery loop detects it and reclaims
-    sleep(Duration::from_millis(400)).await;
-
-    // The abandoned job should now be reclaimed back into pending
-    assert_eq!(queue.pending_count().await.unwrap(), 1);
-
-    let _ = worker1.drain(Duration::from_millis(100)).await;
+    let _ = worker1.drain(Duration::from_millis(200)).await;
 }

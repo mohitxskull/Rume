@@ -43,13 +43,13 @@ pub use app::{
 pub use auth::RedisSessionStore;
 pub use auth::{
     ApiKeyScheme, AuthError, AuthLayer, AuthUser, Authenticated, BearerTokenScheme, CustomPolicy,
-    Identity, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
+    Identity, InMemorySessionStore, OptionalAuth, Policy, PolicyLayer, RequireAllPermissions,
     RequireAnyRole, RequirePermission, RequireRole, Session, SessionScheme, SessionStore,
     authorize,
 };
 #[cfg(feature = "redis")]
 pub use cache::RedisCacheBackend;
-pub use cache::{Cache, CacheBackend, CacheConfig, CacheError};
+pub use cache::{Cache, CacheBackend, CacheConfig, CacheError, InMemoryCacheBackend};
 pub use coordination::{
     CoordinationError, CoordinationFuture, DistributedLock, LeaderElector, LeaderLease, LockGuard,
 };
@@ -116,7 +116,7 @@ pub use security::{
 #[cfg(feature = "redis")]
 pub use tenant::RedisTenantQuotaStore;
 pub use tenant::{
-    HeaderTenantResolver, OptionalTenant, SubdomainTenantResolver, Tenant,
+    HeaderTenantResolver, InMemoryTenantQuotaStore, OptionalTenant, SubdomainTenantResolver, Tenant,
     TenantContext, TenantError, TenantLayer, TenantQuotaStore, TenantResolver, TenantScopedCache,
 };
 pub use testing::{TestApp, TestAppBuilder};

@@ -104,3 +104,51 @@ pub trait SessionStore: Send + Sync + 'static {
         })
     }
 }
+
+/// Thread-safe in-memory session store suitable for testing and single-instance deployments.
+#[derive(Debug, Clone, Default)]
+pub struct InMemorySessionStore {
+    sessions: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Session>>>,
+}
+
+impl InMemorySessionStore {
+    /// Creates a new in-memory session store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl SessionStore for InMemorySessionStore {
+    fn load(&self, id: &str) -> BoxFuture<'_, Result<Option<Session>, AuthError>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let map = self.sessions.read().await;
+            if let Some(session) = map.get(&id) {
+                if session.is_expired() {
+                    Ok(None)
+                } else {
+                    Ok(Some(session.clone()))
+                }
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn save(&self, session: Session) -> BoxFuture<'_, Result<(), AuthError>> {
+        Box::pin(async move {
+            let mut map = self.sessions.write().await;
+            map.insert(session.id.clone(), session);
+            Ok(())
+        })
+    }
+
+    fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let mut map = self.sessions.write().await;
+            map.remove(&id);
+            Ok(())
+        })
+    }
+}

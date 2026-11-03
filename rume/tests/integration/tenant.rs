@@ -1,14 +1,10 @@
-#![cfg(feature = "redis")]
-
 use std::sync::Arc;
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
-use rume::cache::{Cache, CacheConfig, RedisCacheBackend};
+use rume::cache::{Cache, CacheConfig, InMemoryCacheBackend};
 use rume::prelude::*;
 use rume::tenant::*;
-use testcontainers_modules::redis::Redis;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 #[tokio::test]
 async fn test_header_tenant_resolver_success_and_context_extractor() {
@@ -251,30 +247,16 @@ async fn test_optional_tenant_extractor() {
     assert_eq!(TestApp::body_text(res).await, "tenant: umbrella");
 }
 
-async fn start_redis_tenant_cache() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
-    TenantScopedCache<RedisCacheBackend>,
-) {
-    let node = Redis::default().start().await.expect("start redis node");
-    let port = node
-        .get_host_port_ipv4(6379)
-        .await
-        .expect("get redis port");
-    let url = format!("redis://127.0.0.1:{port}");
-    let pool_cfg = deadpool_redis::Config::from_url(&url);
-    let pool = pool_cfg
-        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-        .expect("create redis pool");
-    let backend = RedisCacheBackend::new(&url).expect("create redis cache backend");
-    let base_cache = Cache::new(backend, CacheConfig::new(&url));
-    let quota_store = Arc::new(RedisTenantQuotaStore::new(pool));
-    let scoped = TenantScopedCache::new(base_cache).with_quota_store(quota_store);
-    (node, scoped)
+fn start_tenant_cache() -> TenantScopedCache<InMemoryCacheBackend> {
+    let backend = InMemoryCacheBackend::new();
+    let base_cache = Cache::new(backend, CacheConfig::new("memory://test"));
+    let quota_store = Arc::new(InMemoryTenantQuotaStore::new());
+    TenantScopedCache::new(base_cache).with_quota_store(quota_store)
 }
 
 #[tokio::test]
 async fn test_tenant_scoped_cache() {
-    let (_node, scoped_cache) = start_redis_tenant_cache().await;
+    let scoped_cache = start_tenant_cache();
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
     struct UserSettings {
@@ -328,7 +310,7 @@ async fn test_tenant_scoped_cache() {
 
 #[tokio::test]
 async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
-    let (_node, scoped_cache) = start_redis_tenant_cache().await;
+    let scoped_cache = start_tenant_cache();
     let scoped_cache = scoped_cache.with_max_keys_per_tenant(2);
 
     #[derive(Serialize, Deserialize, PartialEq, Debug)]
@@ -390,7 +372,7 @@ async fn tenant_scoped_cache_tag_isolation_and_quota_bounds() {
 
 #[tokio::test]
 async fn test_tenant_cache_delimiter_isolation() {
-    let (_node, scoped_cache) = start_redis_tenant_cache().await;
+    let scoped_cache = start_tenant_cache();
 
     // Tenant "a:b" with key "c"
     scoped_cache

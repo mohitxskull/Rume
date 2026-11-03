@@ -459,7 +459,8 @@ async fn test_redis_heartbeat_registry_and_dead_worker_reaping() {
     let (_container, backend) = setup_redis_backend().await;
     let pool = backend.pool().clone();
 
-    let registry = RedisHeartbeatRegistry::new(pool);
+    let registry = RedisHeartbeatRegistry::new(pool)
+        .with_set_key(format!("test:heartbeats:{}", uuid::Uuid::new_v4()));
 
     // Record worker-1 with short TTL (100ms) and worker-2 with long TTL (10s)
     registry

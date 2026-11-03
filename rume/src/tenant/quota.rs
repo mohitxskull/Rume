@@ -50,6 +50,67 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
     fn reset<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>>;
 }
 
+/// Thread-safe in-memory tenant quota store suitable for testing and single-instance deployments.
+#[derive(Debug, Clone, Default)]
+pub struct InMemoryTenantQuotaStore {
+    counts: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, usize>>>,
+}
+
+impl InMemoryTenantQuotaStore {
+    /// Creates a new in-memory tenant quota store.
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl TenantQuotaStore for InMemoryTenantQuotaStore {
+    fn acquire<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        max_keys: usize,
+    ) -> BoxFuture<'a, Result<bool, CacheError>> {
+        let tid = tenant_id.to_string();
+        Box::pin(async move {
+            let mut map = self.counts.write().await;
+            let count = map.entry(tid).or_insert(0);
+            if *count >= max_keys {
+                Ok(false)
+            } else {
+                *count += 1;
+                Ok(true)
+            }
+        })
+    }
+
+    fn release<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
+        let tid = tenant_id.to_string();
+        Box::pin(async move {
+            let mut map = self.counts.write().await;
+            if let Some(count) = map.get_mut(&tid) {
+                *count = count.saturating_sub(1);
+            }
+            Ok(())
+        })
+    }
+
+    fn count<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<usize, CacheError>> {
+        let tid = tenant_id.to_string();
+        Box::pin(async move {
+            let map = self.counts.read().await;
+            Ok(map.get(&tid).copied().unwrap_or(0))
+        })
+    }
+
+    fn reset<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
+        let tid = tenant_id.to_string();
+        Box::pin(async move {
+            let mut map = self.counts.write().await;
+            map.remove(&tid);
+            Ok(())
+        })
+    }
+}
+
 #[cfg(feature = "redis")]
 pub use redis_store::RedisTenantQuotaStore;
 

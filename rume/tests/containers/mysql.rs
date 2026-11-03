@@ -1,7 +1,6 @@
 #![cfg(feature = "mysql")]
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use testcontainers_modules::mysql::Mysql;
 
@@ -190,12 +189,17 @@ async fn test_mysql_outbox_claims_skip_locked_and_lease() {
 
     let backend = Arc::new(backend);
 
+    let base_time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
     for i in 1..=10 {
-        let msg = OutboxMessage::new(
+        let mut msg = OutboxMessage::new(
             format!("msg_{i}"),
             "InventoryReserved".to_string(),
             format!("{{\"item\":{i}}}").into_bytes(),
         );
+        msg.created_at = base_time + (i as u64 * 10);
         backend.save(msg).await.expect("save outbox message");
     }
 
@@ -250,8 +254,11 @@ async fn test_mysql_outbox_expired_claim_recovery() {
     assert_eq!(claimed.len(), 1);
     assert_eq!(claimed[0].status, OutboxStatus::InFlight);
 
-    // Wait 2 seconds for lease to expire
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Expire lease deterministically in storage
+    backend
+        .execute("UPDATE rume_outbox SET lease_expires_at = 0 WHERE status = 'inflight'")
+        .await
+        .expect("expire lease");
 
     let recovered = backend
         .recover_expired_claims(1)

@@ -57,13 +57,13 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 ### Group E — Container Test Reliability, Docker Bleed & Verification Depth (solve together)
 > Root cause: Uncoordinated background worker tasks in reliability tests, Redis container bleed into zero-docker test binaries, and shallow assertions.
 
-- [ ] **Jobs M2 — Race condition and uncoordinated worker execution in `test_worker_heartbeat_and_abandoned_job_recovery` causes deterministic container test failure** (`jobs-worker-concurrency.md` M2, `testing-feature-matrix.md` M2).
+- [x] **Jobs M2 — Race condition and uncoordinated worker execution in `test_worker_heartbeat_and_abandoned_job_recovery` causes deterministic container test failure** (`jobs-worker-concurrency.md` M2, `testing-feature-matrix.md` M2).
       `rume/tests/containers/job_reliability.rs:227–258`: `worker1` is started before enqueuing and claiming the fixture job. `worker1`'s background poll loop steals the job immediately, causing `queue.dequeue_for("crashed-worker-99")` to return `None` and panic on `assert!(claimed.is_some())`. Enqueue and claim the job under `crashed-worker-99` *before* starting `worker1`.
-- [ ] **Testing M1 — Contamination of "zero-docker" `tests/integration.rs` with 15 unshared live Redis container spin-ups** (`testing-feature-matrix.md` M1).
+- [x] **Testing M1 — Contamination of "zero-docker" `tests/integration.rs` with 15 unshared live Redis container spin-ups** (`testing-feature-matrix.md` M1).
       `rume/tests/integration/`: `auth.rs`, `cache.rs`, `coordination.rs`, and `tenant.rs` spin up 15 separate Docker containers inside the `integration` test binary, violating the zero-docker contract of `tests/integration.rs`. Move Redis container suites to `tests/containers/` and connect to shared `OnceCell` Redis container fixtures.
-- [ ] **Testing M3 — Potemkin pool lifecycle assertions in `containers/postgres.rs` persist without verifying query rejection or physical connection termination** (`testing-feature-matrix.md` M3).
+- [x] **Testing M3 — Potemkin pool lifecycle assertions in `containers/postgres.rs` persist without verifying query rejection or physical connection termination** (`testing-feature-matrix.md` M3).
       `rume/tests/containers/postgres.rs:77–81`: Test checks only boolean flags on `pool` without attempting a query after `close_and_drain` or verifying that physical TCP connections are severed. Assert that queries on closed pools return `Err(PersistenceError::PoolClosed)`.
-- [ ] **Testing M4 — 16 non-deterministic wall-clock sleeps remain across 6 container test suites** (`testing-feature-matrix.md` M4).
+- [x] **Testing M4 — 16 non-deterministic wall-clock sleeps remain across 6 container test suites** (`testing-feature-matrix.md` M4).
       `rume/tests/containers/{jobs.rs, job_reliability.rs, mysql.rs, postgres.rs, redis.rs}`: 16 wall-clock `sleep()` calls remain. Replace with atomic synchronization (`Notify`, channels) or virtual time.
 
 ---
@@ -92,7 +92,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
       `rume/src/security/audit.rs:188–205`: Unconditional MySQL C-string escaping doubles backslashes and converts newlines to literal `\n` in PostgreSQL and SQLite.
 - [ ] **Testing m1 — Redundant test assertions between unit and integration suites in `integration/health.rs` and `integration/error.rs`** (`testing-feature-matrix.md` m1).
       `rume/tests/integration/{health.rs, error.rs}`: Prune duplicate domain variant checks already covered in unit tests.
-- [ ] **Testing m2 — Six unused import compiler warnings in `rume/src/testing/harness.rs`** (`testing-feature-matrix.md` m2).
+- [x] **Testing m2 — Six unused import compiler warnings in `rume/src/testing/harness.rs`** (`testing-feature-matrix.md` m2).
       `rume/src/testing/harness.rs:1–10`: Remove unused imports under default feature configurations.
 
 ---

@@ -1,8 +1,10 @@
 //! Declarative test harness coordinating database pools, lifecycle hooks, outbox relays, and router integration.
 
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use axum::body::Body;
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use axum::http::Response;
-
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use super::app::TestApp;
 
 /// Declarative, fluent test harness coordinating database pools, lifecycle hooks, outbox relays, and test app routing.

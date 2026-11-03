@@ -9,7 +9,7 @@ pub mod typed;
 
 #[cfg(feature = "redis")]
 pub use self::redis::RedisCacheBackend;
-pub use backend::{BoxFuture, CacheBackend};
+pub use backend::{BoxFuture, CacheBackend, InMemoryCacheBackend};
 pub use config::CacheConfig;
 pub use error::CacheError;
 pub use typed::{Cache, CacheHealthCheck};
