@@ -176,7 +176,7 @@ async fn openapi_generation_with_explicit_parameter_matchers() {
     assert_eq!(slug_param.schema.r#type, "string");
     assert_eq!(
         slug_param.schema.pattern.as_deref(),
-        Some("^[a-z0-9]+(?:-[a-z0-9]+)*$")
+        Some("^[a-zA-Z0-9][a-zA-Z0-9_-]{1,}[a-zA-Z0-9]$")
     );
 
     // 2. order_token matches Matcher::Uuid -> uuid format (even without 'uuid' in name)

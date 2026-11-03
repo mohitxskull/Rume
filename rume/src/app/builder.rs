@@ -256,7 +256,7 @@ where
     router: Router<AppContext<E, C, S>>,
     /// Application-scoped route registry. Cloned from the [`AppContext`] at
     /// construction; [`run`](Self::run) passes it back into the context.
-    route_registry: RouteRegistry,
+    route_registry: Arc<std::sync::RwLock<RouteRegistry>>,
     /// Registered first-class application modules.
     modules: Vec<Arc<dyn crate::module::Module>>,
     bind: String,
@@ -302,7 +302,7 @@ where
     /// point for building a Rume application.
     pub(crate) fn new(ctx: AppContext<E, C, S>) -> Self {
         let state = ctx.state.clone();
-        let route_registry = ctx.route_registry.clone();
+        let route_registry = Arc::new(std::sync::RwLock::new(ctx.route_registry.clone()));
         Self {
             ctx,
             state,
@@ -322,6 +322,10 @@ where
             applied_groups: BTreeSet::new(),
             shutdown_timeout: Duration::from_secs(30),
         }
+    }
+
+    fn record_route(&self, info: crate::routing::RouteInfo) {
+        self.route_registry.write().unwrap().register(info);
     }
 
     /// Register a first-class application module.
@@ -348,7 +352,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::get(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::GET,
             path: path.to_string(),
             name: None,
@@ -365,7 +369,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::post(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::POST,
             path: path.to_string(),
             name: None,
@@ -382,7 +386,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::put(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::PUT,
             path: path.to_string(),
             name: None,
@@ -399,7 +403,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::patch(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::PATCH,
             path: path.to_string(),
             name: None,
@@ -416,7 +420,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::delete(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::DELETE,
             path: path.to_string(),
             name: None,
@@ -433,7 +437,7 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::any(handler));
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
             path: path.to_string(),
             name: None,
@@ -447,7 +451,7 @@ where
     pub fn resource(mut self, resource: crate::routing::Resource<AppContext<E, C, S>>) -> Self {
         for r in resource.routes() {
             self.router = self.router.route(&r.path, r.router.clone());
-            self.route_registry.register(crate::routing::RouteInfo {
+            self.record_route(crate::routing::RouteInfo {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 name: Some(r.name.clone()),
@@ -467,7 +471,7 @@ where
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.nest(path, axum_router);
         for r in registry.routes() {
-            self.route_registry.register(crate::routing::RouteInfo {
+            self.record_route(crate::routing::RouteInfo {
                 method: r.method.clone(),
                 path: crate::routing::registry::join_path(path, &r.path),
                 name: r.name.clone(),
@@ -482,7 +486,7 @@ where
     pub fn merge(mut self, router: impl Into<crate::routing::Router<AppContext<E, C, S>>>) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.merge(axum_router);
-        self.route_registry.extend(registry);
+        self.route_registry.write().unwrap().extend(registry);
         self
     }
 
@@ -538,7 +542,7 @@ where
         T::Future: Send + 'static,
     {
         self.router = self.router.route_service(path, service);
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
             path: path.to_string(),
             name: None,
@@ -712,7 +716,7 @@ where
     /// information.
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
-        self.route_registry.register(crate::routing::RouteInfo {
+        self.record_route(crate::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap(),
             path: path.to_string(),
             name: None,
@@ -731,17 +735,23 @@ where
         let rume_router = crate::routing::Router::new().route_spec(spec, handler);
         let (axum_router, registry) = rume_router.into_parts();
         self.router = self.router.merge(axum_router);
-        self.route_registry.extend(registry);
+        self.route_registry.write().unwrap().extend(registry);
         self
     }
 
     /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
+    ///
+    /// The specification is generated lazily when requested from the shared route registry,
+    /// guaranteeing that routes registered after `.openapi()` and module routes are included.
     pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
-        let spec = self.route_registry.to_openapi(info);
-        let json_value = spec.to_json_value();
+        let registry = Arc::clone(&self.route_registry);
         self.get(path, move || {
-            let val = json_value.clone();
-            async move { axum::Json(val) }
+            let reg = Arc::clone(&registry);
+            let inf = info.clone();
+            async move {
+                let spec = reg.read().unwrap().to_openapi(inf);
+                axum::Json(spec.to_json_value())
+            }
         })
     }
 
@@ -769,7 +779,7 @@ where
     ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = axum_router;
-        self.route_registry = registry;
+        *self.route_registry.write().unwrap() = registry;
         self
     }
 
@@ -948,7 +958,7 @@ where
             applied_middleware,
             applied_groups,
             modules,
-            mut route_registry,
+            route_registry,
             ..
         } = self;
 
@@ -961,22 +971,28 @@ where
 
         let mut module_axum = axum::Router::new();
         let mut module_routes = crate::routing::RouteRegistry::new();
-        let mut seen_routes = HashSet::new();
-        for r in route_registry.routes() {
-            seen_routes.insert((r.method.to_string(), r.path.clone()));
+        let mut seen_routes: Vec<(String, String)> = Vec::new();
+        for r in route_registry.read().unwrap().routes() {
+            seen_routes.push((r.method.to_string(), r.path.clone()));
         }
 
         for m in &startup_modules {
             let single_mod_router = m.register_routes(crate::routing::Router::new());
             let (axum_r, routes) = single_mod_router.into_parts();
             for r in routes.routes() {
-                let key = (r.method.to_string(), r.path.clone());
-                if !seen_routes.insert(key) {
+                let new_method = r.method.to_string();
+                let new_path = &r.path;
+                // App M4: Check ANY method overlap against existing routes to avoid Axum panics
+                if seen_routes
+                    .iter()
+                    .any(|(m, p)| p == new_path && (m == &new_method || m == "ANY" || new_method == "ANY"))
+                {
                     return Err(BuildError::DuplicateRoute {
-                        method: r.method.to_string(),
+                        method: new_method,
                         path: r.path.clone(),
                     });
                 }
+                seen_routes.push((new_method, r.path.clone()));
             }
             module_axum = module_axum.merge(axum_r);
             module_routes.extend(routes);
@@ -985,7 +1001,8 @@ where
 
         let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
         let router = router.merge(adapted);
-        route_registry.extend(module_routes);
+        route_registry.write().unwrap().extend(module_routes);
+        ctx.route_registry = route_registry.read().unwrap().clone();
 
         // --- Step 2: Validation phase (fail closed, before any middleware wraps) ---
         let mut seen_middleware: HashSet<&str> = HashSet::new();
@@ -1088,7 +1105,7 @@ where
         // Pass the builder's route registry into the app context so the
         // application's routes are observable from `AppContext::route_registry`
         // (e.g. by `rume list:routes`).
-        self.ctx.route_registry = self.route_registry.clone();
+        self.ctx.route_registry = self.route_registry.read().unwrap().clone();
 
         let addr: SocketAddr = self
             .bind
@@ -1118,9 +1135,10 @@ where
                     module_router = m.register_routes(module_router);
                 }
                 let (_, module_routes) = module_router.into_parts();
-                self.route_registry.extend(module_routes);
+                self.route_registry.write().unwrap().extend(module_routes);
+                self.ctx.route_registry = self.route_registry.read().unwrap().clone();
 
-                let json = serde_json::to_string(self.route_registry.routes())
+                let json = serde_json::to_string(self.ctx.route_registry.routes())
                     .unwrap_or_else(|_| "[]".to_string());
                 println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
             }
@@ -1177,7 +1195,7 @@ where
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.ctx.route_registry = self.route_registry.clone();
+        self.ctx.route_registry = self.route_registry.read().unwrap().clone();
 
         let mode = if std::env::var("RUME_INSPECT").is_ok()
             || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
@@ -1200,9 +1218,10 @@ where
                     module_router = m.register_routes(module_router);
                 }
                 let (_, module_routes) = module_router.into_parts();
-                self.route_registry.extend(module_routes);
+                self.route_registry.write().unwrap().extend(module_routes);
+                self.ctx.route_registry = self.route_registry.read().unwrap().clone();
 
-                let json = serde_json::to_string(self.route_registry.routes())
+                let json = serde_json::to_string(self.ctx.route_registry.routes())
                     .unwrap_or_else(|_| "[]".to_string());
                 println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
             }

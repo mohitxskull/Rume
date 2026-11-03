@@ -5,6 +5,8 @@
 //!
 //! Mounting a route and recording its metadata are one atomic operation.
 
+use std::sync::{Arc, RwLock};
+
 use axum::handler::Handler;
 use axum::http::Method;
 use axum::routing::MethodRouter;
@@ -19,7 +21,7 @@ use crate::routing::spec::RouteSpec;
 #[derive(Debug, Clone)]
 pub struct Router<S = ()> {
     inner: axum::Router<S>,
-    registry: RouteRegistry,
+    registry: Arc<RwLock<RouteRegistry>>,
 }
 
 impl<S> Default for Router<S>
@@ -39,8 +41,18 @@ where
     pub fn new() -> Self {
         Self {
             inner: axum::Router::new(),
-            registry: RouteRegistry::new(),
+            registry: Arc::new(RwLock::new(RouteRegistry::new())),
         }
+    }
+
+    /// Record route metadata into this router's registry.
+    pub fn record_route(&self, info: RouteInfo) {
+        self.registry.write().unwrap().register(info);
+    }
+
+    /// Clear all registered route metadata from this router.
+    pub fn clear_registry(&self) {
+        self.registry.write().unwrap().clear();
     }
 
     /// Mount a `GET` route and register its metadata.
@@ -50,7 +62,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::get(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::GET,
             path: path.to_string(),
             name: None,
@@ -67,7 +79,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::post(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::POST,
             path: path.to_string(),
             name: None,
@@ -84,7 +96,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::put(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::PUT,
             path: path.to_string(),
             name: None,
@@ -101,7 +113,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::patch(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::PATCH,
             path: path.to_string(),
             name: None,
@@ -118,7 +130,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::delete(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::DELETE,
             path: path.to_string(),
             name: None,
@@ -135,7 +147,7 @@ where
         T: 'static,
     {
         self.inner = self.inner.route(path, axum::routing::any(handler));
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
             path: path.to_string(),
             name: None,
@@ -157,7 +169,7 @@ where
         T::Future: Send + 'static,
     {
         self.inner = self.inner.route_service(path, service);
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
             path: path.to_string(),
             name: None,
@@ -200,7 +212,7 @@ where
     /// for exact metadata reflection.
     pub fn route(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
         self.inner = self.inner.route(path, method_router);
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
             path: path.to_string(),
             name: None,
@@ -241,7 +253,7 @@ where
 
         let method_router = method_router.layer(validation_layer);
         self.inner = self.inner.route(&path, method_router);
-        self.registry.register(RouteInfo {
+        self.record_route(RouteInfo {
             method,
             path,
             name,
@@ -258,7 +270,7 @@ where
     pub fn resource(mut self, resource: Resource<S>) -> Self {
         for r in resource.routes() {
             self.inner = self.inner.route(&r.path, r.router.clone());
-            self.registry.register(RouteInfo {
+            self.record_route(RouteInfo {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 name: Some(r.name.clone()),
@@ -275,8 +287,9 @@ where
     /// with their full prefixed paths.
     pub fn nest(mut self, path: &str, other: Router<S>) -> Self {
         self.inner = self.inner.nest(path, other.inner);
-        for r in other.registry.routes() {
-            self.registry.register(RouteInfo {
+        let other_routes = other.registry.read().unwrap().clone();
+        for r in other_routes.routes() {
+            self.record_route(RouteInfo {
                 method: r.method.clone(),
                 path: join_path(path, &r.path),
                 name: r.name.clone(),
@@ -292,7 +305,8 @@ where
     /// Merges both the Axum routing tree and the route registries.
     pub fn merge(mut self, other: Router<S>) -> Self {
         self.inner = self.inner.merge(other.inner);
-        self.registry.extend(other.registry);
+        let other_routes = other.registry.read().unwrap().clone();
+        self.registry.write().unwrap().extend(other_routes);
         self
     }
 
@@ -335,36 +349,46 @@ where
 
     /// Consume this router and return both the [`axum::Router`] and [`RouteRegistry`].
     pub fn into_parts(self) -> (axum::Router<S>, RouteRegistry) {
-        (self.inner, self.registry)
+        let registry = self.registry.read().unwrap().clone();
+        (self.inner, registry)
     }
 
-    /// Access the route registry.
-    pub fn registry(&self) -> &RouteRegistry {
-        &self.registry
+    /// Construct a [`Router`] from an underlying [`axum::Router`] and [`RouteRegistry`].
+    pub fn from_parts(inner: axum::Router<S>, registry: RouteRegistry) -> Self {
+        Self {
+            inner,
+            registry: Arc::new(RwLock::new(registry)),
+        }
     }
 
-    /// Access the route registry mutably.
-    pub fn registry_mut(&mut self) -> &mut RouteRegistry {
-        &mut self.registry
+    /// Access a snapshot of the route registry.
+    pub fn registry(&self) -> RouteRegistry {
+        self.registry.read().unwrap().clone()
     }
 
     /// Return all registered routes.
-    pub fn routes(&self) -> &[RouteInfo] {
-        self.registry.routes()
+    pub fn routes(&self) -> Vec<RouteInfo> {
+        self.registry.read().unwrap().routes().to_vec()
     }
 
     /// Generates an OpenAPI v3.1 specification for all registered routes on this router.
     pub fn openapi_spec(&self, info: crate::openapi::OpenApiInfo) -> crate::openapi::OpenApiSpec {
-        self.registry.to_openapi(info)
+        self.registry.read().unwrap().to_openapi(info)
     }
 
     /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
+    ///
+    /// The specification is evaluated lazily when requested from the shared route registry,
+    /// guaranteeing that routes registered after `.openapi()` and merged subrouters are included.
     pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
-        let spec = self.openapi_spec(info);
-        let json_value = spec.to_json_value();
+        let registry = Arc::clone(&self.registry);
         self.get(path, move || {
-            let val = json_value.clone();
-            async move { axum::Json(val) }
+            let reg = Arc::clone(&registry);
+            let inf = info.clone();
+            async move {
+                let spec = reg.read().unwrap().to_openapi(inf);
+                axum::Json(spec.to_json_value())
+            }
         })
     }
 
@@ -391,7 +415,7 @@ where
         let (axum_router, registry) = stateless.into_parts();
         let adapted: axum::Router<S> = axum_router.with_state(());
         self.inner = self.inner.merge(adapted);
-        self.registry.extend(registry);
+        self.registry.write().unwrap().extend(registry);
         self
     }
 }
@@ -426,7 +450,7 @@ impl<S> From<axum::Router<S>> for Router<S> {
     fn from(axum_router: axum::Router<S>) -> Self {
         Self {
             inner: axum_router,
-            registry: RouteRegistry::new(),
+            registry: Arc::new(RwLock::new(RouteRegistry::new())),
         }
     }
 }

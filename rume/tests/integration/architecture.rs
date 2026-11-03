@@ -300,3 +300,110 @@ async fn test_app_from_builder_executes_module_lifecycle() {
     app.teardown();
     assert!(shutdown.load(Ordering::SeqCst));
 }
+
+#[test]
+fn architecture_rules_detects_undeclared_missing_dependencies() {
+    // Architecture M1: detect dependencies on modules not in verified set
+    let payments = PaymentsModule {
+        deps: vec!["unprovided_module"],
+    };
+
+    let rules = ArchitectureRules::new();
+    let modules: Vec<&dyn Module> = vec![&payments];
+    let err = rules.verify(&modules).unwrap_err();
+    assert_eq!(err.rule, "undeclared_dependency");
+    assert!(err.details.contains("unprovided_module"));
+}
+
+struct CycleModuleA;
+impl Module for CycleModuleA {
+    fn name(&self) -> &'static str {
+        "cycle_a"
+    }
+    fn dependencies(&self) -> Vec<&'static str> {
+        vec!["cycle_b"]
+    }
+}
+
+struct CycleModuleB;
+impl Module for CycleModuleB {
+    fn name(&self) -> &'static str {
+        "cycle_b"
+    }
+    fn dependencies(&self) -> Vec<&'static str> {
+        vec!["cycle_a"]
+    }
+}
+
+#[test]
+fn architecture_rules_detects_circular_dependencies() {
+    // Architecture M1: detect circular dependencies in verified set
+    let rules = ArchitectureRules::new();
+    let a = CycleModuleA;
+    let b = CycleModuleB;
+    let modules: Vec<&dyn Module> = vec![&a, &b];
+    let err = rules.verify(&modules).unwrap_err();
+    assert_eq!(err.rule, "circular_dependency");
+    assert!(err.details.contains("circular dependency detected"));
+}
+
+struct AnyOverlapModule;
+impl Module for AnyOverlapModule {
+    fn name(&self) -> &'static str {
+        "any_overlap"
+    }
+    fn register_routes(&self, router: Router) -> Router {
+        router.any("/shared/endpoint", || async { "any" })
+    }
+}
+
+#[tokio::test]
+async fn route_merge_collision_detects_any_overlap() {
+    // App M4: Check ANY matcher overlap between builder route and module route
+    let builder = Rume::new()
+        .get("/shared/endpoint", || async { "get" })
+        .module(AnyOverlapModule);
+
+    let res = builder.build_test_app().await;
+    assert!(res.is_err());
+    let err = res.unwrap_err();
+    assert!(matches!(
+        err,
+        rume::app::builder::BuildError::DuplicateRoute { ref path, .. } if path == "/shared/endpoint"
+    ));
+}
+
+struct DomainModule;
+impl Module for DomainModule {
+    fn name(&self) -> &'static str {
+        "domain"
+    }
+    fn register_routes(&self, router: Router) -> Router {
+        router.get("/domain/items", || async { "domain items" })
+    }
+}
+
+#[tokio::test]
+async fn openapi_dynamically_includes_module_routes_and_late_registered_routes() {
+    // App M1 & Routing M1: OpenAPI endpoint generated lazily includes module routes
+    // and routes registered after .openapi()
+    let info = rume::openapi::OpenApiInfo::new("Test API", "1.0.0");
+
+    let builder = Rume::new()
+        .openapi("/openapi.json", info)
+        .module(DomainModule)
+        .get("/after/openapi", || async { "after" });
+
+    let app = builder.build_test_app().await.expect("test app build");
+
+    let res = app.get("/openapi.json").await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = TestApp::body_text(res).await;
+    let doc: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+    let paths = doc["paths"].as_object().expect("paths object");
+    // Verify builder route registered after .openapi() is included
+    assert!(paths.contains_key("/after/openapi"), "missing /after/openapi");
+    // Verify module route registered via Module is included
+    assert!(paths.contains_key("/domain/items"), "missing /domain/items");
+}

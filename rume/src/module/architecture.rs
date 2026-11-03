@@ -81,12 +81,74 @@ impl ArchitectureRules {
             }
         }
 
-        // 2. Build dependency graph and compute transitive closure
+        // 2. Verify all declared dependencies exist in the verified module set (fail-closed against unprovided modules)
+        for module in modules {
+            for dep in module.dependencies() {
+                if !registered_names.contains(&dep) {
+                    return Err(ArchitectureViolation {
+                        rule: "undeclared_dependency".to_string(),
+                        details: format!(
+                            "module '{}' depends on '{dep}', which is missing from the verified module set",
+                            module.name()
+                        ),
+                    });
+                }
+            }
+        }
+
+        // 3. Build dependency graph and detect cycles
         let mut dep_graph: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for module in modules {
             dep_graph.insert(module.name(), module.dependencies());
         }
 
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum DfsState {
+            Unvisited,
+            Visiting,
+            Visited,
+        }
+
+        let mut states: BTreeMap<&str, DfsState> = BTreeMap::new();
+        for module in modules {
+            states.insert(module.name(), DfsState::Unvisited);
+        }
+
+        fn check_cycle<'a>(
+            node: &'a str,
+            dep_graph: &BTreeMap<&'a str, Vec<&'a str>>,
+            states: &mut BTreeMap<&'a str, DfsState>,
+        ) -> Result<(), ArchitectureViolation> {
+            states.insert(node, DfsState::Visiting);
+            if let Some(deps) = dep_graph.get(node) {
+                for dep in deps {
+                    match states.get(dep) {
+                        Some(DfsState::Visiting) => {
+                            return Err(ArchitectureViolation {
+                                rule: "circular_dependency".to_string(),
+                                details: format!(
+                                    "circular dependency detected involving module '{node}' and '{dep}'"
+                                ),
+                            });
+                        }
+                        Some(DfsState::Unvisited) => {
+                            check_cycle(dep, dep_graph, states)?;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            states.insert(node, DfsState::Visited);
+            Ok(())
+        }
+
+        for module in modules {
+            if states.get(module.name()) == Some(&DfsState::Unvisited) {
+                check_cycle(module.name(), &dep_graph, &mut states)?;
+            }
+        }
+
+        // 4. Compute transitive closure
         let mut transitive_deps: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         for module in modules {
             let mut visited = BTreeSet::new();
@@ -107,7 +169,7 @@ impl ArchitectureRules {
             transitive_deps.insert(module.name(), visited);
         }
 
-        // 3. Verify forbidden dependencies against direct and transitive dependencies
+        // 5. Verify forbidden dependencies against direct and transitive dependencies
         for (forbidden_from, forbidden_to) in &self.forbidden_deps {
             if let Some(all_deps) = transitive_deps.get(forbidden_from.as_str())
                 && all_deps.contains(forbidden_to.as_str())

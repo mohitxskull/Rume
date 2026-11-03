@@ -169,7 +169,7 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
                     crate::routing::Matcher::Slug => OpenApiSchema {
                         r#type: "string".into(),
                         format: None,
-                        pattern: Some("^[a-z0-9]+(?:-[a-z0-9]+)*$".into()),
+                        pattern: Some("^[a-zA-Z0-9][a-zA-Z0-9_-]{1,}[a-zA-Z0-9]$".into()),
                     },
                 }
             } else if param.contains("uuid") {

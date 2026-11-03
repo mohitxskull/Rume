@@ -36,19 +36,19 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group C — Dynamic OpenAPI & Route Registration (solve together)
 > Root cause: Eager compilation of OpenAPI specs during builder construction discards all later-registered domain module routes and subrouters.
 
-- [ ] **App M1 — `RumeBuilder::openapi()` freezes route registry eagerly, omitting module routes** (`app-lifecycle.md` M1).
+- [x] **App M1 — `RumeBuilder::openapi()` freezes route registry eagerly, omitting module routes** (`app-lifecycle.md` M1).
       `rume/src/app/builder.rs:739–746, 1088–1091`: `OpenApiSpec::from_routes` is generated eagerly when `.openapi(...)` is called, discarding all module endpoints. Defer OpenAPI generation to preflight completion via lazy evaluation on the final merged registry.
-- [ ] **Routing M1 — `Router::openapi()` captures static snapshot at registration time** (`routing-api-openapi.md` M1).
+- [x] **Routing M1 — `Router::openapi()` captures static snapshot at registration time** (`routing-api-openapi.md` M1).
       `rume/src/routing/router.rs:361–369`: Static routes snapshot misses subsequently mounted subrouters. Wire OpenAPI endpoint to query the shared `Arc<RouteRegistry>` dynamically.
-- [ ] **Routing M2 — OpenAPI parameter schema regex for `Matcher::Slug` contradicts runtime** (`routing-api-openapi.md` M2).
+- [x] **Routing M2 — OpenAPI parameter schema regex for `Matcher::Slug` contradicts runtime** (`routing-api-openapi.md` M2).
       `rume/src/openapi/spec.rs:169–173`: Pattern `^[a-z0-9]+(?:-[a-z0-9]+)*$` contradicts `matchers.rs:66–85` which accepts underscores, uppercase letters, and lengths up to 128. Align regex pattern with runtime validator.
 
 ### Group D — Module Preflight & Boundary Verification (solve together)
 > Root cause: Route collision preflight and architecture rule verification do not check transitive reachability or overlapping wildcard methods.
 
-- [ ] **App M4 — Module route collision preflight ignores `ANY` matcher overlap, triggering Axum panics** (`app-lifecycle.md` M4).
+- [x] **App M4 — Module route collision preflight ignores `ANY` matcher overlap, triggering Axum panics** (`app-lifecycle.md` M4).
       `rume/src/app/builder.rs:964–984`: Checks method equality without handling `MethodFilter::all()` / `ANY` overlaps, causing Axum's `Router::merge` to panic at runtime. Check bitwise intersection of method filters on identical paths; fail closed with `BuildError::DuplicateRoute`.
-- [ ] **Architecture M1 — `ArchitectureRules::verify` ignores undeclared dependencies and cycles** (`architecture-module-boundaries.md` M1).
+- [x] **Architecture M1 — `ArchitectureRules::verify` ignores undeclared dependencies and cycles** (`architecture-module-boundaries.md` M1).
       `rume/src/module/architecture.rs:84–123`: Traverses only explicitly declared dependencies, allowing transitive forbidden calls to bypass CI. Traverse transitive dependency graph and detect cycles during `verify()`.
 
 ### Group E — Redis & Multi-Tenant Coordination Isolation (solve together)

@@ -124,9 +124,9 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
     pub fn resource(mut self, resource: Resource<S>) -> Self {
         for r in resource.routes() {
             let full_path = join_path(&self.prefix, &r.path);
-            let mut sub_router = Router::new().route(&full_path, r.router.clone());
-            sub_router.registry_mut().clear();
-            sub_router.registry_mut().register(RouteInfo {
+            let sub_router = Router::new().route(&full_path, r.router.clone());
+            sub_router.clear_registry();
+            sub_router.record_route(RouteInfo {
                 method: r.method.clone(),
                 path: full_path,
                 name: Some(r.name.clone()),
