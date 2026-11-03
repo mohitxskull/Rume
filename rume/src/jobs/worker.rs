@@ -298,7 +298,9 @@ impl<Q: JobQueue> JobWorker<Q> {
 
             tokio::spawn(async move {
                 while !is_stopping.load(Ordering::Relaxed) {
-                    let _ = hb_loop.record_heartbeat(&worker_id, ttl).await;
+                    if let Err(e) = hb_loop.record_heartbeat(&worker_id, ttl).await {
+                        tracing::warn!(worker_id = %worker_id, error = %e, "Failed to record worker heartbeat");
+                    }
                     sleep(interval).await;
                 }
             });
@@ -310,10 +312,21 @@ impl<Q: JobQueue> JobWorker<Q> {
                 tokio::spawn(async move {
                     while !is_stopping.load(Ordering::Relaxed) {
                         sleep(recovery_interval).await;
-                        if let Ok(dead) = hb_reap.reap_dead_workers().await
-                            && !dead.is_empty()
-                        {
-                            let _ = queue.reclaim_abandoned_jobs(&dead).await;
+                        match hb_reap.reap_dead_workers().await {
+                            Ok(dead) => {
+                                if !dead.is_empty()
+                                    && let Err(e) = queue.reclaim_abandoned_jobs(&dead).await
+                                {
+                                    tracing::error!(
+                                        error = %e,
+                                        dead_workers = ?dead,
+                                        "Failed to reclaim abandoned jobs"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = %e, "Failed to reap dead workers during recovery");
+                            }
                         }
                     }
                 });
@@ -420,7 +433,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                     }
                     return;
                 }
-                _ => {}
+                Ok(IdempotencyStatus::New) => {}
+                Err(err) => {
+                    tracing::error!(
+                        job_id = %job_id,
+                        key = %key,
+                        error = %err,
+                        "Failed to acquire idempotency lock"
+                    );
+                }
             }
         }
 
@@ -489,15 +510,29 @@ impl<Q: JobQueue> JobWorker<Q> {
                     transition_errors.fetch_add(1, Ordering::SeqCst);
                     lost_leases.fetch_add(1, Ordering::SeqCst);
                 }
-                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                    let _ = store.complete_with_token(key, &token, None).await;
+                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                    && let Err(err) = store.complete_with_token(key, &token, None).await
+                {
+                    tracing::error!(
+                        job_id = %job_id,
+                        key = %key,
+                        error = %err,
+                        "Failed to record idempotency completion"
+                    );
                 }
             }
             Err(JobError::Fatal(msg))
             | Err(JobError::UnknownJob(msg))
             | Err(JobError::Serialization(msg)) => {
-                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                    let _ = store.release_with_token(key, &token).await;
+                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                    && let Err(err) = store.release_with_token(key, &token).await
+                {
+                    tracing::error!(
+                        job_id = %job_id,
+                        key = %key,
+                        error = %err,
+                        "Failed to release idempotency token on fatal failure"
+                    );
                 }
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
@@ -512,6 +547,16 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(err) => {
                 // Retryable failure: check remaining attempts
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                        && let Err(rel_err) = store.release_with_token(key, &token).await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            key = %key,
+                            error = %rel_err,
+                            "Failed to release idempotency token on retry"
+                        );
+                    }
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -522,8 +567,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     }
                 } else {
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                        let _ = store.release_with_token(key, &token).await;
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                        && let Err(rel_err) = store.release_with_token(key, &token).await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            key = %key,
+                            error = %rel_err,
+                            "Failed to release idempotency token on dead letter"
+                        );
                     }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {

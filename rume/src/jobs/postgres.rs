@@ -152,15 +152,14 @@ impl JobQueue for PostgresJobQueue {
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
         let wid = worker_id.to_string();
         Box::pin(async move {
-            let now = current_epoch_millis();
-            let lease_duration = self.default_lease_duration.as_millis() as i64;
-            let lease_expires_at = now.saturating_add(lease_duration);
+            // Use database-evaluated time: lease_expires_at = clock_timestamp() + $2 ms
+            // No host-clock values are bound; the DB is the sole clock authority.
+            let lease_duration_ms = self.default_lease_duration.as_millis() as i64;
             let new_lease_token = Uuid::new_v4().to_string();
 
             let row: Option<PgRow> = sqlx::query(JOBS_CLAIM_SQL)
                 .bind(&wid)
-                .bind(lease_expires_at)
-                .bind(now)
+                .bind(lease_duration_ms)
                 .bind(&new_lease_token)
                 .fetch_optional(&self.pool)
                 .await
@@ -179,7 +178,7 @@ impl JobQueue for PostgresJobQueue {
                 let idempotency_key: Option<String> = r.try_get(9).ok();
                 let tenant_id: Option<String> = r.try_get(10).ok();
                 let assigned_worker: Option<String> = r.try_get(11).ok();
-                let available_at_ms: i64 = r.try_get(12).unwrap_or(now);
+                let available_at_ms: i64 = r.try_get(12).unwrap_or(0);
                 let lease_token: Option<String> = r.try_get(13).ok();
 
                 let retry_policy = RetryPolicy {
@@ -191,6 +190,7 @@ impl JobQueue for PostgresJobQueue {
 
                 let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
 
+                let now = current_epoch_millis();
                 let available_at = if available_at_ms <= now {
                     Instant::now()
                 } else {
@@ -311,16 +311,19 @@ impl JobQueue for PostgresJobQueue {
         let jid = job_id.to_string();
         let token = lease_token.to_string();
         Box::pin(async move {
-            let now = current_epoch_millis();
-            let new_expiry = now.saturating_add(extension.as_millis() as i64);
+            // Both the new expiry and the validity check use clock_timestamp() so all
+            // lease decisions are made by the database clock, not the worker clock.
+            let extension_ms = extension.as_millis() as i64;
 
             let res = sqlx::query(
-                "UPDATE rume_jobs SET lease_expires_at = $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > $4"
+                "UPDATE rume_jobs \
+                 SET lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 \
+                 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' \
+                   AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
             )
-            .bind(new_expiry)
+            .bind(extension_ms)
             .bind(&jid)
             .bind(&token)
-            .bind(now)
             .execute(&self.pool)
             .await
             .map_err(|e| JobError::Fatal(e.to_string()))?;

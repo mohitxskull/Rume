@@ -407,6 +407,38 @@ impl OutboxRepository for MysqlBackend {
         })
     }
 
+    fn renew_outbox_lease(
+        &self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
+        let token_str = lease_token.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE rume_outbox \
+                 SET lease_expires_at = UNIX_TIMESTAMP() + ? \
+                 WHERE id = ? AND lease_token = ? AND status = 'inflight' \
+                   AND lease_expires_at > UNIX_TIMESTAMP()"
+            )
+            .bind(extension_secs as i64)
+            .bind(&id_str)
+            .bind(&token_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(OutboxError::Repository(format!(
+                    "cannot renew lease: message {id_str} not in flight, lease expired, or token mismatch"
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
     fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();

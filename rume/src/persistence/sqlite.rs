@@ -415,6 +415,38 @@ impl OutboxRepository for SqliteBackend {
         })
     }
 
+    fn renew_outbox_lease(
+        &self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
+        let token_str = lease_token.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE rume_outbox \
+                 SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?1 \
+                 WHERE id = ?2 AND lease_token = ?3 AND status = 'inflight' \
+                   AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)"
+            )
+            .bind(extension_secs as i64)
+            .bind(&id_str)
+            .bind(&token_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(OutboxError::Repository(format!(
+                    "cannot renew lease: message {id_str} not in flight, lease expired, or token mismatch"
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
     fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();

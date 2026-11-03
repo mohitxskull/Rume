@@ -325,9 +325,7 @@ impl OutboxRepository for PostgresBackend {
 
     fn fetch_pending(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now as i64)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
@@ -347,8 +345,6 @@ impl OutboxRepository for PostgresBackend {
         lease_duration_secs: u64,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
-            let expires_at = now + lease_duration_secs;
             let mut tx = self
                 .pool
                 .begin()
@@ -356,7 +352,6 @@ impl OutboxRepository for PostgresBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now as i64)
                 .bind(limit as i64)
                 .fetch_all(&mut *tx)
                 .await
@@ -367,10 +362,10 @@ impl OutboxRepository for PostgresBackend {
                 let mut msg = parse_postgres_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
                 sqlx::query(
-                    "UPDATE rume_outbox SET status = 'inflight', lease_token = $1, lease_expires_at = $2 WHERE id = $3"
+                    "UPDATE rume_outbox SET status = 'inflight', lease_token = $1, lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $2 WHERE id = $3"
                 )
                 .bind(&token)
-                .bind(expires_at as i64)
+                .bind(lease_duration_secs as i64)
                 .bind(&msg.id)
                 .execute(&mut *tx)
                 .await
@@ -378,7 +373,7 @@ impl OutboxRepository for PostgresBackend {
 
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);
-                msg.lease_expires_at = Some(expires_at);
+                msg.lease_expires_at = None;
                 claimed.push(msg);
             }
 
@@ -390,12 +385,44 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
+    fn renew_outbox_lease(
+        &self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id_str = id.to_string();
+        let token_str = lease_token.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE rume_outbox \
+                 SET lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $1 \
+                 WHERE id = $2 AND lease_token = $3 AND status = 'inflight' \
+                   AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
+            )
+            .bind(extension_secs as i64)
+            .bind(&id_str)
+            .bind(&token_str)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(OutboxError::Repository(format!(
+                    "cannot renew lease: message {id_str} not in flight, lease expired, or token mismatch"
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
     fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)"
+                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
             )
             .bind(&id_str)
             .bind(&token_str)
@@ -427,7 +454,7 @@ impl OutboxRepository for PostgresBackend {
         let token_str = lease_token.to_string();
         Box::pin(async move {
             let now = current_timestamp();
-            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)")
+            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1 AND lease_token = $2 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT")
                 .bind(&id_str)
                 .bind(&token_str)
                 .fetch_optional(&self.pool)
@@ -446,7 +473,7 @@ impl OutboxRepository for PostgresBackend {
             let next_retry = now + backoff_secs;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > CAST(EXTRACT(EPOCH FROM clock_timestamp()) AS BIGINT)"
+                "UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
             )
             .bind(status)
             .bind(retry_count)
@@ -470,9 +497,7 @@ impl OutboxRepository for PostgresBackend {
 
     fn recover_expired_claims(&self, _max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
-                .bind(now as i64)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

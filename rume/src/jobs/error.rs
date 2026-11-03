@@ -28,4 +28,8 @@ pub enum JobError {
     /// The queue has been closed or stopped.
     #[error("job queue is closed")]
     QueueClosed,
+
+    /// The requested operation is not supported by this queue backend.
+    #[error("operation not supported by this queue backend: {0}")]
+    Unsupported(String),
 }

@@ -54,13 +54,22 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), JobError>>;
 
     /// Extends the exclusive claim lease of an actively running job.
+    ///
+    /// The default implementation returns `Err(JobError::Unsupported)` to prevent
+    /// backends from silently appearing lease-renewal-capable when they do not implement it.
+    /// Backends that support renewal must override this method.
     fn renew_lease(
         &self,
-        _job_id: &str,
+        job_id: &str,
         _lease_token: &str,
         _extension: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        Box::pin(async move { Ok(()) })
+        let id = job_id.to_string();
+        Box::pin(async move {
+            Err(JobError::Unsupported(format!(
+                "lease renewal not supported by this queue backend (job_id={id})"
+            )))
+        })
     }
 
     /// Returns the number of currently pending jobs in the queue.

@@ -165,6 +165,52 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 }
             };
 
+            // Renew the lease before dispatching to refresh it after waiting in batch
+            let lease_duration_secs = self.config.lease_duration_secs;
+            let renew_extension_secs = lease_duration_secs.max(2);
+            if let Err(e) = self
+                .repository
+                .renew_outbox_lease(&message.id, token, renew_extension_secs)
+                .await
+            {
+                tracing::warn!(
+                    message_id = %message.id,
+                    error = %e,
+                    "Failed to renew outbox message lease before dispatch; lease expired or token mismatch"
+                );
+                result.failed_transitions += 1;
+                continue;
+            }
+
+            // Spawn a heartbeat task to keep the lease renewed while the dispatcher runs
+            let hb_repo = Arc::clone(&self.repository);
+            let hb_msg_id = message.id.clone();
+            let hb_token = token.to_string();
+            let hb_interval = Duration::from_millis(
+                (lease_duration_secs * 1000 / 3).clamp(50, 20_000),
+            );
+            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+            let heartbeat_handle = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(hb_interval);
+                interval.tick().await; // first tick immediate
+                loop {
+                    tokio::select! {
+                        _ = &mut cancel_rx => break,
+                        _ = interval.tick() => {
+                            if let Err(e) = hb_repo.renew_outbox_lease(&hb_msg_id, &hb_token, renew_extension_secs).await {
+                                tracing::warn!(
+                                    message_id = %hb_msg_id,
+                                    error = %e,
+                                    "Failed to renew outbox lease heartbeat"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+
             let fut_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (self.dispatcher)(&message)
             }));
@@ -176,6 +222,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 },
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
             };
+
+            let _ = cancel_tx.send(());
+            let _ = heartbeat_handle.await;
 
             match dispatch_result {
                 Ok(()) => {

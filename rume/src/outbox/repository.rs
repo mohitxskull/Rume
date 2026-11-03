@@ -36,6 +36,20 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
         lease_duration_secs: u64,
     ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>>;
 
+    /// Extends the lease of an in-flight outbox message, preventing it from being
+    /// recovered while dispatch is still in progress.
+    ///
+    /// Only updates the message if the token matches and the lease has not yet expired.
+    /// The default implementation is a no-op for backends that do not support lease renewal.
+    fn renew_outbox_lease(
+        &self,
+        _id: &str,
+        _lease_token: &str,
+        _extension_secs: u64,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
     /// Marks a message as successfully published with the worker's active lease token.
     fn mark_published(&self, id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
 

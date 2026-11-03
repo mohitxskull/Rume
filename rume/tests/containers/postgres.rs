@@ -24,7 +24,9 @@ use rume::jobs::{
     BoxFuture, Job, JobContext, JobError, JobHandler, JobQueue, JobRegistry, JobWorker,
     PostgresJobQueue,
 };
-use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRepository, TransactionalOutbox};
+use rume::outbox::{
+    OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, TransactionalOutbox,
+};
 use rume::persistence::error::PersistenceError;
 use rume::persistence::migration::{Migration, Migrator};
 use rume::persistence::pool::DatabasePool;
@@ -1358,4 +1360,94 @@ async fn test_postgres_job_worker_heartbeat_renewal_keeps_long_running_job_valid
     // Verify job was acknowledged and is no longer pending
     assert_eq!(queue.pending_count().await.unwrap(), 0);
     assert!(worker.drain(Duration::from_secs(1)).await);
+}
+
+#[tokio::test]
+async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = Arc::new(pool.backend().clone());
+    backend.init_outbox_table().await.expect("init outbox table failed");
+
+    let event = OrderPlacedEvent {
+        order_id: "order-relay-heartbeat-1".into(),
+        amount: 9900,
+    };
+    let msg = OutboxMessage::from_event(&event).expect("outbox message");
+    backend.save(msg).await.expect("save outbox message");
+
+    // Configure relay with a 1-second lease
+    let config = OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 1,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let dispatched_clone = Arc::clone(&dispatched);
+
+    // Dispatcher sleeps 1400ms (> initial 1s lease duration!)
+    let relay = OutboxRelay::new(Arc::clone(&backend), move |_msg: &OutboxMessage| {
+        let count = Arc::clone(&dispatched_clone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(1400)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch failed");
+
+    // Heartbeat kept lease renewed, so mark_published succeeded
+    assert_eq!(res.published, 1);
+    assert_eq!(res.failed_transitions, 0);
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.pending_count().await.unwrap(), 0);
+    assert_eq!(backend.published_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = Arc::new(pool.backend().clone());
+    backend.init_outbox_table().await.expect("init outbox table failed");
+
+    // Enqueue 2 messages
+    let msg1 = OutboxMessage::new("msg-batch-1", "order.placed", b"{}".to_vec());
+    let msg2 = OutboxMessage::new("msg-batch-2", "order.placed", b"{}".to_vec());
+    backend.save(msg1).await.expect("save msg1");
+    backend.save(msg2).await.expect("save msg2");
+
+    // 1-second lease for the batch of 2 messages
+    let config = OutboxRelayConfig {
+        batch_size: 2,
+        lease_duration_secs: 1,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    let processed = Arc::new(AtomicUsize::new(0));
+    let processed_clone = Arc::clone(&processed);
+
+    // Each message takes 600ms to dispatch.
+    // Total sequential processing time for batch is 1200ms (> 1s original lease).
+    // Pre-dispatch renewal ensures msg2's lease is refreshed before its dispatch starts!
+    let relay = OutboxRelay::new(Arc::clone(&backend), move |_msg: &OutboxMessage| {
+        let count = Arc::clone(&processed_clone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(2).await.expect("poll_and_dispatch failed");
+
+    assert_eq!(res.published, 2);
+    assert_eq!(res.failed_transitions, 0);
+    assert_eq!(processed.load(Ordering::SeqCst), 2);
+    assert_eq!(backend.pending_count().await.unwrap(), 0);
+    assert_eq!(backend.published_count().await.unwrap(), 2);
 }

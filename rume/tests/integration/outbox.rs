@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use rume::events::Event;
 use rume::outbox::{
-    OutboxError, OutboxMessage, OutboxRelay, OutboxRepository, OutboxStatus,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, OutboxStatus,
 };
 use rume::persistence::SqliteBackend;
 use serde::{Deserialize, Serialize};
@@ -883,4 +883,44 @@ async fn duplicate_event_delivery_consumer_idempotency_prevents_duplicate_effect
         500,
         "consumer idempotency must guarantee duplicate event delivery does not duplicate business effects"
     );
+}
+
+#[tokio::test]
+async fn sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
+    let repo = setup_real_outbox().await;
+    let event = OrderPaidEvent {
+        order_id: "order_relay_sqlite_hb".into(),
+        amount_cents: 8900,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    repo.save(msg).await.unwrap();
+
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let dispatched_clone = Arc::clone(&dispatched);
+
+    // Relay with 1-second lease duration
+    let config = OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 1,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    // Dispatcher runs for 1200ms (> initial 1s lease)
+    let relay = OutboxRelay::new(Arc::clone(&repo), move |_msg: &OutboxMessage| {
+        let count = Arc::clone(&dispatched_clone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(10).await.expect("dispatch");
+    assert_eq!(res.published, 1);
+    assert_eq!(res.failed_transitions, 0);
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.pending_count().await.unwrap(), 0);
+    assert_eq!(repo.published_count().await.unwrap(), 1);
 }
