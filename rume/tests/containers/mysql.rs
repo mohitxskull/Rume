@@ -10,7 +10,7 @@ use rume::persistence::{
     DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MysqlBackend,
 };
 
-mod common;
+use crate::common;
 
 async fn start_mysql_node() -> (
     &'static testcontainers_modules::testcontainers::ContainerAsync<Mysql>,

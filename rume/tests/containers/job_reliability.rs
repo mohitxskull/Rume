@@ -11,7 +11,7 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
 use tokio::time::sleep;
 
-mod common;
+use crate::common;
 
 async fn start_redis_pool() -> (
     &'static testcontainers_modules::testcontainers::ContainerAsync<Redis>,

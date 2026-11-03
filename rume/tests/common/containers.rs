@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
 use tokio::sync::OnceCell;
 
 // ─── PostgreSQL Shared Container & Isolation ─────────────────────────────────

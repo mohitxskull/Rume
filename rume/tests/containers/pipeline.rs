@@ -76,7 +76,7 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
     }
 }
 
-mod common;
+use crate::common;
 
 #[tokio::test]
 async fn realistic_enterprise_pipeline_end_to_end() {

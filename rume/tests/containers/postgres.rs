@@ -31,7 +31,7 @@ use rume::routing::health::{HealthCheck, HealthStatus};
 
 use testcontainers_modules::postgres::Postgres;
 
-mod common;
+use crate::common;
 
 /// Helper to spin up a PostgreSQL 16 container and return a configured connection pool.
 async fn setup_postgres_pool(

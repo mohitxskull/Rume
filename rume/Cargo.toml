@@ -57,3 +57,11 @@ insta = { version = "1.49", features = ["json"] }
 rstest = "0.28"
 wiremock = "0.6"
 ureq = "3.5"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[[test]]
+name = "containers"
+path = "tests/containers.rs"

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 use rume::config;
 use rume::env::ResolvedEnv;
 use serde::Deserialize;

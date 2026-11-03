@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use testcontainers_modules::redis::Redis;
 
-mod common;
+use crate::common;
 
 /// Helper to start a Redis alpine container and construct a connected backend.
 async fn setup_redis_backend() -> (
