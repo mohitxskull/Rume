@@ -2542,6 +2542,7 @@ dependencies = [
  "deadpool-redis",
  "dotenvy",
  "figment",
+ "futures-util",
  "garde",
  "hmac",
  "insta",

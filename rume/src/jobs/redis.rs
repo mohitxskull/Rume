@@ -314,11 +314,11 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            // Only delete the lock if it is still IN_PROGRESS, preventing deletion of completed jobs or peer claims
+            // Evicts key if IN_PROGRESS or COMPLETED, clearing idempotency state
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
-                if current == 'IN_PROGRESS' then
+                if current == 'IN_PROGRESS' or (current and string.sub(current, 1, 9) == 'COMPLETED') then
                     redis.call('DEL', KEYS[1])
                     return 1
                 else

@@ -41,9 +41,9 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 ### Group C — Distributed Coordination Fencing & Idempotency Eviction (solve together)
 > Root cause: Overly restrictive state checks in Lua eviction scripts and preserved election terms on unexpired crash re-acquisition.
 
-- [ ] **Coordination M1 — `RedisIdempotencyStore::release` ignores `COMPLETED` records, breaking key eviction and failing `test_redis_idempotency_store`** (`coordination-multi-tenant.md` M1, `jobs-worker-concurrency.md` m1, `testing-feature-matrix.md` M2).
+- [x] **Coordination M1 — `RedisIdempotencyStore::release` ignores `COMPLETED` records, breaking key eviction and failing `test_redis_idempotency_store`** (`coordination-multi-tenant.md` M1, `jobs-worker-concurrency.md` m1, `testing-feature-matrix.md` M2).
       `rume/src/jobs/redis.rs:320–334`: `release` script only deletes keys if value is `'IN_PROGRESS'`. Consequently, `'COMPLETED'` records can never be cleared, reset, or evicted, causing `test_redis_idempotency_store` (`rume/tests/containers/redis.rs:534`) to fail on re-acquisition. Update Lua script to delete keys if status is either `'IN_PROGRESS'` or `'COMPLETED'`.
-- [ ] **Coordination M2 — `leader_acquire.sql` preserves election term on unexpired re-acquisition, defeating monotonic fencing on node crash recovery** (`coordination-multi-tenant.md` M2).
+- [x] **Coordination M2 — `leader_acquire.sql` preserves election term on unexpired re-acquisition, defeating monotonic fencing on node crash recovery** (`coordination-multi-tenant.md` M2).
       `rume/src/persistence/sql/postgres/leader_acquire.sql:6–12`: Query retains `OR rume_leaders.candidate_id = $2` and suppresses term incrementation when `expires_at > clock_timestamp()`. A crashed node restarting within its TTL calls `try_acquire` on boot and re-acquires leadership with the exact same term, defeating downstream split-brain fencing and diverging from `RedisLeaderElector`. Increment `term = nextval('rume_leader_term_seq')` on every acquisition.
 
 ### Group D — Security Envelope Signature Binding & CSRF Hardening (solve together)
@@ -80,7 +80,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
       `rume/src/jobs/redis.rs:284–302, 318–334`: `complete` and `release` Lua scripts check only key presence and status, but not the worker token that acquired the claim.
 - [x] **Jobs m2 — Job lease renewal failure in `JobWorker` heartbeat does not signal cancellation to running job handler** (`jobs-worker-concurrency.md` m2).
       `rume/src/jobs/worker.rs:356–361`: If `renew_lease` returns an error, the heartbeat task logs a warning but does not trigger the `CancellationToken` in `JobContext`.
-- [ ] **Coordination m1 — Duplicate sequence evaluation in `leader_acquire.sql` conflict update path burns term sequence numbers** (`coordination-multi-tenant.md` m1).
+- [x] **Coordination m1 — Duplicate sequence evaluation in `leader_acquire.sql` conflict update path burns term sequence numbers** (`coordination-multi-tenant.md` m1).
       `rume/src/persistence/sql/postgres/leader_acquire.sql:10–12`: Conflict resolution evaluates `nextval()` multiple times on collision.
 - [ ] **Coordination m2 — `RateLimitService` ignores `TenantContext` extensions, bypassing tenant rate limiting for subdomain-routed requests** (`coordination-multi-tenant.md` m2).
       `rume/src/resilience/rate_limiter.rs:260–270`: Rate limiting middleware extracts tenant ID only from headers, ignoring `TenantContext` injected by `SubdomainTenantResolver`.
