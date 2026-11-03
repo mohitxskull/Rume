@@ -9,7 +9,6 @@ use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, S
 use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
-use crate::outbox::message::current_timestamp;
 use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     TransactionalOutbox,
@@ -350,9 +349,7 @@ impl OutboxRepository for SqliteBackend {
 
     fn fetch_pending(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now as i64)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
@@ -372,8 +369,6 @@ impl OutboxRepository for SqliteBackend {
         lease_duration_secs: u64,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
-            let expires_at = now + lease_duration_secs;
             let mut tx = self
                 .pool
                 .begin()
@@ -381,7 +376,6 @@ impl OutboxRepository for SqliteBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now as i64)
                 .bind(limit as i64)
                 .fetch_all(&mut *tx)
                 .await
@@ -391,19 +385,20 @@ impl OutboxRepository for SqliteBackend {
             for row in &rows {
                 let mut msg = parse_sqlite_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
-                sqlx::query(
-                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?1, lease_expires_at = ?2 WHERE id = ?3"
+                let updated = sqlx::query(
+                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?1, lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?2 WHERE id = ?3 RETURNING lease_expires_at"
                 )
                 .bind(&token)
-                .bind(expires_at as i64)
+                .bind(lease_duration_secs as i64)
                 .bind(&msg.id)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+                let exp: i64 = updated.try_get(0).unwrap_or(0);
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);
-                msg.lease_expires_at = Some(expires_at);
+                msg.lease_expires_at = Some(exp as u64);
                 claimed.push(msg);
             }
 
@@ -483,7 +478,6 @@ impl OutboxRepository for SqliteBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let now = current_timestamp();
             let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ?1 AND lease_token = ?2 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)")
                 .bind(&id_str)
                 .bind(&token_str)
@@ -500,15 +494,14 @@ impl OutboxRepository for SqliteBackend {
             let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
             let status = if retry_count >= max_retries as i32 { "failed" } else { "pending" };
             let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
-            let next_retry = now + backoff_secs;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = ?1, retry_count = ?2, last_error = ?3, next_retry_at = ?4, lease_token = NULL, lease_expires_at = NULL WHERE id = ?5 AND lease_token = ?6 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)"
+                "UPDATE rume_outbox SET status = ?1, retry_count = ?2, last_error = ?3, next_retry_at = CAST(strftime('%s', 'now') AS INTEGER) + ?4, lease_token = NULL, lease_expires_at = NULL WHERE id = ?5 AND lease_token = ?6 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)"
             )
             .bind(status)
             .bind(retry_count)
             .bind(&error)
-            .bind(next_retry as i64)
+            .bind(backoff_secs as i64)
             .bind(&id_str)
             .bind(&token_str)
             .execute(&self.pool)
@@ -527,9 +520,7 @@ impl OutboxRepository for SqliteBackend {
 
     fn recover_expired_claims(&self, _max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
-                .bind(now as i64)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

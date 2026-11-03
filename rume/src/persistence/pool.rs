@@ -400,6 +400,24 @@ where
         })
     }
 
+    fn renew_outbox_lease(
+        &self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        let id = id.to_string();
+        let lease_token = lease_token.to_string();
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .renew_outbox_lease(&id, &lease_token, extension_secs)
+                .await
+        })
+    }
+
     fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id = id.to_string();
         let lease_token = lease_token.to_string();

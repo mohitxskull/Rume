@@ -7,7 +7,6 @@ use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
 use sqlx::{Acquire, MySqlPool, Row};
 use uuid::Uuid;
 
-use crate::outbox::message::current_timestamp;
 use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     TransactionalOutbox,
@@ -334,9 +333,7 @@ impl OutboxRepository for MysqlBackend {
 
     fn fetch_pending(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now)
                 .bind(limit as i64)
                 .fetch_all(&self.pool)
                 .await
@@ -356,8 +353,6 @@ impl OutboxRepository for MysqlBackend {
         lease_duration_secs: u64,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
-            let expires_at = now + lease_duration_secs;
             let mut conn = self
                 .pool
                 .acquire()
@@ -373,7 +368,6 @@ impl OutboxRepository for MysqlBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
-                .bind(now)
                 .bind(limit as i64)
                 .fetch_all(&mut *tx)
                 .await
@@ -384,10 +378,10 @@ impl OutboxRepository for MysqlBackend {
                 let mut msg = parse_mysql_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
                 sqlx::query(
-                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?, lease_expires_at = ? WHERE id = ?"
+                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?, lease_expires_at = UNIX_TIMESTAMP() + ? WHERE id = ?"
                 )
                 .bind(&token)
-                .bind(expires_at)
+                .bind(lease_duration_secs as i64)
                 .bind(&msg.id)
                 .execute(&mut *tx)
                 .await
@@ -395,7 +389,7 @@ impl OutboxRepository for MysqlBackend {
 
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);
-                msg.lease_expires_at = Some(expires_at);
+                msg.lease_expires_at = None;
                 claimed.push(msg);
             }
 
@@ -475,7 +469,6 @@ impl OutboxRepository for MysqlBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let now = current_timestamp();
             let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()")
                 .bind(&id_str)
                 .bind(&token_str)
@@ -492,15 +485,14 @@ impl OutboxRepository for MysqlBackend {
             let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
             let status = if retry_count >= max_retries as i32 { "failed" } else { "pending" };
             let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
-            let next_retry = now + backoff_secs;
 
             let res = sqlx::query(
-                "UPDATE rume_outbox SET status = ?, retry_count = ?, last_error = ?, next_retry_at = ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()"
+                "UPDATE rume_outbox SET status = ?, retry_count = ?, last_error = ?, next_retry_at = UNIX_TIMESTAMP() + ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()"
             )
             .bind(status)
             .bind(retry_count)
             .bind(&error)
-            .bind(next_retry)
+            .bind(backoff_secs as i64)
             .bind(&id_str)
             .bind(&token_str)
             .execute(&self.pool)
@@ -519,9 +511,7 @@ impl OutboxRepository for MysqlBackend {
 
     fn recover_expired_claims(&self, _max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let now = current_timestamp();
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
-                .bind(now)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

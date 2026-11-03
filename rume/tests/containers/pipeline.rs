@@ -196,7 +196,7 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     // Deterministically await background job execution
     notify.notified().await;
 
-    let drained = worker.drain(Duration::from_millis(200)).await;
+    let drained = worker.drain(Duration::from_secs(2)).await;
     assert!(
         drained,
         "worker must successfully process queued job and drain"

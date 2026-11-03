@@ -1375,10 +1375,10 @@ async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatc
     let msg = OutboxMessage::from_event(&event).expect("outbox message");
     backend.save(msg).await.expect("save outbox message");
 
-    // Configure relay with a 1-second lease
+    // Configure relay with a 2-second lease
     let config = OutboxRelayConfig {
         batch_size: 10,
-        lease_duration_secs: 1,
+        lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
     };
@@ -1386,11 +1386,11 @@ async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatc
     let dispatched = Arc::new(AtomicUsize::new(0));
     let dispatched_clone = Arc::clone(&dispatched);
 
-    // Dispatcher sleeps 1400ms (> initial 1s lease duration!)
+    // Dispatcher sleeps 2400ms (> initial 2s lease duration!)
     let relay = OutboxRelay::new(Arc::clone(&backend), move |_msg: &OutboxMessage| {
         let count = Arc::clone(&dispatched_clone);
         async move {
-            tokio::time::sleep(Duration::from_millis(1400)).await;
+            tokio::time::sleep(Duration::from_millis(2400)).await;
             count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1419,10 +1419,10 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
     backend.save(msg1).await.expect("save msg1");
     backend.save(msg2).await.expect("save msg2");
 
-    // 1-second lease for the batch of 2 messages
+    // 2-second lease for claimed messages
     let config = OutboxRelayConfig {
         batch_size: 2,
-        lease_duration_secs: 1,
+        lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
     };
@@ -1430,13 +1430,19 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
     let processed = Arc::new(AtomicUsize::new(0));
     let processed_clone = Arc::clone(&processed);
 
-    // Each message takes 600ms to dispatch.
-    // Total sequential processing time for batch is 1200ms (> 1s original lease).
-    // Pre-dispatch renewal ensures msg2's lease is refreshed before its dispatch starts!
-    let relay = OutboxRelay::new(Arc::clone(&backend), move |_msg: &OutboxMessage| {
+    // Msg1 takes 600ms.
+    // Msg2 sits in batch queue during msg1's dispatch, then takes 1600ms.
+    // Total time elapsed since msg2 was claimed is 2200ms (> initial 2s lease).
+    // Pre-dispatch renewal before msg2 starts dispatch refreshes msg2's lease!
+    let relay = OutboxRelay::new(Arc::clone(&backend), move |msg: &OutboxMessage| {
         let count = Arc::clone(&processed_clone);
+        let msg_id = msg.id.clone();
         async move {
-            tokio::time::sleep(Duration::from_millis(600)).await;
+            if msg_id == "msg-batch-1" {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            } else {
+                tokio::time::sleep(Duration::from_millis(1600)).await;
+            }
             count.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
@@ -1450,4 +1456,48 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
     assert_eq!(processed.load(Ordering::SeqCst), 2);
     assert_eq!(backend.pending_count().await.unwrap(), 0);
     assert_eq!(backend.published_count().await.unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_postgres_database_pool_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    pool.backend().init_outbox_table().await.expect("init outbox table failed");
+    let pool_arc = Arc::new(pool);
+
+    let event = OrderPlacedEvent {
+        order_id: "order-pool-relay-hb-1".into(),
+        amount: 8800,
+    };
+    let msg = OutboxMessage::from_event(&event).expect("outbox message");
+    pool_arc.save(msg).await.expect("save outbox message");
+
+    let config = OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 2,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let dispatched_clone = Arc::clone(&dispatched);
+
+    // Dispatcher sleeps 2400ms (> initial 2s lease duration!)
+    // Exercises lease renewal through DatabasePool<PostgresBackend> delegation
+    let relay = OutboxRelay::new(Arc::clone(&pool_arc), move |_msg: &OutboxMessage| {
+        let count = Arc::clone(&dispatched_clone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(2400)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch failed");
+
+    assert_eq!(res.published, 1);
+    assert_eq!(res.failed_transitions, 0);
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(pool_arc.pending_count().await.unwrap(), 0);
+    assert_eq!(pool_arc.published_count().await.unwrap(), 1);
 }

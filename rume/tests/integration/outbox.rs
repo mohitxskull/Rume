@@ -645,6 +645,15 @@ impl OutboxRepository for FaultyOutboxRepo {
         self.inner.claim_pending_with_lease(limit, lease_duration_secs)
     }
 
+    fn renew_outbox_lease<'a>(
+        &'a self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
+        self.inner.renew_outbox_lease(id, lease_token, extension_secs)
+    }
+
     fn mark_published<'a>(
         &'a self,
         id: &str,
@@ -923,4 +932,84 @@ async fn sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid
     assert_eq!(dispatched.load(Ordering::SeqCst), 1);
     assert_eq!(repo.pending_count().await.unwrap(), 0);
     assert_eq!(repo.published_count().await.unwrap(), 1);
+}
+
+#[derive(Debug)]
+struct MockBareOutboxRepo;
+
+impl OutboxRepository for MockBareOutboxRepo {
+    fn save(&self, _msg: OutboxMessage) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn fetch_pending(&self, _limit: usize) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+    fn claim_pending_with_lease(&self, _limit: usize, _secs: u64) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+    fn mark_published(&self, _id: &str, _token: &str) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn pending_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move { Ok(0) })
+    }
+    fn published_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move { Ok(0) })
+    }
+}
+
+#[tokio::test]
+async fn test_outbox_repository_unsupported_renewal_default_returns_error() {
+    let repo = MockBareOutboxRepo;
+    let res = repo.renew_outbox_lease("msg-bare-1", "token-xyz", 30).await;
+    match res {
+        Err(OutboxError::Unsupported(msg)) => {
+            assert!(msg.contains("msg-bare-1"));
+        }
+        other => panic!("expected OutboxError::Unsupported, got: {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn database_pool_sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+    backend.init_outbox_table().await.expect("init outbox table");
+    let pool = Arc::new(rume::persistence::pool::DatabasePool::new(
+        backend,
+        rume::persistence::config::DatabaseConfig::default(),
+    ));
+
+    let event = OrderPaidEvent {
+        order_id: "order_relay_pool_hb".into(),
+        amount_cents: 9900,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    pool.save(msg).await.unwrap();
+
+    let dispatched = Arc::new(AtomicUsize::new(0));
+    let dispatched_clone = Arc::clone(&dispatched);
+
+    let config = OutboxRelayConfig {
+        batch_size: 10,
+        lease_duration_secs: 1,
+        poll_interval: Duration::from_millis(50),
+        max_retries: 3,
+    };
+
+    let relay = OutboxRelay::new(Arc::clone(&pool), move |_msg: &OutboxMessage| {
+        let count = Arc::clone(&dispatched_clone);
+        async move {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    })
+    .with_config(config);
+
+    let res = relay.poll_and_dispatch(10).await.expect("dispatch");
+    assert_eq!(res.published, 1);
+    assert_eq!(res.failed_transitions, 0);
+    assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(pool.pending_count().await.unwrap(), 0);
+    assert_eq!(pool.published_count().await.unwrap(), 1);
 }

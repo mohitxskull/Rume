@@ -40,14 +40,20 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     /// recovered while dispatch is still in progress.
     ///
     /// Only updates the message if the token matches and the lease has not yet expired.
-    /// The default implementation is a no-op for backends that do not support lease renewal.
+    /// The default implementation returns `Err(OutboxError::Unsupported)` to prevent
+    /// repositories from silently appearing renewal-capable when they do not implement it.
     fn renew_outbox_lease(
         &self,
-        _id: &str,
+        id: &str,
         _lease_token: &str,
         _extension_secs: u64,
     ) -> BoxFuture<'_, Result<(), OutboxError>> {
-        Box::pin(async move { Ok(()) })
+        let msg_id = id.to_string();
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(format!(
+                "outbox lease renewal not supported by this repository backend (id={msg_id})"
+            )))
+        })
     }
 
     /// Marks a message as successfully published with the worker's active lease token.

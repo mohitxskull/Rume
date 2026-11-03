@@ -361,19 +361,20 @@ impl OutboxRepository for PostgresBackend {
             for row in &rows {
                 let mut msg = parse_postgres_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
-                sqlx::query(
-                    "UPDATE rume_outbox SET status = 'inflight', lease_token = $1, lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $2 WHERE id = $3"
+                let updated = sqlx::query(
+                    "UPDATE rume_outbox SET status = 'inflight', lease_token = $1, lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $2 WHERE id = $3 RETURNING lease_expires_at"
                 )
                 .bind(&token)
                 .bind(lease_duration_secs as i64)
                 .bind(&msg.id)
-                .execute(&mut *tx)
+                .fetch_one(&mut *tx)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+                let exp: i64 = updated.try_get(0).unwrap_or(0);
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);
-                msg.lease_expires_at = None;
+                msg.lease_expires_at = Some(exp as u64);
                 claimed.push(msg);
             }
 

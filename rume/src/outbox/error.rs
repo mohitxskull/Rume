@@ -20,4 +20,8 @@ pub enum OutboxError {
     /// The outbox relay has been stopped.
     #[error("outbox relay is stopped")]
     Stopped,
+
+    /// The requested operation is not supported by this outbox repository backend.
+    #[error("operation not supported by this outbox repository: {0}")]
+    Unsupported(String),
 }
