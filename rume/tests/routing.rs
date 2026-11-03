@@ -75,6 +75,18 @@ async fn route_invalid_number_returns_400() {
     assert!(body.contains("INVALID_PARAM"));
 }
 
+#[rstest::rstest]
+#[case("/users/42", StatusCode::OK)]
+#[case("/users/abc", StatusCode::BAD_REQUEST)]
+#[case("/users/999", StatusCode::OK)]
+#[case("/users/12a", StatusCode::BAD_REQUEST)]
+#[tokio::test]
+async fn test_number_route_parameterized(#[case] path: &str, #[case] expected: StatusCode) {
+    let app = TestApp::new(number_route_router());
+    let response = app.get(path).await;
+    assert_eq!(response.status(), expected);
+}
+
 #[tokio::test]
 async fn route_uuid_validation_succeeds() {
     let app = TestApp::new(uuid_route_router());
@@ -133,6 +145,7 @@ async fn route_malformed_percent_encoding_fails_closed_and_does_not_invoke_handl
     let body = TestApp::body_text(response).await;
     assert!(body.contains("INVALID_PARAM"));
 }
+
 
 #[tokio::test]
 async fn route_registry_metadata_is_correct() {

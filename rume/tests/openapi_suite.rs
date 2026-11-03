@@ -27,6 +27,64 @@ async fn openapi_generation_from_route_registry() {
 
     let spec = generate_openapi(&registry, info);
 
+    insta::assert_json_snapshot!(spec, @r###"
+    {
+      "openapi": "3.1.0",
+      "info": {
+        "title": "User Service",
+        "version": "1.0.0",
+        "description": "Production user management API"
+      },
+      "paths": {
+        "/users": {
+          "post": {
+            "operation_id": "users.create",
+            "summary": "users.create",
+            "responses": {
+              "200": {
+                "description": "Successful response"
+              },
+              "400": {
+                "description": "Bad Request (RFC 9457 Problem Details)"
+              },
+              "422": {
+                "description": "Validation Failed (RFC 9457 Problem Details)"
+              }
+            }
+          }
+        },
+        "/users/{id}": {
+          "get": {
+            "operation_id": "users.show",
+            "summary": "users.show",
+            "parameters": [
+              {
+                "name": "id",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "integer",
+                  "format": "int64"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Successful response"
+              },
+              "400": {
+                "description": "Bad Request (RFC 9457 Problem Details)"
+              },
+              "422": {
+                "description": "Validation Failed (RFC 9457 Problem Details)"
+              }
+            }
+          }
+        }
+      }
+    }
+    "###);
+
     assert_eq!(spec.openapi, "3.1.0");
     assert_eq!(spec.info.title, "User Service");
     assert_eq!(spec.info.version, "1.0.0");

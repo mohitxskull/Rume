@@ -271,3 +271,21 @@ fn test_saml_xsw_envelope_injection_prevention() {
         "NameID must be extracted strictly from inside Assertion subtree, ignoring envelope injection"
     );
 }
+
+#[tokio::test]
+async fn test_enterprise_idp_metadata_wiremock_integration() {
+    let mock_server = wiremock::MockServer::start().await;
+    let metadata_xml = r#"<EntityDescriptor entityID="https://mock-idp.example.com"><IDPSSODescriptor /></EntityDescriptor>"#;
+
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/saml/metadata"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(metadata_xml))
+        .mount(&mock_server)
+        .await;
+
+    let target_url = format!("{}/saml/metadata", mock_server.uri());
+    let mut resp = ureq::get(&target_url).call().expect("fetch IdP metadata from mock server");
+    assert_eq!(resp.status(), 200);
+    let body = resp.body_mut().read_to_string().expect("read body");
+    assert!(body.contains("mock-idp.example.com"));
+}

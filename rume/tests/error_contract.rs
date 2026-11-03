@@ -59,6 +59,17 @@ async fn bad_request_returns_problem_details() {
     );
 
     let body = body_json(response).await;
+    insta::assert_json_snapshot!(body, @r###"
+    {
+      "code": "INVALID_INPUT",
+      "detail": "The request could not be processed.",
+      "instance": null,
+      "request_id": null,
+      "status": 400,
+      "title": "Bad Request",
+      "type": "about:blank"
+    }
+    "###);
     assert_eq!(body["type"].as_str(), Some("about:blank"));
     assert_eq!(body["title"].as_str(), Some("Bad Request"));
     assert_eq!(body["status"].as_u64(), Some(400));
@@ -85,6 +96,17 @@ async fn not_found_returns_problem_details() {
     );
 
     let body = body_json(response).await;
+    insta::assert_json_snapshot!(body, @r###"
+    {
+      "code": "NOT_FOUND",
+      "detail": "The requested resource was not found.",
+      "instance": null,
+      "request_id": null,
+      "status": 404,
+      "title": "Not Found",
+      "type": "about:blank"
+    }
+    "###);
     assert_eq!(body["type"].as_str(), Some("about:blank"));
     assert_eq!(body["title"].as_str(), Some("Not Found"));
     assert_eq!(body["status"].as_u64(), Some(404));

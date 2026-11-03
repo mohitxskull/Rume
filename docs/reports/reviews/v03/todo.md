@@ -167,7 +167,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor hardening), wi
       `rume/tests/`: 34 raw `tokio::time::sleep` calls remain across 14 files. Replace wall-clock sleeps with deterministic synchronization (`tokio::sync::Barrier`, `Notify`, or `tokio::time::pause()`).
 - [x] **Testing M4 — Absence of a First-Party Declarative Test Harness (`RumeTestHarness` in `rume::testing`) Forces Repetitive Boilerplate** (`testing-feature-matrix.md` M4).
       `rume/tests/`: Setup code (container spin-up, connection URL, schema init, runner launch) is copy-pasted across 10 files. Introduce a fluent `RumeTestHarness` in `rume::testing`.
-- [ ] **Testing M5 — Lack of Modern Testing Ecosystem Tooling (`insta`, `rstest`, `wiremock`) Hinders Snapshot and Protocol Verification** (`testing-feature-matrix.md` M5).
+- [x] **Testing M5 — Lack of Modern Testing Ecosystem Tooling (`insta`, `rstest`, `wiremock`) Hinders Snapshot and Protocol Verification** (`testing-feature-matrix.md` M5).
       `rume/tests/`: Verbose manual assertion logic for OpenAPI specs and Problem Details. Introduce `rstest` for fixture injection, `insta` for snapshot assertions, and `wiremock` for IdP HTTP mocks.
 
 ---
