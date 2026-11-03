@@ -10,19 +10,19 @@ use rume::jobs::{
 };
 use serde::{Deserialize, Serialize};
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::time::sleep;
 
+mod common;
+
 async fn start_postgres_queue() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     Arc<PostgresJobQueue>,
 ) {
-    let node = Postgres::default().start().await.expect("start postgres");
-    let port = node.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let node = common::containers::shared_postgres().await;
+    let (_db_name, config) = common::containers::create_isolated_postgres_db().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&url)
+        .connect(&config.url)
         .await
         .expect("pg pool");
     let queue = Arc::new(PostgresJobQueue::new(pool));

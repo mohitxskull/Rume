@@ -26,34 +26,18 @@ use rume::resilience::{RateLimitConfig, RedisRateLimiter, ResilienceError};
 use rume::tenant::{RedisTenantQuotaStore, TenantScopedCache};
 use serde::{Deserialize, Serialize};
 
-use testcontainers_modules::redis::{REDIS_PORT, Redis};
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
+use testcontainers_modules::redis::Redis;
+
+mod common;
 
 /// Helper to start a Redis alpine container and construct a connected backend.
 async fn setup_redis_backend() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Redis>,
     RedisCacheBackend,
 ) {
-    let container = Redis::default()
-        .with_tag("alpine")
-        .start()
-        .await
-        .expect("Failed to start Redis container");
-
-    let host = container
-        .get_host()
-        .await
-        .expect("Failed to get container host");
-    let port = container
-        .get_host_port_ipv4(REDIS_PORT)
-        .await
-        .expect("Failed to get mapped port");
-
-    let url = format!("redis://{host}:{port}");
-    let backend = RedisCacheBackend::new(&url).expect("Failed to initialize RedisCacheBackend");
-
-    (container, backend)
+    let node = common::containers::shared_redis().await;
+    let backend = common::containers::create_isolated_redis_backend().await;
+    (node, backend)
 }
 
 #[tokio::test]

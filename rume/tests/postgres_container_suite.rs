@@ -22,7 +22,6 @@ use rume::coordination::{
 use rume::events::{Event, EventBus};
 use rume::jobs::{Job, JobQueue, PostgresJobQueue};
 use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRepository, TransactionalOutbox};
-use rume::persistence::config::DatabaseConfig;
 use rume::persistence::error::PersistenceError;
 use rume::persistence::migration::{Migration, Migrator};
 use rume::persistence::pool::DatabasePool;
@@ -31,45 +30,20 @@ use rume::persistence::{DatabaseBackend, DatabaseTransaction};
 use rume::routing::health::{HealthCheck, HealthStatus};
 
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::ImageExt;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
+mod common;
 
 /// Helper to spin up a PostgreSQL 16 container and return a configured connection pool.
 async fn setup_postgres_pool(
     max_connections: u32,
 ) -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     DatabasePool<PostgresBackend>,
 ) {
-    let container = Postgres::default()
-        .with_tag("16-alpine")
-        .start()
-        .await
-        .expect("Failed to start PostgreSQL container");
-
-    let host = container
-        .get_host()
-        .await
-        .expect("Failed to get container host");
-    let port = container
-        .get_host_port_ipv4(5432)
-        .await
-        .expect("Failed to get mapped port");
-
-    let url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
-    let config = DatabaseConfig {
-        url,
-        max_connections,
-        min_connections: 1,
-        connect_timeout_secs: 5,
-        idle_timeout_secs: Some(10),
-        auto_migrate: false,
-    };
-
-    let backend = PostgresBackend::new(&config).expect("Failed to create PostgresBackend");
-    let pool = DatabasePool::new(backend, config);
-
-    (container, pool)
+    let node = common::containers::shared_postgres().await;
+    let (_db_name, pool) =
+        common::containers::create_isolated_postgres_pool(max_connections).await;
+    (node, pool)
 }
 
 #[tokio::test]

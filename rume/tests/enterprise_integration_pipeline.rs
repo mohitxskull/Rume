@@ -27,8 +27,7 @@ use rume::persistence::{
     SqliteBackend,
 };
 use rume::tenant::{Tenant, TenantContext};
-use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
+
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderBilledEvent {
@@ -74,6 +73,8 @@ impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
     }
 }
 
+mod common;
+
 #[tokio::test]
 async fn realistic_enterprise_pipeline_end_to_end() {
     // 1. Setup Framework Subsystems
@@ -87,12 +88,10 @@ async fn realistic_enterprise_pipeline_end_to_end() {
 
     let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
     
-    let pg_node = Postgres::default().start().await.expect("start postgres");
-    let pg_port = pg_node.get_host_port_ipv4(5432).await.expect("port");
-    let pg_url = format!("postgresql://postgres:postgres@127.0.0.1:{pg_port}/postgres");
+    let (_db_name, pg_config) = common::containers::create_isolated_postgres_db().await;
     let pg_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&pg_url)
+        .connect(&pg_config.url)
         .await
         .expect("pg pool");
     let queue = Arc::new(PostgresJobQueue::new(pg_pool));

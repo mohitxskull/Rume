@@ -9,36 +9,28 @@ use rume::jobs::{
 };
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::time::sleep;
 
+mod common;
+
 async fn start_redis_pool() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Redis>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Redis>,
     deadpool_redis::Pool,
 ) {
-    let node = Redis::default().start().await.expect("start redis node");
-    let port = node
-        .get_host_port_ipv4(6379)
-        .await
-        .expect("get redis port");
-    let url = format!("redis://127.0.0.1:{port}");
-    let pool_cfg = deadpool_redis::Config::from_url(&url);
-    let pool = pool_cfg
-        .create_pool(Some(deadpool_redis::Runtime::Tokio1))
-        .expect("create redis pool");
+    let node = common::containers::shared_redis().await;
+    let pool = common::containers::create_isolated_redis_pool().await;
     (node, pool)
 }
 
 async fn start_postgres_queue() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Postgres>,
     Arc<PostgresJobQueue>,
 ) {
-    let node = Postgres::default().start().await.expect("start postgres");
-    let port = node.get_host_port_ipv4(5432).await.expect("port");
-    let url = format!("postgresql://postgres:postgres@127.0.0.1:{port}/postgres");
+    let node = common::containers::shared_postgres().await;
+    let (_db_name, config) = common::containers::create_isolated_postgres_db().await;
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
-        .connect(&url)
+        .connect(&config.url)
         .await
         .expect("pg pool");
     let queue = Arc::new(PostgresJobQueue::new(pool));

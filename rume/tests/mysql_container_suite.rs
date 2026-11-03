@@ -4,26 +4,22 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use testcontainers_modules::mysql::Mysql;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 
 use rume::outbox::{OutboxMessage, OutboxRepository, OutboxStatus, TransactionalOutbox};
 use rume::persistence::{
     DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MysqlBackend,
 };
 
+mod common;
+
 async fn start_mysql_node() -> (
-    testcontainers_modules::testcontainers::ContainerAsync<Mysql>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<Mysql>,
     MysqlBackend,
     DatabaseConfig,
 ) {
-    let node = Mysql::default().start().await.expect("start mysql node");
-    let port = node
-        .get_host_port_ipv4(3306)
-        .await
-        .expect("get mysql port");
-    let url = format!("mysql://root@127.0.0.1:{port}/test");
-
-    let config = DatabaseConfig::new(&url).with_max_connections(5);
+    let node = common::containers::shared_mysql().await;
+    let (_db_name, mut config) = common::containers::create_isolated_mysql_db().await;
+    config.max_connections = 5;
     let backend = MysqlBackend::new(&config).expect("create mysql backend");
 
     // Initialize outbox schema

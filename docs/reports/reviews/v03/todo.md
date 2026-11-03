@@ -161,7 +161,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor hardening), wi
 
 - [ ] **Testing M1 — Test Directory Binary Explosion: 32 Flat Test Crates Cause 11 GB Build Bloat and Extreme Link Overhead** (`testing-feature-matrix.md` M1).
       `rume/tests/`: 24 flat integration test files compile as 24 separate executables, linking dependencies 24 times. Consolidate into `tests/integration.rs`, `tests/containers.rs`, and uncompiled `tests/common/` helpers.
-- [ ] **Testing M2 — Per-Test Container Spin-Up Overhead Adds 3+ Minutes of Idle Latency and Risks Docker Daemon Exhaustion** (`testing-feature-matrix.md` M2).
+- [x] **Testing M2 — Per-Test Container Spin-Up Overhead Adds 3+ Minutes of Idle Latency and Risks Docker Daemon Exhaustion** (`testing-feature-matrix.md` M2).
       `rume/tests/*_container_suite.rs`: Tests launch 46 separate container instances. Replace with shared container fixtures (`tokio::sync::OnceCell`) and per-test database/schema isolation (`test_{uuid}`).
 - [ ] **Testing M3 — Persistent Async Wall-Clock Sleeps Across 14 Test Suites Violate Determinism and Introduce Flaky Races** (`testing-feature-matrix.md` M3).
       `rume/tests/`: 34 raw `tokio::time::sleep` calls remain across 14 files. Replace wall-clock sleeps with deterministic synchronization (`tokio::sync::Barrier`, `Notify`, or `tokio::time::pause()`).
@@ -203,7 +203,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor hardening), wi
 - [x] **Security m3 — SAML Parser Comment Truncation and Tag Extraction Fragility** (`security-protocols.md` m3).
 - [ ] **Testing m1 — Inconsistent Test File Naming Conventions Across `rume/tests/`** (`testing-feature-matrix.md` m1).
 - [ ] **Testing m2 — Redundant Test Coverage Between Unit Tests and Integration Tests** (`testing-feature-matrix.md` m2).
-- [ ] **Testing m3 — Duplicate Container Spin-Up Logic Across PostgreSQL and Redis Suites** (`testing-feature-matrix.md` m3).
+- [x] **Testing m3 — Duplicate Container Spin-Up Logic Across PostgreSQL and Redis Suites** (`testing-feature-matrix.md` m3).
 
 ---
 
