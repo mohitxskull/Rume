@@ -537,3 +537,48 @@ async fn outbox_duplicate_insert_preserves_published_and_inflight_state() {
     assert_eq!(repo.published_count().await.unwrap(), 1);
     assert_eq!(repo.pending_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn outbox_relay_recovers_from_async_dispatcher_panic() {
+    let repo = setup_real_outbox().await;
+
+    let event = OrderPaidEvent {
+        order_id: "order_panic_1".into(),
+        amount_cents: 100,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+    repo.save(msg).await.unwrap();
+
+    let panic_hit = Arc::new(AtomicUsize::new(0));
+    let hit_clone = Arc::clone(&panic_hit);
+
+    let relay = OutboxRelay::new(Arc::clone(&repo), move |_msg: &OutboxMessage| {
+        let hit = Arc::clone(&hit_clone);
+        async move {
+            hit.fetch_add(1, Ordering::SeqCst);
+            panic!("unhandled async dispatcher panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        }
+    });
+    let published = relay.poll_and_dispatch(10).await.unwrap();
+
+    assert_eq!(published, 0);
+    assert_eq!(panic_hit.load(Ordering::SeqCst), 1);
+
+    // Durable outbox invariant: message failure recorded with panic error and retry backoff scheduled
+    use sqlx::Row;
+    let row = sqlx::query("SELECT retry_count, last_error, lease_token FROM rume_outbox WHERE id = ?1")
+        .bind(&msg_id)
+        .fetch_one(repo.pool())
+        .await
+        .unwrap();
+    let retry_count: i32 = row.get(0);
+    let last_error: Option<String> = row.get(1);
+    let lease_token: Option<String> = row.get(2);
+
+    assert_eq!(retry_count, 1);
+    assert!(last_error.unwrap_or_default().contains("panicked"));
+    assert_eq!(lease_token, None, "lease token cleared on failure");
+}

@@ -33,9 +33,9 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 ### Group B — Worker & Outbox Async Panic Unwinding Isolation (solve together)
 > Root cause: Wrapping `std::panic::catch_unwind` around future construction closures rather than the polled asynchronous future itself.
 
-- [ ] **Outbox M1 — Unhandled asynchronous dispatcher panics bypass `catch_unwind` and terminate `OutboxRelay` background worker loop** (`outbox-data-integrity.md` M1).
+- [x] **Outbox M1 — Unhandled asynchronous dispatcher panics bypass `catch_unwind` and terminate `OutboxRelay` background worker loop** (`outbox-data-integrity.md` M1).
       `rume/src/outbox/relay.rs:113–120`: `std::panic::catch_unwind` is wrapped only around calling the closure that returns the future (`dispatcher.dispatch(&message)`), but NOT around `fut.await`. Panics during async execution unwind uncaught, permanently terminating the background worker task in `start()`. Wrap the async future itself with `std::panic::AssertUnwindSafe(fut).catch_unwind().await`.
-- [ ] **Jobs M1 — Unhandled asynchronous job handler panics bypass `catch_unwind`, stranding jobs in `in_flight` status without DLQ routing or lock release** (`jobs-worker-concurrency.md` M1, `testing-feature-matrix.md` M2).
+- [x] **Jobs M1 — Unhandled asynchronous job handler panics bypass `catch_unwind`, stranding jobs in `in_flight` status without DLQ routing or lock release** (`jobs-worker-concurrency.md` M1, `testing-feature-matrix.md` M2).
       `rume/src/jobs/worker.rs:366–371`: In `execute_job`, `catch_unwind` wraps only the closure constructing the future, while `fut.await` is evaluated outside `catch_unwind`. Unhandled async panics unwind uncaught to task join boundaries, stranding jobs in `status = 'in_flight'` in PostgreSQL and breaking `test_worker_panic_does_not_leak_in_flight_count`. Wrap the future execution itself in `AssertUnwindSafe(fut).catch_unwind().await`.
 
 ### Group C — Distributed Coordination Fencing & Idempotency Eviction (solve together)
@@ -78,7 +78,7 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
       `rume/src/persistence/config.rs:25`: `auto_migrate` field exists but is never read or executed on pool startup.
 - [ ] **Jobs m1 — Redis `IdempotencyStore::release` and `complete` perform unverified mutations across expired lease renewals** (`jobs-worker-concurrency.md` m1).
       `rume/src/jobs/redis.rs:284–302, 318–334`: `complete` and `release` Lua scripts check only key presence and status, but not the worker token that acquired the claim.
-- [ ] **Jobs m2 — Job lease renewal failure in `JobWorker` heartbeat does not signal cancellation to running job handler** (`jobs-worker-concurrency.md` m2).
+- [x] **Jobs m2 — Job lease renewal failure in `JobWorker` heartbeat does not signal cancellation to running job handler** (`jobs-worker-concurrency.md` m2).
       `rume/src/jobs/worker.rs:356–361`: If `renew_lease` returns an error, the heartbeat task logs a warning but does not trigger the `CancellationToken` in `JobContext`.
 - [ ] **Coordination m1 — Duplicate sequence evaluation in `leader_acquire.sql` conflict update path burns term sequence numbers** (`coordination-multi-tenant.md` m1).
       `rume/src/persistence/sql/postgres/leader_acquire.sql:10–12`: Conflict resolution evaluates `nextval()` multiple times on collision.

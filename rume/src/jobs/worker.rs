@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use tokio::time::sleep;
 use uuid::Uuid;
 
@@ -342,20 +343,30 @@ impl<Q: JobQueue> JobWorker<Q> {
         }
 
         // Spawn background lease heartbeat while job is executing
+        let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let hb_token = token.clone();
         let hb_queue = Arc::clone(&queue);
         let hb_jid = job_id.clone();
+        let hb_cancelled = Arc::clone(&job_cancelled);
+        let hb_stopping = Arc::clone(&stopping);
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(20));
             interval.tick().await; // tick immediately
+            let mut stop_check = tokio::time::interval(Duration::from_millis(50));
             loop {
                 tokio::select! {
                     _ = &mut cancel_rx => break,
+                    _ = stop_check.tick() => {
+                        if hb_stopping.load(Ordering::Relaxed) {
+                            hb_cancelled.store(true, Ordering::SeqCst);
+                        }
+                    }
                     _ = interval.tick() => {
                         if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, Duration::from_secs(60)).await {
                             tracing::warn!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat");
+                            hb_cancelled.store(true, Ordering::SeqCst);
                             break;
                         }
                     }
@@ -364,9 +375,12 @@ impl<Q: JobQueue> JobWorker<Q> {
         });
 
         let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.dispatch_with_cancellation(&job, Some(stopping))
+            registry.dispatch_with_cancellation(&job, Some(job_cancelled))
         })) {
-            Ok(fut) => fut.await,
+            Ok(fut) => match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                Ok(res) => res,
+                Err(_) => Err(JobError::Fatal("handler panicked".into())),
+            },
             Err(_) => Err(JobError::Fatal("handler panicked".into())),
         };
 

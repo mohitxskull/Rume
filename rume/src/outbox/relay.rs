@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use tokio::time::sleep;
 
 use crate::outbox::error::OutboxError;
@@ -112,10 +113,15 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 }
             };
 
-            let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let fut_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 (self.dispatcher)(&message)
-            })) {
-                Ok(fut) => fut.await,
+            }));
+
+            let dispatch_result = match fut_result {
+                Ok(fut) => match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                    Ok(res) => res,
+                    Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
+                },
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
             };
 

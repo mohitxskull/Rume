@@ -11,6 +11,7 @@ description = "Explicit, typed, production-ready application shell for Axum."
 axum.workspace = true
 # Async runtime.
 tokio.workspace = true
+futures-util.workspace = true
 # Serialization.
 serde.workspace = true
 # Tracing.
