@@ -329,7 +329,10 @@ impl<Q: JobQueue> JobWorker<Q> {
         };
 
         if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-            match store.try_acquire(key, Duration::from_secs(300)).await {
+            match store
+                .try_acquire_with_token(key, &token, Duration::from_secs(300))
+                .await
+            {
                 Ok(IdempotencyStatus::Completed(_)) => {
                     let _ = queue.ack(&job_id, &token).await;
                     return;
@@ -391,14 +394,14 @@ impl<Q: JobQueue> JobWorker<Q> {
             Ok(()) => {
                 let _ = queue.ack(&job_id, &token).await;
                 if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                    let _ = store.complete(key, None).await;
+                    let _ = store.complete_with_token(key, &token, None).await;
                 }
             }
             Err(JobError::Fatal(msg))
             | Err(JobError::UnknownJob(msg))
             | Err(JobError::Serialization(msg)) => {
                 if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                    let _ = store.release(key).await;
+                    let _ = store.release_with_token(key, &token).await;
                 }
                 let _ = queue.dead_letter(job, &token, msg).await;
             }
@@ -408,7 +411,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                     let _ = queue.nack(job, &token, backoff).await;
                 } else {
                     if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
-                        let _ = store.release(key).await;
+                        let _ = store.release_with_token(key, &token).await;
                     }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     let _ = queue.dead_letter(job, &token, reason).await;

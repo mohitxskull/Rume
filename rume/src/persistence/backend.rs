@@ -45,6 +45,11 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
     fn close(&self) -> BoxFuture<'_, ()> {
         Box::pin(async move {})
     }
+
+    /// Returns the database dialect (e.g. "postgres", "mysql", "sqlite", "default").
+    fn dialect(&self) -> &'static str {
+        "default"
+    }
 }
 
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]

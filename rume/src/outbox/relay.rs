@@ -26,6 +26,8 @@ pub struct OutboxRelayConfig {
     pub lease_duration_secs: u64,
     /// Polling interval between relay loop passes.
     pub poll_interval: Duration,
+    /// Maximum number of dispatch retries before transitioning a message to failed.
+    pub max_retries: u32,
 }
 
 impl Default for OutboxRelayConfig {
@@ -34,7 +36,16 @@ impl Default for OutboxRelayConfig {
             batch_size: 50,
             lease_duration_secs: 30,
             poll_interval: Duration::from_millis(500),
+            max_retries: 5,
         }
+    }
+}
+
+impl OutboxRelayConfig {
+    /// Sets a custom retry limit before a message is marked as failed.
+    pub fn with_max_retries(mut self, max_retries: u32) -> Self {
+        self.max_retries = max_retries;
+        self
     }
 }
 
@@ -136,7 +147,12 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 Err(err) => {
                     if let Err(mark_err) = self
                         .repository
-                        .mark_failed(&message.id, token, err.to_string())
+                        .mark_failed_with_max_retries(
+                            &message.id,
+                            token,
+                            err.to_string(),
+                            self.config.max_retries,
+                        )
                         .await
                     {
                         tracing::error!(

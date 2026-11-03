@@ -41,30 +41,44 @@ pub struct RateLimitStatus {
     pub reset_after_secs: u64,
 }
 
+const NUM_SHARDS: usize = 16;
+
 #[derive(Debug, Default)]
 struct RateLimitEntry {
     timestamps: Vec<Instant>,
 }
 
-/// In-memory sliding-window rate limiter.
+/// In-memory sliding-window rate limiter with sharded concurrency.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     config: RateLimitConfig,
-    clients: Arc<RwLock<BTreeMap<String, RateLimitEntry>>>,
+    shards: Arc<[RwLock<BTreeMap<String, RateLimitEntry>>]>,
 }
 
 impl RateLimiter {
     /// Creates a new rate limiter with the specified configuration.
     pub fn new(config: RateLimitConfig) -> Self {
+        let mut shards = Vec::with_capacity(NUM_SHARDS);
+        for _ in 0..NUM_SHARDS {
+            shards.push(RwLock::new(BTreeMap::new()));
+        }
         Self {
             config,
-            clients: Arc::new(RwLock::new(BTreeMap::new())),
+            shards: shards.into(),
         }
+    }
+
+    fn shard_for(&self, key: &str) -> &RwLock<BTreeMap<String, RateLimitEntry>> {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let idx = (hasher.finish() as usize) % self.shards.len();
+        &self.shards[idx]
     }
 
     /// Evaluates if a request from `key` is within limits, recording the request on success.
     pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
-        let mut clients = self.clients.write().unwrap();
+        let mut clients = self.shard_for(key).write().unwrap();
         let now = Instant::now();
         let window_start = now.checked_sub(self.config.window).unwrap_or(now);
 
@@ -97,13 +111,27 @@ impl RateLimiter {
 
     /// Prunes expired client entries whose recorded requests fall outside the sliding window.
     pub fn prune_expired(&self) {
-        let mut clients = self.clients.write().unwrap();
         let now = Instant::now();
         let window_start = now.checked_sub(self.config.window).unwrap_or(now);
-        clients.retain(|_, entry| {
-            entry.timestamps.retain(|&t| t > window_start);
-            !entry.timestamps.is_empty()
-        });
+        for shard in self.shards.iter() {
+            let mut clients = shard.write().unwrap();
+            clients.retain(|_, entry| {
+                entry.timestamps.retain(|&t| t > window_start);
+                !entry.timestamps.is_empty()
+            });
+        }
+    }
+
+    /// Spawns a background task that periodically prunes expired client entries at the given interval.
+    pub fn spawn_background_eviction(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let limiter = self.clone();
+        tokio::spawn(async move {
+            let mut timer = tokio::time::interval(interval);
+            loop {
+                timer.tick().await;
+                limiter.prune_expired();
+            }
+        })
     }
 }
 
@@ -157,12 +185,17 @@ where
         let limiter = self.limiter.clone();
         let mut inner = self.inner.clone();
 
-        // Extract client key (prefer tenant ID if present for multi-tenant isolation, otherwise trimmed client IP from X-Forwarded-For)
+        // Extract client key (prefer tenant context or header if present for multi-tenant isolation, otherwise trimmed client IP from X-Forwarded-For)
         let tenant_key = req
-            .headers()
-            .get("x-tenant-id")
-            .and_then(|h| h.to_str().ok())
-            .map(|t| format!("tenant:{}", t.trim()));
+            .extensions()
+            .get::<crate::tenant::TenantContext>()
+            .map(|tc| format!("tenant:{}", tc.id))
+            .or_else(|| {
+                req.headers()
+                    .get("x-tenant-id")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|t| format!("tenant:{}", t.trim()))
+            });
 
         let client_key = tenant_key.unwrap_or_else(|| {
             req.headers()

@@ -82,6 +82,24 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         &self.config
     }
 
+    /// Returns whether `auto_migrate` is enabled in configuration.
+    pub fn auto_migrate(&self) -> bool {
+        self.config.auto_migrate
+    }
+
+    /// Automatically applies pending migrations on the backend if `auto_migrate` is configured.
+    /// Returns `Some(summary)` if migrations were executed, or `None` if `auto_migrate` was false.
+    pub async fn apply_auto_migrations(
+        &self,
+        migrator: &crate::persistence::migration::Migrator,
+    ) -> Result<Option<crate::persistence::migration::MigrationSummary>, PersistenceError> {
+        if !self.config.auto_migrate {
+            return Ok(None);
+        }
+        let summary = migrator.run_pending_backend(self.backend()).await?;
+        Ok(Some(summary))
+    }
+
     /// Returns the underlying database backend.
     pub fn backend(&self) -> &B {
         &self.backend
@@ -399,13 +417,25 @@ where
         lease_token: &str,
         error: String,
     ) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        self.mark_failed_with_max_retries(id, lease_token, error, 5)
+    }
+
+    fn mark_failed_with_max_retries(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+        max_retries: u32,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id = id.to_string();
         let lease_token = lease_token.to_string();
         Box::pin(async move {
             let _lease = self
                 .acquire_lease()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().mark_failed(&id, &lease_token, error).await
+            self.backend()
+                .mark_failed_with_max_retries(&id, &lease_token, error, max_retries)
+                .await
         })
     }
 

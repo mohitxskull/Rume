@@ -31,6 +31,35 @@ pub trait IdempotencyStore: Debug + Send + Sync + 'static {
 
     /// Releases an in-progress lock (e.g. after failure), permitting re-execution.
     fn release(&self, key: &str) -> BoxFuture<'_, Result<(), JobError>>;
+
+    /// Attempts to acquire an idempotency lock for `key` valid for `ttl` with owner token fencing.
+    fn try_acquire_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+        ttl: Duration,
+    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+        self.try_acquire(key, ttl)
+    }
+
+    /// Marks the execution as completed with owner token validation, saving an optional result payload.
+    fn complete_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+        result: Option<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        self.complete(key, result)
+    }
+
+    /// Releases an in-progress lock with owner token validation, permitting re-execution.
+    fn release_with_token(
+        &self,
+        key: &str,
+        _token: &str,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        self.release(key)
+    }
 }
 
 /// Formats an idempotency key with length-prefixed tenant isolation to prevent collisions.

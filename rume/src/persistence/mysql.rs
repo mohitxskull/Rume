@@ -193,6 +193,10 @@ impl DatabaseBackend for MysqlBackend {
             self.pool.close().await;
         })
     }
+
+    fn dialect(&self) -> &'static str {
+        "mysql"
+    }
 }
 
 /// Active transaction handle for MySQL.
@@ -426,6 +430,16 @@ impl OutboxRepository for MysqlBackend {
     }
 
     fn mark_failed(&self, id: &str, lease_token: &str, error: String) -> OutboxFuture<'_, Result<(), OutboxError>> {
+        self.mark_failed_with_max_retries(id, lease_token, error, 5)
+    }
+
+    fn mark_failed_with_max_retries(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+        max_retries: u32,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
@@ -444,7 +458,7 @@ impl OutboxRepository for MysqlBackend {
             };
 
             let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
-            let status = if retry_count >= 5 { "failed" } else { "pending" };
+            let status = if retry_count >= max_retries as i32 { "failed" } else { "pending" };
             let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
             let next_retry = now + backoff_secs;
 

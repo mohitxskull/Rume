@@ -70,14 +70,6 @@ async fn bad_request_returns_problem_details() {
       "type": "about:blank"
     }
     "###);
-    assert_eq!(body["type"].as_str(), Some("about:blank"));
-    assert_eq!(body["title"].as_str(), Some("Bad Request"));
-    assert_eq!(body["status"].as_u64(), Some(400));
-    assert_eq!(body["code"].as_str(), Some("INVALID_INPUT"));
-    assert_eq!(
-        body["detail"].as_str(),
-        Some("The request could not be processed.")
-    );
     // Raw message must not leak to clients
     let body_str = serde_json::to_string(&body).unwrap();
     assert!(!body_str.contains("something went wrong"));
@@ -107,10 +99,6 @@ async fn not_found_returns_problem_details() {
       "type": "about:blank"
     }
     "###);
-    assert_eq!(body["type"].as_str(), Some("about:blank"));
-    assert_eq!(body["title"].as_str(), Some("Not Found"));
-    assert_eq!(body["status"].as_u64(), Some(404));
-    assert_eq!(body["code"].as_str(), Some("NOT_FOUND"));
 }
 
 #[tokio::test]

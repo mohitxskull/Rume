@@ -72,25 +72,25 @@ Ordered by priority tier (`P0` critical unblockers → `P2` minor polish), with 
 
 > Schedule in follow-up sprint; non-blocking for core reliability milestones.
 
-- [ ] **Outbox m1 — Hardcoded `max_retries` threshold of 5 remains unconfigurable across database drivers** (`outbox-data-integrity.md` m1).
+- [x] **Outbox m1 — Hardcoded `max_retries` threshold of 5 remains unconfigurable across database drivers** (`outbox-data-integrity.md` m1).
       `rume/src/persistence/{postgres,mysql,sqlite}.rs:374`: Drivers hardcode `retry_count >= 5` in SQL. Add `max_retries: u32` to `OutboxRelayConfig` and driver claim queries.
-- [ ] **Pool m1 — `DatabaseConfig::auto_migrate` configuration property is completely disconnected and ignored** (`pool-lifecycle-persistence.md` m1).
+- [x] **Pool m1 — `DatabaseConfig::auto_migrate` configuration property is completely disconnected and ignored** (`pool-lifecycle-persistence.md` m1).
       `rume/src/persistence/config.rs:25`: `auto_migrate` field exists but is never read or executed on pool startup.
-- [ ] **Jobs m1 — Redis `IdempotencyStore::release` and `complete` perform unverified mutations across expired lease renewals** (`jobs-worker-concurrency.md` m1).
+- [x] **Jobs m1 — Redis `IdempotencyStore::release` and `complete` perform unverified mutations across expired lease renewals** (`jobs-worker-concurrency.md` m1).
       `rume/src/jobs/redis.rs:284–302, 318–334`: `complete` and `release` Lua scripts check only key presence and status, but not the worker token that acquired the claim.
 - [x] **Jobs m2 — Job lease renewal failure in `JobWorker` heartbeat does not signal cancellation to running job handler** (`jobs-worker-concurrency.md` m2).
       `rume/src/jobs/worker.rs:356–361`: If `renew_lease` returns an error, the heartbeat task logs a warning but does not trigger the `CancellationToken` in `JobContext`.
 - [x] **Coordination m1 — Duplicate sequence evaluation in `leader_acquire.sql` conflict update path burns term sequence numbers** (`coordination-multi-tenant.md` m1).
       `rume/src/persistence/sql/postgres/leader_acquire.sql:10–12`: Conflict resolution evaluates `nextval()` multiple times on collision.
-- [ ] **Coordination m2 — `RateLimitService` ignores `TenantContext` extensions, bypassing tenant rate limiting for subdomain-routed requests** (`coordination-multi-tenant.md` m2).
+- [x] **Coordination m2 — `RateLimitService` ignores `TenantContext` extensions, bypassing tenant rate limiting for subdomain-routed requests** (`coordination-multi-tenant.md` m2).
       `rume/src/resilience/rate_limiter.rs:260–270`: Rate limiting middleware extracts tenant ID only from headers, ignoring `TenantContext` injected by `SubdomainTenantResolver`.
-- [ ] **Coordination m3 — `RateLimiter` retains global write lock serialization and lacks background eviction scheduling** (`coordination-multi-tenant.md` m3).
+- [x] **Coordination m3 — `RateLimiter` retains global write lock serialization and lacks background eviction scheduling** (`coordination-multi-tenant.md` m3).
       `rume/src/resilience/rate_limiter.rs:45–80`: In-memory rate limiter acquires exclusive `write()` lock on every check; consider sharding with `DashMap`.
 - [x] **Security m1 — Non-atomic session ID rotation in `SessionStore::regenerate_id` risks session state loss on write failure** (`security-protocols.md` m1).
       `rume/src/auth/session.rs:77–84`: `regenerate_id` deletes `old_id` before writing `new_id`. If `save(new)` fails, session data is lost.
-- [ ] **Security m2 — Audit logger literal escaping data distortion in Postgres and SQLite** (`security-protocols.md` m2).
+- [x] **Security m2 — Audit logger literal escaping data distortion in Postgres and SQLite** (`security-protocols.md` m2).
       `rume/src/security/audit.rs:188–205`: Unconditional MySQL C-string escaping doubles backslashes and converts newlines to literal `\n` in PostgreSQL and SQLite.
-- [ ] **Testing m1 — Redundant test assertions between unit and integration suites in `integration/health.rs` and `integration/error.rs`** (`testing-feature-matrix.md` m1).
+- [x] **Testing m1 — Redundant test assertions between unit and integration suites in `integration/health.rs` and `integration/error.rs`** (`testing-feature-matrix.md` m1).
       `rume/tests/integration/{health.rs, error.rs}`: Prune duplicate domain variant checks already covered in unit tests.
 - [x] **Testing m2 — Six unused import compiler warnings in `rume/src/testing/harness.rs`** (`testing-feature-matrix.md` m2).
       `rume/src/testing/harness.rs:1–10`: Remove unused imports under default feature configurations.

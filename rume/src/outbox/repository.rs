@@ -46,7 +46,20 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
         id: &str,
         lease_token: &str,
         error: String,
-    ) -> BoxFuture<'_, Result<(), OutboxError>>;
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        self.mark_failed_with_max_retries(id, lease_token, error, 5)
+    }
+
+    /// Marks a message as failed with a configurable maximum retry limit before marking as failed.
+    fn mark_failed_with_max_retries(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+        _max_retries: u32,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        self.mark_failed(id, lease_token, error)
+    }
 
     /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
     /// resetting their status back to `Pending`.

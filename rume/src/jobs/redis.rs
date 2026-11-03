@@ -203,7 +203,17 @@ impl IdempotencyStore for RedisIdempotencyStore {
         key: &str,
         ttl: Duration,
     ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+        self.try_acquire_with_token(key, "", ttl)
+    }
+
+    fn try_acquire_with_token(
+        &self,
+        key: &str,
+        token: &str,
+        ttl: Duration,
+    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
         let redis_key = self.key(key);
+        let token = token.to_string();
         let ttl_ms = ttl.as_millis().max(1) as u64;
         Box::pin(async move {
             let mut conn = self
@@ -213,17 +223,21 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             // Lua script:
-            // 1. If key doesn't exist, set 'IN_PROGRESS' with TTL, return {1, nil} (New)
-            // 2. If key is 'IN_PROGRESS', return {2, nil} (InProgress)
+            // 1. If key doesn't exist, set 'IN_PROGRESS' (or 'IN_PROGRESS:<token>') with TTL, return {1, nil} (New)
+            // 2. If key is 'IN_PROGRESS' or starts with 'IN_PROGRESS:', return {2, nil} (InProgress)
             // 3. If key starts with 'COMPLETED:', return {3, payload} (Completed)
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 if not current then
-                    redis.call('SET', KEYS[1], 'IN_PROGRESS', 'PX', ARGV[1])
+                    local val = 'IN_PROGRESS'
+                    if ARGV[2] ~= '' then
+                        val = 'IN_PROGRESS:' .. ARGV[2]
+                    end
+                    redis.call('SET', KEYS[1], val, 'PX', ARGV[1])
                     return { 1, false }
                 else
-                    if current == 'IN_PROGRESS' then
+                    if current == 'IN_PROGRESS' or string.sub(current, 1, 12) == 'IN_PROGRESS:' then
                         return { 2, false }
                     else
                         return { 3, current }
@@ -235,6 +249,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
             let res: (i64, redis::Value) = script
                 .key(&redis_key)
                 .arg(ttl_ms)
+                .arg(&token)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -266,7 +281,17 @@ impl IdempotencyStore for RedisIdempotencyStore {
     }
 
     fn complete(&self, key: &str, result: Option<Vec<u8>>) -> BoxFuture<'_, Result<(), JobError>> {
+        self.complete_with_token(key, "", result)
+    }
+
+    fn complete_with_token(
+        &self,
+        key: &str,
+        token: &str,
+        result: Option<Vec<u8>>,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
         let redis_key = self.key(key);
+        let token = token.to_string();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -284,7 +309,16 @@ impl IdempotencyStore for RedisIdempotencyStore {
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
+                local matches = false
                 if current == 'IN_PROGRESS' then
+                    matches = true
+                elseif current and ARGV[3] ~= '' and current == ('IN_PROGRESS:' .. ARGV[3]) then
+                    matches = true
+                elseif current and ARGV[3] == '' and string.sub(current, 1, 12) == 'IN_PROGRESS:' then
+                    matches = true
+                end
+
+                if matches then
                     redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
                     return 1
                 else
@@ -297,6 +331,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .key(&redis_key)
                 .arg(&val)
                 .arg(ttl_ms)
+                .arg(&token)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -306,7 +341,16 @@ impl IdempotencyStore for RedisIdempotencyStore {
     }
 
     fn release(&self, key: &str) -> BoxFuture<'_, Result<(), JobError>> {
+        self.release_with_token(key, "")
+    }
+
+    fn release_with_token(
+        &self,
+        key: &str,
+        token: &str,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
         let redis_key = self.key(key);
+        let token = token.to_string();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -314,11 +358,22 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            // Evicts key if IN_PROGRESS or COMPLETED, clearing idempotency state
+            // Evicts key if IN_PROGRESS, IN_PROGRESS:<token>, or COMPLETED, clearing idempotency state
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
-                if current == 'IN_PROGRESS' or (current and string.sub(current, 1, 9) == 'COMPLETED') then
+                local can_delete = false
+                if current == 'IN_PROGRESS' then
+                    can_delete = true
+                elseif current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
+                    can_delete = true
+                elseif current and ARGV[1] == '' and string.sub(current, 1, 12) == 'IN_PROGRESS:' then
+                    can_delete = true
+                elseif current and string.sub(current, 1, 9) == 'COMPLETED' then
+                    can_delete = true
+                end
+
+                if can_delete then
                     redis.call('DEL', KEYS[1])
                     return 1
                 else
@@ -329,6 +384,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
 
             let _: i64 = script
                 .key(&redis_key)
+                .arg(&token)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;

@@ -155,17 +155,17 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     }
 }
 
-fn escape_sql_literal(s: &str) -> String {
+fn escape_sql_literal(s: &str, is_mysql: bool) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     out.push('\'');
     for c in s.chars() {
         match c {
             '\'' => out.push_str("''"),
-            '\\' => out.push_str("\\\\"),
-            '\0' => out.push_str("\\0"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\x1a' => out.push_str("\\Z"),
+            '\\' if is_mysql => out.push_str("\\\\"),
+            '\0' if is_mysql => out.push_str("\\0"),
+            '\n' if is_mysql => out.push_str("\\n"),
+            '\r' if is_mysql => out.push_str("\\r"),
+            '\x1a' if is_mysql => out.push_str("\\Z"),
             other => out.push(other),
         }
     }
@@ -176,7 +176,10 @@ fn escape_sql_literal(s: &str) -> String {
 impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
     fn record<'a>(&'a self, record: AuditRecord) -> AuditFuture<'a> {
         Box::pin(async move {
-            let id = escape_sql_literal(&record.id);
+            let is_mysql = self.backend.dialect() == "mysql";
+            let esc = |val: &str| escape_sql_literal(val, is_mysql);
+
+            let id = esc(&record.id);
             let status_str = match record.status {
                 AuditStatus::Success => "success",
                 AuditStatus::Denied => "denied",
@@ -192,21 +195,21 @@ impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
             let actor_val = record
                 .actor_id
                 .as_deref()
-                .map(escape_sql_literal)
+                .map(esc)
                 .unwrap_or_else(|| "NULL".to_string());
             let target_val = record
                 .target_id
                 .as_deref()
-                .map(escape_sql_literal)
+                .map(esc)
                 .unwrap_or_else(|| "NULL".to_string());
             let ip_val = record
                 .ip_address
                 .as_deref()
-                .map(escape_sql_literal)
+                .map(esc)
                 .unwrap_or_else(|| "NULL".to_string());
-            let meta_val = escape_sql_literal(&meta_json);
-            let action = escape_sql_literal(&record.action);
-            let resource = escape_sql_literal(&record.target_type);
+            let meta_val = esc(&meta_json);
+            let action = esc(&record.action);
+            let resource = esc(&record.target_type);
 
             let stmt = format!(
                 "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ({id}, {action}, {resource}, '{status_str}', {actor_val}, {target_val}, {ip_val}, {meta_val}, {})",
