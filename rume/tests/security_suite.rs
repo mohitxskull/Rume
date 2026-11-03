@@ -1,3 +1,5 @@
+#![cfg(feature = "sqlite")]
+
 use axum::http::{Method, Request, StatusCode};
 use axum::routing::{get, post};
 use rume::persistence::{DatabaseBackend, SqliteBackend};
@@ -272,4 +274,29 @@ async fn test_audit_logging() {
         .unwrap()
         .unwrap();
     assert_eq!(status, "denied");
+}
+
+#[tokio::test]
+async fn test_audit_logging_sql_injection_resilience_and_id_preservation() {
+    let backend = SqliteBackend::in_memory().await.unwrap();
+    let logger = SqlAuditLogger::new(backend);
+    logger.init_table().await.unwrap();
+
+    let malicious_record = AuditRecord::new("user.inject", "account", AuditStatus::Failure)
+        .with_actor("corp\\attacker\\' OR '1'='1; --")
+        .with_target("tgt\\target\\")
+        .with_ip("127.0.0.1\\")
+        .with_meta("key", "val\\' OR '1'='1");
+    let record_id = malicious_record.id.clone();
+
+    logger.record(malicious_record).await.expect("record with backslashes and quotes must succeed");
+    assert_eq!(logger.count().await.unwrap(), 1);
+
+    // Verify record.id was preserved in the database
+    let saved_id = logger
+        .backend()
+        .query_scalar(&format!("SELECT id FROM rume_audit_log WHERE id = '{record_id}'"))
+        .await
+        .unwrap();
+    assert_eq!(saved_id.as_deref(), Some(record_id.as_str()));
 }

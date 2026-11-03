@@ -191,15 +191,23 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
                 if let Some((name, val)) = cookie.trim().split_once('=')
                     && name == self.cookie_name
                 {
-                    if let Ok(Some(session)) = self.store.load(val).await {
-                        let mut user = AuthUser::new(session.user_id)
-                            .with_roles(session.roles)
-                            .with_permissions(session.permissions);
-                        user.metadata = session.data;
-                        return Ok(Some(user));
+                    match self.store.load(val).await {
+                        Ok(Some(session)) => {
+                            let mut user = AuthUser::new(session.user_id)
+                                .with_roles(session.roles)
+                                .with_permissions(session.permissions);
+                            user.metadata = session.data;
+                            return Ok(Some(user));
+                        }
+                        Ok(None) => {
+                            // Stale or expired cookie: allow fallback to subsequent schemes in the chain
+                            return Ok(None);
+                        }
+                        Err(err) => {
+                            // Infrastructure or provider error: do not silently degrade to guest!
+                            return Err(err);
+                        }
                     }
-                    // Stale or expired cookie: allow fallback to subsequent schemes in the chain
-                    return Ok(None);
                 }
             }
 

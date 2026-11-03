@@ -187,8 +187,13 @@ impl RedisIdempotencyStore {
         self
     }
 
+    /// Formats an idempotency key with length-prefixed tenant isolation to prevent collisions.
+    pub fn scoped_key(tenant_id: &str, key: &str) -> String {
+        crate::jobs::reliability::scoped_idempotency_key(tenant_id, key)
+    }
+
     fn key(&self, key: &str) -> String {
-        format!("{}{}", self.prefix, key)
+        format!("{}{{{}}}", self.prefix, key)
     }
 }
 
@@ -274,14 +279,25 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 val.push_str(&hex_encode(&payload));
             }
 
-            // Retain completed state for 24 hours (86,400,000 ms)
+            // Retain completed state for 24 hours (86,400,000 ms), but only transition if currently IN_PROGRESS
             let ttl_ms = 86_400_000_u64;
-            let _: () = redis::cmd("SET")
-                .arg(&redis_key)
+            let script = redis::Script::new(
+                r#"
+                local current = redis.call('GET', KEYS[1])
+                if current == 'IN_PROGRESS' then
+                    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+                    return 1
+                else
+                    return 0
+                end
+                "#,
+            );
+
+            let _: i64 = script
+                .key(&redis_key)
                 .arg(&val)
-                .arg("PX")
                 .arg(ttl_ms)
-                .query_async(&mut *conn)
+                .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
@@ -298,9 +314,22 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            let _: () = redis::cmd("DEL")
-                .arg(&redis_key)
-                .query_async(&mut *conn)
+            // Only delete the lock if it is still IN_PROGRESS, preventing deletion of completed jobs or peer claims
+            let script = redis::Script::new(
+                r#"
+                local current = redis.call('GET', KEYS[1])
+                if current == 'IN_PROGRESS' then
+                    redis.call('DEL', KEYS[1])
+                    return 1
+                else
+                    return 0
+                end
+                "#,
+            );
+
+            let _: i64 = script
+                .key(&redis_key)
+                .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 

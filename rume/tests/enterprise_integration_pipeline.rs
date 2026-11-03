@@ -5,6 +5,8 @@
 //! Atomic Database Transaction + Outbox Enlistment -> Relay Event Dispatch ->
 //! Background Worker Execution -> Tracing & Metrics -> Failure Recovery & Graceful Drain.
 
+#![cfg(all(feature = "postgres", feature = "sqlite"))]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;

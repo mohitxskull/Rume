@@ -20,6 +20,39 @@ pub struct LockGuard {
     pub lease_id: String,
     /// Monotonically increasing fencing token.
     pub fencing_token: u64,
+    /// Expiration timestamp of the lease.
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl LockGuard {
+    /// Creates a new LockGuard.
+    pub fn new(resource: impl Into<String>, lease_id: impl Into<String>, fencing_token: u64) -> Self {
+        Self {
+            resource: resource.into(),
+            lease_id: lease_id.into(),
+            fencing_token,
+            expires_at: None,
+        }
+    }
+
+    /// Attaches an expiration timestamp.
+    pub fn with_expires_at(mut self, expires_at: std::time::Instant) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Checks if this lock guard's lease has expired according to monotonic clock.
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .map(|exp| std::time::Instant::now() >= exp)
+            .unwrap_or(false)
+    }
+
+    /// Returns the remaining duration before expiration, or None if already expired or unbounded.
+    pub fn time_remaining(&self) -> Option<Duration> {
+        self.expires_at
+            .and_then(|exp| exp.checked_duration_since(std::time::Instant::now()))
+    }
 }
 
 /// Interface for distributed locking.

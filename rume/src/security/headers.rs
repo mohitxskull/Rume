@@ -38,6 +38,10 @@ pub struct SecurityHeadersConfig {
     pub custom_headers: BTreeMap<String, String>,
     /// Whether HSTS injection strictly requires HTTPS or `x-forwarded-proto: https` (default: `true`).
     pub hsts_require_tls: bool,
+    /// Whether native TLS is terminated in-process (default: `false`).
+    pub native_tls: bool,
+    /// Whether to trust `x-forwarded-proto` and `Forwarded` headers from reverse proxies (default: `true`).
+    pub trust_proxy_headers: bool,
 }
 
 impl Default for SecurityHeadersConfig {
@@ -52,6 +56,8 @@ impl Default for SecurityHeadersConfig {
             x_xss_protection: Some("0".to_string()),
             custom_headers: BTreeMap::new(),
             hsts_require_tls: true,
+            native_tls: false,
+            trust_proxy_headers: true,
         }
     }
 }
@@ -83,6 +89,18 @@ impl SecurityHeadersConfig {
     /// Configures whether HSTS injection requires HTTPS or `x-forwarded-proto: https` (default: `true`).
     pub fn with_hsts_require_tls(mut self, require: bool) -> Self {
         self.hsts_require_tls = require;
+        self
+    }
+
+    /// Flags that native TLS is terminated in-process.
+    pub fn with_native_tls(mut self, native: bool) -> Self {
+        self.native_tls = native;
+        self
+    }
+
+    /// Configures whether reverse proxy headers (`x-forwarded-proto`, `Forwarded`) are trusted.
+    pub fn with_trust_proxy_headers(mut self, trust: bool) -> Self {
+        self.trust_proxy_headers = trust;
         self
     }
 
@@ -153,13 +171,21 @@ where
         let config = Arc::clone(&self.config);
         let mut inner = self.inner.clone();
 
-        let is_https = req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
-            || req
-                .headers()
-                .get("x-forwarded-proto")
-                .and_then(|v| v.to_str().ok())
-                .map(|v| v.eq_ignore_ascii_case("https"))
-                .unwrap_or(false);
+        let is_https = config.native_tls
+            || req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
+            || (config.trust_proxy_headers
+                && (req
+                    .headers()
+                    .get("x-forwarded-proto")
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| v.eq_ignore_ascii_case("https"))
+                    .unwrap_or(false)
+                    || req
+                        .headers()
+                        .get("forwarded")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|v| v.to_ascii_lowercase().contains("proto=https"))
+                        .unwrap_or(false)));
 
         Box::pin(async move {
             let mut response = inner.call(req).await?;

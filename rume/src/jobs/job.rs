@@ -33,10 +33,18 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn idempotency_key(&self) -> Option<String> {
         None
     }
+
+    /// Optional tenant identifier for multi-tenant queue and idempotency scoping.
+    fn tenant_id(&self) -> Option<String> {
+        None
+    }
 }
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Execution context provided to a job handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct JobContext {
     /// Unique identifier for this queued job instance.
     pub id: String,
@@ -44,6 +52,34 @@ pub struct JobContext {
     pub attempt: u32,
     /// Maximum allowed attempts before DLQ.
     pub max_attempts: u32,
+    /// Optional cancellation signal triggered during graceful worker shutdown.
+    pub cancellation: Option<Arc<AtomicBool>>,
+}
+
+impl JobContext {
+    /// Creates a new job execution context.
+    pub fn new(id: impl Into<String>, attempt: u32, max_attempts: u32) -> Self {
+        Self {
+            id: id.into(),
+            attempt,
+            max_attempts,
+            cancellation: None,
+        }
+    }
+
+    /// Attaches a cancellation token to the job context.
+    pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
+        self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Checks if the worker has requested graceful cancellation.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation
+            .as_ref()
+            .map(|c| c.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
 }
 
 /// Handler responsible for executing a specific background job type.
@@ -69,8 +105,12 @@ pub struct QueuedJob {
     pub timeout: Option<Duration>,
     /// Optional idempotency key for deduplication.
     pub idempotency_key: Option<String>,
+    /// Optional tenant identifier for multi-tenant isolation.
+    pub tenant_id: Option<String>,
     /// Identifier of the worker node actively executing this job.
     pub assigned_worker: Option<String>,
+    /// Unique lease token fencing this claim attempt.
+    pub lease_token: Option<String>,
     /// Earliest time when this job is eligible for execution.
     pub available_at: Instant,
 }

@@ -53,7 +53,7 @@ fn test_saml_assertion_parsing_and_validation() {
     </saml2:Assertion>
     "#;
 
-    let assertion = SamlParser::parse(saml_xml).unwrap();
+    let assertion = SamlParser::parse_unverified(saml_xml).unwrap();
     assert_eq!(assertion.id, "_abc123");
     assert_eq!(assertion.issuer, "https://idp.enterprise.com/saml");
     assert_eq!(assertion.subject, "bob@enterprise.com");
@@ -98,7 +98,7 @@ fn test_saml_condition_timestamps_and_comment_injection() {
     </saml2:Assertion>
     "#;
 
-    let assertion = SamlParser::parse(saml_xml).unwrap();
+    let assertion = SamlParser::parse_unverified(saml_xml).unwrap();
     // Comment was stripped, subject is contractor, not ceo
     assert_eq!(assertion.subject, "contractor@enterprise.com");
     assert!(assertion.not_before.is_some());
@@ -173,7 +173,7 @@ fn test_saml_signature_wrapping_and_strict_validation() {
     </saml2p:Response>
     "#;
 
-    let res = SamlParser::parse(xsw_xml);
+    let res = SamlParser::parse_unverified(xsw_xml);
     assert!(matches!(res, Err(SamlError::SignatureWrappingDetected(_))));
 
     // 2. Detect Reference URI mismatch
@@ -189,7 +189,7 @@ fn test_saml_signature_wrapping_and_strict_validation() {
     </saml2:Assertion>
     "##;
 
-    let res_ref = SamlParser::parse(ref_mismatch_xml);
+    let res_ref = SamlParser::parse_unverified(ref_mismatch_xml);
     assert!(matches!(
         res_ref,
         Err(SamlError::SignatureWrappingDetected(_))
@@ -208,7 +208,7 @@ fn test_saml_signature_wrapping_and_strict_validation() {
     </saml2p:Response>
     "#;
 
-    let assertion = SamlParser::parse(valid_xml).unwrap();
+    let assertion = SamlParser::parse_unverified(valid_xml).unwrap();
     assert_eq!(
         assertion.destination.as_deref(),
         Some("https://sp.myapp.io/saml/acs")
@@ -246,4 +246,28 @@ fn test_saml_signature_wrapping_and_strict_validation() {
         bad_dest,
         Err(SamlError::DestinationMismatch { .. })
     ));
+}
+
+#[test]
+fn test_saml_xsw_envelope_injection_prevention() {
+    let response_envelope_xsw = r#"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" Destination="https://sp.myapp.io/saml/acs">
+        <saml2:Subject xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">
+            <saml2:NameID>attacker@evil.com</saml2:NameID>
+        </saml2:Subject>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_legit123">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>legit@enterprise.com</saml2:NameID></saml2:Subject>
+            <saml2:Conditions>
+                <saml2:Audience>https://sp.myapp.io</saml2:Audience>
+            </saml2:Conditions>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "#;
+
+    let assertion = SamlParser::parse_unverified(response_envelope_xsw).unwrap();
+    assert_eq!(
+        assertion.subject, "legit@enterprise.com",
+        "NameID must be extracted strictly from inside Assertion subtree, ignoring envelope injection"
+    );
 }

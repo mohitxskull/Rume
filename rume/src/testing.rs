@@ -101,6 +101,37 @@ impl TestApp {
     }
 }
 
+/// Declarative, fluent test harness coordinating database pools, lifecycle hooks, and test app routing.
+#[cfg(feature = "sqlite")]
+pub struct RumeTestHarness<B: crate::persistence::DatabaseBackend> {
+    /// Active database pool configured for testing.
+    pub pool: crate::persistence::DatabasePool<B>,
+    /// Optional test app for issuing simulated HTTP requests.
+    pub app: Option<TestApp>,
+}
+
+#[cfg(feature = "sqlite")]
+impl RumeTestHarness<crate::persistence::SqliteBackend> {
+    /// Builds an in-memory SQLite test harness with an initialized pool.
+    pub async fn in_memory() -> Result<Self, crate::persistence::PersistenceError> {
+        let backend = crate::persistence::SqliteBackend::in_memory().await?;
+        let config = crate::persistence::DatabaseConfig::new("memory://test");
+        let pool = crate::persistence::DatabasePool::new(backend, config);
+        Ok(Self { pool, app: None })
+    }
+
+    /// Attaches an Axum router to the test harness.
+    pub fn with_router(mut self, router: axum::Router<()>) -> Self {
+        self.app = Some(TestApp::new(router));
+        self
+    }
+
+    /// Returns a reference to the active test app, panicking if no router was configured.
+    pub fn app(&self) -> &TestApp {
+        self.app.as_ref().expect("no router configured on test harness")
+    }
+}
+
 impl std::fmt::Debug for TestApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let has_cleanup = self.cleanup.lock().map(|l| l.is_some()).unwrap_or(false);

@@ -30,7 +30,7 @@ pub struct ScimEmail {
     pub email_type: Option<String>,
 }
 
-/// SCIM Metadata sub-attribute.
+/// SCIM Metadata sub-attribute (RFC 7643 Section 3.1).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ScimMeta {
@@ -38,6 +38,15 @@ pub struct ScimMeta {
     pub created: Option<String>,
     pub last_modified: Option<String>,
     pub location: Option<String>,
+    pub version: Option<String>,
+}
+
+impl ScimMeta {
+    /// Configures the ETag version string (e.g. W/"v1.0").
+    pub fn with_version(mut self, version: impl Into<String>) -> Self {
+        self.version = Some(version.into());
+        self
+    }
 }
 
 /// SCIM 2.0 User resource representation (RFC 7643).
@@ -105,6 +114,7 @@ pub struct ScimGroup {
     pub id: String,
     pub display_name: String,
     pub members: Vec<ScimMember>,
+    pub meta: Option<ScimMeta>,
 }
 
 impl ScimGroup {
@@ -115,6 +125,10 @@ impl ScimGroup {
             id: id.into(),
             display_name: display_name.into(),
             members: Vec::new(),
+            meta: Some(ScimMeta {
+                resource_type: "Group".to_string(),
+                ..Default::default()
+            }),
         }
     }
 }

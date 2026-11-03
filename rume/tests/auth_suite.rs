@@ -1,3 +1,5 @@
+#![cfg(feature = "redis")]
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::routing::{get, post};

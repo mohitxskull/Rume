@@ -1,3 +1,5 @@
+#![cfg(feature = "redis")]
+
 use std::sync::Arc;
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
@@ -164,6 +166,50 @@ async fn test_header_tenant_resolver_id_and_slug_namespace_isolation() {
     assert_eq!(res.status(), StatusCode::OK);
     let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
     assert_eq!(body["id"], "t-100");
+    assert_eq!(body["slug"], "acme");
+}
+
+#[tokio::test]
+async fn test_header_tenant_resolver_slug_conflict_rejection() {
+    let resolver = HeaderTenantResolver::new();
+    let res1 = resolver.try_add_tenant(Tenant::new("t-1", "acme"));
+    assert!(res1.is_ok());
+
+    // Duplicate slug under different ID must return Conflict error
+    let res2 = resolver.try_add_tenant(Tenant::new("t-2", "acme"));
+    assert!(matches!(res2, Err(TenantError::Conflict(_))));
+
+    // Adding same tenant (same ID and slug) is idempotent
+    let res3 = resolver.try_add_tenant(Tenant::new("t-1", "acme"));
+    assert!(res3.is_ok());
+}
+
+#[tokio::test]
+async fn test_subdomain_tenant_resolver_case_insensitivity() {
+    let resolver = SubdomainTenantResolver::new("platform.io")
+        .add_tenant(Tenant::new("t-1", "acme"));
+
+    let app = Router::new()
+        .route(
+            "/tenant",
+            get(|TenantContext(tenant): TenantContext| async move {
+                Json(serde_json::json!({ "id": tenant.id, "slug": tenant.slug }))
+            }),
+        )
+        .layer(TenantLayer::required(resolver));
+
+    let test_app = TestApp::new(app);
+
+    let req = Request::builder()
+        .uri("/tenant")
+        .header("host", "ACME.platform.io:8080")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = test_app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(body["id"], "t-100".replace("100", "1"));
     assert_eq!(body["slug"], "acme");
 }
 

@@ -13,3 +13,7 @@ CREATE TABLE IF NOT EXISTS rume_outbox (
 
 CREATE INDEX IF NOT EXISTS idx_rume_outbox_pending
 ON rume_outbox (status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_rume_outbox_lease
+ON rume_outbox (status, lease_expires_at);
+

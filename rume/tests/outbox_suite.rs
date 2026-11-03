@@ -1,3 +1,5 @@
+#![cfg(feature = "sqlite")]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -103,15 +105,24 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
         "Backoff should prevent immediate refetch during outage"
     );
 
-    // Verify backoff and failure tracking directly
+    // Verify backoff and failure tracking directly with lease token fencing
+    use rume::persistence::DatabaseBackend;
     for _ in 0..3 {
-        repo.mark_failed(&msg_id, "cluster down".into())
+        repo.execute(&format!("UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'")).await.unwrap();
+        let claimed = repo.claim_pending(1).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        let token = claimed[0].lease_token.as_ref().unwrap();
+        repo.mark_failed(&msg_id, token, "cluster down".into())
             .await
             .unwrap();
     }
 
-    // 5th failure -> status transitions to Failed
-    repo.mark_failed(&msg_id, "cluster down".into())
+    // 5th failure -> status transitions to Failed (DLQ)
+    repo.execute(&format!("UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'")).await.unwrap();
+    let claimed = repo.claim_pending(1).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.as_ref().unwrap();
+    repo.mark_failed(&msg_id, token, "cluster down".into())
         .await
         .unwrap();
 
@@ -119,6 +130,16 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
     assert_eq!(pending_after.len(), 0); // No longer returned as Pending
 
     assert_eq!(repo.pending_count().await.unwrap(), 0);
+    assert_eq!(repo.failed_count().await.unwrap(), 1);
+
+    // Verify DLQ fetch and reprocessing
+    let failed = repo.fetch_failed(10).await.unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].id, msg_id);
+
+    repo.reprocess_failed(&msg_id).await.unwrap();
+    assert_eq!(repo.pending_count().await.unwrap(), 1);
+    assert_eq!(repo.failed_count().await.unwrap(), 0);
 }
 
 #[tokio::test]
@@ -222,12 +243,17 @@ async fn outbox_relay_drain_fails_closed_when_pending_count_errors() {
         ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
             Box::pin(async { Ok(vec![]) })
         }
-        fn mark_published(&self, _id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
+        fn mark_published(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
             Box::pin(async { Ok(()) })
         }
         fn mark_failed(
             &self,
             _id: &str,
+            _lease_token: &str,
             _reason: String,
         ) -> BoxFuture<'_, Result<(), OutboxError>> {
             Box::pin(async { Ok(()) })
@@ -403,5 +429,111 @@ async fn outbox_claim_lease_recovery_of_abandoned_messages() {
     let published_count = relay.poll_and_dispatch(5).await.unwrap();
     assert_eq!(published_count, 1);
     assert_eq!(dispatched.load(Ordering::SeqCst), 1);
+    assert_eq!(repo.pending_count().await.unwrap(), 0);
+}
+
+#[tokio::test]
+async fn outbox_superseded_worker_cannot_mark_published_or_failed() {
+    let repo = setup_real_outbox().await;
+
+    let event = OrderPaidEvent {
+        order_id: "order_fencing".into(),
+        amount_cents: 2500,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+    repo.save(msg).await.unwrap();
+
+    // Worker A claims with 0s lease
+    let claimed_a = repo.claim_pending_with_lease(1, 0).await.unwrap();
+    assert_eq!(claimed_a.len(), 1);
+    let token_a = claimed_a[0].lease_token.clone().unwrap();
+
+    // 1. Worker A attempts mark_published with invalid token -> rejected
+    let bad_res = repo.mark_published(&msg_id, "invalid-token").await;
+    assert!(bad_res.is_err(), "invalid token must be rejected");
+
+    // 2. Recovery runs because lease duration was 0s
+    let recovered = repo.recover_expired_claims(0).await.unwrap();
+    assert_eq!(recovered, 1);
+
+    // 3. Worker B claims the message
+    let claimed_b = repo.claim_pending_with_lease(1, 60).await.unwrap();
+    assert_eq!(claimed_b.len(), 1);
+    let token_b = claimed_b[0].lease_token.clone().unwrap();
+    assert_ne!(token_a, token_b);
+
+    // 4. Superseded Worker A attempts mark_published with token_a -> rejected!
+    let a_pub_res = repo.mark_published(&msg_id, &token_a).await;
+    assert!(a_pub_res.is_err(), "superseded worker A must not mark published");
+
+    // 5. Superseded Worker A attempts mark_failed with token_a -> rejected!
+    let a_fail_res = repo.mark_failed(&msg_id, &token_a, "failed".into()).await;
+    assert!(a_fail_res.is_err(), "superseded worker A must not mark failed");
+
+    // 6. Active Worker B marks published with token_b -> succeeds
+    let b_pub_res = repo.mark_published(&msg_id, &token_b).await;
+    assert!(b_pub_res.is_ok(), "active worker B must succeed");
+    assert_eq!(repo.published_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn outbox_recovery_does_not_prematurely_revoke_valid_lease_on_old_message() {
+    let repo = setup_real_outbox().await;
+
+    let event = OrderPaidEvent {
+        order_id: "order_old_queue".into(),
+        amount_cents: 3000,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+    repo.save(msg).await.unwrap();
+
+    // Simulate message queued for 100 seconds
+    use rume::persistence::DatabaseBackend;
+    repo.execute(&format!("UPDATE rume_outbox SET created_at = created_at - 100 WHERE id = '{msg_id}'"))
+        .await
+        .unwrap();
+
+    // Worker claims message with a 60-second lease
+    let claimed = repo.claim_pending_with_lease(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.clone().unwrap();
+
+    // Another relay executes recovery (e.g. recover_expired_claims(30))
+    // Message is 100s old, but its lease expires in 60s, so it MUST NOT be reclaimed!
+    let recovered = repo.recover_expired_claims(30).await.unwrap();
+    assert_eq!(recovered, 0, "active 60s lease on old message must NOT be revoked");
+
+    // Original worker completes successfully
+    repo.mark_published(&msg_id, &token).await.unwrap();
+    assert_eq!(repo.published_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn outbox_duplicate_insert_preserves_published_and_inflight_state() {
+    let repo = setup_real_outbox().await;
+
+    let event = OrderPaidEvent {
+        order_id: "order_idempotent_1".into(),
+        amount_cents: 9999,
+    };
+    let msg = OutboxMessage::from_event(&event).unwrap();
+    let msg_id = msg.id.clone();
+    repo.save(msg.clone()).await.unwrap();
+
+    // Claim and publish
+    let claimed = repo.claim_pending_with_lease(1, 60).await.unwrap();
+    assert_eq!(claimed.len(), 1);
+    let token = claimed[0].lease_token.clone().unwrap();
+    repo.mark_published(&msg_id, &token).await.unwrap();
+    assert_eq!(repo.published_count().await.unwrap(), 1);
+    assert_eq!(repo.pending_count().await.unwrap(), 0);
+
+    // Client idempotently retries request: save() with same message ID
+    repo.save(msg).await.unwrap();
+
+    // Must remain published, not reset to pending!
+    assert_eq!(repo.published_count().await.unwrap(), 1);
     assert_eq!(repo.pending_count().await.unwrap(), 0);
 }

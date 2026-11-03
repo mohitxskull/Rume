@@ -264,27 +264,22 @@ where
                 // If auto_inject_cookie is enabled, ensure the client has a valid cookie token
                 let mut token_to_inject = None;
                 if config.auto_inject_cookie {
-                    let existing_cookie = req
+                    let has_valid_cookie = req
                         .headers()
                         .get(COOKIE)
                         .and_then(|val| val.to_str().ok())
-                        .and_then(|cookies| {
-                            cookies.split(';').find_map(|pair| {
-                                let (name, value) = pair.trim().split_once('=')?;
-                                if name == config.cookie_name {
-                                    Some(value)
+                        .map(|cookies| {
+                            cookies.split(';').any(|pair| {
+                                if let Some((name, value)) = pair.trim().split_once('=') {
+                                    name == config.cookie_name && config.verify_token(value)
                                 } else {
-                                    None
+                                    false
                                 }
                             })
-                        });
+                        })
+                        .unwrap_or(false);
 
-                    let is_valid = match existing_cookie {
-                        Some(tok) => config.verify_token(tok),
-                        None => false,
-                    };
-
-                    if !is_valid {
+                    if !has_valid_cookie {
                         token_to_inject = Some(config.generate_token());
                     }
                 }
@@ -325,33 +320,41 @@ where
                 return Ok(err.into_response());
             };
 
-            // Extract token from Cookie header
-            let cookie_token = req
+            // Extract matching tokens from Cookie header (inspect all matching cookies to avoid subdomain cookie-tossing denial of service)
+            let matching_cookies: Vec<&str> = req
                 .headers()
                 .get(COOKIE)
                 .and_then(|val| val.to_str().ok())
-                .and_then(|cookies| {
-                    cookies.split(';').find_map(|pair| {
-                        let (name, value) = pair.trim().split_once('=')?;
-                        if name == config.cookie_name {
-                            Some(value)
-                        } else {
-                            None
-                        }
-                    })
-                });
+                .map(|cookies| {
+                    cookies
+                        .split(';')
+                        .filter_map(|pair| {
+                            let (name, value) = pair.trim().split_once('=')?;
+                            if name == config.cookie_name {
+                                Some(value)
+                            } else {
+                                None
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
 
-            let Some(cookie_token) = cookie_token else {
+            if matching_cookies.is_empty() {
                 let err = AppError::Public {
                     status: StatusCode::FORBIDDEN,
                     code: "CSRF_TOKEN_MISSING",
                     message: format!("Missing required CSRF cookie '{}'", config.cookie_name),
                 };
                 return Ok(err.into_response());
-            };
+            }
 
-            // Verify cookie signature if secret is configured (guards against subdomain cookie tossing)
-            if !config.verify_token(cookie_token) {
+            // 1. Verify if ANY matching cookie has a valid signature (guards against invalid tossed cookies)
+            let any_valid = matching_cookies.iter().any(|&cookie_token| {
+                config.verify_token(cookie_token)
+            });
+
+            if !any_valid {
                 let err = AppError::Public {
                     status: StatusCode::FORBIDDEN,
                     code: "CSRF_TOKEN_INVALID",
@@ -360,8 +363,13 @@ where
                 return Ok(err.into_response());
             }
 
-            // Constant-time token verification to prevent timing side-channels
-            if !safe_equal(header_token.as_bytes(), cookie_token.as_bytes()) {
+            // 2. Verify if ANY valid matching cookie matches the header token in constant time
+            let has_valid_match = matching_cookies.iter().any(|&cookie_token| {
+                config.verify_token(cookie_token)
+                    && safe_equal(header_token.as_bytes(), cookie_token.as_bytes())
+            });
+
+            if !has_valid_match {
                 let err = AppError::Public {
                     status: StatusCode::FORBIDDEN,
                     code: "CSRF_TOKEN_MISMATCH",

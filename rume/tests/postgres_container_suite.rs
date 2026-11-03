@@ -315,8 +315,8 @@ async fn test_postgres_outbox_concurrency_skip_locked() {
     assert_eq!(batch1.len(), 5, "worker 1 should claim exactly 5 messages");
     assert_eq!(batch2.len(), 5, "worker 2 should claim exactly 5 messages");
 
-    let ids1: HashSet<String> = batch1.into_iter().map(|m| m.id).collect();
-    let ids2: HashSet<String> = batch2.into_iter().map(|m| m.id).collect();
+    let ids1: HashSet<String> = batch1.iter().map(|m| m.id.clone()).collect();
+    let ids2: HashSet<String> = batch2.iter().map(|m| m.id.clone()).collect();
 
     // Verify strict mutual exclusion: no message was claimed by both workers
     let intersection: HashSet<_> = ids1.intersection(&ids2).collect();
@@ -325,10 +325,11 @@ async fn test_postgres_outbox_concurrency_skip_locked() {
         "claimed batches must not overlap due to FOR UPDATE SKIP LOCKED, got: {intersection:?}"
     );
 
-    // All 10 are now inflight; mark them published
-    for id in ids1.union(&ids2) {
+    // All 10 are now inflight; mark them published with their lease tokens
+    for m in batch1.into_iter().chain(batch2.into_iter()) {
+        let token = m.lease_token.as_ref().unwrap();
         backend
-            .mark_published(id)
+            .mark_published(&m.id, token)
             .await
             .expect("mark published failed");
     }
@@ -382,8 +383,9 @@ async fn test_postgres_outbox_expired_claim_recovery() {
     assert_eq!(reclaimed.len(), 1);
     assert_eq!(reclaimed[0].id, "crashed-worker-msg");
 
+    let token = reclaimed[0].lease_token.as_ref().unwrap();
     backend
-        .mark_published(&reclaimed[0].id)
+        .mark_published(&reclaimed[0].id, token)
         .await
         .expect("mark published failed");
     assert_eq!(backend.published_count().await.unwrap(), 1);
@@ -721,8 +723,9 @@ async fn test_postgres_job_queue_enqueue_dequeue_and_ack() {
     // In-flight job is no longer pending
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
-    // Ack removes job
-    queue.ack(&job_id).await.expect("ack failed");
+    // Ack marks job completed with valid lease token
+    let token = dequeued.lease_token.as_deref().unwrap();
+    queue.ack(&job_id, token).await.expect("ack failed");
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 }
 
@@ -753,7 +756,7 @@ async fn test_postgres_job_queue_concurrency_skip_locked() {
         let mut claimed = Vec::new();
         while claimed.len() < 5 {
             if let Some(job) = q1.dequeue_for("worker-1").await.unwrap() {
-                claimed.push(job.id);
+                claimed.push((job.id, job.lease_token.unwrap()));
             }
         }
         claimed
@@ -763,7 +766,7 @@ async fn test_postgres_job_queue_concurrency_skip_locked() {
         let mut claimed = Vec::new();
         while claimed.len() < 5 {
             if let Some(job) = q2.dequeue_for("worker-2").await.unwrap() {
-                claimed.push(job.id);
+                claimed.push((job.id, job.lease_token.unwrap()));
             }
         }
         claimed
@@ -774,8 +777,8 @@ async fn test_postgres_job_queue_concurrency_skip_locked() {
     assert_eq!(batch1.len(), 5);
     assert_eq!(batch2.len(), 5);
 
-    let ids1: HashSet<String> = batch1.into_iter().collect();
-    let ids2: HashSet<String> = batch2.into_iter().collect();
+    let ids1: HashSet<String> = batch1.iter().map(|(id, _)| id.clone()).collect();
+    let ids2: HashSet<String> = batch2.iter().map(|(id, _)| id.clone()).collect();
 
     // Assert zero overlap due to FOR UPDATE SKIP LOCKED
     let overlap: HashSet<_> = ids1.intersection(&ids2).collect();
@@ -784,9 +787,9 @@ async fn test_postgres_job_queue_concurrency_skip_locked() {
         "job claiming must not overlap, got: {overlap:?}"
     );
 
-    // Ack all claimed jobs
-    for id in ids1.union(&ids2) {
-        queue.ack(id).await.expect("ack failed");
+    // Ack all claimed jobs with their respective lease tokens
+    for (id, token) in batch1.into_iter().chain(batch2.into_iter()) {
+        queue.ack(&id, &token).await.expect("ack failed");
     }
 
     assert_eq!(queue.pending_count().await.unwrap(), 0);
@@ -835,9 +838,10 @@ async fn test_postgres_job_queue_abandoned_worker_reclaim_and_dlq() {
     assert_eq!(retried.id, job_id);
     assert_eq!(retried.attempt, 2);
 
-    // Move to Dead-Letter Queue
+    // Move to Dead-Letter Queue with lease token
+    let retried_token = retried.lease_token.clone().unwrap();
     queue
-        .dead_letter(retried, "database unrecoverable error".into())
+        .dead_letter(retried, &retried_token, "database unrecoverable error".into())
         .await
         .expect("dead_letter failed");
 
@@ -1015,7 +1019,8 @@ async fn test_postgres_realistic_enterprise_transaction_pipeline() {
     assert_eq!(job_payload.tenant_id, tenant);
 
     // Acknowledge job completion
-    queue.ack(&queued_job.id).await.expect("ack failed");
+    let job_token = queued_job.lease_token.as_deref().unwrap();
+    queue.ack(&queued_job.id, job_token).await.expect("ack failed");
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // 8. Injected Failure Scenario: Rollback aborts both business write and outbox message

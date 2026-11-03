@@ -321,7 +321,6 @@ async fn tracing_context_preserved_across_async_yields() {
     async fn yielding_handler(request_id: RequestId) -> String {
         let initial_id = request_id.to_string();
         tokio::task::yield_now().await;
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         tokio::task::yield_now().await;
         let final_id = request_id.to_string();
         assert_eq!(initial_id, final_id);

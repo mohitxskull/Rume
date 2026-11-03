@@ -226,9 +226,10 @@ async fn test_mysql_outbox_claims_skip_locked_and_lease() {
         }
     }
 
-    // Mark c1 published
+    // Mark c1 published with lease tokens
     for m in &c1 {
-        backend.mark_published(&m.id).await.expect("mark published");
+        let token = m.lease_token.as_ref().unwrap();
+        backend.mark_published(&m.id, token).await.expect("mark published");
     }
 
     assert_eq!(backend.published_count().await.expect("published count"), 5);

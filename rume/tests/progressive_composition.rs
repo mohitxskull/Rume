@@ -246,8 +246,13 @@ async fn modules_with_explicit_dependencies_topological_startup() {
             .await
     });
 
-    // Wait briefly for startup to complete
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Wait deterministically for startup to complete
+    for _ in 0..100 {
+        if events.lock().unwrap().len() >= 2 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
 
     // Trigger shutdown
     let _ = shutdown_tx.send(());

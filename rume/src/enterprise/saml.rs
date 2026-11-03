@@ -73,7 +73,7 @@ pub struct SamlAssertion {
 /// Parser and validator for SAML 2.0 assertions.
 pub struct SamlParser;
 
-fn strip_comments(xml: &str) -> String {
+fn strip_comments(xml: &str) -> Result<String, SamlError> {
     let mut out = String::with_capacity(xml.len());
     let mut rest = xml;
     while let Some(start) = rest.find("<!--") {
@@ -81,11 +81,11 @@ fn strip_comments(xml: &str) -> String {
         if let Some(end) = rest[start..].find("-->") {
             rest = &rest[start + end + 3..];
         } else {
-            return out;
+            return Err(SamlError::Malformed("unclosed XML comment".into()));
         }
     }
     out.push_str(rest);
-    out
+    Ok(out)
 }
 
 fn parse_iso8601_or_epoch(s: &str) -> Option<u64> {
@@ -139,11 +139,21 @@ fn parse_iso8601_or_epoch(s: &str) -> Option<u64> {
 }
 
 fn extract_attribute(tag_slice: &str, attr: &str) -> Option<String> {
-    let pattern = format!("{attr}=\"");
-    let pos = tag_slice.find(&pattern)?;
-    let rest = &tag_slice[pos + pattern.len()..];
-    let end = rest.find('"')?;
-    Some(rest[..end].to_string())
+    for quote in ['"', '\''] {
+        let pattern_exact = format!("{attr}={quote}");
+        let pattern_space1 = format!("{attr} ={quote}");
+        let pattern_space2 = format!("{attr} = {quote}");
+        let pattern_space3 = format!("{attr}= {quote}");
+        for p in [&pattern_exact, &pattern_space1, &pattern_space2, &pattern_space3] {
+            if let Some(pos) = tag_slice.find(p) {
+                let rest = &tag_slice[pos + p.len()..];
+                if let Some(end) = rest.find(quote) {
+                    return Some(rest[..end].to_string());
+                }
+            }
+        }
+    }
+    None
 }
 
 impl SamlParser {
@@ -167,7 +177,17 @@ impl SamlParser {
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion.
+    ///
+    /// Deprecated: Unverified assertion parsing in production is insecure.
+    /// Prefer [`SamlParser::parse_signed`] with an injected [`SamlSignatureVerifier`].
+    #[deprecated(note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests")]
     pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {
+        Self::parse_unverified(xml)
+    }
+
+    /// Parses an XML string containing a SAML 2.0 Assertion without signature verification.
+    /// Explicitly intended for offline tests and diagnostics.
+    pub fn parse_unverified(xml: &str) -> Result<SamlAssertion, SamlError> {
         Self::parse_with_verifier(xml, None)
     }
 
@@ -188,23 +208,61 @@ impl SamlParser {
             v.verify_signature(xml)?;
         }
 
-        let clean_xml = strip_comments(xml);
+        let clean_xml = strip_comments(xml)?;
         let xml = clean_xml.as_str();
 
         // Security check: Guard against XML Signature Wrapping (XSW) attacks
-        // Reject messages with multiple assertion tags.
-        let assertion_count = xml.match_indices("<saml2:Assertion").count()
-            + xml.match_indices("<saml:Assertion").count()
-            + xml.match_indices("<Assertion").count();
-        if assertion_count > 1 {
+        // Detect all assertion elements regardless of namespace prefix (<([a-zA-Z0-9_\-]+:)?Assertion)
+        let mut assertion_positions = Vec::new();
+        let mut search_idx = 0;
+        while let Some(pos) = xml[search_idx..].find(":Assertion") {
+            let abs_pos = search_idx + pos;
+            if let Some(tag_start) = xml[..abs_pos].rfind('<') {
+                let tag_prefix = &xml[tag_start + 1..abs_pos];
+                if tag_prefix.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '-') {
+                    assertion_positions.push(tag_start);
+                }
+            }
+            search_idx = abs_pos + ":Assertion".len();
+        }
+        search_idx = 0;
+        while let Some(pos) = xml[search_idx..].find("<Assertion") {
+            let abs_pos = search_idx + pos;
+            if !assertion_positions.contains(&abs_pos) {
+                assertion_positions.push(abs_pos);
+            }
+            search_idx = abs_pos + "<Assertion".len();
+        }
+
+        if assertion_positions.len() > 1 {
             return Err(SamlError::SignatureWrappingDetected(format!(
-                "multiple ({assertion_count}) Assertion elements detected; possible XML signature wrapping attack"
+                "multiple ({}) Assertion elements detected; possible XML signature wrapping attack",
+                assertion_positions.len()
             )));
         }
 
-        // Optional Assertion ID
-        let id = if let Some(pos) = xml.find("ID=\"") {
-            let rest = &xml[pos + 4..];
+        if assertion_positions.is_empty() {
+            return Err(SamlError::Malformed("missing Assertion element in SAML payload".into()));
+        }
+
+        let assertion_start = assertion_positions[0];
+        let assertion_xml = if let Some(close_pos) = xml[assertion_start..].find(":Assertion>") {
+            if let Some(_close_tag_start) = xml[assertion_start..assertion_start + close_pos].rfind("</") {
+                let end = assertion_start + close_pos + ":Assertion>".len();
+                &xml[assertion_start..end]
+            } else {
+                &xml[assertion_start..]
+            }
+        } else if let Some(close_pos) = xml[assertion_start..].find("</Assertion>") {
+            let end = assertion_start + close_pos + "</Assertion>".len();
+            &xml[assertion_start..end]
+        } else {
+            &xml[assertion_start..]
+        };
+
+        // Optional Assertion ID bound to the verified assertion subtree
+        let id = if let Some(pos) = assertion_xml.find("ID=\"") {
+            let rest = &assertion_xml[pos + 4..];
             if let Some(end) = rest.find('"') {
                 rest[..end].to_string()
             } else {
@@ -228,24 +286,24 @@ impl SamlParser {
             }
         }
 
-        // Find Issuer
-        let issuer = Self::extract_tag(xml, "saml:Issuer")
-            .or_else(|| Self::extract_tag(xml, "saml2:Issuer"))
-            .or_else(|| Self::extract_tag(xml, "Issuer"))
+        // Find Issuer inside isolated assertion subtree
+        let issuer = Self::extract_tag(assertion_xml, "saml:Issuer")
+            .or_else(|| Self::extract_tag(assertion_xml, "saml2:Issuer"))
+            .or_else(|| Self::extract_tag(assertion_xml, "Issuer"))
             .ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?
             .to_string();
 
-        // Find Subject NameID
-        let subject = Self::extract_tag(xml, "saml:NameID")
-            .or_else(|| Self::extract_tag(xml, "saml2:NameID"))
-            .or_else(|| Self::extract_tag(xml, "NameID"))
+        // Find Subject NameID inside isolated assertion subtree (prevents Envelope Injection XSW)
+        let subject = Self::extract_tag(assertion_xml, "saml:NameID")
+            .or_else(|| Self::extract_tag(assertion_xml, "saml2:NameID"))
+            .or_else(|| Self::extract_tag(assertion_xml, "NameID"))
             .ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?
             .to_string();
 
-        // Optional Audience
-        let audience = Self::extract_tag(xml, "saml:Audience")
-            .or_else(|| Self::extract_tag(xml, "saml2:Audience"))
-            .or_else(|| Self::extract_tag(xml, "Audience"))
+        // Optional Audience inside isolated assertion subtree
+        let audience = Self::extract_tag(assertion_xml, "saml:Audience")
+            .or_else(|| Self::extract_tag(assertion_xml, "saml2:Audience"))
+            .or_else(|| Self::extract_tag(assertion_xml, "Audience"))
             .map(str::to_string);
 
         // Optional Destination endpoint
@@ -256,14 +314,14 @@ impl SamlParser {
             None
         };
 
-        // Parse Conditions NotBefore and NotOnOrAfter
+        // Parse Conditions NotBefore and NotOnOrAfter inside isolated assertion subtree
         let mut not_before = None;
         let mut not_on_or_after = None;
 
         let cond_tags = ["<saml2:Conditions", "<saml:Conditions", "<Conditions"];
         for cond_tag in cond_tags {
-            if let Some(pos) = xml.find(cond_tag) {
-                let rest = &xml[pos..];
+            if let Some(pos) = assertion_xml.find(cond_tag) {
+                let rest = &assertion_xml[pos..];
                 if let Some(close_bracket) = rest.find('>') {
                     let tag_slice = &rest[..close_bracket];
                     if let Some(nb) = extract_attribute(tag_slice, "NotBefore") {
@@ -277,29 +335,32 @@ impl SamlParser {
             }
         }
 
-        // Extract Attributes
+        // Extract Attributes inside isolated assertion subtree
         let mut attributes: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        let attr_pattern = "Attribute Name=\"";
         let mut search_idx = 0;
 
-        while let Some(pos) = xml[search_idx..].find(attr_pattern) {
-            let start = search_idx + pos + attr_pattern.len();
-            if let Some(end) = xml[start..].find('"') {
-                let name = &xml[start..start + end];
-                let attr_body_start = start + end;
+        while let Some(pos) = assertion_xml[search_idx..].find("<saml:Attribute")
+            .or_else(|| assertion_xml[search_idx..].find("<saml2:Attribute"))
+            .or_else(|| assertion_xml[search_idx..].find("<Attribute"))
+        {
+            let tag_start = search_idx + pos;
+            let Some(tag_end) = assertion_xml[tag_start..].find('>') else { break };
+            let tag_header = &assertion_xml[tag_start..tag_start + tag_end];
+            let attr_body_start = tag_start + tag_end + 1;
 
-                if let Some(close_attr) = xml[attr_body_start..]
+            if let Some(name) = extract_attribute(tag_header, "Name") {
+                if let Some(close_attr) = assertion_xml[attr_body_start..]
                     .find("</saml:Attribute>")
-                    .or_else(|| xml[attr_body_start..].find("</saml2:Attribute>"))
-                    .or_else(|| xml[attr_body_start..].find("</Attribute>"))
+                    .or_else(|| assertion_xml[attr_body_start..].find("</saml2:Attribute>"))
+                    .or_else(|| assertion_xml[attr_body_start..].find("</Attribute>"))
                 {
-                    let attr_content = &xml[attr_body_start..attr_body_start + close_attr];
+                    let attr_content = &assertion_xml[attr_body_start..attr_body_start + close_attr];
                     let mut vals = Vec::new();
                     let mut content_slice = attr_content;
                     while let Some(open_idx) = content_slice.find("AttributeValue") {
                         let rest = &content_slice[open_idx..];
-                        let Some(tag_end) = rest.find('>') else { break };
-                        let after_tag = &rest[tag_end + 1..];
+                        let Some(val_tag_end) = rest.find('>') else { break };
+                        let after_tag = &rest[val_tag_end + 1..];
                         let Some(close_idx) = after_tag.find("</") else {
                             break;
                         };
@@ -312,13 +373,13 @@ impl SamlParser {
                         content_slice = &after_close[close_tag_end + 1..];
                     }
 
-                    attributes.insert(name.to_string(), vals);
+                    attributes.insert(name, vals);
                     search_idx = attr_body_start + close_attr;
                 } else {
                     search_idx = attr_body_start;
                 }
             } else {
-                break;
+                search_idx = attr_body_start;
             }
         }
 

@@ -16,11 +16,33 @@ pub type MessageDispatcher = Arc<
     dyn Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static,
 >;
 
+/// Configuration for the outbox relay background processor.
+#[derive(Debug, Clone)]
+pub struct OutboxRelayConfig {
+    /// Maximum number of messages claimed and dispatched per batch.
+    pub batch_size: usize,
+    /// Duration in seconds for which claimed messages are leased to this relay.
+    pub lease_duration_secs: u64,
+    /// Polling interval between relay loop passes.
+    pub poll_interval: Duration,
+}
+
+impl Default for OutboxRelayConfig {
+    fn default() -> Self {
+        Self {
+            batch_size: 50,
+            lease_duration_secs: 30,
+            poll_interval: Duration::from_millis(500),
+        }
+    }
+}
+
 /// Background relay that drains pending outbox messages and dispatches them to an external broker or event bus.
 pub struct OutboxRelay<R: OutboxRepository> {
     repository: Arc<R>,
     dispatcher: MessageDispatcher,
     is_stopping: Arc<AtomicBool>,
+    config: OutboxRelayConfig,
 }
 
 impl<R: OutboxRepository> Clone for OutboxRelay<R> {
@@ -29,6 +51,7 @@ impl<R: OutboxRepository> Clone for OutboxRelay<R> {
             repository: Arc::clone(&self.repository),
             dispatcher: Arc::clone(&self.dispatcher),
             is_stopping: Arc::clone(&self.is_stopping),
+            config: self.config.clone(),
         }
     }
 }
@@ -37,6 +60,7 @@ impl<R: OutboxRepository> Debug for OutboxRelay<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutboxRelay")
             .field("is_stopping", &self.is_stopping.load(Ordering::Relaxed))
+            .field("config", &self.config)
             .finish()
     }
 }
@@ -52,27 +76,69 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             repository,
             dispatcher: Arc::new(move |msg| Box::pin(dispatcher(msg))),
             is_stopping: Arc::new(AtomicBool::new(false)),
+            config: OutboxRelayConfig::default(),
         }
+    }
+
+    /// Configures the outbox relay parameters.
+    pub fn with_config(mut self, config: OutboxRelayConfig) -> Self {
+        self.config = config;
+        self
     }
 
     /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
         // Automatically reclaim any expired in-flight message leases before polling new items
-        let _ = self.repository.recover_expired_claims(30).await;
+        if let Err(err) = self
+            .repository
+            .recover_expired_claims(self.config.lease_duration_secs)
+            .await
+        {
+            tracing::warn!(error = %err, "Failed to recover expired outbox claims");
+        }
 
-        let pending = self.repository.claim_pending(batch_size).await?;
+        let pending = self
+            .repository
+            .claim_pending_with_lease(batch_size, self.config.lease_duration_secs)
+            .await?;
         let mut published_count = 0;
 
         for message in pending {
-            match (self.dispatcher)(&message).await {
+            let token = match message.lease_token.as_deref() {
+                Some(t) => t,
+                None => {
+                    tracing::error!(message_id = %message.id, "Claimed outbox message is missing lease token");
+                    continue;
+                }
+            };
+
+            let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                (self.dispatcher)(&message)
+            })) {
+                Ok(fut) => fut.await,
+                Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
+            };
+
+            match dispatch_result {
                 Ok(()) => {
-                    self.repository.mark_published(&message.id).await?;
-                    published_count += 1;
+                    if let Err(err) = self.repository.mark_published(&message.id, token).await {
+                        tracing::error!(message_id = %message.id, error = %err, "Failed to mark outbox message as published");
+                    } else {
+                        published_count += 1;
+                    }
                 }
                 Err(err) => {
-                    self.repository
-                        .mark_failed(&message.id, err.to_string())
-                        .await?;
+                    if let Err(mark_err) = self
+                        .repository
+                        .mark_failed(&message.id, token, err.to_string())
+                        .await
+                    {
+                        tracing::error!(
+                            message_id = %message.id,
+                            error = %mark_err,
+                            "Failed to mark outbox message as failed"
+                        );
+                    }
                 }
             }
         }
@@ -80,12 +146,28 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         Ok(published_count)
     }
 
-    /// Spawns the background polling loop.
-    pub fn start(&self, interval: Duration) {
+    /// Spawns the background polling loop using configured interval and batch size.
+    pub fn start_with_config(&self) {
         let relay = self.clone();
         tokio::spawn(async move {
+            let interval = relay.config.poll_interval;
+            let batch = relay.config.batch_size;
             while !relay.is_stopping.load(Ordering::Relaxed) {
-                if let Err(err) = relay.poll_and_dispatch(50).await {
+                if let Err(err) = relay.poll_and_dispatch(batch).await {
+                    tracing::error!(error = %err, "Outbox relay background dispatch error");
+                }
+                sleep(interval).await;
+            }
+        });
+    }
+
+    /// Spawns the background polling loop with explicit interval.
+    pub fn start(&self, interval: Duration) {
+        let relay = self.clone();
+        let batch = relay.config.batch_size;
+        tokio::spawn(async move {
+            while !relay.is_stopping.load(Ordering::Relaxed) {
+                if let Err(err) = relay.poll_and_dispatch(batch).await {
                     tracing::error!(error = %err, "Outbox relay background dispatch error");
                 }
                 sleep(interval).await;

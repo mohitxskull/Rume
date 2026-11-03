@@ -152,6 +152,15 @@ impl CacheBackend for RedisCacheBackend {
                     .query_async::<()>(&mut *conn)
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
+
+                if let Some(ttl) = ttl {
+                    let tag_ttl_ms = (ttl.as_millis() as u64).saturating_add(3_600_000);
+                    let _ = redis::cmd("PEXPIRE")
+                        .arg(&tk)
+                        .arg(tag_ttl_ms)
+                        .query_async::<()>(&mut *conn)
+                        .await;
+                }
             }
 
             Ok(())
@@ -212,22 +221,16 @@ impl CacheBackend for RedisCacheBackend {
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
             let count = keys.len();
-            if !keys.is_empty() {
-                let mut del_cmd = redis::cmd("DEL");
-                for k in &keys {
-                    del_cmd.arg(k);
-                }
-                del_cmd.arg(&tk);
-                del_cmd
-                    .query_async::<()>(&mut *conn)
-                    .await
-                    .map_err(|e| CacheError::Backend(e.to_string()))?;
-            } else {
+            for k in &keys {
                 let _ = redis::cmd("DEL")
-                    .arg(&tk)
+                    .arg(k)
                     .query_async::<()>(&mut *conn)
                     .await;
             }
+            let _ = redis::cmd("DEL")
+                .arg(&tk)
+                .query_async::<()>(&mut *conn)
+                .await;
 
             Ok(count)
         })

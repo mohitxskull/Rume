@@ -1,3 +1,5 @@
+#![cfg(all(feature = "postgres", feature = "redis"))]
+
 use std::sync::Arc;
 use std::time::Duration;
 

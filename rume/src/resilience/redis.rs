@@ -57,7 +57,7 @@ impl RedisRateLimiter {
             .pool
             .get()
             .await
-            .map_err(|_| ResilienceError::CircuitOpen)?;
+            .map_err(|e| ResilienceError::Backend(e.to_string()))?;
 
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -101,7 +101,7 @@ impl RedisRateLimiter {
             .arg(&rand_id)
             .invoke_async(&mut *conn)
             .await
-            .map_err(|_| ResilienceError::CircuitOpen)?;
+            .map_err(|e| ResilienceError::Backend(e.to_string()))?;
 
         if res.0 == 1 {
             Ok(RateLimitStatus {

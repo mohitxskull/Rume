@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::persistence::backend::{BoxFuture, DatabaseBackend};
+use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransaction};
 use crate::persistence::error::PersistenceError;
 
 /// Function signature for dynamic migration execution.
@@ -149,7 +149,7 @@ impl Migrator {
     ) -> Result<MigrationSummary, PersistenceError> {
         backend
             .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
             )
             .await?;
 
@@ -161,9 +161,9 @@ impl Migrator {
             );
             let exists = backend.query_scalar(&check_sql).await?;
             if exists.is_none() {
+                let tx = backend.begin_transaction().await?;
                 if let Some(sql) = &migration.up_sql {
-                    backend
-                        .execute(sql)
+                    tx.execute(sql)
                         .await
                         .map_err(|err| PersistenceError::MigrationError {
                             migration: migration.id.clone(),
@@ -174,12 +174,23 @@ impl Migrator {
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
+                let name = migration.description.replace('\'', "''");
+                let checksum = match &migration.up_sql {
+                    Some(s) => {
+                        use sha2::{Digest, Sha256};
+                        format!("{:x}", Sha256::digest(s.as_bytes()))
+                    }
+                    None => String::new(),
+                };
                 let insert_sql = format!(
-                    "INSERT INTO rume_migrations (id, applied_at) VALUES ('{}', {})",
+                    "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ('{}', '{}', {}, '{}')",
                     migration.id.replace('\'', "''"),
-                    now
+                    name,
+                    now,
+                    checksum
                 );
-                backend.execute(&insert_sql).await?;
+                tx.execute(&insert_sql).await?;
+                tx.commit().await?;
                 applied.push(migration.id.clone());
             }
         }
@@ -194,7 +205,7 @@ impl Migrator {
     ) -> Result<Option<String>, PersistenceError> {
         backend
             .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, applied_at BIGINT NOT NULL)",
+                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
             )
             .await?;
 
@@ -211,8 +222,8 @@ impl Migrator {
                     ));
                 };
 
-                backend
-                    .execute(sql)
+                let tx = backend.begin_transaction().await?;
+                tx.execute(sql)
                     .await
                     .map_err(|err| PersistenceError::MigrationError {
                         migration: migration.id.clone(),
@@ -223,7 +234,8 @@ impl Migrator {
                     "DELETE FROM rume_migrations WHERE id = '{}'",
                     migration.id.replace('\'', "''")
                 );
-                backend.execute(&delete_sql).await?;
+                tx.execute(&delete_sql).await?;
+                tx.commit().await?;
                 return Ok(Some(migration.id.clone()));
             }
         }

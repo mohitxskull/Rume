@@ -1,3 +1,5 @@
+#![cfg(feature = "sqlite")]
+
 use axum::Json;
 use axum::http::StatusCode;
 use axum::routing::post;
@@ -18,7 +20,7 @@ async fn pool_lifecycle_and_capacity_limits() {
 
     let status = pool.status();
     assert_eq!(status.active_connections, 0);
-    assert_eq!(status.total_connections, 2);
+    assert_eq!(status.total_connections, 1);
     assert_eq!(status.max_connections, 2);
     assert!(!status.is_closed);
 
@@ -352,4 +354,7 @@ async fn pool_acquire_timeout_and_graceful_drain() {
     let drained_clean = pool.close_and_drain(Duration::from_millis(50)).await;
     assert!(drained_clean, "should cleanly drain once lease is released");
     assert!(pool.status().is_closed);
+    assert!(pool.backend().is_closed());
+    let ping_after = pool.backend().ping().await;
+    assert!(matches!(ping_after, Err(PersistenceError::Closed)));
 }

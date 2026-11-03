@@ -22,11 +22,16 @@ pub enum ResilienceError {
     /// Request execution timed out.
     #[error("request timed out")]
     Timeout,
+
+    /// Underlying storage or communication backend failed.
+    #[error("resilience backend error: {0}")]
+    Backend(String),
 }
 
 impl From<ResilienceError> for AppError {
     fn from(err: ResilienceError) -> Self {
         match err {
+            ResilienceError::Backend(msg) => AppError::internal(format!("Resilience backend error: {msg}")),
             ResilienceError::CircuitOpen => AppError::Public {
                 status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 code: "CIRCUIT_BREAKER_OPEN",

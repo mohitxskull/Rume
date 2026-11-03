@@ -65,9 +65,19 @@ impl RetryPolicy {
             return None;
         }
 
+        let factor = if self.backoff_factor.is_finite() && self.backoff_factor >= 1.0 {
+            self.backoff_factor
+        } else {
+            2.0
+        };
+
         let exponent = (attempt.saturating_sub(1)) as i32;
-        let factor = self.backoff_factor.powi(exponent);
-        let backoff_ms = (self.initial_backoff_ms as f64 * factor).round() as u64;
+        let factor_pow = factor.powi(exponent);
+        let backoff_ms = if factor_pow.is_finite() {
+            (self.initial_backoff_ms as f64 * factor_pow).round() as u64
+        } else {
+            self.max_backoff_ms
+        };
         let capped_ms = backoff_ms.min(self.max_backoff_ms);
 
         Some(Duration::from_millis(capped_ms))

@@ -33,6 +33,11 @@ pub trait IdempotencyStore: Debug + Send + Sync + 'static {
     fn release(&self, key: &str) -> BoxFuture<'_, Result<(), JobError>>;
 }
 
+/// Formats an idempotency key with length-prefixed tenant isolation to prevent collisions.
+pub fn scoped_idempotency_key(tenant_id: &str, key: &str) -> String {
+    format!("tenant:{}:{}:idemp:{key}", tenant_id.len(), tenant_id)
+}
+
 /// Registry tracking distributed worker heartbeats and detecting dead nodes.
 pub trait HeartbeatRegistry: Debug + Send + Sync + 'static {
     /// Records or updates a heartbeat for a worker, valid for `ttl`.

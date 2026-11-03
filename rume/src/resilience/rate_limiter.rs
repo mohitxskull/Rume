@@ -88,14 +88,6 @@ impl RateLimiter {
             .max_requests
             .saturating_sub(entry.timestamps.len() as u32);
 
-        // Passive eviction of inactive clients to bound memory usage
-        if clients.len() > 256 {
-            clients.retain(|_, e| {
-                e.timestamps.retain(|&t| t > window_start);
-                !e.timestamps.is_empty()
-            });
-        }
-
         Ok(RateLimitStatus {
             limit: self.config.max_requests,
             remaining,
@@ -165,13 +157,21 @@ where
         let limiter = self.limiter.clone();
         let mut inner = self.inner.clone();
 
-        // Extract client key (from X-Forwarded-For or default "global")
-        let client_key = req
+        // Extract client key (prefer tenant ID if present for multi-tenant isolation, otherwise trimmed client IP from X-Forwarded-For)
+        let tenant_key = req
             .headers()
-            .get("x-forwarded-for")
+            .get("x-tenant-id")
             .and_then(|h| h.to_str().ok())
-            .unwrap_or("client_default")
-            .to_string();
+            .map(|t| format!("tenant:{}", t.trim()));
+
+        let client_key = tenant_key.unwrap_or_else(|| {
+            req.headers()
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|s| s.split(',').next())
+                .map(|ip| format!("ip:{}", ip.trim()))
+                .unwrap_or_else(|| "client_default".to_string())
+        });
 
         Box::pin(async move {
             match limiter.check(&client_key) {

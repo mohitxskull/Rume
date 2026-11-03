@@ -25,6 +25,36 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
 
     /// Begins a new transaction.
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>>;
+
+    /// Returns the current number of open physical connections managed by the backend driver.
+    fn pool_size(&self) -> u32 {
+        0
+    }
+
+    /// Returns the number of idle connections currently available in the backend pool.
+    fn pool_idle(&self) -> u32 {
+        0
+    }
+
+    /// Returns whether the underlying driver pool has been closed.
+    fn is_closed(&self) -> bool {
+        false
+    }
+
+    /// Closes the physical database connection pool.
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async move {})
+    }
+}
+
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
+pub(crate) fn map_sqlx_error(err: sqlx::Error) -> PersistenceError {
+    match err {
+        sqlx::Error::PoolTimedOut => PersistenceError::Timeout,
+        sqlx::Error::PoolClosed => PersistenceError::Closed,
+        sqlx::Error::Io(e) => PersistenceError::ConnectionFailed(e.to_string()),
+        other => PersistenceError::QueryFailed(other.to_string()),
+    }
 }
 
 /// Active transaction handle providing isolated mutation and explicit commit/rollback.

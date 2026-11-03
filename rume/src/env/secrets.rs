@@ -22,6 +22,11 @@ pub fn is_secret_key(key: &str) -> bool {
     if upper.contains("SECRET")
         || upper.contains("PASSWORD")
         || upper.contains("TOKEN")
+        || upper.contains("APIKEY")
+        || upper.contains("AUTHORIZATION")
+        || upper.contains("BEARER")
+        || upper.contains("SESSION_ID")
+        || upper.contains("SESSION")
         || upper.contains("_PASS")
         || upper.contains("_PWD")
         || upper.contains("_CRED")
@@ -37,6 +42,11 @@ pub fn is_secret_key(key: &str) -> bool {
         || upper == "PASS"
         || upper == "PWD"
         || upper == "TOKEN"
+        || upper == "APIKEY"
+        || upper == "AUTHORIZATION"
+        || upper == "BEARER"
+        || upper == "SESSION"
+        || upper == "SESSION_ID"
         || upper.starts_with("STRIPE_")
         || upper.starts_with("PRIVATE_KEY")
 }
@@ -84,7 +94,7 @@ pub fn redact_credential_urls_in_text(text: &str) -> String {
             .unwrap_or(rest.len());
         let authority = &rest[..end_authority];
 
-        if let Some(at_pos) = authority.find('@') {
+        if let Some(at_pos) = authority.rfind('@') {
             let user_info = &authority[..at_pos];
             if let Some(colon_pos) = user_info.find(':') {
                 let user = &user_info[..colon_pos];

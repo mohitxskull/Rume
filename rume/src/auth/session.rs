@@ -81,4 +81,24 @@ pub trait SessionStore: Send + Sync + 'static {
 
     /// Invalidates and removes a session.
     fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>>;
+
+    /// Rotates a session identifier to prevent session fixation, copying existing data to the new ID and deleting the old ID.
+    fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>> {
+        Box::pin(async move {
+            let existing = self.load(old_id).await?.ok_or_else(|| {
+                AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
+            })?;
+            self.destroy(old_id).await?;
+            let new_session = Session {
+                id: uuid::Uuid::new_v4().to_string(),
+                user_id: existing.user_id,
+                roles: existing.roles,
+                permissions: existing.permissions,
+                data: existing.data,
+                expires_at: existing.expires_at,
+            };
+            self.save(new_session.clone()).await?;
+            Ok(new_session)
+        })
+    }
 }

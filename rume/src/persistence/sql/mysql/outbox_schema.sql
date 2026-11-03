@@ -9,5 +9,6 @@ CREATE TABLE IF NOT EXISTS rume_outbox (
     next_retry_at BIGINT UNSIGNED,
     lease_token VARCHAR(64),
     lease_expires_at BIGINT UNSIGNED,
-    INDEX idx_rume_outbox_claim (status, created_at)
+    INDEX idx_rume_outbox_claim (status, created_at),
+    INDEX idx_rume_outbox_lease (status, lease_expires_at)
 ) ENGINE=InnoDB;

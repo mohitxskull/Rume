@@ -88,6 +88,7 @@ impl JobQueue for PostgresJobQueue {
         let retry_policy = job.retry_policy();
         let timeout = job.timeout();
         let idempotency_key = job.idempotency_key();
+        let tenant_id = job.tenant_id();
         let id = Uuid::new_v4().to_string();
 
         Box::pin(async move {
@@ -112,6 +113,7 @@ impl JobQueue for PostgresJobQueue {
                 .bind(backoff_factor)
                 .bind(timeout_ms)
                 .bind(&idempotency_key)
+                .bind(&tenant_id)
                 .bind(available_at)
                 .bind(now)
                 .fetch_optional(&self.pool)
@@ -123,20 +125,22 @@ impl JobQueue for PostgresJobQueue {
                 Ok(inserted_id)
             } else if let Some(ref ikey) = idempotency_key {
                 let existing = sqlx::query(
-                    "SELECT id FROM rume_jobs WHERE idempotency_key = $1 AND status != 'dead_letter'"
+                    "SELECT id FROM rume_jobs WHERE COALESCE(tenant_id, '') = COALESCE($1, '') AND idempotency_key = $2 AND status NOT IN ('dead_letter', 'purged')"
                 )
+                .bind(&tenant_id)
                 .bind(ikey)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
                 if let Some(erow) = existing {
-                    Ok(erow.try_get(0).unwrap_or(id))
+                    let existing_id: String = erow.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+                    Ok(existing_id)
                 } else {
-                    Ok(id)
+                    Err(JobError::Fatal("idempotency conflict race: conflicting row is no longer active".into()))
                 }
             } else {
-                Ok(id)
+                Err(JobError::Fatal("conflict detected but no idempotency key was supplied".into()))
             }
         })
     }
@@ -151,11 +155,13 @@ impl JobQueue for PostgresJobQueue {
             let now = current_epoch_millis();
             let lease_duration = self.default_lease_duration.as_millis() as i64;
             let lease_expires_at = now.saturating_add(lease_duration);
+            let new_lease_token = Uuid::new_v4().to_string();
 
             let row: Option<PgRow> = sqlx::query(JOBS_CLAIM_SQL)
                 .bind(&wid)
                 .bind(lease_expires_at)
                 .bind(now)
+                .bind(&new_lease_token)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -171,8 +177,10 @@ impl JobQueue for PostgresJobQueue {
                 let backoff_factor: f64 = r.try_get(7).unwrap_or(2.0);
                 let timeout_ms: Option<i64> = r.try_get(8).ok();
                 let idempotency_key: Option<String> = r.try_get(9).ok();
-                let assigned_worker: Option<String> = r.try_get(10).ok();
-                let available_at_ms: i64 = r.try_get(11).unwrap_or(now);
+                let tenant_id: Option<String> = r.try_get(10).ok();
+                let assigned_worker: Option<String> = r.try_get(11).ok();
+                let available_at_ms: i64 = r.try_get(12).unwrap_or(now);
+                let lease_token: Option<String> = r.try_get(13).ok();
 
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
@@ -184,7 +192,7 @@ impl JobQueue for PostgresJobQueue {
                 let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
 
                 let available_at = if available_at_ms <= now {
-                    Instant::now() - Duration::from_millis((now - available_at_ms).max(0) as u64)
+                    Instant::now()
                 } else {
                     Instant::now() + Duration::from_millis((available_at_ms - now).max(0) as u64)
                 };
@@ -197,7 +205,9 @@ impl JobQueue for PostgresJobQueue {
                     retry_policy,
                     timeout,
                     idempotency_key,
+                    tenant_id,
                     assigned_worker,
+                    lease_token,
                     available_at,
                 }))
             } else {
@@ -206,46 +216,119 @@ impl JobQueue for PostgresJobQueue {
         })
     }
 
-    fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
+    fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let jid = job_id.to_string();
+        let token = lease_token.to_string();
         Box::pin(async move {
-            sqlx::query("DELETE FROM rume_jobs WHERE id = $1")
-                .bind(&jid)
-                .execute(&self.pool)
-                .await
-                .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let now = current_epoch_millis();
+            let res = sqlx::query(
+                "UPDATE rume_jobs SET status = 'completed', completed_at = $1, lease_expires_at = NULL WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
+            )
+            .bind(now)
+            .bind(&jid)
+            .bind(&token)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot ack job {jid}: lease lost, expired, or invalid token"
+                )));
+            }
             Ok(())
         })
     }
 
-    fn nack(&self, job: QueuedJob, delay: Duration) -> BoxFuture<'_, Result<(), JobError>> {
+    fn nack(
+        &self,
+        job: QueuedJob,
+        lease_token: &str,
+        delay: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let token = lease_token.to_string();
         Box::pin(async move {
             let now = current_epoch_millis();
             let next_available = now.saturating_add(delay.as_millis() as i64);
 
-            sqlx::query(
-                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL, available_at = $1 WHERE id = $2"
+            let res = sqlx::query(
+                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, available_at = $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
             )
             .bind(next_available)
             .bind(&job.id)
+            .bind(&token)
             .execute(&self.pool)
             .await
             .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot nack job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
 
             Ok(())
         })
     }
 
-    fn dead_letter(&self, job: QueuedJob, reason: String) -> BoxFuture<'_, Result<(), JobError>> {
+    fn dead_letter(
+        &self,
+        job: QueuedJob,
+        lease_token: &str,
+        reason: String,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let token = lease_token.to_string();
         Box::pin(async move {
-            sqlx::query(
-                "UPDATE rume_jobs SET status = 'dead_letter', assigned_worker = NULL, lease_expires_at = NULL, dead_letter_reason = $1 WHERE id = $2"
+            let res = sqlx::query(
+                "UPDATE rume_jobs SET status = 'dead_letter', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = $1, dead_lettered_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'"
             )
             .bind(&reason)
             .bind(&job.id)
+            .bind(&token)
             .execute(&self.pool)
             .await
             .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot dead_letter job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn renew_lease(
+        &self,
+        job_id: &str,
+        lease_token: &str,
+        extension: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let jid = job_id.to_string();
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let now = current_epoch_millis();
+            let new_expiry = now.saturating_add(extension.as_millis() as i64);
+
+            let res = sqlx::query(
+                "UPDATE rume_jobs SET lease_expires_at = $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > $4"
+            )
+            .bind(new_expiry)
+            .bind(&jid)
+            .bind(&token)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot renew lease for job {jid}: lease expired or invalid token"
+                )));
+            }
 
             Ok(())
         })
@@ -257,10 +340,8 @@ impl JobQueue for PostgresJobQueue {
     ) -> BoxFuture<'_, Result<usize, JobError>> {
         let workers = dead_workers.to_vec();
         Box::pin(async move {
-            let now = current_epoch_millis();
             let res = sqlx::query(JOBS_REAP_SQL)
                 .bind(&workers)
-                .bind(now)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -290,6 +371,79 @@ impl JobQueue for PostgresJobQueue {
 
             let count: i64 = row.try_get(0).unwrap_or(0);
             Ok(count as usize)
+        })
+    }
+
+    fn list_dead_letters(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
+        Box::pin(async move {
+            let rows = sqlx::query(
+                "SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token FROM rume_jobs WHERE status = 'dead_letter' ORDER BY dead_lettered_at DESC LIMIT $1"
+            )
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let mut jobs = Vec::new();
+            for r in rows {
+                let id: String = r.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let name: String = r.try_get(1).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let payload: Vec<u8> = r.try_get(2).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let attempt: i32 = r.try_get(3).unwrap_or(1);
+                let max_attempts: i32 = r.try_get(4).unwrap_or(3);
+                let initial_backoff_ms: i64 = r.try_get(5).unwrap_or(1000);
+                let max_backoff_ms: i64 = r.try_get(6).unwrap_or(60000);
+                let backoff_factor: f64 = r.try_get(7).unwrap_or(2.0);
+                let timeout_ms: Option<i64> = r.try_get(8).ok();
+                let idempotency_key: Option<String> = r.try_get(9).ok();
+                let tenant_id: Option<String> = r.try_get(10).ok();
+                let assigned_worker: Option<String> = r.try_get(11).ok();
+                let retry_policy = RetryPolicy {
+                    max_attempts: max_attempts.max(1) as u32,
+                    initial_backoff_ms: initial_backoff_ms.max(0) as u64,
+                    max_backoff_ms: max_backoff_ms.max(0) as u64,
+                    backoff_factor,
+                };
+                let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
+                jobs.push(QueuedJob {
+                    id,
+                    name,
+                    payload,
+                    attempt: attempt.max(1) as u32,
+                    retry_policy,
+                    timeout,
+                    idempotency_key,
+                    tenant_id,
+                    available_at: Instant::now(),
+                    lease_token: None,
+                    assigned_worker,
+                });
+            }
+            Ok(jobs)
+        })
+    }
+
+    fn replay_dead_letter(
+        &self,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let jid = job_id.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(
+                "UPDATE rume_jobs SET status = 'pending', attempt = 0, assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = NULL, dead_lettered_at = NULL, available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $1 AND status = 'dead_letter'"
+            )
+            .bind(&jid)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!("dead letter job {jid} not found or not in dead_letter status")));
+            }
+            Ok(())
         })
     }
 }

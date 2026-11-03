@@ -7,5 +7,5 @@ pub mod repository;
 
 pub use error::OutboxError;
 pub use message::{OutboxMessage, OutboxStatus};
-pub use relay::OutboxRelay;
+pub use relay::{OutboxRelay, OutboxRelayConfig};
 pub use repository::{BoxFuture, OutboxRepository, TransactionalOutbox};

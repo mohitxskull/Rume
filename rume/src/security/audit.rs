@@ -155,30 +155,61 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     }
 }
 
+fn escape_sql_literal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    out.push('\'');
+    for c in s.chars() {
+        match c {
+            '\'' => out.push_str("''"),
+            '\\' => out.push_str("\\\\"),
+            '\0' => out.push_str("\\0"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\x1a' => out.push_str("\\Z"),
+            other => out.push(other),
+        }
+    }
+    out.push('\'');
+    out
+}
+
 impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
     fn record<'a>(&'a self, record: AuditRecord) -> AuditFuture<'a> {
         Box::pin(async move {
-            let id = uuid::Uuid::new_v4().to_string();
+            let id = escape_sql_literal(&record.id);
             let status_str = match record.status {
                 AuditStatus::Success => "success",
                 AuditStatus::Denied => "denied",
                 AuditStatus::Failure => "failure",
             };
-            let meta_json = serde_json::to_string(&record.metadata)
+            let redacted_metadata: BTreeMap<String, String> = record
+                .metadata
+                .iter()
+                .map(|(k, v)| (k.clone(), crate::env::secrets::redact_value(k, v)))
+                .collect();
+            let meta_json = serde_json::to_string(&redacted_metadata)
                 .map_err(|e| AuditError::Sink(e.to_string()))?;
-            let actor = record.actor_id.as_deref().unwrap_or("NULL");
-            let target = record.target_id.as_deref().unwrap_or("NULL");
-            let ip = record.ip_address.as_deref().unwrap_or("NULL");
-
-            let actor_val = if actor == "NULL" { "NULL".to_string() } else { format!("'{}'", actor.replace('\'', "''")) };
-            let target_val = if target == "NULL" { "NULL".to_string() } else { format!("'{}'", target.replace('\'', "''")) };
-            let ip_val = if ip == "NULL" { "NULL".to_string() } else { format!("'{}'", ip.replace('\'', "''")) };
-            let meta_val = format!("'{}'", meta_json.replace('\'', "''"));
+            let actor_val = record
+                .actor_id
+                .as_deref()
+                .map(escape_sql_literal)
+                .unwrap_or_else(|| "NULL".to_string());
+            let target_val = record
+                .target_id
+                .as_deref()
+                .map(escape_sql_literal)
+                .unwrap_or_else(|| "NULL".to_string());
+            let ip_val = record
+                .ip_address
+                .as_deref()
+                .map(escape_sql_literal)
+                .unwrap_or_else(|| "NULL".to_string());
+            let meta_val = escape_sql_literal(&meta_json);
+            let action = escape_sql_literal(&record.action);
+            let resource = escape_sql_literal(&record.target_type);
 
             let stmt = format!(
-                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ('{id}', '{}', '{}', '{status_str}', {actor_val}, {target_val}, {ip_val}, {meta_val}, {})",
-                record.action.replace('\'', "''"),
-                record.target_type.replace('\'', "''"),
+                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ({id}, {action}, {resource}, '{status_str}', {actor_val}, {target_val}, {ip_val}, {meta_val}, {})",
                 record.timestamp_ms
             );
 

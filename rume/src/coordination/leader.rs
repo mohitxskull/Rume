@@ -14,6 +14,39 @@ pub struct LeaderLease {
     pub candidate_id: String,
     /// Monotonically increasing election term / fencing token.
     pub term: u64,
+    /// Expiration timestamp of the lease.
+    pub expires_at: Option<std::time::Instant>,
+}
+
+impl LeaderLease {
+    /// Creates a new LeaderLease.
+    pub fn new(role: impl Into<String>, candidate_id: impl Into<String>, term: u64) -> Self {
+        Self {
+            role: role.into(),
+            candidate_id: candidate_id.into(),
+            term,
+            expires_at: None,
+        }
+    }
+
+    /// Attaches an expiration timestamp.
+    pub fn with_expires_at(mut self, expires_at: std::time::Instant) -> Self {
+        self.expires_at = Some(expires_at);
+        self
+    }
+
+    /// Checks if this leadership lease has expired according to monotonic clock.
+    pub fn is_expired(&self) -> bool {
+        self.expires_at
+            .map(|exp| std::time::Instant::now() >= exp)
+            .unwrap_or(false)
+    }
+
+    /// Returns the remaining duration before expiration, or None if already expired or unbounded.
+    pub fn time_remaining(&self) -> Option<Duration> {
+        self.expires_at
+            .and_then(|exp| exp.checked_duration_since(std::time::Instant::now()))
+    }
 }
 
 /// Interface for distributed leader election.

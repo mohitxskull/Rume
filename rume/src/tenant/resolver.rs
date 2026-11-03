@@ -50,13 +50,43 @@ impl HeaderTenantResolver {
         self
     }
 
+    /// Attempts to register a known tenant by ID and slug, returning an error if a conflict exists.
+    pub fn try_add_tenant(&self, tenant: Tenant) -> Result<(), TenantError> {
+        let mut id_map = self
+            .by_id
+            .write()
+            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+        let mut slug_map = self
+            .by_slug
+            .write()
+            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+
+        if let Some(existing) = slug_map.get(&tenant.slug)
+            && existing.id != tenant.id
+        {
+            return Err(TenantError::Conflict(format!(
+                "tenant slug '{}' already registered to tenant '{}'",
+                tenant.slug, existing.id
+            )));
+        }
+        if let Some(existing) = id_map.get(&tenant.id)
+            && existing.slug != tenant.slug
+        {
+            return Err(TenantError::Conflict(format!(
+                "tenant ID '{}' already registered to tenant with slug '{}'",
+                tenant.id, existing.slug
+            )));
+        }
+
+        id_map.insert(tenant.id.clone(), tenant.clone());
+        slug_map.insert(tenant.slug.clone(), tenant);
+        Ok(())
+    }
+
     /// Registers a known tenant by ID or slug.
     pub fn add_tenant(self, tenant: Tenant) -> Self {
-        if let Ok(mut id_map) = self.by_id.write() {
-            id_map.insert(tenant.id.clone(), tenant.clone());
-        }
-        if let Ok(mut slug_map) = self.by_slug.write() {
-            slug_map.insert(tenant.slug.clone(), tenant);
+        if let Err(e) = self.try_add_tenant(tenant) {
+            tracing::warn!("Failed to add tenant: {e}");
         }
         self
     }
@@ -149,8 +179,17 @@ impl TenantResolver for SubdomainTenantResolver {
                 return Err(TenantError::ResolverError("malformed host header".into()));
             };
 
-            // Remove optional port: "acme.myplatform.com:8080" -> "acme.myplatform.com"
-            let host_no_port = host_str.split(':').next().unwrap_or(host_str);
+            // Convert host to lowercase and remove optional port: "ACME.myplatform.com:8080" -> "acme.myplatform.com", "[::1]:8080" -> "[::1]"
+            let host_lower = host_str.to_ascii_lowercase();
+            let host_no_port = if host_lower.starts_with('[') {
+                if let Some(bracket_end) = host_lower.find(']') {
+                    &host_lower[..=bracket_end]
+                } else {
+                    &host_lower
+                }
+            } else {
+                host_lower.split(':').next().unwrap_or(&host_lower)
+            };
 
             // Why: Normalizing base_domain to guarantee a leading dot (".{base_domain}") ensures that
             // host.strip_suffix matches strictly on a DNS label boundary. Without the leading dot,

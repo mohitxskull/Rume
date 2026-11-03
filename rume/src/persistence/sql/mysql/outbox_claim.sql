@@ -3,5 +3,6 @@ SELECT id, event_type, payload, status, retry_count,
 FROM rume_outbox
 WHERE status = 'pending'
   AND (next_retry_at IS NULL OR next_retry_at <= ?)
+ORDER BY created_at ASC, id ASC
 LIMIT ?
 FOR UPDATE SKIP LOCKED;

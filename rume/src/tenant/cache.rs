@@ -99,12 +99,9 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
-        let exists = self.cache.exists(&full_key).await?;
 
-        if !exists
-            && let Some(ref quota) = self.quota_store
-        {
-            let acquired = quota.acquire(tenant_id, self.max_keys_per_tenant).await?;
+        if let Some(ref quota) = self.quota_store {
+            let acquired = quota.record_key(tenant_id, key, ttl, self.max_keys_per_tenant).await?;
             if !acquired {
                 return Err(CacheError::QuotaExceeded(format!(
                     "tenant '{tenant_id}' exceeded quota of {} keys",
@@ -120,9 +117,17 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         }
         let tag_refs: Vec<&str> = all_tags.iter().map(|s| s.as_str()).collect();
 
-        self.cache
+        let res = self.cache
             .set_json_with_tags(&full_key, value, &tag_refs, ttl)
-            .await
+            .await;
+
+        if res.is_err()
+            && let Some(ref quota) = self.quota_store
+        {
+            let _ = quota.remove_key(tenant_id, key).await;
+        }
+
+        res
     }
 
     /// Deletes a specific key scoped to `tenant_id`.
@@ -132,7 +137,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         if deleted
             && let Some(ref quota) = self.quota_store
         {
-            let _ = quota.release(tenant_id).await;
+            let _ = quota.remove_key(tenant_id, key).await;
         }
         Ok(deleted)
     }

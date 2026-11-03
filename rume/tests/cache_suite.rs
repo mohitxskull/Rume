@@ -1,3 +1,5 @@
+#![cfg(feature = "redis")]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;

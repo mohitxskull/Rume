@@ -18,6 +18,10 @@ pub enum TenantError {
     /// The tenant resolver encountered an internal error.
     #[error("tenant resolver error: {0}")]
     ResolverError(String),
+
+    /// A tenant registration conflict occurred (e.g. duplicate slug or ID collision).
+    #[error("tenant registration conflict: {0}")]
+    Conflict(String),
 }
 
 impl From<TenantError> for AppError {
@@ -34,6 +38,11 @@ impl From<TenantError> for AppError {
             },
             TenantError::ResolverError(msg) => AppError::BadRequest {
                 code: "TENANT_RESOLVER_ERROR",
+                message: msg,
+            },
+            TenantError::Conflict(msg) => AppError::Public {
+                status: axum::http::StatusCode::CONFLICT,
+                code: "TENANT_CONFLICT",
                 message: msg,
             },
         }

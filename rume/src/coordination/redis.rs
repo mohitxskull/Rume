@@ -55,11 +55,11 @@ impl RedisDistributedLock {
     }
 
     fn lock_key(&self, resource: &str) -> String {
-        format!("{}{}", self.prefix, resource)
+        format!("{}{{{}}}", self.prefix, resource)
     }
 
     fn fence_key(&self, resource: &str) -> String {
-        format!("{}fence:{}", self.prefix, resource)
+        format!("{}fence:{{{}}}", self.prefix, resource)
     }
 }
 
@@ -110,6 +110,7 @@ impl DistributedLock for RedisDistributedLock {
                     resource: res,
                     lease_id,
                     fencing_token: token as u64,
+                    expires_at: Some(std::time::Instant::now() + ttl),
                 }))
             } else {
                 Ok(None)
@@ -236,11 +237,11 @@ impl RedisLeaderElector {
     }
 
     fn leader_key(&self, role: &str) -> String {
-        format!("{}{}", self.prefix, role)
+        format!("{}{{{}}}", self.prefix, role)
     }
 
     fn term_key(&self, role: &str) -> String {
-        format!("{}term:{}", self.prefix, role)
+        format!("{}term:{{{}}}", self.prefix, role)
     }
 }
 
@@ -264,13 +265,13 @@ impl LeaderElector for RedisLeaderElector {
             let term_key = self.term_key(&r);
             let ttl_ms = ttl.as_millis().max(1) as u64;
 
-            // Lua script: if leader key is not set, increment term and set candidate_id:term
+            // Lua script: if leader key is not set, increment term and set length-prefixed candidate_id:term
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 if not current then
                     local term = redis.call('INCR', KEYS[2])
-                    local val = ARGV[1] .. ':' .. tostring(term)
+                    local val = tostring(string.len(ARGV[1])) .. ':' .. ARGV[1] .. ':' .. tostring(term)
                     redis.call('SET', KEYS[1], val, 'PX', ARGV[2])
                     return term
                 else
@@ -293,6 +294,7 @@ impl LeaderElector for RedisLeaderElector {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
+                    expires_at: Some(std::time::Instant::now() + ttl),
                 }))
             } else {
                 Ok(None)
@@ -322,7 +324,7 @@ impl LeaderElector for RedisLeaderElector {
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 if current then
-                    local prefix = ARGV[1] .. ':'
+                    local prefix = tostring(string.len(ARGV[1])) .. ':' .. ARGV[1] .. ':'
                     if string.sub(current, 1, string.len(prefix)) == prefix then
                         redis.call('PEXPIRE', KEYS[1], ARGV[2])
                         local term = string.sub(current, string.len(prefix) + 1)
@@ -346,6 +348,7 @@ impl LeaderElector for RedisLeaderElector {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
+                    expires_at: Some(std::time::Instant::now() + ttl),
                 }))
             } else {
                 Ok(None)
@@ -370,13 +373,18 @@ impl LeaderElector for RedisLeaderElector {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if let Some(s) = val
-                && let Some((candidate, term_str)) = s.split_once(':')
-                && let Ok(term) = term_str.parse::<u64>()
+                && let Some((len_str, rest)) = s.split_once(':')
+                && let Ok(len) = len_str.parse::<usize>()
+                && rest.len() > len
+                && &rest[len..=len] == ":"
+                && let Ok(term) = rest[len + 1..].parse::<u64>()
             {
+                let candidate = &rest[..len];
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: candidate.to_string(),
                     term,
+                    expires_at: None,
                 }))
             } else {
                 Ok(None)
@@ -400,7 +408,7 @@ impl LeaderElector for RedisLeaderElector {
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 if current then
-                    local prefix = ARGV[1] .. ':'
+                    local prefix = tostring(string.len(ARGV[1])) .. ':' .. ARGV[1] .. ':'
                     if string.sub(current, 1, string.len(prefix)) == prefix then
                         redis.call('DEL', KEYS[1])
                         return 1

@@ -12,7 +12,9 @@ use uuid::Uuid;
 use crate::jobs::error::JobError;
 use crate::jobs::job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
 use crate::jobs::queue::JobQueue;
-use crate::jobs::reliability::{HeartbeatRegistry, IdempotencyStatus, IdempotencyStore};
+use crate::jobs::reliability::{
+    HeartbeatRegistry, IdempotencyStatus, IdempotencyStore, scoped_idempotency_key,
+};
 
 type ErasedHandler =
     Arc<dyn Fn(&JobContext, &[u8]) -> BoxFuture<'static, Result<(), JobError>> + Send + Sync>;
@@ -63,6 +65,15 @@ impl JobRegistry {
 
     /// Dispatches a raw queued job to its registered handler.
     pub async fn dispatch(&self, job: &QueuedJob) -> Result<(), JobError> {
+        self.dispatch_with_cancellation(job, None).await
+    }
+
+    /// Dispatches a raw queued job to its registered handler with optional cancellation awareness.
+    pub async fn dispatch_with_cancellation(
+        &self,
+        job: &QueuedJob,
+        cancellation: Option<Arc<AtomicBool>>,
+    ) -> Result<(), JobError> {
         let Some(handler) = self.handlers.get(&job.name) else {
             return Err(JobError::UnknownJob(job.name.clone()));
         };
@@ -71,6 +82,7 @@ impl JobRegistry {
             id: job.id.clone(),
             attempt: job.attempt,
             max_attempts: job.retry_policy.max_attempts,
+            cancellation,
         };
 
         let fut = handler(&ctx, &job.payload);
@@ -260,6 +272,7 @@ impl<Q: JobQueue> JobWorker<Q> {
 
     /// Internal worker execution loop.
     async fn run_loop(&self) {
+        let mut consecutive_errors: u32 = 0;
         while !self.is_stopping.load(Ordering::Relaxed) {
             let permit = match self.semaphore.clone().acquire_owned().await {
                 Ok(permit) => permit,
@@ -268,25 +281,30 @@ impl<Q: JobQueue> JobWorker<Q> {
 
             match self.queue.dequeue_for(&self.worker_id).await {
                 Ok(Some(job)) => {
+                    consecutive_errors = 0;
                     self.in_flight_count.fetch_add(1, Ordering::SeqCst);
                     let queue = Arc::clone(&self.queue);
                     let registry = Arc::clone(&self.registry);
                     let in_flight = Arc::clone(&self.in_flight_count);
                     let idempotency = self.idempotency_store.clone();
+                    let stopping = Arc::clone(&self.is_stopping);
 
                     tokio::spawn(async move {
                         let _permit = permit;
                         let _guard = InFlightGuard(in_flight);
-                        Self::execute_job(queue, registry, job, idempotency).await;
+                        Self::execute_job(queue, registry, job, idempotency, stopping).await;
                     });
                 }
                 Ok(None) => {
+                    consecutive_errors = 0;
                     drop(permit);
                     sleep(Duration::from_millis(25)).await;
                 }
                 Err(_) => {
+                    consecutive_errors = consecutive_errors.saturating_add(1);
                     drop(permit);
-                    sleep(Duration::from_millis(50)).await;
+                    let backoff_ms = (50u64 * 2u64.pow(consecutive_errors.min(6))).min(5000);
+                    sleep(Duration::from_millis(backoff_ms)).await;
                 }
             }
         }
@@ -298,45 +316,88 @@ impl<Q: JobQueue> JobWorker<Q> {
         registry: Arc<JobRegistry>,
         job: QueuedJob,
         idempotency_store: Option<Arc<dyn IdempotencyStore>>,
+        stopping: Arc<AtomicBool>,
     ) {
         let job_id = job.id.clone();
+        let token = job.lease_token.clone().unwrap_or_default();
 
-        if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+        let effective_key = match (&job.tenant_id, &job.idempotency_key) {
+            (Some(tenant), Some(key)) => Some(scoped_idempotency_key(tenant, key)),
+            (None, Some(key)) => Some(key.clone()),
+            _ => None,
+        };
+
+        if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
             match store.try_acquire(key, Duration::from_secs(300)).await {
                 Ok(IdempotencyStatus::Completed(_)) => {
-                    let _ = queue.ack(&job_id).await;
+                    let _ = queue.ack(&job_id, &token).await;
                     return;
                 }
                 Ok(IdempotencyStatus::InProgress) => {
+                    let _ = queue.nack(job, &token, Duration::from_secs(2)).await;
                     return;
                 }
                 _ => {}
             }
         }
 
-        match registry.dispatch(&job).await {
+        // Spawn background lease heartbeat while job is executing
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        let hb_token = token.clone();
+        let hb_queue = Arc::clone(&queue);
+        let hb_jid = job_id.clone();
+
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(20));
+            interval.tick().await; // tick immediately
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => break,
+                    _ = interval.tick() => {
+                        if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, Duration::from_secs(60)).await {
+                            tracing::warn!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat");
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            registry.dispatch_with_cancellation(&job, Some(stopping))
+        })) {
+            Ok(fut) => fut.await,
+            Err(_) => Err(JobError::Fatal("handler panicked".into())),
+        };
+
+        let _ = cancel_tx.send(());
+        heartbeat_handle.abort();
+
+        match dispatch_result {
             Ok(()) => {
-                let _ = queue.ack(&job_id).await;
-                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+                let _ = queue.ack(&job_id, &token).await;
+                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
                     let _ = store.complete(key, None).await;
                 }
             }
-            Err(JobError::Fatal(msg)) => {
-                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
+            Err(JobError::Fatal(msg))
+            | Err(JobError::UnknownJob(msg))
+            | Err(JobError::Serialization(msg)) => {
+                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
                     let _ = store.release(key).await;
                 }
-                let _ = queue.dead_letter(job, msg).await;
+                let _ = queue.dead_letter(job, &token, msg).await;
             }
             Err(err) => {
-                if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
-                    let _ = store.release(key).await;
-                }
                 // Retryable failure: check remaining attempts
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
-                    let _ = queue.nack(job, backoff).await;
+                    let _ = queue.nack(job, &token, backoff).await;
                 } else {
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
+                        let _ = store.release(key).await;
+                    }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
-                    let _ = queue.dead_letter(job, reason).await;
+                    let _ = queue.dead_letter(job, &token, reason).await;
                 }
             }
         }

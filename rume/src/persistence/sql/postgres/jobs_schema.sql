@@ -9,13 +9,18 @@ CREATE TABLE IF NOT EXISTS rume_jobs (
     backoff_factor DOUBLE PRECISION NOT NULL DEFAULT 2.0,
     timeout_ms BIGINT,
     idempotency_key TEXT,
+    tenant_id TEXT,
     assigned_worker TEXT,
     available_at BIGINT NOT NULL,
     lease_expires_at BIGINT,
     status TEXT NOT NULL DEFAULT 'pending',
     dead_letter_reason TEXT,
-    created_at BIGINT NOT NULL
+    dead_lettered_at BIGINT,
+    created_at BIGINT NOT NULL,
+    completed_at BIGINT,
+    lease_token TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_rume_jobs_pending ON rume_jobs (available_at) WHERE status = 'pending';
-CREATE UNIQUE INDEX IF NOT EXISTS idx_rume_jobs_idempotency ON rume_jobs (idempotency_key) WHERE idempotency_key IS NOT NULL AND status != 'dead_letter';
+CREATE INDEX IF NOT EXISTS idx_rume_jobs_dead_letter ON rume_jobs (dead_lettered_at) WHERE status = 'dead_letter';
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rume_jobs_idempotency ON rume_jobs (COALESCE(tenant_id, ''), idempotency_key) WHERE idempotency_key IS NOT NULL AND status NOT IN ('dead_letter', 'purged');

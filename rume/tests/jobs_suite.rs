@@ -1,3 +1,5 @@
+#![cfg(feature = "postgres")]
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
@@ -307,6 +309,10 @@ async fn worker_panic_does_not_leak_in_flight_count() {
     // Drain should succeed without hanging because RAII guard decremented in_flight_count
     let drained = worker.drain(Duration::from_millis(200)).await;
     assert!(drained);
+
+    // Durable queue invariant: panicked job must not be orphaned in 'in_flight'
+    assert_eq!(queue.dead_letter_count().await.unwrap(), 1, "panicked job must be routed to DLQ");
+    assert_eq!(queue.pending_count().await.unwrap(), 0);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -418,4 +424,45 @@ async fn worker_concurrency_is_bounded() {
         "max concurrent observed was {}",
         max_observed.load(Ordering::SeqCst)
     );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MultiTenantDeduplicationJob {
+    tenant: String,
+    invoice_id: String,
+}
+
+impl Job for MultiTenantDeduplicationJob {
+    const NAME: &'static str = "multi_tenant_dedup_job";
+
+    fn idempotency_key(&self) -> Option<String> {
+        Some(self.invoice_id.clone())
+    }
+
+    fn tenant_id(&self) -> Option<String> {
+        Some(self.tenant.clone())
+    }
+}
+
+#[tokio::test]
+async fn cross_tenant_job_idempotency_isolation() {
+    let (_node, queue) = start_postgres_queue().await;
+
+    let job_a = MultiTenantDeduplicationJob {
+        tenant: "tenant-a".into(),
+        invoice_id: "inv-100".into(),
+    };
+    let job_b = MultiTenantDeduplicationJob {
+        tenant: "tenant-b".into(),
+        invoice_id: "inv-100".into(),
+    };
+
+    // Both tenants can enqueue a job with the identical idempotency key "inv-100" without collision
+    let id_a = queue.enqueue(job_a.clone()).await.unwrap();
+    let id_b = queue.enqueue(job_b.clone()).await.unwrap();
+    assert_ne!(id_a, id_b, "different tenants must get distinct job IDs");
+
+    // Idempotent retry within tenant-a returns the same ID
+    let id_a_retry = queue.enqueue(job_a).await.unwrap();
+    assert_eq!(id_a, id_a_retry, "tenant-a retry must resolve to existing job ID");
 }

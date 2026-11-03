@@ -1,3 +1,5 @@
+#![cfg(feature = "redis")]
+
 use std::time::Duration;
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -105,11 +107,7 @@ async fn test_leader_election_lifecycle() {
 
     assert_eq!(
         elector.get_leader(role).await.unwrap(),
-        Some(LeaderLease {
-            role: role.to_string(),
-            candidate_id: "worker-node-1".to_string(),
-            term: 1,
-        })
+        Some(LeaderLease::new(role, "worker-node-1", 1))
     );
 
     // 2. Candidate 2 attempts to acquire - rejected while active
@@ -140,10 +138,6 @@ async fn test_leader_election_lifecycle() {
     assert_eq!(lease_b.term, 2);
     assert_eq!(
         elector.get_leader(role).await.unwrap(),
-        Some(LeaderLease {
-            role: role.to_string(),
-            candidate_id: "worker-node-2".to_string(),
-            term: 2,
-        })
+        Some(LeaderLease::new(role, "worker-node-2", 2))
     );
 }

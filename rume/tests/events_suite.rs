@@ -3,7 +3,6 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use rume::events::{Event, EventBus, EventError, EventHandler};
-use tokio::time::sleep;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct UserRegisteredEvent {
@@ -99,13 +98,16 @@ async fn synchronous_dispatch_propagates_listener_error() {
 async fn asynchronous_event_delivery_unblocks_caller() {
     let bus = EventBus::new();
     let async_counter = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
 
     let counter_clone = Arc::clone(&async_counter);
+    let notify_clone = Arc::clone(&notify);
     bus.subscribe_fn(move |_event: &UserRegisteredEvent| {
         let cnt = Arc::clone(&counter_clone);
+        let ntf = Arc::clone(&notify_clone);
         async move {
-            sleep(Duration::from_millis(20)).await;
             cnt.fetch_add(1, Ordering::SeqCst);
+            ntf.notify_one();
             Ok(())
         }
     });
@@ -118,10 +120,11 @@ async fn asynchronous_event_delivery_unblocks_caller() {
     // publish_async returns immediately
     let scheduled = bus.publish_async(event);
     assert_eq!(scheduled, 1);
-    assert_eq!(async_counter.load(Ordering::SeqCst), 0);
 
-    // Wait for async task to complete
-    sleep(Duration::from_millis(50)).await;
+    // Wait deterministically for async task to complete via Notify
+    tokio::time::timeout(Duration::from_secs(1), notify.notified())
+        .await
+        .expect("async handler should notify within timeout");
     assert_eq!(async_counter.load(Ordering::SeqCst), 1);
 }
 

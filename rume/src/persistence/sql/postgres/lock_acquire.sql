@@ -1,8 +1,8 @@
 INSERT INTO rume_locks (resource, lease_id, fencing_token, expires_at)
-VALUES ($1, $2, nextval('rume_lock_fencing_seq'), $3)
+VALUES ($1, $2, nextval('rume_lock_fencing_seq'), (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $3)
 ON CONFLICT (resource) DO UPDATE
 SET lease_id = EXCLUDED.lease_id,
-    fencing_token = nextval('rume_lock_fencing_seq'),
-    expires_at = EXCLUDED.expires_at
-WHERE rume_locks.expires_at <= $4
+    fencing_token = EXCLUDED.fencing_token,
+    expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $3
+WHERE rume_locks.expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
 RETURNING fencing_token;
