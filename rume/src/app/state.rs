@@ -157,9 +157,29 @@ impl Availability {
     }
 
     pub fn set(&self, state: AvailabilityState) {
-        // The type system guarantees only valid variants reach here through
-        // safe code, but guard the stored discriminant anyway so an out-of-range
-        // u8 can never be observed through `state()`.
+        let new_val = state as u8;
+        if new_val > Self::MAX_DISCRIMINANT {
+            return;
+        }
+
+        // Monotonic transition guard: once in a drain or terminal state (RefusingTraffic or Broken),
+        // reject transitions back to Live or Ready to prevent in-flight workers or handlers from bypassing drain.
+        let _ = self.inner.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
+            if (curr == AvailabilityState::RefusingTraffic as u8
+                || curr == AvailabilityState::Broken as u8)
+                && (new_val == AvailabilityState::Live as u8
+                    || new_val == AvailabilityState::Ready as u8)
+            {
+                None
+            } else {
+                Some(new_val)
+            }
+        });
+    }
+
+    /// Sets the availability state unconditionally, bypassing monotonicity guards.
+    /// Intended for diagnostic testing and fixture resets.
+    pub fn force_set(&self, state: AvailabilityState) {
         let value = state as u8;
         if value <= Self::MAX_DISCRIMINANT {
             self.inner.store(value, Ordering::SeqCst);
@@ -228,5 +248,38 @@ mod tests {
 
         availability.inner.store(255, Ordering::SeqCst);
         assert_eq!(availability.state(), AvailabilityState::Unknown);
+    }
+
+    #[test]
+    fn availability_monotonic_transition_guard() {
+        let availability = Availability::new();
+        availability.set(AvailabilityState::Live);
+        assert_eq!(availability.state(), AvailabilityState::Live);
+
+        availability.set(AvailabilityState::Ready);
+        assert_eq!(availability.state(), AvailabilityState::Ready);
+
+        // Transition to RefusingTraffic (graceful shutdown)
+        availability.set(AvailabilityState::RefusingTraffic);
+        assert_eq!(availability.state(), AvailabilityState::RefusingTraffic);
+
+        // Attempting to transition back to Live or Ready via set() is blocked
+        availability.set(AvailabilityState::Live);
+        assert_eq!(availability.state(), AvailabilityState::RefusingTraffic);
+
+        availability.set(AvailabilityState::Ready);
+        assert_eq!(availability.state(), AvailabilityState::RefusingTraffic);
+
+        // Can transition to Broken
+        availability.set(AvailabilityState::Broken);
+        assert_eq!(availability.state(), AvailabilityState::Broken);
+
+        // Once Broken, cannot transition back
+        availability.set(AvailabilityState::Ready);
+        assert_eq!(availability.state(), AvailabilityState::Broken);
+
+        // force_set allows test reset
+        availability.force_set(AvailabilityState::Ready);
+        assert_eq!(availability.state(), AvailabilityState::Ready);
     }
 }

@@ -377,3 +377,50 @@ async fn test_stale_session_cookie_falls_back_to_bearer_token() {
     let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
     assert_eq!(val["id"], "user_fallback");
 }
+
+#[tokio::test]
+async fn test_session_scheme_subdomain_cookie_tossing_protection() {
+    // Security M2: SessionScheme does not suffer from first-cookie selection bias.
+    // When a request carries a tossed invalid cookie followed by a valid host cookie,
+    // SessionScheme must inspect subsequent cookies and succeed.
+    let session_store = start_session_store().await;
+    let valid_session = Session::new("sess_valid_123", "valid_user_123", 3600);
+    let valid_id = valid_session.id.clone();
+    session_store.save(valid_session).await.unwrap();
+
+    let session_scheme = SessionScheme::new(session_store);
+
+    let router = rume::routing::Router::new()
+        .route("/profile", get(get_me))
+        .layer(AuthLayer::required().scheme(session_scheme));
+
+    let app = TestApp::new(router);
+
+    // Request with tossed invalid cookie first, valid cookie second
+    let req = axum::http::Request::builder()
+        .uri("/profile")
+        .header(
+            "cookie",
+            format!("rume_session=tossed_invalid_cookie; rume_session={valid_id}"),
+        )
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let val: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(val["id"], "valid_user_123");
+
+    // Also verify across split Cookie headers
+    let req2 = axum::http::Request::builder()
+        .uri("/profile")
+        .header("cookie", "rume_session=tossed_invalid_cookie")
+        .header("cookie", format!("rume_session={valid_id}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res2 = app.request(req2).await;
+    assert_eq!(res2.status(), StatusCode::OK);
+    let val2: serde_json::Value = serde_json::from_str(&TestApp::body_text(res2).await).unwrap();
+    assert_eq!(val2["id"], "valid_user_123");
+}

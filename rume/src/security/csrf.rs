@@ -49,6 +49,9 @@ pub struct CsrfConfig {
     pub exempt_prefixes: BTreeSet<String>,
     /// Optional secret key for HMAC-signing tokens to defeat subdomain cookie tossing.
     pub secret: Option<Vec<u8>>,
+    /// Explicit opt-in to allow unauthenticated double-submit tokens when `secret` is None.
+    /// Default is `false` (fail-closed) to protect against subdomain cookie-tossing in production.
+    pub allow_unauthenticated: bool,
     /// Whether to automatically generate and inject the CSRF cookie on safe GET/HEAD requests.
     pub auto_inject_cookie: bool,
     /// Cookie path (default: `/`).
@@ -68,6 +71,7 @@ impl Default for CsrfConfig {
             cookie_name: "csrf_token".to_string(),
             exempt_prefixes: BTreeSet::new(),
             secret: None,
+            allow_unauthenticated: false,
             auto_inject_cookie: false,
             cookie_path: "/".to_string(),
             cookie_same_site: "Strict".to_string(),
@@ -113,6 +117,19 @@ impl CsrfConfig {
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         self.secret = Some(secret);
+        self
+    }
+
+    /// Explicitly allow unauthenticated double-submit tokens when running without an HMAC secret.
+    /// In production, tokens without HMAC signing permit subdomain cookie-tossing attacks.
+    pub fn allow_unauthenticated(mut self, allow: bool) -> Self {
+        self.allow_unauthenticated = allow;
+        self
+    }
+
+    /// Convenience helper for mock testing: enables unauthenticated double-submit tokens.
+    pub fn insecure_without_secret_for_testing(mut self) -> Self {
+        self.allow_unauthenticated = true;
         self
     }
 
@@ -165,9 +182,10 @@ impl CsrfConfig {
     }
 
     /// Verifies the authenticity and signature of a token.
+    /// Fails closed if no secret is configured unless `allow_unauthenticated` is explicitly enabled.
     pub fn verify_token(&self, token: &str) -> bool {
         let Some(secret) = &self.secret else {
-            return !token.is_empty();
+            return self.allow_unauthenticated && !token.is_empty();
         };
 
         let Some((raw, sig_hex)) = token.split_once('.') else {
@@ -210,18 +228,20 @@ pub struct CsrfLayer {
 }
 
 impl CsrfLayer {
-    /// Creates a CSRF protection layer with default configuration.
+    /// Creates a CSRF protection layer with default configuration and auto-generated 32-byte HMAC secret.
     pub fn new() -> Self {
-        Self {
-            config: Arc::new(CsrfConfig::default()),
-        }
+        Self::with_config(CsrfConfig::default().with_random_secret())
     }
 
     /// Creates a CSRF protection layer with custom configuration.
     pub fn with_config(config: CsrfConfig) -> Self {
-        if config.secret.is_none() {
+        if config.secret.is_none() && !config.allow_unauthenticated {
             tracing::warn!(
-                "CsrfLayer initialized without HMAC secret; tokens will not be protected against subdomain cookie-tossing"
+                "CsrfLayer initialized without HMAC secret or allow_unauthenticated; CSRF token verification will fail closed"
+            );
+        } else if config.secret.is_none() {
+            tracing::warn!(
+                "CsrfLayer running in unauthenticated mode (allow_unauthenticated=true); tokens will not be protected against subdomain cookie-tossing"
             );
         }
         Self {
@@ -334,25 +354,19 @@ where
                 return Ok(err.into_response());
             };
 
-            // Extract matching tokens from Cookie header (inspect all matching cookies to avoid subdomain cookie-tossing denial of service)
-            let matching_cookies: Vec<&str> = req
-                .headers()
-                .get(COOKIE)
-                .and_then(|val| val.to_str().ok())
-                .map(|cookies| {
-                    cookies
-                        .split(';')
-                        .filter_map(|pair| {
-                            let (name, value) = pair.trim().split_once('=')?;
-                            if name == config.cookie_name {
-                                Some(value)
-                            } else {
-                                None
-                            }
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Extract matching tokens from Cookie headers (inspect all matching cookies across split headers to avoid subdomain cookie-tossing denial of service)
+            let mut matching_cookies = Vec::new();
+            for header_val in req.headers().get_all(COOKIE) {
+                if let Ok(cookies) = header_val.to_str() {
+                    for pair in cookies.split(';') {
+                        if let Some((name, value)) = pair.trim().split_once('=')
+                            && name == config.cookie_name
+                        {
+                            matching_cookies.push(value);
+                        }
+                    }
+                }
+            }
 
             if matching_cookies.is_empty() {
                 let err = AppError::Public {

@@ -111,6 +111,9 @@ pub enum ConfigCommands {
     Explain {
         /// Config key to explain (e.g. app.name or database.url).
         key: String,
+        /// Show secret values in plaintext without redaction.
+        #[arg(long)]
+        unredacted: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,

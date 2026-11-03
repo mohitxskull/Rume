@@ -89,6 +89,7 @@ fn build_ctx() -> AppContext<std::net::IpAddr, std::collections::BTreeMap<String
 #[tokio::test]
 async fn health_live_returns_ok_when_not_broken() {
     let ctx = build_ctx();
+    ctx.availability.set(AvailabilityState::Live);
     let app = TestAppBuilder::new(ctx.clone())
         .router(health_routes())
         .build()
@@ -98,6 +99,25 @@ async fn health_live_returns_ok_when_not_broken() {
     assert_eq!(response.status(), StatusCode::OK);
     let body = TestApp::body_text(response).await;
     assert!(body.contains("\"status\":\"alive\""));
+}
+
+#[tokio::test]
+async fn health_live_returns_503_when_unknown_or_broken() {
+    let ctx = build_ctx();
+    // Default build_ctx availability is Unknown
+    let app = TestAppBuilder::new(ctx.clone())
+        .router(health_routes())
+        .build()
+        .await;
+
+    let response = app.get("/health/live").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = TestApp::body_text(response).await;
+    assert!(body.contains("\"status\":\"broken\""));
+
+    ctx.availability.set(AvailabilityState::Broken);
+    let response = app.get("/health/live").await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
 #[tokio::test]

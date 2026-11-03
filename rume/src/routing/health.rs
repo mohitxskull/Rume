@@ -312,7 +312,8 @@ where
         .get(
             "/health/live",
             move |State(ctx): State<AppContext<E, C, S>>| async move {
-                if ctx.availability.state() == AvailabilityState::Broken {
+                let state = ctx.availability.state();
+                if state == AvailabilityState::Broken || state == AvailabilityState::Unknown {
                     (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"status": "broken"})),
@@ -326,13 +327,10 @@ where
         .get(
             "/health/ready",
             move |State(ctx): State<AppContext<E, C, S>>| async move {
-                // S-m4: readiness also respects lifecycle state — refuse
-                // traffic when the application is terminating or
-                // refusing traffic, even if all health checks pass.
-                if ctx.availability.state() == AvailabilityState::RefusingTraffic
-                    || ctx.availability.state() == AvailabilityState::Unknown
-                    || ctx.availability.state() == AvailabilityState::Broken
-                {
+                // Routing C1: readiness strictly requires AvailabilityState::Ready.
+                // Refuse traffic when the application is booting (Live), terminating
+                // (RefusingTraffic), Broken, or Unknown.
+                if ctx.availability.state() != AvailabilityState::Ready {
                     return (
                         StatusCode::SERVICE_UNAVAILABLE,
                         Json(json!({"status": "error"})),
@@ -865,5 +863,94 @@ mod tests {
             1,
             "second run within TTL must not re-execute"
         );
+    }
+
+    #[tokio::test]
+    async fn health_ready_strictly_requires_ready_state_rejecting_live() {
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new().register(OkCheck),
+            (),
+        );
+
+        // App starts in Live state during startup/migrations
+        ctx.availability.set(AvailabilityState::Live);
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx.clone());
+
+        let request = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("request failed");
+        // Must reject with 503 during Live/startup phase
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Once transitioned to Ready, /health/ready returns 200 OK
+        ctx.availability.set(AvailabilityState::Ready);
+        let request2 = axum::http::Request::builder()
+            .uri("/health/ready")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response2 = router.oneshot(request2).await.expect("request failed");
+        assert_eq!(response2.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn health_live_rejects_unknown_and_broken() {
+        type TestEnv = std::collections::BTreeMap<String, String>;
+        type TestConfig = std::collections::BTreeMap<String, String>;
+
+        let ctx = AppContext::new(
+            TestEnv::new(),
+            TestConfig::new(),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+            (),
+        );
+
+        let router = super::health_routes::<TestEnv, TestConfig, ()>().with_state(ctx.clone());
+
+        // Default state is Unknown -> must return 503
+        let request = axum::http::Request::builder()
+            .uri("/health/live")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Live state -> 200 OK
+        ctx.availability.set(AvailabilityState::Live);
+        let request = axum::http::Request::builder()
+            .uri("/health/live")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Ready state -> 200 OK
+        ctx.availability.set(AvailabilityState::Ready);
+        let request = axum::http::Request::builder()
+            .uri("/health/live")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Broken state -> 503
+        ctx.availability.set(AvailabilityState::Broken);
+        let request = axum::http::Request::builder()
+            .uri("/health/live")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.expect("request failed");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 }

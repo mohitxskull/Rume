@@ -1,6 +1,7 @@
 use rume::config;
+use rume::env::{is_secret_key, redact_value};
 
-pub fn run(key: &str, json: bool) {
+pub fn run(key: &str, unredacted: bool, json: bool) {
     let source_map = match config::source_map(std::path::Path::new(".")) {
         Ok(sm) => sm,
         Err(err) => {
@@ -17,7 +18,22 @@ pub fn run(key: &str, json: bool) {
         }
     };
 
-    let explanation = source_map.explain(key);
+    let mut explanation = source_map.explain(key);
+    if !unredacted && let Some(ref mut val) = explanation.value {
+        let is_secret = is_secret_key(key);
+        let str_val = match val {
+            toml::Value::String(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let should_redact = is_secret
+            || str_val
+                .map(|s| redact_value(key, s) == "[redacted]")
+                .unwrap_or(false);
+        if should_redact {
+            *val = toml::Value::String("[redacted]".to_string());
+        }
+    }
+
     match &explanation.value {
         Some(val) => {
             if json {

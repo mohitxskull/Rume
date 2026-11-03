@@ -13,6 +13,10 @@ pub fn run(command: ConfigCommands) {
             let fmt = if json { "json" } else { &format };
             check::run(unredacted, fmt);
         }
-        ConfigCommands::Explain { key, json } => explain::run(&key, json),
+        ConfigCommands::Explain {
+            key,
+            unredacted,
+            json,
+        } => explain::run(&key, unredacted, json),
     }
 }

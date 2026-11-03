@@ -10,23 +10,23 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group A — Application Readiness & Availability Lifecycle (solve together)
 > Root cause: `routing/health.rs` and `app/state.rs` fail to enforce a strict three-phase lifecycle (Live → Ready → RefusingTraffic), causing traffic to be routed prematurely during boot and admitted during shutdown.
 
-- [ ] **Routing C1 — Readiness probe `/health/ready` returns 200 OK during startup** (`routing-api-openapi.md` C1).
+- [x] **Routing C1 — Readiness probe `/health/ready` returns 200 OK during startup** (`routing-api-openapi.md` C1).
       `rume/src/routing/health.rs:335`: `state == AvailabilityState::Ready || state == AvailabilityState::Live` returns 200 OK before module and application startup hooks execute. Change check to strictly require `state == AvailabilityState::Ready`.
-- [ ] **App M5 — `Availability::set` allows unconstrained drain bypass** (`app-lifecycle.md` M5).
+- [x] **App M5 — `Availability::set` allows unconstrained drain bypass** (`app-lifecycle.md` M5).
       `rume/src/app/state.rs:159–167`: `Availability::set` allows arbitrary external state mutation, permitting workers or handlers to overwrite `RefusingTraffic` with `Ready`. Enforce monotonic forward transitions (reject transition to `Ready` if current state is `RefusingTraffic` or `Terminating`).
-- [ ] **App m4 — `/health/live` returns 200 OK for `AvailabilityState::Unknown`** (`app-lifecycle.md` m4).
+- [x] **App m4 — `/health/live` returns 200 OK for `AvailabilityState::Unknown`** (`app-lifecycle.md` m4).
       `rume/src/routing/health.rs:320`: Unmapped atomic values return 200 OK. Return 503 Service Unavailable when state is `Unknown`.
 
 ### Group B — Secret Redaction & Token Security (solve together)
 > Root cause: Diagnostic CLI commands and default middleware configurations lack fail-closed secret masking and token verification.
 
-- [ ] **CLI C1 — Multi-line secret leakage in `rume config check`** (`dx-cli.md` C1).
+- [x] **CLI C1 — Multi-line secret leakage in `rume config check`** (`dx-cli.md` C1).
       `rume-cli/src/commands/config.rs:114–119`: Line-by-line splitting leaks multi-line RSA and PEM secret blocks on continuation lines. Apply `redact_value` to the entire string before line splitting.
-- [ ] **Security M1 — Insecure defaults in `CsrfConfig` allow unauthenticated double-submit tokens** (`security-protocols.md` M1).
+- [x] **Security M1 — Insecure defaults in `CsrfConfig` allow unauthenticated double-submit tokens** (`security-protocols.md` M1).
       `rume/src/security/csrf.rs:56–65`: `secret: None` allows unauthenticated tokens without startup validation. Require explicit opt-in for unauthenticated tokens; fail closed at boot if HMAC secret is missing in production.
-- [ ] **Security M2 — Subdomain cookie-tossing DoS in `SessionScheme`** (`security-protocols.md` M2).
+- [x] **Security M2 — Subdomain cookie-tossing DoS in `SessionScheme`** (`security-protocols.md` M2).
       `rume/src/auth/session.rs:67–76`: Aborts cookie extraction on the first matching cookie name, enabling denial-of-service via tossed parent-domain cookies. Iterate through all matching cookie headers/values until a valid session is found.
-- [ ] **CLI M1 — `rume config explain` outputs plaintext secrets without redaction** (`dx-cli.md` M1).
+- [x] **CLI M1 — `rume config explain` outputs plaintext secrets without redaction** (`dx-cli.md` M1).
       `rume-cli/src/commands/config.rs:14–35`: Dumps configuration entries in plaintext without `--unredacted` gating. Apply `mask_secret` / `redact_value` to secret fields by default.
 
 ---
@@ -204,7 +204,7 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
       `rume/src/openapi/spec.rs:83`: Populate request body schemas and auth security schemes in generated document.
 - [ ] **Security m1 — `Forwarded` header substring matching and unchecked proxy trust** (`security-protocols.md` m1).
       `rume/src/security/headers.rs:88`: Require trusted proxy CIDR configuration before honoring `X-Forwarded-*`.
-- [ ] **Security m2 — `CsrfService` reads only first Cookie header** (`security-protocols.md` m2).
+- [x] **Security m2 — `CsrfService` reads only first Cookie header** (`security-protocols.md` m2).
       `rume/src/security/csrf.rs:120`: Parse split cookie headers across all incoming `Cookie` header lines.
 - [ ] **Security m3 — Non-atomic session ID rotation in `RedisSessionStore`** (`security-protocols.md` m3).
       `rume/src/auth/session.rs:145`: Execute session ID rotation in single atomic Lua script.

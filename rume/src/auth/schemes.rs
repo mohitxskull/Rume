@@ -178,34 +178,34 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<AuthUser>, AuthError>> {
         Box::pin(async move {
-            let Some(cookie_header) = parts.headers.get(COOKIE) else {
-                return Ok(None);
-            };
+            // Security M2: Iterate through all Cookie headers and all matching cookie pairs.
+            // Continuing past invalid/stale cookies defeats subdomain cookie-tossing DoS,
+            // where an attacker sets a bogus parent-domain cookie with the same name.
+            for cookie_header in parts.headers.get_all(COOKIE) {
+                let Ok(cookie_str) = cookie_header.to_str() else {
+                    continue;
+                };
 
-            let Ok(cookie_str) = cookie_header.to_str() else {
-                return Ok(None);
-            };
-
-            // Parse cookies: name=val; name2=val2
-            for cookie in cookie_str.split(';') {
-                if let Some((name, val)) = cookie.trim().split_once('=')
-                    && name == self.cookie_name
-                {
-                    match self.store.load(val).await {
-                        Ok(Some(session)) => {
-                            let mut user = AuthUser::new(session.user_id)
-                                .with_roles(session.roles)
-                                .with_permissions(session.permissions);
-                            user.metadata = session.data;
-                            return Ok(Some(user));
-                        }
-                        Ok(None) => {
-                            // Stale or expired cookie: allow fallback to subsequent schemes in the chain
-                            return Ok(None);
-                        }
-                        Err(err) => {
-                            // Infrastructure or provider error: do not silently degrade to guest!
-                            return Err(err);
+                for cookie in cookie_str.split(';') {
+                    if let Some((name, val)) = cookie.trim().split_once('=')
+                        && name == self.cookie_name
+                    {
+                        match self.store.load(val).await {
+                            Ok(Some(session)) => {
+                                let mut user = AuthUser::new(session.user_id)
+                                    .with_roles(session.roles)
+                                    .with_permissions(session.permissions);
+                                user.metadata = session.data;
+                                return Ok(Some(user));
+                            }
+                            Ok(None) => {
+                                // Stale or tossed cookie: continue checking subsequent cookies
+                                continue;
+                            }
+                            Err(err) => {
+                                // Infrastructure or provider error: do not silently degrade to guest!
+                                return Err(err);
+                            }
                         }
                     }
                 }

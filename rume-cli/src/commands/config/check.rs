@@ -2,54 +2,6 @@ use rume::config;
 use rume::env::redact_value;
 use serde::Serialize;
 
-/// Extract the inner string content of a TOML value token, for redaction
-/// decisions. Quoted strings are unquoted; unquoted scalars are taken as-is.
-/// Containers return `None` and are recursed into instead.
-fn toml_value_inner(trimmed: &str) -> Option<String> {
-    if let Some(inner) = trimmed.strip_prefix('"').and_then(|q| q.strip_suffix('"')) {
-        return Some(inner.to_string());
-    }
-    if let Some(inner) = trimmed
-        .strip_prefix('\'')
-        .and_then(|q| q.strip_suffix('\''))
-    {
-        return Some(inner.to_string());
-    }
-    if !trimmed.is_empty() && !trimmed.starts_with('[') && !trimmed.starts_with('{') {
-        return Some(trimmed.to_string());
-    }
-    None
-}
-
-/// Redact secret-looking values in a single `key = "value"` TOML line.
-///
-/// Redaction uses [`rume::env::redact_value`], which matches on both the key
-/// and the value, so a credential URL is redacted even when the key does not
-/// match the secret heuristics.
-fn redact_toml_line(line: &str) -> String {
-    // Match lines like:  key = "value"   or   key = 'value'
-    if let Some((key, rest)) = line.split_once('=') {
-        let key = key.trim();
-        let trimmed = rest.trim();
-        let value = match toml_value_inner(trimmed) {
-            Some(v) => v,
-            None => return line.to_string(),
-        };
-        if redact_value(key, &value) == "[redacted]" {
-            // Preserve the quoting style of the original value.
-            if trimmed.starts_with('"') && trimmed.ends_with('"') {
-                return format!("{key} = \"[redacted]\"");
-            }
-            if trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-                return format!("{key} = '[redacted]'");
-            }
-            // Unquoted value (number, bool, etc.)
-            return format!("{key} = [redacted]");
-        }
-    }
-    line.to_string()
-}
-
 /// Render a scalar toml::Value as its string content, for redaction decisions.
 /// Containers (arrays/tables) return `None` and are recursed into instead.
 fn toml_value_as_string(value: &toml::Value) -> Option<String> {
@@ -62,11 +14,12 @@ fn toml_value_as_string(value: &toml::Value) -> Option<String> {
     }
 }
 
-/// Recursively redact secret-looking values in a toml::Value.
+/// Recursively redact secret-looking values in a toml::Value AST before serialization.
 ///
-/// Uses [`rume::env::redact_value`] so both key-based and value-based
-/// detection apply consistently with the rest of the application.
-fn redact_toml_value(value: &mut toml::Value) {
+/// Operating on the structured AST eliminates multi-line string leakage (CLI C1),
+/// ensuring multi-line RSA and PEM private keys and certificates are redacted
+/// in both human-readable and JSON modes.
+pub fn redact_toml_value(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
             let keys: Vec<String> = table.keys().cloned().collect();
@@ -99,34 +52,27 @@ struct ConfigCheckOutput {
 
 pub fn run(unredacted: bool, format: &str) {
     match config::load_raw(std::path::Path::new(".")) {
-        Ok(value) => match format {
-            "json" => {
-                let mut output_value = value.clone();
-                if !unredacted {
-                    redact_toml_value(&mut output_value);
-                }
-                let output = ConfigCheckOutput {
-                    config: output_value,
-                };
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&output).unwrap_or_default()
-                );
+        Ok(value) => {
+            let mut output_value = value;
+            if !unredacted {
+                redact_toml_value(&mut output_value);
             }
-            _ => {
-                let text = toml::to_string_pretty(&value).unwrap_or_default();
-                if unredacted {
+            match format {
+                "json" => {
+                    let output = ConfigCheckOutput {
+                        config: output_value,
+                    };
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&output).unwrap_or_default()
+                    );
+                }
+                _ => {
+                    let text = toml::to_string_pretty(&output_value).unwrap_or_default();
                     println!("{text}");
-                } else {
-                    let redacted: String = text
-                        .lines()
-                        .map(redact_toml_line)
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    println!("{redacted}");
                 }
             }
-        },
+        }
         Err(err) => {
             if format == "json" {
                 let err_json = serde_json::json!({"error": err.to_string()});
@@ -139,5 +85,33 @@ pub fn run(unredacted: bool, format: &str) {
             }
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_redact_toml_value_multiline_secrets() {
+        let raw = r#"
+            app_name = "demo"
+            private_key = """
+-----BEGIN RSA PRIVATE KEY-----
+MIIEogIBAAKCAQEA0+abc...
+-----END RSA PRIVATE KEY-----
+"""
+            database_url = "postgres://admin:secretpass@localhost:5432/db"
+            safe_setting = "hello world"
+        "#;
+        let mut val: toml::Value = toml::from_str(raw).unwrap();
+        redact_toml_value(&mut val);
+
+        let formatted = toml::to_string_pretty(&val).unwrap();
+        assert!(!formatted.contains("BEGIN RSA PRIVATE KEY"));
+        assert!(!formatted.contains("secretpass"));
+        assert!(formatted.contains("private_key = \"[redacted]\""));
+        assert!(formatted.contains("database_url = \"[redacted]\""));
+        assert!(formatted.contains("safe_setting = \"hello world\""));
     }
 }

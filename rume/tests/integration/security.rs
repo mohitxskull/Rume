@@ -95,6 +95,7 @@ async fn test_custom_security_headers() {
 #[tokio::test]
 async fn test_csrf_protection_lifecycle() {
     let csrf_config = CsrfConfig::new()
+        .allow_unauthenticated(true)
         .with_header("x-csrf-token")
         .with_cookie("csrf_token")
         .exempt("/api/webhook");
@@ -299,4 +300,63 @@ async fn test_audit_logging_sql_injection_resilience_and_id_preservation() {
         .await
         .unwrap();
     assert_eq!(saved_id.as_deref(), Some(record_id.as_str()));
+}
+
+#[tokio::test]
+async fn test_csrf_fails_closed_without_secret_by_default() {
+    // Security M1: CsrfConfig::new() without secret or allow_unauthenticated fails closed
+    let csrf_config = CsrfConfig::new()
+        .with_header("x-csrf-token")
+        .with_cookie("csrf_token");
+
+    let app = Router::new()
+        .route("/data", post(|| async { "updated" }))
+        .layer(CsrfLayer::with_config(csrf_config));
+
+    let test_app = TestApp::new(app);
+
+    let post_req = Request::builder()
+        .method(Method::POST)
+        .uri("/data")
+        .header("x-csrf-token", "arbitrary-token")
+        .header("cookie", "csrf_token=arbitrary-token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = test_app.request(post_req).await;
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
+    assert_eq!(body["code"], "CSRF_TOKEN_INVALID");
+}
+
+#[tokio::test]
+async fn test_csrf_split_cookie_headers() {
+    // Security m2: CsrfService inspects cookies across multiple RFC 7540 split Cookie headers
+    let secret = b"super-secret-hmac-key-for-split-cookies";
+    let csrf_config = CsrfConfig::new()
+        .with_secret(secret.to_vec())
+        .with_header("x-csrf-token")
+        .with_cookie("csrf_token");
+
+    let token = csrf_config.generate_token();
+
+    let app = Router::new()
+        .route("/data", post(|| async { "updated" }))
+        .layer(CsrfLayer::with_config(csrf_config));
+
+    let test_app = TestApp::new(app);
+
+    // Request with two separate Cookie headers
+    let post_req = Request::builder()
+        .method(Method::POST)
+        .uri("/data")
+        .header("x-csrf-token", &token)
+        .header("cookie", "session=xyz")
+        .header("cookie", format!("csrf_token={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res = test_app.request(post_req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(TestApp::body_text(res).await, "updated");
 }
