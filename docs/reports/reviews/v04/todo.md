@@ -108,15 +108,15 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group I — Application Lifecycle Shutdown & Health Probe Stampede (solve together)
 > Root cause: Teardown hook ordering diverges between test harness and server, and probe cache expiration allows thundering herd races.
 
-- [ ] **App M2 — `build_test_app()` inverts shutdown hook ordering** (`app-lifecycle.md` M2).
+- [x] **App M2 — `build_test_app()` inverts shutdown hook ordering** (`app-lifecycle.md` M2).
       `rume/src/app/builder.rs:602–613`: Runs module shutdown before application shutdown hooks (inverting `run()` order). Align shutdown hook sequence to run application hooks first, followed by module hooks.
-- [ ] **App M3 — Shutdown signal unmonitored during startup hooks** (`app-lifecycle.md` M3).
+- [x] **App M3 — Shutdown signal unmonitored during startup hooks** (`app-lifecycle.md` M3).
       `rume/src/app/builder.rs:1157–1168`: Boot process hangs indefinitely if a module startup hook blocks on external dependency. Wrap startup hook execution with `tokio::select!` monitoring shutdown signal.
-- [ ] **Routing M3 — Health check probe race on cache expiry causes thundering herd** (`routing-api-openapi.md` M3).
+- [x] **Routing M3 — Health check probe race on cache expiry causes thundering herd** (`routing-api-openapi.md` M3).
       `rume/src/routing/health.rs:186–210`: Concurrent requests during TTL expiry trigger duplicate probe executions. Protect probe execution with singleflight stampede suppression.
-- [ ] **Jobs M1 — Redis job queue computes lease expiry from host clock** (`jobs-worker-concurrency.md` M1).
+- [x] **Jobs M1 — Redis job queue computes lease expiry from host clock** (`jobs-worker-concurrency.md` M1).
       `rume/src/jobs/redis.rs:72–95`: Uses `SystemTime::now()` for job lease expiry scores. Use Redis server-side `TIME` command to evaluate lease deadlines.
-- [ ] **Jobs M2 — Redis job worker cancellation token ignored in handler** (`jobs-worker-concurrency.md` M2).
+- [x] **Jobs M2 — Redis job worker cancellation token ignored in handler** (`jobs-worker-concurrency.md` M2).
       `rume/src/jobs/worker.rs:114–135`: Lost lease heartbeat does not cancel active running handler. Propagate cancellation signal to `JobContext` during active execution.
 
 ### Group J — Crate Boundaries & Dependency Hygiene (solve together)

@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -576,7 +577,7 @@ where
         let startup_modules = module_registry.resolve_startup_modules()?;
         let shutdown_modules = module_registry.resolve_shutdown_modules()?;
 
-        let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let mut on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
@@ -605,6 +606,9 @@ where
 
                 started_modules.reverse();
                 let cleanup_ctx = ctx.clone();
+                for hook in std::mem::take(&mut on_shutdown) {
+                    let _ = hook(cleanup_ctx.clone()).await;
+                }
                 for sm in started_modules {
                     let sm_ctx = crate::module::ModuleContext::new(
                         sm.name(),
@@ -634,6 +638,9 @@ where
 
                 started_modules.reverse();
                 let cleanup_ctx = ctx.clone();
+                for hook in std::mem::take(&mut on_shutdown) {
+                    let _ = hook(cleanup_ctx.clone()).await;
+                }
                 for sm in started_modules {
                     let sm_ctx = crate::module::ModuleContext::new(
                         sm.name(),
@@ -664,6 +671,9 @@ where
                     .availability
                     .set(crate::app::state::AvailabilityState::RefusingTraffic);
 
+                for hook in on_shutdown {
+                    let _ = hook(cleanup_ctx.clone()).await;
+                }
                 for m in shutdown_modules {
                     let sm_ctx = crate::module::ModuleContext::new(
                         m.name(),
@@ -672,9 +682,6 @@ where
                         cleanup_ctx.lifecycle.clone(),
                     );
                     m.on_shutdown(&sm_ctx).await;
-                }
-                for hook in on_shutdown {
-                    let _ = hook(cleanup_ctx.clone()).await;
                 }
                 cleanup_ctx
                     .lifecycle
@@ -1268,7 +1275,7 @@ where
         startup_modules: Vec<Arc<dyn crate::module::Module>>,
         shutdown_modules: Vec<Arc<dyn crate::module::Module>>,
         on_ready: Vec<ReadyHook<E, C, S>>,
-        on_shutdown: Vec<ShutdownHook<E, C, S>>,
+        mut on_shutdown: Vec<ShutdownHook<E, C, S>>,
         shutdown_timeout: Duration,
         signal: F,
     ) -> Result<(), std::io::Error>
@@ -1276,6 +1283,28 @@ where
         F: Future<Output = ()> + Send + 'static,
     {
         let addr = listener.local_addr()?;
+
+        // Shutdown signal monitoring for boot hooks and server
+        let shutdown_flag = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+
+        let sf_task = Arc::clone(&shutdown_flag);
+        let sn_task = Arc::clone(&shutdown_notify);
+        tokio::spawn(async move {
+            signal.await;
+            sf_task.store(true, Ordering::SeqCst);
+            sn_task.notify_waiters();
+        });
+
+        let wait_shutdown = |flag: &Arc<AtomicBool>, notify: &Arc<tokio::sync::Notify>| {
+            let f = Arc::clone(flag);
+            let n = Arc::clone(notify);
+            async move {
+                while !f.load(Ordering::SeqCst) {
+                    n.notified().await;
+                }
+            }
+        };
 
         // --- Step 3: Booted & Live ---
         serve_ctx.lifecycle.set(LifecycleState::Booted);
@@ -1290,68 +1319,134 @@ where
                 serve_ctx.availability.clone(),
                 serve_ctx.lifecycle.clone(),
             );
-            if let Err(err) = m.on_start(&mod_ctx).await {
-                tracing::error!(
-                    "module '{}' failed to start: {err}; executing cleanup",
-                    m.name()
-                );
-                serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                serve_ctx.availability.set(AvailabilityState::Broken);
+            tokio::select! {
+                _ = wait_shutdown(&shutdown_flag, &shutdown_notify) => {
+                    tracing::warn!("shutdown signal received during module startup; aborting boot");
+                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                    serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
 
-                started_modules.reverse();
-                let cleanup_ctx = serve_ctx.clone();
-                let rollback_fut = async {
-                    for sm in started_modules {
-                        let sm_ctx = crate::module::ModuleContext::new(
-                            sm.name(),
-                            cleanup_ctx.paths.clone(),
-                            cleanup_ctx.availability.clone(),
-                            cleanup_ctx.lifecycle.clone(),
+                    started_modules.reverse();
+                    let cleanup_ctx = serve_ctx.clone();
+                    let rollback_fut = async {
+                        for hook in std::mem::take(&mut on_shutdown) {
+                            hook(cleanup_ctx.clone()).await;
+                        }
+                        for sm in started_modules {
+                            let sm_ctx = crate::module::ModuleContext::new(
+                                sm.name(),
+                                cleanup_ctx.paths.clone(),
+                                cleanup_ctx.availability.clone(),
+                                cleanup_ctx.lifecycle.clone(),
+                            );
+                            sm.on_shutdown(&sm_ctx).await;
+                        }
+                    };
+                    let _ = timeout(shutdown_timeout, rollback_fut).await;
+                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                    serve_ctx.availability.set(AvailabilityState::Unknown);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "shutdown signal received during module startup",
+                    ));
+                }
+                res = m.on_start(&mod_ctx) => {
+                    if let Err(err) = res {
+                        tracing::error!(
+                            "module '{}' failed to start: {err}; executing cleanup",
+                            m.name()
                         );
-                        sm.on_shutdown(&sm_ctx).await;
-                    }
-                    for hook in on_shutdown {
-                        hook(cleanup_ctx.clone()).await;
-                    }
-                };
-                let _ = timeout(shutdown_timeout, rollback_fut).await;
+                        serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                        serve_ctx.availability.set(AvailabilityState::Broken);
 
-                serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                return Err(std::io::Error::other(format!(
-                    "module '{}' failed to start: {err}",
-                    m.name()
-                )));
+                        started_modules.reverse();
+                        let cleanup_ctx = serve_ctx.clone();
+                        let rollback_fut = async {
+                            for hook in std::mem::take(&mut on_shutdown) {
+                                hook(cleanup_ctx.clone()).await;
+                            }
+                            for sm in started_modules {
+                                let sm_ctx = crate::module::ModuleContext::new(
+                                    sm.name(),
+                                    cleanup_ctx.paths.clone(),
+                                    cleanup_ctx.availability.clone(),
+                                    cleanup_ctx.lifecycle.clone(),
+                                );
+                                sm.on_shutdown(&sm_ctx).await;
+                            }
+                        };
+                        let _ = timeout(shutdown_timeout, rollback_fut).await;
+
+                        serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                        return Err(std::io::Error::other(format!(
+                            "module '{}' failed to start: {err}",
+                            m.name()
+                        )));
+                    }
+                }
             }
             started_modules.push(m);
         }
 
         // --- Step 5: Application startup hooks with cleanup on failure ---
         for hook in on_ready {
-            if let Err(err) = hook(serve_ctx.clone()).await {
-                tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
-                serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                serve_ctx.availability.set(AvailabilityState::Broken);
+            tokio::select! {
+                _ = wait_shutdown(&shutdown_flag, &shutdown_notify) => {
+                    tracing::warn!("shutdown signal received during application startup hooks; aborting boot");
+                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                    serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
 
-                started_modules.reverse();
-                let cleanup_ctx = serve_ctx.clone();
-                let cleanup_fut = async {
-                    for sm in started_modules {
-                        let sm_ctx = crate::module::ModuleContext::new(
-                            sm.name(),
-                            cleanup_ctx.paths.clone(),
-                            cleanup_ctx.availability.clone(),
-                            cleanup_ctx.lifecycle.clone(),
-                        );
-                        sm.on_shutdown(&sm_ctx).await;
-                    }
-                    for hook in on_shutdown {
-                        hook(cleanup_ctx.clone()).await;
-                    }
-                };
-                let _ = timeout(shutdown_timeout, cleanup_fut).await;
+                    started_modules.reverse();
+                    let cleanup_ctx = serve_ctx.clone();
+                    let rollback_fut = async {
+                        for h in std::mem::take(&mut on_shutdown) {
+                            h(cleanup_ctx.clone()).await;
+                        }
+                        for sm in started_modules {
+                            let sm_ctx = crate::module::ModuleContext::new(
+                                sm.name(),
+                                cleanup_ctx.paths.clone(),
+                                cleanup_ctx.availability.clone(),
+                                cleanup_ctx.lifecycle.clone(),
+                            );
+                            sm.on_shutdown(&sm_ctx).await;
+                        }
+                    };
+                    let _ = timeout(shutdown_timeout, rollback_fut).await;
+                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                    serve_ctx.availability.set(AvailabilityState::Unknown);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "shutdown signal received during application startup",
+                    ));
+                }
+                res = hook(serve_ctx.clone()) => {
+                    if let Err(err) = res {
+                        tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
+                        serve_ctx.lifecycle.set(LifecycleState::Terminating);
+                        serve_ctx.availability.set(AvailabilityState::Broken);
 
-                serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                return Err(std::io::Error::other(format!("startup hook failed: {err}")));
+                        started_modules.reverse();
+                        let cleanup_ctx = serve_ctx.clone();
+                        let cleanup_fut = async {
+                            for h in std::mem::take(&mut on_shutdown) {
+                                h(cleanup_ctx.clone()).await;
+                            }
+                            for sm in started_modules {
+                                let sm_ctx = crate::module::ModuleContext::new(
+                                    sm.name(),
+                                    cleanup_ctx.paths.clone(),
+                                    cleanup_ctx.availability.clone(),
+                                    cleanup_ctx.lifecycle.clone(),
+                                );
+                                sm.on_shutdown(&sm_ctx).await;
+                            }
+                        };
+                        let _ = timeout(shutdown_timeout, cleanup_fut).await;
+
+                        serve_ctx.lifecycle.set(LifecycleState::Terminated);
+                        return Err(std::io::Error::other(format!("startup hook failed: {err}")));
+                    }
+                }
             }
         }
 
@@ -1366,7 +1461,9 @@ where
         let shutdown_availability = serve_ctx.availability.clone();
 
         let graceful_signal = async move {
-            signal.await;
+            while !shutdown_flag.load(Ordering::SeqCst) {
+                shutdown_notify.notified().await;
+            }
             tracing::info!(
                 "shutdown signal received: transitioning to Terminating / RefusingTraffic"
             );

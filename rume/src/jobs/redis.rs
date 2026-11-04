@@ -10,13 +10,6 @@ use crate::jobs::error::JobError;
 use crate::jobs::job::BoxFuture;
 use crate::jobs::reliability::{HeartbeatRegistry, IdempotencyStatus, IdempotencyStore};
 
-fn current_epoch_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 /// Redis-backed implementation of [`HeartbeatRegistry`].
 ///
 /// Uses Redis Sorted Sets (`ZADD`, `ZSCORE`, `ZRANGEBYSCORE`) to track active worker nodes
@@ -66,6 +59,7 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
         ttl: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let wid = worker_id.to_string();
+        let ttl_ms = ttl.as_millis() as i64;
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -73,14 +67,22 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            let now = current_epoch_millis();
-            let expires_at = now.saturating_add(ttl.as_millis() as i64);
+            // Compute expires_at using Redis server TIME to eliminate host clock skew
+            let script = redis::Script::new(
+                r#"
+                local server_time = redis.call('TIME')
+                local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+                local expires_at = now_ms + tonumber(ARGV[2])
+                redis.call('ZADD', KEYS[1], expires_at, ARGV[1])
+                return 1
+                "#,
+            );
 
-            let _: () = redis::cmd("ZADD")
-                .arg(&self.set_key)
-                .arg(expires_at)
+            let _: () = script
+                .key(&self.set_key)
                 .arg(&wid)
-                .query_async(&mut *conn)
+                .arg(ttl_ms)
+                .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
@@ -97,19 +99,25 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            let now = current_epoch_millis();
-            let score: Option<i64> = redis::cmd("ZSCORE")
-                .arg(&self.set_key)
+            // Compare score against Redis server TIME to eliminate host clock skew
+            let script = redis::Script::new(
+                r#"
+                local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+                if not score then return 0 end
+                local server_time = redis.call('TIME')
+                local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+                if tonumber(score) > now_ms then return 1 else return 0 end
+                "#,
+            );
+
+            let alive: i64 = script
+                .key(&self.set_key)
                 .arg(&wid)
-                .query_async(&mut *conn)
+                .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            if let Some(exp) = score {
-                Ok(exp > now)
-            } else {
-                Ok(false)
-            }
+            Ok(alive == 1)
         })
     }
 
@@ -121,14 +129,14 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            let now = current_epoch_millis();
-
-            // Lua script: query dead worker IDs with score <= now, remove them atomically, and return list
+            // Query dead worker IDs with score <= Redis server TIME, remove them atomically, and return list
             let script = redis::Script::new(
                 r#"
-                local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+                local server_time = redis.call('TIME')
+                local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+                local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms)
                 if #dead > 0 then
-                    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
+                    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
                 end
                 return dead
                 "#,
@@ -136,7 +144,6 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
 
             let dead_workers: Vec<String> = script
                 .key(&self.set_key)
-                .arg(now)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -369,7 +376,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                     can_delete = true
                 elseif current and ARGV[1] == '' and string.sub(current, 1, 12) == 'IN_PROGRESS:' then
                     can_delete = true
-                elseif current and string.sub(current, 1, 9) == 'COMPLETED' then
+                elseif current and ARGV[1] == '' and string.sub(current, 1, 9) == 'COMPLETED' then
                     can_delete = true
                 end
 

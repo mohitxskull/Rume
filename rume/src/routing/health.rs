@@ -74,6 +74,7 @@ pub struct HealthChecks {
     timeout: Duration,
     cache_ttl: Option<Duration>,
     cache: Arc<RwLock<BTreeMap<String, (Instant, HealthCheckResult)>>>,
+    singleflight: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<Option<HealthReport>>>>>,
 }
 
 impl HealthChecks {
@@ -87,6 +88,7 @@ impl HealthChecks {
             timeout: DEFAULT_TIMEOUT,
             cache_ttl: None,
             cache: Arc::new(RwLock::new(BTreeMap::new())),
+            singleflight: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -141,41 +143,41 @@ impl HealthChecks {
     /// (503 on `/health/ready`); any [`HealthStatus::Warning`] with no
     /// `Failed` → overall `Warning` (degraded, 503); all [`HealthStatus::Ok`]
     /// → overall `Ok` (200).
-    pub async fn run(&self) -> HealthReport {
-        // Serve from cache when a TTL is configured and every check has a
-        // fresh cached result.
-        if let Some(ttl) = self.cache_ttl {
-            let now = Instant::now();
-            let cache = self.cache.read().unwrap();
-            let all_cached = !self.checks.is_empty()
-                && self.checks.iter().all(|check| {
-                    cache
-                        .get(check.name())
-                        .is_some_and(|(instant, _)| now.duration_since(*instant) < ttl)
-                });
-            drop(cache);
-            if all_cached {
-                let checks = self
-                    .checks
-                    .iter()
-                    .map(|check| {
-                        let mut result = self
-                            .cache
-                            .read()
-                            .unwrap()
-                            .get(check.name())
-                            .expect("cached result present")
-                            .1
-                            .clone();
-                        result.cached = true;
-                        result
-                    })
-                    .collect::<Vec<_>>();
-                return Self::build_report(checks);
-            }
+    /// Retrieves a cached report if all checks have fresh results within the TTL.
+    /// Eliminates lock churn by holding the read lock once.
+    fn get_cached_report(&self, ttl: Duration) -> Option<HealthReport> {
+        let now = Instant::now();
+        let cache = self.cache.read().unwrap();
+        if self.checks.is_empty() {
+            return None;
         }
+        let all_cached = self.checks.iter().all(|check| {
+            cache
+                .get(check.name())
+                .is_some_and(|(instant, _)| now.duration_since(*instant) < ttl)
+        });
+        if all_cached {
+            let checks = self
+                .checks
+                .iter()
+                .map(|check| {
+                    let mut result = cache
+                        .get(check.name())
+                        .expect("cached result present")
+                        .1
+                        .clone();
+                    result.cached = true;
+                    result
+                })
+                .collect::<Vec<_>>();
+            Some(Self::build_report(checks))
+        } else {
+            None
+        }
+    }
 
-        // Run all checks concurrently, each wrapped in a per-check timeout.
+    /// Run all checks concurrently without cache interaction.
+    async fn execute_checks(&self) -> HealthReport {
         let mut handles: Vec<(String, tokio::task::JoinHandle<HealthCheckResult>)> =
             Vec::with_capacity(self.checks.len());
         for check in &self.checks {
@@ -211,16 +213,70 @@ impl HealthChecks {
             }));
         }
 
-        // Persist fresh results to the cache. TTL validity is enforced at
-        // read time; we just record the instant now.
-        if self.cache_ttl.is_some() {
-            let mut cache = self.cache.write().unwrap();
-            for result in &checks {
-                cache.insert(result.name.clone(), (Instant::now(), result.clone()));
+        Self::build_report(checks)
+    }
+
+    /// Run all registered checks concurrently and produce a report.
+    ///
+    /// Each check is spawned on a task and wrapped in a per-check timeout.
+    /// When `cache_ttl` is enabled, concurrent requests are protected by
+    /// singleflight stampede suppression to prevent probe herds.
+    pub async fn run(&self) -> HealthReport {
+        if let Some(ttl) = self.cache_ttl {
+            if let Some(report) = self.get_cached_report(ttl) {
+                return report;
+            }
+
+            // Singleflight stampede suppression
+            loop {
+                let (waiter, leader_tx) = {
+                    let mut sf = self.singleflight.lock().await;
+                    // Re-check under lock in case another probe just completed
+                    if let Some(report) = self.get_cached_report(ttl) {
+                        return report;
+                    }
+                    if let Some(existing) = &*sf {
+                        (Some(existing.clone()), None)
+                    } else {
+                        let (tx, rx) = tokio::sync::watch::channel(None);
+                        *sf = Some(rx);
+                        (None, Some(tx))
+                    }
+                };
+
+                if let Some(mut rx) = waiter {
+                    let _ = rx.wait_for(|val| val.is_some()).await;
+                    if let Some(report) = self.get_cached_report(ttl) {
+                        return report;
+                    }
+                    continue;
+                }
+
+                // Leader executes the checks
+                let report = self.execute_checks().await;
+
+                // Persist fresh results
+                {
+                    let mut cache = self.cache.write().unwrap();
+                    for result in &report.checks {
+                        cache.insert(result.name.clone(), (Instant::now(), result.clone()));
+                    }
+                }
+
+                // Clear singleflight and notify waiters
+                {
+                    let mut sf = self.singleflight.lock().await;
+                    *sf = None;
+                }
+                if let Some(tx) = leader_tx {
+                    let _ = tx.send(Some(report.clone()));
+                }
+
+                return report;
             }
         }
 
-        Self::build_report(checks)
+        self.execute_checks().await
     }
 
     /// Aggregate check results into a [`HealthReport`].
@@ -269,6 +325,7 @@ impl Clone for HealthChecks {
             timeout: self.timeout,
             cache_ttl: self.cache_ttl,
             cache: Arc::clone(&self.cache),
+            singleflight: Arc::clone(&self.singleflight),
         }
     }
 }
@@ -952,5 +1009,64 @@ mod tests {
             .unwrap();
         let response = router.oneshot(request).await.expect("request failed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn test_health_checks_singleflight_stampede_protection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingCheck {
+            runs: Arc<AtomicUsize>,
+        }
+
+        impl HealthCheck for CountingCheck {
+            fn name(&self) -> &str {
+                "counting"
+            }
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                let runs = Arc::clone(&self.runs);
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    HealthCheckResult {
+                        name: "counting".to_string(),
+                        status: HealthStatus::Ok,
+                        message: "ok".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                    }
+                })
+            }
+        }
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let hc = Arc::new(
+            HealthChecks::new()
+                .cache_ttl(Some(Duration::from_secs(60)))
+                .register(CountingCheck {
+                    runs: Arc::clone(&runs),
+                }),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..10 {
+            let hc_clone = Arc::clone(&hc);
+            handles.push(tokio::spawn(async move { hc_clone.run().await }));
+        }
+
+        let mut cached_count = 0;
+        for handle in handles {
+            let report = handle.await.unwrap();
+            assert!(report.is_healthy);
+            if report.checks[0].cached {
+                cached_count += 1;
+            }
+        }
+
+        // Exactly 1 execution occurred despite 10 concurrent requests
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        // Followers observed cached: true
+        assert_eq!(cached_count, 9);
     }
 }

@@ -545,18 +545,10 @@ impl<Q: JobQueue> JobWorker<Q> {
                 }
             }
             Err(err) => {
-                // Retryable failure: check remaining attempts
+                // Retryable failure: check remaining attempts.
+                // Do not release the idempotency lock during retry backoff; ownership is retained
+                // until terminal transition (success via ack or terminal failure to dead_letter).
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                        && let Err(rel_err) = store.release_with_token(key, &token).await
-                    {
-                        tracing::error!(
-                            job_id = %job_id,
-                            key = %key,
-                            error = %rel_err,
-                            "Failed to release idempotency token on retry"
-                        );
-                    }
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
