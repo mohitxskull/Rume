@@ -96,7 +96,7 @@ impl Lifecycle {
         }
     }
 
-    pub(crate) fn set(&self, state: LifecycleState) {
+    pub fn set(&self, state: LifecycleState) {
         // The type system guarantees only valid variants reach here through
         // safe code, but guard the stored discriminant anyway so an out-of-range
         // u8 can never be observed through `state()`.

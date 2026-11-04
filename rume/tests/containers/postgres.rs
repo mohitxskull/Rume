@@ -52,6 +52,15 @@ async fn setup_postgres_pool(
 }
 
 #[tokio::test]
+async fn test_postgres_unified_database_conformance_suite() {
+    let (_container, pool) = setup_postgres_pool(16).await;
+    rume::testing::verify_database_conformance(&pool, "postgres")
+        .await
+        .expect("postgres database conformance suite must pass");
+    pool.close_async().await;
+}
+
+#[tokio::test]
 async fn test_postgres_pool_lifecycle_and_health() {
     let (_container, pool) = setup_postgres_pool(4).await;
 

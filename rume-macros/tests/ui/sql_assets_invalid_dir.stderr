@@ -1,0 +1,5 @@
+error: sql_assets!: directory 'non_existent_directory_for_trybuild_test' not found at "$WORKSPACE/target/tests/trybuild/rume-macros/non_existent_directory_for_trybuild_test"
+ --> tests/ui/sql_assets_invalid_dir.rs:3:13
+  |
+3 | sql_assets!("non_existent_directory_for_trybuild_test");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

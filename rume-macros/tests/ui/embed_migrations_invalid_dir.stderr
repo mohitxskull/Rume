@@ -1,0 +1,5 @@
+error: embed_migrations!: directory 'non_existent_migrations_dir' not found at "$WORKSPACE/target/tests/trybuild/rume-macros/non_existent_migrations_dir"
+ --> tests/ui/embed_migrations_invalid_dir.rs:3:19
+  |
+3 | embed_migrations!("non_existent_migrations_dir");
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

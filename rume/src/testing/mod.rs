@@ -5,10 +5,12 @@ pub mod events;
 pub mod fixtures;
 pub mod harness;
 pub mod jobs;
+pub mod server;
 
 pub use app::{TestApp, TestAppBuilder, TestResponse, status};
 pub use events::TestEventBus;
 pub use fixtures::TestTransactionFixture;
+pub use server::TestServer;
 #[cfg(feature = "postgres")]
 pub use fixtures::PostgresSchemaFixture;
 #[cfg(feature = "sqlite")]
@@ -17,3 +19,8 @@ pub use jobs::TestJobQueue;
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub use harness::RumeTestHarness;
+
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub mod conformance;
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub use conformance::{ConformanceRecord, verify_database_conformance};

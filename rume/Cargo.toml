@@ -63,6 +63,7 @@ insta = { version = "1.49", features = ["json"] }
 rstest = "0.28"
 wiremock = "0.6"
 ureq = "3.5"
+proptest = "1.6"
 
 [[test]]
 name = "integration"

@@ -45,6 +45,16 @@ impl TestApp {
         builder.build_test_app().await
     }
 
+    /// Consumes the test application and returns its underlying Axum [`Router`].
+    pub fn into_router(self) -> Router<()> {
+        self.router.clone()
+    }
+
+    /// Returns a reference to the underlying Axum [`Router`].
+    pub fn router(&self) -> &Router<()> {
+        &self.router
+    }
+
     /// Issue a GET request.
     pub async fn get(&self, uri: &str) -> Response<Body> {
         self.request(
@@ -235,6 +245,11 @@ impl TestResponse {
         self.status
     }
 
+    /// Returns the HTTP headers map.
+    pub fn headers(&self) -> &axum::http::HeaderMap {
+        &self.headers
+    }
+
     /// Asserts that the response status equals `expected`.
     pub fn assert_status(self, expected: StatusCode) -> Self {
         assert_eq!(
@@ -292,6 +307,18 @@ impl TestResponse {
             *current, expected_val,
             "expected JSON path '{path}' to equal {:?}, got {:?}",
             expected_val, current
+        );
+        self
+    }
+
+    /// Asserts that the response body text equals `expected`.
+    pub fn assert_text_equals(self, expected: &str) -> Self {
+        assert_eq!(
+            self.text(),
+            expected,
+            "expected body '{}', got '{}'",
+            expected,
+            self.text()
         );
         self
     }

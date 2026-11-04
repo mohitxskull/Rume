@@ -31,6 +31,16 @@ async fn start_mysql_node() -> (
 }
 
 #[tokio::test]
+async fn test_mysql_unified_database_conformance_suite() {
+    let (_node, backend, config) = start_mysql_node().await;
+    let pool = DatabasePool::new(backend, config.with_max_connections(16));
+    rume::testing::verify_database_conformance(&pool, "mysql")
+        .await
+        .expect("mysql database conformance suite must pass");
+    pool.close_async().await;
+}
+
+#[tokio::test]
 async fn test_mysql_pool_lifecycle_and_ping() {
     let (_node, backend, config) = start_mysql_node().await;
 

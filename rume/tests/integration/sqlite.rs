@@ -9,6 +9,17 @@ use rume::persistence::{
 };
 
 #[tokio::test]
+async fn test_sqlite_unified_database_conformance_suite() {
+    let fixture = rume::testing::SqliteTestFixture::create()
+        .await
+        .expect("create sqlite fixture");
+    rume::testing::verify_database_conformance(fixture.pool(), "sqlite")
+        .await
+        .expect("sqlite database conformance suite must pass");
+    fixture.close().await.expect("close sqlite fixture");
+}
+
+#[tokio::test]
 async fn sqlite_pool_lifecycle_and_ping() {
     let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite should initialize");
     let pool = DatabasePool::new(

@@ -18,6 +18,10 @@ pub mod cache;
 #[path = "integration/composition.rs"]
 pub mod composition;
 
+#[path = "integration/concurrency_invariants.rs"]
+#[cfg(feature = "sqlite")]
+pub mod concurrency_invariants;
+
 #[path = "integration/config.rs"]
 pub mod config;
 
@@ -47,6 +51,9 @@ pub mod metrics;
 
 #[path = "integration/openapi.rs"]
 pub mod openapi;
+
+#[path = "integration/property_tests.rs"]
+pub mod property_tests;
 
 #[path = "integration/outbox.rs"]
 #[cfg(feature = "sqlite")]
@@ -81,6 +88,9 @@ pub mod sqlite;
 
 #[path = "integration/tenant.rs"]
 pub mod tenant;
+
+#[path = "integration/test_server.rs"]
+pub mod test_server;
 
 #[path = "integration/validation.rs"]
 pub mod validation;
