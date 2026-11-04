@@ -18,3 +18,8 @@ deadpool-redis = { workspace = true }
 [dev-dependencies]
 testcontainers-modules = { workspace = true }
 tower = { workspace = true }
+
+[[bench]]
+name = "baseline"
+harness = false
+
