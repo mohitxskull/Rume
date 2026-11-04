@@ -1,0 +1,5 @@
+error: embed_migrations!: malformed migration filename 'malformed.sql'. Expected format: '<version>_<name>.up.sql' or '<version>_<name>.down.sql'
+ --> tests/ui/embed_migrations_malformed_filename.rs:3:19
+  |
+3 | embed_migrations!("tests/fixtures/malformed_migrations");
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

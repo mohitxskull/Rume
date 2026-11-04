@@ -22,7 +22,7 @@ use rume::events::Event;
 
 /// Builds the complete Axum router with state and middleware for Workbench.
 pub fn build_app(state: WorkbenchState, tenant_resolver: HeaderTenantResolver) -> Router {
-    build_api_router(state.pool.clone(), tenant_resolver).with_state(state)
+    build_api_router(state.pool.clone(), tenant_resolver).into_inner().with_state(state)
 }
 
 /// Default OS signal handler for SIGINT (Ctrl+C) and SIGTERM.

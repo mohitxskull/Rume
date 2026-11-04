@@ -159,7 +159,7 @@ async fn graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flig
     assert_eq!(server_ctx.availability.state(), AvailabilityState::Unknown);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
     let ctx: AppContext<(), (), ()> = AppContext::builder((), ()).build();
     let server_ctx = ctx.clone();
@@ -207,7 +207,7 @@ async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
         }
         tokio::task::yield_now().await;
     }
-    let start = std::time::Instant::now();
+    let start = tokio::time::Instant::now();
     shutdown_tx.send(()).unwrap();
 
     server_task.await.unwrap();

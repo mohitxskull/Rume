@@ -424,3 +424,66 @@ async fn test_session_scheme_subdomain_cookie_tossing_protection() {
     let val2: serde_json::Value = serde_json::from_str(&TestApp::body_text(res2).await).unwrap();
     assert_eq!(val2["id"], "valid_user_123");
 }
+
+#[derive(Debug, Clone)]
+struct TenantResource {
+    tenant_name: String,
+}
+
+#[derive(Debug, Clone)]
+struct RequiresTenantMatchPolicy;
+
+impl Policy<AuthUser, FromExtension<TenantResource>> for RequiresTenantMatchPolicy {
+    fn is_authorized(&self, identity: &AuthUser, resource: &FromExtension<TenantResource>) -> bool {
+        identity.id == resource.0.tenant_name
+    }
+}
+
+#[tokio::test]
+async fn policy_layer_with_extension_resource() {
+    let bearer = BearerTokenScheme::new(|token| async move {
+        if token == "alice_token" {
+            Ok(Some(AuthUser::new("acme")))
+        } else if token == "bob_token" {
+            Ok(Some(AuthUser::new("other")))
+        } else {
+            Ok(None)
+        }
+    });
+
+    let router = rume::routing::Router::new()
+        .route(
+            "/tenant-data",
+            get(|| async { Json(serde_json::json!({ "status": "ok" })) }),
+        )
+        .layer(PolicyLayer::from_extension(RequiresTenantMatchPolicy))
+        .layer(AuthLayer::required().scheme(bearer))
+        .layer(axum::middleware::from_fn(
+            |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+                req.extensions_mut().insert(TenantResource {
+                    tenant_name: "acme".to_string(),
+                });
+                next.run(req).await
+            },
+        ));
+
+    let app = TestApp::new(router);
+
+    // Alice matches tenant_name "acme"
+    let req = axum::http::Request::builder()
+        .uri("/tenant-data")
+        .header("authorization", "Bearer alice_token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = app.request(req).await;
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Bob has id "other" != "acme"
+    let req2 = axum::http::Request::builder()
+        .uri("/tenant-data")
+        .header("authorization", "Bearer bob_token")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res2 = app.request(req2).await;
+    assert_eq!(res2.status(), StatusCode::FORBIDDEN);
+}

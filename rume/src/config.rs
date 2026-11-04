@@ -159,6 +159,12 @@ pub fn load_raw(dir: &Path) -> Result<toml::Value> {
     figment.extract::<toml::Value>().map_err(ConfigError::from)
 }
 
+/// Load the merged configuration for a specific environment name as a raw TOML value.
+pub fn load_raw_for_env(dir: &Path, env_name: &str) -> Result<toml::Value> {
+    let figment = build_figment_for_env(dir, env_name)?;
+    figment.extract::<toml::Value>().map_err(ConfigError::from)
+}
+
 /// Load the merged configuration as a pretty TOML string.
 pub fn load_raw_pretty(dir: &Path) -> Result<String> {
     let value = load_raw(dir)?;

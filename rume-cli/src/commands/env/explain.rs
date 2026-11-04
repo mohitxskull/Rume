@@ -5,7 +5,7 @@
 
 use rume::env::{ResolvedEnv, is_secret_key, redact_value};
 
-pub fn run(key: &str, json: bool) {
+pub fn run(key: &str, unredacted: bool, json: bool) {
     let resolved = match ResolvedEnv::load() {
         Ok(r) => r,
         Err(err) => {
@@ -43,7 +43,11 @@ pub fn run(key: &str, json: bool) {
     };
 
     let is_secret = is_secret_key(key);
-    let display_value = redact_value(key, &raw_value);
+    let display_value = if unredacted {
+        raw_value.clone()
+    } else {
+        redact_value(key, &raw_value)
+    };
 
     let source = resolved
         .sources
@@ -75,7 +79,7 @@ pub fn run(key: &str, json: bool) {
     println!(
         "  {}: {}  ({})",
         source,
-        truncate_value(&display_value, 60),
+        rume::helpers::truncate(&display_value, 60),
         source_type
     );
     if !from_file {
@@ -87,17 +91,8 @@ pub fn run(key: &str, json: bool) {
     println!();
     println!("Precedence:");
     println!("  Highest priority wins.");
-    if is_secret {
+    if is_secret && !unredacted {
         println!();
         println!("Note: this value is treated as a secret and is redacted in output.");
-    }
-}
-
-/// Truncate a value for display, adding "..." if it exceeds max_len.
-fn truncate_value(value: &str, max_len: usize) -> String {
-    if value.len() <= max_len {
-        value.to_string()
-    } else {
-        format!("{}...", &value[..max_len.saturating_sub(3)])
     }
 }

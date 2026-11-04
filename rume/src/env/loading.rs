@@ -46,6 +46,11 @@ impl ResolvedEnv {
         load_merged_map_in(dir)
     }
 
+    /// Load the environment rooted at `dir` for a specific environment name.
+    pub fn load_for_env_in(dir: &Path, env_name: &str) -> Result<Self, EnvError> {
+        load_merged_map_for_env_in(dir, env_name)
+    }
+
     /// Look up a resolved value. Secret values are exposed via `expose_secret()`.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.secrets
@@ -100,10 +105,19 @@ where
     T: DeserializeOwned,
 {
     let mut parsed: BTreeMap<String, figment::value::Value> = BTreeMap::new();
+    let known_secrets: Vec<&str> = resolved
+        .secrets
+        .values()
+        .map(|s| s.expose_secret().as_str())
+        .collect();
+
     for (key, value) in resolved.values {
         let value = value
             .parse::<figment::value::Value>()
-            .map_err(|err| EnvError::Validation(err.to_string()))?;
+            .map_err(|err| {
+                let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+                EnvError::Validation(redacted)
+            })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
@@ -111,23 +125,16 @@ where
         let value = secret
             .expose_secret()
             .parse::<figment::value::Value>()
-            .map_err(|err| EnvError::Validation(err.to_string()))?;
+            .map_err(|err| {
+                let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+                EnvError::Validation(redacted)
+            })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key.clone(), value);
     }
 
-    let known_secrets: Vec<&str> = resolved
-        .secrets
-        .values()
-        .map(|s| s.expose_secret().as_str())
-        .collect();
-
     let figment = Figment::from(Serialized::defaults(parsed));
-    figment.extract::<T>().map_err(|err| {
-        let redacted =
-            crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-        EnvError::Validation(redacted)
-    })
+    figment.extract::<T>().map_err(|err| EnvError::from_figment_with_secrets(&err, &known_secrets))
 }
 
 /// Load the merged environment map for the current directory.

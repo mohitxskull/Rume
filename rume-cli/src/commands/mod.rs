@@ -51,10 +51,10 @@ pub async fn run(cli: Cli) {
             let fmt = if json { "json" } else { &format };
             doctor::run(fmt).await;
         }
-        Some(Commands::ListRoutes { format, json }) => {
+        Some(Commands::ListRoutes { bin, format, json }) => {
             require_rume_project();
             let is_json = json || format == "json";
-            list_routes::run(is_json);
+            list_routes::run(bin.as_deref(), is_json);
         }
         Some(Commands::Codegen { dry_run }) => {
             require_rume_project();

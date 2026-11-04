@@ -42,6 +42,7 @@ deadpool-redis = "0.23.1"
 redis = { version = "1.8", default-features = false, features = ["tokio-comp", "script"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "mysql"] }
+garde = { version = "0.23.0", features = ["derive", "email", "url"] }
 
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,

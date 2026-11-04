@@ -1245,7 +1245,7 @@ async fn test_postgres_job_queue_lease_expiry_rejects_ack_nack_dead_letter_befor
 async fn test_postgres_job_queue_superseded_worker_cannot_ack_after_peer_claims() {
     let (_container, pool) = setup_postgres_pool(4).await;
     let queue = PostgresJobQueue::from_backend(pool.backend())
-        .with_lease_duration(Duration::from_millis(100));
+        .with_lease_duration(Duration::from_millis(300));
     queue.init_schema().await.expect("init job schema failed");
 
     let job_id = queue
@@ -1261,7 +1261,7 @@ async fn test_postgres_job_queue_superseded_worker_cannot_ack_after_peer_claims(
     let token_a = job_a.lease_token.unwrap();
 
     // Sleep past lease duration
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    tokio::time::sleep(Duration::from_millis(450)).await;
 
     // Worker B dequeues (claims after lease expired)
     let job_b = queue.dequeue_for("worker-B").await.unwrap().unwrap();

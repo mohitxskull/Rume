@@ -44,12 +44,13 @@ pub fn escape_html(input: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
-/// Strips all HTML/XML tags from a string.
+/// Strips all HTML/XML tags from a string and decodes standard entities.
 ///
-/// Ensures block or inline tags that abut text (e.g. `</h1><p>`) are separated
-/// by whitespace so words do not inadvertently concatenate together.
+/// Ensures block tags (e.g. `</h1><p>`) or inline tags abutting words are separated
+/// by whitespace so words do not inadvertently concatenate together, while avoiding
+/// synthetic whitespace before punctuation following closing tags (e.g. `<strong>World</strong>!`).
 ///
-/// Returns `Cow::Borrowed` if the string contains no angle brackets.
+/// Returns `Cow::Borrowed` if the string contains neither `<` nor `&`.
 ///
 /// # Examples
 ///
@@ -57,28 +58,104 @@ pub fn escape_html(input: &str) -> Cow<'_, str> {
 /// use rume::helpers::strip_html_tags;
 ///
 /// assert_eq!(
-///     strip_html_tags("<p>Hello <strong>World</strong></p>"),
-///     "Hello World"
+///     strip_html_tags("<p>Hello <strong>World</strong>!</p>"),
+///     "Hello World!"
 /// );
 /// ```
 pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
-    if !input.contains('<') {
+    if !input.contains('<') && !input.contains('&') {
         return Cow::Borrowed(input);
     }
 
     let mut out = String::with_capacity(input.len());
     let mut in_tag = false;
+    let mut tag_name = String::new();
+    let mut pending_separator = false;
 
-    for ch in input.chars() {
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let ch = chars[i];
         if ch == '<' {
             in_tag = true;
-        } else if ch == '>' {
-            in_tag = false;
-            if !out.is_empty() && !out.ends_with(' ') {
-                out.push(' ');
+            tag_name.clear();
+            i += 1;
+            if i < chars.len() && chars[i] == '/' {
+                i += 1;
             }
-        } else if !in_tag {
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == ':') {
+                tag_name.push(chars[i].to_ascii_lowercase());
+                i += 1;
+            }
+            let is_block_tag = matches!(
+                tag_name.as_str(),
+                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "br" | "hr" | "li"
+                    | "ul" | "ol" | "tr" | "td" | "th" | "blockquote" | "pre" | "article"
+                    | "section" | "header" | "footer" | "nav"
+            );
+            while i < chars.len() && chars[i] != '>' {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '>' {
+                in_tag = false;
+                if is_block_tag {
+                    if !out.is_empty() && !out.ends_with(' ') {
+                        out.push(' ');
+                    }
+                    pending_separator = false;
+                } else {
+                    pending_separator = true;
+                }
+                i += 1;
+            }
+            continue;
+        }
+
+        if !in_tag {
+            if ch == '&' {
+                let mut entity = String::new();
+                let mut j = i + 1;
+                while j < chars.len() && j - i < 10 && chars[j] != ';' && !chars[j].is_whitespace() && chars[j] != '<' {
+                    entity.push(chars[j]);
+                    j += 1;
+                }
+                if j < chars.len() && chars[j] == ';' {
+                    let decoded_char = match entity.as_str() {
+                        "amp" => Some('&'),
+                        "lt" => Some('<'),
+                        "gt" => Some('>'),
+                        "quot" => Some('"'),
+                        "#39" | "#x27" | "apos" => Some('\''),
+                        "nbsp" => Some(' '),
+                        _ => None,
+                    };
+                    if let Some(dec) = decoded_char {
+                        if pending_separator {
+                            let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+                            if prev_is_alnum && dec.is_alphanumeric() && !out.ends_with(' ') {
+                                out.push(' ');
+                            }
+                            pending_separator = false;
+                        }
+                        out.push(dec);
+                        i = j + 1;
+                        continue;
+                    }
+                }
+            }
+
+            if pending_separator {
+                let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+                if prev_is_alnum && ch.is_alphanumeric() && !out.ends_with(' ') {
+                    out.push(' ');
+                }
+                pending_separator = false;
+            }
+
             out.push(ch);
+            i += 1;
+        } else {
+            i += 1;
         }
     }
 
@@ -139,6 +216,18 @@ mod tests {
         assert_eq!(
             strip_html_tags("<div><p>Hello <br/>World</p></div>").trim(),
             "Hello World"
+        );
+        assert_eq!(
+            strip_html_tags("<p>Hello <strong>World</strong>!</p>"),
+            "Hello World!"
+        );
+        assert_eq!(
+            strip_html_tags("<span>Hello</span><span>World</span>"),
+            "Hello World"
+        );
+        assert_eq!(
+            strip_html_tags("Fish &amp; Chips"),
+            "Fish & Chips"
         );
     }
 

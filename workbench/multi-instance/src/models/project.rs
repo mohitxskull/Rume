@@ -1,3 +1,4 @@
+use garde::Validate;
 use rume::persistence::error::PersistenceError;
 use rume::persistence::row::{DbRow, FromRow};
 use serde::{Deserialize, Serialize};
@@ -23,8 +24,10 @@ impl FromRow for Project {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Validate)]
 pub struct CreateProjectRequest {
+    #[garde(length(min = 1, max = 100))]
     pub name: String,
+    #[garde(skip)]
     pub description: Option<String>,
 }

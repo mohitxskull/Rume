@@ -48,6 +48,9 @@ pub enum Commands {
     /// List registered routes.
     #[command(name = "list:routes", alias = "list-routes")]
     ListRoutes {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,
@@ -143,6 +146,9 @@ pub enum EnvCommands {
     Explain {
         /// Environment variable name to explain.
         key: String,
+        /// Show secret values in plaintext without redaction.
+        #[arg(long)]
+        unredacted: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,

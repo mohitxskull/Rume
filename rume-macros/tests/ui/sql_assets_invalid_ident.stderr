@@ -1,0 +1,5 @@
+error: sql_assets!: SQL filename 'invalid-ident.sql' contains invalid Rust identifier 'invalid-ident'
+ --> tests/ui/sql_assets_invalid_ident.rs:3:13
+  |
+3 | sql_assets!("tests/fixtures/invalid_ident_sql");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

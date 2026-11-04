@@ -1,13 +1,11 @@
 #![allow(unsafe_code)]
 
+use crate::common::ENV_LOCK;
 use rume::config;
 use rume::env::ResolvedEnv;
 use serde::Deserialize;
 use std::fs;
-use std::sync::Mutex;
 use tempfile::TempDir;
-
-static ENV_LOCK: Mutex<()> = Mutex::new(());
 
 struct EnvVarGuard {
     saved: Vec<(String, Option<String>)>,
@@ -16,16 +14,6 @@ struct EnvVarGuard {
 impl EnvVarGuard {
     fn new() -> Self {
         Self { saved: Vec::new() }
-    }
-
-    fn set(&mut self, key: &str, value: &str) {
-        if !self.saved.iter().any(|(k, _)| k == key) {
-            let prev = std::env::var(key).ok();
-            self.saved.push((key.to_string(), prev));
-        }
-        unsafe {
-            std::env::set_var(key, value);
-        }
     }
 
     fn remove(&mut self, key: &str) {
@@ -62,7 +50,6 @@ fn loads_layered_env_files() {
     let mut env = EnvVarGuard::new();
     env.remove("HOST");
     env.remove("PORT");
-    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -71,7 +58,7 @@ fn loads_layered_env_files() {
     write(&root.join(".env.development"), "PORT=2222\n");
     write(&root.join(".env.local"), "HOST=local\n");
 
-    let resolved = ResolvedEnv::load_in(root).unwrap();
+    let resolved = ResolvedEnv::load_for_env_in(root, "development").unwrap();
 
     assert_eq!(resolved.get("HOST"), Some("local"));
     assert_eq!(resolved.get("PORT"), Some("2222"));
@@ -90,7 +77,6 @@ fn skips_local_files_in_test_env() {
     let _guard = ENV_LOCK.lock().unwrap();
     let mut env = EnvVarGuard::new();
     env.remove("PORT");
-    env.set("RUME_ENV", "test");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -99,7 +85,7 @@ fn skips_local_files_in_test_env() {
     write(&root.join(".env.test"), "PORT=2222\n");
     write(&root.join(".env.local"), "PORT=9999\n");
 
-    let resolved = ResolvedEnv::load_in(root).unwrap();
+    let resolved = ResolvedEnv::load_for_env_in(root, "test").unwrap();
 
     assert_eq!(resolved.get("PORT"), Some("2222"));
 }
@@ -109,7 +95,6 @@ fn resolves_file_values() {
     let _guard = ENV_LOCK.lock().unwrap();
     let mut env = EnvVarGuard::new();
     env.remove("SECRET");
-    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -117,7 +102,7 @@ fn resolves_file_values() {
     write(&root.join("secret.txt"), "topsecret\n");
     write(&root.join(".env"), "SECRET=file:secret.txt\n");
 
-    let resolved = ResolvedEnv::load_in(root).unwrap();
+    let resolved = ResolvedEnv::load_for_env_in(root, "development").unwrap();
 
     assert_eq!(resolved.get("SECRET"), Some("topsecret"));
 }
@@ -136,8 +121,6 @@ struct TestApp {
 #[test]
 fn loads_merged_config() {
     let _guard = ENV_LOCK.lock().unwrap();
-    let mut env = EnvVarGuard::new();
-    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
@@ -151,11 +134,11 @@ fn loads_merged_config() {
         "[app]\nport = 2222\n",
     );
 
-    let value = config::load_raw(root).unwrap();
+    let value = config::load_raw_for_env(root, "development").unwrap();
     assert_eq!(value["app"]["name"].as_str(), Some("Base"));
     assert_eq!(value["app"]["port"].as_integer(), Some(2222));
 
-    let cfg: TestConfig = config::load_in(root).unwrap();
+    let cfg: TestConfig = config::load_for_env_in(root, "development").unwrap();
     assert_eq!(cfg.app.name, "Base");
     assert_eq!(cfg.app.port, 2222);
 }
@@ -176,14 +159,13 @@ fn loads_typed_env() {
     env.remove("HOST");
     env.remove("PORT");
     env.remove("LOG_LEVEL");
-    env.set("RUME_ENV", "development");
 
     let dir = TempDir::new().unwrap();
     let root = dir.path();
 
     write(&root.join(".env"), "HOST=127.0.0.1\nPORT=3333\n");
 
-    let env_res: TypedEnv = rume::env::load_in(root).unwrap();
+    let env_res: TypedEnv = rume::env::load_for_env_in(root, "development").unwrap();
 
     assert_eq!(env_res.host, std::net::IpAddr::from([127, 0, 0, 1]));
     assert_eq!(env_res.port, 3333);

@@ -38,14 +38,21 @@ pub enum ParseDurationError {
 /// assert_eq!(format_duration(Duration::from_secs(86400 * 2)), "2d");
 /// ```
 pub fn format_duration(d: Duration) -> String {
-    let total_secs = d.as_secs();
-    let millis = d.subsec_millis();
-
-    if total_secs == 0 && millis == 0 {
+    if d.is_zero() {
         return "0ms".to_string();
     }
 
+    let total_secs = d.as_secs();
+    let millis = d.subsec_millis();
+
     if total_secs == 0 {
+        if millis == 0 {
+            let micros = d.subsec_micros();
+            if micros > 0 {
+                return format!("{micros}µs");
+            }
+            return format!("{}ns", d.subsec_nanos());
+        }
         return format!("{millis}ms");
     }
 
@@ -201,6 +208,8 @@ mod tests {
     #[test]
     fn format_duration_various() {
         assert_eq!(format_duration(Duration::ZERO), "0ms");
+        assert_eq!(format_duration(Duration::from_nanos(750)), "750ns");
+        assert_eq!(format_duration(Duration::from_micros(50)), "50µs");
         assert_eq!(format_duration(Duration::from_millis(500)), "500ms");
         assert_eq!(format_duration(Duration::from_millis(1500)), "1.5s");
         assert_eq!(format_duration(Duration::from_secs(30)), "30s");

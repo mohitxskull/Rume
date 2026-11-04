@@ -85,12 +85,11 @@ pub fn run(all: bool, unredacted: bool, format: &str) {
             } else {
                 let process_count = resolved
                     .values
-                    .len()
-                    .saturating_sub(resolved.file_keys.len())
-                    + resolved
-                        .secrets
-                        .len()
-                        .saturating_sub(resolved.file_keys.len());
+                    .keys()
+                    .chain(resolved.secrets.keys())
+                    .filter(|k| !resolved.file_keys.contains(k.as_str()))
+                    .collect::<BTreeSet<_>>()
+                    .len();
                 output.hidden_count = process_count;
             }
 

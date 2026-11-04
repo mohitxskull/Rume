@@ -27,6 +27,7 @@ pub struct ResourceRoute<S> {
 /// | show      | GET    | `/{name}/{id}`   | `{name}.show`    |
 /// | create    | POST   | `/{name}`        | `{name}.create`  |
 /// | update    | PUT    | `/{name}/{id}`   | `{name}.update`  |
+/// | patch     | PATCH  | `/{name}/{id}`   | `{name}.patch`   |
 /// | destroy   | DELETE | `/{name}/{id}`   | `{name}.destroy` |
 pub struct Resource<S> {
     name: String,
@@ -100,6 +101,23 @@ impl<S> Resource<S> {
         self
     }
 
+    /// `PATCH /{name}/{id}` — partially update an existing resource.
+    pub fn patch(mut self, router: MethodRouter<S>) -> Self {
+        self.routes.push(ResourceRoute {
+            method: Method::PATCH,
+            path: format!("/{}/{{id}}", self.name),
+            name: format!("{}.patch", self.name),
+            params: vec!["id".to_string()],
+            router,
+        });
+        self
+    }
+
+    /// Alias for `patch`: `PATCH /{name}/{id}`.
+    pub fn update_patch(self, router: MethodRouter<S>) -> Self {
+        self.patch(router)
+    }
+
     /// `DELETE /{name}/{id}` — destroy a resource.
     pub fn destroy(mut self, router: MethodRouter<S>) -> Self {
         self.routes.push(ResourceRoute {
@@ -133,6 +151,7 @@ mod tests {
         async fn show() {}
         async fn create() {}
         async fn update() {}
+        async fn patch() {}
         async fn destroy() {}
 
         let resource = Resource::<()>::new("posts")
@@ -140,6 +159,7 @@ mod tests {
             .show(get(show))
             .create(post(create))
             .update(put(update))
+            .patch(axum::routing::patch(patch))
             .destroy(delete(destroy));
 
         let paths: Vec<&str> = resource.routes().iter().map(|r| r.path.as_str()).collect();
@@ -149,6 +169,7 @@ mod tests {
                 "/posts",
                 "/posts/{id}",
                 "/posts",
+                "/posts/{id}",
                 "/posts/{id}",
                 "/posts/{id}"
             ]
@@ -162,6 +183,7 @@ mod tests {
                 Method::GET,
                 Method::POST,
                 Method::PUT,
+                Method::PATCH,
                 Method::DELETE
             ]
         );

@@ -110,7 +110,13 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let sql_dir_rel = args.dir_path.value();
     let sql_dir_rel = sql_dir_rel.trim_start_matches('/').trim_start_matches('\\');
-    let full_sql_dir = Path::new(&manifest_dir).join(sql_dir_rel);
+    let mut full_sql_dir = Path::new(&manifest_dir).join(sql_dir_rel);
+    if !full_sql_dir.exists() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(sql_dir_rel);
+        if crate_dir.exists() {
+            full_sql_dir = crate_dir;
+        }
+    }
 
     if !full_sql_dir.exists() {
         let err_msg = format!(
@@ -158,6 +164,16 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
             let file_name = &remaining[remaining.len() - 1];
             let query_name = file_name.trim_end_matches(".sql");
+            if syn::parse_str::<syn::Ident>(query_name).is_err() {
+                return syn::Error::new(
+                    args.dir_path.span(),
+                    format!(
+                        "sql_assets!: SQL filename '{file_name}' contains invalid Rust identifier '{query_name}'",
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
             let query_ident = sanitize_ident(query_name);
 
             let namespace = if remaining.len() > 1 {
@@ -300,6 +316,28 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+fn extract_migration_version(id: &str) -> &str {
+    let parts: Vec<&str> = id.split('_').collect();
+    let mut version_parts_len = 0;
+    for part in &parts {
+        if part.chars().any(|c| c.is_ascii_digit()) {
+            version_parts_len += 1;
+        } else {
+            break;
+        }
+    }
+    if version_parts_len > 0 && version_parts_len < parts.len() {
+        let end_idx = parts[..version_parts_len]
+            .iter()
+            .map(|p| p.len())
+            .sum::<usize>()
+            + (version_parts_len - 1);
+        &id[..end_idx]
+    } else {
+        id.split_once('_').map(|(v, _)| v).unwrap_or(id)
+    }
+}
+
 /// Discovers `.up.sql` and `.down.sql` migrations and embeds them into a [`Migrator`].
 ///
 /// # Usage
@@ -312,7 +350,13 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
     let dir_rel = dir_lit.value();
     let dir_rel = dir_rel.trim_start_matches('/').trim_start_matches('\\');
-    let full_dir = Path::new(&manifest_dir).join(dir_rel);
+    let mut full_dir = Path::new(&manifest_dir).join(dir_rel);
+    if !full_dir.exists() {
+        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir_rel);
+        if crate_dir.exists() {
+            full_dir = crate_dir;
+        }
+    }
 
     if !full_dir.exists() {
         let err_msg = format!(
@@ -327,6 +371,7 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 
     let mut up_files: BTreeMap<String, String> = BTreeMap::new();
     let mut down_files: BTreeSet<String> = BTreeSet::new();
+    let mut seen_versions: BTreeMap<String, String> = BTreeMap::new();
 
     let entries = match fs::read_dir(&full_dir) {
         Ok(e) => e,
@@ -340,6 +385,7 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
         }
     };
 
+    let mut entries_vec = Vec::new();
     for entry in entries {
         let entry = match entry {
             Ok(e) => e,
@@ -352,6 +398,11 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
                 .into();
             }
         };
+        entries_vec.push(entry);
+    }
+    entries_vec.sort_by_key(|e| e.path());
+
+    for entry in entries_vec {
         let path = entry.path();
         if !path.is_file() {
             continue;
@@ -359,11 +410,69 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
         let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
-        if let Some(id) = file_name.strip_suffix(".up.sql") {
-            let rel_path = format!("{}/{}", dir_rel.replace('\\', "/"), file_name);
-            up_files.insert(id.to_string(), rel_path);
-        } else if let Some(id) = file_name.strip_suffix(".down.sql") {
-            down_files.insert(id.to_string());
+        if file_name.starts_with('.') {
+            continue;
+        }
+
+        if path.extension().is_some_and(|ext| ext == "sql") {
+            let is_up = file_name.ends_with(".up.sql");
+            let is_down = file_name.ends_with(".down.sql");
+            if !is_up && !is_down {
+                return syn::Error::new(
+                    dir_lit.span(),
+                    format!(
+                        "embed_migrations!: malformed migration filename '{file_name}'. Expected format: '<version>_<name>.up.sql' or '<version>_<name>.down.sql'"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+
+            let id = if is_up {
+                file_name.strip_suffix(".up.sql").unwrap()
+            } else {
+                file_name.strip_suffix(".down.sql").unwrap()
+            };
+
+            let Some((version, name)) = id.split_once('_') else {
+                return syn::Error::new(
+                    dir_lit.span(),
+                    format!(
+                        "embed_migrations!: malformed migration filename '{file_name}'. Expected format: '<version>_<name>.up.sql'"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            };
+
+            if version.is_empty() || name.is_empty() {
+                return syn::Error::new(
+                    dir_lit.span(),
+                    format!(
+                        "embed_migrations!: malformed migration filename '{file_name}'. Expected format: '<version>_<name>.up.sql'"
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
+
+            if is_up {
+                let ver_prefix = extract_migration_version(id);
+                if let Some(existing_file) = seen_versions.insert(ver_prefix.to_string(), file_name.to_string()) {
+                    return syn::Error::new(
+                        dir_lit.span(),
+                        format!(
+                            "embed_migrations!: duplicate migration version prefix '{ver_prefix}' found in '{file_name}' and '{existing_file}'"
+                        ),
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let rel_path = format!("{}/{}", dir_rel.replace('\\', "/"), file_name);
+                up_files.insert(id.to_string(), rel_path);
+            } else {
+                down_files.insert(id.to_string());
+            }
         }
     }
 

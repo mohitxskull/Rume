@@ -1,0 +1,5 @@
+error: embed_migrations!: duplicate migration version prefix '001' found in '001_second.up.sql' and '001_first.up.sql'
+ --> tests/ui/embed_migrations_duplicate_version.rs:3:19
+  |
+3 | embed_migrations!("tests/fixtures/duplicate_migrations");
+  |                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

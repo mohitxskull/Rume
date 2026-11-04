@@ -28,7 +28,7 @@ pub use duration::{ParseDurationError, format_duration, parse_duration};
 pub use html::{escape_html, excerpt, strip_html_tags};
 pub use mask::{mask_email, mask_secret};
 pub use ordinal::{ordinal, ordinal_suffix};
-pub use safe_equal::safe_equal;
+pub use safe_equal::{safe_equal, safe_equal_hashed};
 pub use sentence::{to_sentence, to_sentence_with};
 pub use slug::slug;
 pub use truncate::{TruncateOptions, truncate, truncate_with};

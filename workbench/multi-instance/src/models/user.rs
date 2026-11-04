@@ -10,6 +10,7 @@ pub struct User {
     pub email: String,
     pub name: String,
     pub role: String,
+    #[serde(skip_serializing, default)]
     pub api_token: String,
     pub created_at: i64,
 }

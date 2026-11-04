@@ -1,10 +1,11 @@
 use axum::routing::{get, post};
-use axum::Router;
 use rume::app::observability::ObservabilityLayer;
 use rume::auth::policy::RequireAnyRole;
 use rume::auth::{AuthLayer, BearerTokenScheme, PolicyLayer};
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
+use rume::resilience::{RateLimitConfig, RateLimitLayer, RateLimiter};
+use rume::routing::Router;
 use rume::tenant::resolver::HeaderTenantResolver;
 use rume::tenant::{TenantLayer, TenantMembershipLayer};
 
@@ -48,6 +49,8 @@ pub fn build_api_router(
         .layer(AuthLayer::required().scheme(auth_scheme))
         .layer(TenantLayer::required(tenant_resolver));
 
+    let org_limiter = RateLimiter::new(RateLimitConfig::default());
+
     let public_org_routes = Router::new()
         .route(
             "/organizations",
@@ -56,7 +59,8 @@ pub fn build_api_router(
         .route(
             "/organizations/{id}",
             get(organizations::get_organization),
-        );
+        )
+        .layer(RateLimitLayer::new(org_limiter));
 
     Router::new()
         .nest("/api/v1", tenant_scoped_routes)

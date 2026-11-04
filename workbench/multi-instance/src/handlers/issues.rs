@@ -6,6 +6,7 @@ use rume::error::AppError;
 use rume::outbox::{OutboxMessage, TransactionalOutbox};
 use rume::persistence::error::PersistenceError;
 use rume::tenant::TenantContext;
+use rume::validation::ValidatedJson;
 use uuid::Uuid;
 
 use crate::models::{
@@ -14,38 +15,15 @@ use crate::models::{
 use crate::repositories::{IssueRepository, ProjectRepository};
 use crate::state::WorkbenchState;
 
-const VALID_STATUSES: &[&str] = &["open", "in_progress", "resolved", "closed"];
-const VALID_PRIORITIES: &[&str] = &["low", "medium", "high", "urgent"];
-
 pub async fn create_issue(
     TenantContext(tenant): TenantContext,
     Path(project_id): Path<String>,
     State(state): State<WorkbenchState>,
-    Json(payload): Json<CreateIssueRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateIssueRequest>,
 ) -> Result<(StatusCode, Json<Issue>), AppError> {
     let title = payload.title.trim();
-    if title.is_empty() {
-        return Err(AppError::bad_request("Issue title cannot be empty"));
-    }
-    if title.len() > 200 {
-        return Err(AppError::bad_request(
-            "Issue title exceeds maximum length of 200 characters",
-        ));
-    }
-
     let status = payload.status.to_lowercase();
-    if !VALID_STATUSES.contains(&status.as_str()) {
-        return Err(AppError::bad_request(format!(
-            "Invalid status '{status}'. Must be one of: open, in_progress, resolved, closed"
-        )));
-    }
-
     let priority = payload.priority.to_lowercase();
-    if !VALID_PRIORITIES.contains(&priority.as_str()) {
-        return Err(AppError::bad_request(format!(
-            "Invalid priority '{priority}'. Must be one of: low, medium, high, urgent"
-        )));
-    }
 
     // Verify project exists for this tenant
     let project = ProjectRepository::find(&state.pool, &project_id, &tenant.id)
@@ -141,7 +119,7 @@ pub async fn update_issue(
     TenantContext(tenant): TenantContext,
     Path(id): Path<String>,
     State(state): State<WorkbenchState>,
-    Json(payload): Json<UpdateIssueRequest>,
+    ValidatedJson(payload): ValidatedJson<UpdateIssueRequest>,
 ) -> Result<Json<Issue>, AppError> {
     let mut current = IssueRepository::find(&state.pool, &id, &tenant.id)
         .await
@@ -154,18 +132,10 @@ pub async fn update_issue(
         .as_millis() as i64;
 
     if let Some(s) = &payload.status {
-        let status = s.to_lowercase();
-        if !VALID_STATUSES.contains(&status.as_str()) {
-            return Err(AppError::bad_request("Invalid status"));
-        }
-        current.status = status;
+        current.status = s.to_lowercase();
     }
     if let Some(p) = &payload.priority {
-        let priority = p.to_lowercase();
-        if !VALID_PRIORITIES.contains(&priority.as_str()) {
-            return Err(AppError::bad_request("Invalid priority"));
-        }
-        current.priority = priority;
+        current.priority = p.to_lowercase();
     }
     if let Some(a) = &payload.assignee_id {
         current.assignee_id = Some(a.clone());

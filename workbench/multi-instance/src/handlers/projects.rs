@@ -3,6 +3,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use rume::error::AppError;
 use rume::tenant::TenantContext;
+use rume::validation::ValidatedJson;
 use uuid::Uuid;
 
 use crate::models::{CreateProjectRequest, Project};
@@ -12,15 +13,9 @@ use crate::state::WorkbenchState;
 pub async fn create_project(
     TenantContext(tenant): TenantContext,
     State(state): State<WorkbenchState>,
-    Json(payload): Json<CreateProjectRequest>,
+    ValidatedJson(payload): ValidatedJson<CreateProjectRequest>,
 ) -> Result<(StatusCode, Json<Project>), AppError> {
     let name = payload.name.trim();
-    if name.is_empty() {
-        return Err(AppError::bad_request("Project name cannot be empty"));
-    }
-    if name.len() > 100 {
-        return Err(AppError::bad_request("Project name exceeds maximum length of 100 characters"));
-    }
 
     let id = format!("proj-{}", Uuid::new_v4());
     let now = std::time::SystemTime::now()

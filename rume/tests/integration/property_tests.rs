@@ -8,9 +8,15 @@
 use proptest::prelude::*;
 use rume::app::TraceContext;
 use rume::env::secrets::redact_diagnostic_text;
+use rume::helpers::bytes::{format_bytes, parse_bytes};
+use rume::helpers::case::{camel_case, kebab_case, pascal_case, snake_case};
+use rume::helpers::duration::{format_duration, parse_duration};
 use rume::helpers::mask::mask_secret;
+use rume::helpers::slug::slug;
 use rume::helpers::truncate::truncate;
 use rume::helpers::whitespace::condense_whitespace;
+use rume::routing::Matcher;
+use std::time::Duration;
 
 proptest! {
     // -------------------------------------------------------------------------
@@ -128,5 +134,81 @@ proptest! {
         prop_assert!(!condensed.contains("  "), "condensed string contains double spaces: '{condensed}'");
         prop_assert!(!condensed.contains(" \t"), "condensed string contains space-tab");
         prop_assert!(!condensed.contains("\t "), "condensed string contains tab-space");
+    }
+
+    // -------------------------------------------------------------------------
+    // 4. Bytes & Duration Helpers Invariants & Fuzzing
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_bytes_fuzz_never_panics(s in "\\PC*") {
+        let _ = parse_bytes(&s);
+    }
+
+    #[test]
+    fn parse_bytes_roundtrips_formatted_bytes(n in 0u64..100_000_000_000_000u64) {
+        let formatted = format_bytes(n);
+        let parsed = parse_bytes(&formatted);
+        prop_assert!(parsed.is_ok(), "failed to parse formatted bytes '{formatted}' for {n}");
+        let parsed_val = parsed.unwrap();
+        // format_bytes rounds to 2 decimals, so exact round-trip holds within 1% or for small values
+        if n == 0 {
+            prop_assert_eq!(parsed_val, 0);
+        } else {
+            let diff = (parsed_val as f64 - n as f64).abs();
+            let relative_error = diff / (n as f64);
+            prop_assert!(relative_error < 0.05, "error too high for n={n}: formatted={formatted}, parsed={parsed_val}");
+        }
+    }
+
+    #[test]
+    fn parse_duration_fuzz_never_panics(s in "\\PC*") {
+        let _ = parse_duration(&s);
+    }
+
+    #[test]
+    fn parse_duration_roundtrips_formatted_duration(
+        millis in 0u64..3_600_000_u64,
+    ) {
+        let dur = Duration::from_millis(millis);
+        let formatted = format_duration(dur);
+        let parsed = parse_duration(&formatted);
+        prop_assert!(parsed.is_ok(), "failed to parse formatted duration '{formatted}' for {dur:?}");
+        let parsed_val = parsed.unwrap();
+        if millis == 0 {
+            prop_assert_eq!(parsed_val, Duration::ZERO);
+        } else {
+            let diff = (parsed_val.as_millis() as i64 - millis as i64).abs();
+            prop_assert!(diff <= 1000, "duration divergence too high for {millis}ms: formatted={formatted}, parsed={parsed_val:?}");
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 5. Slug and Case Helper Invariants
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn slug_output_satisfies_slug_matcher(
+        s in "[a-zA-Z0-9 _-]{3,64}",
+    ) {
+        let sl = slug(&s);
+        if sl.len() >= 3 {
+            let validation = Matcher::Slug.validate(&sl);
+            prop_assert!(validation.is_ok(), "slug '{sl}' from '{s}' failed Matcher::Slug: {:?}", validation.err());
+        }
+    }
+
+    #[test]
+    fn case_converters_never_panic(s in "\\PC*") {
+        let sc = snake_case(&s);
+        let cc = camel_case(&s);
+        let kc = kebab_case(&s);
+        let pc = pascal_case(&s);
+
+        prop_assert!(!sc.contains(' '));
+        prop_assert!(!kc.contains(' '));
+        prop_assert!(!kc.contains('_'));
+        let _ = cc;
+        let _ = pc;
     }
 }

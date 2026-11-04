@@ -27,7 +27,9 @@ pub mod secrets;
 // Re-export the public env surface at the module root for convenience.
 pub use error::EnvError;
 pub use interpolation::interpolate_value;
-pub use loading::{ResolvedEnv, load, load_for_env, load_in, load_merged_map, resolve_env_name};
+pub use loading::{
+    ResolvedEnv, load, load_for_env, load_for_env_in, load_in, load_merged_map, resolve_env_name,
+};
 pub use secrets::{is_secret_key, redact_value, value_looks_sensitive};
 
 pub type Result<T> = std::result::Result<T, EnvError>;

@@ -30,18 +30,19 @@ impl ConcurrencyLimiter {
 
     /// Attempts to acquire an execution permit.
     pub fn acquire(&self) -> Result<ConcurrencyPermit, ResilienceError> {
-        let current = self.current.fetch_add(1, Ordering::SeqCst);
-        if current >= self.max {
-            self.current.fetch_sub(1, Ordering::SeqCst);
-            return Err(ResilienceError::LoadShed {
+        match self
+            .current
+            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |c| {
+                (c < self.max).then_some(c + 1)
+            }) {
+            Ok(_) => Ok(ConcurrencyPermit {
+                counter: Arc::clone(&self.current),
+            }),
+            Err(current) => Err(ResilienceError::LoadShed {
                 current,
                 max: self.max,
-            });
+            }),
         }
-
-        Ok(ConcurrencyPermit {
-            counter: Arc::clone(&self.current),
-        })
     }
 
     /// Returns the current number of in-flight requests.

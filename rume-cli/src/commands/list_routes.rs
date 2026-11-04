@@ -13,9 +13,16 @@ use comfy_table::Color;
 use rume::routing::RouteInfo;
 use std::process::Command;
 
-pub fn run(json_output: bool) {
+pub fn run(bin: Option<&str>, json_output: bool) {
+    let mut args = vec!["run", "--quiet"];
+    if let Some(b) = bin {
+        args.push("--bin");
+        args.push(b);
+    }
+    args.extend(["--", "--rume-inspect-routes"]);
+
     let output = match Command::new("cargo")
-        .args(["run", "--quiet", "--", "--rume-inspect-routes"])
+        .args(&args)
         .env("RUME_INSPECT", "routes")
         .output()
     {

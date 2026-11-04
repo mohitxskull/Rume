@@ -17,7 +17,7 @@ pub mod session;
 pub use self::redis::RedisSessionStore;
 pub use error::AuthError;
 pub use identity::{AuthUser, Authenticated, Identity, OptionalAuth};
-pub use layer::{AuthLayer, PolicyLayer};
+pub use layer::{AuthLayer, FromExtension, PolicyLayer, PolicyResource};
 pub use policy::{
     CustomPolicy, Policy, RequireAllPermissions, RequireAnyRole, RequirePermission, RequireRole,
     authorize,
