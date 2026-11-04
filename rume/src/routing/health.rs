@@ -127,6 +127,7 @@ pub struct HealthChecks {
     cache_ttl: Option<Duration>,
     cache: Arc<RwLock<BTreeMap<String, (Instant, HealthCheckResult)>>>,
     singleflight: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<Option<HealthReport>>>>>,
+    metrics: Option<crate::metrics::MetricsRegistry>,
 }
 
 impl HealthChecks {
@@ -141,6 +142,7 @@ impl HealthChecks {
             cache_ttl: None,
             cache: Arc::new(RwLock::new(BTreeMap::new())),
             singleflight: Arc::new(tokio::sync::Mutex::new(None)),
+            metrics: None,
         }
     }
 
@@ -185,6 +187,13 @@ impl HealthChecks {
     /// re-running the checks. When `None`, caching is disabled.
     pub fn cache_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.cache_ttl = ttl;
+        self
+    }
+
+    /// Attaches a [`MetricsRegistry`](crate::metrics::MetricsRegistry) so executed health checks
+    /// automatically record latency, status, and execution counters into Prometheus metrics.
+    pub fn with_metrics(mut self, metrics: crate::metrics::MetricsRegistry) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
@@ -271,6 +280,13 @@ impl HealthChecks {
                 cached: false,
                 duration_ms: None,
             }));
+        }
+
+        if let Some(metrics) = &self.metrics {
+            for check in &checks {
+                let duration = Duration::from_millis(check.duration_ms.unwrap_or(0));
+                metrics.record_health_check(&check.name, check.status.clone(), duration);
+            }
         }
 
         Self::build_report(checks)
@@ -386,6 +402,7 @@ impl Clone for HealthChecks {
             cache_ttl: self.cache_ttl,
             cache: Arc::clone(&self.cache),
             singleflight: Arc::clone(&self.singleflight),
+            metrics: self.metrics.clone(),
         }
     }
 }

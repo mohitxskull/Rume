@@ -81,6 +81,54 @@ struct HealthCheckMetric {
     duration_secs: f64,
 }
 
+/// Trait for types that can export database connection pool metrics into [`MetricsRegistry`].
+pub trait PoolMetricsExporter: Send + Sync + std::fmt::Debug {
+    /// Returns the logical pool name (e.g. "primary", "analytics").
+    fn pool_name(&self) -> &str;
+    /// Exports the current pool telemetry into the registry.
+    fn export_metrics(&self, registry: &MetricsRegistry);
+}
+
+/// Dynamic pool exporter invoking a status closure.
+pub struct DynamicPoolExporter<F> {
+    name: String,
+    status_fn: F,
+}
+
+impl<F> DynamicPoolExporter<F>
+where
+    F: Fn() -> PoolStatus + Send + Sync + 'static,
+{
+    pub fn new(name: impl Into<String>, status_fn: F) -> Self {
+        Self {
+            name: name.into(),
+            status_fn,
+        }
+    }
+}
+
+impl<F> std::fmt::Debug for DynamicPoolExporter<F> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DynamicPoolExporter")
+            .field("name", &self.name)
+            .finish()
+    }
+}
+
+impl<F> PoolMetricsExporter for DynamicPoolExporter<F>
+where
+    F: Fn() -> PoolStatus + Send + Sync + 'static,
+{
+    fn pool_name(&self) -> &str {
+        &self.name
+    }
+
+    fn export_metrics(&self, registry: &MetricsRegistry) {
+        let status = (self.status_fn)();
+        registry.record_db_pool_status(&self.name, &status);
+    }
+}
+
 /// Standard HTTP request metrics registry with Prometheus text-format exporter.
 #[derive(Debug, Clone, Default)]
 pub struct MetricsRegistry {
@@ -88,7 +136,10 @@ pub struct MetricsRegistry {
     request_latencies: Arc<RwLock<BTreeMap<String, LatencySummary>>>,
     in_flight: Arc<AtomicI64>,
     db_pools: Arc<RwLock<BTreeMap<String, DbPoolMetrics>>>,
+    pool_exporters: Arc<RwLock<Vec<Arc<dyn PoolMetricsExporter>>>>,
     health_checks: Arc<RwLock<BTreeMap<String, HealthCheckMetric>>>,
+    health_checks_total: Arc<RwLock<BTreeMap<String, u64>>>,
+    health_check_failures_total: Arc<RwLock<BTreeMap<String, u64>>>,
 }
 
 impl MetricsRegistry {
@@ -131,6 +182,24 @@ impl MetricsRegistry {
         self.in_flight.load(Ordering::Relaxed)
     }
 
+    /// Registers a custom pool metrics exporter.
+    pub fn register_pool_exporter(&self, exporter: Arc<dyn PoolMetricsExporter>) {
+        if let Ok(mut exporters) = self.pool_exporters.write() {
+            exporters.push(exporter);
+        }
+    }
+
+    /// Registers a database pool for automated Prometheus telemetry polling.
+    pub fn register_pool<B: crate::persistence::DatabaseBackend + 'static>(
+        &self,
+        name: impl Into<String>,
+        pool: &crate::persistence::DatabasePool<B>,
+    ) {
+        let p = pool.clone();
+        let exporter = Arc::new(DynamicPoolExporter::new(name, move || p.status()));
+        self.register_pool_exporter(exporter);
+    }
+
     /// Records connection pool metrics for a database pool.
     pub fn record_db_pool_status(&self, pool_name: &str, status: &PoolStatus) {
         if let Ok(mut pools) = self.db_pools.write() {
@@ -160,10 +229,25 @@ impl MetricsRegistry {
                 },
             );
         }
+        if let Ok(mut totals) = self.health_checks_total.write() {
+            *totals.entry(name.to_string()).or_default() += 1;
+        }
+        if status != HealthStatus::Ok
+            && let Ok(mut fails) = self.health_check_failures_total.write()
+        {
+            *fails.entry(name.to_string()).or_default() += 1;
+        }
     }
 
     /// Renders all registered metrics into the standard Prometheus exposition format.
     pub fn render_prometheus(&self) -> String {
+        // Refresh pool metrics via registered exporters before formatting
+        if let Ok(exporters) = self.pool_exporters.read() {
+            for exp in exporters.iter() {
+                exp.export_metrics(self);
+            }
+        }
+
         let mut out = String::new();
 
         // 1. in_flight gauge
@@ -290,6 +374,30 @@ impl MetricsRegistry {
             for (name, m) in checks.iter() {
                 writeln!(out, "health_check_duration_seconds{{name=\"{name}\"}} {:.6}", m.duration_secs).unwrap();
             }
+
+            writeln!(
+                out,
+                "# HELP health_checks_total Total number of health check executions partitioned by check name."
+            )
+            .unwrap();
+            writeln!(out, "# TYPE health_checks_total counter").unwrap();
+            if let Ok(totals) = self.health_checks_total.read() {
+                for (name, count) in totals.iter() {
+                    writeln!(out, "health_checks_total{{name=\"{name}\"}} {count}").unwrap();
+                }
+            }
+
+            writeln!(
+                out,
+                "# HELP health_check_failures_total Total number of failed health check executions partitioned by check name."
+            )
+            .unwrap();
+            writeln!(out, "# TYPE health_check_failures_total counter").unwrap();
+            if let Ok(fails) = self.health_check_failures_total.read() {
+                for (name, count) in fails.iter() {
+                    writeln!(out, "health_check_failures_total{{name=\"{name}\"}} {count}").unwrap();
+                }
+            }
         }
 
         out
@@ -335,5 +443,38 @@ mod tests {
         assert!(rendered.contains("health_check_status{name=\"db\"} 0"));
         assert!(rendered.contains("health_check_duration_seconds{name=\"redis\"} 0.015000"));
         assert!(rendered.contains("health_check_duration_seconds{name=\"db\"} 0.120000"));
+        assert!(rendered.contains("health_checks_total{name=\"redis\"} 1"));
+        assert!(rendered.contains("health_checks_total{name=\"db\"} 1"));
+        assert!(rendered.contains("health_check_failures_total{name=\"db\"} 1"));
+        assert!(!rendered.contains("health_check_failures_total{name=\"redis\"}"));
+    }
+
+    #[test]
+    fn test_dynamic_pool_exporter_auto_refresh() {
+        let registry = MetricsRegistry::new();
+        let counter = Arc::new(AtomicU64::new(1));
+        let c_clone = Arc::clone(&counter);
+
+        let exporter = Arc::new(DynamicPoolExporter::new("test_pool", move || {
+            let active = c_clone.load(Ordering::Relaxed) as u32;
+            PoolStatus {
+                leased_connections: active,
+                active_connections: active,
+                idle_connections: 5,
+                total_connections: 5 + active,
+                max_connections: 20,
+                in_flight_transactions: 0,
+                is_closed: false,
+            }
+        }));
+
+        registry.register_pool_exporter(exporter);
+
+        let rendered1 = registry.render_prometheus();
+        assert!(rendered1.contains("db_pool_connections{pool=\"test_pool\",state=\"active\"} 1"));
+
+        counter.store(4, Ordering::Relaxed);
+        let rendered2 = registry.render_prometheus();
+        assert!(rendered2.contains("db_pool_connections{pool=\"test_pool\",state=\"active\"} 4"));
     }
 }
