@@ -19,18 +19,21 @@ async fn sqlite_pool_lifecycle_and_ping() {
     );
 
     pool.backend().ping().await.expect("ping should succeed");
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
     let status = pool.status();
+    assert_eq!(status.leased_connections, 0);
     assert_eq!(status.active_connections, 0);
     assert_eq!(status.max_connections, 5);
 
     let lease1 = pool.acquire_lease().expect("should acquire lease 1");
     let lease2 = pool.acquire_lease().expect("should acquire lease 2");
-    assert_eq!(pool.status().active_connections, 2);
+    assert_eq!(pool.status().leased_connections, 2);
+    assert_eq!(pool.status().active_connections, 0);
 
     drop(lease1);
     drop(lease2);
-    assert_eq!(pool.status().active_connections, 0);
+    assert_eq!(pool.status().leased_connections, 0);
 }
 
 #[tokio::test]

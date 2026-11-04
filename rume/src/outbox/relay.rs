@@ -1,8 +1,11 @@
 //! Background outbox processor and message relay.
 
+use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use futures_util::FutureExt;
@@ -11,6 +14,7 @@ use tokio::time::sleep;
 use crate::outbox::error::OutboxError;
 use crate::outbox::message::OutboxMessage;
 use crate::outbox::repository::{BoxFuture, OutboxRepository};
+use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 
 /// Type alias for the message dispatch callback.
 pub type MessageDispatcher = Arc<
@@ -68,6 +72,23 @@ impl PartialEq<RelayPollResult> for usize {
     }
 }
 
+/// Operational health and telemetry summary for an [`OutboxRelay`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RelayStatus {
+    /// Whether the relay has been requested to stop.
+    pub is_stopping: bool,
+    /// Number of consecutive polling or dispatch errors encountered.
+    pub consecutive_errors: u32,
+    /// Lifetime total polling or repository errors encountered.
+    pub total_errors: u64,
+    /// Lifetime failed message state transitions (e.g. missing lease tokens or lost leases).
+    pub failed_transitions: u64,
+    /// Most recent operational error message, if any.
+    pub last_error: Option<String>,
+    /// Whether the relay is considered healthy (`consecutive_errors < 5`).
+    pub is_healthy: bool,
+}
+
 /// Configuration for the outbox relay background processor.
 #[derive(Debug, Clone)]
 pub struct OutboxRelayConfig {
@@ -106,6 +127,11 @@ pub struct OutboxRelay<R: OutboxRepository> {
     dispatcher: CancellableMessageDispatcher,
     is_stopping: Arc<AtomicBool>,
     config: OutboxRelayConfig,
+    consecutive_errors: Arc<AtomicU32>,
+    total_errors: Arc<AtomicU64>,
+    failed_transitions: Arc<AtomicU64>,
+    last_error: Arc<RwLock<Option<String>>>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
 }
 
 impl<R: OutboxRepository> Clone for OutboxRelay<R> {
@@ -115,6 +141,11 @@ impl<R: OutboxRepository> Clone for OutboxRelay<R> {
             dispatcher: Arc::clone(&self.dispatcher),
             is_stopping: Arc::clone(&self.is_stopping),
             config: self.config.clone(),
+            consecutive_errors: Arc::clone(&self.consecutive_errors),
+            total_errors: Arc::clone(&self.total_errors),
+            failed_transitions: Arc::clone(&self.failed_transitions),
+            last_error: Arc::clone(&self.last_error),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
         }
     }
 }
@@ -123,6 +154,7 @@ impl<R: OutboxRepository> Debug for OutboxRelay<R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OutboxRelay")
             .field("is_stopping", &self.is_stopping.load(Ordering::Relaxed))
+            .field("status", &self.status())
             .field("config", &self.config)
             .finish()
     }
@@ -140,6 +172,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             dispatcher: Arc::new(move |msg, _cancel| Box::pin(dispatcher(msg))),
             is_stopping: Arc::new(AtomicBool::new(false)),
             config: OutboxRelayConfig::default(),
+            consecutive_errors: Arc::new(AtomicU32::new(0)),
+            total_errors: Arc::new(AtomicU64::new(0)),
+            failed_transitions: Arc::new(AtomicU64::new(0)),
+            last_error: Arc::new(RwLock::new(None)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -155,6 +192,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             dispatcher: Arc::new(move |msg, cancel| Box::pin(dispatcher(msg, cancel))),
             is_stopping: Arc::new(AtomicBool::new(false)),
             config: OutboxRelayConfig::default(),
+            consecutive_errors: Arc::new(AtomicU32::new(0)),
+            total_errors: Arc::new(AtomicU64::new(0)),
+            failed_transitions: Arc::new(AtomicU64::new(0)),
+            last_error: Arc::new(RwLock::new(None)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -312,10 +354,36 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         Ok(result)
     }
 
-    /// Spawns the background polling loop using configured interval and batch size.
+    /// Returns the current runtime health and error telemetry for this relay.
+    pub fn status(&self) -> RelayStatus {
+        let consecutive = self.consecutive_errors.load(Ordering::Relaxed);
+        let last_err = self.last_error.read().ok().and_then(|g| g.clone());
+        RelayStatus {
+            is_stopping: self.is_stopping.load(Ordering::Relaxed),
+            consecutive_errors: consecutive,
+            total_errors: self.total_errors.load(Ordering::Relaxed),
+            failed_transitions: self.failed_transitions.load(Ordering::Relaxed),
+            last_error: last_err,
+            is_healthy: consecutive < 5,
+        }
+    }
+
+    /// Creates a Rume [`HealthCheck`] for supervising this relay's operational health.
+    pub fn health_check(&self, name: impl Into<String>) -> RelayHealthCheck<R> {
+        RelayHealthCheck {
+            name: name.into(),
+            relay: self.clone(),
+        }
+    }
+
     /// Spawns the background polling loop using configured interval and batch size.
     ///
-    /// Returns a [`tokio::task::JoinHandle`] enabling background task supervision and cancellation.
+    /// ## Supervision & Health Guarantees
+    /// The returned [`tokio::task::JoinHandle`] supervises background task lifecycle (e.g., detecting panics
+    /// or explicitly aborting the polling task). The polling loop treats transient database or broker errors
+    /// as retryable conditions, continuing to poll without terminating the task.
+    ///
+    /// To monitor operational health, inspect [`OutboxRelay::status`] or register [`OutboxRelay::health_check`].
     pub fn start_with_config(&self) -> tokio::task::JoinHandle<()> {
         let relay = self.clone();
         tokio::spawn(async move {
@@ -324,7 +392,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             while !relay.is_stopping.load(Ordering::Relaxed) {
                 match relay.poll_and_dispatch(batch).await {
                     Ok(res) => {
-                        if !res.is_success() {
+                        relay.consecutive_errors.store(0, Ordering::SeqCst);
+                        if res.failed_transitions > 0 {
+                            relay
+                                .failed_transitions
+                                .fetch_add(res.failed_transitions as u64, Ordering::SeqCst);
                             tracing::error!(
                                 published = res.published,
                                 retried = res.retried,
@@ -334,10 +406,18 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         }
                     }
                     Err(err) => {
+                        relay.consecutive_errors.fetch_add(1, Ordering::SeqCst);
+                        relay.total_errors.fetch_add(1, Ordering::SeqCst);
+                        if let Ok(mut g) = relay.last_error.write() {
+                            *g = Some(err.to_string());
+                        }
                         tracing::error!(error = %err, "Outbox relay background dispatch error");
                     }
                 }
-                sleep(interval).await;
+                tokio::select! {
+                    _ = sleep(interval) => {},
+                    _ = relay.shutdown_notify.notified() => { break; }
+                }
             }
         })
     }
@@ -360,6 +440,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// checking pending count or dispatching messages.
     pub async fn try_drain(&self, timeout: Duration) -> Result<bool, OutboxError> {
         self.is_stopping.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
         let start = std::time::Instant::now();
 
         loop {
@@ -396,5 +477,105 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 false
             }
         }
+    }
+}
+
+/// Health check implementation for an [`OutboxRelay`].
+pub struct RelayHealthCheck<R: OutboxRepository> {
+    name: String,
+    relay: OutboxRelay<R>,
+}
+
+impl<R: OutboxRepository> Clone for RelayHealthCheck<R> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            relay: self.relay.clone(),
+        }
+    }
+}
+
+impl<R: OutboxRepository> Debug for RelayHealthCheck<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RelayHealthCheck")
+            .field("name", &self.name)
+            .field("status", &self.relay.status())
+            .finish()
+    }
+}
+
+impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self) -> Pin<Box<dyn std::future::Future<Output = HealthCheckResult> + Send>> {
+        let name = self.name.clone();
+        let relay = self.relay.clone();
+
+        Box::pin(async move {
+            let status = relay.status();
+            let mut meta = BTreeMap::new();
+            meta.insert(
+                "is_stopping".to_string(),
+                serde_json::json!(status.is_stopping),
+            );
+            meta.insert(
+                "consecutive_errors".to_string(),
+                serde_json::json!(status.consecutive_errors),
+            );
+            meta.insert(
+                "total_errors".to_string(),
+                serde_json::json!(status.total_errors),
+            );
+            meta.insert(
+                "failed_transitions".to_string(),
+                serde_json::json!(status.failed_transitions),
+            );
+            meta.insert("is_healthy".to_string(), serde_json::json!(status.is_healthy));
+            if let Some(err) = &status.last_error {
+                meta.insert("last_error".to_string(), serde_json::json!(err));
+            }
+
+            if status.is_stopping {
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Warning,
+                    message: "outbox relay is stopping".to_string(),
+                    meta,
+                    cached: false,
+                }
+            } else if status.consecutive_errors >= 5 {
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Failed,
+                    message: format!(
+                        "outbox relay exceeded error threshold (consecutive_errors: {})",
+                        status.consecutive_errors
+                    ),
+                    meta,
+                    cached: false,
+                }
+            } else if status.consecutive_errors > 0 {
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Warning,
+                    message: format!(
+                        "outbox relay experiencing transient errors: {}",
+                        status.last_error.as_deref().unwrap_or("unknown")
+                    ),
+                    meta,
+                    cached: false,
+                }
+            } else {
+                HealthCheckResult {
+                    name,
+                    status: HealthStatus::Ok,
+                    message: "outbox relay healthy".to_string(),
+                    meta,
+                    cached: false,
+                }
+            }
+        })
     }
 }

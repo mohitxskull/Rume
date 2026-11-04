@@ -124,6 +124,91 @@ pub struct WorkerStatus {
     pub lost_leases: u64,
 }
 
+/// Handle to background tasks spawned by [`JobWorker::start`].
+///
+/// Enables external supervision, explicit task inspection, and graceful awaitable shutdown.
+#[derive(Debug)]
+pub struct WorkerHandle {
+    /// Join handle of the primary queue polling and execution loop.
+    pub worker_task: tokio::task::JoinHandle<()>,
+    /// Join handle of the worker heartbeat registration loop, if configured.
+    pub heartbeat_task: Option<tokio::task::JoinHandle<()>>,
+    /// Join handle of the dead worker abandoned job recovery loop, if configured.
+    pub recovery_task: Option<tokio::task::JoinHandle<()>>,
+    is_stopping: Arc<AtomicBool>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    in_flight_count: Arc<AtomicU32>,
+    active_tasks: Arc<AtomicU32>,
+}
+
+impl WorkerHandle {
+    /// Returns the number of currently running worker background tasks (execution, heartbeat, recovery).
+    pub fn active_tasks(&self) -> u32 {
+        self.active_tasks.load(Ordering::Relaxed)
+    }
+
+    /// Returns `true` if the main polling task and all auxiliary tasks have completed.
+    pub fn is_finished(&self) -> bool {
+        self.worker_task.is_finished()
+            && self.heartbeat_task.as_ref().is_none_or(|h| h.is_finished())
+            && self.recovery_task.as_ref().is_none_or(|h| h.is_finished())
+    }
+
+    /// Aborts all worker and auxiliary background tasks immediately.
+    pub fn abort_all(&self) {
+        self.is_stopping.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        self.worker_task.abort();
+        if let Some(h) = &self.heartbeat_task {
+            h.abort();
+        }
+        if let Some(r) = &self.recovery_task {
+            r.abort();
+        }
+    }
+
+    /// Signals the worker to stop, waits for in-flight jobs to complete, and awaits all tasks.
+    ///
+    /// Returns `true` if cleanly shut down within `timeout`, or `false` if jobs or tasks remained.
+    pub async fn shutdown(mut self, timeout: Duration) -> bool {
+        self.is_stopping.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
+        let start = std::time::Instant::now();
+
+        // 1. Wait for in-flight job handlers to complete
+        while self.in_flight_count.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2. Await the worker execution loop
+        let remaining = timeout.saturating_sub(start.elapsed());
+        if tokio::time::timeout(remaining, &mut self.worker_task).await.is_err() {
+            return false;
+        }
+
+        // 3. Await heartbeat task if present
+        if let Some(mut hb) = self.heartbeat_task.take() {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if tokio::time::timeout(remaining, &mut hb).await.is_err() {
+                return false;
+            }
+        }
+
+        // 4. Await recovery task if present
+        if let Some(mut rec) = self.recovery_task.take() {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if tokio::time::timeout(remaining, &mut rec).await.is_err() {
+                return false;
+            }
+        }
+
+        true
+    }
+}
+
 /// Background worker managing queue polling, retries, and graceful shutdown drain.
 pub struct JobWorker<Q: JobQueue> {
     worker_id: String,
@@ -140,6 +225,8 @@ pub struct JobWorker<Q: JobQueue> {
     idempotency_store: Option<Arc<dyn IdempotencyStore>>,
     transition_errors: Arc<AtomicU64>,
     lost_leases: Arc<AtomicU64>,
+    shutdown_notify: Arc<tokio::sync::Notify>,
+    active_tasks: Arc<AtomicU32>,
 }
 
 impl<Q: JobQueue> Clone for JobWorker<Q> {
@@ -159,6 +246,8 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             idempotency_store: self.idempotency_store.clone(),
             transition_errors: Arc::clone(&self.transition_errors),
             lost_leases: Arc::clone(&self.lost_leases),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            active_tasks: Arc::clone(&self.active_tasks),
         }
     }
 }
@@ -213,6 +302,8 @@ impl<Q: JobQueue> JobWorker<Q> {
             idempotency_store: None,
             transition_errors: Arc::new(AtomicU64::new(0)),
             lost_leases: Arc::new(AtomicU64::new(0)),
+            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            active_tasks: Arc::new(AtomicU32::new(0)),
         }
     }
 
@@ -283,35 +374,60 @@ impl<Q: JobQueue> JobWorker<Q> {
     }
 
     /// Spawns the background execution loop into the current async runtime.
-    pub fn start(&self) {
+    ///
+    /// Returns a [`WorkerHandle`] providing lifecycle supervision, status queries,
+    /// and graceful awaitable shutdown across execution, heartbeat, and recovery tasks.
+    pub fn start(&self) -> WorkerHandle {
+        self.active_tasks.fetch_add(1, Ordering::SeqCst);
         let worker = self.clone();
-        tokio::spawn(async move {
+        let worker_task = tokio::spawn(async move {
             worker.run_loop().await;
+            worker.active_tasks.fetch_sub(1, Ordering::SeqCst);
         });
+
+        let mut heartbeat_task = None;
+        let mut recovery_task = None;
 
         if let Some(heartbeat) = self.heartbeat_registry.clone() {
             let worker_id = self.worker_id.clone();
             let is_stopping = Arc::clone(&self.is_stopping);
+            let shutdown_notify = Arc::clone(&self.shutdown_notify);
+            let active_tasks = Arc::clone(&self.active_tasks);
             let ttl = self.heartbeat_ttl;
             let interval = self.heartbeat_interval;
             let hb_loop = Arc::clone(&heartbeat);
 
-            tokio::spawn(async move {
-                while !is_stopping.load(Ordering::Relaxed) {
+            active_tasks.fetch_add(1, Ordering::SeqCst);
+            heartbeat_task = Some(tokio::spawn(async move {
+                while !is_stopping.load(Ordering::SeqCst) {
                     if let Err(e) = hb_loop.record_heartbeat(&worker_id, ttl).await {
                         tracing::warn!(worker_id = %worker_id, error = %e, "Failed to record worker heartbeat");
                     }
-                    sleep(interval).await;
+                    tokio::select! {
+                        _ = sleep(interval) => {},
+                        _ = shutdown_notify.notified() => { break; }
+                    }
                 }
-            });
+                active_tasks.fetch_sub(1, Ordering::SeqCst);
+            }));
 
             if let Some(recovery_interval) = self.abandoned_recovery_interval {
                 let queue = Arc::clone(&self.queue);
                 let is_stopping = Arc::clone(&self.is_stopping);
+                let shutdown_notify = Arc::clone(&self.shutdown_notify);
+                let active_tasks = Arc::clone(&self.active_tasks);
                 let hb_reap = Arc::clone(&heartbeat);
-                tokio::spawn(async move {
-                    while !is_stopping.load(Ordering::Relaxed) {
-                        sleep(recovery_interval).await;
+
+                active_tasks.fetch_add(1, Ordering::SeqCst);
+                recovery_task = Some(tokio::spawn(async move {
+                    while !is_stopping.load(Ordering::SeqCst) {
+                        tokio::select! {
+                            _ = sleep(recovery_interval) => {},
+                            _ = shutdown_notify.notified() => { break; }
+                        }
+                        if is_stopping.load(Ordering::SeqCst) {
+                            break;
+                        }
                         match hb_reap.reap_dead_workers().await {
                             Ok(dead) => {
                                 if !dead.is_empty()
@@ -329,23 +445,51 @@ impl<Q: JobQueue> JobWorker<Q> {
                             }
                         }
                     }
-                });
+                    active_tasks.fetch_sub(1, Ordering::SeqCst);
+                }));
             }
+        }
+
+        WorkerHandle {
+            worker_task,
+            heartbeat_task,
+            recovery_task,
+            is_stopping: Arc::clone(&self.is_stopping),
+            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            in_flight_count: Arc::clone(&self.in_flight_count),
+            active_tasks: Arc::clone(&self.active_tasks),
         }
     }
 
     /// Internal worker execution loop.
     async fn run_loop(&self) {
         let mut consecutive_errors: u32 = 0;
-        while !self.is_stopping.load(Ordering::Relaxed) {
-            let permit = match self.semaphore.clone().acquire_owned().await {
-                Ok(permit) => permit,
-                Err(_) => break,
+        while !self.is_stopping.load(Ordering::SeqCst) {
+            let permit = tokio::select! {
+                res = self.semaphore.clone().acquire_owned() => match res {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                },
+                _ = self.shutdown_notify.notified() => break,
             };
+
+            if self.is_stopping.load(Ordering::SeqCst) {
+                drop(permit);
+                break;
+            }
 
             match self.queue.dequeue_for(&self.worker_id).await {
                 Ok(Some(job)) => {
                     consecutive_errors = 0;
+                    if self.is_stopping.load(Ordering::SeqCst) {
+                        // Crucial race check: draining started while dequeue was in-flight!
+                        // Guarantee that no new job starts after draining begins.
+                        let token = job.lease_token.clone().unwrap_or_default();
+                        let _ = self.queue.nack(job, &token, Duration::ZERO).await;
+                        drop(permit);
+                        break;
+                    }
+
                     self.in_flight_count.fetch_add(1, Ordering::SeqCst);
                     let queue = Arc::clone(&self.queue);
                     let registry = Arc::clone(&self.registry);
@@ -373,13 +517,19 @@ impl<Q: JobQueue> JobWorker<Q> {
                 Ok(None) => {
                     consecutive_errors = 0;
                     drop(permit);
-                    sleep(Duration::from_millis(25)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(25)) => {},
+                        _ = self.shutdown_notify.notified() => { break; }
+                    }
                 }
                 Err(_) => {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     drop(permit);
                     let backoff_ms = (50u64 * 2u64.pow(consecutive_errors.min(6))).min(5000);
-                    sleep(Duration::from_millis(backoff_ms)).await;
+                    tokio::select! {
+                        _ = sleep(Duration::from_millis(backoff_ms)) => {},
+                        _ = self.shutdown_notify.notified() => { break; }
+                    }
                 }
             }
         }
@@ -584,16 +734,26 @@ impl<Q: JobQueue> JobWorker<Q> {
         }
     }
 
-    /// Gracefully requests worker shutdown and waits for in-flight jobs to complete within `timeout`.
+    /// Gracefully requests worker shutdown and waits for in-flight jobs and background polling tasks to complete within `timeout`.
     pub async fn drain(&self, timeout: Duration) -> bool {
         self.is_stopping.store(true, Ordering::SeqCst);
+        self.shutdown_notify.notify_waiters();
         let start = std::time::Instant::now();
 
+        // 1. Wait for in-flight jobs to finish
         while self.in_flight_count.load(Ordering::SeqCst) > 0 {
             if start.elapsed() >= timeout {
                 return false;
             }
-            sleep(Duration::from_millis(20)).await;
+            sleep(Duration::from_millis(10)).await;
+        }
+
+        // 2. Wait for polling, heartbeat, and recovery loops to exit
+        while self.active_tasks.load(Ordering::SeqCst) > 0 {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            sleep(Duration::from_millis(10)).await;
         }
 
         true
@@ -602,5 +762,192 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Returns the number of currently executing jobs.
     pub fn in_flight_count(&self) -> u32 {
         self.in_flight_count.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tokio::sync::{mpsc, Mutex};
+    use crate::jobs::job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
+    use crate::jobs::retry::RetryPolicy;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BlockTestJob {
+        data: String,
+    }
+
+    impl Job for BlockTestJob {
+        const NAME: &'static str = "block_test_job";
+    }
+
+    struct BlockTestHandler {
+        executions: Arc<AtomicUsize>,
+    }
+
+    impl JobHandler<BlockTestJob> for BlockTestHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: BlockTestJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let executions = Arc::clone(&self.executions);
+            Box::pin(async move {
+                executions.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BlockingTestQueue {
+        job: Mutex<Option<QueuedJob>>,
+        enter_tx: mpsc::Sender<()>,
+        release_rx: Mutex<mpsc::Receiver<()>>,
+        nack_count: Arc<AtomicUsize>,
+    }
+
+    impl JobQueue for BlockingTestQueue {
+        fn enqueue_delayed<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async move { Ok("test-id".to_string()) })
+        }
+
+        fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            let worker_id = worker_id.to_string();
+            Box::pin(async move {
+                let _ = self.enter_tx.send(()).await;
+                let _ = self.release_rx.lock().await.recv().await;
+                let mut guard = self.job.lock().await;
+                if let Some(mut j) = guard.take() {
+                    j.assigned_worker = Some(worker_id);
+                    j.lease_token = Some("test-token".to_string());
+                    Ok(Some(j))
+                } else {
+                    Ok(None)
+                }
+            })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.nack_count.fetch_add(1, Ordering::SeqCst);
+            let mut guard = self.job.try_lock().unwrap();
+            *guard = Some(job);
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_nacks_immediately() {
+        let (enter_tx, mut enter_rx) = mpsc::channel(1);
+        let (release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+
+        let payload_bytes = serde_json::to_vec(&BlockTestJob {
+            data: "hello".into(),
+        })
+        .unwrap();
+
+        let job = QueuedJob {
+            id: "job-123".to_string(),
+            name: BlockTestJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(10)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: None,
+            lease_token: None,
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(10),
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(Some(job)),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+        });
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = JobRegistry::new();
+        registry.register(BlockTestHandler {
+            executions: Arc::clone(&executions),
+        });
+
+        let worker = JobWorker::new(queue.clone(), Arc::new(registry));
+        let handle = worker.start();
+
+        // 1. Wait until the worker has entered dequeue_for and is actively suspended
+        enter_rx.recv().await.expect("worker entered dequeue_for");
+
+        // 2. Concurrently initiate drain
+        let drain_worker = worker.clone();
+        let drain_task = tokio::spawn(async move {
+            drain_worker.drain(Duration::from_secs(2)).await
+        });
+
+        // Small yield so drain sets is_stopping
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // 3. Release dequeue_for so it returns the job
+        release_tx.send(()).await.expect("released dequeue");
+
+        // 4. Drain should complete cleanly and return true
+        let drained = drain_task.await.expect("drain task");
+        assert!(drained, "worker should drain cleanly within timeout");
+
+        // 5. Verify task handle is finished
+        assert!(handle.is_finished());
+
+        // 6. Guarantee that no new job started after draining began!
+        assert_eq!(executions.load(Ordering::SeqCst), 0, "job must not execute after drain requested");
+
+        // 7. Verify the returned job was immediately nack'd back to queue
+        assert_eq!(nack_count.load(Ordering::SeqCst), 1, "unstarted job must be nack'd immediately");
     }
 }

@@ -60,24 +60,24 @@ async fn test_postgres_pool_lifecycle_and_health() {
     assert_eq!(health.status, HealthStatus::Ok, "pool should be healthy");
 
     // Acquire and release leases
-    assert_eq!(pool.status().active_connections, 0);
+    assert_eq!(pool.status().leased_connections, 0);
     {
         let lease1 = pool
             .acquire_lease_timeout(Duration::from_millis(500))
             .await
             .expect("should acquire lease 1");
-        assert_eq!(pool.status().active_connections, 1);
+        assert_eq!(pool.status().leased_connections, 1);
 
         let _lease2 = pool
             .acquire_lease_timeout(Duration::from_millis(500))
             .await
             .expect("should acquire lease 2");
-        assert_eq!(pool.status().active_connections, 2);
+        assert_eq!(pool.status().leased_connections, 2);
 
         drop(lease1);
-        assert_eq!(pool.status().active_connections, 1);
+        assert_eq!(pool.status().leased_connections, 1);
     }
-    assert_eq!(pool.status().active_connections, 0);
+    assert_eq!(pool.status().leased_connections, 0);
 
     // Verify graceful closure
     let closed = pool.close_and_drain(Duration::from_millis(500)).await;

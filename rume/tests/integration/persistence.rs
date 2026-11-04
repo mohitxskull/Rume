@@ -19,6 +19,7 @@ async fn pool_lifecycle_and_capacity_limits() {
     let pool = DatabasePool::new(db, config);
 
     let status = pool.status();
+    assert_eq!(status.leased_connections, 0);
     assert_eq!(status.active_connections, 0);
     assert_eq!(status.total_connections, 1);
     assert_eq!(status.max_connections, 2);
@@ -26,11 +27,13 @@ async fn pool_lifecycle_and_capacity_limits() {
 
     // Acquire lease 1
     let lease1 = pool.acquire_lease().expect("lease 1 should succeed");
-    assert_eq!(pool.status().active_connections, 1);
+    assert_eq!(pool.status().leased_connections, 1);
+    assert_eq!(pool.status().active_connections, 0);
 
     // Acquire lease 2
     let lease2 = pool.acquire_lease().expect("lease 2 should succeed");
-    assert_eq!(pool.status().active_connections, 2);
+    assert_eq!(pool.status().leased_connections, 2);
+    assert_eq!(pool.status().active_connections, 0);
 
     // Pool is now at max capacity; next acquisition must fail with PoolExhausted
     let lease3 = pool.acquire_lease();
@@ -44,14 +47,14 @@ async fn pool_lifecycle_and_capacity_limits() {
 
     // Dropping lease 2 frees capacity
     drop(lease2);
-    assert_eq!(pool.status().active_connections, 1);
+    assert_eq!(pool.status().leased_connections, 1);
 
     let lease2_retry = pool.acquire_lease().expect("should acquire after release");
-    assert_eq!(pool.status().active_connections, 2);
+    assert_eq!(pool.status().leased_connections, 2);
 
     drop(lease1);
     drop(lease2_retry);
-    assert_eq!(pool.status().active_connections, 0);
+    assert_eq!(pool.status().leased_connections, 0);
 
     // Closing the pool prevents further acquisitions
     pool.close();

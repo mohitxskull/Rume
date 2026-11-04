@@ -22,14 +22,13 @@ use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 pub struct PoolStatus {
     /// Logical connection leases currently held by application callers via `acquire_lease`.
     pub leased_connections: u32,
-    /// Physical active (busy) connections in the underlying driver pool (`total - idle`),
-    /// or equal to `leased_connections` if in-memory/mock backend without a separate pool.
+    /// Physical active (busy) connections in the underlying driver pool (`total - idle`).
     pub active_connections: u32,
     /// Physical idle connections available in the underlying driver pool.
     pub idle_connections: u32,
-    /// Physical total connections opened by the underlying driver pool.
+    /// Physical total opened connections in the underlying driver pool.
     pub total_connections: u32,
-    /// Configured maximum connection limit.
+    /// Configured maximum connection capacity.
     pub max_connections: u32,
     /// In-flight transaction handles.
     pub in_flight_transactions: u32,
@@ -122,9 +121,10 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         let idle = self.backend.pool_idle();
         self.total_connections.store(total, Ordering::Relaxed);
         let leased = self.active_connections.load(Ordering::Relaxed);
+        let active = total.saturating_sub(idle);
         PoolStatus {
             leased_connections: leased,
-            active_connections: leased,
+            active_connections: active,
             idle_connections: idle,
             total_connections: total,
             max_connections: self.config.max_connections,

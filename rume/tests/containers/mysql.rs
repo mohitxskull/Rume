@@ -38,7 +38,7 @@ async fn test_mysql_pool_lifecycle_and_ping() {
 
     let pool = DatabasePool::new(backend.clone(), config);
     let _lease = pool.acquire_lease().expect("acquire lease");
-    assert_eq!(pool.status().active_connections, 1);
+    assert_eq!(pool.status().leased_connections, 1);
 }
 
 #[tokio::test]

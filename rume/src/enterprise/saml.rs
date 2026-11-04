@@ -1,8 +1,14 @@
 //! SAML 2.0 assertion parsing, claim extraction, and condition validation.
 //!
 //! **Stability: Experimental.**
-//! This module is currently experimental while cryptographic trust boundaries and XMLDSig
+//! This module is experimental while cryptographic trust boundaries and XMLDSig
 //! verification continue hardening.
+//!
+//! > [!WARNING]
+//! > **Non-Production Experimental Status**: The `SamlSignatureVerifier` interface mandates exact-assertion
+//! > binding, but built-in implementations are development/test doubles. Do not promote or rely on this
+//! > module as a production-supported authentication path until genuine cryptographic XMLDSig verification
+//! > against real IdP certificates and adversarial wrapping test fixtures is formally certified.
 
 use std::collections::BTreeMap;
 use quick_xml::events::Event;
