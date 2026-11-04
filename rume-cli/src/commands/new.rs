@@ -182,12 +182,31 @@ fn run_inner(name: &str, rume_dependency: &str) -> Result<(), NewError> {
 }
 
 fn validate_name(name: &str) -> Result<(), NewError> {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
+    if name.is_empty() {
         return Err(NewError::InvalidName(name.to_string()));
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return Err(NewError::InvalidName(format!(
+            "project name `{name}` must start with an ASCII letter or underscore"
+        )));
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return Err(NewError::InvalidName(name.to_string()));
+    }
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    const RESERVED_KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+    ];
+    if RESERVED_KEYWORDS.contains(&normalized.as_str()) {
+        return Err(NewError::InvalidName(format!(
+            "project name `{name}` is a reserved Rust keyword"
+        )));
     }
     Ok(())
 }
@@ -223,6 +242,11 @@ mod tests {
         assert!(validate_name("").is_err());
         assert!(validate_name("demo app").is_err());
         assert!(validate_name("demo/app").is_err());
+        assert!(validate_name("2fa").is_err());
+        assert!(validate_name("404").is_err());
+        assert!(validate_name("type").is_err());
+        assert!(validate_name("match").is_err());
+        assert!(validate_name("-app").is_err());
     }
 
     #[test]

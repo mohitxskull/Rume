@@ -178,6 +178,46 @@ impl DatabaseBackend for SqliteBackend {
         })
     }
 
+    fn record_audit_log(
+        &self,
+        id: &str,
+        action: &str,
+        resource: &str,
+        status: &str,
+        actor_id: Option<&str>,
+        target_id: Option<&str>,
+        ip_address: Option<&str>,
+        metadata: &str,
+        created_at: i64,
+    ) -> BoxFuture<'_, Result<(), PersistenceError>> {
+        let id = id.to_string();
+        let action = action.to_string();
+        let resource = resource.to_string();
+        let status = status.to_string();
+        let actor_id = actor_id.map(|s| s.to_string());
+        let target_id = target_id.map(|s| s.to_string());
+        let ip_address = ip_address.map(|s| s.to_string());
+        let metadata = metadata.to_string();
+        Box::pin(async move {
+            sqlx::query(
+                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
+            )
+            .bind(id)
+            .bind(action)
+            .bind(resource)
+            .bind(status)
+            .bind(actor_id)
+            .bind(target_id)
+            .bind(ip_address)
+            .bind(metadata)
+            .bind(created_at)
+            .execute(&self.pool)
+            .await
+            .map_err(map_sqlx_error)?;
+            Ok(())
+        })
+    }
+
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
         Box::pin(async move {
             let tx = self

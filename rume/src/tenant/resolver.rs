@@ -78,6 +78,24 @@ impl HeaderTenantResolver {
             )));
         }
 
+        // Cross-namespace collision checks (prevent shadowing):
+        if let Some(existing) = id_map.get(&tenant.slug)
+            && existing.id != tenant.id
+        {
+            return Err(TenantError::Conflict(format!(
+                "tenant slug '{}' conflicts with existing tenant ID for '{}'",
+                tenant.slug, existing.id
+            )));
+        }
+        if let Some(existing) = slug_map.get(&tenant.id)
+            && existing.id != tenant.id
+        {
+            return Err(TenantError::Conflict(format!(
+                "tenant ID '{}' conflicts with existing tenant slug for '{}'",
+                tenant.id, existing.id
+            )));
+        }
+
         id_map.insert(tenant.id.clone(), tenant.clone());
         slug_map.insert(tenant.slug.clone(), tenant);
         Ok(())
@@ -156,10 +174,28 @@ impl SubdomainTenantResolver {
         }
     }
 
+    /// Attempts to register a tenant associated with a subdomain slug, returning an error on conflict.
+    pub fn try_add_tenant(&self, tenant: Tenant) -> Result<(), TenantError> {
+        let mut map = self
+            .tenants
+            .write()
+            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+        if let Some(existing) = map.get(&tenant.slug)
+            && existing.id != tenant.id
+        {
+            return Err(TenantError::Conflict(format!(
+                "subdomain slug '{}' already registered to tenant '{}'",
+                tenant.slug, existing.id
+            )));
+        }
+        map.insert(tenant.slug.clone(), tenant);
+        Ok(())
+    }
+
     /// Registers a tenant associated with a subdomain slug.
     pub fn add_tenant(self, tenant: Tenant) -> Self {
-        if let Ok(mut map) = self.tenants.write() {
-            map.insert(tenant.slug.clone(), tenant);
+        if let Err(e) = self.try_add_tenant(tenant) {
+            tracing::error!("Failed to add tenant: {e}");
         }
         self
     }
@@ -325,55 +361,18 @@ mod tests {
         let tenant1 = Tenant::new("t-001", "acme");
         let tenant2 = Tenant::new("acme", "globex");
 
-        let resolver = HeaderTenantResolver::new()
-            .add_tenant(tenant1.clone())
-            .add_tenant(tenant2.clone());
-
-        // Querying "acme" resolves Tenant 2 by ID
-        let (parts_acme, _) = Request::builder()
-            .header("x-tenant-id", "acme")
-            .body(())
-            .unwrap()
-            .into_parts();
-        let res_acme = resolver.resolve(&parts_acme).await.expect("resolution ok");
-        assert_eq!(res_acme, Some(tenant2.clone()));
-
-        // Querying "t-001" resolves Tenant 1 by ID
-        let (parts_t1, _) = Request::builder()
-            .header("x-tenant-id", "t-001")
-            .body(())
-            .unwrap()
-            .into_parts();
-        let res_t1 = resolver.resolve(&parts_t1).await.expect("resolution ok");
-        assert_eq!(res_t1, Some(tenant1.clone()));
+        let resolver = HeaderTenantResolver::new();
+        assert!(resolver.try_add_tenant(tenant1.clone()).is_ok());
+        // Colliding ID with existing slug fails closed with Conflict
+        let conflict_err1 = resolver.try_add_tenant(tenant2.clone()).unwrap_err();
+        assert!(matches!(conflict_err1, TenantError::Conflict(_)));
 
         // Reversed registration order: Tenant 2 registered before Tenant 1.
-        // Adding Tenant 1 with slug "acme" must not overwrite Tenant 2 whose ID is "acme".
-        let resolver_rev = HeaderTenantResolver::new()
-            .add_tenant(tenant2.clone())
-            .add_tenant(tenant1.clone());
-
-        let (parts_acme_rev, _) = Request::builder()
-            .header("x-tenant-id", "acme")
-            .body(())
-            .unwrap()
-            .into_parts();
-        let res_acme_rev = resolver_rev
-            .resolve(&parts_acme_rev)
-            .await
-            .expect("resolution ok");
-        assert_eq!(res_acme_rev, Some(tenant2));
-
-        let (parts_t1_rev, _) = Request::builder()
-            .header("x-tenant-id", "t-001")
-            .body(())
-            .unwrap()
-            .into_parts();
-        let res_t1_rev = resolver_rev
-            .resolve(&parts_t1_rev)
-            .await
-            .expect("resolution ok");
-        assert_eq!(res_t1_rev, Some(tenant1));
+        // Adding Tenant 1 with slug "acme" must fail closed with Conflict against Tenant 2 whose ID is "acme".
+        let resolver_rev = HeaderTenantResolver::new();
+        assert!(resolver_rev.try_add_tenant(tenant2).is_ok());
+        let conflict_err2 = resolver_rev.try_add_tenant(tenant1).unwrap_err();
+        assert!(matches!(conflict_err2, TenantError::Conflict(_)));
     }
 
     #[tokio::test]

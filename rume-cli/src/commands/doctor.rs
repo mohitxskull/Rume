@@ -96,7 +96,7 @@ pub fn run(format: &str) {
     });
 
     // Port availability
-    let port_result = match env::ResolvedEnv::load() {
+    let (port_result, port_ok) = match env::ResolvedEnv::load() {
         Ok(resolved) => {
             let port = resolved
                 .get("PORT")
@@ -108,19 +108,21 @@ pub fn run(format: &str) {
                 .unwrap_or(std::net::IpAddr::from([127, 0, 0, 1]));
 
             match std::net::TcpListener::bind((host, port)) {
-                Ok(_) => format!("port {port} is available"),
+                Ok(_) => (format!("port {port} is available"), true),
                 Err(err) => {
                     ok = false;
-                    format!("port {port} is in use: {err} (stop the process or change PORT)")
+                    (
+                        format!("port {port} is in use: {err} (stop the process or change PORT)"),
+                        false,
+                    )
                 }
             }
         }
         Err(err) => {
             ok = false;
-            format!("error: {err}")
+            (format!("error: {err}"), false)
         }
     };
-    let port_ok = port_result.starts_with("port ");
     checks.push(DoctorCheck {
         label: "port availability".to_string(),
         status: port_result,

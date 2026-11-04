@@ -80,29 +80,29 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group G — Audit Logging & Persistence Parity (solve together)
 > Root cause: `SqlAuditLogger` relies on string concatenation and hardcodes PostgreSQL DDL across all database backends.
 
-- [ ] **Security M4 — `SqlAuditLogger` unparameterized queries & hardcoded PostgreSQL DDL** (`security-protocols.md` M4).
+- [x] **Security M4 — `SqlAuditLogger` unparameterized queries & hardcoded PostgreSQL DDL** (`security-protocols.md` M4).
       `rume/src/security/audit.rs:76–112`: Uses unescaped string formatting and executes PostgreSQL-specific schema on MySQL and SQLite. Rewrite using parameterized queries and dialect-specific DDL.
-- [ ] **Pool M1 — `DatabasePool::close_and_drain` does not close backend pools** (`pool-lifecycle-persistence.md` M1).
+- [x] **Pool M1 — `DatabasePool::close_and_drain` does not close backend pools** (`pool-lifecycle-persistence.md` M1).
       `rume/src/persistence/pool.rs:120–145`: Closes pool handle without terminating underlying database backend driver connections. Invoke `self.backend.close().await` inside `close_and_drain`.
-- [ ] **Outbox M1 — `outbox_insert.sql` lacks conflict handling** (`outbox-data-integrity.md` M1).
+- [x] **Outbox M1 — `outbox_insert.sql` lacks conflict handling** (`outbox-data-integrity.md` M1).
       `rume/src/persistence/sql/{postgres,mysql,sqlite}/outbox_insert.sql`: Re-inserting existing message ID fails on primary key. Add `ON CONFLICT (id) DO NOTHING` (or `INSERT IGNORE`).
-- [ ] **Outbox M2 — Saga rollback ignores compensation errors** (`outbox-data-integrity.md` M2).
+- [x] **Outbox M2 — Saga rollback ignores compensation errors** (`outbox-data-integrity.md` M2).
       `rume/src/saga/mod.rs:85–102`: Swallows step compensation errors during saga abort. Track and return `CompensationFailed` error details.
-- [ ] **Coordination M6 — PostgreSQL leader `try_acquire` candidate ID divergence** (`coordination-multi-tenant.md` M6).
+- [x] **Coordination M6 — PostgreSQL leader `try_acquire` candidate ID divergence** (`coordination-multi-tenant.md` M6).
       `rume/src/coordination/postgres.rs:167–182`: `OR rume_leaders.candidate_id = $2` diverges from Redis term semantics and self-fences. Align incumbent re-acquisition with Redis term semantics.
-- [ ] **Coordination M7 — Tenant registration admits silent collisions** (`coordination-multi-tenant.md` M7).
+- [x] **Coordination M7 — Tenant registration admits silent collisions** (`coordination-multi-tenant.md` M7).
       `rume/src/tenant/resolver.rs:188–205`: Slug/ID shadowing logs warning and continues. Return `TenantError::Conflict` on any duplicate identifier or subdomain registration.
 
 ### Group H — CLI Component Generation & Diagnostics (solve together)
 > Root cause: CLI generators lack input identifier validation, atomic rollback, and non-TTY error handling.
 
-- [ ] **CLI M2 — `rume doctor` port availability check reports false-positive** (`dx-cli.md` M2).
+- [x] **CLI M2 — `rume doctor` port availability check reports false-positive** (`dx-cli.md` M2).
       `rume-cli/src/commands/doctor.rs:45–58`: `starts_with("port ")` matches error `"port 3000 is in use"`, reporting `ok: true`. Check `TcpListener::bind` success explicitly.
-- [ ] **CLI M3 — Component generators accept non-identifier names** (`dx-cli.md` M3).
+- [x] **CLI M3 — Component generators accept non-identifier names** (`dx-cli.md` M3).
       `rume-cli/src/commands/new.rs:88–102`: Allows digit-prefixed and non-identifier names (`2fa`, `404`), generating invalid Rust syntax. Validate names against Rust identifier grammar (`[a-zA-Z_][a-zA-Z0-9_]*`).
-- [ ] **CLI M4 — Non-transactional component generation leaves orphans** (`dx-cli.md` M4).
+- [x] **CLI M4 — Non-transactional component generation leaves orphans** (`dx-cli.md` M4).
       `rume-cli/src/commands/new.rs:120–145`: Route marker insertion failure leaves orphaned handler files on disk. Implement atomic generation with cleanup rollback on write failure.
-- [ ] **CLI M5 — Interactive prompts swallow Ctrl+C in non-TTY environments** (`dx-cli.md` M5).
+- [x] **CLI M5 — Interactive prompts swallow Ctrl+C in non-TTY environments** (`dx-cli.md` M5).
       `rume-cli/src/prompts.rs:25–48`: Hangs or swallows cancellation in headless CI/CD. Check `io::stdin().is_terminal()`; fail closed with descriptive error in non-interactive environments.
 
 ### Group I — Application Lifecycle Shutdown & Health Probe Stampede (solve together)

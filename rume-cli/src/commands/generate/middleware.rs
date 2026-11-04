@@ -3,14 +3,7 @@ use std::fs;
 const TEMPLATE: &str = include_str!("../../../templates/src/middleware.rs.tpl");
 
 pub fn run(name: &str) {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        eprintln!("error: middleware name must contain only letters, numbers, '-' or '_'");
-        std::process::exit(1);
-    }
+    super::validate_identifier(name, "middleware");
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
 

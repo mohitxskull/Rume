@@ -221,3 +221,91 @@ async fn test_saga_compensation_failure() {
         _ => panic!("expected SagaStatus::CompensationFailed"),
     }
 }
+
+#[tokio::test]
+async fn test_saga_multi_step_partial_compensation_runs_all_steps() {
+    let saga = Saga::new("multi_step_compensation")
+        .step(
+            "step_1",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_compensated".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_2",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_2_done".into());
+                async { Ok(()) }
+            },
+            |_ctx: &mut OrderContext| async {
+                Err(SagaError::CompensationFailed {
+                    step: "step_2".into(),
+                    message: "gateway down".into(),
+                })
+            },
+        )
+        .step(
+            "step_3",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_3_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_3_compensated".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_4_fails",
+            |_ctx: &mut OrderContext| async {
+                Err(SagaError::ActionFailed {
+                    step: "step_4_fails".into(),
+                    message: "terminal failure".into(),
+                })
+            },
+            |_ctx: &mut OrderContext| async { Ok(()) },
+        );
+
+    let initial = OrderContext::default();
+    let report = saga.run(initial).await;
+
+    // Even though step_2 compensation failed, step_3 AND step_1 compensations MUST run!
+    assert!(matches!(report.status, SagaStatus::CompensationFailed { .. }));
+    assert!(report.context.events.contains(&"step_3_compensated".to_string()));
+    assert!(report.context.events.contains(&"step_1_compensated".to_string()));
+}
+
+#[tokio::test]
+async fn test_saga_step_panic_isolation() {
+    let saga = Saga::new("panic_isolation_saga")
+        .step(
+            "step_1",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_compensated".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_2_panics",
+            |_ctx: &mut OrderContext| async {
+                panic!("critical invariant broken in action!");
+            },
+            |_ctx: &mut OrderContext| async { Ok(()) },
+        );
+
+    let initial = OrderContext::default();
+    let report = saga.run(initial).await;
+
+    // Panic must not crash thread; must compensate step 1
+    assert!(matches!(report.status, SagaStatus::Compensated { .. }));
+    assert!(report.context.events.contains(&"step_1_compensated".to_string()));
+}

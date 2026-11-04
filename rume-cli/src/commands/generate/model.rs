@@ -3,14 +3,7 @@ use std::fs;
 const TEMPLATE: &str = include_str!("../../../templates/src/model.rs.tpl");
 
 pub fn run(name: &str) {
-    if name.is_empty()
-        || !name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-    {
-        eprintln!("error: model name must contain only letters, numbers, '-' or '_'");
-        std::process::exit(1);
-    }
+    super::validate_identifier(name, "model");
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
     let struct_name = rume::helpers::pascal_case(&module_name);

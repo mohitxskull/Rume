@@ -4,6 +4,39 @@ mod model;
 mod resource;
 mod service;
 
+pub(crate) fn validate_identifier(name: &str, entity_type: &str) {
+    if name.is_empty() {
+        eprintln!("error: {entity_type} name cannot be empty");
+        std::process::exit(1);
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        eprintln!(
+            "error: {entity_type} name `{name}` must start with an ASCII letter or underscore"
+        );
+        std::process::exit(1);
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        eprintln!(
+            "error: {entity_type} name `{name}` must contain only letters, numbers, '-' or '_'"
+        );
+        std::process::exit(1);
+    }
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    const RESERVED_KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+    ];
+    if RESERVED_KEYWORDS.contains(&normalized.as_str()) {
+        eprintln!("error: {entity_type} name `{name}` is a reserved Rust keyword");
+        std::process::exit(1);
+    }
+}
+
 pub fn run(kind: Option<&str>, name: Option<&str>) {
     let Some(kind) = kind else {
         println!("Available generators:");

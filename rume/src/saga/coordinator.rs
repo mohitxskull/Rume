@@ -1,7 +1,10 @@
 //! Saga workflow coordinator and runner.
 
 use std::fmt::Debug;
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
+
+use futures_util::FutureExt;
 
 use crate::saga::error::SagaError;
 use crate::saga::step::{FunctionalStep, Step};
@@ -90,32 +93,74 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let mut compensated_names = Vec::new();
 
         for (idx, step) in self.steps.iter().enumerate() {
-            match step.execute(&mut ctx).await {
+            let res = AssertUnwindSafe(step.execute(&mut ctx)).catch_unwind().await;
+            let step_result = match res {
+                Ok(r) => r,
+                Err(payload) => {
+                    let msg = payload
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                        .unwrap_or("step execution panicked");
+                    Err(SagaError::Aborted {
+                        saga: self.name.clone(),
+                        reason: format!("panic in step '{}': {msg}", step.name()),
+                    })
+                }
+            };
+
+            match step_result {
                 Ok(()) => {
                     completed_indices.push(idx);
                     completed_names.push(step.name().to_string());
                 }
                 Err(err) => {
                     // Forward execution failed. Run compensation in reverse order.
+                    let mut first_comp_error = None;
                     for &prev_idx in completed_indices.iter().rev() {
                         let prev_step = &self.steps[prev_idx];
-                        if let Err(comp_err) = prev_step.compensate(&mut ctx).await {
-                            return SagaReport {
-                                context: ctx,
-                                status: SagaStatus::CompensationFailed {
-                                    error: err,
-                                    compensation_error: comp_err,
-                                },
-                                completed_steps: completed_names,
-                                compensated_steps: compensated_names,
-                            };
+                        let comp_res = AssertUnwindSafe(prev_step.compensate(&mut ctx))
+                            .catch_unwind()
+                            .await;
+                        let comp_outcome = match comp_res {
+                            Ok(r) => r,
+                            Err(payload) => {
+                                let msg = payload
+                                    .downcast_ref::<&str>()
+                                    .copied()
+                                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                                    .unwrap_or("compensation panicked");
+                                Err(SagaError::Aborted {
+                                    saga: self.name.clone(),
+                                    reason: format!("panic in compensation for step '{}': {msg}", prev_step.name()),
+                                })
+                            }
+                        };
+
+                        match comp_outcome {
+                            Ok(()) => {
+                                compensated_names.push(prev_step.name().to_string());
+                            }
+                            Err(comp_err) => {
+                                if first_comp_error.is_none() {
+                                    first_comp_error = Some(comp_err);
+                                }
+                            }
                         }
-                        compensated_names.push(prev_step.name().to_string());
                     }
+
+                    let status = if let Some(compensation_error) = first_comp_error {
+                        SagaStatus::CompensationFailed {
+                            error: err,
+                            compensation_error,
+                        }
+                    } else {
+                        SagaStatus::Compensated { error: err }
+                    };
 
                     return SagaReport {
                         context: ctx,
-                        status: SagaStatus::Compensated { error: err },
+                        status,
                         completed_steps: completed_names,
                         compensated_steps: compensated_names,
                     };

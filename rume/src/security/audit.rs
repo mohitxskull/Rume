@@ -121,18 +121,35 @@ pub struct SqlAuditLogger<B: DatabaseBackend> {
 }
 
 impl<B: DatabaseBackend> SqlAuditLogger<B> {
-    /// Schema DDL for audit log table.
-    pub const SCHEMA: &'static str = include_str!("../persistence/sql/postgres/audit_schema.sql");
+    /// Schema DDL for audit log table in PostgreSQL.
+    pub const POSTGRES_SCHEMA: &'static str = include_str!("../persistence/sql/postgres/audit_schema.sql");
+    /// Schema DDL for audit log table in MySQL.
+    pub const MYSQL_SCHEMA: &'static str = include_str!("../persistence/sql/mysql/audit_schema.sql");
+    /// Schema DDL for audit log table in SQLite.
+    pub const SQLITE_SCHEMA: &'static str = include_str!("../persistence/sql/sqlite/audit_schema.sql");
+
+    /// Backward compatibility alias.
+    pub const SCHEMA: &'static str = Self::POSTGRES_SCHEMA;
+
+    /// Returns the schema DDL for the specified dialect.
+    pub fn schema_for_dialect(dialect: &str) -> &'static str {
+        match dialect {
+            "mysql" => Self::MYSQL_SCHEMA,
+            "sqlite" => Self::SQLITE_SCHEMA,
+            _ => Self::POSTGRES_SCHEMA,
+        }
+    }
 
     /// Creates a new SQL audit logger.
     pub fn new(backend: B) -> Self {
         Self { backend }
     }
 
-    /// Initializes the audit log database table.
+    /// Initializes the audit log database table using dialect-specific DDL.
     pub async fn init_table(&self) -> Result<(), AuditError> {
+        let schema = Self::schema_for_dialect(self.backend.dialect());
         self.backend
-            .execute(Self::SCHEMA)
+            .execute(schema)
             .await
             .map_err(|e| AuditError::Sink(e.to_string()))?;
         Ok(())
@@ -155,31 +172,9 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     }
 }
 
-fn escape_sql_literal(s: &str, is_mysql: bool) -> String {
-    let mut out = String::with_capacity(s.len() + 8);
-    out.push('\'');
-    for c in s.chars() {
-        match c {
-            '\'' => out.push_str("''"),
-            '\\' if is_mysql => out.push_str("\\\\"),
-            '\0' if is_mysql => out.push_str("\\0"),
-            '\n' if is_mysql => out.push_str("\\n"),
-            '\r' if is_mysql => out.push_str("\\r"),
-            '\x1a' if is_mysql => out.push_str("\\Z"),
-            other => out.push(other),
-        }
-    }
-    out.push('\'');
-    out
-}
-
 impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
     fn record<'a>(&'a self, record: AuditRecord) -> AuditFuture<'a> {
         Box::pin(async move {
-            let is_mysql = self.backend.dialect() == "mysql";
-            let esc = |val: &str| escape_sql_literal(val, is_mysql);
-
-            let id = esc(&record.id);
             let status_str = match record.status {
                 AuditStatus::Success => "success",
                 AuditStatus::Denied => "denied",
@@ -192,34 +187,22 @@ impl<B: DatabaseBackend> AuditLogger for SqlAuditLogger<B> {
                 .collect();
             let meta_json = serde_json::to_string(&redacted_metadata)
                 .map_err(|e| AuditError::Sink(e.to_string()))?;
-            let actor_val = record
-                .actor_id
-                .as_deref()
-                .map(esc)
-                .unwrap_or_else(|| "NULL".to_string());
-            let target_val = record
-                .target_id
-                .as_deref()
-                .map(esc)
-                .unwrap_or_else(|| "NULL".to_string());
-            let ip_val = record
-                .ip_address
-                .as_deref()
-                .map(esc)
-                .unwrap_or_else(|| "NULL".to_string());
-            let meta_val = esc(&meta_json);
-            let action = esc(&record.action);
-            let resource = esc(&record.target_type);
-
-            let stmt = format!(
-                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ({id}, {action}, {resource}, '{status_str}', {actor_val}, {target_val}, {ip_val}, {meta_val}, {})",
-                record.timestamp_ms
-            );
 
             self.backend
-                .execute(&stmt)
+                .record_audit_log(
+                    &record.id,
+                    &record.action,
+                    &record.target_type,
+                    status_str,
+                    record.actor_id.as_deref(),
+                    record.target_id.as_deref(),
+                    record.ip_address.as_deref(),
+                    &meta_json,
+                    record.timestamp_ms as i64,
+                )
                 .await
                 .map_err(|e| AuditError::Sink(e.to_string()))?;
+
             Ok(())
         })
     }

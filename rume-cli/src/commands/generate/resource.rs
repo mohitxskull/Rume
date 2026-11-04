@@ -1,10 +1,7 @@
 use std::fs;
 
 pub fn run(name: &str) {
-    if !validate_name(name) {
-        eprintln!("error: resource name must contain only letters, numbers, '-' or '_'");
-        std::process::exit(1);
-    }
+    super::validate_identifier(name, "resource");
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
     let struct_name = rume::helpers::pascal_case(&module_name);
@@ -14,6 +11,54 @@ pub fn run(name: &str) {
         eprintln!("error: handler `{module_name}` already exists");
         std::process::exit(1);
     }
+
+    // Pre-flight check: ensure routes.rs is present and has the marker BEFORE creating files
+    let routes_path = "src/routes.rs";
+    let route_lines = [
+        format!(
+            "    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n",
+            name = name,
+            module_name = module_name
+        ),
+        format!(
+            "    router = router.get(\"/{name}/{{id}}\", crate::handlers::{module_name}::show);\n",
+            name = name,
+            module_name = module_name
+        ),
+        format!(
+            "    router = router.post(\"/{name}\", crate::handlers::{module_name}::create);\n",
+            name = name,
+            module_name = module_name
+        ),
+        format!(
+            "    router = router.put(\"/{name}/{{id}}\", crate::handlers::{module_name}::update);\n",
+            name = name,
+            module_name = module_name
+        ),
+        format!(
+            "    router = router.delete(\"/{name}/{{id}}\", crate::handlers::{module_name}::destroy);\n",
+            name = name,
+            module_name = module_name
+        ),
+    ];
+    let routes_len: usize = route_lines.iter().map(|line| line.len()).sum();
+    let routes_content = match fs::read_to_string(routes_path) {
+        Ok(existing) => {
+            if !existing.contains(&route_lines[0]) && !existing.contains("    // rume:routes") {
+                eprintln!(
+                    "error: could not find route marker `// rume:routes` in {routes_path}; \
+                     add the marker or register the routes manually"
+                );
+                std::process::exit(1);
+            }
+            Some(existing)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+        Err(err) => {
+            eprintln!("error: failed to read {routes_path}: {err}");
+            std::process::exit(1);
+        }
+    };
 
     let content = format!(
         r#"use axum::Json;
@@ -94,84 +139,52 @@ pub async fn destroy(Path(id): Path<String>) -> Json<{struct_name}DestroyRespons
         std::process::exit(1);
     }
 
-    // Register the module.
+    // Register the module with rollback on error.
     let mod_path = "src/handlers/mod.rs";
     let mod_entry = format!("pub mod {module_name};\n");
-    match fs::read_to_string(mod_path) {
-        Ok(existing) if !existing.contains(&mod_entry) => {
-            if let Err(err) = fs::write(mod_path, format!("{existing}{mod_entry}")) {
+    let prev_mod_content = match fs::read_to_string(mod_path) {
+        Ok(existing) => {
+            if !existing.contains(&mod_entry)
+                && let Err(err) = fs::write(mod_path, format!("{existing}{mod_entry}"))
+            {
+                let _ = fs::remove_file(&handler_path);
                 eprintln!("error: failed to update {mod_path}: {err}");
                 std::process::exit(1);
             }
+            Some(existing)
         }
-        Ok(_) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if let Err(err) = fs::write(mod_path, &mod_entry) {
+                let _ = fs::remove_file(&handler_path);
                 eprintln!("error: failed to create {mod_path}: {err}");
                 std::process::exit(1);
             }
+            None
         }
         Err(err) => {
+            let _ = fs::remove_file(&handler_path);
             eprintln!("error: failed to read {mod_path}: {err}");
             std::process::exit(1);
         }
-    }
+    };
 
-    // Register the routes.
-    let routes_path = "src/routes.rs";
-    let route_lines = [
-        format!(
-            "    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n",
-            name = name,
-            module_name = module_name
-        ),
-        format!(
-            "    router = router.get(\"/{name}/{{id}}\", crate::handlers::{module_name}::show);\n",
-            name = name,
-            module_name = module_name
-        ),
-        format!(
-            "    router = router.post(\"/{name}\", crate::handlers::{module_name}::create);\n",
-            name = name,
-            module_name = module_name
-        ),
-        format!(
-            "    router = router.put(\"/{name}/{{id}}\", crate::handlers::{module_name}::update);\n",
-            name = name,
-            module_name = module_name
-        ),
-        format!(
-            "    router = router.delete(\"/{name}/{{id}}\", crate::handlers::{module_name}::destroy);\n",
-            name = name,
-            module_name = module_name
-        ),
-    ];
-    let routes_len: usize = route_lines.iter().map(|line| line.len()).sum();
-    match fs::read_to_string(routes_path) {
-        Ok(existing) => {
-            if existing.contains(&route_lines[0]) {
-                // Already registered.
-            } else if let Some(marker) = existing.find("    // rume:routes") {
-                let mut updated = String::with_capacity(existing.len() + routes_len);
-                updated.push_str(&existing[..marker]);
-                for line in &route_lines {
-                    updated.push_str(line);
-                }
-                updated.push_str(&existing[marker..]);
-                if let Err(err) = fs::write(routes_path, updated) {
-                    eprintln!("error: failed to update {routes_path}: {err}");
-                    std::process::exit(1);
-                }
-            } else {
-                eprintln!(
-                    "error: could not find route marker `// rume:routes` in {routes_path}; \
-                     add the marker or register the routes manually"
-                );
-                std::process::exit(1);
-            }
+    // Register the routes with rollback on error.
+    if let Some(existing) = routes_content
+        && !existing.contains(&route_lines[0])
+        && let Some(marker) = existing.find("    // rume:routes")
+    {
+        let mut updated = String::with_capacity(existing.len() + routes_len);
+        updated.push_str(&existing[..marker]);
+        for line in &route_lines {
+            updated.push_str(line);
         }
-        Err(err) => {
-            eprintln!("error: failed to read {routes_path}: {err}");
+        updated.push_str(&existing[marker..]);
+        if let Err(err) = fs::write(routes_path, updated) {
+            let _ = fs::remove_file(&handler_path);
+            if let Some(prev) = prev_mod_content {
+                let _ = fs::write(mod_path, prev);
+            }
+            eprintln!("error: failed to update {routes_path}: {err}");
             std::process::exit(1);
         }
     }
@@ -183,10 +196,26 @@ pub async fn destroy(Path(id): Path<String>) -> Json<{struct_name}DestroyRespons
 }
 
 fn validate_name(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    if name.is_empty() {
+        return false;
+    }
+    let mut chars = name.chars();
+    let first = chars.next().unwrap();
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return false;
+    }
+    let normalized = name.to_ascii_lowercase().replace('-', "_");
+    const RESERVED_KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
+        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
+        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
+        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
+    ];
+    !RESERVED_KEYWORDS.contains(&normalized.as_str())
 }
 
 #[cfg(test)]
@@ -199,6 +228,10 @@ mod tests {
         assert!(!validate_name("bad name"));
         assert!(!validate_name("bad/name"));
         assert!(!validate_name("bad.name"));
+        assert!(!validate_name("2fa"));
+        assert!(!validate_name("404"));
+        assert!(!validate_name("type"));
+        assert!(!validate_name("match"));
     }
 
     #[test]

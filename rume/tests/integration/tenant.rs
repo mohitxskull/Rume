@@ -120,49 +120,24 @@ async fn test_subdomain_tenant_resolver() {
 
 #[tokio::test]
 async fn test_header_tenant_resolver_id_and_slug_namespace_isolation() {
+    let resolver = HeaderTenantResolver::new();
+
     // Tenant 1 has slug "acme" with id "t-100"
-    // Tenant 2 has id "acme" with slug "globex"
-    let resolver = HeaderTenantResolver::new()
-        .add_tenant(Tenant::new("t-100", "acme"))
-        .add_tenant(Tenant::new("acme", "globex"));
+    resolver.try_add_tenant(Tenant::new("t-100", "acme")).unwrap();
 
-    let app = Router::new()
-        .route(
-            "/tenant",
-            get(|TenantContext(tenant): TenantContext| async move {
-                Json(serde_json::json!({
-                    "id": tenant.id,
-                    "slug": tenant.slug,
-                }))
-            }),
-        )
-        .layer(TenantLayer::required(resolver));
+    // Cross-namespace collision 1: new tenant with id="acme" collides with existing slug="acme"
+    let err1 = resolver.try_add_tenant(Tenant::new("acme", "globex"));
+    assert!(matches!(err1, Err(rume::tenant::TenantError::Conflict(_))));
 
-    let test_app = TestApp::new(app);
+    // Cross-namespace collision 2: new tenant with slug="t-100" collides with existing id="t-100"
+    let err2 = resolver.try_add_tenant(Tenant::new("t-200", "t-100"));
+    assert!(matches!(err2, Err(rume::tenant::TenantError::Conflict(_))));
 
-    // Request with x-tenant-id: acme should match Tenant 2 by ID first
-    let req = Request::builder()
-        .uri("/tenant")
-        .header("x-tenant-id", "acme")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let res = test_app.request(req).await;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
-    assert_eq!(body["id"], "acme");
-    assert_eq!(body["slug"], "globex");
-
-    // Request with x-tenant-id: t-100 matches Tenant 1 by ID
-    let req = Request::builder()
-        .uri("/tenant")
-        .header("x-tenant-id", "t-100")
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let res = test_app.request(req).await;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body: serde_json::Value = serde_json::from_str(&TestApp::body_text(res).await).unwrap();
-    assert_eq!(body["id"], "t-100");
-    assert_eq!(body["slug"], "acme");
+    // Subdomain resolver conflict check
+    let sub_resolver = rume::tenant::SubdomainTenantResolver::new("example.com");
+    sub_resolver.try_add_tenant(Tenant::new("t-1", "acme")).unwrap();
+    let sub_err = sub_resolver.try_add_tenant(Tenant::new("t-2", "acme"));
+    assert!(matches!(sub_err, Err(rume::tenant::TenantError::Conflict(_))));
 }
 
 #[tokio::test]
