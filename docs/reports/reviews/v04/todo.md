@@ -122,9 +122,9 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group J — Crate Boundaries & Dependency Hygiene (solve together)
 > Root cause: Enterprise XML parser is unconditionally pulled into core library, and crate root re-exports expose internal types.
 
-- [ ] **Architecture M2 — Core crate unconditionally depends on `quick-xml`** (`architecture-module-boundaries.md` M2).
+- [x] **Architecture M2 — Core crate unconditionally depends on `quick-xml`** (`architecture-module-boundaries.md` M2).
       `rume/Cargo.toml:46`: `quick-xml` pulled into minimal builds without enterprise features. Gate `quick-xml` behind an optional `saml` / `enterprise` feature.
-- [ ] **Architecture M3 — Crate root `lib.rs` violates re-export discipline** (`architecture-module-boundaries.md` M3).
+- [x] **Architecture M3 — Crate root `lib.rs` violates re-export discipline** (`architecture-module-boundaries.md` M3).
       `rume/src/lib.rs:35–123`: Flattens 70+ domain types into `rume::*`. Prune root re-exports to core primitives (`Rume`, `AppError`, `Event`); keep subsystem types in their respective modules.
 
 ---

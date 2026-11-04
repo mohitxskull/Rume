@@ -206,8 +206,10 @@ impl Rume<(), (), ()> {
     /// Create a new progressive Rume application with default configuration.
     ///
     /// The application starts with default paths, availability, lifecycle,
-    /// and health checks, and state `()`. Additional modules, state, routes,
-    /// and middleware can be composed progressively.
+    /// health checks, and empty state `()`. Modules encapsulate their own private
+    /// state via `.with_state()` on their sub-routers. Applications requiring custom
+    /// typed global state in [`AppContext`] must initialize via [`AppContext::builder`]
+    /// and [`Rume::builder`].
     #[allow(clippy::new_ret_no_self)]
     pub fn new() -> RumeBuilder<(), (), ()> {
         let paths = ProjectPaths::from_current_dir();

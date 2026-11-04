@@ -1,8 +1,10 @@
 //! Enterprise protocol starters: SCIM 2.0 provisioning and SAML 2.0 assertion validation.
 
+#[cfg(feature = "saml")]
 pub mod saml;
 pub mod scim;
 
+#[cfg(feature = "saml")]
 pub use saml::{
     parse_iso8601_strict, SamlAssertion, SamlError, SamlParser, SamlSignatureVerifier,
 };

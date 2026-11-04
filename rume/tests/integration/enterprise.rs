@@ -28,8 +28,12 @@ fn test_scim_models_and_json_serialization() {
     assert_eq!(err_json["detail"], "User already exists");
 }
 
-#[test]
-fn test_saml_assertion_parsing_and_validation() {
+#[cfg(feature = "saml")]
+mod saml_tests {
+    use super::*;
+
+    #[test]
+    fn test_saml_assertion_parsing_and_validation() {
     let saml_xml = r#"
     <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_abc123" IssueInstant="2026-11-02T12:00:00Z">
         <saml2:Issuer>https://idp.enterprise.com/saml</saml2:Issuer>
@@ -490,4 +494,5 @@ fn test_saml_missing_expiration_fails_closed() {
     let assertion = SamlParser::parse_unverified(saml_xml).unwrap();
     let res = SamlParser::validate(&assertion, 1700000000, Some("https://sp.myapp.io"));
     assert!(matches!(res, Err(SamlError::MissingExpirationCondition)));
+}
 }

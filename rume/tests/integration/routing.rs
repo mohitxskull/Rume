@@ -7,7 +7,7 @@
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use rume::prelude::TestApp;
+use rume::testing::TestApp;
 use rume::routing::{Matcher, RouteGroup, RouteRegistry, RouteSpec};
 use std::collections::BTreeMap;
 

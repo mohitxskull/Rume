@@ -4,7 +4,7 @@
 
 use axum::http::StatusCode;
 use rume::app::{AppContext, Availability, AvailabilityState, ProjectPaths};
-use rume::prelude::{TestApp, TestAppBuilder};
+use rume::testing::{TestApp, TestAppBuilder};
 use rume::routing::{HealthCheck, HealthCheckResult, HealthChecks, HealthStatus, health_routes};
 use std::collections::BTreeMap;
 use std::pin::Pin;

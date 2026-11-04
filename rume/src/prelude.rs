@@ -5,7 +5,7 @@ pub use crate::app::{
     IntoBindAddr, Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder,
 };
 pub use crate::error::AppError;
-pub use crate::module::{Module, ModuleContext, ModuleHarness};
+pub use crate::module::{Module, ModuleContext};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router,
