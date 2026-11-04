@@ -137,6 +137,23 @@ impl AppError {
         }
     }
 
+    /// Creates a 400 Bad Request error with a custom message.
+    pub fn bad_request(msg: impl Into<String>) -> Self {
+        Self::BadRequest {
+            code: "BAD_REQUEST",
+            message: msg.into(),
+        }
+    }
+
+    /// Creates a 404 Not Found error with a custom message.
+    pub fn not_found(msg: impl Into<String>) -> Self {
+        Self::Public {
+            status: StatusCode::NOT_FOUND,
+            code: "NOT_FOUND",
+            message: msg.into(),
+        }
+    }
+
     /// The HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {

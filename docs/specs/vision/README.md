@@ -190,3 +190,4 @@ The phased engineering execution plan for this vision is detailed in **[`ROADMAP
 * **Phase 3: Enterprise Reliability** (`ENT-01` through `ENT-08`) — *Completed & verified*
 * **Phase 4: Framework Maturation** (`MAT-01` through `MAT-03`) — *Completed & verified*
 * **Phase 5: Production Semantics and Integration** (`REL-01` through `REL-07`) — *Completed & verified: genuine persistence, transactional outbox atomicity, shared coordination, and resilient multi-process integration with full failure-injection matrix*
+* **Phase 6: Stabilization through Real-Application Validation** (`STAB-01` through `STAB-05`) — *Completed & verified: reference SaaS application ('Rume Workbench') scaffolded from `rume new`, multi-tenant CRUD, transaction-enlisted outbox, background worker pipeline with Redis deduplication, multi-instance deployment validation, DX friction remediation, and formal public API stability contracts.*

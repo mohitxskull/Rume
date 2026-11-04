@@ -156,6 +156,29 @@ The final milestone of Phase 5 is a comprehensive failure-oriented integration t
 
 ---
 
+## Phase 6 — Stabilization through Real-Application Validation
+
+> **Priority:** P0 · Real-Application Validation & Production Hardening  
+> **Status:** Completed & Verified
+
+This phase proves that Rume is genuinely easier to build and operate with—not just that its individual subsystems pass isolated tests. It builds and exercises a complete multi-tenant SaaS application (**Rume Workbench**) scaffolded directly from `rume new`, auditing developer experience and validating deployment under live concurrency.
+
+### Strategic Tasks
+
+| ID | Task | Acceptance Criteria | Target |
+|---|---|---|---|
+| **STAB-01** | Preflight Telemetry & Supervision | Correct pool telemetry to distinguish physical driver active connections from logical permits; enforce worker task supervision with awaitable drains preventing post-drain job dispatches; add relay health state and error visibility; keep SAML experimental. | **Completed** |
+| **STAB-02** | Reference Application (Rume Workbench) | Scaffold from `rume new` and build multi-tenant project & issue management application: users, orgs, projects, issues, PostgreSQL persistence, migrations, and atomic transactions. | **Completed** |
+| **STAB-03** | End-to-End Outbox & Background Processing | Atomic issue creation + `IssueCreatedEvent` enrollment in single DB transaction; outbox relay claims and dispatches to `SendNotificationJob`; worker executes with retry, DLQ, and Redis idempotency. | **Completed** |
+| **STAB-04** | Developer Experience (DX) Audit & Polish | Remove friction points: relative path resolution in `rume new`, ergonomic `AppError::bad_request` and `AppError::not_found` constructors, unified `Migration::from_sql` builder, and public schema constants. | **Completed** |
+| **STAB-05** | Multi-Instance Deployment Validation | Run two application instances concurrently with real PostgreSQL and Redis containers, verifying cross-tenant isolation, concurrent claiming via `SKIP LOCKED`, zero message duplicates, and graceful shutdown drain. | **Completed** |
+
+**Verification Suites:**
+- [`workbench/tests/workbench_test.rs`](../../../workbench/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, auth/authz, transaction-enlisted outbox, worker processing, and graceful drain).
+- [`workbench/tests/deployment_validation.rs`](../../../workbench/tests/deployment_validation.rs) (Multi-instance concurrency across tenants, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
+
+---
+
 Every capability on this roadmap is evaluated across five dimensions:
 
 1. **Simplicity:** Easier to build everyday features than the alternatives. Zero ceremonial overhead for small applications.
