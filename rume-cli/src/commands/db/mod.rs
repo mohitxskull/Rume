@@ -103,7 +103,7 @@ pub fn make_migration(name: Option<String>) {
     );
 }
 
-fn discover_local_migrations() -> Migrator {
+pub(crate) fn discover_local_migrations() -> Migrator {
     let mut migrator = Migrator::new();
     let migrations_dir = Path::new("migrations");
     if !migrations_dir.exists() {
@@ -149,7 +149,7 @@ fn discover_local_migrations() -> Migrator {
     migrator
 }
 
-fn resolve_db_url() -> Option<String> {
+pub(crate) fn resolve_db_url() -> Option<String> {
     if let Ok(url) = std::env::var("DATABASE_URL") {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
@@ -175,13 +175,13 @@ fn resolve_db_url() -> Option<String> {
     }
 }
 
-enum BackendHandle {
+pub(crate) enum BackendHandle {
     Postgres(PostgresBackend),
     Sqlite(SqliteBackend),
     Mysql(MysqlBackend),
 }
 
-async fn connect_backend(url: &str) -> Result<(BackendHandle, &'static str), String> {
+pub(crate) async fn connect_backend(url: &str) -> Result<(BackendHandle, &'static str), String> {
     let config = DatabaseConfig::new(url);
     if url.starts_with("postgres://") || url.starts_with("postgresql://") {
         let backend = PostgresBackend::new(&config)

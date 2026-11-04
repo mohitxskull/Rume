@@ -91,6 +91,19 @@ pub enum Commands {
     /// Shortcut for `rume db rollback`.
     #[command(name = "db:rollback", alias = "db-rollback", hide = true)]
     DbRollback,
+    /// Validate SQL files in the project for syntax and non-empty queries.
+    #[command(name = "sql:check", alias = "sql-check")]
+    SqlCheck {
+        /// Path to directory containing SQL files (defaults to `sql`).
+        #[arg(long, default_value = "sql")]
+        path: String,
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

@@ -6,6 +6,7 @@ mod env;
 mod generate;
 mod list_routes;
 mod new;
+mod sql_check;
 
 use crate::cli::{Cli, Commands};
 pub fn require_rume_project() {
@@ -48,7 +49,7 @@ pub async fn run(cli: Cli) {
         Some(Commands::Doctor { format, json }) => {
             require_rume_project();
             let fmt = if json { "json" } else { &format };
-            doctor::run(fmt);
+            doctor::run(fmt).await;
         }
         Some(Commands::ListRoutes { format, json }) => {
             require_rume_project();
@@ -82,6 +83,10 @@ pub async fn run(cli: Cli) {
         Some(Commands::DbRollback) => {
             require_rume_project();
             db::run(crate::cli::DbCommands::Rollback).await;
+        }
+        Some(Commands::SqlCheck { path, format, json }) => {
+            require_rume_project();
+            sql_check::run(&path, &format, json);
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
