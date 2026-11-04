@@ -1,0 +1,18 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY target/release/workbench /app/workbench
+COPY workbench/multi-instance/config /app/config
+COPY workbench/multi-instance/migrations /app/migrations
+COPY workbench/multi-instance/sql /app/sql
+COPY workbench/multi-instance/.env.example /app/.env
+
+ENV HOST=0.0.0.0
+ENV PORT=8080
+EXPOSE 8080
+
+ENTRYPOINT ["/app/workbench"]

@@ -270,6 +270,66 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<MigrationSummary, PersistenceError> {
+        let dialect = backend.dialect();
+        if dialect == "postgres" {
+            let tx = backend.begin_transaction().await?;
+            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
+            tx.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+
+            let mut applied = Vec::new();
+            for migration in &self.migrations {
+                let check_sql = format!(
+                    "SELECT checksum FROM rume_migrations WHERE id = '{}'",
+                    migration.id.replace('\'', "''")
+                );
+                let stored_checksum = tx.query_scalar(&check_sql).await?;
+                if let Some(actual) = stored_checksum {
+                    let expected = migration.checksum();
+                    if !actual.is_empty() && actual != expected {
+                        return Err(PersistenceError::MigrationChecksumMismatch {
+                            migration: migration.id.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                } else {
+                    if let Some(sql) = &migration.up_sql {
+                        tx.execute(sql)
+                            .await
+                            .map_err(|err| PersistenceError::MigrationError {
+                                migration: migration.id.clone(),
+                                message: err.to_string(),
+                            })?;
+                    }
+                    let now = if let Ok(Some(s)) = tx
+                        .query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text")
+                        .await
+                        && let Ok(ts) = s.parse::<u64>()
+                    {
+                        ts
+                    } else {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    };
+                    let name = migration.description.replace('\'', "''");
+                    let checksum = migration.checksum();
+                    let insert_sql = format!(
+                        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ('{}', '{}', {}, '{}')",
+                        migration.id.replace('\'', "''"),
+                        name,
+                        now,
+                        checksum
+                    );
+                    tx.execute(&insert_sql).await?;
+                    applied.push(migration.id.clone());
+                }
+            }
+            tx.commit().await?;
+            return Ok(MigrationSummary { applied });
+        }
+
         backend
             .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;
@@ -340,6 +400,41 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<Option<String>, PersistenceError> {
+        let dialect = backend.dialect();
+        if dialect == "postgres" {
+            let tx = backend.begin_transaction().await?;
+            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
+            tx.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+
+            for migration in self.migrations.iter().rev() {
+                let check_sql = format!(
+                    "SELECT id FROM rume_migrations WHERE id = '{}'",
+                    migration.id.replace('\'', "''")
+                );
+                let applied = tx.query_scalar(&check_sql).await?;
+                if applied.is_some() {
+                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                        PersistenceError::IrreversibleMigration(migration.id.clone())
+                    })?;
+                    tx.execute(down_sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                    let delete_sql = format!(
+                        "DELETE FROM rume_migrations WHERE id = '{}'",
+                        migration.id.replace('\'', "''")
+                    );
+                    tx.execute(&delete_sql).await?;
+                    tx.commit().await?;
+                    return Ok(Some(migration.id.clone()));
+                }
+            }
+            tx.commit().await?;
+            return Ok(None);
+        }
+
         backend
             .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;

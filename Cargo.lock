@@ -4588,6 +4588,7 @@ dependencies = [
  "axum",
  "deadpool-redis",
  "redis",
+ "reqwest",
  "rume",
  "serde",
  "serde_json",
