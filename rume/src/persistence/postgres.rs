@@ -11,7 +11,9 @@ use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, OutboxStatus,
     TransactionalOutbox,
 };
-use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, map_sqlx_error};
+use crate::persistence::backend::{
+    map_sqlx_error, BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue,
+};
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 
@@ -130,21 +132,61 @@ impl DatabaseBackend for PostgresBackend {
         })
     }
 
-    fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
+    fn execute_params(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
         let stmt = statement.to_string();
+        let params_vec = params.to_vec();
         Box::pin(async move {
-            let res = sqlx::raw_sql(&stmt)
-                .execute(&self.pool)
-                .await
-                .map_err(map_sqlx_error)?;
-            Ok(res.rows_affected())
+            if params_vec.is_empty() {
+                let res = sqlx::raw_sql(&stmt)
+                    .execute(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                Ok(res.rows_affected())
+            } else {
+                let mut query = sqlx::query(&stmt);
+                for param in &params_vec {
+                    query = match param {
+                        DbValue::Null => query.bind(None as Option<String>),
+                        DbValue::Text(s) => query.bind(s.as_str()),
+                        DbValue::Int(i) => query.bind(*i),
+                        DbValue::Float(f) => query.bind(*f),
+                        DbValue::Bool(b) => query.bind(*b),
+                        DbValue::Bytes(b) => query.bind(b.as_slice()),
+                    };
+                }
+                let res = query
+                    .execute(&self.pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                Ok(res.rows_affected())
+            }
         })
     }
 
-    fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
+    fn query_scalar_params(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
         let q = query.trim().to_string();
+        let params_vec = params.to_vec();
         Box::pin(async move {
-            let row: Option<PgRow> = sqlx::query(&q)
+            let mut query_obj = sqlx::query(&q);
+            for param in &params_vec {
+                query_obj = match param {
+                    DbValue::Null => query_obj.bind(None as Option<String>),
+                    DbValue::Text(s) => query_obj.bind(s.as_str()),
+                    DbValue::Int(i) => query_obj.bind(*i),
+                    DbValue::Float(f) => query_obj.bind(*f),
+                    DbValue::Bool(b) => query_obj.bind(*b),
+                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
+                };
+            }
+            let row: Option<PgRow> = query_obj
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(map_sqlx_error)?;
@@ -235,6 +277,18 @@ pub struct PostgresTransaction {
     tx: Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>>,
 }
 
+impl PostgresTransaction {
+    /// Returns a reference to the shared mutex containing the native SQLx transaction.
+    ///
+    /// This escape hatch allows applications to execute driver-native SQLx queries directly
+    /// while participating in the same transaction boundary.
+    pub fn raw_tx(
+        &self,
+    ) -> &Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Postgres>>>> {
+        &self.tx
+    }
+}
+
 impl Debug for PostgresTransaction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresTransaction").finish()
@@ -242,6 +296,38 @@ impl Debug for PostgresTransaction {
 }
 
 impl DatabaseTransaction for PostgresTransaction {
+    fn execute_params(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
+        let stmt = statement.to_string();
+        let params_vec = params.to_vec();
+        let tx_arc = Arc::clone(&self.tx);
+        Box::pin(async move {
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .as_mut()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let mut query = sqlx::query(&stmt);
+            for param in &params_vec {
+                query = match param {
+                    DbValue::Null => query.bind(None as Option<String>),
+                    DbValue::Text(s) => query.bind(s.as_str()),
+                    DbValue::Int(i) => query.bind(*i),
+                    DbValue::Float(f) => query.bind(*f),
+                    DbValue::Bool(b) => query.bind(*b),
+                    DbValue::Bytes(b) => query.bind(b.as_slice()),
+                };
+            }
+            let res = query
+                .execute(&mut **tx)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(res.rows_affected())
+        })
+    }
+
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
         let stmt = statement.to_string();
         let tx_arc = Arc::clone(&self.tx);
@@ -259,20 +345,40 @@ impl DatabaseTransaction for PostgresTransaction {
         })
     }
 
-    fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
+    fn query_scalar_params(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
         let q = query.trim().to_string();
+        let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
             let tx = guard
                 .as_mut()
                 .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
-            let row: Option<PgRow> = sqlx::query(&q)
+            let mut query_obj = sqlx::query(&q);
+            for param in &params_vec {
+                query_obj = match param {
+                    DbValue::Null => query_obj.bind(None as Option<String>),
+                    DbValue::Text(s) => query_obj.bind(s.as_str()),
+                    DbValue::Int(i) => query_obj.bind(*i),
+                    DbValue::Float(f) => query_obj.bind(*f),
+                    DbValue::Bool(b) => query_obj.bind(*b),
+                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
+                };
+            }
+            let row: Option<PgRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
             Ok(row.and_then(|r| extract_postgres_scalar(&r)))
         })
+    }
+
+    fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
+        self.query_scalar_params(query, &[])
     }
 
     fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {

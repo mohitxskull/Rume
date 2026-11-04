@@ -308,3 +308,88 @@ async fn sqlite_outbox_lease_expiry_rejects_completion_before_another_claims() {
 
     assert_eq!(backend.published_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn sqlite_parameterized_transaction_and_safe_values() {
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    backend
+        .execute("CREATE TABLE products (id TEXT PRIMARY KEY, name TEXT NOT NULL, price REAL, description TEXT);")
+        .await
+        .expect("table should create");
+
+    let tx = backend.begin_transaction().await.expect("begin tx");
+
+    // Test quotes, malicious SQL injection attempts, Unicode, and nulls
+    let malicious_name = "Robert'); DROP TABLE products; --";
+    let unicode_desc = "🦀 High Performance & Safe 🚀";
+    let sql = "INSERT INTO products (id, name, price, description) VALUES (?, ?, ?, ?);";
+
+    let rows = tx
+        .execute_params(
+            sql,
+            &rume::params![
+                "prod-1",
+                malicious_name,
+                99.95,
+                unicode_desc,
+            ],
+        )
+        .await
+        .expect("parameterized insert should succeed");
+    assert_eq!(rows, 1);
+
+    // Insert product with null description
+    let rows_null = tx
+        .execute_params(
+            sql,
+            &rume::params![
+                "prod-2",
+                "Standard Widget",
+                19.99,
+                None as Option<String>,
+            ],
+        )
+        .await
+        .expect("insert with null should succeed");
+    assert_eq!(rows_null, 1);
+
+    // Query scalar with parameter inside transaction
+    let queried_name = tx
+        .query_scalar_params("SELECT name FROM products WHERE id = ?", &rume::params!["prod-1"])
+        .await
+        .expect("query scalar with param")
+        .expect("product name found");
+    assert_eq!(queried_name, malicious_name);
+
+    tx.commit().await.expect("commit should succeed");
+
+    // Verify products table still exists and contains both records
+    let total_count = backend
+        .query_scalar("SELECT count(*) FROM products;")
+        .await
+        .expect("count query")
+        .expect("count present");
+    assert_eq!(total_count, "2");
+
+    // Test raw_tx escape hatch
+    let tx_native = backend.begin_transaction().await.expect("begin native tx");
+    let mut guard = tx_native.raw_tx().lock().await;
+    let active_tx = guard.as_mut().expect("active tx present");
+    sqlx::query("INSERT INTO products (id, name, price, description) VALUES (?, ?, ?, ?)")
+        .bind("prod-3")
+        .bind("Native SQLx Product")
+        .bind(42.0)
+        .bind("Direct driver access")
+        .execute(&mut **active_tx)
+        .await
+        .expect("native driver execute");
+    drop(guard);
+    tx_native.commit().await.expect("commit native tx");
+
+    let count_after_native = backend
+        .query_scalar("SELECT count(*) FROM products;")
+        .await
+        .expect("count query")
+        .expect("count present");
+    assert_eq!(count_after_native, "3");
+}

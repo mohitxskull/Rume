@@ -312,3 +312,79 @@ async fn test_mysql_outbox_lease_expiry_rejects_completion_before_another_claims
 
     assert_eq!(backend.published_count().await.unwrap(), 0);
 }
+
+#[tokio::test]
+async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
+    let (_node, backend, _config) = start_mysql_node().await;
+
+    backend
+        .execute("CREATE TABLE test_mysql_params (id VARCHAR(64) PRIMARY KEY, title VARCHAR(255) NOT NULL, amount BIGINT, note TEXT);")
+        .await
+        .expect("create table");
+
+    let tx = backend.begin_transaction().await.expect("begin tx");
+
+    let injection_str = "'; DROP TABLE test_mysql_params; --";
+    let unicode_note = "Safe 🚀 MySQL UTF-8: 'quotes' and \\backslashes\\";
+
+    let rows = tx
+        .execute_params(
+            "INSERT INTO test_mysql_params (id, title, amount, note) VALUES (?, ?, ?, ?)",
+            &rume::params![
+                "row-1",
+                injection_str,
+                54321_i64,
+                unicode_note,
+            ],
+        )
+        .await
+        .expect("execute_params should succeed");
+    assert_eq!(rows, 1);
+
+    // Insert with null amount and note
+    let rows_null = tx
+        .execute_params(
+            "INSERT INTO test_mysql_params (id, title, amount, note) VALUES (?, ?, ?, ?)",
+            &rume::params![
+                "row-2",
+                "Second MySQL Row",
+                None as Option<i64>,
+                None as Option<String>,
+            ],
+        )
+        .await
+        .expect("insert null values");
+    assert_eq!(rows_null, 1);
+
+    // Query scalar params inside transaction
+    let retrieved = tx
+        .query_scalar_params("SELECT title FROM test_mysql_params WHERE id = ?", &rume::params!["row-1"])
+        .await
+        .expect("query scalar")
+        .expect("found title");
+    assert_eq!(retrieved, injection_str);
+
+    tx.commit().await.expect("commit tx");
+
+    // Test raw_tx native escape hatch
+    let tx_native = backend.begin_transaction().await.expect("begin native tx");
+    let mut guard = tx_native.raw_tx().lock().await;
+    let active_tx = guard.as_mut().expect("active tx present");
+    sqlx::query("INSERT INTO test_mysql_params (id, title, amount, note) VALUES (?, ?, ?, ?)")
+        .bind("row-native")
+        .bind("Native Driver Row")
+        .bind(8888_i64)
+        .bind("Direct SQLx Access")
+        .execute(&mut **active_tx)
+        .await
+        .expect("native SQLx execute");
+    drop(guard);
+    tx_native.commit().await.expect("commit native tx");
+
+    let count = backend
+        .query_scalar("SELECT count(*) FROM test_mysql_params")
+        .await
+        .expect("count")
+        .expect("count present");
+    assert_eq!(count, "3");
+}

@@ -15,7 +15,7 @@ pub mod sqlite;
 #[cfg(feature = "mysql")]
 pub mod mysql;
 
-pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction};
+pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue};
 pub use config::DatabaseConfig;
 pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator};

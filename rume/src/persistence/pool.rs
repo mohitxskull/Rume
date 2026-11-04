@@ -12,7 +12,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use crate::outbox::{
     BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, TransactionalOutbox,
 };
-use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction};
+use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
@@ -216,6 +216,46 @@ impl<B: DatabaseBackend> DatabasePool<B> {
                 Err(PersistenceError::from(err))
             }
         }
+    }
+
+    /// Executes a SQL or DDL statement directly using the pool backend, returning the number of affected rows.
+    pub async fn execute(&self, statement: &str) -> Result<u64, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.execute(statement).await
+    }
+
+    /// Executes a parameterized SQL statement directly using the pool backend, returning the number of affected rows.
+    pub async fn execute_params(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<u64, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.execute_params(statement, params).await
+    }
+
+    /// Executes a scalar query directly using the pool backend, returning an optional string value.
+    pub async fn query_scalar(&self, query: &str) -> Result<Option<String>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.query_scalar(query).await
+    }
+
+    /// Executes a parameterized scalar query directly using the pool backend, returning an optional string value.
+    pub async fn query_scalar_params(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<Option<String>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.query_scalar_params(query, params).await
     }
 
     /// Gracefully closes the connection pool, refusing new leases and draining connections.
