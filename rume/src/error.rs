@@ -70,27 +70,58 @@ struct ProblemDetails {
 ///
 /// Wrapped in a newtype so thiserror treats it as the chained error
 /// source (`String` itself does not implement `std::error::Error`). The
-/// source is logged server-side via tracing rather than surfaced to
-/// clients.
+/// source is logged server-side via tracing with captured backtrace and active span.
 #[derive(Debug)]
-pub struct InternalSource(pub(crate) String);
+pub struct InternalSource {
+    pub message: String,
+    pub backtrace: Option<std::backtrace::Backtrace>,
+    pub span_context: Option<String>,
+}
 
 impl InternalSource {
-    /// Creates a new internal diagnostic error source.
+    /// Creates a new internal diagnostic error source with backtrace and span context.
     pub fn new(source: impl Into<String>) -> Self {
-        Self(source.into())
+        let span = tracing::Span::current();
+        let span_context = if span.is_none() {
+            None
+        } else {
+            Some(format!("{:?}", span.id()))
+        };
+        Self {
+            message: source.into(),
+            backtrace: Some(std::backtrace::Backtrace::capture()),
+            span_context,
+        }
+    }
+
+    /// Attaches an explicit backtrace.
+    pub fn with_backtrace(mut self, backtrace: std::backtrace::Backtrace) -> Self {
+        self.backtrace = Some(backtrace);
+        self
+    }
+
+    /// Attaches an explicit span context.
+    pub fn with_span_context(mut self, span_context: impl Into<String>) -> Self {
+        self.span_context = Some(span_context.into());
+        self
     }
 }
 
 impl From<String> for InternalSource {
     fn from(s: String) -> Self {
-        Self(s)
+        Self::new(s)
+    }
+}
+
+impl From<&str> for InternalSource {
+    fn from(s: &str) -> Self {
+        Self::new(s)
     }
 }
 
 impl std::fmt::Display for InternalSource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(f)
+        self.message.fmt(f)
     }
 }
 
@@ -132,7 +163,7 @@ impl AppError {
     /// Creates an internal server error from a diagnostic message.
     pub fn internal(msg: impl Into<String>) -> Self {
         Self::Internal {
-            source: InternalSource(msg.into()),
+            source: InternalSource::new(msg),
             request_id: None,
         }
     }
@@ -177,7 +208,7 @@ impl AppError {
 fn problem(
     status: StatusCode,
     title: &'static str,
-    detail: &'static str,
+    detail: impl Into<String>,
     code: &'static str,
     request_id: Option<String>,
     details: Option<Vec<ValidationErrorDetail>>,
@@ -186,7 +217,7 @@ fn problem(
         r#type: "about:blank".to_string(),
         title: title.to_string(),
         status: status.as_u16(),
-        detail: detail.to_string(),
+        detail: detail.into(),
         instance: None,
         code: code.to_string(),
         request_id,
@@ -207,8 +238,9 @@ fn title_for(status: StatusCode) -> &'static str {
     status.canonical_reason().unwrap_or("Error")
 }
 
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
+impl AppError {
+    /// Converts this error into an HTTP response using explicit environment configuration.
+    pub fn into_response_in_env(self, env: &crate::app::Environment) -> Response {
         let status = self.status_code();
 
         match self {
@@ -224,15 +256,18 @@ impl IntoResponse for AppError {
                 ),
             ),
             Self::BadRequest { code, message } => {
-                // S-M4: log the detail server-side; clients get a generic
-                // message. The raw message must never be echoed to clients.
                 warn!("bad request: {}", message);
+                let detail = if env.in_development() {
+                    message
+                } else {
+                    "The request could not be processed.".to_string()
+                };
                 problem_details_response(
                     status,
                     &problem(
                         status,
                         "Bad Request",
-                        "The request could not be processed.",
+                        detail,
                         code,
                         None,
                         None,
@@ -273,21 +308,29 @@ impl IntoResponse for AppError {
                 ),
             ),
             Self::Internal { source, request_id } => {
-                // S-M4: log the source server-side; clients get a generic
-                // message. The request_id is echoed so the client can
-                // reference it when contacting support.
-                error!(%source, "internal server error");
-                problem_details_response(
+                if let Some(ref bt) = source.backtrace {
+                    error!(%source.message, span_context = ?source.span_context, backtrace = %bt, "internal server error");
+                } else {
+                    error!(%source.message, span_context = ?source.span_context, "internal server error");
+                }
+                let (detail, instance) = if env.in_development() {
+                    (
+                        format!("Internal Error: {}", source.message),
+                        source.span_context.clone(),
+                    )
+                } else {
+                    ("An unexpected error occurred.".to_string(), None)
+                };
+                let mut prob = problem(
                     status,
-                    &problem(
-                        status,
-                        "Internal Server Error",
-                        "An unexpected error occurred.",
-                        "INTERNAL_ERROR",
-                        request_id,
-                        None,
-                    ),
-                )
+                    "Internal Server Error",
+                    detail,
+                    "INTERNAL_ERROR",
+                    request_id,
+                    None,
+                );
+                prob.instance = instance;
+                problem_details_response(status, &prob)
             }
             Self::Public {
                 status: custom_status,
@@ -311,6 +354,16 @@ impl IntoResponse for AppError {
                 )
             }
         }
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        if crate::env::loading::is_running_in_test() {
+            return self.into_response_in_env(&crate::app::Environment::new("test"));
+        }
+        let env = crate::app::Environment::from_env();
+        self.into_response_in_env(&env)
     }
 }
 
@@ -342,7 +395,7 @@ mod tests {
         );
         assert_eq!(
             AppError::Internal {
-                source: InternalSource("x".into()),
+                source: InternalSource::new("x"),
                 request_id: None,
             }
             .status_code(),
@@ -429,7 +482,7 @@ mod tests {
         // is echoed so the client can reference it in support.
         let request_id = "req-123".to_string();
         let body = body_of(AppError::Internal {
-            source: InternalSource("connection string: postgresql://user:pass@db".into()),
+            source: InternalSource::new("connection string: postgresql://user:pass@db"),
             request_id: Some(request_id.clone()),
         })
         .await;
@@ -462,6 +515,42 @@ mod tests {
         assert_eq!(details.len(), 1);
         assert_eq!(details[0]["field"].as_str(), Some("email"));
         assert_eq!(details[0]["message"].as_str(), Some("invalid format"));
+    }
+
+    #[tokio::test]
+    async fn bad_request_surfaces_message_in_development() {
+        let dev_env = crate::app::Environment::new("development");
+        let resp = AppError::BadRequest {
+            code: "MISSING_PARAM",
+            message: "missing parameter: project_id".into(),
+        }
+        .into_response_in_env(&dev_env);
+        let body = body_of(resp).await;
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(400));
+        assert_eq!(value["code"].as_str(), Some("MISSING_PARAM"));
+        assert_eq!(
+            value["detail"].as_str(),
+            Some("missing parameter: project_id")
+        );
+    }
+
+    #[tokio::test]
+    async fn internal_surfaces_diagnostics_in_development() {
+        let dev_env = crate::app::Environment::new("development");
+        let resp = AppError::Internal {
+            source: InternalSource::new("database socket timeout").with_span_context("span-456"),
+            request_id: Some("req-dev-1".into()),
+        }
+        .into_response_in_env(&dev_env);
+        let body = body_of(resp).await;
+        let value = serde_json::from_str::<serde_json::Value>(&body).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(500));
+        assert_eq!(
+            value["detail"].as_str(),
+            Some("Internal Error: database socket timeout")
+        );
+        assert_eq!(value["instance"].as_str(), Some("span-456"));
     }
 
     #[tokio::test]

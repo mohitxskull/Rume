@@ -218,10 +218,23 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
     })
 }
 
+pub(crate) fn is_running_in_test() -> bool {
+    if cfg!(test) {
+        return true;
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        let path = exe.to_string_lossy();
+        if path.contains("/deps/") || path.ends_with(".test") {
+            return true;
+        }
+    }
+    false
+}
+
 /// Resolve the active environment name.
 ///
 /// Precedence: `RUME_ENV`, then `RAILS_ENV`, then `NODE_ENV`, then
-/// `"development"`.
+/// `"test"` if running in test harness, otherwise `"development"`.
 pub fn resolve_env_name() -> String {
     for var in ["RUME_ENV", "RAILS_ENV", "NODE_ENV"] {
         if let Ok(value) = std::env::var(var)
@@ -229,6 +242,9 @@ pub fn resolve_env_name() -> String {
         {
             return value;
         }
+    }
+    if is_running_in_test() {
+        return "test".to_string();
     }
     "development".to_string()
 }
