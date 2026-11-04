@@ -2,14 +2,14 @@ use axum::routing::{get, post};
 use axum::Router;
 use rume::app::observability::ObservabilityLayer;
 use rume::auth::policy::RequireAnyRole;
-use rume::auth::{AuthLayer, AuthUser, BearerTokenScheme, PolicyLayer};
+use rume::auth::{AuthLayer, BearerTokenScheme, PolicyLayer};
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 use rume::tenant::resolver::HeaderTenantResolver;
 use rume::tenant::{TenantLayer, TenantMembershipLayer};
-use sqlx::Row;
 
 use crate::handlers::{health, issues, organizations, projects, users};
+use crate::repositories::UserRepository;
 use crate::state::WorkbenchState;
 
 pub fn build_api_router(
@@ -20,56 +20,9 @@ pub fn build_api_router(
     let auth_scheme = BearerTokenScheme::new(move |token: String| {
         let pool = auth_pool.clone();
         async move {
-            let sql = r#"
-                SELECT id, organization_id, email, name, role
-                FROM workbench_users
-                WHERE api_token = $1
-            "#;
-            let row = sqlx::query(sql)
-                .bind(&token)
-                .fetch_optional(pool.backend().pool())
+            UserRepository::find_by_token(&pool, &token)
                 .await
-                .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-
-            if let Some(r) = row {
-                let id: String = r
-                    .try_get("id")
-                    .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-                let org_id: String = r
-                    .try_get("organization_id")
-                    .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-                let role: String = r
-                    .try_get("role")
-                    .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-                let name: String = r
-                    .try_get("name")
-                    .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-                let email: String = r
-                    .try_get("email")
-                    .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))?;
-
-                let mut user = AuthUser::new(&id)
-                    .with_tenant_id(&org_id)
-                    .with_role(&role)
-                    .with_metadata("name", name)
-                    .with_metadata("email", email)
-                    .with_metadata("organization_id", org_id);
-
-                if role == "admin" || role == "member" {
-                    user = user
-                        .with_permission("projects:write")
-                        .with_permission("issues:write");
-                }
-                if role == "viewer" || role == "member" || role == "admin" {
-                    user = user
-                        .with_permission("projects:read")
-                        .with_permission("issues:read");
-                }
-
-                Ok(Some(user))
-            } else {
-                Ok(None)
-            }
+                .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))
         }
     });
 

@@ -2,9 +2,9 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use rume::error::AppError;
-use sqlx::Row;
 
 use crate::models::{CreateOrganizationRequest, Organization};
+use crate::repositories::OrganizationRepository;
 use crate::state::WorkbenchState;
 
 pub async fn create_organization(
@@ -28,12 +28,7 @@ pub async fn create_organization(
         created_at: now,
     };
 
-    let sql = "INSERT INTO workbench_organizations (id, name, created_at) VALUES ($1, $2, $3)";
-    sqlx::query(sql)
-        .bind(&org.id)
-        .bind(&org.name)
-        .bind(org.created_at)
-        .execute(state.pool.backend().pool())
+    OrganizationRepository::create(&state.pool, &org)
         .await
         .map_err(|e| AppError::internal(format!("Failed to create organization: {e}")))?;
 
@@ -44,38 +39,20 @@ pub async fn get_organization(
     Path(id): Path<String>,
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Organization>, AppError> {
-    let sql = "SELECT id, name, created_at FROM workbench_organizations WHERE id = $1";
-    let row = sqlx::query(sql)
-        .bind(&id)
-        .fetch_optional(state.pool.backend().pool())
+    let org = OrganizationRepository::find(&state.pool, &id)
         .await
         .map_err(|e| AppError::internal(format!("Database error: {e}")))?
         .ok_or_else(|| AppError::not_found(format!("Organization '{id}' not found")))?;
 
-    Ok(Json(Organization {
-        id: row.try_get("id").map_err(|e| AppError::internal(e.to_string()))?,
-        name: row.try_get("name").map_err(|e| AppError::internal(e.to_string()))?,
-        created_at: row.try_get("created_at").map_err(|e| AppError::internal(e.to_string()))?,
-    }))
+    Ok(Json(org))
 }
 
 pub async fn list_organizations(
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Vec<Organization>>, AppError> {
-    let sql = "SELECT id, name, created_at FROM workbench_organizations ORDER BY name ASC";
-    let rows = sqlx::query(sql)
-        .fetch_all(state.pool.backend().pool())
+    let orgs = OrganizationRepository::list_all(&state.pool)
         .await
         .map_err(|e| AppError::internal(format!("Database error: {e}")))?;
-
-    let mut orgs = Vec::with_capacity(rows.len());
-    for row in rows {
-        orgs.push(Organization {
-            id: row.try_get("id").map_err(|e| AppError::internal(e.to_string()))?,
-            name: row.try_get("name").map_err(|e| AppError::internal(e.to_string()))?,
-            created_at: row.try_get("created_at").map_err(|e| AppError::internal(e.to_string()))?,
-        });
-    }
 
     Ok(Json(orgs))
 }

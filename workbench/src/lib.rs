@@ -5,6 +5,7 @@ pub mod handlers;
 pub mod jobs;
 pub mod migrations;
 pub mod models;
+pub mod repositories;
 pub mod routes;
 pub mod state;
 

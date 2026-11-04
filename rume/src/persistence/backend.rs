@@ -143,6 +143,15 @@ impl<T: Into<DbValue>> From<Option<T>> for DbValue {
     }
 }
 
+impl<T: Clone + Into<DbValue>> From<&Option<T>> for DbValue {
+    fn from(opt: &Option<T>) -> Self {
+        match opt {
+            Some(v) => v.clone().into(),
+            None => DbValue::Null,
+        }
+    }
+}
+
 /// Convenience macro for constructing an array of [`DbValue`] parameters suitable for borrowing as a slice.
 #[macro_export]
 macro_rules! params {

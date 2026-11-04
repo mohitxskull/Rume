@@ -3,10 +3,10 @@ use axum::http::StatusCode;
 use axum::Json;
 use rume::error::AppError;
 use rume::tenant::TenantContext;
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::models::{CreateProjectRequest, Project};
+use crate::repositories::ProjectRepository;
 use crate::state::WorkbenchState;
 
 pub async fn create_project(
@@ -36,14 +36,7 @@ pub async fn create_project(
         created_at: now,
     };
 
-    let sql = "INSERT INTO workbench_projects (id, tenant_id, name, description, created_at) VALUES ($1, $2, $3, $4, $5)";
-    sqlx::query(sql)
-        .bind(&project.id)
-        .bind(&project.tenant_id)
-        .bind(&project.name)
-        .bind(&project.description)
-        .bind(project.created_at)
-        .execute(state.pool.backend().pool())
+    ProjectRepository::create(&state.pool, &project)
         .await
         .map_err(|e| AppError::internal(format!("Failed to create project: {e}")))?;
 
@@ -54,23 +47,9 @@ pub async fn list_projects(
     TenantContext(tenant): TenantContext,
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Vec<Project>>, AppError> {
-    let sql = "SELECT id, tenant_id, name, description, created_at FROM workbench_projects WHERE tenant_id = $1 ORDER BY created_at DESC";
-    let rows = sqlx::query(sql)
-        .bind(&tenant.id)
-        .fetch_all(state.pool.backend().pool())
+    let projects = ProjectRepository::list_by_tenant(&state.pool, &tenant.id)
         .await
         .map_err(|e| AppError::internal(format!("Failed to list projects: {e}")))?;
-
-    let mut projects = Vec::with_capacity(rows.len());
-    for row in rows {
-        projects.push(Project {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            name: row.get("name"),
-            description: row.get("description"),
-            created_at: row.get("created_at"),
-        });
-    }
 
     Ok(Json(projects))
 }
@@ -80,22 +59,10 @@ pub async fn get_project(
     Path(id): Path<String>,
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Project>, AppError> {
-    let sql = "SELECT id, tenant_id, name, description, created_at FROM workbench_projects WHERE id = $1 AND tenant_id = $2";
-    let row = sqlx::query(sql)
-        .bind(&id)
-        .bind(&tenant.id)
-        .fetch_optional(state.pool.backend().pool())
+    let project = ProjectRepository::find(&state.pool, &id, &tenant.id)
         .await
-        .map_err(|e| AppError::internal(format!("Failed to get project: {e}")))?;
+        .map_err(|e| AppError::internal(format!("Failed to get project: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("Project '{id}' not found")))?;
 
-    match row {
-        Some(r) => Ok(Json(Project {
-            id: r.get("id"),
-            tenant_id: r.get("tenant_id"),
-            name: r.get("name"),
-            description: r.get("description"),
-            created_at: r.get("created_at"),
-        })),
-        None => Err(AppError::not_found(format!("Project '{id}' not found"))),
-    }
+    Ok(Json(project))
 }

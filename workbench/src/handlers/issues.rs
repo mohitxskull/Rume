@@ -4,15 +4,14 @@ use axum::http::StatusCode;
 use axum::Json;
 use rume::error::AppError;
 use rume::outbox::{OutboxMessage, TransactionalOutbox};
-use rume::persistence::backend::DatabaseTransaction;
 use rume::persistence::error::PersistenceError;
 use rume::tenant::TenantContext;
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::models::{
     CreateIssueRequest, Issue, IssueCreatedEvent, IssueUpdatedEvent, UpdateIssueRequest,
 };
+use crate::repositories::{IssueRepository, ProjectRepository};
 use crate::state::WorkbenchState;
 
 const VALID_STATUSES: &[&str] = &["open", "in_progress", "resolved", "closed"];
@@ -49,14 +48,11 @@ pub async fn create_issue(
     }
 
     // Verify project exists for this tenant
-    let project_check = sqlx::query("SELECT id FROM workbench_projects WHERE id = $1 AND tenant_id = $2")
-        .bind(&project_id)
-        .bind(&tenant.id)
-        .fetch_optional(state.pool.backend().pool())
+    let project = ProjectRepository::find(&state.pool, &project_id, &tenant.id)
         .await
-        .map_err(|e| AppError::internal(format!("Database query error: {e}")))?;
+        .map_err(|e| AppError::internal(format!("Database error: {e}")))?;
 
-    if project_check.is_none() {
+    if project.is_none() {
         return Err(AppError::not_found(format!(
             "Project '{project_id}' not found"
         )));
@@ -103,20 +99,7 @@ pub async fn create_issue(
             let iss = issue_clone.clone();
             let msg = outbox_msg.clone();
             async move {
-                let sql = format!(
-                    "INSERT INTO workbench_issues (id, tenant_id, project_id, title, description, status, priority, assignee_id, created_at, updated_at) VALUES ('{}', '{}', '{}', '{}', {}, '{}', '{}', {}, {}, {});",
-                    iss.id,
-                    iss.tenant_id,
-                    iss.project_id,
-                    iss.title.replace('\'', "''"),
-                    iss.description.as_ref().map(|d| format!("'{}'", d.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
-                    iss.status,
-                    iss.priority,
-                    iss.assignee_id.as_ref().map(|a| format!("'{}'", a.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
-                    iss.created_at,
-                    iss.updated_at
-                );
-                tx.execute(&sql).await?;
+                IssueRepository::create_in_tx(&tx, &iss).await?;
                 pool.save_tx(&tx, msg)
                     .await
                     .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
@@ -134,29 +117,9 @@ pub async fn list_issues(
     Path(project_id): Path<String>,
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Vec<Issue>>, AppError> {
-    let sql = "SELECT id, tenant_id, project_id, title, description, status, priority, assignee_id, created_at, updated_at FROM workbench_issues WHERE project_id = $1 AND tenant_id = $2 ORDER BY created_at ASC";
-    let rows = sqlx::query(sql)
-        .bind(&project_id)
-        .bind(&tenant.id)
-        .fetch_all(state.pool.backend().pool())
+    let issues = IssueRepository::list_by_project(&state.pool, &project_id, &tenant.id)
         .await
         .map_err(|e| AppError::internal(format!("Failed to list issues: {e}")))?;
-
-    let mut issues = Vec::with_capacity(rows.len());
-    for row in rows {
-        issues.push(Issue {
-            id: row.get("id"),
-            tenant_id: row.get("tenant_id"),
-            project_id: row.get("project_id"),
-            title: row.get("title"),
-            description: row.get("description"),
-            status: row.get("status"),
-            priority: row.get("priority"),
-            assignee_id: row.get("assignee_id"),
-            created_at: row.get("created_at"),
-            updated_at: row.get("updated_at"),
-        });
-    }
 
     Ok(Json(issues))
 }
@@ -166,29 +129,12 @@ pub async fn get_issue(
     Path(id): Path<String>,
     State(state): State<WorkbenchState>,
 ) -> Result<Json<Issue>, AppError> {
-    let sql = "SELECT id, tenant_id, project_id, title, description, status, priority, assignee_id, created_at, updated_at FROM workbench_issues WHERE id = $1 AND tenant_id = $2";
-    let row = sqlx::query(sql)
-        .bind(&id)
-        .bind(&tenant.id)
-        .fetch_optional(state.pool.backend().pool())
+    let issue = IssueRepository::find(&state.pool, &id, &tenant.id)
         .await
-        .map_err(|e| AppError::internal(format!("Failed to get issue: {e}")))?;
+        .map_err(|e| AppError::internal(format!("Failed to get issue: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("Issue '{id}' not found")))?;
 
-    match row {
-        Some(r) => Ok(Json(Issue {
-            id: r.get("id"),
-            tenant_id: r.get("tenant_id"),
-            project_id: r.get("project_id"),
-            title: r.get("title"),
-            description: r.get("description"),
-            status: r.get("status"),
-            priority: r.get("priority"),
-            assignee_id: r.get("assignee_id"),
-            created_at: r.get("created_at"),
-            updated_at: r.get("updated_at"),
-        })),
-        None => Err(AppError::not_found(format!("Issue '{id}' not found"))),
-    }
+    Ok(Json(issue))
 }
 
 pub async fn update_issue(
@@ -197,9 +143,10 @@ pub async fn update_issue(
     State(state): State<WorkbenchState>,
     Json(payload): Json<UpdateIssueRequest>,
 ) -> Result<Json<Issue>, AppError> {
-    let mut current = get_issue(TenantContext(tenant.clone()), Path(id.clone()), State(state.clone()))
-        .await?
-        .0;
+    let mut current = IssueRepository::find(&state.pool, &id, &tenant.id)
+        .await
+        .map_err(|e| AppError::internal(format!("Database error: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("Issue '{id}' not found")))?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -244,16 +191,7 @@ pub async fn update_issue(
             let iss = iss.clone();
             let msg = outbox_msg.clone();
             async move {
-                let sql = format!(
-                    "UPDATE workbench_issues SET status = '{}', priority = '{}', assignee_id = {}, updated_at = {} WHERE id = '{}' AND tenant_id = '{}';",
-                    iss.status,
-                    iss.priority,
-                    iss.assignee_id.as_ref().map(|a| format!("'{}'", a.replace('\'', "''"))).unwrap_or_else(|| "NULL".to_string()),
-                    iss.updated_at,
-                    iss.id,
-                    iss.tenant_id
-                );
-                tx.execute(&sql).await?;
+                IssueRepository::update_in_tx(&tx, &iss).await?;
                 pool.save_tx(&tx, msg)
                     .await
                     .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;

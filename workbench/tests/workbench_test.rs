@@ -488,3 +488,177 @@ async fn test_workbench_run_with_signal_shutdown_during_active_operations() {
         shutdown_result
     );
 }
+
+#[tokio::test]
+async fn test_workbench_sql_injection_resilience_and_special_characters() {
+    let node = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres container");
+
+    let host = node.get_host().await.expect("host");
+    let port = node.get_host_port_ipv4(5432).await.expect("port");
+    let db_name = format!("wb_sqli_{}", uuid::Uuid::new_v4().simple());
+
+    let root_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let root_pool = sqlx::PgPool::connect(&root_url)
+        .await
+        .expect("connect root postgres");
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+        .execute(&root_pool)
+        .await
+        .expect("create test db");
+
+    let test_url = format!("postgres://postgres:postgres@{host}:{port}/{db_name}");
+    let mut pg_config = DatabaseConfig::new(&test_url);
+    pg_config.max_connections = 10;
+    pg_config.auto_migrate = true;
+
+    let backend = PostgresBackend::connect(&pg_config)
+        .await
+        .expect("connect postgres backend");
+    let pool = DatabasePool::new(backend, pg_config);
+
+    let migrator = workbench_migrator();
+    pool.apply_auto_migrations(&migrator)
+        .await
+        .expect("apply migrations");
+
+    let tenant_resolver = HeaderTenantResolver::new()
+        .add_tenant(Tenant::new("acme-corp", "acme-corp"));
+    let job_queue = Arc::new(PostgresJobQueue::new(pool.backend().pool().clone()));
+    let notification_handler = NotificationHandler::new();
+    let app = build_app(
+        WorkbenchState {
+            pool: pool.clone(),
+            job_queue,
+            notification_handler,
+            relay: None,
+            worker: None,
+        },
+        tenant_resolver,
+    );
+
+    // 1. Create Project with injection payload and Unicode
+    let sqli_project_name = "Project'); DROP TABLE workbench_projects; --";
+    let sqli_desc = "Testing quotes: 'single', \"double\", backslashes: \\, and UTF-8: 🚀🦀";
+    let project_id: String;
+    {
+        let payload = serde_json::json!({
+            "name": sqli_project_name,
+            "description": sqli_desc
+        });
+        let req = Request::builder()
+            .uri("/api/v1/projects")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer member-token")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let proj: Project = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(proj.name, sqli_project_name);
+        assert_eq!(proj.description.as_deref(), Some(sqli_desc));
+        project_id = proj.id;
+    }
+
+    // 2. Create Issue with injection payloads across title, description, assignee
+    let sqli_issue_title = "Issue'); DROP TABLE workbench_issues; --";
+    let sqli_issue_desc = "Testing quotes: ''' OR 1=1 -- \\ escaped \\";
+    let sqli_assignee = "alice' OR '1'='1";
+    let issue_id: String;
+    {
+        let payload = serde_json::json!({
+            "title": sqli_issue_title,
+            "description": sqli_issue_desc,
+            "status": "open",
+            "priority": "urgent",
+            "assignee_id": sqli_assignee
+        });
+        let req = Request::builder()
+            .uri(format!("/api/v1/projects/{project_id}/issues"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer member-token")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(issue.title, sqli_issue_title);
+        assert_eq!(issue.description.as_deref(), Some(sqli_issue_desc));
+        assert_eq!(issue.assignee_id.as_deref(), Some(sqli_assignee));
+        issue_id = issue.id;
+    }
+
+    // 3. Update Issue with injection payload
+    let update_assignee = "bob'; TRUNCATE workbench_issues; --";
+    {
+        let payload = serde_json::json!({
+            "status": "resolved",
+            "priority": "low",
+            "assignee_id": update_assignee
+        });
+        let req = Request::builder()
+            .uri(format!("/api/v1/issues/{issue_id}"))
+            .method("PATCH")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer member-token")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(issue.status, "resolved");
+        assert_eq!(issue.priority, "low");
+        assert_eq!(issue.assignee_id.as_deref(), Some(update_assignee));
+    }
+
+    // 4. Verify negative lookup with malicious project_id in path -> 404 Not Found, tables intact
+    {
+        let malicious_proj_id = "non-existent%27%29%3B%20DROP%20TABLE%20workbench_issues%3B%20--";
+        let payload = serde_json::json!({
+            "title": "Legit Title",
+            "status": "open",
+            "priority": "low"
+        });
+        let req = Request::builder()
+            .uri(format!("/api/v1/projects/{malicious_proj_id}/issues"))
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer member-token")
+            .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    // 5. Query issue directly and assert table still exists and data is intact
+    {
+        let req = Request::builder()
+            .uri(format!("/api/v1/issues/{issue_id}"))
+            .method("GET")
+            .header("x-tenant-id", "acme-corp")
+            .header("authorization", "Bearer member-token")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(issue.id, issue_id);
+        assert_eq!(issue.title, sqli_issue_title);
+        assert_eq!(issue.description.as_deref(), Some(sqli_issue_desc));
+    }
+
+    let _ = pool.close_and_drain(Duration::from_secs(5)).await;
+}
