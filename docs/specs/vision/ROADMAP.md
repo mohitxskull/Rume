@@ -75,7 +75,7 @@ This phase provides enterprise-grade reliability, data consistency, and architec
 | **ENT-01** | Transactional Outbox | Durable event publication pattern ensuring atomic database mutation and event emission without message loss on process crash. | **Completed** |
 | **ENT-02** | Job Reliability | Distributed worker execution, idempotency keys, exponential backoff retries, dead-letter queues, and worker heartbeat recovery. | **Completed** |
 | **ENT-03** | Resilience Middleware | Circuit breakers, adaptive timeouts, concurrency limits, rate limiting, and shed-load policies. | **Completed** |
-| **ENT-04** | Unified Observability | Correlated OpenTelemetry distributed tracing, Prometheus metrics export, structured JSON logging, and error tracking. | **Completed** |
+| **ENT-04** | Unified Observability | Correlated W3C TraceContext distributed tracing across asynchronous boundaries, Prometheus metrics registry, structured logging, and RFC 9457 error tracking. | **Completed** |
 | **ENT-05** | Module Integration Testing | In-memory and test-container test harnesses allowing individual modules to be tested with real dependencies or explicit test doubles. | **Completed** |
 | **ENT-06** | Architecture CI Verification | Compile-time and CI test runners enforcing module visibility, forbidden cross-domain calls, and clean dependency graphs. | **Completed** |
 | **ENT-07** | Multi-Tenant Primitives | Optional tenant resolution extractors, connection scoping, and tenant-isolated cache/storage boundaries. | **Completed** |
@@ -103,7 +103,7 @@ Specialized enterprise and distributed extensions built on the proven core archi
 |---|---|---|---|
 | **MAT-01** | Workflow Orchestration | Multi-step saga execution with functional or trait steps, automated reverse compensation hooks, and full execution tracing. | **Completed** |
 | **MAT-02** | Distributed Coordination | Exclusive distributed locking with monotonic fencing tokens and TTL auto-expiration; leader election with lease renewal. | **Completed** |
-| **MAT-03** | Enterprise Protocol Starters | Standard SCIM 2.0 (RFC 7643 / RFC 7644) provisioning envelopes and SAML 2.0 assertion parser, audience/condition validator. | **Completed** |
+| **MAT-03** | Enterprise Protocol Starters | Standard SCIM 2.0 (RFC 7643 / RFC 7644) provisioning envelopes and experimental SAML 2.0 assertion parser (non-production; XMLDSig validation pending). | **Completed** |
 
 **Verification Suites:**
 - [`rume/tests/saga_suite.rs`](../../../rume/tests/saga_suite.rs)
@@ -128,7 +128,7 @@ This phase ensures Rume's capabilities function dependably under realistic appli
 | **REL-03** | Durable Jobs & Worker Recovery | Persistent queue backend, atomic job claiming with leases and heartbeats, automatic abandoned-job recovery, durable retry scheduling, dead-letter storage, and cross-process idempotency. | **P1** |
 | **REL-04** | Production Distributed Coordination | Real shared-store distributed lock and leader election with lease auto-renewal, node crash takeover, and monotonically increasing fencing tokens. | **P1** |
 | **REL-05** | Production Infrastructure Integrations | Production Redis cache adapter and session store, multi-instance cache quota enforcement, and distributed tag invalidation. | **P1** |
-| **REL-06** | Security & Enterprise Hardening | Standards-compliant XML parsing for SAML 2.0 with mandatory digital signature verification (protecting against XML signature-wrapping attacks), audience/issuer/time-condition validation, and hardened tenant isolation. | **P1** |
+| **REL-06** | Security & Enterprise Hardening | Standards-compliant XML parsing for experimental SAML 2.0 (flagged non-production until certified XMLDSig verification is implemented), audience/issuer/time-condition validation, and hardened tenant isolation. | **P1** |
 | **REL-07** | Meaningful Architecture Verification | Clarify and enforce boundaries between declared module dependency graphs (`Module::dependencies()`) and compile-time Rust module visibility rules. | **P1** |
 
 ### Sprint Prioritization Order
@@ -195,7 +195,7 @@ With runtime durability, multi-tenant isolation, safe transactions, and first-cl
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
-| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Completed** |
+| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Active Sprint** |
 | **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **Completed** |
 | **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export, and zero-downtime rolling upgrades. | **P1** |
 | **REL-11** | Crate Publishing & Semantic Versioning Audit | Final audit of crate dependencies, API surface documentation, `#![forbid(unsafe_code)]` verification across all workspace crates, and v0.1.0 release packaging. | **P1** |
