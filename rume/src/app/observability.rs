@@ -44,6 +44,89 @@ pub fn init_tracing() {
 /// The standard HTTP header name for request identity: `x-request-id`.
 pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
+/// Standard W3C TraceContext header name: `traceparent`.
+pub static TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
+
+/// Standard W3C TraceContext header name: `tracestate`.
+pub static TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
+
+/// W3C TraceContext representation propagating distributed trace identity across HTTP, jobs, and outbox.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TraceContext {
+    /// W3C `traceparent` header string (e.g. `00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01`).
+    pub traceparent: String,
+    /// Optional W3C `tracestate` header string.
+    pub tracestate: Option<String>,
+}
+
+impl TraceContext {
+    /// Generates a new valid W3C TraceContext traceparent.
+    pub fn generate() -> Self {
+        let trace_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
+        let span_id = format!("{:016x}", uuid::Uuid::new_v4().as_u128() as u64);
+        Self {
+            traceparent: format!("00-{trace_id}-{span_id}-01"),
+            tracestate: None,
+        }
+    }
+
+    /// Creates a `TraceContext` from an explicit `traceparent` string.
+    pub fn from_traceparent(traceparent: impl Into<String>) -> Self {
+        Self {
+            traceparent: traceparent.into(),
+            tracestate: None,
+        }
+    }
+
+    /// Validates whether a string matches W3C `traceparent` specification.
+    pub fn is_valid_traceparent(s: &str) -> bool {
+        let parts: Vec<&str> = s.split('-').collect();
+        if parts.len() != 4 {
+            return false;
+        }
+        if parts[0] != "00" {
+            return false;
+        }
+        if parts[1].len() != 32
+            || !parts[1].chars().all(|c| c.is_ascii_hexdigit())
+            || parts[1] == "00000000000000000000000000000000"
+        {
+            return false;
+        }
+        if parts[2].len() != 16
+            || !parts[2].chars().all(|c| c.is_ascii_hexdigit())
+            || parts[2] == "0000000000000000"
+        {
+            return false;
+        }
+        if parts[3].len() != 2 || !parts[3].chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+        true
+    }
+}
+
+impl Display for TraceContext {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.traceparent)
+    }
+}
+
+impl<S> FromRequestParts<S> for TraceContext
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        if let Some(ctx) = parts.extensions.get::<TraceContext>() {
+            Ok(ctx.clone())
+        } else {
+            Ok(TraceContext::generate())
+        }
+    }
+}
+
 /// A unique identifier for an HTTP request.
 ///
 /// Propagated through request extensions and extractable in Axum handlers via
@@ -182,8 +265,27 @@ where
             None => RequestId::generate(),
         };
 
-        // Propagate RequestId through request extensions for handlers & other layers.
+        let trace_context = match req.headers().get(&TRACEPARENT) {
+            Some(val) => match val.to_str() {
+                Ok(s) if TraceContext::is_valid_traceparent(s) => {
+                    let tracestate = req
+                        .headers()
+                        .get(&TRACESTATE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(ToString::to_string);
+                    TraceContext {
+                        traceparent: s.to_string(),
+                        tracestate,
+                    }
+                }
+                _ => TraceContext::generate(),
+            },
+            None => TraceContext::generate(),
+        };
+
+        // Propagate RequestId and TraceContext through request extensions for handlers & other layers.
         req.extensions_mut().insert(request_id.clone());
+        req.extensions_mut().insert(trace_context.clone());
 
         let method = req.method().clone();
         let matched_path = req
@@ -194,6 +296,7 @@ where
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
+            traceparent = %trace_context.traceparent,
             method = %method,
             route = tracing::field::Empty,
             status = tracing::field::Empty,
@@ -206,6 +309,7 @@ where
 
         let mut inner = self.inner.clone();
         let req_id_str = request_id.0.clone();
+        let trace_parent_str = trace_context.traceparent.clone();
         let span_clone = span.clone();
 
         use tracing::Instrument;
@@ -229,9 +333,12 @@ where
                     tracing::info!(status = status.as_u16(), latency_ms, "request completed");
                 }
 
-                // Always add X-Request-ID to response headers
+                // Always add X-Request-ID and traceparent to response headers
                 if let Ok(hdr_val) = HeaderValue::from_str(&req_id_str) {
                     response.headers_mut().insert(X_REQUEST_ID.clone(), hdr_val);
+                }
+                if let Ok(hdr_val) = HeaderValue::from_str(&trace_parent_str) {
+                    response.headers_mut().insert(TRACEPARENT.clone(), hdr_val);
                 }
 
                 // If response is RFC 9457 Problem Details, ensure request_id is populated safely.

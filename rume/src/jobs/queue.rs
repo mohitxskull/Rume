@@ -10,7 +10,8 @@ use crate::jobs::job::{BoxFuture, Job, QueuedJob};
 pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Enqueues a typed job for immediate execution.
     fn enqueue<J: Job>(&self, job: J) -> BoxFuture<'_, Result<String, JobError>> {
-        self.enqueue_delayed(job, Duration::ZERO)
+        let trace = job.trace_context();
+        self.enqueue_delayed_with_trace(job, Duration::ZERO, trace)
     }
 
     /// Enqueues a typed job with an initial execution delay.
@@ -18,7 +19,29 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         &self,
         job: J,
         delay: Duration,
-    ) -> BoxFuture<'_, Result<String, JobError>>;
+    ) -> BoxFuture<'_, Result<String, JobError>> {
+        let trace = job.trace_context();
+        self.enqueue_delayed_with_trace(job, delay, trace)
+    }
+
+    /// Enqueues a typed job with an initial execution delay and explicit W3C trace context.
+    fn enqueue_delayed_with_trace<J: Job>(
+        &self,
+        job: J,
+        delay: Duration,
+        _trace_context: Option<String>,
+    ) -> BoxFuture<'_, Result<String, JobError>> {
+        self.enqueue_delayed(job, delay)
+    }
+
+    /// Enqueues a typed job for immediate execution with explicit W3C trace context.
+    fn enqueue_with_trace<J: Job>(
+        &self,
+        job: J,
+        trace_context: Option<String>,
+    ) -> BoxFuture<'_, Result<String, JobError>> {
+        self.enqueue_delayed_with_trace(job, Duration::ZERO, trace_context)
+    }
 
     /// Dequeues the next available job, recording the worker identifier that claimed it.
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;

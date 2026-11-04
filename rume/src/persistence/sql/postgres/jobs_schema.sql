@@ -18,7 +18,8 @@ CREATE TABLE IF NOT EXISTS rume_jobs (
     dead_lettered_at BIGINT,
     created_at BIGINT NOT NULL,
     completed_at BIGINT,
-    lease_token TEXT
+    lease_token TEXT,
+    trace_context TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_rume_jobs_pending ON rume_jobs (available_at) WHERE status = 'pending';

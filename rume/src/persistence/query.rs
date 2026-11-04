@@ -1,6 +1,7 @@
 //! First-class SQL query asset definition and execution interface.
 
 use std::fmt::Display;
+use tracing::Instrument;
 
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::error::PersistenceError;
@@ -36,13 +37,23 @@ impl<'a> SqlQuery<'a> {
         self.sql
     }
 
+    fn span(&self) -> tracing::Span {
+        tracing::info_span!(
+            "db.query",
+            "db.system" = self.dialect.unwrap_or("sql"),
+            "db.statement.name" = self.name,
+            "db.query.path" = self.path
+        )
+    }
+
     /// Executes the query statement within a transaction with bound parameters, returning affected rows.
     pub async fn execute<T: DatabaseTransaction>(
         &self,
         tx: &T,
         params: &[DbValue],
     ) -> Result<u64, PersistenceError> {
-        tx.execute_params(self.sql, params).await
+        let span = self.span();
+        tx.execute_params(self.sql, params).instrument(span).await
     }
 
     /// Executes the query statement directly on a database pool with bound parameters, returning affected rows.
@@ -51,7 +62,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<u64, PersistenceError> {
-        pool.execute_params(self.sql, params).await
+        let span = self.span();
+        pool.execute_params(self.sql, params).instrument(span).await
     }
 
     /// Executes the query on a database pool and fetches all matching rows as generic [`DbRow`] records.
@@ -60,7 +72,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, PersistenceError> {
-        pool.fetch_all(self.sql, params).await
+        let span = self.span();
+        pool.fetch_all(self.sql, params).instrument(span).await
     }
 
     /// Executes the query on a database pool and maps all matching rows into type `R` via [`FromRow`].
@@ -69,7 +82,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Vec<R>, PersistenceError> {
-        pool.fetch_all_as(self.sql, params).await
+        let span = self.span();
+        pool.fetch_all_as(self.sql, params).instrument(span).await
     }
 
     /// Executes the query within a transaction and fetches all matching rows as generic [`DbRow`] records.
@@ -78,7 +92,8 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, PersistenceError> {
-        tx.fetch_all(self.sql, params).await
+        let span = self.span();
+        tx.fetch_all(self.sql, params).instrument(span).await
     }
 
     /// Executes the query within a transaction and maps all matching rows into type `R` via [`FromRow`].
@@ -87,8 +102,13 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Vec<R>, PersistenceError> {
-        let rows = tx.fetch_all(self.sql, params).await?;
-        rows.iter().map(R::from_row).collect()
+        let span = self.span();
+        async move {
+            let rows = tx.fetch_all(self.sql, params).await?;
+            rows.iter().map(R::from_row).collect()
+        }
+        .instrument(span)
+        .await
     }
 
     /// Executes the query on a database pool and fetches an optional row as [`DbRow`].
@@ -97,7 +117,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, PersistenceError> {
-        pool.fetch_optional(self.sql, params).await
+        let span = self.span();
+        pool.fetch_optional(self.sql, params).instrument(span).await
     }
 
     /// Executes the query on a database pool and maps an optional row into type `R` via [`FromRow`].
@@ -106,7 +127,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<R>, PersistenceError> {
-        pool.fetch_optional_as(self.sql, params).await
+        let span = self.span();
+        pool.fetch_optional_as(self.sql, params).instrument(span).await
     }
 
     /// Executes the query within a transaction and fetches an optional row as [`DbRow`].
@@ -115,7 +137,8 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, PersistenceError> {
-        tx.fetch_optional(self.sql, params).await
+        let span = self.span();
+        tx.fetch_optional(self.sql, params).instrument(span).await
     }
 
     /// Executes the query within a transaction and maps an optional row into type `R` via [`FromRow`].
@@ -124,10 +147,15 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<R>, PersistenceError> {
-        match tx.fetch_optional(self.sql, params).await? {
-            Some(row) => R::from_row(&row).map(Some),
-            None => Ok(None),
+        let span = self.span();
+        async move {
+            match tx.fetch_optional(self.sql, params).await? {
+                Some(row) => R::from_row(&row).map(Some),
+                None => Ok(None),
+            }
         }
+        .instrument(span)
+        .await
     }
 
     /// Executes the query on a database pool and fetches exactly one row as [`DbRow`].
@@ -136,7 +164,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<DbRow, PersistenceError> {
-        pool.fetch_one(self.sql, params).await
+        let span = self.span();
+        pool.fetch_one(self.sql, params).instrument(span).await
     }
 
     /// Executes the query on a database pool and maps exactly one row into type `R` via [`FromRow`].
@@ -145,7 +174,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<R, PersistenceError> {
-        pool.fetch_one_as(self.sql, params).await
+        let span = self.span();
+        pool.fetch_one_as(self.sql, params).instrument(span).await
     }
 
     /// Executes the query and returns an optional scalar string from the first column of the first row.
@@ -154,7 +184,8 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<String>, PersistenceError> {
-        pool.query_scalar_params(self.sql, params).await
+        let span = self.span();
+        pool.query_scalar_params(self.sql, params).instrument(span).await
     }
 
     /// Executes the query within a transaction and returns an optional scalar string.
@@ -163,7 +194,8 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<String>, PersistenceError> {
-        tx.query_scalar_params(self.sql, params).await
+        let span = self.span();
+        tx.query_scalar_params(self.sql, params).instrument(span).await
     }
 }
 

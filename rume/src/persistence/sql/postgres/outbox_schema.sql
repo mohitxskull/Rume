@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS rume_outbox (
     last_error TEXT,
     next_retry_at BIGINT,
     lease_token VARCHAR(64),
-    lease_expires_at BIGINT
+    lease_expires_at BIGINT,
+    trace_context TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_rume_outbox_pending

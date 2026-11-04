@@ -84,6 +84,16 @@ impl JobQueue for PostgresJobQueue {
         job: J,
         delay: Duration,
     ) -> BoxFuture<'_, Result<String, JobError>> {
+        let trace = job.trace_context();
+        self.enqueue_delayed_with_trace(job, delay, trace)
+    }
+
+    fn enqueue_delayed_with_trace<J: Job>(
+        &self,
+        job: J,
+        delay: Duration,
+        trace_context: Option<String>,
+    ) -> BoxFuture<'_, Result<String, JobError>> {
         let name = J::NAME.to_string();
         let retry_policy = job.retry_policy();
         let timeout = job.timeout();
@@ -114,6 +124,7 @@ impl JobQueue for PostgresJobQueue {
                 .bind(&idempotency_key)
                 .bind(&tenant_id)
                 .bind(delay_ms)
+                .bind(&trace_context)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -178,6 +189,8 @@ impl JobQueue for PostgresJobQueue {
                 let assigned_worker: Option<String> = r.try_get(11).ok();
                 let available_at_ms: i64 = r.try_get(12).unwrap_or(0);
                 let lease_token: Option<String> = r.try_get(13).ok();
+                let trace_context: Option<String> =
+                    r.try_get(14).ok().or_else(|| r.try_get("trace_context").ok());
 
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
@@ -208,6 +221,7 @@ impl JobQueue for PostgresJobQueue {
                     lease_token,
                     available_at,
                     lease_duration: self.default_lease_duration,
+                    trace_context,
                 }))
             } else {
                 Ok(None)
@@ -400,6 +414,7 @@ impl JobQueue for PostgresJobQueue {
                 let idempotency_key: Option<String> = r.try_get(9).ok();
                 let tenant_id: Option<String> = r.try_get(10).ok();
                 let assigned_worker: Option<String> = r.try_get(11).ok();
+                let trace_context: Option<String> = r.try_get("trace_context").ok();
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
                     initial_backoff_ms: initial_backoff_ms.max(0) as u64,
@@ -420,6 +435,7 @@ impl JobQueue for PostgresJobQueue {
                     lease_token: None,
                     assigned_worker,
                     lease_duration: self.default_lease_duration,
+                    trace_context,
                 });
             }
             Ok(jobs)

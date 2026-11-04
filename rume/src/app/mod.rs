@@ -11,7 +11,8 @@ pub mod state;
 pub use builder::{BuildError, IntoBindAddr, MiddlewareConfigError, Rume, RumeBuilder};
 pub use context::{AppContext, AppContextBuilder};
 pub use observability::{
-    ObservabilityLayer, RequestId, X_REQUEST_ID, init_tracing, try_init_tracing,
+    ObservabilityLayer, RequestId, TRACEPARENT, TRACESTATE, TraceContext, X_REQUEST_ID,
+    init_tracing, try_init_tracing,
 };
 pub use paths::ProjectPaths;
 #[allow(deprecated)]

@@ -545,6 +545,7 @@ fn parse_postgres_outbox_row(row: &PgRow) -> Result<OutboxMessage, OutboxError> 
     let next_retry_at: Option<i64> = row.try_get("next_retry_at").ok();
     let lease_token: Option<String> = row.try_get("lease_token").ok();
     let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").ok();
+    let trace_context: Option<String> = row.try_get("trace_context").ok();
 
     Ok(OutboxMessage {
         id,
@@ -557,6 +558,7 @@ fn parse_postgres_outbox_row(row: &PgRow) -> Result<OutboxMessage, OutboxError> 
         next_retry_at: next_retry_at.map(|v| v as u64),
         lease_token,
         lease_expires_at: lease_expires_at.map(|v| v as u64),
+        trace_context,
     })
 }
 
@@ -580,6 +582,7 @@ impl OutboxRepository for PostgresBackend {
                 .bind(msg.next_retry_at.map(|v| v as i64))
                 .bind(&msg.lease_token)
                 .bind(msg.lease_expires_at.map(|v| v as i64))
+                .bind(&msg.trace_context)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
@@ -830,6 +833,7 @@ impl OutboxRepository for PostgresBackend {
                 let next_retry_at: Option<i64> = row.try_get("next_retry_at").ok();
                 let lease_token: Option<String> = row.try_get("lease_token").ok();
                 let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").ok();
+                let trace_context: Option<String> = row.try_get("trace_context").ok();
 
                 messages.push(OutboxMessage {
                     id,
@@ -842,6 +846,7 @@ impl OutboxRepository for PostgresBackend {
                     next_retry_at: next_retry_at.map(|v| v as u64),
                     lease_token,
                     lease_expires_at: lease_expires_at.map(|v| v as u64),
+                    trace_context,
                 });
             }
             Ok(messages)
@@ -898,6 +903,7 @@ impl TransactionalOutbox<PostgresTransaction> for PostgresBackend {
                 .bind(msg.next_retry_at.map(|v| v as i64))
                 .bind(&msg.lease_token)
                 .bind(msg.lease_expires_at.map(|v| v as i64))
+                .bind(&msg.trace_context)
                 .execute(&mut **active_tx)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

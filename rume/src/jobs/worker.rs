@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use futures_util::FutureExt;
 use tokio::time::sleep;
+use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::jobs::error::JobError;
@@ -84,17 +85,31 @@ impl JobRegistry {
             attempt: job.attempt,
             max_attempts: job.retry_policy.max_attempts,
             cancellation,
+            trace_context: job.trace_context.clone(),
         };
 
-        let fut = handler(&ctx, &job.payload);
-        if let Some(timeout) = job.timeout {
-            match tokio::time::timeout(timeout, fut).await {
-                Ok(res) => res,
-                Err(_) => Err(JobError::Timeout),
+        let span = tracing::info_span!(
+            "job.dispatch",
+            job.id = %job.id,
+            job.name = %job.name,
+            job.attempt = job.attempt,
+            traceparent = job.trace_context.as_deref().unwrap_or(""),
+        );
+        use tracing::Instrument;
+
+        async move {
+            let fut = handler(&ctx, &job.payload);
+            if let Some(timeout) = job.timeout {
+                match tokio::time::timeout(timeout, fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(JobError::Timeout),
+                }
+            } else {
+                fut.await
             }
-        } else {
-            fut.await
         }
+        .instrument(span)
+        .await
     }
 }
 
@@ -523,20 +538,30 @@ impl<Q: JobQueue> JobWorker<Q> {
                     let transition_errors = Arc::clone(&self.transition_errors);
                     let lost_leases = Arc::clone(&self.lost_leases);
 
-                    tokio::spawn(async move {
-                        let _permit = permit;
-                        let _guard = InFlightGuard(in_flight);
-                        Self::execute_job(
-                            queue,
-                            registry,
-                            job,
-                            idempotency,
-                            stopping,
-                            transition_errors,
-                            lost_leases,
-                        )
-                        .await;
-                    });
+                    let job_span = tracing::info_span!(
+                        "job.execute",
+                        job.id = %job.id,
+                        job.name = %job.name,
+                        traceparent = job.trace_context.as_deref().unwrap_or("")
+                    );
+
+                    tokio::spawn(
+                        async move {
+                            let _permit = permit;
+                            let _guard = InFlightGuard(in_flight);
+                            Self::execute_job(
+                                queue,
+                                registry,
+                                job,
+                                idempotency,
+                                stopping,
+                                transition_errors,
+                                lost_leases,
+                            )
+                            .await;
+                        }
+                        .instrument(job_span),
+                    );
                 }
                 Ok(None) => {
                     consecutive_errors = 0;
@@ -928,6 +953,7 @@ mod tests {
             lease_token: None,
             available_at: Instant::now(),
             lease_duration: Duration::from_secs(10),
+            trace_context: None,
         };
 
         let queue = Arc::new(BlockingTestQueue {

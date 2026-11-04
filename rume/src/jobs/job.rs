@@ -38,6 +38,11 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn tenant_id(&self) -> Option<String> {
         None
     }
+
+    /// Optional W3C TraceContext traceparent string propagating distributed trace identity.
+    fn trace_context(&self) -> Option<String> {
+        None
+    }
 }
 
 use std::sync::Arc;
@@ -54,6 +59,8 @@ pub struct JobContext {
     pub max_attempts: u32,
     /// Optional cancellation signal triggered during graceful worker shutdown.
     pub cancellation: Option<Arc<AtomicBool>>,
+    /// Optional W3C TraceContext traceparent string.
+    pub trace_context: Option<String>,
 }
 
 impl JobContext {
@@ -64,12 +71,19 @@ impl JobContext {
             attempt,
             max_attempts,
             cancellation: None,
+            trace_context: None,
         }
     }
 
     /// Attaches a cancellation token to the job context.
     pub fn with_cancellation(mut self, cancellation: Arc<AtomicBool>) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Attaches a W3C trace context string to the job context.
+    pub fn with_trace_context(mut self, trace_context: impl Into<String>) -> Self {
+        self.trace_context = Some(trace_context.into());
         self
     }
 
@@ -115,4 +129,6 @@ pub struct QueuedJob {
     pub available_at: Instant,
     /// Lease duration granted for this execution attempt.
     pub lease_duration: Duration,
+    /// Optional W3C TraceContext traceparent string.
+    pub trace_context: Option<String>,
 }

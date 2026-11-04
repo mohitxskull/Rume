@@ -52,6 +52,8 @@ pub struct OutboxMessage {
     pub lease_token: Option<String>,
     /// Timestamp when the worker's exclusive claim lease expires.
     pub lease_expires_at: Option<u64>,
+    /// Optional W3C TraceContext traceparent string propagating distributed trace identity.
+    pub trace_context: Option<String>,
 }
 
 impl OutboxMessage {
@@ -68,7 +70,14 @@ impl OutboxMessage {
             next_retry_at: None,
             lease_token: None,
             lease_expires_at: None,
+            trace_context: None,
         }
+    }
+
+    /// Attaches a W3C trace context string to the message.
+    pub fn with_trace_context(mut self, trace_context: impl Into<String>) -> Self {
+        self.trace_context = Some(trace_context.into());
+        self
     }
 
     /// Creates a new outbox message from a serializable event.
@@ -90,6 +99,7 @@ impl OutboxMessage {
             next_retry_at: None,
             lease_token: None,
             lease_expires_at: None,
+            trace_context: None,
         })
     }
 

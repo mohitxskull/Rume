@@ -554,6 +554,7 @@ fn parse_mysql_outbox_row(row: &MySqlRow) -> Result<OutboxMessage, OutboxError> 
     let next_retry_at: Option<u64> = row.try_get("next_retry_at").ok();
     let lease_token: Option<String> = row.try_get("lease_token").ok();
     let lease_expires_at: Option<u64> = row.try_get("lease_expires_at").ok();
+    let trace_context: Option<String> = row.try_get("trace_context").ok();
 
     Ok(OutboxMessage {
         id,
@@ -566,6 +567,7 @@ fn parse_mysql_outbox_row(row: &MySqlRow) -> Result<OutboxMessage, OutboxError> 
         next_retry_at,
         lease_token,
         lease_expires_at,
+        trace_context,
     })
 }
 
@@ -589,6 +591,7 @@ impl OutboxRepository for MysqlBackend {
                 .bind(msg.next_retry_at)
                 .bind(&msg.lease_token)
                 .bind(msg.lease_expires_at)
+                .bind(&msg.trace_context)
                 .execute(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
@@ -846,6 +849,7 @@ impl OutboxRepository for MysqlBackend {
                 let next_retry_at: Option<u64> = row.try_get("next_retry_at").ok();
                 let lease_token: Option<String> = row.try_get("lease_token").ok();
                 let lease_expires_at: Option<u64> = row.try_get("lease_expires_at").ok();
+                let trace_context: Option<String> = row.try_get("trace_context").ok();
 
                 messages.push(OutboxMessage {
                     id,
@@ -858,6 +862,7 @@ impl OutboxRepository for MysqlBackend {
                     next_retry_at,
                     lease_token,
                     lease_expires_at,
+                    trace_context,
                 });
             }
             Ok(messages)
@@ -914,6 +919,7 @@ impl TransactionalOutbox<MysqlTransaction> for MysqlBackend {
                 .bind(msg.next_retry_at)
                 .bind(&msg.lease_token)
                 .bind(msg.lease_expires_at)
+                .bind(&msg.trace_context)
                 .execute(&mut **active_tx)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

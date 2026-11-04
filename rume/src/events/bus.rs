@@ -6,6 +6,7 @@ use std::fmt::Debug;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
 use futures_util::FutureExt;
+use tracing::Instrument;
 
 use crate::events::error::EventError;
 use crate::events::event::{BoxFuture, ErasedEventListener, Event, EventHandler};
@@ -137,20 +138,24 @@ impl EventBus {
         let count = listeners.len();
         if count > 0 {
             let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
-            tokio::spawn(async move {
-                for listener in listeners {
-                    let fut = listener(Arc::clone(&event_arc));
-                    match AssertUnwindSafe(fut).catch_unwind().await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            tracing::error!("async event listener returned error: {err}");
-                        }
-                        Err(panic_payload) => {
-                            tracing::error!("async event listener panicked: {panic_payload:?}");
+            let span = tracing::info_span!("event.publish_async", event.type = E::TYPE);
+            tokio::spawn(
+                async move {
+                    for listener in listeners {
+                        let fut = listener(Arc::clone(&event_arc));
+                        match AssertUnwindSafe(fut).catch_unwind().await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                tracing::error!("async event listener returned error: {err}");
+                            }
+                            Err(panic_payload) => {
+                                tracing::error!("async event listener panicked: {panic_payload:?}");
+                            }
                         }
                     }
                 }
-            });
+                .instrument(span),
+            );
         }
 
         count

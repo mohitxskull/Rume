@@ -284,8 +284,16 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 (self.dispatcher)(&message, cancel_signal)
             }));
 
+            let span = tracing::info_span!(
+                "outbox.dispatch",
+                message.id = %message.id,
+                message.event_type = %message.event_type,
+                traceparent = message.trace_context.as_deref().unwrap_or("")
+            );
+            use tracing::Instrument;
+
             let dispatch_result = match fut_result {
-                Ok(fut) => match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                Ok(fut) => match std::panic::AssertUnwindSafe(fut.instrument(span)).catch_unwind().await {
                     Ok(res) => res,
                     Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
                 },
@@ -542,6 +550,7 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                     message: "outbox relay is stopping".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 }
             } else if status.consecutive_errors >= 5 {
                 HealthCheckResult {
@@ -553,6 +562,7 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                     ),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 }
             } else if status.consecutive_errors > 0 {
                 HealthCheckResult {
@@ -564,6 +574,7 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                     ),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 }
             } else {
                 HealthCheckResult {
@@ -572,6 +583,7 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                     message: "outbox relay healthy".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 }
             }
         })
