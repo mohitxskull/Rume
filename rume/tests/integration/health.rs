@@ -26,6 +26,7 @@ impl HealthCheck for OkCheck {
                 message: "connection established".to_string(),
                 meta: BTreeMap::new(),
                 cached: false,
+                duration_ms: None,
             }
         })
     }
@@ -48,6 +49,7 @@ impl HealthCheck for WarningCheck {
                 message: "high latency".to_string(),
                 meta: BTreeMap::new(),
                 cached: false,
+                duration_ms: None,
             }
         })
     }
@@ -70,6 +72,7 @@ impl HealthCheck for FailedCheck {
                 message: "credentials invalid".to_string(),
                 meta: BTreeMap::new(),
                 cached: false,
+                duration_ms: None,
             }
         })
     }

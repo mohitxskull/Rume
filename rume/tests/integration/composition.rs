@@ -506,6 +506,7 @@ impl HealthCheck for DatabaseHealthCheck {
                 message: "pool healthy".to_string(),
                 meta: Default::default(),
                 cached: false,
+                duration_ms: None,
             }
         })
     }

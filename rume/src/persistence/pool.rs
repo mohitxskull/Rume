@@ -134,6 +134,11 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         }
     }
 
+    /// Exports pool metrics to the provided [`MetricsRegistry`].
+    pub fn export_metrics(&self, registry: &crate::metrics::MetricsRegistry, pool_name: &str) {
+        registry.record_db_pool_status(pool_name, &self.status());
+    }
+
     /// Acquires a connection lease from the pool synchronously, checking capacity and closed state.
     pub fn acquire_lease(&self) -> Result<ConnectionLease, PersistenceError> {
         if self.is_closed.load(Ordering::SeqCst) {
@@ -454,6 +459,7 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                     message: "database pool is closed".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 };
             }
 
@@ -466,6 +472,7 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                     message: "database connection healthy".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 },
                 Ok(Err(err)) => HealthCheckResult {
                     name,
@@ -473,6 +480,7 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                     message: format!("database connection check failed: {err}"),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 },
                 Err(_) => HealthCheckResult {
                     name,
@@ -480,6 +488,7 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                     message: format!("database connection check timed out after {}s", ping_timeout.as_secs()),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 },
             }
         })

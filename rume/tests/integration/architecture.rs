@@ -87,6 +87,7 @@ impl rume::routing::HealthCheck for FailingDbCheck {
                 message: "database unavailable".to_string(),
                 meta: std::collections::BTreeMap::new(),
                 cached: false,
+                duration_ms: None,
             }
         })
     }

@@ -325,6 +325,7 @@ impl<B: CacheBackend> HealthCheck for CacheHealthCheck<B> {
                     message: "cache is closed".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 };
             }
 
@@ -335,6 +336,7 @@ impl<B: CacheBackend> HealthCheck for CacheHealthCheck<B> {
                     message: "cache connection healthy".to_string(),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 },
                 Err(err) => HealthCheckResult {
                     name,
@@ -342,6 +344,7 @@ impl<B: CacheBackend> HealthCheck for CacheHealthCheck<B> {
                     message: format!("cache connection check failed: {err}"),
                     meta,
                     cached: false,
+                    duration_ms: None,
                 },
             }
         })

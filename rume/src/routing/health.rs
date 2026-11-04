@@ -37,6 +37,58 @@ pub struct HealthCheckResult {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub meta: BTreeMap<String, serde_json::Value>,
     pub cached: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+impl HealthCheckResult {
+    /// Creates a healthy result.
+    pub fn ok(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: HealthStatus::Ok,
+            message: message.into(),
+            meta: BTreeMap::new(),
+            cached: false,
+            duration_ms: None,
+        }
+    }
+
+    /// Creates a warning result.
+    pub fn warning(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: HealthStatus::Warning,
+            message: message.into(),
+            meta: BTreeMap::new(),
+            cached: false,
+            duration_ms: None,
+        }
+    }
+
+    /// Creates a failed result.
+    pub fn failed(name: impl Into<String>, message: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            status: HealthStatus::Failed,
+            message: message.into(),
+            meta: BTreeMap::new(),
+            cached: false,
+            duration_ms: None,
+        }
+    }
+
+    /// Attaches metadata to the health check result.
+    pub fn with_meta(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+        self.meta.insert(key.into(), value.into());
+        self
+    }
+
+    /// Attaches execution duration in milliseconds.
+    pub fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
+        self
+    }
 }
 
 /// A health check that can be registered.
@@ -187,14 +239,21 @@ impl HealthChecks {
             handles.push((
                 name.clone(),
                 tokio::spawn(async move {
+                    let start = Instant::now();
                     match timeout(timeout_duration, check.run()).await {
-                        Ok(result) => result,
+                        Ok(mut result) => {
+                            if result.duration_ms.is_none() {
+                                result.duration_ms = Some(start.elapsed().as_millis() as u64);
+                            }
+                            result
+                        }
                         Err(_elapsed) => HealthCheckResult {
                             name,
                             status: HealthStatus::Failed,
                             message: format!("health check timed out after {:?}", timeout_duration),
                             meta: BTreeMap::new(),
                             cached: false,
+                            duration_ms: Some(start.elapsed().as_millis() as u64),
                         },
                     }
                 }),
@@ -210,6 +269,7 @@ impl HealthChecks {
                 message: "health check task panicked".to_string(),
                 meta: BTreeMap::new(),
                 cached: false,
+                duration_ms: None,
             }));
         }
 
@@ -438,6 +498,7 @@ mod tests {
                     message: "ok".to_string(),
                     meta: BTreeMap::new(),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -459,6 +520,7 @@ mod tests {
                     message: "not found".to_string(),
                     meta: BTreeMap::new(),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -489,6 +551,7 @@ mod tests {
                     message: "ok".to_string(),
                     meta: BTreeMap::new(),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -516,6 +579,7 @@ mod tests {
                     message: "ok".to_string(),
                     meta: BTreeMap::new(),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -537,6 +601,7 @@ mod tests {
                     message: "high latency".to_string(),
                     meta: BTreeMap::new(),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -732,6 +797,7 @@ mod tests {
                         ("password".to_string(), serde_json::json!("secret")),
                     ]),
                     cached: false,
+                    duration_ms: None,
                 }
             })
         }
@@ -1035,6 +1101,7 @@ mod tests {
                         message: "ok".to_string(),
                         meta: BTreeMap::new(),
                         cached: false,
+                        duration_ms: None,
                     }
                 })
             }
@@ -1068,5 +1135,13 @@ mod tests {
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         // Followers observed cached: true
         assert_eq!(cached_count, 9);
+    }
+
+    #[tokio::test]
+    async fn health_check_populates_duration_ms() {
+        let hc = HealthChecks::new().register(OkCheck);
+        let report = hc.run().await;
+        assert_eq!(report.checks.len(), 1);
+        assert!(report.checks[0].duration_ms.is_some());
     }
 }
