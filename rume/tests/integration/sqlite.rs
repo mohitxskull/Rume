@@ -86,6 +86,38 @@ async fn sqlite_migrations_and_rollback() {
 }
 
 #[tokio::test]
+async fn sqlite_auto_migrate_applies_pending_migrations() {
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    let config = DatabaseConfig::default().with_auto_migrate(true);
+    let pool = DatabasePool::new(backend, config);
+
+    let migrator = Migrator::new().add_migration(Migration::from_sql(
+        "001_create_items",
+        "create items",
+        "CREATE TABLE items (id INTEGER PRIMARY KEY);",
+    ));
+
+    // When auto_migrate is true:
+    let res = pool
+        .apply_auto_migrations(&migrator)
+        .await
+        .expect("apply auto migrations");
+    assert!(res.is_some());
+    let summary = res.unwrap();
+    assert_eq!(summary.applied.len(), 1);
+
+    // When auto_migrate is false:
+    let backend2 = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    let config2 = DatabaseConfig::default().with_auto_migrate(false);
+    let pool2 = DatabasePool::new(backend2, config2);
+    let res2 = pool2
+        .apply_auto_migrations(&migrator)
+        .await
+        .expect("no-op");
+    assert!(res2.is_none());
+}
+
+#[tokio::test]
 async fn sqlite_explicit_transaction_commit_and_rollback() {
     let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
     backend

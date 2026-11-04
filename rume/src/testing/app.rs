@@ -99,6 +99,11 @@ impl TestApp {
             cleanup();
         }
     }
+
+    /// Run teardown asynchronously without blocking the active Tokio runtime worker thread.
+    pub async fn teardown_async(self) {
+        let _ = tokio::task::spawn_blocking(move || self.teardown()).await;
+    }
 }
 
 impl std::fmt::Debug for TestApp {

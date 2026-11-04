@@ -1,5 +1,6 @@
 //! Fast zero-docker integration suites.
 
+// Why: #![deny(unsafe_code)] instead of #![forbid(unsafe_code)] is required to allow integration::config to use unsafe for process environment mutation via EnvVarGuard.
 #![deny(unsafe_code)]
 
 #[path = "common/mod.rs"]

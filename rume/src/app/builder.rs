@@ -583,8 +583,18 @@ where
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
+        let mode = self.mode;
 
         let app_router = self.build_router(ctx.clone())?;
+
+        // In Inspect mode, align with run(): boot context to Booted/Live and return without running hooks.
+        if mode == ApplicationMode::Inspect {
+            ctx.lifecycle.set(crate::app::state::LifecycleState::Booted);
+            ctx.availability
+                .set(crate::app::state::AvailabilityState::Live);
+            let test_app = crate::testing::TestApp::new(app_router.with_state(ctx.clone()));
+            return Ok(test_app);
+        }
 
         // 1. Booted & Live
         ctx.lifecycle.set(crate::app::state::LifecycleState::Booted);
@@ -711,18 +721,11 @@ where
 
     /// Add a route to the application.
     ///
-    /// The route is mounted on the router but not recorded in the route
-    /// registry: a [`MethodRouter`] does not expose its HTTP method, so
-    /// recording a [`crate::routing::RouteInfo`] here would require fabricating
-    /// one (likely `GET`), which would produce incorrect `rume list:routes`
-    /// output. Registration stays explicit: construct a [`RouteInfo`] from
-    /// [`crate::routing::RouteSpec::build`] metadata and call
-    /// [`RouteRegistry::register`] on [`AppContext::route_registry`].
-    ///
-    /// Why: a wrongly registered method is a real bug for `rume list:routes`,
-    /// whereas an empty registry is obvious and easy to populate explicitly.
-    /// Revisit if `MethodRouter` exposes its method or `route()` gains method
-    /// information.
+    /// The route is mounted on the router and registered into the route
+    /// registry with an `ANY` method filter (since [`MethodRouter`] does not
+    /// expose its specific HTTP methods). To register explicit HTTP methods
+    /// with typed metadata for OpenAPI or `rume list:routes`, use
+    /// [`RumeBuilder::route_spec`].
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
         self.record_route(crate::routing::RouteInfo {
@@ -1116,11 +1119,6 @@ where
         // (e.g. by `rume list:routes`).
         self.ctx.route_registry = self.route_registry.read().unwrap().clone();
 
-        let addr: SocketAddr = self
-            .bind
-            .parse()
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidInput, err))?;
-
         let mode = if std::env::var("RUME_INSPECT").is_ok()
             || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
         {
@@ -1167,6 +1165,7 @@ where
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let serve_ctx = self.ctx.clone();
+        let bind_addr = self.bind.clone();
 
         let router = match self.build_router(serve_ctx.clone()) {
             Ok(router) => router,
@@ -1174,10 +1173,10 @@ where
         };
 
         // --- Step 2: Bind listener ---
-        let listener = TcpListener::bind(addr).await.map_err(|err| {
+        let listener = TcpListener::bind(&bind_addr).await.map_err(|err| {
             std::io::Error::new(
                 err.kind(),
-                format!("failed to bind {addr}: {err} (is the port already in use?)"),
+                format!("failed to bind {bind_addr}: {err} (is the port already in use?)"),
             )
         })?;
 

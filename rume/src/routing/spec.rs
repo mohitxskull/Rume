@@ -160,6 +160,14 @@ impl RouteSpec {
     /// Building a route without mounting it therefore never pollutes any
     /// registry.
     pub fn build(self) -> (String, Method, Vec<(String, Matcher)>, Option<String>) {
+        let declared_params = self.param_names();
+        for (name, _) in &self.params {
+            assert!(
+                declared_params.contains(name),
+                "RouteSpec: parameter '{name}' declared in where_param does not exist in path '{}'",
+                self.path
+            );
+        }
         (self.path, self.method, self.params, self.name)
     }
 

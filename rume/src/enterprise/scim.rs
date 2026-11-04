@@ -141,6 +141,7 @@ pub struct ScimListResponse<T> {
     pub total_results: usize,
     pub items_per_page: usize,
     pub start_index: usize,
+    #[serde(rename = "Resources")]
     pub resources: Vec<T>,
 }
 

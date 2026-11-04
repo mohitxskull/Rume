@@ -128,4 +128,71 @@ impl SessionStore for RedisSessionStore {
             Ok(())
         })
     }
+
+    fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>> {
+        let old_key = self.key(old_id);
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let new_key = self.key(&new_id);
+
+        Box::pin(async move {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+
+            let script = r#"
+                local old_key = KEYS[1]
+                local new_key = KEYS[2]
+                local data = redis.call('GET', old_key)
+                if not data then
+                    return nil
+                end
+                local ttl = redis.call('PTTL', old_key)
+                if ttl > 0 then
+                    redis.call('SET', new_key, data, 'PX', ttl)
+                else
+                    redis.call('SET', new_key, data)
+                end
+                redis.call('DEL', old_key)
+                return data
+            "#;
+
+            let data: Option<Vec<u8>> = redis::Script::new(script)
+                .key(&old_key)
+                .key(&new_key)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+
+            let bytes = data.ok_or_else(|| {
+                AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
+            })?;
+
+            let mut session: Session = serde_json::from_slice(&bytes)
+                .map_err(|e| AuthError::ProviderError(format!("malformed session: {e}")))?;
+
+            if session.is_expired() {
+                let _: () = redis::cmd("DEL")
+                    .arg(&new_key)
+                    .query_async(&mut *conn)
+                    .await
+                    .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+                return Err(AuthError::InvalidCredentials("session expired".into()));
+            }
+
+            session.id = new_id;
+            let updated_bytes = serde_json::to_vec(&session)
+                .map_err(|e| AuthError::ProviderError(format!("failed to serialize session: {e}")))?;
+            let _: () = redis::cmd("SET")
+                .arg(&new_key)
+                .arg(&updated_bytes)
+                .arg("KEEPTTL")
+                .query_async(&mut *conn)
+                .await
+                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+
+            Ok(session)
+        })
+    }
 }

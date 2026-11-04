@@ -1,5 +1,6 @@
 //! Tower middleware for recording HTTP latency, status, and in-flight counts into Prometheus metrics.
 
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -13,12 +14,21 @@ use crate::metrics::registry::MetricsRegistry;
 #[derive(Debug, Clone)]
 pub struct MetricsLayer {
     registry: MetricsRegistry,
+    bypass_path: Arc<String>,
 }
 
 impl MetricsLayer {
-    /// Creates a new metrics layer wrapping the given registry.
+    /// Creates a new metrics layer wrapping the given registry with default bypass path `/metrics`.
     pub fn new(registry: MetricsRegistry) -> Self {
-        Self { registry }
+        Self::with_bypass_path(registry, "/metrics")
+    }
+
+    /// Creates a metrics layer with a custom bypass path.
+    pub fn with_bypass_path(registry: MetricsRegistry, bypass_path: impl Into<String>) -> Self {
+        Self {
+            registry,
+            bypass_path: Arc::new(bypass_path.into()),
+        }
     }
 }
 
@@ -29,6 +39,7 @@ impl<S> Layer<S> for MetricsLayer {
         MetricsService {
             inner,
             registry: self.registry.clone(),
+            bypass_path: Arc::clone(&self.bypass_path),
         }
     }
 }
@@ -46,6 +57,7 @@ impl Drop for InFlightGuard {
 pub struct MetricsService<S> {
     inner: S,
     registry: MetricsRegistry,
+    bypass_path: Arc<String>,
 }
 
 impl<S> Service<Request<Body>> for MetricsService<S>
@@ -64,7 +76,7 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        if req.uri().path() == "/metrics" {
+        if req.uri().path() == self.bypass_path.as_str() {
             let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await });
         }
@@ -115,6 +127,7 @@ mod tests {
         let mut metrics_service = MetricsService {
             inner: service,
             registry: registry.clone(),
+            bypass_path: Arc::new("/metrics".to_string()),
         };
 
         let req = Request::builder().body(Body::empty()).unwrap();

@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::Path;
 
-pub fn run() {
+pub fn run(dry_run: bool) {
     if !Path::new("Cargo.toml").is_file() {
         eprintln!("error: not a Rust project (Cargo.toml not found)");
         std::process::exit(1);
@@ -13,10 +13,10 @@ pub fn run() {
         std::process::exit(1);
     }
 
-    regenerate_dir(handlers_dir, "handler");
-    regenerate_dir(Path::new("src/models"), "model");
-    regenerate_dir(Path::new("src/services"), "service");
-    regenerate_dir(Path::new("src/middleware"), "middleware");
+    regenerate_dir(handlers_dir, "handler", dry_run);
+    regenerate_dir(Path::new("src/models"), "model", dry_run);
+    regenerate_dir(Path::new("src/services"), "service", dry_run);
+    regenerate_dir(Path::new("src/middleware"), "middleware", dry_run);
 
     // Validate routes.rs marker.
     let routes_path = Path::new("src/routes.rs");
@@ -35,7 +35,17 @@ pub fn run() {
     }
 }
 
-fn regenerate_dir(dir: &Path, label: &str) {
+fn is_valid_rust_identifier(s: &str) -> bool {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
+            chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        _ => false,
+    }
+}
+
+fn regenerate_dir(dir: &Path, label: &str, dry_run: bool) {
     if !dir.is_dir() {
         return;
     }
@@ -57,7 +67,7 @@ fn regenerate_dir(dir: &Path, label: &str) {
         let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
             continue;
         };
-        if stem == "mod" {
+        if stem == "mod" || !is_valid_rust_identifier(stem) {
             continue;
         }
         modules.push(stem.to_string());
@@ -71,6 +81,12 @@ fn regenerate_dir(dir: &Path, label: &str) {
     }
 
     let mod_path = dir.join("mod.rs");
+    if dry_run {
+        println!("Would regenerate {} (dry-run):", mod_path.display());
+        println!("  {} {} module(s)", modules.len(), label);
+        return;
+    }
+
     if let Err(err) = fs::write(&mod_path, content) {
         eprintln!("error: failed to write {}: {err}", mod_path.display());
         std::process::exit(1);

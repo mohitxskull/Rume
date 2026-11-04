@@ -48,6 +48,9 @@ pub enum Commands {
     /// List registered routes.
     #[command(name = "list:routes", alias = "list-routes")]
     ListRoutes {
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
         /// Output routes as JSON.
         #[arg(long)]
         json: bool,
@@ -58,7 +61,11 @@ pub enum Commands {
         shell: clap_complete::Shell,
     },
     /// Regenerate barrel and registration files.
-    Codegen,
+    Codegen {
+        /// Show planned file modifications without writing to disk.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Generate a component.
     Generate {
         kind: Option<String>,

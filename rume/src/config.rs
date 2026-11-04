@@ -127,12 +127,29 @@ where
     load_in(Path::new("."))
 }
 
+/// Load and validate a typed configuration for a specific environment name (e.g. "test").
+pub fn load_for_env<T>(env_name: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    load_for_env_in(Path::new("."), env_name)
+}
+
 /// Load and validate a typed configuration rooted at `dir`.
 pub fn load_in<T>(dir: &Path) -> Result<T>
 where
     T: DeserializeOwned,
 {
     let figment = build_figment(dir)?;
+    figment.extract::<T>().map_err(ConfigError::from)
+}
+
+/// Load and validate a typed configuration rooted at `dir` for a specific environment name.
+pub fn load_for_env_in<T>(dir: &Path, env_name: &str) -> Result<T>
+where
+    T: DeserializeOwned,
+{
+    let figment = build_figment_for_env(dir, env_name)?;
     figment.extract::<T>().map_err(ConfigError::from)
 }
 
@@ -203,7 +220,10 @@ where
 
 fn build_figment(dir: &Path) -> Result<Figment> {
     let env_name = crate::env::resolve_env_name();
+    build_figment_for_env(dir, &env_name)
+}
 
+fn build_figment_for_env(dir: &Path, env_name: &str) -> Result<Figment> {
     let candidates = [
         dir.join("config").join("app.toml"),
         dir.join("config").join(format!("app.{env_name}.toml")),

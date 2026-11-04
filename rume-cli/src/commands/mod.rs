@@ -7,19 +7,6 @@ mod list_routes;
 mod new;
 
 use crate::cli::{Cli, Commands};
-use std::sync::atomic::{AtomicBool, Ordering};
-
-static NO_COLOR: AtomicBool = AtomicBool::new(false);
-static VERBOSE: AtomicBool = AtomicBool::new(false);
-
-pub fn is_no_color() -> bool {
-    NO_COLOR.load(Ordering::Relaxed)
-}
-
-pub fn is_verbose() -> bool {
-    VERBOSE.load(Ordering::Relaxed)
-}
-
 pub fn require_rume_project() {
     if !std::path::Path::new("config/app.toml").is_file() {
         eprintln!("error: not a Rume project (config/app.toml not found)");
@@ -29,8 +16,9 @@ pub fn require_rume_project() {
 }
 
 pub fn run(cli: Cli) {
-    NO_COLOR.store(cli.no_color, Ordering::Relaxed);
-    VERBOSE.store(cli.verbose, Ordering::Relaxed);
+    if cli.no_color {
+        console::set_colors_enabled(false);
+    }
 
     match cli.command {
         Some(Commands::New {
@@ -61,13 +49,14 @@ pub fn run(cli: Cli) {
             let fmt = if json { "json" } else { &format };
             doctor::run(fmt);
         }
-        Some(Commands::ListRoutes { json }) => {
+        Some(Commands::ListRoutes { format, json }) => {
             require_rume_project();
-            list_routes::run(json);
+            let is_json = json || format == "json";
+            list_routes::run(is_json);
         }
-        Some(Commands::Codegen) => {
+        Some(Commands::Codegen { dry_run }) => {
             require_rume_project();
-            codegen::run();
+            codegen::run(dry_run);
         }
         Some(Commands::Generate { kind, name }) => {
             require_rume_project();

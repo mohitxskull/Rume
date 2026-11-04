@@ -1,19 +1,16 @@
 //! Sticker / boxed content for highlighting important info.
 
-use console::Style;
 use unicode_width::UnicodeWidthStr;
 
 /// Render boxed content (sticker).
 pub struct Sticker {
     lines: Vec<String>,
-    color: Option<Style>,
 }
 
 impl Sticker {
     pub fn new() -> Self {
         Self {
             lines: Vec::new(),
-            color: None,
         }
     }
 

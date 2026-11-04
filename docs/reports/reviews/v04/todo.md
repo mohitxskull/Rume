@@ -144,79 +144,79 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
       `rume/tests/`: Untested error paths in new pipeline code. Add unit and integration assertions for listener panics, saga step compensation errors, and worker lease fences.
 
 ### Group L — Minor Polish & Diagnostics (solve together)
-- [ ] **App m1 — Stale code rationale comment on `RumeBuilder::route`** (`app-lifecycle.md` m1).
+- [x] **App m1 — Stale code rationale comment on `RumeBuilder::route`** (`app-lifecycle.md` m1).
       `rume/src/app/builder.rs:218`: Comment claims route registration is delayed when it is now eager. Update comment to match active behavior.
-- [ ] **App m2 — `ObservabilityLayer` checks `MatchedPath` outside router** (`app-lifecycle.md` m2).
+- [x] **App m2 — `ObservabilityLayer` checks `MatchedPath` outside router** (`app-lifecycle.md` m2).
       `rume/src/app/observability.rs:45`: Span `route` field is permanently empty. Capture matched path inside router middleware.
-- [ ] **App m3 — `RumeBuilder::run` rejects `localhost` hostnames** (`app-lifecycle.md` m3).
+- [x] **App m3 — `RumeBuilder::run` rejects `localhost` hostnames** (`app-lifecycle.md` m3).
       `rume/src/app/builder.rs:1042`: Parses addresses strictly as `SocketAddr`. Support `ToSocketAddrs` for hostname resolution.
-- [ ] **App m5 — `build_test_app()` ignores `ApplicationMode::Inspect`** (`app-lifecycle.md` m5).
+- [x] **App m5 — `build_test_app()` ignores `ApplicationMode::Inspect`** (`app-lifecycle.md` m5).
       `rume/src/app/builder.rs:592`: Inspect mode is not respected in test app. Align inspect handling with `run()`.
-- [ ] **App m6 — `TestApp` drop blocks Tokio runtime thread via OS thread join** (`app-lifecycle.md` m6).
+- [x] **App m6 — `TestApp` drop blocks Tokio runtime thread via OS thread join** (`app-lifecycle.md` m6).
       `rume/src/testing/app.rs:88`: Blocking thread join inside async context. Use async task handle abort and drain.
-- [ ] **Architecture m1 — `prelude.rs` exports test harnesses into production** (`architecture-module-boundaries.md` m1).
+- [x] **Architecture m1 — `prelude.rs` exports test harnesses into production** (`architecture-module-boundaries.md` m1).
       `rume/src/prelude.rs:8, 13`: Exports `TestApp` and `ModuleHarness` in production prelude. Move test utilities behind `#[cfg(feature = "testing")]`.
-- [ ] **Architecture m2 — `RumeBuilder::state()` rejects state transitions due to type pinning** (`architecture-module-boundaries.md` m2).
+- [x] **Architecture m2 — `RumeBuilder::state()` rejects state transitions due to type pinning** (`architecture-module-boundaries.md` m2).
       `rume/src/app/builder.rs:208`: Prevents state re-assignment. Support type-transforming state transition or clarify doc comment.
-- [ ] **Architecture m3 — `lib.rs` re-exports deprecated `ops_router`** (`architecture-module-boundaries.md` m3).
+- [x] **Architecture m3 — `lib.rs` re-exports deprecated `ops_router`** (`architecture-module-boundaries.md` m3).
       `rume/src/lib.rs:35–36`: Re-exports deprecated helper at crate root. Remove deprecated export.
-- [ ] **Architecture m4 — Missing stability tiers in public API docs** (`architecture-module-boundaries.md` m4).
+- [x] **Architecture m4 — Missing stability tiers in public API docs** (`architecture-module-boundaries.md` m4).
       `rume/src/lib.rs:1–7`: Add module stability badges (`Stable`, `Evolving`, `Experimental`).
-- [ ] **Coordination m1 — Host wall-clock drives Redis rate-limit/quota windows** (`coordination-multi-tenant.md` m1).
+- [x] **Coordination m1 — Host wall-clock drives Redis rate-limit/quota windows** (`coordination-multi-tenant.md` m1).
       `rume/src/resilience/redis.rs:84`: Use Redis server time for sliding window calculation.
-- [ ] **Coordination m2 — Subdomain resolver case sensitivity on IPv6** (`coordination-multi-tenant.md` m2).
+- [x] **Coordination m2 — Subdomain resolver case sensitivity on IPv6** (`coordination-multi-tenant.md` m2).
       `rume/src/tenant/resolver.rs:114`: Strip brackets and normalize IPv6 hosts.
-- [ ] **DX m1 — Inconsistent CLI argument flags for JSON output** (`dx-cli.md` m1).
+- [x] **DX m1 — Inconsistent CLI argument flags for JSON output** (`dx-cli.md` m1).
       `rume-cli/src/commands/list_routes.rs:24`: Support `--format json` consistently across all CLI subcommands.
-- [ ] **DX m2 — Dead UI code with crate-level `#![allow(dead_code)]`** (`dx-cli.md` m2).
+- [x] **DX m2 — Dead UI code with crate-level `#![allow(dead_code)]`** (`dx-cli.md` m2).
       `rume-cli/src/ui/mod.rs:1–15`: Prune unused UI primitives and remove crate-level dead code attribute.
-- [ ] **DX m3 — Generated smoke test template forces `unsafe` in Rust 2024** (`dx-cli.md` m3).
+- [x] **DX m3 — Generated smoke test template forces `unsafe` in Rust 2024** (`dx-cli.md` m3).
       `rume-cli/src/templates/tests_smoke_rs.tpl:12`: Replace `std::env::set_var` with safe environment loading.
-- [ ] **DX m4 — `rume codegen` lacks dry-run support** (`dx-cli.md` m4).
+- [x] **DX m4 — `rume codegen` lacks dry-run support** (`dx-cli.md` m4).
       `rume-cli/src/commands/codegen.rs:34`: Add `--dry-run` flag showing planned file modifications.
-- [ ] **Jobs m1 — `AssertUnwindSafe` around construct instead of future** (`jobs-worker-concurrency.md` m1).
+- [x] **Jobs m1 — `AssertUnwindSafe` around construct instead of future** (`jobs-worker-concurrency.md` m1).
       `rume/src/jobs/worker.rs:188`: Wrap the executed future with `catch_unwind` rather than construction closure.
-- [ ] **Jobs m2 — DLQ routing on heartbeat loss** (`jobs-worker-concurrency.md` m2).
+- [x] **Jobs m2 — DLQ routing on heartbeat loss** (`jobs-worker-concurrency.md` m2).
       `rume/src/jobs/worker.rs:215`: Move lost-heartbeat jobs to DLQ rather than leaving them in limbo.
-- [ ] **Outbox m1 — `EventBus` downcasting safety** (`outbox-data-integrity.md` m1).
+- [x] **Outbox m1 — `EventBus` downcasting safety** (`outbox-data-integrity.md` m1).
       `rume/src/events/mod.rs:120`: Document and assert type-safe event handler downcasting.
-- [ ] **Outbox m2 — In-flight lease expiration SQL edge case** (`outbox-data-integrity.md` m2).
+- [x] **Outbox m2 — In-flight lease expiration SQL edge case** (`outbox-data-integrity.md` m2).
       `rume/src/persistence/sql/postgres/outbox_claim.sql`: Ensure exact millisecond bounds matching database clock.
-- [ ] **Pool m1 — Pool telemetry dead atomics** (`pool-lifecycle-persistence.md` m1).
+- [x] **Pool m1 — Pool telemetry dead atomics** (`pool-lifecycle-persistence.md` m1).
       `rume/src/persistence/pool.rs:88`: Wire `total_connections` atomic to actual driver pool sizing metrics.
-- [ ] **Pool m2 — `auto_migrate` is inert** (`pool-lifecycle-persistence.md` m2).
+- [x] **Pool m2 — `auto_migrate` is inert** (`pool-lifecycle-persistence.md` m2).
       `rume/src/persistence/pool.rs:160`: Wire `apply_auto_migrations` to pool initialization or remove inert configuration.
-- [ ] **Pool m3 — Four drifting copies of `rume_migrations` DDL** (`pool-lifecycle-persistence.md` m3).
+- [x] **Pool m3 — Four drifting copies of `rume_migrations` DDL** (`pool-lifecycle-persistence.md` m3).
       `rume/src/persistence/migration.rs:45`: Consolidate to single source of truth for migration ledger schema.
-- [ ] **Pool m4 — Migration ledger `applied_at` uses host clock** (`pool-lifecycle-persistence.md` m4).
+- [x] **Pool m4 — Migration ledger `applied_at` uses host clock** (`pool-lifecycle-persistence.md` m4).
       `rume/src/persistence/migration.rs:112`: Evaluate migration `applied_at` via database clock.
-- [ ] **Pool m5 — `DatabasePool::close()` is fire-and-forget** (`pool-lifecycle-persistence.md` m5).
+- [x] **Pool m5 — `DatabasePool::close()` is fire-and-forget** (`pool-lifecycle-persistence.md` m5).
       `rume/src/persistence/pool.rs:135`: Add async close awaiting physical connection teardown.
-- [ ] **Pool m6 — Dead scaffolding `MigrationFn`** (`pool-lifecycle-persistence.md` m6).
+- [x] **Pool m6 — Dead scaffolding `MigrationFn`** (`pool-lifecycle-persistence.md` m6).
       `rume/src/persistence/migration.rs:32`: Prune unused `MigrationFn` definition.
-- [ ] **Routing m1 — `/health/ready` collapses Warning into error in body while returning 503** (`routing-api-openapi.md` m1).
+- [x] **Routing m1 — `/health/ready` collapses Warning into error in body while returning 503** (`routing-api-openapi.md` m1).
       `rume/src/routing/health.rs:350`: Preserve `"status": "warning"` in response payload when reporting 503.
-- [ ] **Routing m2 — `MetricsLayer` hardcodes bypass for exact path `"/metrics"`** (`routing-api-openapi.md` m2).
+- [x] **Routing m2 — `MetricsLayer` hardcodes bypass for exact path `"/metrics"`** (`routing-api-openapi.md` m2).
       `rume/src/metrics/layer.rs:67`: Dynamically match configured metrics endpoint path rather than hardcoded string.
-- [ ] **Routing m3 — Route parameter matcher declaration does not validate against path template** (`routing-api-openapi.md` m3).
+- [x] **Routing m3 — Route parameter matcher declaration does not validate against path template** (`routing-api-openapi.md` m3).
       `rume/src/routing/spec.rs:101`: Assert declared parameter names exist within path template during route registration.
-- [ ] **Routing m4 — OpenAPI 3.1 generator lacks Request Body and Security Schemes** (`routing-api-openapi.md` m4).
+- [x] **Routing m4 — OpenAPI 3.1 generator lacks Request Body and Security Schemes** (`routing-api-openapi.md` m4).
       `rume/src/openapi/spec.rs:83`: Populate request body schemas and auth security schemes in generated document.
-- [ ] **Security m1 — `Forwarded` header substring matching and unchecked proxy trust** (`security-protocols.md` m1).
+- [x] **Security m1 — `Forwarded` header substring matching and unchecked proxy trust** (`security-protocols.md` m1).
       `rume/src/security/headers.rs:88`: Require trusted proxy CIDR configuration before honoring `X-Forwarded-*`.
 - [x] **Security m2 — `CsrfService` reads only first Cookie header** (`security-protocols.md` m2).
       `rume/src/security/csrf.rs:120`: Parse split cookie headers across all incoming `Cookie` header lines.
-- [ ] **Security m3 — Non-atomic session ID rotation in `RedisSessionStore`** (`security-protocols.md` m3).
+- [x] **Security m3 — Non-atomic session ID rotation in `RedisSessionStore`** (`security-protocols.md` m3).
       `rume/src/auth/session.rs:145`: Execute session ID rotation in single atomic Lua script.
-- [ ] **Security m4 — Dead error variant `SamlError::MissingSignatureVerifier`** (`security-protocols.md` m4).
+- [x] **Security m4 — Dead error variant `SamlError::MissingSignatureVerifier`** (`security-protocols.md` m4).
       `rume/src/enterprise/saml.rs:30`: Clean up unused error variant and enforce mandatory verifier checks.
-- [ ] **Security m5 — SCIM 2.0 casing and attribute type deviations** (`security-protocols.md` m5).
+- [x] **Security m5 — SCIM 2.0 casing and attribute type deviations** (`security-protocols.md` m5).
       `rume/src/enterprise/scim.rs:48`: Align `Resources` list key casing and complex roles with RFC 7643/7644.
 - [x] **Testing m1 — Unused import compiler warnings in `pipeline.rs` under non-sqlite builds** (`testing-feature-matrix.md` m1).
       `rume/tests/containers/pipeline.rs:25`: Clean up feature-gated imports to prevent build warnings.
-- [ ] **Testing m2 — Redundant assertions duplicating `insta` snapshots** (`testing-feature-matrix.md` m2).
+- [x] **Testing m2 — Redundant assertions duplicating `insta` snapshots** (`testing-feature-matrix.md` m2).
       `rume/tests/integration/openapi.rs:45`: Prune redundant manual field assertions that duplicate snapshot coverage.
-- [ ] **Testing m3 — Inconsistent `#![forbid(unsafe_code)]` vs `#![deny(unsafe_code)]`** (`testing-feature-matrix.md` m3).
+- [x] **Testing m3 — Inconsistent `#![forbid(unsafe_code)]` vs `#![deny(unsafe_code)]`** (`testing-feature-matrix.md` m3).
       `rume/tests/`: Align test harness crate-level lint attributes.
 
 ---

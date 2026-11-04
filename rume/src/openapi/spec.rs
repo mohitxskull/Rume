@@ -108,6 +108,8 @@ pub struct OpenApiOperation {
     pub summary: Option<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<OpenApiParameter>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_body: Option<serde_json::Value>,
     pub responses: OpenApiResponses,
 }
 
@@ -126,12 +128,23 @@ pub struct OpenApiPathItem {
     pub patch: Option<OpenApiOperation>,
 }
 
+/// OpenAPI Components object for schemas and security schemes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct OpenApiComponents {
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub schemas: BTreeMap<String, serde_json::Value>,
+    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    pub security_schemes: BTreeMap<String, serde_json::Value>,
+}
+
 /// Root OpenAPI v3.1 specification document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenApiSpec {
     pub openapi: String,
     pub info: OpenApiInfo,
     pub paths: BTreeMap<String, OpenApiPathItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub components: Option<OpenApiComponents>,
 }
 
 impl OpenApiSpec {
@@ -213,6 +226,7 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
             operation_id: route.name.clone(),
             summary: route.name.clone(),
             parameters,
+            request_body: None,
             responses,
         };
 
@@ -231,5 +245,6 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
         openapi: "3.1.0".to_string(),
         info,
         paths,
+        components: None,
     }
 }

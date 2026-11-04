@@ -402,7 +402,7 @@ where
                 // infrastructure details, or credentials) are not exposed over
                 // HTTP. Use `HealthChecks::run()` programmatically for full
                 // diagnostics.
-                let status = if report.is_healthy { "ok" } else { "error" };
+                let status = if report.is_healthy { "ok" } else { &report.status };
                 let code = if report.is_healthy {
                     StatusCode::OK
                 } else {

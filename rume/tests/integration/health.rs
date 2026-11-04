@@ -166,8 +166,8 @@ async fn health_ready_returns_503_on_warning() {
     let response = app.get("/health/ready").await;
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     let body = TestApp::body_text(response).await;
-    // Minimal response: Warning maps to "error" (not healthy).
-    assert!(body.contains("\"status\":\"error\""));
+    // Minimal response: Warning status preserved in response payload.
+    assert!(body.contains("\"status\":\"warning\""));
     assert!(!body.contains("\"name\":\"cache\""));
     assert!(!body.contains("\"message\""));
 }

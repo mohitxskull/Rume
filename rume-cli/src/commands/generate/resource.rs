@@ -195,51 +195,26 @@ pub async fn destroy(Path(id): Path<String>) -> Json<{struct_name}DestroyRespons
     println!("  updated {routes_path}");
 }
 
-fn validate_name(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    let mut chars = name.chars();
-    let first = chars.next().unwrap();
-    if !first.is_ascii_alphabetic() && first != '_' {
-        return false;
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        return false;
-    }
-    let normalized = name.to_ascii_lowercase().replace('-', "_");
-    const RESERVED_KEYWORDS: &[&str] = &[
-        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
-        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
-        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
-    ];
-    !RESERVED_KEYWORDS.contains(&normalized.as_str())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn validate_name_rejects_empty_and_invalid() {
-        assert!(!validate_name(""));
-        assert!(!validate_name("bad name"));
-        assert!(!validate_name("bad/name"));
-        assert!(!validate_name("bad.name"));
-        assert!(!validate_name("2fa"));
-        assert!(!validate_name("404"));
-        assert!(!validate_name("type"));
-        assert!(!validate_name("match"));
+        assert!(!super::super::is_valid_identifier(""));
+        assert!(!super::super::is_valid_identifier("bad name"));
+        assert!(!super::super::is_valid_identifier("bad/name"));
+        assert!(!super::super::is_valid_identifier("bad.name"));
+        assert!(!super::super::is_valid_identifier("2fa"));
+        assert!(!super::super::is_valid_identifier("404"));
+        assert!(!super::super::is_valid_identifier("type"));
+        assert!(!super::super::is_valid_identifier("match"));
     }
 
     #[test]
     fn validate_name_accepts_valid() {
-        assert!(validate_name("users"));
-        assert!(validate_name("my-resource"));
-        assert!(validate_name("my_resource"));
-        assert!(validate_name("User123"));
+        assert!(super::super::is_valid_identifier("users"));
+        assert!(super::super::is_valid_identifier("my-resource"));
+        assert!(super::super::is_valid_identifier("my_resource"));
+        assert!(super::super::is_valid_identifier("User123"));
     }
 
     #[test]

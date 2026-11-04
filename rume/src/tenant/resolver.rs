@@ -219,7 +219,7 @@ impl TenantResolver for SubdomainTenantResolver {
             let host_lower = host_str.to_ascii_lowercase();
             let host_no_port = if host_lower.starts_with('[') {
                 if let Some(bracket_end) = host_lower.find(']') {
-                    &host_lower[..=bracket_end]
+                    &host_lower[1..bracket_end]
                 } else {
                     &host_lower
                 }

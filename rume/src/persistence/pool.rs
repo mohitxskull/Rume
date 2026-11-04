@@ -109,6 +109,7 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     pub fn status(&self) -> PoolStatus {
         let is_closed = self.is_closed.load(Ordering::Relaxed) || self.backend.is_closed();
         let total = self.backend.pool_size();
+        self.total_connections.store(total, Ordering::Relaxed);
         let active = self.active_connections.load(Ordering::Relaxed);
         PoolStatus {
             active_connections: active,
@@ -212,6 +213,13 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         tokio::spawn(async move {
             backend.close().await;
         });
+    }
+
+    /// Asynchronously closes the connection pool, refusing new leases and awaiting backend driver connection teardown.
+    pub async fn close_async(&self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.semaphore.close();
+        self.backend.close().await;
     }
 
     /// Closes the pool and waits up to `timeout` for all active connections and in-flight transactions to drain.

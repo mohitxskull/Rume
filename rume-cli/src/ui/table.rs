@@ -47,10 +47,6 @@ impl TableBuilder {
     pub fn render(&self) {
         println!("{}", self.table);
     }
-
-    pub fn render_string(&self) -> String {
-        self.table.to_string()
-    }
 }
 
 impl Default for TableBuilder {

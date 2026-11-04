@@ -21,7 +21,6 @@ use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::request::Parts;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
-use tracing::Instrument;
 
 /// Non-panicking initializer for the global tracing subscriber.
 ///
@@ -192,29 +191,24 @@ where
             .get::<axum::extract::MatchedPath>()
             .map(|mp| mp.as_str().to_string());
 
-        let span = if let Some(ref route) = matched_path {
-            tracing::info_span!(
-                "http_request",
-                request_id = %request_id,
-                method = %method,
-                route = %route,
-                status = tracing::field::Empty,
-                latency_ms = tracing::field::Empty,
-            )
-        } else {
-            tracing::info_span!(
-                "http_request",
-                request_id = %request_id,
-                method = %method,
-                status = tracing::field::Empty,
-                latency_ms = tracing::field::Empty,
-            )
-        };
+        let span = tracing::info_span!(
+            "http_request",
+            request_id = %request_id,
+            method = %method,
+            route = tracing::field::Empty,
+            status = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+        );
+
+        if let Some(ref route) = matched_path {
+            span.record("route", route.as_str());
+        }
 
         let mut inner = self.inner.clone();
         let req_id_str = request_id.0.clone();
         let span_clone = span.clone();
 
+        use tracing::Instrument;
         Box::pin(
             async move {
                 let start = Instant::now();

@@ -272,7 +272,7 @@ impl SamlParser {
     /// Parses an XML string containing a SAML 2.0 Assertion without signature verification.
     /// Explicitly intended for offline tests and diagnostics.
     pub fn parse_unverified(xml: &str) -> Result<SamlAssertion, SamlError> {
-        Self::parse_with_verifier(xml, None)
+        Self::parse_internal(xml, None, true)
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion with mandatory cryptographic signature verification.
@@ -280,7 +280,7 @@ impl SamlParser {
         xml: &str,
         verifier: &dyn SamlSignatureVerifier,
     ) -> Result<SamlAssertion, SamlError> {
-        Self::parse_with_verifier(xml, Some(verifier))
+        Self::parse_internal(xml, Some(verifier), false)
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion using a namespace-aware XML parser
@@ -288,6 +288,17 @@ impl SamlParser {
     pub fn parse_with_verifier(
         xml: &str,
         verifier: Option<&dyn SamlSignatureVerifier>,
+    ) -> Result<SamlAssertion, SamlError> {
+        match verifier {
+            Some(v) => Self::parse_internal(xml, Some(v), false),
+            None => Err(SamlError::MissingSignatureVerifier),
+        }
+    }
+
+    fn parse_internal(
+        xml: &str,
+        verifier: Option<&dyn SamlSignatureVerifier>,
+        allow_unverified: bool,
     ) -> Result<SamlAssertion, SamlError> {
         let mut reader = NsReader::from_str(xml);
         reader.config_mut().trim_text(true);
@@ -502,6 +513,8 @@ impl SamlParser {
 
         if let Some(v) = verifier {
             v.verify_assertion_signature(xml, &id, assertion_raw_slice)?;
+        } else if !allow_unverified {
+            return Err(SamlError::MissingSignatureVerifier);
         }
 
         Ok(SamlAssertion {

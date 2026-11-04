@@ -85,31 +85,6 @@ async fn openapi_generation_from_route_registry() {
     }
     "###);
 
-    assert_eq!(spec.openapi, "3.1.0");
-    assert_eq!(spec.info.title, "User Service");
-    assert_eq!(spec.info.version, "1.0.0");
-    assert_eq!(
-        spec.info.description.as_deref(),
-        Some("Production user management API")
-    );
-
-    // Verify /users/{id}
-    let user_path = spec.paths.get("/users/{id}").expect("/users/{id} path");
-    let get_op = user_path.get.as_ref().expect("GET operation");
-    assert_eq!(get_op.operation_id.as_deref(), Some("users.show"));
-    assert_eq!(get_op.parameters.len(), 1);
-    assert_eq!(get_op.parameters[0].name, "id");
-    assert_eq!(get_op.parameters[0].schema.r#type, "integer");
-    assert!(get_op.responses.contains_key("200"));
-    assert!(get_op.responses.contains_key("400"));
-    assert!(get_op.responses.contains_key("422"));
-
-    // Verify /users
-    let users_path = spec.paths.get("/users").expect("/users path");
-    let post_op = users_path.post.as_ref().expect("POST operation");
-    assert_eq!(post_op.operation_id.as_deref(), Some("users.create"));
-    assert!(post_op.parameters.is_empty());
-
     // JSON export
     let json_str = spec.to_json_string().unwrap();
     assert!(json_str.contains("\"openapi\": \"3.1.0\""));

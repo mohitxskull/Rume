@@ -69,17 +69,36 @@ where
     load_in(Path::new("."))
 }
 
+/// Load and validate a typed environment from the current directory for a specific environment name.
+pub fn load_for_env<T>(env_name: &str) -> Result<T, EnvError>
+where
+    T: DeserializeOwned,
+{
+    load_for_env_in(Path::new("."), env_name)
+}
+
 /// Load and validate a typed environment rooted at `dir`.
 pub fn load_in<T>(dir: &Path) -> Result<T, EnvError>
 where
     T: DeserializeOwned,
 {
     let resolved = load_merged_map_in(dir)?;
+    load_from_resolved(resolved)
+}
 
-    // Parse scalar values the same way figment's built-in `Env` provider does,
-    // so numbers and booleans are not treated as strings. Secret values are
-    // exposed at this final consumption point for deserialization into typed
-    // env structs (which may use `secrecy::SecretBox<String>` fields).
+/// Load and validate a typed environment rooted at `dir` for a specific environment name.
+pub fn load_for_env_in<T>(dir: &Path, env_name: &str) -> Result<T, EnvError>
+where
+    T: DeserializeOwned,
+{
+    let resolved = load_merged_map_for_env_in(dir, env_name)?;
+    load_from_resolved(resolved)
+}
+
+fn load_from_resolved<T>(resolved: ResolvedEnv) -> Result<T, EnvError>
+where
+    T: DeserializeOwned,
+{
     let mut parsed: BTreeMap<String, figment::value::Value> = BTreeMap::new();
     for (key, value) in resolved.values {
         let value = value
@@ -119,14 +138,18 @@ pub fn load_merged_map() -> Result<ResolvedEnv, EnvError> {
 /// Load the merged environment map rooted at `dir`.
 fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv, EnvError> {
     let env_name = resolve_env_name();
+    load_merged_map_for_env_in(dir, &env_name)
+}
 
+/// Load the merged environment map rooted at `dir` for a specific environment name.
+fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv, EnvError> {
     // Collect raw values from all file sources, lowest to highest priority.
     // Later files override earlier ones. `file:` resolution happens here, per
     // value, before interpolation.
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
 
-    for (path, label) in dotenv_candidates(dir, &env_name) {
+    for (path, label) in dotenv_candidates(dir, env_name) {
         if !path.is_file() {
             continue;
         }

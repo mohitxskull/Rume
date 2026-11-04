@@ -4,6 +4,13 @@
 //! Small applications start with minimal boilerplate, while enterprise applications
 //! leverage built-in modules, persistence, background jobs, multi-tenancy, transactional
 //! outbox, sagas, resilience, authentication, and architectural verification.
+//!
+//! # Stability Tiers
+//!
+//! Rume categorizes its subsystem APIs into explicit stability tiers:
+//! - **Stable (Tier 1)**: Core HTTP shell, application lifecycle, typed configuration, RFC 9457 error contracts, and module composition (`app`, `config`, `env`, `error`, `module`, `routing`, `helpers`). Frozen pre-1.0 contracts.
+//! - **Evolving (Tier 2)**: Persistence, caching, resilience, background jobs, transactional outbox, and security headers (`persistence`, `cache`, `resilience`, `jobs`, `outbox`, `security`, `auth`). Backwards-compatible within minor releases.
+//! - **Experimental (Tier 3)**: Enterprise SAML/SCIM, sagas, and distributed multi-tenant coordination (`enterprise`, `saga`, `coordination`, `tenant`). Active evolution subject to refinement.
 
 #![forbid(unsafe_code)]
 

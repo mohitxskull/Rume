@@ -1,16 +1,15 @@
 //! Database migration definitions, runner, and preflight verification.
 
-use std::sync::Arc;
-
-use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransaction};
+use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction};
 use crate::persistence::error::PersistenceError;
 
-/// Function signature for dynamic migration execution.
-pub type MigrationFn = Arc<
-    dyn Fn(Arc<dyn std::any::Any + Send + Sync>) -> BoxFuture<'static, Result<(), PersistenceError>>
-        + Send
-        + Sync,
->;
+/// Canonical DDL for the migration tracking ledger table across all database backends.
+pub const CREATE_MIGRATIONS_TABLE_DDL: &str =
+    "CREATE TABLE IF NOT EXISTS rume_migrations (\
+     id VARCHAR(255) PRIMARY KEY, \
+     name VARCHAR(255) NOT NULL DEFAULT '', \
+     applied_at BIGINT NOT NULL, \
+     checksum VARCHAR(64) NOT NULL DEFAULT '')";
 
 /// A single versioned database migration step.
 #[derive(Clone)]
@@ -96,9 +95,7 @@ impl Migrator {
         backend: &B,
     ) -> Result<Vec<String>, PersistenceError> {
         backend
-            .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
-            )
+            .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;
 
         let mut pending = Vec::new();
@@ -148,9 +145,7 @@ impl Migrator {
         backend: &B,
     ) -> Result<MigrationSummary, PersistenceError> {
         backend
-            .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
-            )
+            .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;
 
         let mut applied = Vec::new();
@@ -170,10 +165,23 @@ impl Migrator {
                             message: err.to_string(),
                         })?;
                 }
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs();
+                let clock_query = match backend.dialect() {
+                    "postgres" => Some("SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text"),
+                    "mysql" => Some("SELECT UNIX_TIMESTAMP()"),
+                    "sqlite" => Some("SELECT CAST(strftime('%s', 'now') AS TEXT)"),
+                    _ => None,
+                };
+                let now = if let Some(query) = clock_query
+                    && let Ok(Some(s)) = tx.query_scalar(query).await
+                    && let Ok(ts) = s.parse::<u64>()
+                {
+                    ts
+                } else {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs()
+                };
                 let name = migration.description.replace('\'', "''");
                 let checksum = match &migration.up_sql {
                     Some(s) => {
@@ -204,9 +212,7 @@ impl Migrator {
         backend: &B,
     ) -> Result<Option<String>, PersistenceError> {
         backend
-            .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
-            )
+            .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;
 
         for migration in self.migrations.iter().rev() {
@@ -249,9 +255,7 @@ impl Migrator {
         backend: &B,
     ) -> Result<(), PersistenceError> {
         backend
-            .execute(
-                "CREATE TABLE IF NOT EXISTS rume_migrations (id VARCHAR(255) PRIMARY KEY, name VARCHAR(255) NOT NULL DEFAULT '', applied_at BIGINT NOT NULL, checksum VARCHAR(64) NOT NULL DEFAULT '')",
-            )
+            .execute(CREATE_MIGRATIONS_TABLE_DDL)
             .await?;
 
         let mut pending = Vec::new();

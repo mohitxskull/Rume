@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![forbid(unsafe_code)]
 
 mod cli;
 mod commands;

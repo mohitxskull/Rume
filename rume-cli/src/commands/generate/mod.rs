@@ -4,24 +4,17 @@ mod model;
 mod resource;
 mod service;
 
-pub(crate) fn validate_identifier(name: &str, entity_type: &str) {
+pub(crate) fn is_valid_identifier(name: &str) -> bool {
     if name.is_empty() {
-        eprintln!("error: {entity_type} name cannot be empty");
-        std::process::exit(1);
+        return false;
     }
     let mut chars = name.chars();
     let first = chars.next().unwrap();
     if !first.is_ascii_alphabetic() && first != '_' {
-        eprintln!(
-            "error: {entity_type} name `{name}` must start with an ASCII letter or underscore"
-        );
-        std::process::exit(1);
+        return false;
     }
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-        eprintln!(
-            "error: {entity_type} name `{name}` must contain only letters, numbers, '-' or '_'"
-        );
-        std::process::exit(1);
+        return false;
     }
     let normalized = name.to_ascii_lowercase().replace('-', "_");
     const RESERVED_KEYWORDS: &[&str] = &[
@@ -31,8 +24,18 @@ pub(crate) fn validate_identifier(name: &str, entity_type: &str) {
         "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
         "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
     ];
-    if RESERVED_KEYWORDS.contains(&normalized.as_str()) {
-        eprintln!("error: {entity_type} name `{name}` is a reserved Rust keyword");
+    !RESERVED_KEYWORDS.contains(&normalized.as_str())
+}
+
+pub(crate) fn validate_identifier(name: &str, entity_type: &str) {
+    if name.is_empty() {
+        eprintln!("error: {entity_type} name cannot be empty");
+        std::process::exit(1);
+    }
+    if !is_valid_identifier(name) {
+        eprintln!(
+            "error: {entity_type} name `{name}` must be a valid Rust identifier and not a reserved keyword"
+        );
         std::process::exit(1);
     }
 }

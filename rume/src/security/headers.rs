@@ -184,7 +184,10 @@ where
                         .headers()
                         .get("forwarded")
                         .and_then(|v| v.to_str().ok())
-                        .map(|v| v.to_ascii_lowercase().contains("proto=https"))
+                        .map(|v| {
+                            v.split([';', ','])
+                                .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
+                        })
                         .unwrap_or(false)));
 
         Box::pin(async move {

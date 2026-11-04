@@ -59,20 +59,17 @@ impl RedisRateLimiter {
             .await
             .map_err(|e| ResilienceError::Backend(e.to_string()))?;
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as i64;
         let window_ms = self.config.window.as_millis() as i64;
         let max_req = self.config.max_requests as i64;
         let rand_id = uuid::Uuid::new_v4().to_string();
 
         let script = r#"
             local key = KEYS[1]
-            local now = tonumber(ARGV[1])
-            local window = tonumber(ARGV[2])
-            local max_requests = tonumber(ARGV[3])
-            local member = ARGV[4]
+            local redis_time = redis.call('TIME')
+            local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
+            local window = tonumber(ARGV[1])
+            local max_requests = tonumber(ARGV[2])
+            local member = ARGV[3]
             local clear_before = now - window
 
             redis.call('ZREMRANGEBYSCORE', key, '-inf', clear_before)
@@ -95,7 +92,6 @@ impl RedisRateLimiter {
 
         let res: (i64, i64, i64) = redis::Script::new(script)
             .key(&redis_key)
-            .arg(now_ms)
             .arg(window_ms)
             .arg(max_req)
             .arg(&rand_id)
