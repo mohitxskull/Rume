@@ -664,6 +664,19 @@ where
             self.backend().reprocess_failed(&id).await
         })
     }
+
+    fn purge_published(
+        &self,
+        older_than_secs: u64,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease()
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().purge_published(older_than_secs, limit).await
+        })
+    }
 }
 
 impl<B> TransactionalOutbox<B::Transaction> for DatabasePool<B>

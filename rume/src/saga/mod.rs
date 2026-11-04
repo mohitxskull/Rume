@@ -4,6 +4,8 @@ pub mod coordinator;
 pub mod error;
 pub mod step;
 
-pub use coordinator::{Saga, SagaReport, SagaStatus};
+pub use coordinator::{
+    InMemorySagaStore, Saga, SagaRecord, SagaReport, SagaStatus, SagaStore,
+};
 pub use error::SagaError;
 pub use step::{FunctionalStep, SagaFuture, Step};

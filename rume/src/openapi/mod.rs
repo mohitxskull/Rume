@@ -6,6 +6,6 @@
 pub mod spec;
 
 pub use spec::{
-    OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn, OpenApiPathItem,
-    OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
+    HasOpenApiSchema, OpenApiInfo, OpenApiOperation, OpenApiParameter, OpenApiParameterIn,
+    OpenApiPathItem, OpenApiResponses, OpenApiSchema, OpenApiSpec, generate_openapi,
 };

@@ -44,6 +44,7 @@ pub struct RouteSpec {
     method: Method,
     name: Option<String>,
     params: Vec<(String, Matcher)>,
+    request_schema: Option<crate::openapi::spec::OpenApiSchema>,
 }
 
 impl RouteSpec {
@@ -54,6 +55,7 @@ impl RouteSpec {
             method: Method::GET,
             name: None,
             params: Vec::new(),
+            request_schema: None,
         }
     }
 
@@ -64,6 +66,7 @@ impl RouteSpec {
             method: Method::POST,
             name: None,
             params: Vec::new(),
+            request_schema: None,
         }
     }
 
@@ -74,6 +77,7 @@ impl RouteSpec {
             method: Method::PUT,
             name: None,
             params: Vec::new(),
+            request_schema: None,
         }
     }
 
@@ -84,6 +88,7 @@ impl RouteSpec {
             method: Method::PATCH,
             name: None,
             params: Vec::new(),
+            request_schema: None,
         }
     }
 
@@ -94,6 +99,7 @@ impl RouteSpec {
             method: Method::DELETE,
             name: None,
             params: Vec::new(),
+            request_schema: None,
         }
     }
 
@@ -112,6 +118,22 @@ impl RouteSpec {
     pub fn r#as(mut self, name: &str) -> Self {
         self.name = Some(name.to_string());
         self
+    }
+
+    /// Attaches an OpenAPI request schema describing request body or parameter constraints.
+    pub fn with_request_schema(mut self, schema: crate::openapi::spec::OpenApiSchema) -> Self {
+        self.request_schema = Some(schema);
+        self
+    }
+
+    /// Attaches an OpenAPI request body schema inferred from a type implementing [`crate::openapi::spec::HasOpenApiSchema`].
+    pub fn with_body<T: crate::openapi::spec::HasOpenApiSchema>(self) -> Self {
+        self.with_request_schema(T::schema())
+    }
+
+    /// Access the attached request schema, if any.
+    pub fn request_schema(&self) -> Option<&crate::openapi::spec::OpenApiSchema> {
+        self.request_schema.as_ref()
     }
 
     /// Access the route's path template.
@@ -169,6 +191,19 @@ impl RouteSpec {
             );
         }
         (self.path, self.method, self.params, self.name)
+    }
+
+    /// Converts this route spec directly into a [`crate::routing::RouteInfo`].
+    pub fn into_route_info(self) -> crate::routing::RouteInfo {
+        let req_schema = self.request_schema.clone();
+        let (path, method, params, name) = self.build();
+        let param_names = params.iter().map(|(p, _)| p.clone()).collect();
+        let mut info = crate::routing::RouteInfo::new(method, path, name, param_names)
+            .with_matchers(params);
+        if let Some(schema) = req_schema {
+            info = info.with_request_schema(schema);
+        }
+        info
     }
 
     /// Create a validation layer that enforces this route spec's parameter

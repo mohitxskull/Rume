@@ -12,6 +12,7 @@ async fn openapi_generation_from_route_registry() {
         name: Some("users.show".into()),
         params: vec!["id".into()],
         matchers: vec![],
+        request_schema: None,
     });
 
     registry.register(RouteInfo {
@@ -20,6 +21,7 @@ async fn openapi_generation_from_route_registry() {
         name: Some("users.create".into()),
         params: vec![],
         matchers: vec![],
+        request_schema: None,
     });
 
     let info = OpenApiInfo::new("User Service", "1.0.0")

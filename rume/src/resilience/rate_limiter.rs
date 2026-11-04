@@ -48,15 +48,22 @@ struct RateLimitEntry {
     timestamps: Vec<Instant>,
 }
 
-/// In-memory sliding-window rate limiter with sharded concurrency.
+#[derive(Debug, Clone)]
+enum RateLimiterBackend {
+    InMemory(Arc<[RwLock<BTreeMap<String, RateLimitEntry>>]>),
+    #[cfg(feature = "redis")]
+    Redis(crate::resilience::redis::RedisRateLimiter),
+}
+
+/// In-memory or distributed Redis-backed sliding-window rate limiter.
 #[derive(Debug, Clone)]
 pub struct RateLimiter {
     config: RateLimitConfig,
-    shards: Arc<[RwLock<BTreeMap<String, RateLimitEntry>>]>,
+    backend: RateLimiterBackend,
 }
 
 impl RateLimiter {
-    /// Creates a new rate limiter with the specified configuration.
+    /// Creates a new in-memory rate limiter with the specified configuration.
     pub fn new(config: RateLimitConfig) -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
         for _ in 0..NUM_SHARDS {
@@ -64,32 +71,54 @@ impl RateLimiter {
         }
         Self {
             config,
-            shards: shards.into(),
+            backend: RateLimiterBackend::InMemory(shards.into()),
         }
     }
 
-    fn shard_for(&self, key: &str) -> &RwLock<BTreeMap<String, RateLimitEntry>> {
+    /// Creates a cluster-wide distributed rate limiter backed by Redis.
+    #[cfg(feature = "redis")]
+    pub fn redis(pool: deadpool_redis::Pool, config: RateLimitConfig) -> Self {
+        Self {
+            config: config.clone(),
+            backend: RateLimiterBackend::Redis(crate::resilience::redis::RedisRateLimiter::new(
+                pool, config,
+            )),
+        }
+    }
+
+    /// Returns a reference to the active rate limit configuration.
+    pub fn config(&self) -> &RateLimitConfig {
+        &self.config
+    }
+
+    fn shard_for<'a>(
+        shards: &'a [RwLock<BTreeMap<String, RateLimitEntry>>],
+        key: &str,
+    ) -> &'a RwLock<BTreeMap<String, RateLimitEntry>> {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % self.shards.len();
-        &self.shards[idx]
+        let idx = (hasher.finish() as usize) % shards.len();
+        &shards[idx]
     }
 
-    /// Evaluates if a request from `key` is within limits, recording the request on success.
-    pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
-        let mut clients = self.shard_for(key).write().unwrap();
+    fn check_in_memory(
+        config: &RateLimitConfig,
+        shards: &[RwLock<BTreeMap<String, RateLimitEntry>>],
+        key: &str,
+    ) -> Result<RateLimitStatus, ResilienceError> {
+        let mut clients = Self::shard_for(shards, key).write().unwrap();
         let now = Instant::now();
-        let window_start = now.checked_sub(self.config.window).unwrap_or(now);
+        let window_start = now.checked_sub(config.window).unwrap_or(now);
 
         let entry = clients.entry(key.to_string()).or_default();
         // Discard timestamps older than the sliding window
         entry.timestamps.retain(|&t| t > window_start);
 
-        if entry.timestamps.len() >= self.config.max_requests as usize {
+        if entry.timestamps.len() >= config.max_requests as usize {
             let oldest = entry.timestamps.first().copied().unwrap_or(now);
             let elapsed = now.duration_since(oldest);
-            let retry_after = self.config.window.saturating_sub(elapsed).as_secs().max(1);
+            let retry_after = config.window.saturating_sub(elapsed).as_secs().max(1);
 
             return Err(ResilienceError::RateLimited {
                 retry_after_secs: retry_after,
@@ -97,28 +126,59 @@ impl RateLimiter {
         }
 
         entry.timestamps.push(now);
-        let remaining = self
-            .config
+        let remaining = config
             .max_requests
             .saturating_sub(entry.timestamps.len() as u32);
 
         Ok(RateLimitStatus {
-            limit: self.config.max_requests,
+            limit: config.max_requests,
             remaining,
-            reset_after_secs: self.config.window.as_secs(),
+            reset_after_secs: config.window.as_secs(),
         })
+    }
+
+    /// Evaluates if a request from `key` is within limits, recording the request on success.
+    pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
+        match &self.backend {
+            RateLimiterBackend::InMemory(shards) => {
+                Self::check_in_memory(&self.config, shards, key)
+            }
+            #[cfg(feature = "redis")]
+            RateLimiterBackend::Redis(r) => {
+                tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(r.check(key))
+                })
+            }
+        }
+    }
+
+    /// Asynchronously evaluates if a request from `key` is within limits (compatible with async Redis backends).
+    pub async fn check_async(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
+        match &self.backend {
+            RateLimiterBackend::InMemory(shards) => {
+                Self::check_in_memory(&self.config, shards, key)
+            }
+            #[cfg(feature = "redis")]
+            RateLimiterBackend::Redis(r) => r.check(key).await,
+        }
     }
 
     /// Prunes expired client entries whose recorded requests fall outside the sliding window.
     pub fn prune_expired(&self) {
-        let now = Instant::now();
-        let window_start = now.checked_sub(self.config.window).unwrap_or(now);
-        for shard in self.shards.iter() {
-            let mut clients = shard.write().unwrap();
-            clients.retain(|_, entry| {
-                entry.timestamps.retain(|&t| t > window_start);
-                !entry.timestamps.is_empty()
-            });
+        match &self.backend {
+            RateLimiterBackend::InMemory(shards) => {
+                let now = Instant::now();
+                let window_start = now.checked_sub(self.config.window).unwrap_or(now);
+                for shard in shards.iter() {
+                    let mut clients = shard.write().unwrap();
+                    clients.retain(|_, entry| {
+                        entry.timestamps.retain(|&t| t > window_start);
+                        !entry.timestamps.is_empty()
+                    });
+                }
+            }
+            #[cfg(feature = "redis")]
+            RateLimiterBackend::Redis(_) => {}
         }
     }
 
@@ -212,7 +272,7 @@ where
         });
 
         Box::pin(async move {
-            match limiter.check(&client_key) {
+            match limiter.check_async(&client_key).await {
                 Ok(status) => {
                     let mut response = inner.call(req).await?;
                     let headers = response.headers_mut();

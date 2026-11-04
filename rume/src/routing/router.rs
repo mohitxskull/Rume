@@ -68,6 +68,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -85,6 +86,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -102,6 +104,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -119,6 +122,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -136,6 +140,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -153,6 +158,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -175,6 +181,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -218,6 +225,7 @@ where
             name: None,
             params: extract_path_params(path),
             matchers: Vec::new(),
+            request_schema: None,
         });
         self
     }
@@ -240,6 +248,7 @@ where
         let name = spec.name().map(String::from);
         let params = spec.param_names();
         let matchers = spec.params().to_vec();
+        let request_schema = spec.request_schema().cloned();
         let validation_layer = spec.validation_layer();
 
         let method_router = match method {
@@ -259,6 +268,7 @@ where
             name,
             params,
             matchers,
+            request_schema,
         });
         self
     }
@@ -276,6 +286,7 @@ where
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
                 matchers: Vec::new(),
+                request_schema: None,
             });
         }
         self
@@ -295,6 +306,7 @@ where
                 name: r.name.clone(),
                 params: r.params.clone(),
                 matchers: r.matchers.clone(),
+                request_schema: r.request_schema.clone(),
             });
         }
         self

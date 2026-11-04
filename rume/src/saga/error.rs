@@ -2,8 +2,8 @@
 
 use thiserror::Error;
 
-/// Errors that can occur during saga step execution or compensation.
-#[derive(Debug, Error, Clone, PartialEq, Eq)]
+/// Errors that can occur during saga step execution, compensation, or persistence.
+#[derive(Debug, Error, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SagaError {
     /// A forward action failed.
     #[error("step '{step}' execution failed: {message}")]
@@ -16,4 +16,8 @@ pub enum SagaError {
     /// The saga coordinator was aborted.
     #[error("saga '{saga}' was aborted: {reason}")]
     Aborted { saga: String, reason: String },
+
+    /// A saga persistence or storage error occurred.
+    #[error("saga storage error: {message}")]
+    Storage { message: String },
 }

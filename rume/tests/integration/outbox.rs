@@ -1079,3 +1079,36 @@ async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_c
     assert!(!res.is_success());
     assert!(observed_cancellation.load(Ordering::SeqCst), "dispatcher must observe cancellation signal when heartbeat fails");
 }
+
+#[tokio::test]
+async fn outbox_sweeper_purges_published_messages_and_prevents_bloat() {
+    let repo = setup_real_outbox().await;
+    let relay = OutboxRelay::new(Arc::clone(&repo), |_msg| async { Ok(()) });
+
+    // 1. Insert 5 messages
+    for i in 1..=5 {
+        let event = OrderPaidEvent {
+            order_id: format!("ord_sweep_{i}"),
+            amount_cents: 100 * i,
+        };
+        let msg = OutboxMessage::from_event(&event).unwrap();
+        repo.save(msg).await.unwrap();
+    }
+
+    assert_eq!(repo.pending_count().await.unwrap(), 5);
+    assert_eq!(repo.published_count().await.unwrap(), 0);
+
+    // 2. Dispatch all messages to published status
+    let res = relay.poll_and_dispatch(10).await.unwrap();
+    assert_eq!(res.published, 5);
+    assert_eq!(repo.published_count().await.unwrap(), 5);
+
+    // 3. Run sweeper with 0-second retention (purging immediately)
+    let purged = relay.sweep_published(0, 10).await.unwrap();
+    assert_eq!(purged, 5, "all 5 published messages must be purged");
+
+    // 4. Verify table is clean
+    assert_eq!(repo.published_count().await.unwrap(), 0);
+    assert_eq!(repo.pending_count().await.unwrap(), 0);
+    assert_eq!(relay.status().total_purged, 5);
+}

@@ -901,6 +901,32 @@ impl OutboxRepository for SqliteBackend {
             Ok(())
         })
     }
+
+    fn purge_published(
+        &self,
+        older_than_secs: u64,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let res = sqlx::query(
+                "DELETE FROM rume_outbox \
+                 WHERE id IN ( \
+                     SELECT id FROM rume_outbox \
+                     WHERE status = 'published' \
+                       AND created_at <= unixepoch() - ?1 \
+                     ORDER BY created_at ASC \
+                     LIMIT ?2 \
+                 )"
+            )
+            .bind(older_than_secs as i64)
+            .bind(limit as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
+            Ok(res.rows_affected() as usize)
+        })
+    }
 }
 
 impl TransactionalOutbox<SqliteTransaction> for SqliteBackend {

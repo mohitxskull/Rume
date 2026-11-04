@@ -116,6 +116,9 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
         if let Some(name) = spec.name() {
             new_spec = new_spec.r#as(name);
         }
+        if let Some(schema) = spec.request_schema() {
+            new_spec = new_spec.with_request_schema(schema.clone());
+        }
         self.router = self.router.route_spec(new_spec, handler);
         self
     }
@@ -132,6 +135,7 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
                 matchers: Vec::new(),
+                request_schema: None,
             });
             self.router = self.router.merge(sub_router);
         }

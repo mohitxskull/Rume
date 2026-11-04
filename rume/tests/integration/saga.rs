@@ -309,3 +309,156 @@ async fn test_saga_step_panic_isolation() {
     assert!(matches!(report.status, SagaStatus::Compensated { .. }));
     assert!(report.context.events.contains(&"step_1_compensated".to_string()));
 }
+
+#[tokio::test]
+async fn test_saga_persistence_and_crash_resume() {
+    let store = std::sync::Arc::new(InMemorySagaStore::new());
+    let saga_id = "saga-order-crash-recovery-1";
+
+    let saga = Saga::new("persisted_order_flow")
+        .with_store(store.clone())
+        .step(
+            "step_1_reserve",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_undone".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_2_charge",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_2_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_2_undone".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_3_ship",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_3_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_3_undone".into());
+                async { Ok(()) }
+            },
+        );
+
+    // 1. Simulate a crash after step 1 by directly setting a record with step 1 completed
+    let crashed_record = SagaRecord {
+        saga_id: saga_id.to_string(),
+        saga_name: "persisted_order_flow".into(),
+        status: SagaStatus::Running {
+            current_step: "step_2_charge".into(),
+        },
+        completed_steps: vec!["step_1_reserve".into()],
+        compensated_steps: Vec::new(),
+        updated_at: 1000,
+    };
+    store.save_record(&crashed_record).await.expect("save crashed record");
+
+    // 2. Query incomplete sagas - it must show up
+    let incomplete = store.list_incomplete().await.expect("list incomplete");
+    assert_eq!(incomplete.len(), 1);
+    assert_eq!(incomplete[0].saga_id, saga_id);
+
+    // 3. Resume the saga from the crash point
+    let initial = OrderContext {
+        order_id: "ord-resumed".into(),
+        events: vec!["step_1_done".into()], // state left after step 1
+        ..Default::default()
+    };
+    let report = saga.resume(saga_id, initial).await.expect("resume saga");
+
+    assert!(report.status.is_success());
+    assert_eq!(
+        report.completed_steps,
+        vec!["step_1_reserve", "step_2_charge", "step_3_ship"]
+    );
+    assert_eq!(
+        report.context.events,
+        vec!["step_1_done", "step_2_done", "step_3_done"]
+    );
+
+    // 4. Verify terminal record in store
+    let persisted = store.load_record(saga_id).await.expect("load").expect("exists");
+    assert_eq!(persisted.status, SagaStatus::Success);
+    assert_eq!(persisted.completed_steps.len(), 3);
+
+    // Incomplete list is now empty
+    let incomplete_after = store.list_incomplete().await.expect("list");
+    assert!(incomplete_after.is_empty());
+}
+
+#[tokio::test]
+async fn test_saga_persistence_and_crashed_compensation() {
+    let store = std::sync::Arc::new(InMemorySagaStore::new());
+    let saga_id = "saga-order-crash-compensate-2";
+
+    let saga = Saga::new("compensate_crashed_flow")
+        .with_store(store.clone())
+        .step(
+            "step_1_reserve",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_1_undone".into());
+                async { Ok(()) }
+            },
+        )
+        .step(
+            "step_2_charge",
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_2_done".into());
+                async { Ok(()) }
+            },
+            |ctx: &mut OrderContext| {
+                ctx.events.push("step_2_undone".into());
+                async { Ok(()) }
+            },
+        );
+
+    // Simulate coordinator crashed while compensating step 2 (step 2 already compensated, step 1 uncompensated)
+    let crashed_record = SagaRecord {
+        saga_id: saga_id.to_string(),
+        saga_name: "compensate_crashed_flow".into(),
+        status: SagaStatus::Compensating {
+            current_step: "step_1_reserve".into(),
+        },
+        completed_steps: vec!["step_1_reserve".into(), "step_2_charge".into()],
+        compensated_steps: vec!["step_2_charge".into()],
+        updated_at: 2000,
+    };
+    store.save_record(&crashed_record).await.expect("save crashed record");
+
+    let initial = OrderContext {
+        order_id: "ord-compensate".into(),
+        events: vec!["step_2_undone".into()],
+        ..Default::default()
+    };
+
+    let report = saga.compensate_crashed(saga_id, initial).await.expect("compensate crashed");
+
+    assert!(matches!(report.status, SagaStatus::Compensated { .. }));
+    // Step 1 was compensated during resume
+    assert_eq!(
+        report.compensated_steps,
+        vec!["step_2_charge", "step_1_reserve"]
+    );
+    assert_eq!(
+        report.context.events,
+        vec!["step_2_undone", "step_1_undone"]
+    );
+
+    let persisted = store.load_record(saga_id).await.expect("load").expect("exists");
+    assert!(matches!(persisted.status, SagaStatus::Compensated { .. }));
+}

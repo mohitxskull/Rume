@@ -38,6 +38,8 @@ pub struct RouteInfo {
     pub params: Vec<String>,
     #[serde(default)]
     pub matchers: Vec<(String, Matcher)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_schema: Option<crate::openapi::spec::OpenApiSchema>,
 }
 
 impl RouteInfo {
@@ -54,12 +56,19 @@ impl RouteInfo {
             name,
             params,
             matchers: Vec::new(),
+            request_schema: None,
         }
     }
 
     /// Attach declared parameter matchers.
     pub fn with_matchers(mut self, matchers: Vec<(String, Matcher)>) -> Self {
         self.matchers = matchers;
+        self
+    }
+
+    /// Attach an OpenAPI request schema.
+    pub fn with_request_schema(mut self, schema: crate::openapi::spec::OpenApiSchema) -> Self {
+        self.request_schema = Some(schema);
         self
     }
 }
@@ -172,6 +181,7 @@ mod tests {
             name: Some("users.index".to_string()),
             params: vec![],
             matchers: vec![],
+            request_schema: None,
         });
         registry.register(RouteInfo {
             method: Method::POST,
@@ -179,6 +189,7 @@ mod tests {
             name: Some("users.create".to_string()),
             params: vec![],
             matchers: vec![],
+            request_schema: None,
         });
 
         assert_eq!(registry.len(), 2);

@@ -591,6 +591,16 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
     assert_eq!(rotated.roles, vec!["editor"]);
     assert!(server_2.load("session_old").await.unwrap().is_none(), "old session key destroyed");
     assert!(server_2.load(&rotated.id).await.unwrap().is_some(), "new session key active");
+
+    // 6. Regeneration error paths: non-existent and expired sessions
+    let non_existent_err = server_1.regenerate_id("session_does_not_exist").await.unwrap_err();
+    assert!(matches!(non_existent_err, rume::auth::AuthError::InvalidCredentials(_)));
+
+    let expired_session = Session::new("session_to_expire", "user_exp", 1);
+    server_1.save(expired_session).await.expect("save expired");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let expired_err = server_1.regenerate_id("session_to_expire").await.unwrap_err();
+    assert!(matches!(expired_err, rume::auth::AuthError::InvalidCredentials(_)));
 }
 
 #[tokio::test]

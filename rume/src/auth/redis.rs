@@ -141,56 +141,68 @@ impl SessionStore for RedisSessionStore {
                 .await
                 .map_err(|e| AuthError::ProviderError(e.to_string()))?;
 
+            let now = current_timestamp();
+
             let script = r#"
                 local old_key = KEYS[1]
                 local new_key = KEYS[2]
+                local old_id = ARGV[1]
+                local new_id = ARGV[2]
+                local now = tonumber(ARGV[3])
+
                 local data = redis.call('GET', old_key)
                 if not data then
                     return nil
                 end
+
+                local exp_str = string.match(data, '"expires_at":%s*(%d+)')
+                if exp_str and tonumber(exp_str) <= now then
+                    redis.call('DEL', old_key)
+                    return redis.error_reply("EXPIRED")
+                end
+
+                local target = '"id":"' .. old_id .. '"'
+                local replacement = '"id":"' .. new_id .. '"'
+                local updated, count = string.gsub(data, target, replacement, 1)
+                if count == 0 then
+                    target = '"id":%s*"' .. old_id .. '"'
+                    replacement = '"id":"' .. new_id .. '"'
+                    updated = string.gsub(data, target, replacement, 1)
+                end
+
                 local ttl = redis.call('PTTL', old_key)
                 if ttl > 0 then
-                    redis.call('SET', new_key, data, 'PX', ttl)
+                    redis.call('SET', new_key, updated, 'PX', ttl)
                 else
-                    redis.call('SET', new_key, data)
+                    redis.call('SET', new_key, updated)
                 end
                 redis.call('DEL', old_key)
-                return data
+                return updated
             "#;
 
-            let data: Option<Vec<u8>> = redis::Script::new(script)
+            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(script)
                 .key(&old_key)
                 .key(&new_key)
+                .arg(old_id)
+                .arg(&new_id)
+                .arg(now)
                 .invoke_async(&mut *conn)
-                .await
-                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+                .await;
+
+            let data = match res {
+                Ok(opt) => opt,
+                Err(err) if err.to_string().contains("EXPIRED") => {
+                    return Err(AuthError::InvalidCredentials("session expired".into()));
+                }
+                Err(err) => return Err(AuthError::ProviderError(err.to_string())),
+            };
 
             let bytes = data.ok_or_else(|| {
                 AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
             })?;
 
-            let mut session: Session = serde_json::from_slice(&bytes)
+            let session: Session = serde_json::from_slice(&bytes)
                 .map_err(|e| AuthError::ProviderError(format!("malformed session: {e}")))?;
-
-            if session.is_expired() {
-                let _: () = redis::cmd("DEL")
-                    .arg(&new_key)
-                    .query_async(&mut *conn)
-                    .await
-                    .map_err(|e| AuthError::ProviderError(e.to_string()))?;
-                return Err(AuthError::InvalidCredentials("session expired".into()));
-            }
-
-            session.id = new_id;
-            let updated_bytes = serde_json::to_vec(&session)
-                .map_err(|e| AuthError::ProviderError(format!("failed to serialize session: {e}")))?;
-            let _: () = redis::cmd("SET")
-                .arg(&new_key)
-                .arg(&updated_bytes)
-                .arg("KEEPTTL")
-                .query_async(&mut *conn)
-                .await
-                .map_err(|e| AuthError::ProviderError(e.to_string()))?;
 
             Ok(session)
         })

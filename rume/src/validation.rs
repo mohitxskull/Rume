@@ -3,6 +3,7 @@
 //! Provides typed request extractors that automatically validate their payloads using [`garde::Validate`].
 //! All extractors produce unified, sanitized RFC 9457 Problem Details rejection responses.
 
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 
 use axum::extract::rejection::{FormRejection, JsonRejection, PathRejection, QueryRejection};
@@ -11,6 +12,7 @@ use axum::http::request::Parts;
 use garde::Validate;
 
 use crate::error::{AppError, ValidationErrorDetail};
+use crate::openapi::spec::{HasOpenApiSchema, OpenApiSchema};
 
 fn map_validation_report(report: garde::Report) -> AppError {
     let details: Vec<ValidationErrorDetail> = report
@@ -216,6 +218,103 @@ where
     }
 }
 
+impl<T: HasOpenApiSchema> HasOpenApiSchema for ValidatedJson<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
+    }
+}
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for Validated<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
+    }
+}
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for ValidatedQuery<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
+    }
+}
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for ValidatedPath<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
+    }
+}
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for ValidatedForm<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
+    }
+}
+
+/// Fluent builder for constructing OpenAPI JSON Schema representations matching garde validation constraints.
+#[derive(Debug, Default, Clone)]
+pub struct SchemaBuilder {
+    properties: BTreeMap<String, OpenApiSchema>,
+    required: Vec<String>,
+}
+
+impl SchemaBuilder {
+    /// Creates a new schema builder for an object payload.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds an optional field to the schema.
+    pub fn field(mut self, name: impl Into<String>, schema: OpenApiSchema) -> Self {
+        self.properties.insert(name.into(), schema);
+        self
+    }
+
+    /// Adds a required field to the schema.
+    pub fn required_field(mut self, name: impl Into<String>, schema: OpenApiSchema) -> Self {
+        let name_str = name.into();
+        if !self.required.contains(&name_str) {
+            self.required.push(name_str.clone());
+        }
+        self.properties.insert(name_str, schema);
+        self
+    }
+
+    /// Builds the composite [`OpenApiSchema`].
+    pub fn build(self) -> OpenApiSchema {
+        let mut schema = OpenApiSchema::object();
+        if !self.properties.is_empty() {
+            schema.properties = Some(self.properties);
+        }
+        if !self.required.is_empty() {
+            schema.required = Some(self.required);
+        }
+        schema
+    }
+}
+
+/// Helper returning a string [`OpenApiSchema`] with min/max length matching garde `#[garde(length(min = ..., max = ...))]`.
+pub fn string_length(min: usize, max: usize) -> OpenApiSchema {
+    OpenApiSchema::string().with_min_length(min).with_max_length(max)
+}
+
+/// Helper returning an integer [`OpenApiSchema`] with min/max range matching garde `#[garde(range(min = ..., max = ...))]`.
+pub fn integer_range(min: i64, max: i64) -> OpenApiSchema {
+    OpenApiSchema::integer().with_minimum(min).with_maximum(max)
+}
+
+/// Helper returning a string [`OpenApiSchema`] with email format matching garde `#[garde(email)]`.
+pub fn email_schema() -> OpenApiSchema {
+    OpenApiSchema::string().with_format("email")
+}
+
+/// Helper returning a string [`OpenApiSchema`] with uri format matching garde `#[garde(url)]`.
+pub fn url_schema() -> OpenApiSchema {
+    OpenApiSchema::string().with_format("uri")
+}
+
+/// Helper returning a string [`OpenApiSchema`] with regex pattern matching garde `#[garde(pattern = "...")]`.
+pub fn pattern_schema(pattern: impl Into<String>) -> OpenApiSchema {
+    OpenApiSchema::string().with_pattern(pattern)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -413,5 +512,55 @@ mod tests {
             .unwrap();
         let res = app.request(req).await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    }
+
+    impl HasOpenApiSchema for CreateUser {
+        fn schema() -> OpenApiSchema {
+            SchemaBuilder::new()
+                .required_field("username", string_length(3, 50))
+                .required_field("email", email_schema())
+                .required_field("age", integer_range(18, 120))
+                .build()
+        }
+    }
+
+    #[test]
+    fn test_openapi_validation_synergy_reflects_garde_rules() {
+        use crate::openapi::{generate_openapi, OpenApiInfo};
+        use crate::routing::{RouteRegistry, RouteSpec};
+
+        // 1. ValidatedJson schema reflects garde rules
+        let json_schema = ValidatedJson::<CreateUser>::schema();
+        let props = json_schema.properties.as_ref().expect("properties present");
+        let username_prop = props.get("username").expect("username property");
+        assert_eq!(username_prop.min_length, Some(3));
+        assert_eq!(username_prop.max_length, Some(50));
+
+        let email_prop = props.get("email").expect("email property");
+        assert_eq!(email_prop.format.as_deref(), Some("email"));
+
+        let age_prop = props.get("age").expect("age property");
+        assert_eq!(age_prop.minimum, Some(18));
+        assert_eq!(age_prop.maximum, Some(120));
+
+        // 2. RouteSpec bridges schema to OpenAPI generator
+        let spec = RouteSpec::post("/users")
+            .r#as("users.create")
+            .with_body::<ValidatedJson<CreateUser>>();
+
+        let mut registry = RouteRegistry::new();
+        registry.register(spec.into_route_info());
+
+        let doc = generate_openapi(&registry, OpenApiInfo::new("User API", "1.0.0"));
+        let path_item = doc.paths.get("/users").expect("users path exists");
+        let post_op = path_item.post.as_ref().expect("post operation exists");
+
+        let body_json = post_op.request_body.as_ref().expect("request_body is generated");
+        let schema_val = &body_json["content"]["application/json"]["schema"];
+        assert_eq!(schema_val["properties"]["username"]["minLength"], 3);
+        assert_eq!(schema_val["properties"]["username"]["maxLength"], 50);
+        assert_eq!(schema_val["properties"]["email"]["format"], "email");
+        assert_eq!(schema_val["properties"]["age"]["minimum"], 18);
+        assert_eq!(schema_val["properties"]["age"]["maximum"], 120);
     }
 }

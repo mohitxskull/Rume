@@ -131,6 +131,21 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
             )))
         })
     }
+
+    /// Hard-deletes or archives up to `limit` outbox messages marked as `published`
+    /// that were created at or before `older_than_secs` seconds ago.
+    /// Returns the number of purged rows.
+    fn purge_published(
+        &self,
+        _older_than_secs: u64,
+        _limit: usize,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(
+                "purge_published not supported by this repository backend".into(),
+            ))
+        })
+    }
 }
 
 /// Extension trait for outbox repositories supporting atomic persistence enlisted inside database transactions.

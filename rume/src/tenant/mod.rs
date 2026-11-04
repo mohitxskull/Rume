@@ -9,7 +9,10 @@ pub mod resolver;
 
 pub use cache::TenantScopedCache;
 pub use error::TenantError;
-pub use layer::{TenantLayer, TenantMembershipLayer, TenantMembershipService};
+pub use layer::{
+    TenantLayer, TenantMembershipLayer, TenantMembershipService, TenantQuotaLayer,
+    TenantQuotaService, TenantTier, TieredQuotaPolicy,
+};
 pub use model::{OptionalTenant, Tenant, TenantContext};
 #[cfg(feature = "redis")]
 pub use quota::RedisTenantQuotaStore;

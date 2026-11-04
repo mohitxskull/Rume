@@ -22,6 +22,10 @@ pub enum TenantError {
     /// A tenant registration conflict occurred (e.g. duplicate slug or ID collision).
     #[error("tenant registration conflict: {0}")]
     Conflict(String),
+
+    /// A tenant has exceeded its tiered quota limit.
+    #[error("tenant '{tenant_id}' exceeded quota limit of {limit}")]
+    QuotaExceeded { tenant_id: String, limit: usize },
 }
 
 impl From<TenantError> for AppError {
@@ -44,6 +48,11 @@ impl From<TenantError> for AppError {
                 status: axum::http::StatusCode::CONFLICT,
                 code: "TENANT_CONFLICT",
                 message: msg,
+            },
+            TenantError::QuotaExceeded { tenant_id, limit } => AppError::Public {
+                status: axum::http::StatusCode::TOO_MANY_REQUESTS,
+                code: "TENANT_QUOTA_EXCEEDED",
+                message: format!("Tenant '{tenant_id}' has exceeded its tiered quota limit of {limit}"),
             },
         }
     }

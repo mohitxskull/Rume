@@ -44,22 +44,35 @@ pub enum OpenApiParameterIn {
     Cookie,
 }
 
-/// JSON Schema representation for parameter types.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// JSON Schema representation for parameter types and request/response payloads.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct OpenApiSchema {
     pub r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pattern: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "minLength")]
+    pub min_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "maxLength")]
+    pub max_length: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub minimum: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub properties: Option<BTreeMap<String, OpenApiSchema>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub required: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Box<OpenApiSchema>>,
 }
 
 impl OpenApiSchema {
     pub fn string() -> Self {
         Self {
             r#type: "string".into(),
-            format: None,
-            pattern: None,
+            ..Default::default()
         }
     }
 
@@ -67,7 +80,28 @@ impl OpenApiSchema {
         Self {
             r#type: "integer".into(),
             format: Some("int64".into()),
-            pattern: None,
+            ..Default::default()
+        }
+    }
+
+    pub fn number() -> Self {
+        Self {
+            r#type: "number".into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn boolean() -> Self {
+        Self {
+            r#type: "boolean".into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn object() -> Self {
+        Self {
+            r#type: "object".into(),
+            ..Default::default()
         }
     }
 
@@ -75,8 +109,115 @@ impl OpenApiSchema {
         Self {
             r#type: "string".into(),
             format: Some("uuid".into()),
-            pattern: None,
+            ..Default::default()
         }
+    }
+
+    pub fn array(items: OpenApiSchema) -> Self {
+        Self {
+            r#type: "array".into(),
+            items: Some(Box::new(items)),
+            ..Default::default()
+        }
+    }
+
+    pub fn with_min_length(mut self, min: usize) -> Self {
+        self.min_length = Some(min);
+        self
+    }
+
+    pub fn with_max_length(mut self, max: usize) -> Self {
+        self.max_length = Some(max);
+        self
+    }
+
+    pub fn with_range(mut self, min: usize, max: usize) -> Self {
+        self.min_length = Some(min);
+        self.max_length = Some(max);
+        self
+    }
+
+    pub fn with_minimum(mut self, min: i64) -> Self {
+        self.minimum = Some(min);
+        self
+    }
+
+    pub fn with_maximum(mut self, max: i64) -> Self {
+        self.maximum = Some(max);
+        self
+    }
+
+    pub fn with_format(mut self, format: impl Into<String>) -> Self {
+        self.format = Some(format.into());
+        self
+    }
+
+    pub fn with_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.pattern = Some(pattern.into());
+        self
+    }
+
+    pub fn with_property(mut self, name: impl Into<String>, schema: OpenApiSchema) -> Self {
+        let mut props = self.properties.unwrap_or_default();
+        props.insert(name.into(), schema);
+        self.properties = Some(props);
+        self
+    }
+
+    pub fn with_required_property(mut self, name: impl Into<String>, schema: OpenApiSchema) -> Self {
+        let name_str = name.into();
+        let mut req = self.required.unwrap_or_default();
+        if !req.contains(&name_str) {
+            req.push(name_str.clone());
+        }
+        self.required = Some(req);
+        self.with_property(name_str, schema)
+    }
+}
+
+/// Trait for types that can describe their OpenAPI JSON Schema representation,
+/// including field constraints and garde validation rules.
+pub trait HasOpenApiSchema {
+    /// Returns the OpenAPI schema representation.
+    fn schema() -> OpenApiSchema;
+}
+
+impl HasOpenApiSchema for String {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::string()
+    }
+}
+
+impl HasOpenApiSchema for &str {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::string()
+    }
+}
+
+impl HasOpenApiSchema for i8 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
+impl HasOpenApiSchema for i16 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
+impl HasOpenApiSchema for i32 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
+impl HasOpenApiSchema for i64 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
+impl HasOpenApiSchema for isize { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
+impl HasOpenApiSchema for u8 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
+impl HasOpenApiSchema for u16 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
+impl HasOpenApiSchema for u32 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
+impl HasOpenApiSchema for u64 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
+impl HasOpenApiSchema for usize { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
+impl HasOpenApiSchema for f32 { fn schema() -> OpenApiSchema { OpenApiSchema::number() } }
+impl HasOpenApiSchema for f64 { fn schema() -> OpenApiSchema { OpenApiSchema::number() } }
+impl HasOpenApiSchema for bool { fn schema() -> OpenApiSchema { OpenApiSchema::boolean() } }
+impl HasOpenApiSchema for uuid::Uuid { fn schema() -> OpenApiSchema { OpenApiSchema::uuid() } }
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for Vec<T> {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::array(T::schema())
+    }
+}
+
+impl<T: HasOpenApiSchema> HasOpenApiSchema for Option<T> {
+    fn schema() -> OpenApiSchema {
+        T::schema()
     }
 }
 
@@ -177,12 +318,14 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
             let schema = if let Some((_, matcher)) = route.matchers.iter().find(|(p, _)| p == param)
             {
                 match matcher {
-                    crate::routing::Matcher::Number => OpenApiSchema::integer(),
+                    crate::routing::Matcher::Number => OpenApiSchema::integer().with_minimum(0),
                     crate::routing::Matcher::Uuid => OpenApiSchema::uuid(),
                     crate::routing::Matcher::Slug => OpenApiSchema {
                         r#type: "string".into(),
                         format: None,
                         pattern: Some("^[a-zA-Z0-9][a-zA-Z0-9_-]{1,}[a-zA-Z0-9]$".into()),
+                        min_length: Some(3),
+                        ..Default::default()
                     },
                 }
             } else if param.contains("uuid") {
@@ -222,11 +365,23 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
             },
         );
 
+        let request_body = route.request_schema.as_ref().map(|schema| {
+            serde_json::json!({
+                "description": "Request payload",
+                "required": true,
+                "content": {
+                    "application/json": {
+                        "schema": schema
+                    }
+                }
+            })
+        });
+
         let operation = OpenApiOperation {
             operation_id: route.name.clone(),
             summary: route.name.clone(),
             parameters,
-            request_body: None,
+            request_body,
             responses,
         };
 

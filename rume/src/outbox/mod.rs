@@ -22,5 +22,8 @@ pub mod repository;
 
 pub use error::OutboxError;
 pub use message::{OutboxMessage, OutboxStatus};
-pub use relay::{OutboxRelay, OutboxRelayConfig, RelayHealthCheck, RelayPollResult, RelayStatus};
+pub use relay::{
+    OutboxRelay, OutboxRelayConfig, OutboxSweeperConfig, RelayHealthCheck, RelayPollResult,
+    RelayStatus,
+};
 pub use repository::{BoxFuture, OutboxRepository, TransactionalOutbox};

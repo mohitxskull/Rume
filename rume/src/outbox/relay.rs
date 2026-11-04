@@ -83,10 +83,33 @@ pub struct RelayStatus {
     pub total_errors: u64,
     /// Lifetime failed message state transitions (e.g. missing lease tokens or lost leases).
     pub failed_transitions: u64,
+    /// Lifetime total published messages hard-deleted or archived by the background sweeper.
+    pub total_purged: u64,
     /// Most recent operational error message, if any.
     pub last_error: Option<String>,
     /// Whether the relay is considered healthy (`consecutive_errors < 5`).
     pub is_healthy: bool,
+}
+
+/// Configuration for the outbox published message sweeper.
+#[derive(Debug, Clone)]
+pub struct OutboxSweeperConfig {
+    /// Retention age in seconds: messages marked as published older than this are purged.
+    pub retention_secs: u64,
+    /// Maximum number of messages to purge in a single batch pass.
+    pub batch_size: usize,
+    /// Interval between background sweeper passes.
+    pub interval: Duration,
+}
+
+impl Default for OutboxSweeperConfig {
+    fn default() -> Self {
+        Self {
+            retention_secs: 86400, // 24 hours
+            batch_size: 500,
+            interval: Duration::from_secs(300), // 5 minutes
+        }
+    }
 }
 
 /// Configuration for the outbox relay background processor.
@@ -130,6 +153,7 @@ pub struct OutboxRelay<R: OutboxRepository> {
     consecutive_errors: Arc<AtomicU32>,
     total_errors: Arc<AtomicU64>,
     failed_transitions: Arc<AtomicU64>,
+    total_purged: Arc<AtomicU64>,
     last_error: Arc<RwLock<Option<String>>>,
     shutdown_notify: Arc<tokio::sync::Notify>,
 }
@@ -144,6 +168,7 @@ impl<R: OutboxRepository> Clone for OutboxRelay<R> {
             consecutive_errors: Arc::clone(&self.consecutive_errors),
             total_errors: Arc::clone(&self.total_errors),
             failed_transitions: Arc::clone(&self.failed_transitions),
+            total_purged: Arc::clone(&self.total_purged),
             last_error: Arc::clone(&self.last_error),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
         }
@@ -175,6 +200,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             total_errors: Arc::new(AtomicU64::new(0)),
             failed_transitions: Arc::new(AtomicU64::new(0)),
+            total_purged: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -195,6 +221,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             consecutive_errors: Arc::new(AtomicU32::new(0)),
             total_errors: Arc::new(AtomicU64::new(0)),
             failed_transitions: Arc::new(AtomicU64::new(0)),
+            total_purged: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
         }
@@ -381,9 +408,46 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             consecutive_errors: consecutive,
             total_errors: self.total_errors.load(Ordering::Relaxed),
             failed_transitions: self.failed_transitions.load(Ordering::Relaxed),
+            total_purged: self.total_purged.load(Ordering::Relaxed),
             last_error: last_err,
             is_healthy: consecutive < 5,
         }
+    }
+
+    /// Explicitly executes a published message sweep pass to prevent unbounded table bloat.
+    ///
+    /// Purges up to `batch_size` messages with status `published` created at or before `retention_secs` ago.
+    /// Returns the count of hard-deleted rows.
+    pub async fn sweep_published(
+        &self,
+        retention_secs: u64,
+        batch_size: usize,
+    ) -> Result<usize, OutboxError> {
+        let count = self
+            .repository
+            .purge_published(retention_secs, batch_size)
+            .await?;
+        if count > 0 {
+            self.total_purged.fetch_add(count as u64, Ordering::SeqCst);
+            tracing::info!(purged = count, "Outbox sweeper purged published messages");
+        }
+        Ok(count)
+    }
+
+    /// Spawns a background maintenance sweeper that periodically purges old published outbox rows.
+    pub fn start_sweeper(&self, config: OutboxSweeperConfig) -> tokio::task::JoinHandle<()> {
+        let relay = self.clone();
+        tokio::spawn(async move {
+            while !relay.is_stopping.load(Ordering::Relaxed) {
+                if let Err(err) = relay.sweep_published(config.retention_secs, config.batch_size).await {
+                    tracing::error!(error = %err, "Outbox background sweeper encountered an error");
+                }
+                tokio::select! {
+                    _ = sleep(config.interval) => {},
+                    _ = relay.shutdown_notify.notified() => { break; }
+                }
+            }
+        })
     }
 
     /// Creates a Rume [`HealthCheck`] for supervising this relay's operational health.
