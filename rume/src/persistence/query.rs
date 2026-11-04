@@ -46,12 +46,28 @@ impl<'a> SqlQuery<'a> {
         )
     }
 
+    /// Validates that if this query targets a specific SQL dialect, the active backend matches.
+    pub fn check_dialect(&self, actual_dialect: &str) -> Result<(), PersistenceError> {
+        if let Some(expected) = self.dialect
+            && actual_dialect != "default"
+            && !actual_dialect.eq_ignore_ascii_case(expected)
+        {
+            return Err(PersistenceError::DialectMismatch {
+                query: self.name.to_string(),
+                expected: expected.to_string(),
+                actual: actual_dialect.to_string(),
+            });
+        }
+        Ok(())
+    }
+
     /// Executes the query statement within a transaction with bound parameters, returning affected rows.
     pub async fn execute<T: DatabaseTransaction>(
         &self,
         tx: &T,
         params: &[DbValue],
     ) -> Result<u64, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         tx.execute_params(self.sql, params).instrument(span).await
     }
@@ -62,6 +78,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<u64, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.execute_params(self.sql, params).instrument(span).await
     }
@@ -72,6 +89,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_all(self.sql, params).instrument(span).await
     }
@@ -82,6 +100,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Vec<R>, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_all_as(self.sql, params).instrument(span).await
     }
@@ -92,6 +111,7 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Vec<DbRow>, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         tx.fetch_all(self.sql, params).instrument(span).await
     }
@@ -102,6 +122,7 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Vec<R>, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         async move {
             let rows = tx.fetch_all(self.sql, params).await?;
@@ -117,6 +138,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_optional(self.sql, params).instrument(span).await
     }
@@ -127,6 +149,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<R>, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_optional_as(self.sql, params).instrument(span).await
     }
@@ -137,6 +160,7 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<DbRow>, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         tx.fetch_optional(self.sql, params).instrument(span).await
     }
@@ -147,6 +171,7 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<R>, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         async move {
             match tx.fetch_optional(self.sql, params).await? {
@@ -164,6 +189,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<DbRow, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_one(self.sql, params).instrument(span).await
     }
@@ -174,6 +200,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<R, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.fetch_one_as(self.sql, params).instrument(span).await
     }
@@ -184,6 +211,7 @@ impl<'a> SqlQuery<'a> {
         pool: &DatabasePool<B>,
         params: &[DbValue],
     ) -> Result<Option<String>, PersistenceError> {
+        self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
         pool.query_scalar_params(self.sql, params).instrument(span).await
     }
@@ -194,6 +222,7 @@ impl<'a> SqlQuery<'a> {
         tx: &T,
         params: &[DbValue],
     ) -> Result<Option<String>, PersistenceError> {
+        self.check_dialect(tx.dialect())?;
         let span = self.span();
         tx.query_scalar_params(self.sql, params).instrument(span).await
     }
@@ -208,5 +237,34 @@ impl<'a> Display for SqlQuery<'a> {
 impl<'a> AsRef<str> for SqlQuery<'a> {
     fn as_ref(&self) -> &str {
         self.sql
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_dialect_compatibility() {
+        let generic_query = SqlQuery::new("users.list", "queries/users.sql", None, "SELECT 1");
+        assert!(generic_query.check_dialect("postgres").is_ok());
+        assert!(generic_query.check_dialect("sqlite").is_ok());
+
+        let pg_query = SqlQuery::new("users.list", "queries/users.sql", Some("postgres"), "SELECT $1");
+        assert!(pg_query.check_dialect("postgres").is_ok());
+
+        let mismatch = pg_query.check_dialect("sqlite").unwrap_err();
+        match mismatch {
+            PersistenceError::DialectMismatch {
+                query,
+                expected,
+                actual,
+            } => {
+                assert_eq!(query, "users.list");
+                assert_eq!(expected, "postgres");
+                assert_eq!(actual, "sqlite");
+            }
+            other => panic!("expected DialectMismatch, got {other:?}"),
+        }
     }
 }

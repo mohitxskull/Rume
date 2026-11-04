@@ -219,7 +219,7 @@ impl DatabaseBackend for PostgresBackend {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(map_sqlx_error)?;
-            Ok(rows.iter().map(sqlx_pg_row_to_db_row).collect())
+            rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
     }
 
@@ -246,7 +246,7 @@ impl DatabaseBackend for PostgresBackend {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(map_sqlx_error)?;
-            Ok(row.as_ref().map(sqlx_pg_row_to_db_row))
+            row.as_ref().map(sqlx_pg_row_to_db_row).transpose()
         })
     }
 
@@ -351,6 +351,10 @@ impl Debug for PostgresTransaction {
 }
 
 impl DatabaseTransaction for PostgresTransaction {
+    fn dialect(&self) -> &'static str {
+        "postgres"
+    }
+
     fn execute_params(
         &self,
         statement: &str,
@@ -464,7 +468,7 @@ impl DatabaseTransaction for PostgresTransaction {
                 .fetch_all(&mut **tx)
                 .await
                 .map_err(map_sqlx_error)?;
-            Ok(rows.iter().map(sqlx_pg_row_to_db_row).collect())
+            rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
     }
 
@@ -496,7 +500,7 @@ impl DatabaseTransaction for PostgresTransaction {
                 .fetch_optional(&mut **tx)
                 .await
                 .map_err(map_sqlx_error)?;
-            Ok(row.as_ref().map(sqlx_pg_row_to_db_row))
+            row.as_ref().map(sqlx_pg_row_to_db_row).transpose()
         })
     }
 
@@ -913,43 +917,98 @@ impl TransactionalOutbox<PostgresTransaction> for PostgresBackend {
     }
 }
 
-pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> DbRow {
+pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> Result<DbRow, PersistenceError> {
     use sqlx::{Column, Row, TypeInfo, ValueRef};
     let columns: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
     let mut values = Vec::with_capacity(columns.len());
-    for i in 0..columns.len() {
-        let raw = row.try_get_raw(i);
-        let val = match raw {
-            Ok(v) if v.is_null() => DbValue::Null,
-            Ok(v) => {
-                let type_info = v.type_info();
-                let type_name = type_info.name();
-                match type_name {
-                    "BOOL" => row.try_get::<bool, _>(i).map(DbValue::Bool).unwrap_or(DbValue::Null),
-                    "INT2" => row.try_get::<i16, _>(i).map(|n| DbValue::Int(n as i64)).unwrap_or(DbValue::Null),
-                    "INT4" => row.try_get::<i32, _>(i).map(|n| DbValue::Int(n as i64)).unwrap_or(DbValue::Null),
-                    "INT8" => row.try_get::<i64, _>(i).map(DbValue::Int).unwrap_or(DbValue::Null),
-                    "FLOAT4" => row.try_get::<f32, _>(i).map(|f| DbValue::Float(f as f64)).unwrap_or(DbValue::Null),
-                    "FLOAT8" => row.try_get::<f64, _>(i).map(DbValue::Float).unwrap_or(DbValue::Null),
-                    "BYTEA" => row.try_get::<Vec<u8>, _>(i).map(DbValue::Bytes).unwrap_or(DbValue::Null),
-                    _ => {
-                        if let Ok(s) = row.try_get::<String, _>(i) {
-                            DbValue::Text(s)
-                        } else if let Ok(n) = row.try_get::<i64, _>(i) {
-                            DbValue::Int(n)
-                        } else if let Ok(f) = row.try_get::<f64, _>(i) {
-                            DbValue::Float(f)
-                        } else if let Ok(b) = row.try_get::<bool, _>(i) {
-                            DbValue::Bool(b)
-                        } else {
-                            DbValue::Null
-                        }
+    for (i, col_name) in columns.iter().enumerate() {
+        let raw = row.try_get_raw(i).map_err(|e| PersistenceError::DecodeError {
+            column: col_name.clone(),
+            message: format!("failed to read raw column: {e}"),
+        })?;
+        let val = if raw.is_null() {
+            DbValue::Null
+        } else {
+            let type_info = raw.type_info();
+            let type_name = type_info.name();
+            match type_name {
+                "BOOL" => row
+                    .try_get::<bool, _>(i)
+                    .map(DbValue::Bool)
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode BOOL: {e}"),
+                    })?,
+                "INT2" => row
+                    .try_get::<i16, _>(i)
+                    .map(|n| DbValue::Int(n as i64))
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode INT2: {e}"),
+                    })?,
+                "INT4" => row
+                    .try_get::<i32, _>(i)
+                    .map(|n| DbValue::Int(n as i64))
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode INT4: {e}"),
+                    })?,
+                "INT8" => row
+                    .try_get::<i64, _>(i)
+                    .map(DbValue::Int)
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode INT8: {e}"),
+                    })?,
+                "FLOAT4" => row
+                    .try_get::<f32, _>(i)
+                    .map(|f| DbValue::Float(f as f64))
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode FLOAT4: {e}"),
+                    })?,
+                "FLOAT8" => row
+                    .try_get::<f64, _>(i)
+                    .map(DbValue::Float)
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode FLOAT8: {e}"),
+                    })?,
+                "BYTEA" => row
+                    .try_get::<Vec<u8>, _>(i)
+                    .map(DbValue::Bytes)
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode BYTEA: {e}"),
+                    })?,
+                "VARCHAR" | "CHAR" | "TEXT" | "NAME" => row
+                    .try_get::<String, _>(i)
+                    .map(DbValue::Text)
+                    .map_err(|e| PersistenceError::DecodeError {
+                        column: col_name.clone(),
+                        message: format!("failed to decode TEXT: {e}"),
+                    })?,
+                _ => {
+                    if let Ok(s) = row.try_get::<String, _>(i) {
+                        DbValue::Text(s)
+                    } else if let Ok(n) = row.try_get::<i64, _>(i) {
+                        DbValue::Int(n)
+                    } else if let Ok(f) = row.try_get::<f64, _>(i) {
+                        DbValue::Float(f)
+                    } else if let Ok(b) = row.try_get::<bool, _>(i) {
+                        DbValue::Bool(b)
+                    } else if let Ok(bytes) = row.try_get::<Vec<u8>, _>(i) {
+                        DbValue::Bytes(bytes)
+                    } else {
+                        return Err(PersistenceError::DecodeError {
+                            column: col_name.clone(),
+                            message: format!("unsupported or undecodable column type '{type_name}'"),
+                        });
                     }
                 }
             }
-            Err(_) => DbValue::Null,
         };
         values.push(val);
     }
-    DbRow::new(columns, values)
+    Ok(DbRow::new(columns, values))
 }

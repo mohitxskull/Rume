@@ -52,4 +52,23 @@ pub enum PersistenceError {
     /// Statement or query execution failed.
     #[error("query execution failed: {0}")]
     QueryFailed(String),
+
+    /// A query asset specified a target dialect that does not match the active backend.
+    #[error("SQL dialect mismatch for query '{query}': expected '{expected}', active backend is '{actual}'")]
+    DialectMismatch {
+        query: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// The requested column was not found in the result row schema.
+    #[error("column '{0}' not found in result row")]
+    ColumnNotFound(String),
+
+    /// A column or value could not be decoded into the requested Rust type.
+    #[error("failed to decode column '{column}': {message}")]
+    DecodeError {
+        column: String,
+        message: String,
+    },
 }

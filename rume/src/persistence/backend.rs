@@ -95,7 +95,11 @@ impl From<u32> for DbValue {
 
 impl From<u64> for DbValue {
     fn from(u: u64) -> Self {
-        DbValue::Int(u as i64)
+        if let Ok(i) = i64::try_from(u) {
+            DbValue::Int(i)
+        } else {
+            DbValue::Text(u.to_string())
+        }
     }
 }
 
@@ -304,6 +308,11 @@ pub(crate) fn map_sqlx_error(err: sqlx::Error) -> PersistenceError {
 
 /// Active transaction handle providing isolated mutation and explicit commit/rollback.
 pub trait DatabaseTransaction: Debug + Send + Sync {
+    /// Returns the database dialect of this transaction (e.g. "postgres", "sqlite", "mysql", "default").
+    fn dialect(&self) -> &'static str {
+        "default"
+    }
+
     /// Executes a parameterized statement within the transaction boundary.
     fn execute_params(
         &self,
