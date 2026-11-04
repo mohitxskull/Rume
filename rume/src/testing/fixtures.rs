@@ -1,0 +1,279 @@
+//! Isolated database and transaction fixtures for test isolation.
+
+use std::path::{Path, PathBuf};
+use crate::persistence::{DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError};
+
+/// An RAII transaction guard that automatically rolls back the transaction on Drop
+/// unless explicitly committed.
+pub struct TestTransactionFixture<T: DatabaseTransaction + 'static> {
+    tx: Option<T>,
+    committed: bool,
+}
+
+impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
+    /// Creates a new fixture wrapping an active database transaction.
+    pub fn new(tx: T) -> Self {
+        Self {
+            tx: Some(tx),
+            committed: false,
+        }
+    }
+
+    /// Returns a reference to the active transaction.
+    pub fn tx(&self) -> &T {
+        self.tx.as_ref().expect("transaction active")
+    }
+
+    /// Atomically commits the transaction, consuming the fixture and preventing rollback on Drop.
+    pub async fn commit(mut self) -> Result<(), PersistenceError> {
+        if let Some(tx) = self.tx.take() {
+            self.committed = true;
+            tx.commit().await?;
+        }
+        Ok(())
+    }
+
+    /// Discards and rolls back the transaction explicitly.
+    pub async fn rollback(mut self) -> Result<(), PersistenceError> {
+        if let Some(tx) = self.tx.take() {
+            tx.rollback().await?;
+        }
+        Ok(())
+    }
+}
+
+impl<T: DatabaseTransaction + 'static> std::ops::Deref for TestTransactionFixture<T> {
+    type Target = T;
+    fn deref(&self) -> &Self::Target {
+        self.tx()
+    }
+}
+
+impl<T: DatabaseTransaction + 'static> std::fmt::Debug for TestTransactionFixture<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TestTransactionFixture")
+            .field("committed", &self.committed)
+            .finish()
+    }
+}
+
+impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(tx) = self.tx.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                let _ = tx.rollback().await;
+            });
+        }
+    }
+}
+
+/// An isolated SQLite database backed by a temporary file on disk, automatically deleted on Drop.
+#[cfg(feature = "sqlite")]
+pub struct SqliteTestFixture {
+    path: PathBuf,
+    pool: DatabasePool<crate::persistence::SqliteBackend>,
+}
+
+#[cfg(feature = "sqlite")]
+impl SqliteTestFixture {
+    /// Creates a unique temporary SQLite database file and initializes a connection pool.
+    pub async fn create() -> Result<Self, PersistenceError> {
+        let temp_dir = std::env::temp_dir();
+        let db_name = format!("rume_test_{}.db", uuid::Uuid::new_v4().simple());
+        let path = temp_dir.join(db_name);
+        let path_str = path.to_string_lossy().to_string();
+
+        let backend = crate::persistence::SqliteBackend::open(&path_str).await?;
+        let config = DatabaseConfig::new(format!("sqlite://{path_str}"));
+        let pool = DatabasePool::new(backend, config);
+
+        Ok(Self { path, pool })
+    }
+
+    /// Returns a reference to the database pool.
+    pub fn pool(&self) -> &DatabasePool<crate::persistence::SqliteBackend> {
+        &self.pool
+    }
+
+    /// Returns the file path of the temporary SQLite database.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
+    pub async fn begin_test_tx(&self) -> Result<TestTransactionFixture<crate::persistence::SqliteTransaction>, PersistenceError> {
+        let tx = self.pool.backend().begin_transaction().await?;
+        Ok(TestTransactionFixture::new(tx))
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl std::ops::Deref for SqliteTestFixture {
+    type Target = DatabasePool<crate::persistence::SqliteBackend>;
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl std::fmt::Debug for SqliteTestFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SqliteTestFixture")
+            .field("path", &self.path)
+            .finish()
+    }
+}
+
+#[cfg(feature = "sqlite")]
+impl Drop for SqliteTestFixture {
+    fn drop(&mut self) {
+        let path = self.path.clone();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+    }
+}
+
+/// An isolated PostgreSQL test fixture utilizing a unique dedicated schema per test.
+#[cfg(feature = "postgres")]
+pub struct PostgresSchemaFixture {
+    schema_name: String,
+    pool: DatabasePool<crate::persistence::PostgresBackend>,
+    admin_pool: Option<DatabasePool<crate::persistence::PostgresBackend>>,
+}
+
+#[cfg(feature = "postgres")]
+impl PostgresSchemaFixture {
+    /// Creates a unique schema in the target PostgreSQL instance and returns a pool scoped to that schema.
+    pub async fn create(admin_pool: &DatabasePool<crate::persistence::PostgresBackend>) -> Result<Self, PersistenceError> {
+        let schema_name = format!("test_{}", uuid::Uuid::new_v4().simple());
+
+        admin_pool
+            .backend()
+            .execute(&format!("CREATE SCHEMA \"{schema_name}\""))
+            .await?;
+
+        let base_url = &admin_pool.config().url;
+        let scoped_url = if base_url.contains('?') {
+            format!("{base_url}&options=-csearch_path%3D{schema_name}")
+        } else {
+            format!("{base_url}?options=-csearch_path%3D{schema_name}")
+        };
+
+        let mut config = admin_pool.config().clone();
+        config.url = scoped_url;
+        let backend = crate::persistence::PostgresBackend::connect(&config).await?;
+        let pool = DatabasePool::new(backend, config);
+
+        Ok(Self {
+            schema_name,
+            pool,
+            admin_pool: Some(admin_pool.clone()),
+        })
+    }
+
+    /// Returns the schema name created for this test run.
+    pub fn schema_name(&self) -> &str {
+        &self.schema_name
+    }
+
+    /// Returns a reference to the pool scoped to this test's isolated schema.
+    pub fn pool(&self) -> &DatabasePool<crate::persistence::PostgresBackend> {
+        &self.pool
+    }
+
+    /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
+    pub async fn begin_test_tx(&self) -> Result<TestTransactionFixture<crate::persistence::PostgresTransaction>, PersistenceError> {
+        let tx = self.pool.backend().begin_transaction().await?;
+        Ok(TestTransactionFixture::new(tx))
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::ops::Deref for PostgresSchemaFixture {
+    type Target = DatabasePool<crate::persistence::PostgresBackend>;
+    fn deref(&self) -> &Self::Target {
+        &self.pool
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl std::fmt::Debug for PostgresSchemaFixture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostgresSchemaFixture")
+            .field("schema_name", &self.schema_name)
+            .finish()
+    }
+}
+
+#[cfg(feature = "postgres")]
+impl Drop for PostgresSchemaFixture {
+    fn drop(&mut self) {
+        if let Some(admin) = self.admin_pool.take() {
+            let schema = self.schema_name.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = admin
+                        .backend()
+                        .execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
+                        .await;
+                });
+            }
+        }
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_sqlite_test_fixture_creates_and_cleans_up() {
+        let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+        let path = fixture.path().to_path_buf();
+        assert!(path.exists(), "database file must exist on disk");
+
+        fixture.pool().backend().execute("CREATE TABLE users (id INT, name TEXT)").await.expect("execute");
+        fixture.pool().backend().execute("INSERT INTO users VALUES (1, 'Alice')").await.expect("insert");
+
+        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM users").await.expect("count");
+        assert_eq!(count.as_deref(), Some("1"));
+
+        // Drop fixture
+        drop(fixture);
+
+        // Path must be removed from disk
+        assert!(!path.exists(), "database file must be cleaned up on drop");
+    }
+
+    #[tokio::test]
+    async fn test_transaction_fixture_auto_rollback_on_drop() {
+        let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+        fixture.pool().backend().execute("CREATE TABLE items (val INT)").await.expect("create table");
+
+        // Transaction 1: inserted but dropped without commit
+        {
+            let tx = fixture.begin_test_tx().await.expect("begin tx");
+            tx.execute("INSERT INTO items VALUES (999)").await.expect("insert in tx");
+            // drop tx
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM items").await.expect("count");
+        assert_eq!(count.as_deref(), Some("0"), "uncommitted transaction must be rolled back on drop");
+
+        // Transaction 2: committed
+        {
+            let tx = fixture.begin_test_tx().await.expect("begin tx");
+            tx.execute("INSERT INTO items VALUES (123)").await.expect("insert in tx");
+            tx.commit().await.expect("commit");
+        }
+
+        let count2: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM items").await.expect("count");
+        assert_eq!(count2.as_deref(), Some("1"), "committed transaction must persist");
+    }
+}
