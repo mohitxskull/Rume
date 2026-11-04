@@ -173,3 +173,62 @@ async fn decoupled_inter_module_events() {
     // Verify analytics received both events without orders module knowing about analytics
     assert_eq!(total_revenue.load(Ordering::SeqCst), 10000);
 }
+
+#[tokio::test]
+async fn test_event_sync_listener_panic_isolation() {
+    let bus = EventBus::new();
+    bus.subscribe_fn(|_ev: &OrderPlacedEvent| async move {
+        panic!("simulated sync listener panic");
+    });
+
+    let res = bus
+        .publish_sync(&OrderPlacedEvent {
+            order_id: "panic_1".into(),
+            total_cents: 100,
+        })
+        .await;
+
+    assert!(res.is_err());
+    match res.unwrap_err() {
+        EventError::ListenerError { message, .. } => {
+            assert!(message.contains("panicked"));
+        }
+        err => panic!("unexpected error type: {err:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_event_async_listener_panic_isolation() {
+    let bus = EventBus::new();
+    let second_listener_executed = Arc::new(AtomicUsize::new(0));
+    let notify = Arc::new(tokio::sync::Notify::new());
+
+    // First listener panics
+    bus.subscribe_fn(|_ev: &OrderPlacedEvent| async move {
+        panic!("simulated async listener panic");
+    });
+
+    // Second listener should still run safely
+    let executed_clone = Arc::clone(&second_listener_executed);
+    let notify_clone = Arc::clone(&notify);
+    bus.subscribe_fn(move |_ev: &OrderPlacedEvent| {
+        let ex = Arc::clone(&executed_clone);
+        let ntf = Arc::clone(&notify_clone);
+        async move {
+            ex.fetch_add(1, Ordering::SeqCst);
+            ntf.notify_one();
+            Ok(())
+        }
+    });
+
+    let count = bus.publish_async(OrderPlacedEvent {
+        order_id: "panic_async".into(),
+        total_cents: 50,
+    });
+    assert_eq!(count, 2);
+
+    tokio::time::timeout(Duration::from_secs(1), notify.notified())
+        .await
+        .expect("second async listener should be notified despite first listener panic");
+    assert_eq!(second_listener_executed.load(Ordering::SeqCst), 1);
+}

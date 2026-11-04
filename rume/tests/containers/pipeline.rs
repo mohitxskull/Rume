@@ -20,17 +20,22 @@ use axum::Router;
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
+#[cfg(feature = "sqlite")]
 use rume::app::state::{Availability, AvailabilityState};
 use rume::auth::identity::{AuthUser, Authenticated};
 use rume::auth::layer::{AuthLayer, PolicyLayer};
-use rume::auth::policy::{RequirePermission, authorize};
+#[cfg(feature = "sqlite")]
+use rume::auth::policy::authorize;
+use rume::auth::policy::RequirePermission;
 use rume::auth::schemes::BearerTokenScheme;
 use rume::error::AppError;
 use rume::events::Event;
 use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, PostgresJobQueue};
 use rume::metrics::MetricsRegistry;
+#[cfg(feature = "sqlite")]
+use rume::outbox::OutboxStatus;
 use rume::outbox::{
-    OutboxError, OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, OutboxStatus,
+    OutboxError, OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository,
     TransactionalOutbox,
 };
 use rume::persistence::postgres::PostgresBackend;
@@ -45,6 +50,7 @@ use rume::tenant::{Tenant, TenantContext};
 
 use crate::common;
 
+#[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct OrderBilledEvent {
     pub tenant_id: String,
@@ -52,26 +58,31 @@ struct OrderBilledEvent {
     pub amount_cents: u64,
 }
 
+#[cfg(feature = "sqlite")]
 impl Event for OrderBilledEvent {
     const TYPE: &'static str = "billing.order_billed";
 }
 
+#[cfg(feature = "sqlite")]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct FulfillOrderJob {
     pub tenant_id: String,
     pub order_id: String,
 }
 
+#[cfg(feature = "sqlite")]
 impl Job for FulfillOrderJob {
     const NAME: &'static str = "fulfillment.fulfill_order";
 }
 
+#[cfg(feature = "sqlite")]
 struct FulfillOrderHandler {
     jobs_processed: Arc<AtomicUsize>,
     metrics: Arc<MetricsRegistry>,
     notify: Arc<tokio::sync::Notify>,
 }
 
+#[cfg(feature = "sqlite")]
 impl rume::jobs::JobHandler<FulfillOrderJob> for FulfillOrderHandler {
     fn handle<'a>(
         &'a self,

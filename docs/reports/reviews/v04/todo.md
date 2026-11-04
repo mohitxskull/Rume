@@ -134,13 +134,13 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group K — Test Determinism & Harness Upgrades (solve together)
 > Root cause: Hardcoded wall-clock sleeps and orphaned harness definitions create test flakes and compiler warnings.
 
-- [ ] **Testing M1 — 33 wall-clock `sleep()` calls in test suites** (`testing-feature-matrix.md` M1).
+- [x] **Testing M1 — 33 wall-clock `sleep()` calls in test suites** (`testing-feature-matrix.md` M1).
       `rume/tests/`: Adds >12s idle latency and causes timing flakes on loaded runners. Replace wall-clock sleeps with `tokio::sync::Notify`, virtual time, or polling conditions.
-- [ ] **Testing M2 — Orphaned `RumeTestHarness` with zero adoption & compiler warnings** (`testing-feature-matrix.md` M2).
+- [x] **Testing M2 — Orphaned `RumeTestHarness` with zero adoption & compiler warnings** (`testing-feature-matrix.md` M2).
       `rume/src/testing/harness.rs:12–65`: Unused in tests and emits warnings under non-sqlite features. Resolve feature gates and integrate into integration suites.
-- [ ] **Testing M3 — Tautological third-party mock test in enterprise integration** (`testing-feature-matrix.md` M3).
+- [x] **Testing M3 — Tautological third-party mock test in enterprise integration** (`testing-feature-matrix.md` M3).
       `rume/tests/integration/enterprise.rs:300–315`: Asserts `wiremock` against `ureq` with zero Rume code exercised. Test real Rume IdP metadata resolution client.
-- [ ] **Testing M4 — Missing negative-path coverage for events, sagas, and worker fences** (`testing-feature-matrix.md` M4).
+- [x] **Testing M4 — Missing negative-path coverage for events, sagas, and worker fences** (`testing-feature-matrix.md` M4).
       `rume/tests/`: Untested error paths in new pipeline code. Add unit and integration assertions for listener panics, saga step compensation errors, and worker lease fences.
 
 ### Group L — Minor Polish & Diagnostics (solve together)
@@ -212,7 +212,7 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
       `rume/src/enterprise/saml.rs:30`: Clean up unused error variant and enforce mandatory verifier checks.
 - [ ] **Security m5 — SCIM 2.0 casing and attribute type deviations** (`security-protocols.md` m5).
       `rume/src/enterprise/scim.rs:48`: Align `Resources` list key casing and complex roles with RFC 7643/7644.
-- [ ] **Testing m1 — Unused import compiler warnings in `pipeline.rs` under non-sqlite builds** (`testing-feature-matrix.md` m1).
+- [x] **Testing m1 — Unused import compiler warnings in `pipeline.rs` under non-sqlite builds** (`testing-feature-matrix.md` m1).
       `rume/tests/containers/pipeline.rs:25`: Clean up feature-gated imports to prevent build warnings.
 - [ ] **Testing m2 — Redundant assertions duplicating `insta` snapshots** (`testing-feature-matrix.md` m2).
       `rume/tests/integration/openapi.rs:45`: Prune redundant manual field assertions that duplicate snapshot coverage.

@@ -156,7 +156,13 @@ async fn cache_expiration_and_refresh() {
     assert!(cache.exists("short_lived").await.unwrap());
 
     // Wait for TTL expiration in Redis
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let start = std::time::Instant::now();
+    while cache.exists("short_lived").await.unwrap() {
+        if start.elapsed() > Duration::from_secs(2) {
+            panic!("cache key did not expire in time");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     assert!(!cache.exists("short_lived").await.unwrap());
     assert_eq!(cache.get_json::<i32>("short_lived").await.unwrap(), None);

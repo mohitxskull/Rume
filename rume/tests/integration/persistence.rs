@@ -358,3 +358,24 @@ async fn pool_acquire_timeout_and_graceful_drain() {
     let ping_after = pool.backend().ping().await;
     assert!(matches!(ping_after, Err(PersistenceError::Closed)));
 }
+
+#[tokio::test]
+async fn test_persistence_via_rume_test_harness() {
+    use rume::testing::RumeTestHarness;
+
+    let harness = RumeTestHarness::in_memory()
+        .await
+        .expect("in-memory harness init")
+        .with_router(axum::Router::new().route("/ping", axum::routing::get(|| async { "pong" })));
+
+    let resp = harness.get("/ping").await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(TestApp::body_text(resp).await, "pong");
+
+    let count = harness.execute("CREATE TABLE harness_users (id INT, name TEXT);").await.unwrap();
+    assert_eq!(count, 0);
+
+    harness.execute("INSERT INTO harness_users VALUES (1, 'alice');").await.unwrap();
+    let name = harness.query_scalar("SELECT name FROM harness_users WHERE id = 1;").await.unwrap();
+    assert_eq!(name, Some("alice".to_string()));
+}

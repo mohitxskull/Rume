@@ -315,7 +315,9 @@ async fn test_enterprise_idp_metadata_wiremock_integration() {
     let mut resp = ureq::get(&target_url).call().expect("fetch IdP metadata from mock server");
     assert_eq!(resp.status(), 200);
     let body = resp.body_mut().read_to_string().expect("read body");
-    assert!(body.contains("mock-idp.example.com"));
+    // Verify Rume's SAML parser successfully parses the IdP metadata EntityDescriptor
+    let entity_id = SamlParser::parse_entity_id(&body).expect("parse entity id");
+    assert_eq!(entity_id, "https://mock-idp.example.com");
 }
 
 #[test]

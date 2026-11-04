@@ -100,13 +100,12 @@ impl RumeTestHarness<crate::persistence::PostgresBackend> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
     use axum::http::StatusCode;
     use axum::routing::get;
 
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn test_rume_test_harness_in_memory_lifecycle() {
         let router = axum::Router::new().route("/ping", get(|| async { "pong" }));

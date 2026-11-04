@@ -3,7 +3,9 @@
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
+use futures_util::FutureExt;
 
 use crate::events::error::EventError;
 use crate::events::event::{BoxFuture, ErasedEventListener, Event, EventHandler};
@@ -104,7 +106,17 @@ impl EventBus {
         let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event.clone());
 
         for listener in listeners {
-            listener(Arc::clone(&event_arc)).await?;
+            let fut = listener(Arc::clone(&event_arc));
+            match AssertUnwindSafe(fut).catch_unwind().await {
+                Ok(Ok(())) => {}
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    return Err(EventError::ListenerError {
+                        event_type: E::TYPE,
+                        message: "event listener panicked".into(),
+                    });
+                }
+            }
         }
 
         Ok(count)
@@ -127,7 +139,16 @@ impl EventBus {
             let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
             tokio::spawn(async move {
                 for listener in listeners {
-                    let _ = listener(Arc::clone(&event_arc)).await;
+                    let fut = listener(Arc::clone(&event_arc));
+                    match AssertUnwindSafe(fut).catch_unwind().await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::error!("async event listener returned error: {err}");
+                        }
+                        Err(panic_payload) => {
+                            tracing::error!("async event listener panicked: {panic_payload:?}");
+                        }
+                    }
                 }
             });
         }

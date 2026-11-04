@@ -55,12 +55,16 @@ async fn test_distributed_lock_ttl_auto_expiration() {
     let guard_a = lock_service.acquire("batch-job", short_ttl).await.unwrap();
     assert!(guard_a.is_some());
 
-    // Sleep past TTL
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Client B can acquire because A's lease expired automatically
-    let guard_b = lock_service.acquire("batch-job", short_ttl).await.unwrap();
-    assert!(guard_b.is_some());
+    // Poll until A's lease expires automatically in Redis
+    let mut guard_b = None;
+    for _ in 0..25 {
+        if let Ok(Some(g)) = lock_service.acquire("batch-job", short_ttl).await {
+            guard_b = Some(g);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(guard_b.is_some(), "Client B should acquire once A's lease expires");
 }
 
 #[tokio::test]
@@ -98,10 +102,15 @@ async fn test_leader_election_lifecycle() {
     assert_eq!(lease2.term, 2);
 
     // 6. Leadership auto-fails over on crash (TTL expiry)
-    tokio::time::sleep(Duration::from_millis(250)).await;
-
-    let lease3 = elector.try_acquire(role, "node-3", ttl).await.unwrap();
-    assert!(lease3.is_some());
+    let mut lease3 = None;
+    for _ in 0..30 {
+        if let Ok(Some(l)) = elector.try_acquire(role, "node-3", ttl).await {
+            lease3 = Some(l);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(lease3.is_some(), "Node 3 should acquire leadership after TTL expiry");
     let lease3 = lease3.unwrap();
     assert_eq!(lease3.candidate_id, "node-3");
     assert_eq!(lease3.term, 3);
