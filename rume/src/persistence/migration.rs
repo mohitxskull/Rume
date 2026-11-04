@@ -3,6 +3,17 @@
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction};
 use crate::persistence::error::PersistenceError;
 
+/// Canonical migration identifier for Rume core persistence schemas.
+pub const RUME_CORE_MIGRATION_ID: &str = "20261104_001_rume_core_schemas";
+
+const PG_OUTBOX: &str = include_str!("sql/postgres/outbox_schema.sql");
+const PG_JOBS: &str = include_str!("sql/postgres/jobs_schema.sql");
+const PG_LOCKS: &str = include_str!("sql/postgres/locks_schema.sql");
+const PG_LEADER: &str = include_str!("sql/postgres/leader_schema.sql");
+
+const MYSQL_OUTBOX: &str = include_str!("sql/mysql/outbox_schema.sql");
+const SQLITE_OUTBOX: &str = include_str!("sql/sqlite/outbox_schema.sql");
+
 /// Canonical DDL for the migration tracking ledger table across all database backends.
 pub const CREATE_MIGRATIONS_TABLE_DDL: &str =
     "CREATE TABLE IF NOT EXISTS rume_migrations (\
@@ -55,6 +66,17 @@ impl Migration {
         self.down_sql = Some(down_sql.into());
         self
     }
+
+    /// Computes the SHA-256 hexadecimal digest of the migration's `up_sql` statement.
+    pub fn checksum(&self) -> String {
+        match &self.up_sql {
+            Some(s) => {
+                use sha2::{Digest, Sha256};
+                format!("{:x}", Sha256::digest(s.as_bytes()))
+            }
+            None => String::new(),
+        }
+    }
 }
 
 /// Summary report of executed migrations.
@@ -76,6 +98,51 @@ impl Migrator {
         Self {
             migrations: Vec::new(),
         }
+    }
+
+    /// Registers the Rume core persistence migration (outbox, jobs, locks, leader) appropriate for the given dialect.
+    pub fn with_rume_core(mut self, dialect: &str) -> Self {
+        let (up_sql, down_sql) = match dialect {
+            "postgres" => {
+                let up = format!(
+                    "{}\n{}\n{}\n{}",
+                    PG_OUTBOX, PG_JOBS, PG_LOCKS, PG_LEADER
+                );
+                let down = r#"
+DROP TABLE IF EXISTS rume_leaders;
+DROP TABLE IF EXISTS rume_locks;
+DROP TABLE IF EXISTS rume_jobs;
+DROP TABLE IF EXISTS rume_outbox;
+DROP SEQUENCE IF EXISTS rume_leader_term_seq;
+DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
+"#;
+                (up, down)
+            }
+            "mysql" => {
+                let up = MYSQL_OUTBOX.to_string();
+                let down = "DROP TABLE IF EXISTS rume_outbox;";
+                (up, down)
+            }
+            "sqlite" => {
+                let up = SQLITE_OUTBOX.to_string();
+                let down = "DROP TABLE IF EXISTS rume_outbox;";
+                (up, down)
+            }
+            _ => {
+                return self;
+            }
+        };
+
+        self.migrations.insert(
+            0,
+            Migration::from_sql(
+                RUME_CORE_MIGRATION_ID,
+                "Initialize Rume core persistence tables",
+                up_sql,
+            )
+            .with_down(down_sql),
+        );
+        self
     }
 
     /// Registers a migration.
@@ -101,11 +168,20 @@ impl Migrator {
         let mut pending = Vec::new();
         for migration in &self.migrations {
             let check_sql = format!(
-                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
                 migration.id.replace('\'', "''")
             );
-            let exists = backend.query_scalar(&check_sql).await?;
-            if exists.is_none() {
+            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            if let Some(actual) = stored_checksum {
+                let expected = migration.checksum();
+                if !actual.is_empty() && actual != expected {
+                    return Err(PersistenceError::MigrationChecksumMismatch {
+                        migration: migration.id.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            } else {
                 pending.push(migration.id.clone());
             }
         }
@@ -151,11 +227,20 @@ impl Migrator {
         let mut applied = Vec::new();
         for migration in &self.migrations {
             let check_sql = format!(
-                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
                 migration.id.replace('\'', "''")
             );
-            let exists = backend.query_scalar(&check_sql).await?;
-            if exists.is_none() {
+            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            if let Some(actual) = stored_checksum {
+                let expected = migration.checksum();
+                if !actual.is_empty() && actual != expected {
+                    return Err(PersistenceError::MigrationChecksumMismatch {
+                        migration: migration.id.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            } else {
                 let tx = backend.begin_transaction().await?;
                 if let Some(sql) = &migration.up_sql {
                     tx.execute(sql)
@@ -183,13 +268,7 @@ impl Migrator {
                         .as_secs()
                 };
                 let name = migration.description.replace('\'', "''");
-                let checksum = match &migration.up_sql {
-                    Some(s) => {
-                        use sha2::{Digest, Sha256};
-                        format!("{:x}", Sha256::digest(s.as_bytes()))
-                    }
-                    None => String::new(),
-                };
+                let checksum = migration.checksum();
                 let insert_sql = format!(
                     "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ('{}', '{}', {}, '{}')",
                     migration.id.replace('\'', "''"),
@@ -261,11 +340,20 @@ impl Migrator {
         let mut pending = Vec::new();
         for migration in &self.migrations {
             let check_sql = format!(
-                "SELECT id FROM rume_migrations WHERE id = '{}'",
+                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
                 migration.id.replace('\'', "''")
             );
-            let exists = backend.query_scalar(&check_sql).await?;
-            if exists.is_none() {
+            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            if let Some(actual) = stored_checksum {
+                let expected = migration.checksum();
+                if !actual.is_empty() && actual != expected {
+                    return Err(PersistenceError::MigrationChecksumMismatch {
+                        migration: migration.id.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            } else {
                 pending.push(migration.id.clone());
             }
         }

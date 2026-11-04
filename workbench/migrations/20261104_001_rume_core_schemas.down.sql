@@ -1,4 +1,0 @@
-DROP TABLE IF EXISTS rume_leaders;
-DROP TABLE IF EXISTS rume_locks;
-DROP TABLE IF EXISTS rume_jobs;
-DROP TABLE IF EXISTS rume_outbox;

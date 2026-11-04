@@ -145,6 +145,34 @@ async fn test_postgres_migrations_up_and_rollback() {
         .await
         .expect("preflight should pass after running migrations");
 
+    // Tampered migration with altered SQL must be rejected by checksum verification
+    let tampered_migrator = Migrator::new()
+        .add_migration(
+            Migration::from_sql(
+                "20261102_001_accounts",
+                "create accounts table with altered column",
+                "CREATE TABLE accounts (id TEXT PRIMARY KEY, balance INT NOT NULL, extra INT)",
+            )
+            .with_down("DROP TABLE accounts"),
+        )
+        .add_migration(
+            Migration::from_sql(
+                "20261102_002_audit",
+                "create audit table",
+                "CREATE TABLE audit_logs (id TEXT PRIMARY KEY, action TEXT NOT NULL)",
+            )
+            .with_down("DROP TABLE audit_logs"),
+        );
+    let tampered_check = tampered_migrator.verify_no_pending_backend(backend).await;
+    assert!(
+        matches!(
+            tampered_check,
+            Err(PersistenceError::MigrationChecksumMismatch { ref migration, .. })
+            if migration == "20261102_001_accounts"
+        ),
+        "preflight must fail on checksum mismatch: {tampered_check:?}"
+    );
+
     // Write and verify business data
     backend
         .execute("INSERT INTO accounts (id, balance) VALUES ('acc-100', 4200)")

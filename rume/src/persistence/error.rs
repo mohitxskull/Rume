@@ -25,6 +25,14 @@ pub enum PersistenceError {
     #[error("migration '{migration}' failed: {message}")]
     MigrationError { migration: String, message: String },
 
+    /// Stored checksum for an applied migration does not match the current definition.
+    #[error("migration '{migration}' checksum mismatch: expected {expected}, found {actual}")]
+    MigrationChecksumMismatch {
+        migration: String,
+        expected: String,
+        actual: String,
+    },
+
     /// Pending migrations exist that have not been applied.
     #[error("unapplied pending migrations detected: {0:?}")]
     PendingMigrations(Vec<String>),

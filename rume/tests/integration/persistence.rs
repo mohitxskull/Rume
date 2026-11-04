@@ -382,3 +382,76 @@ async fn test_persistence_via_rume_test_harness() {
     let name = harness.query_scalar("SELECT name FROM harness_users WHERE id = 1;").await.unwrap();
     assert_eq!(name, Some("alice".to_string()));
 }
+
+#[tokio::test]
+async fn migration_checksum_mismatch_fails_closed_in_preflight_and_runner() {
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+
+    let initial_migrator = Migrator::new().add_migration(
+        Migration::from_sql(
+            "20261104_001_initial_schema",
+            "Initial schema definition",
+            "CREATE TABLE items (id TEXT PRIMARY KEY, count INTEGER NOT NULL);",
+        )
+        .with_down("DROP TABLE items;"),
+    );
+
+    // Apply valid migration
+    let summary = initial_migrator.run_pending_backend(&backend).await.unwrap();
+    assert_eq!(summary.applied.len(), 1);
+
+    // Preflight check succeeds with matching checksum
+    initial_migrator.verify_no_pending_backend(&backend).await.unwrap();
+
+    // Now tamper with the migration script
+    let tampered_migrator = Migrator::new().add_migration(
+        Migration::from_sql(
+            "20261104_001_initial_schema",
+            "Initial schema definition with tampered DDL",
+            "CREATE TABLE items (id TEXT PRIMARY KEY, count INTEGER NOT NULL, secret_backdoor TEXT);",
+        )
+        .with_down("DROP TABLE items;"),
+    );
+
+    // verify_no_pending_backend must reject the tampered migration
+    let verify_res = tampered_migrator.verify_no_pending_backend(&backend).await;
+    assert!(
+        matches!(
+            verify_res,
+            Err(PersistenceError::MigrationChecksumMismatch { ref migration, ref expected, ref actual })
+            if migration == "20261104_001_initial_schema" && expected != actual
+        ),
+        "verify_no_pending must detect checksum mismatch, got: {verify_res:?}"
+    );
+
+    // run_pending_backend must also refuse to run with tampered applied migration
+    let run_res = tampered_migrator.run_pending_backend(&backend).await;
+    assert!(
+        matches!(
+            run_res,
+            Err(PersistenceError::MigrationChecksumMismatch { ref migration, .. })
+            if migration == "20261104_001_initial_schema"
+        ),
+        "run_pending must detect checksum mismatch, got: {run_res:?}"
+    );
+}
+
+#[tokio::test]
+async fn migrator_with_rume_core_registers_and_applies_core_persistence() {
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+
+    let migrator = Migrator::new()
+        .with_rume_core("sqlite")
+        .add_migration(Migration::from_sql(
+            "20261104_002_custom_app",
+            "Application schema",
+            "CREATE TABLE app_data (key TEXT PRIMARY KEY, val TEXT);",
+        ));
+
+    let summary = migrator.run_pending_backend(&backend).await.unwrap();
+    assert_eq!(summary.applied.len(), 2);
+    assert_eq!(summary.applied[0], rume::persistence::migration::RUME_CORE_MIGRATION_ID);
+    assert_eq!(summary.applied[1], "20261104_002_custom_app");
+
+    migrator.verify_no_pending_backend(&backend).await.unwrap();
+}
