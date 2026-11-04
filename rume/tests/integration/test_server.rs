@@ -231,3 +231,105 @@ async fn test_graceful_shutdown_with_active_in_flight_requests() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "work-completed");
 }
+
+#[tokio::test]
+async fn test_server_lifecycle_retains_modules_until_explicit_shutdown() {
+    use rume::module::{BoxFuture, Module, ModuleContext, ModuleHookResult};
+    use std::sync::Mutex;
+
+    struct LifecycleModule {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Module for LifecycleModule {
+        fn name(&self) -> &str {
+            "lifecycle-test"
+        }
+
+        fn on_start<'a>(&'a self, _ctx: &'a ModuleContext) -> BoxFuture<'a, ModuleHookResult> {
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("start");
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(&'a self, _ctx: &'a ModuleContext) -> BoxFuture<'a, ()> {
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("shutdown");
+            })
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let module = LifecycleModule {
+        events: Arc::clone(&events),
+    };
+
+    let app = Rume::new()
+        .register_module(module)
+        .route("/ping", get(|| async { "pong" }));
+
+    let server = TestServer::from_builder(app).await.expect("start server");
+
+    // 1. Startup hooks executed, shutdown hooks have NOT executed
+    assert_eq!(*events.lock().unwrap(), vec!["start"]);
+
+    // 2. Server handles traffic while module lifecycle is active
+    let resp = server.get("/ping").await.expect("request ping");
+    resp.assert_status(StatusCode::OK).assert_text_equals("pong");
+
+    // Module must still be active and not shut down
+    assert_eq!(*events.lock().unwrap(), vec!["start"]);
+
+    // 3. Explicit graceful shutdown triggers module on_shutdown
+    server.shutdown().await.expect("shutdown completes");
+    assert_eq!(*events.lock().unwrap(), vec!["start", "shutdown"]);
+}
+
+#[tokio::test]
+async fn test_server_lifecycle_drop_triggers_cleanup() {
+    use rume::module::{BoxFuture, Module, ModuleContext, ModuleHookResult};
+    use std::sync::Mutex;
+
+    struct DropLifecycleModule {
+        events: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl Module for DropLifecycleModule {
+        fn name(&self) -> &str {
+            "drop-lifecycle"
+        }
+
+        fn on_start<'a>(&'a self, _ctx: &'a ModuleContext) -> BoxFuture<'a, ModuleHookResult> {
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("start");
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(&'a self, _ctx: &'a ModuleContext) -> BoxFuture<'a, ()> {
+            let events = Arc::clone(&self.events);
+            Box::pin(async move {
+                events.lock().unwrap().push("shutdown");
+            })
+        }
+    }
+
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let module = DropLifecycleModule {
+        events: Arc::clone(&events),
+    };
+
+    let app = Rume::new().register_module(module);
+    let server = TestServer::from_builder(app).await.expect("start server");
+
+    assert_eq!(*events.lock().unwrap(), vec!["start"]);
+
+    // Dropping server without awaiting explicit shutdown still guarantees cleanup execution
+    drop(server);
+
+    assert_eq!(*events.lock().unwrap(), vec!["start", "shutdown"]);
+}

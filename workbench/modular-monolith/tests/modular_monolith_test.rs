@@ -5,32 +5,32 @@ use axum::http::StatusCode;
 use rume::events::EventBus;
 use rume::testing::TestServer;
 use serde_json::json;
-use tokio::sync::RwLock;
-use workbench_modular_monolith::{build_modular_monolith, Order, Product};
+use tokio::sync::{Notify, RwLock};
+use workbench_modular_monolith::{build_modular_monolith_instrumented, Order, Product};
 
 #[tokio::test]
 async fn test_modular_monolith_domain_isolation_and_events() {
     let event_bus = Arc::new(EventBus::new());
     let boot_log = Arc::new(RwLock::new(Vec::new()));
+    let event_completion = Arc::new(Notify::new());
 
-    let builder = build_modular_monolith(Arc::clone(&event_bus), Arc::clone(&boot_log));
+    let builder = build_modular_monolith_instrumented(
+        Arc::clone(&event_bus),
+        Arc::clone(&boot_log),
+        Some(Arc::clone(&event_completion)),
+    );
     let server = TestServer::from_builder(builder)
         .await
         .expect("modular monolith server starts");
 
-    // 1. Verify topological startup and reverse shutdown order:
-    // Catalog must initialize before Orders, and Orders must shut down before Catalog.
+    // 1. Verify topological startup order:
+    // Catalog must initialize before Orders, and shutdown hooks MUST NOT have executed while server is active.
     {
         let logs = boot_log.read().await;
         assert_eq!(
             *logs,
-            vec![
-                "catalog:started",
-                "orders:started",
-                "orders:stopped",
-                "catalog:stopped"
-            ],
-            "startup must be topological (catalog -> orders) and shutdown must be reverse topological (orders -> catalog)"
+            vec!["catalog:started", "orders:started"],
+            "startup must be topological (catalog -> orders) and modules must remain running while server serves traffic"
         );
     }
 
@@ -48,6 +48,7 @@ async fn test_modular_monolith_domain_isolation_and_events() {
         "product_id": "prod_laptop",
         "quantity": 3
     });
+    let notified = event_completion.notified();
     let order_resp = server
         .post_json("/orders", order_payload.to_string())
         .await
@@ -57,8 +58,10 @@ async fn test_modular_monolith_domain_isolation_and_events() {
     assert_eq!(placed_order.product_id, "prod_laptop");
     assert_eq!(placed_order.quantity, 3);
 
-    // Yield a tick for asynchronous event delivery
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // Deterministic synchronization: await event delivery notification from catalog domain
+    tokio::time::timeout(std::time::Duration::from_secs(5), notified)
+        .await
+        .expect("event delivery notification received within 5s");
 
     // 4. Verify catalog domain automatically updated inventory in response to the decoupled event
     let updated_resp = server
@@ -82,8 +85,31 @@ async fn test_modular_monolith_domain_isolation_and_events() {
     assert_eq!(orders.len(), 1);
     assert_eq!(orders[0], placed_order);
 
-    // 6. Graceful shutdown: verify reverse-order termination (orders stops before catalog)
+    // Verify modules are STILL running before shutdown is called
+    {
+        let logs = boot_log.read().await;
+        assert_eq!(
+            *logs,
+            vec!["catalog:started", "orders:started"],
+            "modules must still be running before server shutdown"
+        );
+    }
+
+    // 6. Graceful shutdown: drains TCP connections and triggers reverse-order termination (orders stops before catalog)
     server.shutdown().await.expect("shutdown completes");
 
-    // Rume builder shutdown hooks executed in reverse topological order
+    // Verify reverse topological shutdown hooks executed only after server shutdown
+    {
+        let logs = boot_log.read().await;
+        assert_eq!(
+            *logs,
+            vec![
+                "catalog:started",
+                "orders:started",
+                "orders:stopped",
+                "catalog:stopped"
+            ],
+            "shutdown must be reverse topological (orders -> catalog) and run only upon server shutdown"
+        );
+    }
 }

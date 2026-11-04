@@ -1,7 +1,12 @@
 //! Isolated database and transaction fixtures for test isolation.
 
+#[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
-use crate::persistence::{DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError};
+#[cfg(feature = "sqlite")]
+use crate::persistence::DatabaseConfig;
+#[cfg(any(feature = "sqlite", feature = "postgres"))]
+use crate::persistence::{DatabaseBackend, DatabasePool};
+use crate::persistence::{DatabaseTransaction, PersistenceError};
 
 /// An RAII transaction guard that automatically rolls back the transaction on Drop
 /// unless explicitly committed.

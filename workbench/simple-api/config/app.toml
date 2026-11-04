@@ -1,0 +1,3 @@
+app_name = "simple-api"
+port = 8080
+database_url = "sqlite::memory:"

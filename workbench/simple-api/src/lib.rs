@@ -3,7 +3,9 @@
 //! Proves that Rume stays simple and lightweight for standard REST APIs without
 //! requiring modular monolith ceremony or enterprise infrastructure.
 
-use axum::extract::{Path, State};
+use std::path::Path;
+
+use axum::extract::{Path as AxumPath, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -19,6 +21,12 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub app_name: String,
     pub port: u16,
+    #[serde(default = "default_database_url")]
+    pub database_url: String,
+}
+
+fn default_database_url() -> String {
+    "sqlite::memory:".to_string()
 }
 
 impl Default for AppConfig {
@@ -26,8 +34,14 @@ impl Default for AppConfig {
         Self {
             app_name: "simple-api".into(),
             port: 8080,
+            database_url: default_database_url(),
         }
     }
+}
+
+/// Loads typed application configuration through Rume's configuration system.
+pub fn load_config(root_dir: &Path) -> Result<AppConfig, rume::config::ConfigError> {
+    rume::config::load_in(root_dir)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -108,7 +122,7 @@ async fn create_item(
 
 async fn get_item(
     State(pool): State<DatabasePool<SqliteBackend>>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Item>, StatusCode> {
     let item: Option<Item> = pool
         .fetch_optional_as(
@@ -137,7 +151,7 @@ async fn list_items(
 
 async fn delete_item(
     State(pool): State<DatabasePool<SqliteBackend>>,
-    Path(id): Path<String>,
+    AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, StatusCode> {
     let rows = pool
         .execute_params("DELETE FROM items WHERE id = $1", &rume::params![&id])

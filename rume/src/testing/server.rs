@@ -10,7 +10,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
 use crate::app::builder::{BuildError, RumeBuilder};
-use crate::testing::app::TestResponse;
+use crate::testing::app::{TestApp, TestResponse};
 
 /// A running HTTP server bound to an ephemeral TCP port on `127.0.0.1`.
 ///
@@ -23,6 +23,7 @@ pub struct TestServer {
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<()>>,
     client: reqwest::Client,
+    app: Option<TestApp>,
 }
 
 impl TestServer {
@@ -53,11 +54,25 @@ impl TestServer {
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
             client,
+            app: None,
         })
+    }
+
+    /// Starts a real HTTP server on an ephemeral TCP port (`127.0.0.1:0`) encapsulating
+    /// a [`TestApp`], preserving its lifecycle guard and executing module shutdown hooks
+    /// in reverse topological order only upon server shutdown or drop.
+    pub async fn from_app(app: TestApp) -> Result<Self, std::io::Error> {
+        let mut server = Self::start(app.router().clone()).await?;
+        server.app = Some(app);
+        Ok(server)
     }
 
     /// Builds and starts a real HTTP server from a [`RumeBuilder`], executing module
     /// startup hooks and binding to an ephemeral TCP port.
+    ///
+    /// The application lifecycle guard is preserved for the entire duration of the server;
+    /// module `on_shutdown` hooks execute in reverse topological order only when [`TestServer::shutdown`]
+    /// is awaited or when the server is dropped.
     pub async fn from_builder<E, C, S>(
         builder: RumeBuilder<E, C, S>,
     ) -> Result<Self, BuildError>
@@ -67,10 +82,14 @@ impl TestServer {
         S: Clone + Send + Sync + 'static,
     {
         let app = builder.build_test_app().await?;
-        let router = app.into_router();
-        Self::start(router).await.map_err(|e| {
+        Self::from_app(app).await.map_err(|e| {
             BuildError::Startup(format!("failed to bind test server TCP listener: {e}"))
         })
+    }
+
+    /// Returns a reference to the encapsulated [`TestApp`], if started from an application or builder.
+    pub fn app(&self) -> Option<&TestApp> {
+        self.app.as_ref()
     }
 
     /// Returns the local socket address the server is listening on.
@@ -175,7 +194,8 @@ impl TestServer {
         Ok(TestResponse::new(status, headers, bytes))
     }
 
-    /// Explicitly and gracefully shuts down the server, draining active connections.
+    /// Explicitly and gracefully shuts down the server: stops accepting new connections,
+    /// drains active in-flight requests, and runs application module teardown in reverse topological order.
     pub async fn shutdown(mut self) -> Result<(), std::io::Error> {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
@@ -191,6 +211,9 @@ impl TestServer {
                 })?
                 .map_err(std::io::Error::other)?;
         }
+        if let Some(app) = self.app.take() {
+            app.teardown_async().await;
+        }
         Ok(())
     }
 }
@@ -199,6 +222,9 @@ impl Drop for TestServer {
     fn drop(&mut self) {
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+        }
+        if let Some(app) = self.app.take() {
+            app.teardown();
         }
     }
 }

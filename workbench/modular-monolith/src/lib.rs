@@ -56,6 +56,7 @@ pub struct CatalogState {
 pub struct CatalogModule {
     state: CatalogState,
     event_bus: Arc<EventBus>,
+    event_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 impl CatalogModule {
@@ -86,7 +87,14 @@ impl CatalogModule {
                 boot_log,
             },
             event_bus,
+            event_notify: None,
         }
+    }
+
+    /// Attaches an optional notification trigger signaled when an order event has been processed.
+    pub fn with_event_notify(mut self, notify: Arc<tokio::sync::Notify>) -> Self {
+        self.event_notify = Some(notify);
+        self
     }
 }
 
@@ -103,6 +111,7 @@ impl Module for CatalogModule {
         let boot_log = Arc::clone(&self.state.boot_log);
         let products = Arc::clone(&self.state.products);
         let event_bus = Arc::clone(&self.event_bus);
+        let event_notify = self.event_notify.clone();
 
         Box::pin(async move {
             boot_log.write().await.push("catalog:started".to_string());
@@ -112,10 +121,16 @@ impl Module for CatalogModule {
                 let products_clone = Arc::clone(&products);
                 let pid = event.product_id.clone();
                 let qty = event.quantity;
+                let notify = event_notify.clone();
                 async move {
-                    let mut lock = products_clone.write().await;
-                    if let Some(p) = lock.get_mut(&pid) {
-                        p.stock = p.stock.saturating_sub(qty);
+                    {
+                        let mut lock = products_clone.write().await;
+                        if let Some(p) = lock.get_mut(&pid) {
+                            p.stock = p.stock.saturating_sub(qty);
+                        }
+                    }
+                    if let Some(n) = notify {
+                        n.notify_one();
                     }
                     Ok(())
                 }
@@ -274,7 +289,19 @@ pub fn build_modular_monolith(
     event_bus: Arc<EventBus>,
     boot_log: Arc<RwLock<Vec<String>>>,
 ) -> RumeBuilder<(), (), ()> {
+    build_modular_monolith_instrumented(event_bus, boot_log, None)
+}
+
+pub fn build_modular_monolith_instrumented(
+    event_bus: Arc<EventBus>,
+    boot_log: Arc<RwLock<Vec<String>>>,
+    event_notify: Option<Arc<tokio::sync::Notify>>,
+) -> RumeBuilder<(), (), ()> {
+    let mut catalog = CatalogModule::new(Arc::clone(&event_bus), Arc::clone(&boot_log));
+    if let Some(notify) = event_notify {
+        catalog = catalog.with_event_notify(notify);
+    }
     Rume::new()
-        .register_module(CatalogModule::new(Arc::clone(&event_bus), Arc::clone(&boot_log)))
+        .register_module(catalog)
         .register_module(OrdersModule::new(event_bus, boot_log))
 }

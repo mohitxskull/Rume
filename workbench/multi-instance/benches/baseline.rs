@@ -22,7 +22,7 @@ use axum::Router;
 use rume::app::ObservabilityLayer;
 use rume::events::Event;
 use rume::jobs::postgres::PostgresJobQueue;
-use rume::jobs::{Job, JobQueue, RetryPolicy};
+use rume::jobs::{HeartbeatRegistry, Job, JobQueue, JobRegistry, JobWorker, RetryPolicy};
 use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository};
 use rume::persistence::backend::DatabaseBackend;
 use rume::persistence::pool::DatabasePool;
@@ -34,6 +34,125 @@ use testcontainers_modules::testcontainers::ImageExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
+
+#[derive(Debug, Clone)]
+pub struct BenchmarkEnvironment {
+    pub os: &'static str,
+    pub arch: &'static str,
+    pub logical_cores: usize,
+    pub profile: &'static str,
+    pub postgres_image: &'static str,
+}
+
+impl BenchmarkEnvironment {
+    pub fn current() -> Self {
+        Self {
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+            logical_cores: std::thread::available_parallelism()
+                .map(|p| p.get())
+                .unwrap_or(1),
+            profile: if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            },
+            postgres_image: "postgres:16-alpine",
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct InMemoryHeartbeatRegistry {
+    heartbeats: std::sync::RwLock<std::collections::HashMap<String, Instant>>,
+}
+
+impl HeartbeatRegistry for InMemoryHeartbeatRegistry {
+    fn record_heartbeat(
+        &self,
+        worker_id: &str,
+        ttl: Duration,
+    ) -> rume::module::BoxFuture<'_, Result<(), rume::jobs::JobError>> {
+        let wid = worker_id.to_string();
+        Box::pin(async move {
+            let mut lock = self.heartbeats.write().unwrap();
+            lock.insert(wid, Instant::now() + ttl);
+            Ok(())
+        })
+    }
+
+    fn is_alive(
+        &self,
+        worker_id: &str,
+    ) -> rume::module::BoxFuture<'_, Result<bool, rume::jobs::JobError>> {
+        let wid = worker_id.to_string();
+        Box::pin(async move {
+            let lock = self.heartbeats.read().unwrap();
+            Ok(lock.get(&wid).map(|exp| Instant::now() < *exp).unwrap_or(false))
+        })
+    }
+
+    fn reap_dead_workers(&self) -> rume::module::BoxFuture<'_, Result<Vec<String>, rume::jobs::JobError>> {
+        Box::pin(async move {
+            let mut lock = self.heartbeats.write().unwrap();
+            let now = Instant::now();
+            let mut dead = Vec::new();
+            lock.retain(|id, exp| {
+                if now >= *exp {
+                    dead.push(id.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            Ok(dead)
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkWorkerJob {
+    pub id: String,
+    pub enqueued_at_millis: i64,
+    pub delay_ms: u64,
+}
+
+impl Job for BenchmarkWorkerJob {
+    const NAME: &'static str = "BenchmarkWorkerJob";
+    fn idempotency_key(&self) -> Option<String> {
+        Some(format!("idem-worker-{}", self.id))
+    }
+}
+
+struct BenchmarkWorkerHandler {
+    completed: Arc<AtomicUsize>,
+    samples: Arc<std::sync::Mutex<Vec<Duration>>>,
+}
+
+impl rume::jobs::JobHandler<BenchmarkWorkerJob> for BenchmarkWorkerHandler {
+    fn handle<'a>(
+        &'a self,
+        _ctx: &'a rume::jobs::JobContext,
+        job: BenchmarkWorkerJob,
+    ) -> rume::module::BoxFuture<'a, Result<(), rume::jobs::JobError>> {
+        Box::pin(async move {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0);
+            let latency_ms = (now - job.enqueued_at_millis).max(0) as u64;
+            if job.delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(job.delay_ms)).await;
+            }
+            self.samples
+                .lock()
+                .unwrap()
+                .push(Duration::from_millis(latency_ms));
+            self.completed.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        })
+    }
+}
 
 #[derive(Debug, Clone)]
 #[allow(dead_code)]
@@ -222,6 +341,18 @@ pub async fn run_physical_database_benchmark<B: DatabaseBackend>(
     total_queries: usize,
     concurrency: usize,
 ) -> LatencyStats {
+    // Warm up all pooled physical connections concurrently so that TCP handshake/fork latency does not skew steady-state
+    let mut warmup_handles = Vec::with_capacity(concurrency);
+    for _ in 0..concurrency {
+        let p = pool.clone();
+        warmup_handles.push(tokio::spawn(async move {
+            let _ = p.query_scalar("SELECT 1 AS probe").await;
+        }));
+    }
+    for h in warmup_handles {
+        let _ = h.await;
+    }
+
     let queries_per_worker = total_queries / concurrency;
     let start = Instant::now();
     let mut handles = Vec::with_capacity(concurrency);
@@ -464,16 +595,104 @@ pub async fn run_durable_job_worker_benchmark(
     )
 }
 
+pub async fn run_full_job_worker_benchmark(
+    pg_pool: sqlx::PgPool,
+    queue: Arc<PostgresJobQueue>,
+    job_count: usize,
+    worker_count: usize,
+) -> LatencyStats {
+    let completed_counter = Arc::new(AtomicUsize::new(0));
+    let samples = Arc::new(std::sync::Mutex::new(Vec::with_capacity(job_count)));
+
+    let mut registry = JobRegistry::new();
+    registry.register(BenchmarkWorkerHandler {
+        completed: Arc::clone(&completed_counter),
+        samples: Arc::clone(&samples),
+    });
+    let registry = Arc::new(registry);
+
+    let heartbeat_registry: Arc<dyn HeartbeatRegistry> =
+        Arc::new(InMemoryHeartbeatRegistry::default());
+
+    let mut worker_handles = Vec::with_capacity(worker_count);
+    for idx in 0..worker_count {
+        let worker_id = format!("job-worker-{idx}");
+        let worker = JobWorker::with_concurrency_limit(Arc::clone(&queue), Arc::clone(&registry), 4)
+            .with_worker_id(worker_id)
+            .with_heartbeat(
+                Arc::clone(&heartbeat_registry),
+                Duration::from_secs(30),
+                Duration::from_millis(500),
+            );
+        worker_handles.push(worker.start());
+    }
+
+    let start = Instant::now();
+
+    // Enqueue typed jobs with idempotency keys
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    for i in 0..job_count {
+        queue
+            .enqueue(BenchmarkWorkerJob {
+                id: format!("runtime-job-{i}"),
+                enqueued_at_millis: now,
+                delay_ms: 0,
+            })
+            .await
+            .expect("enqueue runtime job");
+    }
+
+    // Await completion of all jobs with timeout
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while completed_counter.load(Ordering::SeqCst) < job_count && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let elapsed = start.elapsed();
+
+    // Gracefully shutdown all worker instances
+    for handle in worker_handles {
+        let _ = handle.shutdown(Duration::from_secs(5)).await;
+    }
+
+    // Reconcile persisted database state in PostgreSQL
+    let row: (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM rume_jobs WHERE name = 'BenchmarkWorkerJob' AND status = 'completed'",
+    )
+    .fetch_one(&pg_pool)
+    .await
+    .expect("query completed jobs in pg");
+
+    let completed_in_db = row.0 as usize;
+    assert_eq!(
+        completed_in_db, job_count,
+        "persisted completed jobs in database must reconcile exactly with job_count"
+    );
+
+    let mut collected_samples = samples.lock().unwrap().clone();
+    if collected_samples.is_empty() {
+        collected_samples.push(elapsed);
+    }
+    let errors = job_count.saturating_sub(completed_in_db);
+
+    LatencyStats::compute(worker_count, collected_samples, elapsed, errors)
+}
+
 // ------------------------------------------------------------------------------------------------
 // Unified Production Benchmark Runner & Reporting
 // ------------------------------------------------------------------------------------------------
 
 pub struct BenchmarkSuiteResult {
+    pub environment: BenchmarkEnvironment,
     pub concurrency_results: Vec<(usize, LatencyStats, LatencyStats)>,
     pub sqlite_db_stats: LatencyStats,
     pub postgres_db_stats: Option<LatencyStats>,
     pub outbox_stats: LatencyStats,
     pub job_stats: LatencyStats,
+    pub worker_runtime_stats: LatencyStats,
 }
 
 pub async fn run_full_production_suite(
@@ -549,19 +768,25 @@ pub async fn run_full_production_suite(
     let outbox_stats =
         run_competing_outbox_relays_benchmark(Arc::clone(&pg_db_pool), 300, 25, 4).await;
 
-    // 6. Durable Job Worker Benchmark (8 competing workers on PostgresJobQueue)
-    let job_queue = Arc::new(PostgresJobQueue::new(pg_pool));
+    // 6. Durable Job Worker Benchmark (8 competing tasks on PostgresJobQueue)
+    let job_queue = Arc::new(PostgresJobQueue::new(pg_pool.clone()));
     job_queue.init_schema().await.expect("job queue init schema");
-    let job_stats = run_durable_job_worker_benchmark(job_queue, 300, 8).await;
+    let job_stats = run_durable_job_worker_benchmark(Arc::clone(&job_queue), 300, 8).await;
+
+    // 7. Full JobWorker Runtime Benchmark (8 distinct workers, handlers, heartbeats, acks, DB reconciliation)
+    let worker_runtime_stats =
+        run_full_job_worker_benchmark(pg_pool, job_queue, 200, 8).await;
 
     sqlite_fixture.close().await.expect("close sqlite fixture");
 
     BenchmarkSuiteResult {
+        environment: BenchmarkEnvironment::current(),
         concurrency_results,
         sqlite_db_stats,
         postgres_db_stats,
         outbox_stats,
         job_stats,
+        worker_runtime_stats,
     }
 }
 
@@ -578,6 +803,15 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
     println!();
     println!("==========================================================================================================");
     println!("                           RUME PRODUCTION QUALIFICATION BENCHMARK (REL-08)                               ");
+    println!("==========================================================================================================");
+    println!(
+        " Environment: OS={} | Arch={} | Cores={} | Profile={} | Postgres={}",
+        results.environment.os,
+        results.environment.arch,
+        results.environment.logical_cores,
+        results.environment.profile,
+        results.environment.postgres_image
+    );
     println!("==========================================================================================================");
     println!(" 1. REAL TCP HTTP SERVER OVERHEAD ACROSS CONCURRENCY TIERS                                                ");
     println!("----------------------------------------------------------------------------------------------------------");
@@ -671,10 +905,10 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
     );
 
     println!();
-    println!(" 4. DURABLE JOB WORKER CONCURRENT SCHEDULING & ACKNOWLEDGEMENT");
+    println!(" 4. DURABLE JOB QUEUE CONCURRENT CLAIM & ACKNOWLEDGEMENT");
     println!("----------------------------------------------------------------------------------------------------------");
     println!(
-        "  Jobs: {} | Workers: {} | Throughput: {:.0} jobs/sec | Errors: {}",
+        "  Jobs: {} | Tasks: {} | Throughput: {:.0} jobs/sec | Errors: {}",
         results.job_stats.count,
         results.job_stats.concurrency,
         results.job_stats.throughput,
@@ -686,6 +920,24 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
         format_dur(results.job_stats.p95),
         format_dur(results.job_stats.p99),
         format_dur(results.job_stats.mean)
+    );
+
+    println!();
+    println!(" 5. FULL JOBWORKER RUNTIME (8 WORKERS, TYPED HANDLERS, HEARTBEATS, DB RECONCILIATION)");
+    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        "  Jobs: {} | Workers: {} | Throughput: {:.0} jobs/sec | Errors: {}",
+        results.worker_runtime_stats.count,
+        results.worker_runtime_stats.concurrency,
+        results.worker_runtime_stats.throughput,
+        results.worker_runtime_stats.errors
+    );
+    println!(
+        "  Per-Job P50: {}, P95: {}, P99: {}, Mean: {}",
+        format_dur(results.worker_runtime_stats.p50),
+        format_dur(results.worker_runtime_stats.p95),
+        format_dur(results.worker_runtime_stats.p99),
+        format_dur(results.worker_runtime_stats.mean)
     );
 
     println!("==========================================================================================================");

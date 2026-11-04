@@ -7,10 +7,13 @@ use axum::body::Body;
 use axum::http::{Request, Response, StatusCode};
 use tower::ServiceExt;
 
+/// Type alias for an asynchronous or synchronous application teardown hook.
+pub type TeardownHook = Box<dyn FnOnce() + Send>;
+
 /// A lightweight test application backed by an Axum router.
 pub struct TestApp {
     router: Router<()>,
-    cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    cleanup: Mutex<Option<TeardownHook>>,
 }
 
 impl TestApp {
@@ -45,9 +48,20 @@ impl TestApp {
         builder.build_test_app().await
     }
 
+    /// Consumes the test application and decomposes it into its underlying [`Router`] and cleanup teardown guard.
+    ///
+    /// Disarms the default [`Drop`] hook on `self` so that decomposing the test app does not
+    /// trigger immediate synchronous teardown before the caller can start their own server or runner.
+    pub fn into_parts(mut self) -> (Router<()>, Option<TeardownHook>) {
+        let cleanup = self.cleanup.get_mut().ok().and_then(|c| c.take());
+        (self.router.clone(), cleanup)
+    }
+
     /// Consumes the test application and returns its underlying Axum [`Router`].
+    ///
+    /// Teardown is disarmed so that dropping `self` does not execute premature shutdown hooks.
     pub fn into_router(self) -> Router<()> {
-        self.router.clone()
+        self.into_parts().0
     }
 
     /// Returns a reference to the underlying Axum [`Router`].

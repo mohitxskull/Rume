@@ -180,50 +180,40 @@ async fn handle_outbox(action: &str, args: &[String]) -> Result<(), Box<dyn std:
 
 async fn handle_leader(action: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let redis_url = get_arg(args, "--redis-url").expect("--redis-url required");
-    let client = redis::Client::open(redis_url.clone())?;
-    let mut conn = client.get_multiplexed_async_connection().await?;
-    let key = get_arg(args, "--key").unwrap_or_else(|| "test:crash:leader".into());
+    let backend = rume::cache::redis::RedisCacheBackend::new(&redis_url)?;
+    let role = get_arg(args, "--role").unwrap_or_else(|| "crash-cluster".into());
+    let prefix = get_arg(args, "--prefix").unwrap_or_else(|| "test:crash:leader:".into());
     let identity = get_arg(args, "--identity").unwrap_or_else(|| "leader-process-a".into());
     let ttl_ms: u64 = get_arg(args, "--ttl-ms").unwrap_or_else(|| "500".into()).parse()?;
+    let ttl = Duration::from_millis(ttl_ms);
+
+    let elector = rume::coordination::RedisLeaderElector::new(backend.pool().clone())
+        .with_prefix(prefix);
 
     match action {
         "acquire-and-hold" => {
-            let acquired: bool = redis::cmd("SET")
-                .arg(&key)
-                .arg(&identity)
-                .arg("NX")
-                .arg("PX")
-                .arg(ttl_ms)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(false);
-
-            if acquired {
-                println!("LEADER_ACQUIRED:{}", identity);
-                std::io::stdout().flush()?;
-                tokio::time::sleep(Duration::from_secs(300)).await;
-            } else {
-                eprintln!("Failed to acquire leader lock");
-                std::process::exit(2);
+            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl).await? {
+                Some(lease) => {
+                    println!("LEADER_ACQUIRED:{}:{}", lease.candidate_id, lease.term);
+                    std::io::stdout().flush()?;
+                    tokio::time::sleep(Duration::from_secs(300)).await;
+                }
+                None => {
+                    eprintln!("Failed to acquire leader lease: lock held");
+                    std::process::exit(2);
+                }
             }
         }
         "takeover" => {
-            let acquired: bool = redis::cmd("SET")
-                .arg(&key)
-                .arg(&identity)
-                .arg("NX")
-                .arg("PX")
-                .arg(ttl_ms)
-                .query_async(&mut conn)
-                .await
-                .unwrap_or(false);
-
-            if acquired {
-                println!("TAKEOVER_SUCCESS:{}", identity);
-                std::io::stdout().flush()?;
-            } else {
-                eprintln!("Takeover failed; lock still held");
-                std::process::exit(3);
+            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl).await? {
+                Some(lease) => {
+                    println!("TAKEOVER_SUCCESS:{}:{}", lease.candidate_id, lease.term);
+                    std::io::stdout().flush()?;
+                }
+                None => {
+                    eprintln!("Takeover failed; leader lease still active or lock held");
+                    std::process::exit(3);
+                }
             }
         }
         other => {

@@ -5,11 +5,13 @@ pub mod events;
 pub mod fixtures;
 pub mod harness;
 pub mod jobs;
+#[cfg(feature = "testing")]
 pub mod server;
 
 pub use app::{TestApp, TestAppBuilder, TestResponse, status};
 pub use events::TestEventBus;
 pub use fixtures::TestTransactionFixture;
+#[cfg(feature = "testing")]
 pub use server::TestServer;
 #[cfg(feature = "postgres")]
 pub use fixtures::PostgresSchemaFixture;

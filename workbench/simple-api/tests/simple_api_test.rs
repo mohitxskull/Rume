@@ -10,6 +10,12 @@ use workbench_simple_api::{build_app, migrator, Item};
 
 #[tokio::test]
 async fn test_simple_api_lifecycle_validation_and_crud() {
+    // 0. Verify Rume configuration system loads typed AppConfig from config/app.toml
+    let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let app_cfg = workbench_simple_api::load_config(&manifest_dir).expect("load config from config/app.toml");
+    assert_eq!(app_cfg.app_name, "simple-api");
+    assert_eq!(app_cfg.port, 8080);
+
     let backend = SqliteBackend::in_memory()
         .await
         .expect("in-memory sqlite connects");
