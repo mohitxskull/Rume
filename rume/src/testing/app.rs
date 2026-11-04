@@ -225,6 +225,15 @@ pub struct TestResponse {
 }
 
 impl TestResponse {
+    /// Creates a new `TestResponse` from raw parts.
+    pub fn new(status: StatusCode, headers: axum::http::HeaderMap, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            headers,
+            body,
+        }
+    }
+
     /// Creates a `TestResponse` by consuming an Axum HTTP `Response<Body>`.
     pub async fn from_response(response: Response<Body>) -> Self {
         let (parts, body) = response.into_parts();

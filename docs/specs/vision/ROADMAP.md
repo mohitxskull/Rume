@@ -177,8 +177,8 @@ This phase proves that Rume is genuinely easier to build and operate with—not 
 | **STAB-08** | Phase 6.3 First-Class SQL Assets & Database Developer Experience | Build-time SQL discovery and compile-time embedding macro (`rume::sql_assets!`) exposing typed `SqlQuery<'static>` constants; driver-independent generic row extraction (`DbRow`, `FromRow`, `FromDbValue`) and query execution (`fetch_all_as`, `fetch_optional_as`, `fetch_one_as`) across Postgres, MySQL, and SQLite without leaking `sqlx::Row`; convention-based compile-time migration discovery and pairing macro (`rume::embed_migrations!`); database and migration CLI commands (`rume make:migration`, `rume db:status`, `rume db:migrate`, `rume db:rollback`); and refactoring of Workbench repositories to eliminate direct driver dependencies. | **Completed** |
 
 **Verification Suites:**
-- [`workbench/tests/workbench_test.rs`](../../../workbench/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, persisted auth, negative tenant authorization tests, transaction-enlisted outbox, worker processing, signal-based graceful shutdown drain, and SQL injection / Unicode immunity).
-- [`workbench/tests/deployment_validation.rs`](../../../workbench/tests/deployment_validation.rs) (Multi-instance concurrency across tenants with independent connection pools, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
+- [`workbench/multi-instance/tests/workbench_test.rs`](../../../workbench/multi-instance/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, persisted auth, negative tenant authorization tests, transaction-enlisted outbox, worker processing, signal-based graceful shutdown drain, and SQL injection / Unicode immunity).
+- [`workbench/multi-instance/tests/deployment_validation.rs`](../../../workbench/multi-instance/tests/deployment_validation.rs) (Multi-instance concurrency across tenants with independent connection pools, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
 - [`rume/tests/integration/persistence.rs`](../../../rume/tests/integration/persistence.rs) (Preflight and runner checksum mismatch verification, core persistence schema registration via `with_rume_core`, and generic query asset execution via `SqlQuery` and `FromRow`).
 - [`rume-cli/tests/generated_project.rs`](../../../rume-cli/tests/generated_project.rs) (CLI workflow test for `make:migration`, `db:status`, `db:migrate`, and `db:rollback`).
 
@@ -195,15 +195,21 @@ With runtime durability, multi-tenant isolation, safe transactions, and first-cl
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
-| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Completed** |
+| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, physical connection pooling across SQLite and PostgreSQL, competing outbox relay throughput under high concurrency via `SKIP LOCKED`, and durable worker task scheduling with 0.0% error rate SLA enforcement. | **Completed** |
 | **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **Completed** |
-| **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export, and zero-downtime rolling upgrades. | **P1** |
+| **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export (bring-your-own-subscriber model), and zero-downtime rolling upgrades. | **P1** |
 | **REL-11** | Crate Publishing & Semantic Versioning Audit | Final audit of crate dependencies, API surface documentation, `#![forbid(unsafe_code)]` verification across all workspace crates, and v0.1.0 release packaging. | **P1** |
 
 **Verification Suites:**
-- [`workbench/benches/baseline.rs`](../../../workbench/benches/baseline.rs) (Real TCP network benchmark across concurrency levels [1, 8, 32, 64, 128], physical connection checkout & query execution, outbox relay throughput, and worker task scheduling).
-- [`workbench/tests/performance_baseline.rs`](../../../workbench/tests/performance_baseline.rs) (Automated CI performance qualification and SLA budget assertion).
+- [`workbench/multi-instance/benches/baseline.rs`](../../../workbench/multi-instance/benches/baseline.rs) (Real TCP network benchmark across concurrency levels [1, 8, 32, 64, 128], physical connection checkout & query execution, competing outbox relay throughput, and durable worker task scheduling).
+- [`workbench/multi-instance/tests/performance_baseline.rs`](../../../workbench/multi-instance/tests/performance_baseline.rs) (Automated performance qualification and hard SLA budget assertion with 0.0% error rate).
+- [`rume/tests/containers/crash_recovery.rs`](../../../rume/tests/containers/crash_recovery.rs) (Subprocess crash recovery harness exercising `SIGKILL` / `child.kill()` failure injection during worker execution, business transaction outbox commit, and distributed leader takeover).
+- [`rume/tests/integration/test_server.rs`](../../../rume/tests/integration/test_server.rs) (TCP `TestServer` suite verifying connection keep-alive, chunked streaming, 2MB body handling, raw client drop disconnects, and graceful shutdown with active requests).
 - [`rume-cli/tests/scaffold_template.rs`](../../../rume-cli/tests/scaffold_template.rs) (Scaffolding template verification with SQL assets, repository patterns, and embed migrations).
+- Reference Application Scenarios:
+  - [`workbench/simple-api`](../../../workbench/simple-api) (Minimal single-binary REST API with routing, validation, config, and SQLite persistence).
+  - [`workbench/modular-monolith`](../../../workbench/modular-monolith) (Modular monolith with `catalog` and `orders` domain modules, inter-module events, and topological lifecycle startup/shutdown).
+  - [`workbench/multi-instance`](../../../workbench/multi-instance) (Full multi-tenant issue-tracking enterprise SaaS application with PostgreSQL transactions, transactional outbox, durable jobs, and Redis deduplication).
 
 ---
 

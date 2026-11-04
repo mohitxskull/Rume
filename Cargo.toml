@@ -4,7 +4,9 @@ members = [
     "rume",
     "rume-cli",
     "rume-macros",
-    "workbench",
+    "workbench/simple-api",
+    "workbench/modular-monolith",
+    "workbench/multi-instance",
 ]
 exclude = [
     "lab",

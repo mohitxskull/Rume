@@ -4,9 +4,8 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use axum::body::Body;
-use axum::http::{HeaderName, HeaderValue, Method, Request, Response, StatusCode};
+use axum::http::{Request, StatusCode};
 use axum::Router;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -18,11 +17,12 @@ use crate::testing::app::TestResponse;
 /// Unlike [`super::app::TestApp`], which routes in-memory requests via Tower's
 /// `oneshot()` interface, `TestServer` runs a live TCP socket accept loop using
 /// `axum::serve`, exercising real socket I/O, keep-alive connections, streaming,
-/// and graceful shutdown.
+/// chunked responses, and graceful shutdown.
 pub struct TestServer {
     addr: SocketAddr,
     shutdown_tx: Option<oneshot::Sender<()>>,
     server_task: Option<tokio::task::JoinHandle<()>>,
+    client: reqwest::Client,
 }
 
 impl TestServer {
@@ -41,10 +41,18 @@ impl TestServer {
                 .await;
         });
 
+        let client = reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(30))
+            .pool_max_idle_per_host(10)
+            .tcp_nodelay(true)
+            .build()
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+
         Ok(Self {
             addr,
             shutdown_tx: Some(shutdown_tx),
             server_task: Some(server_task),
+            client,
         })
     }
 
@@ -80,14 +88,28 @@ impl TestServer {
         format!("http://{}{}", self.addr, path)
     }
 
+    /// Returns a reference to the shared, connection-pooled HTTP [`reqwest::Client`].
+    pub fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    /// Connects a raw, unbuffered [`TcpStream`] to the server for low-level protocol tests.
+    pub async fn connect_raw(&self) -> Result<TcpStream, std::io::Error> {
+        let stream = TcpStream::connect(self.addr).await?;
+        stream.set_nodelay(true)?;
+        Ok(stream)
+    }
+
     /// Issues a real GET request over TCP, returning a fluent [`TestResponse`].
     pub async fn get(&self, path: &str) -> Result<TestResponse, std::io::Error> {
-        let req = Request::builder()
-            .method(Method::GET)
-            .uri(path)
-            .body(Body::empty())
+        let url = self.url(path);
+        let resp = self
+            .client
+            .get(&url)
+            .send()
+            .await
             .map_err(std::io::Error::other)?;
-        self.request(req).await
+        Self::from_reqwest_response(resp).await
     }
 
     /// Issues a real POST request with a JSON body over TCP, returning a fluent [`TestResponse`].
@@ -96,71 +118,61 @@ impl TestServer {
         path: &str,
         body: impl Into<String>,
     ) -> Result<TestResponse, std::io::Error> {
-        let body_str = body.into();
-        let req = Request::builder()
-            .method(Method::POST)
-            .uri(path)
+        let url = self.url(path);
+        let resp = self
+            .client
+            .post(&url)
             .header("content-type", "application/json")
-            .body(Body::from(body_str))
-            .map_err(std::io::Error::other)?;
-        self.request(req).await
-    }
-
-    /// Issues an arbitrary HTTP request over a live TCP connection and parses the response.
-    pub async fn request(&self, req: Request<Body>) -> Result<TestResponse, std::io::Error> {
-        let (parts, body) = req.into_parts();
-        use axum::body::to_bytes;
-        let body_bytes = to_bytes(body, 16 * 1024 * 1024)
+            .body(body.into())
+            .send()
             .await
             .map_err(std::io::Error::other)?;
+        Self::from_reqwest_response(resp).await
+    }
 
-        let mut stream = TcpStream::connect(self.addr).await?;
-        stream.set_nodelay(true)?;
-
-        let path_and_query = parts
+    /// Issues an arbitrary HTTP request using the keep-alive connection pool and parses the response.
+    pub async fn request(&self, req: Request<Body>) -> Result<TestResponse, std::io::Error> {
+        let (parts, body) = req.into_parts();
+        let path = parts
             .uri
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
+        let url = self.url(path);
 
-        let mut request_bytes = Vec::with_capacity(256 + body_bytes.len());
-        request_bytes.extend_from_slice(
-            format!("{} {} HTTP/1.1\r\n", parts.method.as_str(), path_and_query).as_bytes(),
-        );
-        request_bytes.extend_from_slice(format!("Host: {}\r\n", self.addr).as_bytes());
-        request_bytes.extend_from_slice(b"Connection: close\r\n");
+        let body_bytes = axum::body::to_bytes(body, 64 * 1024 * 1024)
+            .await
+            .map_err(std::io::Error::other)?;
 
-        if !parts.headers.contains_key("content-length") && !body_bytes.is_empty() {
-            request_bytes.extend_from_slice(
-                format!("Content-Length: {}\r\n", body_bytes.len()).as_bytes(),
-            );
-        }
-
+        let mut builder = self.client.request(parts.method, &url);
         for (name, val) in parts.headers.iter() {
-            request_bytes.extend_from_slice(name.as_str().as_bytes());
-            request_bytes.extend_from_slice(b": ");
-            request_bytes.extend_from_slice(val.as_bytes());
-            request_bytes.extend_from_slice(b"\r\n");
+            builder = builder.header(name, val);
         }
-        request_bytes.extend_from_slice(b"\r\n");
-        request_bytes.extend_from_slice(&body_bytes);
+        if !body_bytes.is_empty() {
+            builder = builder.body(body_bytes);
+        }
 
-        stream.write_all(&request_bytes).await?;
-        stream.flush().await?;
+        let resp = builder.send().await.map_err(std::io::Error::other)?;
+        Self::from_reqwest_response(resp).await
+    }
 
-        // Read raw HTTP response until EOF
-        let mut raw_response = Vec::new();
-        let mut chunk = [0u8; 4096];
-        loop {
-            let n = stream.read(&mut chunk).await?;
-            if n == 0 {
-                break;
+    /// Converts a [`reqwest::Response`] into a fluent [`TestResponse`].
+    pub async fn from_reqwest_response(resp: reqwest::Response) -> Result<TestResponse, std::io::Error> {
+        let status = StatusCode::from_u16(resp.status().as_u16())
+            .map_err(|e| std::io::Error::other(format!("invalid status code: {e}")))?;
+
+        let mut headers = axum::http::HeaderMap::new();
+        for (name, val) in resp.headers().iter() {
+            if let (Ok(hname), Ok(hval)) = (
+                axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
+                axum::http::HeaderValue::from_bytes(val.as_bytes()),
+            ) {
+                headers.insert(hname, hval);
             }
-            raw_response.extend_from_slice(&chunk[..n]);
         }
 
-        let resp = parse_raw_http_response(&raw_response)?;
-        Ok(TestResponse::from_response(resp).await)
+        let bytes = resp.bytes().await.map_err(std::io::Error::other)?.to_vec();
+        Ok(TestResponse::new(status, headers, bytes))
     }
 
     /// Explicitly and gracefully shuts down the server, draining active connections.
@@ -191,46 +203,6 @@ impl Drop for TestServer {
     }
 }
 
-fn parse_raw_http_response(raw: &[u8]) -> Result<Response<Body>, std::io::Error> {
-    let boundary = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or_else(|| std::io::Error::other("incomplete HTTP response headers from test server"))?;
-    let header_bytes = &raw[..boundary];
-    let body_bytes = &raw[boundary + 4..];
-
-    let header_str = std::str::from_utf8(header_bytes).map_err(std::io::Error::other)?;
-    let mut lines = header_str.split("\r\n");
-    let status_line = lines
-        .next()
-        .ok_or_else(|| std::io::Error::other("empty response status line"))?;
-
-    let parts: Vec<&str> = status_line.splitn(3, ' ').collect();
-    if parts.len() < 2 {
-        return Err(std::io::Error::other("malformed status line"));
-    }
-    let code: u16 = parts[1].parse().map_err(std::io::Error::other)?;
-    let status = StatusCode::from_u16(code).map_err(std::io::Error::other)?;
-
-    let mut response = Response::builder().status(status);
-    for line in lines {
-        if let Some((k, v)) = line.split_once(':') {
-            let key = k.trim();
-            let val = v.trim();
-            if let (Ok(h_key), Ok(h_val)) = (
-                HeaderName::from_bytes(key.as_bytes()),
-                HeaderValue::from_str(val),
-            ) {
-                response = response.header(h_key, h_val);
-            }
-        }
-    }
-
-    response
-        .body(Body::from(body_bytes.to_vec()))
-        .map_err(std::io::Error::other)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -238,53 +210,63 @@ mod tests {
     use axum::Json;
     use serde::{Deserialize, Serialize};
 
-    #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
-    struct EchoMessage {
+    #[derive(Serialize, Deserialize)]
+    struct EchoRequest {
         message: String,
+    }
+
+    #[derive(Serialize, Deserialize, PartialEq, Eq, Debug)]
+    struct EchoResponse {
+        echo: String,
     }
 
     #[tokio::test]
     async fn test_server_ephemeral_tcp_lifecycle_and_requests() {
         let router = Router::new()
-            .route("/ping", get(|| async { "pong" }))
             .route(
-                "/echo",
-                post(|Json(payload): Json<EchoMessage>| async move {
-                    Json(EchoMessage {
-                        message: format!("echo: {}", payload.message),
+                "/health",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [("x-service-status", "healthy")],
+                        "all-systems-operational",
+                    )
+                }),
+            )
+            .route(
+                "/api/echo",
+                post(|Json(req): Json<EchoRequest>| async move {
+                    Json(EchoResponse {
+                        echo: req.message,
                     })
                 }),
             );
 
-        let server = TestServer::start(router).await.expect("start test server");
-        assert!(server.local_addr().port() > 0);
-        assert_eq!(
-            server.url("/ping"),
-            format!("http://{}/ping", server.local_addr())
-        );
-
-        // GET request over real TCP
-        let resp = server.get("/ping").await.expect("get request succeeds");
-        resp.assert_status(StatusCode::OK)
-            .assert_text_equals("pong");
-
-        // POST request over real TCP
-        let post_resp = server
-            .post_json("/echo", r#"{"message":"hello world"}"#)
+        let server = TestServer::start(router)
             .await
-            .expect("post request succeeds")
-            .assert_status(StatusCode::OK)
-            .assert_header("content-type", "application/json");
+            .expect("server must start on ephemeral port");
 
-        let echo: EchoMessage = post_resp.json();
+        assert!(server.local_addr().port() > 0);
+
+        let health_resp = server.get("/health").await.expect("GET request succeeds");
+        health_resp
+            .assert_status(StatusCode::OK)
+            .assert_header("x-service-status", "healthy")
+            .assert_text_equals("all-systems-operational");
+
+        let echo_resp = server
+            .post_json("/api/echo", r#"{"message":"hello over real tcp"}"#)
+            .await
+            .expect("POST request succeeds")
+            .assert_status(StatusCode::OK);
+        let echo_body: EchoResponse = echo_resp.json();
         assert_eq!(
-            echo,
-            EchoMessage {
-                message: "echo: hello world".to_string()
+            echo_body,
+            EchoResponse {
+                echo: "hello over real tcp".to_string(),
             }
         );
 
-        // Explicit shutdown
-        server.shutdown().await.expect("shutdown test server");
+        server.shutdown().await.expect("graceful shutdown succeeds");
     }
 }

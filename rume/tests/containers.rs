@@ -32,3 +32,7 @@ pub mod job_reliability;
 #[path = "containers/pipeline.rs"]
 #[cfg(feature = "postgres")]
 pub mod pipeline;
+
+#[path = "containers/crash_recovery.rs"]
+#[cfg(all(feature = "postgres", feature = "redis"))]
+pub mod crash_recovery;

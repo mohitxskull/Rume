@@ -22,10 +22,24 @@ use axum::http::request::Parts;
 use axum::response::Response;
 use serde::{Deserialize, Serialize};
 
-/// Non-panicking initializer for the global tracing subscriber.
+/// Non-panicking initializer for the default global tracing subscriber.
 ///
 /// Returns `Ok(())` on successful initialization, or `Err(err)` if a global subscriber
 /// has already been set.
+///
+/// # Observability Contract & OpenTelemetry Integration
+///
+/// Rume's built-in subscriber provides out-of-the-box development and operational console
+/// logging with environment-based filtering (`RUST_LOG`).
+///
+/// For production OpenTelemetry (OTLP) export, Rume intentionally decouples from specific
+/// OTLP exporter versions, gRPC transports, or protobuf bindings. All Rume middleware,
+/// background event buses, durable outbox relays, and job workers emit standard `tracing` spans
+/// carrying W3C TraceContext headers (`traceparent` and `tracestate`).
+///
+/// Applications requiring OTLP telemetry can configure a custom `tracing-subscriber::layer`
+/// combining `tracing_opentelemetry::OpenTelemetryLayer` prior to booting Rume. Rume's internal
+/// calls to `init_tracing()` safely yield if an application-provided subscriber is already registered.
 pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
