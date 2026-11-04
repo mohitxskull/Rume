@@ -57,19 +57,27 @@ struct SqlFileItem {
     logical_name: String,
 }
 
-fn walk_sql_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        let mut entries: Vec<_> = entries.filter_map(Result::ok).collect();
-        entries.sort_by_key(|e| e.path());
-        for entry in entries {
-            let path = entry.path();
-            if path.is_dir() {
-                walk_sql_files(&path, out);
-            } else if path.is_file() && path.extension().is_some_and(|ext| ext == "sql") {
-                out.push(path);
-            }
+fn walk_sql_files(dir: &Path, span: proc_macro2::Span, out: &mut Vec<PathBuf>) -> Result<(), syn::Error> {
+    let entries = fs::read_dir(dir).map_err(|e| {
+        syn::Error::new(span, format!("sql_assets!: failed to read directory {dir:?}: {e}"))
+    })?;
+    let mut sorted_entries = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|e| {
+            syn::Error::new(span, format!("sql_assets!: failed to read directory entry in {dir:?}: {e}"))
+        })?;
+        sorted_entries.push(entry);
+    }
+    sorted_entries.sort_by_key(|e| e.path());
+    for entry in sorted_entries {
+        let path = entry.path();
+        if path.is_dir() {
+            walk_sql_files(&path, span, out)?;
+        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "sql") {
+            out.push(path);
         }
     }
+    Ok(())
 }
 
 fn sanitize_ident(name: &str) -> String {
@@ -116,7 +124,9 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
     }
 
     let mut sql_paths = Vec::new();
-    walk_sql_files(&full_sql_dir, &mut sql_paths);
+    if let Err(err) = walk_sql_files(&full_sql_dir, args.dir_path.span(), &mut sql_paths) {
+        return err.to_compile_error().into();
+    }
 
     let mut items = Vec::new();
     for path in sql_paths {
@@ -168,6 +178,24 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
                 query_ident,
                 logical_name,
             });
+        }
+    }
+
+    // Check for collision within the same dialect and namespace
+    let mut seen_in_ns: BTreeSet<(Option<String>, String, String)> = BTreeSet::new();
+    for item in &items {
+        let key = (item.dialect.clone(), item.namespace.clone(), item.query_ident.clone());
+        if !seen_in_ns.insert(key) {
+            let dialect_label = item.dialect.as_deref().unwrap_or("common");
+            return syn::Error::new(
+                args.dir_path.span(),
+                format!(
+                    "sql_assets!: duplicate query identifier '{}' in dialect '{}', namespace '{}' (file: {})",
+                    item.query_ident, dialect_label, item.namespace, item.relative_path
+                ),
+            )
+            .to_compile_error()
+            .into();
         }
     }
 
@@ -300,21 +328,42 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
     let mut up_files: BTreeMap<String, String> = BTreeMap::new();
     let mut down_files: BTreeSet<String> = BTreeSet::new();
 
-    if let Ok(entries) = fs::read_dir(&full_dir) {
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
+    let entries = match fs::read_dir(&full_dir) {
+        Ok(e) => e,
+        Err(err) => {
+            return syn::Error::new(
+                dir_lit.span(),
+                format!("embed_migrations!: failed to read directory {:?}: {err}", full_dir),
+            )
+            .to_compile_error()
+            .into();
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(err) => {
+                return syn::Error::new(
+                    dir_lit.span(),
+                    format!("embed_migrations!: failed to read entry in {:?}: {err}", full_dir),
+                )
+                .to_compile_error()
+                .into();
             }
-            let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if let Some(id) = file_name.strip_suffix(".up.sql") {
-                let rel_path = format!("{}/{}", dir_rel.replace('\\', "/"), file_name);
-                up_files.insert(id.to_string(), rel_path);
-            } else if let Some(id) = file_name.strip_suffix(".down.sql") {
-                down_files.insert(id.to_string());
-            }
+        };
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if let Some(id) = file_name.strip_suffix(".up.sql") {
+            let rel_path = format!("{}/{}", dir_rel.replace('\\', "/"), file_name);
+            up_files.insert(id.to_string(), rel_path);
+        } else if let Some(id) = file_name.strip_suffix(".down.sql") {
+            down_files.insert(id.to_string());
         }
     }
 
