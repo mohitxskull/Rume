@@ -10,7 +10,9 @@ use crate::jobs::job::{BoxFuture, Job, QueuedJob};
 pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Enqueues a typed job for immediate execution.
     fn enqueue<J: Job>(&self, job: J) -> BoxFuture<'_, Result<String, JobError>> {
-        let trace = job.trace_context();
+        let trace = job
+            .trace_context()
+            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, Duration::ZERO, trace)
     }
 
@@ -20,7 +22,9 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         job: J,
         delay: Duration,
     ) -> BoxFuture<'_, Result<String, JobError>> {
-        let trace = job.trace_context();
+        let trace = job
+            .trace_context()
+            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 

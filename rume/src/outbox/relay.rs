@@ -284,19 +284,35 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 (self.dispatcher)(&message, cancel_signal)
             }));
 
+            let tc = message
+                .trace_context
+                .as_deref()
+                .and_then(|s| {
+                    if crate::app::TraceContext::is_valid_traceparent(s) {
+                        Some(crate::app::TraceContext::from_traceparent(s).new_child())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(crate::app::TraceContext::generate);
+
             let span = tracing::info_span!(
                 "outbox.dispatch",
                 message.id = %message.id,
                 message.event_type = %message.event_type,
-                traceparent = message.trace_context.as_deref().unwrap_or("")
+                traceparent = %tc.traceparent,
             );
             use tracing::Instrument;
 
+            let scope_tc = Some(tc);
             let dispatch_result = match fut_result {
-                Ok(fut) => match std::panic::AssertUnwindSafe(fut.instrument(span)).catch_unwind().await {
-                    Ok(res) => res,
-                    Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
-                },
+                Ok(fut) => {
+                    let scoped_fut = crate::app::CURRENT_TRACE_CONTEXT.scope(scope_tc, fut);
+                    match std::panic::AssertUnwindSafe(scoped_fut.instrument(span)).catch_unwind().await {
+                        Ok(res) => res,
+                        Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
+                    }
+                }
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
             };
 

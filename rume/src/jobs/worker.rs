@@ -88,28 +88,42 @@ impl JobRegistry {
             trace_context: job.trace_context.clone(),
         };
 
+        let tc = job
+            .trace_context
+            .as_deref()
+            .and_then(|s| {
+                if crate::app::TraceContext::is_valid_traceparent(s) {
+                    Some(crate::app::TraceContext::from_traceparent(s).new_child())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(crate::app::TraceContext::generate);
+
         let span = tracing::info_span!(
             "job.dispatch",
             job.id = %job.id,
             job.name = %job.name,
             job.attempt = job.attempt,
-            traceparent = job.trace_context.as_deref().unwrap_or(""),
+            traceparent = %tc.traceparent,
         );
         use tracing::Instrument;
 
-        async move {
-            let fut = handler(&ctx, &job.payload);
-            if let Some(timeout) = job.timeout {
-                match tokio::time::timeout(timeout, fut).await {
-                    Ok(res) => res,
-                    Err(_) => Err(JobError::Timeout),
+        let scope_tc = Some(tc);
+        crate::app::CURRENT_TRACE_CONTEXT
+            .scope(scope_tc, async move {
+                let fut = handler(&ctx, &job.payload);
+                if let Some(timeout) = job.timeout {
+                    match tokio::time::timeout(timeout, fut).await {
+                        Ok(res) => res,
+                        Err(_) => Err(JobError::Timeout),
+                    }
+                } else {
+                    fut.await
                 }
-            } else {
-                fut.await
-            }
-        }
-        .instrument(span)
-        .await
+            })
+            .instrument(span)
+            .await
     }
 }
 

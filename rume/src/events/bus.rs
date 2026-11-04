@@ -138,23 +138,32 @@ impl EventBus {
         let count = listeners.len();
         if count > 0 {
             let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
-            let span = tracing::info_span!("event.publish_async", event.type = E::TYPE);
+            let current_tc = crate::app::TraceContext::current();
+            let span = tracing::info_span!(
+                "event.publish_async",
+                event.type = E::TYPE,
+                traceparent = current_tc.as_ref().map(|tc| tc.traceparent.as_str()).unwrap_or(""),
+            );
             tokio::spawn(
-                async move {
-                    for listener in listeners {
-                        let fut = listener(Arc::clone(&event_arc));
-                        match AssertUnwindSafe(fut).catch_unwind().await {
-                            Ok(Ok(())) => {}
-                            Ok(Err(err)) => {
-                                tracing::error!("async event listener returned error: {err}");
+                crate::app::CURRENT_TRACE_CONTEXT
+                    .scope(
+                        current_tc,
+                        async move {
+                            for listener in listeners {
+                                let fut = listener(Arc::clone(&event_arc));
+                                match AssertUnwindSafe(fut).catch_unwind().await {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(err)) => {
+                                        tracing::error!("async event listener returned error: {err}");
+                                    }
+                                    Err(panic_payload) => {
+                                        tracing::error!("async event listener panicked: {panic_payload:?}");
+                                    }
+                                }
                             }
-                            Err(panic_payload) => {
-                                tracing::error!("async event listener panicked: {panic_payload:?}");
-                            }
-                        }
-                    }
-                }
-                .instrument(span),
+                        },
+                    )
+                    .instrument(span),
             );
         }
 

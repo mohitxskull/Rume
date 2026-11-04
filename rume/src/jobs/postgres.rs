@@ -84,7 +84,9 @@ impl JobQueue for PostgresJobQueue {
         job: J,
         delay: Duration,
     ) -> BoxFuture<'_, Result<String, JobError>> {
-        let trace = job.trace_context();
+        let trace = job
+            .trace_context()
+            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 

@@ -70,7 +70,7 @@ impl OutboxMessage {
             next_retry_at: None,
             lease_token: None,
             lease_expires_at: None,
-            trace_context: None,
+            trace_context: crate::app::TraceContext::current().map(|tc| tc.to_string()),
         }
     }
 
@@ -99,7 +99,7 @@ impl OutboxMessage {
             next_retry_at: None,
             lease_token: None,
             lease_expires_at: None,
-            trace_context: None,
+            trace_context: crate::app::TraceContext::current().map(|tc| tc.to_string()),
         })
     }
 

@@ -359,3 +359,162 @@ async fn tracing_context_preserved_across_async_yields() {
         handle.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_and_worker() {
+    use rume::app::TraceContext;
+    use rume::jobs::{Job, JobHandler, JobQueue, JobRegistry, QueuedJob};
+    use rume::outbox::OutboxMessage;
+    use rume::testing::jobs::TestJobQueue;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Arc;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TraceJob {
+        data: String,
+    }
+
+    impl Job for TraceJob {
+        const NAME: &'static str = "test.trace_job";
+    }
+
+    struct TraceJobHandler {
+        received_trace_id: Arc<tokio::sync::Mutex<Option<String>>>,
+        received_span_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    }
+
+    impl JobHandler<TraceJob> for TraceJobHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a rume::jobs::JobContext,
+            _job: TraceJob,
+        ) -> rume::jobs::BoxFuture<'a, Result<(), rume::jobs::JobError>> {
+            Box::pin(async move {
+                if let Some(tc) = TraceContext::current() {
+                    let mut tid = self.received_trace_id.lock().await;
+                    *tid = Some(tc.trace_id().to_string());
+                    let mut sid = self.received_span_id.lock().await;
+                    *sid = Some(tc.span_id().to_string());
+                }
+                Ok(())
+            })
+        }
+    }
+
+    let captured_outbox_tc = Arc::new(tokio::sync::Mutex::new(None));
+    let captured_job_tc = Arc::new(tokio::sync::Mutex::new(None));
+    let memory_queue = Arc::new(TestJobQueue::new());
+
+    let outbox_tc_clone = Arc::clone(&captured_outbox_tc);
+    let job_tc_clone = Arc::clone(&captured_job_tc);
+    let queue_clone = Arc::clone(&memory_queue);
+
+    let ctx = test_ctx();
+    let builder = Rume::builder(ctx).route(
+        "/trigger-trace",
+        get(move || {
+            let outbox_tc_clone = Arc::clone(&outbox_tc_clone);
+            let job_tc_clone = Arc::clone(&job_tc_clone);
+            let queue = Arc::clone(&queue_clone);
+            async move {
+                // Inside HTTP handler, TraceContext::current() must be available
+                let current_tc = TraceContext::current().expect("TraceContext must be present in HTTP handler");
+                assert_eq!(current_tc.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+
+                // OutboxMessage::new automatically inherits current trace_context
+                let msg = OutboxMessage::new("msg-1", "user.created", vec![]);
+                let mut outbox_guard = outbox_tc_clone.lock().await;
+                *outbox_guard = msg.trace_context.clone();
+
+                // Job enqueue automatically inherits current trace_context
+                let job_id = queue
+                    .enqueue(TraceJob {
+                        data: "hello".into(),
+                    })
+                    .await
+                    .expect("enqueue must succeed");
+
+                let dequeued = queue
+                    .dequeue_for("test-worker")
+                    .await
+                    .expect("dequeue must succeed")
+                    .expect("job must be available");
+
+                let mut job_guard = job_tc_clone.lock().await;
+                *job_guard = dequeued.trace_context.clone();
+
+                format!("ok:{job_id}")
+            }
+        }),
+    );
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+    let incoming_span_id = "00f067aa0ba902b7";
+    let incoming_traceparent = format!("00-{incoming_trace_id}-{incoming_span_id}-01");
+
+    let req = axum::http::Request::builder()
+        .uri("/trigger-trace")
+        .header("traceparent", &incoming_traceparent)
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let resp = app.request(req).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // 1. Response has matching traceparent
+    let resp_traceparent = resp
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .expect("missing traceparent in response");
+    assert_eq!(resp_traceparent, incoming_traceparent);
+
+    // 2. Outbox message inherited exact incoming traceparent
+    let outbox_tc = captured_outbox_tc.lock().await.clone().expect("outbox trace context captured");
+    assert_eq!(outbox_tc, incoming_traceparent);
+
+    // 3. Queued job inherited exact incoming traceparent
+    let job_tc = captured_job_tc.lock().await.clone().expect("job trace context captured");
+    assert_eq!(job_tc, incoming_traceparent);
+
+    // 4. Now dispatch the queued job through JobRegistry and verify child span creation
+    let job_handler_tid = Arc::new(tokio::sync::Mutex::new(None));
+    let job_handler_sid = Arc::new(tokio::sync::Mutex::new(None));
+
+    let mut registry = JobRegistry::new();
+    registry.register(
+        TraceJobHandler {
+            received_trace_id: Arc::clone(&job_handler_tid),
+            received_span_id: Arc::clone(&job_handler_sid),
+        },
+    );
+
+    let queued_job = QueuedJob {
+        id: "job-123".into(),
+        name: TraceJob::NAME.to_string(),
+        payload: serde_json::to_vec(&TraceJob { data: "test".into() }).unwrap(),
+        attempt: 1,
+        retry_policy: Default::default(),
+        timeout: None,
+        idempotency_key: None,
+        tenant_id: None,
+        assigned_worker: Some("worker-1".into()),
+        lease_token: Some("token-1".into()),
+        available_at: std::time::Instant::now(),
+        lease_duration: std::time::Duration::from_secs(60),
+        trace_context: Some(incoming_traceparent.clone()),
+    };
+
+    registry.dispatch_with_cancellation(&queued_job, None).await.expect("dispatch succeeds");
+
+    let worker_tid = job_handler_tid.lock().await.clone().expect("worker received trace id");
+    let worker_sid = job_handler_sid.lock().await.clone().expect("worker received span id");
+
+    // Worker execution preserved trace_id
+    assert_eq!(worker_tid, incoming_trace_id);
+    // Worker execution generated a new unique child span_id
+    assert_ne!(worker_sid, incoming_span_id);
+    assert_eq!(worker_sid.len(), 16);
+}

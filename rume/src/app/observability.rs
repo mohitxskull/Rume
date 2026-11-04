@@ -50,6 +50,11 @@ pub static TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
 /// Standard W3C TraceContext header name: `tracestate`.
 pub static TRACESTATE: HeaderName = HeaderName::from_static("tracestate");
 
+tokio::task_local! {
+    /// Active task-local W3C TraceContext propagating distributed trace context across async boundaries.
+    pub static CURRENT_TRACE_CONTEXT: Option<TraceContext>;
+}
+
 /// W3C TraceContext representation propagating distributed trace identity across HTTP, jobs, and outbox.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct TraceContext {
@@ -60,6 +65,37 @@ pub struct TraceContext {
 }
 
 impl TraceContext {
+    /// Returns the currently active trace context from task-local storage, if any.
+    pub fn current() -> Option<Self> {
+        CURRENT_TRACE_CONTEXT.try_with(|ctx| ctx.clone()).ok().flatten()
+    }
+
+    /// Extracts the 32-character hex trace ID from the `traceparent`.
+    pub fn trace_id(&self) -> &str {
+        self.traceparent.split('-').nth(1).unwrap_or("")
+    }
+
+    /// Extracts the 16-character hex span ID from the `traceparent`.
+    pub fn span_id(&self) -> &str {
+        self.traceparent.split('-').nth(2).unwrap_or("")
+    }
+
+    /// Extracts the 2-character hex flags from the `traceparent`.
+    pub fn flags(&self) -> &str {
+        self.traceparent.split('-').nth(3).unwrap_or("01")
+    }
+
+    /// Creates a child `TraceContext` that preserves the trace ID and flags, but generates a new random span ID.
+    pub fn new_child(&self) -> Self {
+        let trace_id = self.trace_id();
+        let flags = self.flags();
+        let new_span_id = format!("{:016x}", uuid::Uuid::new_v4().as_u128() as u64);
+        Self {
+            traceparent: format!("00-{trace_id}-{new_span_id}-{flags}"),
+            tracestate: self.tracestate.clone(),
+        }
+    }
+
     /// Generates a new valid W3C TraceContext traceparent.
     pub fn generate() -> Self {
         let trace_id = format!("{:032x}", uuid::Uuid::new_v4().as_u128());
@@ -311,10 +347,13 @@ where
         let req_id_str = request_id.0.clone();
         let trace_parent_str = trace_context.traceparent.clone();
         let span_clone = span.clone();
+        let scope_tc = Some(trace_context);
 
         use tracing::Instrument;
         Box::pin(
-            async move {
+            CURRENT_TRACE_CONTEXT.scope(
+                scope_tc,
+                async move {
                 let start = Instant::now();
 
                 let mut response = inner.call(req).await?;
@@ -413,9 +452,9 @@ where
                 }
 
                 Ok(response)
-            }
-            .instrument(span),
+            },
         )
+        .instrument(span))
     }
 }
 

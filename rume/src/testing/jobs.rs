@@ -98,7 +98,9 @@ impl JobQueue for TestJobQueue {
         job: J,
         delay: Duration,
     ) -> BoxFuture<'_, Result<String, JobError>> {
-        let trace = job.trace_context();
+        let trace = job
+            .trace_context()
+            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 
@@ -113,6 +115,9 @@ impl JobQueue for TestJobQueue {
             Ok(p) => p,
             Err(e) => return Box::pin(async move { Err(JobError::Serialization(e.to_string())) }),
         };
+        let effective_tc = trace_context
+            .or_else(|| job.trace_context())
+            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
         let queued = QueuedJob {
             id: id.clone(),
             name: J::NAME.to_string(),
@@ -126,7 +131,7 @@ impl JobQueue for TestJobQueue {
             lease_token: None,
             available_at: Instant::now() + delay,
             lease_duration: Duration::from_secs(60),
-            trace_context: trace_context.or_else(|| job.trace_context()),
+            trace_context: effective_tc,
         };
 
         if let Ok(mut lock) = self.jobs.write() {

@@ -71,7 +71,7 @@ impl JobContext {
             attempt,
             max_attempts,
             cancellation: None,
-            trace_context: None,
+            trace_context: crate::app::TraceContext::current().map(|tc| tc.to_string()),
         }
     }
 
