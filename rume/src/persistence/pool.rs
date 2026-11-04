@@ -15,6 +15,7 @@ use crate::outbox::{
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
+use crate::persistence::row::{DbRow, FromRow};
 use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 
 /// Metrics and status information for a database connection pool.
@@ -256,6 +257,74 @@ impl<B: DatabaseBackend> DatabasePool<B> {
             .acquire_lease_timeout(self.config.connect_timeout())
             .await?;
         self.backend.query_scalar_params(query, params).await
+    }
+
+    /// Fetches all matching rows as generic [`DbRow`] records.
+    pub async fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<DbRow>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_all(statement, params).await
+    }
+
+    /// Fetches all matching rows and maps them into type `R` via [`FromRow`].
+    pub async fn fetch_all_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<R>, PersistenceError> {
+        let rows = self.fetch_all(statement, params).await?;
+        rows.iter().map(R::from_row).collect()
+    }
+
+    /// Fetches an optional single row as [`DbRow`].
+    pub async fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_optional(statement, params).await
+    }
+
+    /// Fetches an optional single row and maps it into type `R` via [`FromRow`].
+    pub async fn fetch_optional_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Option<R>, PersistenceError> {
+        match self.fetch_optional(statement, params).await? {
+            Some(row) => R::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches exactly one row as [`DbRow`].
+    pub async fn fetch_one(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<DbRow, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_one(statement, params).await
+    }
+
+    /// Fetches exactly one row and maps it into type `R` via [`FromRow`].
+    pub async fn fetch_one_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<R, PersistenceError> {
+        let row = self.fetch_one(statement, params).await?;
+        R::from_row(&row)
     }
 
     /// Gracefully closes the connection pool, refusing new leases and draining connections.

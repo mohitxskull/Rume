@@ -316,3 +316,108 @@ fn generated_project_compiles_and_tests_pass_with_all_generators() {
         .expect("config explain --json output must be valid JSON");
     assert_eq!(parsed.get("key").and_then(|k| k.as_str()), Some("app.name"));
 }
+
+#[test]
+fn make_migration_and_db_commands_workflow() {
+    let tmp_dir = TempDir::new().expect("failed to create temp directory");
+    let project_name = "test-migrations-app";
+
+    // 1. Scaffold a project
+    let status = Command::new(rume_binary())
+        .arg("new")
+        .arg(project_name)
+        .arg("--path")
+        .arg(framework_path())
+        .current_dir(tmp_dir.path())
+        .status()
+        .expect("scaffold project");
+    assert!(status.success());
+
+    let project_dir = tmp_dir.path().join(project_name);
+
+    // 2. Run `rume make:migration create_users_table`
+    let make_res = Command::new(rume_binary())
+        .arg("make:migration")
+        .arg("create_users_table")
+        .current_dir(&project_dir)
+        .output()
+        .expect("run make:migration");
+    assert!(make_res.status.success(), "make:migration should exit with code 0");
+
+    let stdout = String::from_utf8_lossy(&make_res.stdout);
+    assert!(stdout.contains("Created migrations/"));
+    assert!(stdout.contains("create_users_table.up.sql"));
+    assert!(stdout.contains("create_users_table.down.sql"));
+
+    let migrations_dir = project_dir.join("migrations");
+    assert!(migrations_dir.is_dir());
+
+    let entries: Vec<_> = fs::read_dir(&migrations_dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(entries.len(), 2);
+    let up_file = entries.iter().find(|n| n.ends_with(".up.sql")).unwrap();
+    let down_file = entries.iter().find(|n| n.ends_with(".down.sql")).unwrap();
+
+    // 3. Run `rume db status` (offline / without DB URL)
+    let status_offline = Command::new(rume_binary())
+        .arg("db")
+        .arg("status")
+        .current_dir(&project_dir)
+        .output()
+        .expect("run db status");
+    assert!(status_offline.status.success());
+    let status_stdout = String::from_utf8_lossy(&status_offline.stdout);
+    assert!(status_stdout.contains("create_users_table"));
+
+    // 4. Configure local SQLite database
+    let db_path = project_dir.join("test.db");
+    let db_url = format!("sqlite://{}", db_path.display());
+
+    // Write real migration DDL
+    fs::write(
+        migrations_dir.join(up_file),
+        "CREATE TABLE test_users (id TEXT PRIMARY KEY, name TEXT NOT NULL);\n",
+    )
+    .unwrap();
+    fs::write(
+        migrations_dir.join(down_file),
+        "DROP TABLE test_users;\n",
+    )
+    .unwrap();
+
+    // 5. Run `rume db:migrate` with DATABASE_URL
+    let migrate_res = Command::new(rume_binary())
+        .arg("db:migrate")
+        .env("DATABASE_URL", &db_url)
+        .current_dir(&project_dir)
+        .output()
+        .expect("run db:migrate");
+    assert!(migrate_res.status.success(), "db:migrate should succeed");
+    let migrate_stdout = String::from_utf8_lossy(&migrate_res.stdout);
+    assert!(migrate_stdout.contains("Successfully applied"));
+
+    // 6. Run `rume db:status` and verify it is Applied
+    let status_applied = Command::new(rume_binary())
+        .arg("db:status")
+        .env("DATABASE_URL", &db_url)
+        .current_dir(&project_dir)
+        .output()
+        .expect("run db:status");
+    assert!(status_applied.status.success());
+    let status_applied_out = String::from_utf8_lossy(&status_applied.stdout);
+    assert!(status_applied_out.contains("Applied"));
+
+    // 7. Run `rume db:rollback` and verify rollback
+    let rollback_res = Command::new(rume_binary())
+        .arg("db:rollback")
+        .env("DATABASE_URL", &db_url)
+        .current_dir(&project_dir)
+        .output()
+        .expect("run db:rollback");
+    assert!(rollback_res.status.success(), "db:rollback should succeed");
+    let rollback_out = String::from_utf8_lossy(&rollback_res.stdout);
+    assert!(rollback_out.contains("Rolled back"));
+}

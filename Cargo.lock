@@ -438,8 +438,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1aa79e62e7697b8e29b513a68abacf485adcd1fe8284a4316c5ae868e6633327"
 dependencies = [
  "iana-time-zone",
+ "js-sys",
  "num-traits",
  "serde",
+ "wasm-bindgen",
  "windows-link",
 ]
 
@@ -2558,6 +2560,7 @@ dependencies = [
  "quick-xml",
  "redis",
  "rstest",
+ "rume-macros",
  "schemars 1.2.3",
  "secrecy",
  "serde",
@@ -2582,10 +2585,12 @@ dependencies = [
 name = "rume-cli"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "clap",
  "clap_complete",
  "comfy-table",
  "console",
+ "dotenvy",
  "indicatif",
  "inquire",
  "rume",
@@ -2595,6 +2600,15 @@ dependencies = [
  "tokio",
  "toml 1.1.8+spec-1.1.0",
  "unicode-width",
+]
+
+[[package]]
+name = "rume-macros"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]

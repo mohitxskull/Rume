@@ -188,6 +188,27 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         Ok(pending)
     }
 
+    /// Returns the list of applied migration IDs and timestamps from the database.
+    pub async fn applied_migrations<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<Vec<(String, i64)>, PersistenceError> {
+        backend.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+        let rows = backend
+            .fetch_all(
+                "SELECT id, applied_at FROM rume_migrations ORDER BY applied_at ASC",
+                &[],
+            )
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id: String = row.get("id")?;
+            let applied_at: i64 = row.get("applied_at")?;
+            out.push((id, applied_at));
+        }
+        Ok(out)
+    }
+
     /// Executes all unapplied pending migrations in order on any [`DatabaseBackend`].
     pub async fn run_pending<B: DatabaseBackend>(
         &self,

@@ -71,6 +71,36 @@ pub enum Commands {
         kind: Option<String>,
         name: Option<String>,
     },
+    /// Create a new versioned database migration pair (.up.sql and .down.sql).
+    #[command(name = "make:migration", alias = "make-migration")]
+    MakeMigration {
+        /// Migration name (e.g. create_users_table).
+        name: Option<String>,
+    },
+    /// Database migration management.
+    Db {
+        #[command(subcommand)]
+        command: DbCommands,
+    },
+    /// Shortcut for `rume db status`.
+    #[command(name = "db:status", alias = "db-status", hide = true)]
+    DbStatus,
+    /// Shortcut for `rume db migrate`.
+    #[command(name = "db:migrate", alias = "db-migrate", hide = true)]
+    DbMigrate,
+    /// Shortcut for `rume db rollback`.
+    #[command(name = "db:rollback", alias = "db-rollback", hide = true)]
+    DbRollback,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum DbCommands {
+    /// Inspect migration ledger and pending migrations.
+    Status,
+    /// Execute pending migrations against the configured database.
+    Migrate,
+    /// Rollback the most recently applied migration.
+    Rollback,
 }
 
 #[derive(Subcommand)]

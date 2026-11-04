@@ -18,6 +18,7 @@ use crate::persistence::backend::{
 };
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
+use crate::persistence::row::DbRow;
 
 const OUTBOX_SCHEMA: &str = include_str!("sql/sqlite/outbox_schema.sql");
 const OUTBOX_CLAIM_SQL: &str = include_str!("sql/sqlite/outbox_claim.sql");
@@ -220,6 +221,60 @@ impl DatabaseBackend for SqliteBackend {
         })
     }
 
+    fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+        let stmt = statement.to_string();
+        let params_vec = params.to_vec();
+        Box::pin(async move {
+            let mut query = sqlx::query(&stmt);
+            for param in &params_vec {
+                query = match param {
+                    DbValue::Null => query.bind(None as Option<String>),
+                    DbValue::Text(s) => query.bind(s.as_str()),
+                    DbValue::Int(i) => query.bind(*i),
+                    DbValue::Float(f) => query.bind(*f),
+                    DbValue::Bool(b) => query.bind(*b),
+                    DbValue::Bytes(b) => query.bind(b.as_slice()),
+                };
+            }
+            let rows: Vec<SqliteRow> = query
+                .fetch_all(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            Ok(rows.iter().map(sqlx_sqlite_row_to_db_row).collect())
+        })
+    }
+
+    fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+        let stmt = statement.to_string();
+        let params_vec = params.to_vec();
+        Box::pin(async move {
+            let mut query = sqlx::query(&stmt);
+            for param in &params_vec {
+                query = match param {
+                    DbValue::Null => query.bind(None as Option<String>),
+                    DbValue::Text(s) => query.bind(s.as_str()),
+                    DbValue::Int(i) => query.bind(*i),
+                    DbValue::Float(f) => query.bind(*f),
+                    DbValue::Bool(b) => query.bind(*b),
+                    DbValue::Bytes(b) => query.bind(b.as_slice()),
+                };
+            }
+            let row: Option<SqliteRow> = query
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            Ok(row.as_ref().map(sqlx_sqlite_row_to_db_row))
+        })
+    }
+
     fn record_audit_log(
         &self,
         id: &str,
@@ -399,6 +454,70 @@ impl DatabaseTransaction for SqliteTransaction {
                 .await
                 .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
             Ok(row.and_then(|r| extract_sqlite_scalar(&r)))
+        })
+    }
+
+    fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+        let stmt = statement.to_string();
+        let params_vec = params.to_vec();
+        let tx_arc = Arc::clone(&self.tx);
+        Box::pin(async move {
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .as_mut()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let mut query = sqlx::query(&stmt);
+            for param in &params_vec {
+                query = match param {
+                    DbValue::Null => query.bind(None as Option<String>),
+                    DbValue::Text(s) => query.bind(s.as_str()),
+                    DbValue::Int(i) => query.bind(*i),
+                    DbValue::Float(f) => query.bind(*f),
+                    DbValue::Bool(b) => query.bind(*b),
+                    DbValue::Bytes(b) => query.bind(b.as_slice()),
+                };
+            }
+            let rows: Vec<SqliteRow> = query
+                .fetch_all(&mut **tx)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(rows.iter().map(sqlx_sqlite_row_to_db_row).collect())
+        })
+    }
+
+    fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+        let stmt = statement.to_string();
+        let params_vec = params.to_vec();
+        let tx_arc = Arc::clone(&self.tx);
+        Box::pin(async move {
+            let mut guard = tx_arc.lock().await;
+            let tx = guard
+                .as_mut()
+                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let mut query = sqlx::query(&stmt);
+            for param in &params_vec {
+                query = match param {
+                    DbValue::Null => query.bind(None as Option<String>),
+                    DbValue::Text(s) => query.bind(s.as_str()),
+                    DbValue::Int(i) => query.bind(*i),
+                    DbValue::Float(f) => query.bind(*f),
+                    DbValue::Bool(b) => query.bind(*b),
+                    DbValue::Bytes(b) => query.bind(b.as_slice()),
+                };
+            }
+            let row: Option<SqliteRow> = query
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            Ok(row.as_ref().map(sqlx_sqlite_row_to_db_row))
         })
     }
 
@@ -811,4 +930,45 @@ impl TransactionalOutbox<SqliteTransaction> for SqliteBackend {
             Ok(())
         })
     }
+}
+
+pub(crate) fn sqlx_sqlite_row_to_db_row(row: &SqliteRow) -> DbRow {
+    use sqlx::{Column, Row, TypeInfo, ValueRef};
+    let columns: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
+    let mut values = Vec::with_capacity(columns.len());
+    for i in 0..columns.len() {
+        let raw = row.try_get_raw(i);
+        let val = match raw {
+            Ok(v) if v.is_null() => DbValue::Null,
+            Ok(v) => {
+                let type_info = v.type_info();
+                let type_name = type_info.name();
+                match type_name {
+                    "BOOLEAN" => row.try_get::<bool, _>(i).map(DbValue::Bool).unwrap_or(DbValue::Null),
+                    "INTEGER" => row.try_get::<i64, _>(i).map(DbValue::Int).unwrap_or(DbValue::Null),
+                    "REAL" => row.try_get::<f64, _>(i).map(DbValue::Float).unwrap_or(DbValue::Null),
+                    "BLOB" => row.try_get::<Vec<u8>, _>(i).map(DbValue::Bytes).unwrap_or(DbValue::Null),
+                    "TEXT" => row.try_get::<String, _>(i).map(DbValue::Text).unwrap_or(DbValue::Null),
+                    _ => {
+                        if let Ok(s) = row.try_get::<String, _>(i) {
+                            DbValue::Text(s)
+                        } else if let Ok(n) = row.try_get::<i64, _>(i) {
+                            DbValue::Int(n)
+                        } else if let Ok(f) = row.try_get::<f64, _>(i) {
+                            DbValue::Float(f)
+                        } else if let Ok(b) = row.try_get::<bool, _>(i) {
+                            DbValue::Bool(b)
+                        } else if let Ok(bytes) = row.try_get::<Vec<u8>, _>(i) {
+                            DbValue::Bytes(bytes)
+                        } else {
+                            DbValue::Null
+                        }
+                    }
+                }
+            }
+            Err(_) => DbValue::Null,
+        };
+        values.push(val);
+    }
+    DbRow::new(columns, values)
 }

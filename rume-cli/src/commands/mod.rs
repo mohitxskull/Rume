@@ -1,5 +1,6 @@
 mod codegen;
 mod config;
+mod db;
 mod doctor;
 mod env;
 mod generate;
@@ -15,7 +16,7 @@ pub fn require_rume_project() {
     }
 }
 
-pub fn run(cli: Cli) {
+pub async fn run(cli: Cli) {
     if cli.no_color {
         console::set_colors_enabled(false);
     }
@@ -61,6 +62,26 @@ pub fn run(cli: Cli) {
         Some(Commands::Generate { kind, name }) => {
             require_rume_project();
             generate::run(kind.as_deref(), name.as_deref());
+        }
+        Some(Commands::MakeMigration { name }) => {
+            require_rume_project();
+            db::make_migration(name);
+        }
+        Some(Commands::Db { command }) => {
+            require_rume_project();
+            db::run(command).await;
+        }
+        Some(Commands::DbStatus) => {
+            require_rume_project();
+            db::run(crate::cli::DbCommands::Status).await;
+        }
+        Some(Commands::DbMigrate) => {
+            require_rume_project();
+            db::run(crate::cli::DbCommands::Migrate).await;
+        }
+        Some(Commands::DbRollback) => {
+            require_rume_project();
+            db::run(crate::cli::DbCommands::Rollback).await;
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

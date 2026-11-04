@@ -455,3 +455,132 @@ async fn migrator_with_rume_core_registers_and_applies_core_persistence() {
 
     migrator.verify_no_pending_backend(&backend).await.unwrap();
 }
+
+#[derive(Debug, PartialEq, Eq)]
+struct TestItem {
+    id: String,
+    title: String,
+    count: i64,
+    active: bool,
+    note: Option<String>,
+}
+
+impl rume::persistence::row::FromRow for TestItem {
+    fn from_row(row: &rume::persistence::row::DbRow) -> Result<Self, PersistenceError> {
+        Ok(Self {
+            id: row.get("id")?,
+            title: row.get("title")?,
+            count: row.get("count")?,
+            active: row.get("active")?,
+            note: row.get_opt("note")?,
+        })
+    }
+}
+
+#[tokio::test]
+async fn test_db_row_and_from_row_query_operations() {
+    let backend = SqliteBackend::in_memory().await.unwrap();
+    let config = DatabaseConfig::new("memory://test");
+    let pool = DatabasePool::new(backend, config);
+
+    pool.execute(
+        "CREATE TABLE items (id TEXT PRIMARY KEY, title TEXT NOT NULL, count INTEGER NOT NULL, active BOOLEAN NOT NULL, note TEXT);"
+    ).await.unwrap();
+
+    let query_insert = rume::persistence::SqlQuery::new(
+        "items.insert",
+        "sql/items/insert.sql",
+        None,
+        "INSERT INTO items (id, title, count, active, note) VALUES (?1, ?2, ?3, ?4, ?5);"
+    );
+
+    let query_find = rume::persistence::SqlQuery::new(
+        "items.find",
+        "sql/items/find.sql",
+        None,
+        "SELECT id, title, count, active, note FROM items WHERE id = ?1;"
+    );
+
+    let query_list = rume::persistence::SqlQuery::new(
+        "items.list",
+        "sql/items/list.sql",
+        None,
+        "SELECT id, title, count, active, note FROM items ORDER BY count ASC;"
+    );
+
+    // 1. Insert via query_insert.execute_pool
+    let affected = query_insert
+        .execute_pool(
+            &pool,
+            &rume::params!["item-1", "First Item", 10i64, true, "First note"],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1);
+
+    // 2. Insert second item in transaction
+    let tx = pool.backend().begin_transaction().await.unwrap();
+    let affected_tx = query_insert
+        .execute(
+            &tx,
+            &rume::params!["item-2", "Second Item", 20i64, false, None as Option<String>],
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected_tx, 1);
+    tx.commit().await.unwrap();
+
+    // 3. fetch_one_as
+    let item1: TestItem = query_find
+        .fetch_one_as(&pool, &rume::params!["item-1"])
+        .await
+        .unwrap();
+    assert_eq!(
+        item1,
+        TestItem {
+            id: "item-1".into(),
+            title: "First Item".into(),
+            count: 10,
+            active: true,
+            note: Some("First note".into()),
+        }
+    );
+
+    // 4. fetch_optional_as
+    let item2: Option<TestItem> = query_find
+        .fetch_optional_as(&pool, &rume::params!["item-2"])
+        .await
+        .unwrap();
+    assert_eq!(
+        item2,
+        Some(TestItem {
+            id: "item-2".into(),
+            title: "Second Item".into(),
+            count: 20,
+            active: false,
+            note: None,
+        })
+    );
+
+    let missing: Option<TestItem> = query_find
+        .fetch_optional_as(&pool, &rume::params!["item-999"])
+        .await
+        .unwrap();
+    assert_eq!(missing, None);
+
+    // 5. fetch_all_as
+    let all: Vec<TestItem> = query_list
+        .fetch_all_as(&pool, &[])
+        .await
+        .unwrap();
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[0].id, "item-1");
+    assert_eq!(all[1].id, "item-2");
+
+    // 6. Direct pool fetch_all_as
+    let direct_all: Vec<TestItem> = pool
+        .fetch_all_as("SELECT id, title, count, active, note FROM items ORDER BY count ASC", &[])
+        .await
+        .unwrap();
+    assert_eq!(direct_all.len(), 2);
+}

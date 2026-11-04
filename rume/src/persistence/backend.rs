@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 use crate::persistence::error::PersistenceError;
+use crate::persistence::row::DbRow;
 
 /// Pinned boxed future type alias for async database traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -196,6 +197,35 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
         self.query_scalar_params(query, &[])
     }
 
+    /// Fetches all rows matching the parameterized query as generic [`DbRow`] records.
+    fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>>;
+
+    /// Fetches an optional single row matching the parameterized query as a [`DbRow`].
+    fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>>;
+
+    /// Fetches exactly one row matching the parameterized query, returning an error if zero rows match.
+    fn fetch_one(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<DbRow, PersistenceError>> {
+        let stmt = statement.to_string();
+        let p = params.to_vec();
+        Box::pin(async move {
+            self.fetch_optional(&stmt, &p)
+                .await?
+                .ok_or_else(|| PersistenceError::QueryFailed("query returned zero rows, expected one".into()))
+        })
+    }
+
     /// Begins a new transaction.
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>>;
 
@@ -296,6 +326,35 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
     /// Queries a scalar value within the transaction boundary.
     fn query_scalar(&self, query: &str) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
         self.query_scalar_params(query, &[])
+    }
+
+    /// Fetches all rows matching the parameterized query within the transaction boundary.
+    fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>>;
+
+    /// Fetches an optional single row matching the parameterized query within the transaction boundary.
+    fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>>;
+
+    /// Fetches exactly one row matching the parameterized query within the transaction boundary.
+    fn fetch_one(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> BoxFuture<'_, Result<DbRow, PersistenceError>> {
+        let stmt = statement.to_string();
+        let p = params.to_vec();
+        Box::pin(async move {
+            self.fetch_optional(&stmt, &p)
+                .await?
+                .ok_or_else(|| PersistenceError::QueryFailed("query returned zero rows, expected one".into()))
+        })
     }
 
     /// Atomically commits all changes made within this transaction.

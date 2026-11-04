@@ -1,3 +1,5 @@
+use rume::persistence::error::PersistenceError;
+use rume::persistence::row::{DbRow, FromRow};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -12,6 +14,23 @@ pub struct Issue {
     pub assignee_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+impl FromRow for Issue {
+    fn from_row(row: &DbRow) -> Result<Self, PersistenceError> {
+        Ok(Self {
+            id: row.get("id")?,
+            tenant_id: row.get("tenant_id")?,
+            project_id: row.get("project_id")?,
+            title: row.get("title")?,
+            description: row.get_opt("description")?,
+            status: row.get("status")?,
+            priority: row.get("priority")?,
+            assignee_id: row.get_opt("assignee_id")?,
+            created_at: row.get("created_at")?,
+            updated_at: row.get("updated_at")?,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

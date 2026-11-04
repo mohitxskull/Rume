@@ -174,11 +174,13 @@ This phase proves that Rume is genuinely easier to build and operate with—not 
 | **STAB-05** | Multi-Instance Deployment Validation | Run two application instances concurrently with real PostgreSQL and Redis containers, verifying cross-tenant isolation, concurrent claiming via `SKIP LOCKED`, zero message duplicates, and graceful shutdown drain. | **Completed** |
 | **STAB-06** | Phase 6.1 Corrective Closure & Security Hardening | Supervised OS signal lifecycle with `WorkerHandle::shutdown()` panic/cancellation inspection; strict `TenantMembershipLayer` rejecting cross-tenant impersonation with 403 Forbidden; persisted organizations and users with database-backed token authentication; isolated multi-pool deployment validation; tightened queue and outbox repository contracts. | **Completed** |
 | **STAB-07** | Phase 6.2 Persistence DX & Safe Transactions | First-class parameterized transaction execution (`execute_params`, `query_scalar_params`, `params!`) across Postgres, MySQL, and SQLite with native `raw_tx()` driver escape hatches; separation of Workbench HTTP handlers from database persistence into repository assets; elimination of all raw SQL interpolation and manual quote escaping; versioned `.sql` migration files; core persistence schema ownership via `Migrator::with_rume_core()`; and fail-closed SHA-256 migration checksum validation. | **Completed** |
+| **STAB-08** | Phase 6.3 First-Class SQL Assets & Database Developer Experience | Build-time SQL discovery and compile-time embedding macro (`rume::sql_assets!`) exposing typed `SqlQuery<'static>` constants; driver-independent generic row extraction (`DbRow`, `FromRow`, `FromDbValue`) and query execution (`fetch_all_as`, `fetch_optional_as`, `fetch_one_as`) across Postgres, MySQL, and SQLite without leaking `sqlx::Row`; convention-based compile-time migration discovery and pairing macro (`rume::embed_migrations!`); database and migration CLI commands (`rume make:migration`, `rume db:status`, `rume db:migrate`, `rume db:rollback`); and refactoring of Workbench repositories to eliminate direct driver dependencies. | **Completed** |
 
 **Verification Suites:**
 - [`workbench/tests/workbench_test.rs`](../../../workbench/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, persisted auth, negative tenant authorization tests, transaction-enlisted outbox, worker processing, signal-based graceful shutdown drain, and SQL injection / Unicode immunity).
 - [`workbench/tests/deployment_validation.rs`](../../../workbench/tests/deployment_validation.rs) (Multi-instance concurrency across tenants with independent connection pools, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
-- [`rume/tests/integration/persistence.rs`](../../../rume/tests/integration/persistence.rs) (Preflight and runner checksum mismatch verification, and core persistence schema registration via `with_rume_core`).
+- [`rume/tests/integration/persistence.rs`](../../../rume/tests/integration/persistence.rs) (Preflight and runner checksum mismatch verification, core persistence schema registration via `with_rume_core`, and generic query asset execution via `SqlQuery` and `FromRow`).
+- [`rume-cli/tests/generated_project.rs`](../../../rume-cli/tests/generated_project.rs) (CLI workflow test for `make:migration`, `db:status`, `db:migrate`, and `db:rollback`).
 
 ---
 
@@ -187,14 +189,14 @@ This phase proves that Rume is genuinely easier to build and operate with—not 
 > **Priority:** P1 · Ecosystem Polish & Release Readiness  
 > **Status:** Next Scheduled Phase
 
-With runtime durability, multi-tenant isolation, safe transactions, and application patterns established and verified through Rume Workbench, Phase 7 focuses on final release readiness for the open-source ecosystem:
+With runtime durability, multi-tenant isolation, safe transactions, and first-class SQL assets established and verified through Rume Workbench, Phase 7 focuses on final release readiness for the open-source ecosystem:
 
 ### Strategic Tasks
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
 | **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **P1** |
-| **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to include repository layering, versioned `.sql` migrations with `include_str!`, and `.with_rume_core()`. | **P1** |
+| **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **P1** |
 | **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export, and zero-downtime rolling upgrades. | **P1** |
 | **REL-11** | Crate Publishing & Semantic Versioning Audit | Final audit of crate dependencies, API surface documentation, `#![forbid(unsafe_code)]` verification across all workspace crates, and v0.1.0 release packaging. | **P1** |
 

@@ -52,3 +52,4 @@ pub use error::AppError;
 pub use events::{Event, EventBus};
 pub use module::{Module, ModuleContext};
 pub use routing::Router;
+pub use rume_macros::{embed_migrations, sql_assets};

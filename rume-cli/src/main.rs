@@ -11,5 +11,5 @@ use clap::Parser;
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-    commands::run(cli);
+    commands::run(cli).await;
 }
