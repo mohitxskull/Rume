@@ -20,12 +20,14 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         delay: Duration,
     ) -> BoxFuture<'_, Result<String, JobError>>;
 
-    /// Dequeues the next available job whose `available_at` time has passed.
-    fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
-
     /// Dequeues the next available job, recording the worker identifier that claimed it.
-    fn dequeue_for(&self, _worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
-        self.dequeue()
+    fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
+
+    /// Dequeues the next available job whose `available_at` time has passed.
+    ///
+    /// Delegates to [`JobQueue::dequeue_for`] with an anonymous worker identifier.
+    fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for("anonymous")
     }
 
     /// Reclaims jobs belonging to dead workers, returning them to the pending queue.
@@ -83,14 +85,23 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         &self,
         _limit: usize,
     ) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
-        Box::pin(async move { Ok(Vec::new()) })
+        Box::pin(async move {
+            Err(JobError::Unsupported(
+                "list_dead_letters not supported by this queue backend".into(),
+            ))
+        })
     }
 
     /// Replays a dead-lettered job by resetting its status back to `pending`.
     fn replay_dead_letter(
         &self,
-        _job_id: &str,
+        job_id: &str,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        Box::pin(async move { Ok(()) })
+        let id = job_id.to_string();
+        Box::pin(async move {
+            Err(JobError::Unsupported(format!(
+                "replay_dead_letter not supported by this queue backend (job_id={id})"
+            )))
+        })
     }
 }

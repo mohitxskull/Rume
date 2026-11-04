@@ -39,3 +39,13 @@ deadpool-redis = "0.23.1"
 redis = { version = "1.8", default-features = false, features = ["tokio-comp", "script"] }
 futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "mysql"] }
+
+# Keep dev/test artifacts small. This workspace has many integration test
+# binaries that each statically link the full dependency stack (sqlx, axum,
+# testcontainers, tonic, ...), and the default `dev` profile embeds full
+# debug info, which pushed target/debug past 50 GB. Line tables keep
+# backtraces useful while dropping most of that size. The `test` profile
+# inherits this setting; use CARGO_PROFILE_DEV_DEBUG=2 for a one-off build
+# that needs full debug info.
+[profile.dev]
+debug = "line-tables-only"

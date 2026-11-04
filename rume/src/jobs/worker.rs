@@ -185,14 +185,14 @@ impl WorkerHandle {
 
         // 2. Await the worker execution loop
         let remaining = timeout.saturating_sub(start.elapsed());
-        if tokio::time::timeout(remaining, &mut self.worker_task).await.is_err() {
+        if !await_supervised_task(&mut self.worker_task, remaining, "worker_execution").await {
             return false;
         }
 
         // 3. Await heartbeat task if present
         if let Some(mut hb) = self.heartbeat_task.take() {
             let remaining = timeout.saturating_sub(start.elapsed());
-            if tokio::time::timeout(remaining, &mut hb).await.is_err() {
+            if !await_supervised_task(&mut hb, remaining, "worker_heartbeat").await {
                 return false;
             }
         }
@@ -200,12 +200,36 @@ impl WorkerHandle {
         // 4. Await recovery task if present
         if let Some(mut rec) = self.recovery_task.take() {
             let remaining = timeout.saturating_sub(start.elapsed());
-            if tokio::time::timeout(remaining, &mut rec).await.is_err() {
+            if !await_supervised_task(&mut rec, remaining, "worker_recovery").await {
                 return false;
             }
         }
 
         true
+    }
+}
+
+async fn await_supervised_task(
+    task: &mut tokio::task::JoinHandle<()>,
+    remaining: Duration,
+    task_name: &'static str,
+) -> bool {
+    match tokio::time::timeout(remaining, task).await {
+        Ok(Ok(())) => true,
+        Ok(Err(join_err)) => {
+            if join_err.is_panic() {
+                tracing::error!(task = task_name, "Worker background task panicked during execution");
+            } else if join_err.is_cancelled() {
+                tracing::warn!(task = task_name, "Worker background task was cancelled");
+            } else {
+                tracing::error!(task = task_name, "Worker background task failed: {join_err}");
+            }
+            false
+        }
+        Err(_) => {
+            tracing::warn!(task = task_name, "Worker background task shutdown timed out");
+            false
+        }
     }
 }
 
@@ -949,5 +973,30 @@ mod tests {
 
         // 7. Verify the returned job was immediately nack'd back to queue
         assert_eq!(nack_count.load(Ordering::SeqCst), 1, "unstarted job must be nack'd immediately");
+    }
+
+    #[tokio::test]
+    async fn test_worker_handle_shutdown_reports_panic() {
+        let is_stopping = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let in_flight_count = Arc::new(AtomicU32::new(0));
+        let active_tasks = Arc::new(AtomicU32::new(1));
+
+        let panicked_task = tokio::spawn(async {
+            panic!("intentional test panic in worker task");
+        });
+
+        let handle = WorkerHandle {
+            worker_task: panicked_task,
+            heartbeat_task: None,
+            recovery_task: None,
+            is_stopping,
+            shutdown_notify,
+            in_flight_count,
+            active_tasks,
+        };
+
+        let success = handle.shutdown(Duration::from_secs(1)).await;
+        assert!(!success, "WorkerHandle::shutdown must return false when a task panics");
     }
 }

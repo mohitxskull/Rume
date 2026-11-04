@@ -209,12 +209,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<RelayPollResult, OutboxError> {
         // Automatically reclaim any expired in-flight message leases before polling new items.
-        // Propagate errors directly unless the backend explicitly does not support lease recovery.
-        match self.repository.recover_expired_claims(self.config.lease_duration_secs).await {
-            Ok(_) => {}
-            Err(OutboxError::Unsupported(_)) => {}
-            Err(e) => return Err(e),
-        }
+        // Propagate errors directly to prevent silent lease stalls or misconfigured repositories.
+        self.repository
+            .recover_expired_claims(self.config.lease_duration_secs)
+            .await?;
 
         let pending = self
             .repository

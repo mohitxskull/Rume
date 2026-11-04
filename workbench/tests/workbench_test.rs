@@ -68,8 +68,8 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
         .expect("migrations summary present");
     assert_eq!(
         migration_summary.applied.len(),
-        2,
-        "both core and workbench migrations must apply"
+        3,
+        "all three core, domain, and auth migrations must apply"
     );
 
     // Verify initial pool health
@@ -208,6 +208,30 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
         );
     }
 
+    // Case 5d: Negative Tenant Authorization Boundary:
+    // A valid Acme user attempting to access Globex by passing X-Tenant-ID: globex -> 403 Forbidden!
+    {
+        let req = Request::builder()
+            .uri("/api/v1/projects")
+            .method("POST")
+            .header("content-type", "application/json")
+            .header("x-tenant-id", "globex")
+            .header("authorization", "Bearer member-token") // valid Acme user token!
+            .body(Body::from(r#"{"name":"Attacker Project"}"#))
+            .unwrap();
+        let resp = app1.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "Acme user attempting to act on Globex tenant must be rejected with 403 Forbidden"
+        );
+        assert!(resp.headers().contains_key("x-request-id"));
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/problem+json"
+        );
+    }
+
     // =========================================================================
     // 6. Multi-Tenant Project CRUD & Tenant Boundary Isolation
     // =========================================================================
@@ -245,7 +269,7 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
             .method("POST")
             .header("content-type", "application/json")
             .header("x-tenant-id", "globex")
-            .header("authorization", "Bearer admin-token")
+            .header("authorization", "Bearer globex-admin-token")
             .body(Body::from(
                 r#"{"name":"Globex Global Logistics","description":"Logistics ERP"}"#,
             ))
@@ -367,10 +391,9 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
     // =========================================================================
     // 9. Concurrency & Graceful Shutdown Drain
     // =========================================================================
-    // Drain background worker and relay gracefully
-    let drained_worker = worker.drain(Duration::from_secs(5)).await;
+    // Drain background worker and relay gracefully using WorkerHandle::shutdown
+    let drained_worker = worker_handle.shutdown(Duration::from_secs(5)).await;
     assert!(drained_worker, "worker must drain cleanly within timeout");
-    assert!(worker_handle.is_finished());
 
     let drained_relay = relay.drain(Duration::from_secs(5)).await;
     assert!(drained_relay, "relay must drain cleanly within timeout");
@@ -378,4 +401,90 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
     let drained_pool = pool.close_and_drain(Duration::from_secs(5)).await;
     assert!(drained_pool, "pool must close and drain connections cleanly");
     assert!(pool.status().is_closed);
+}
+
+#[tokio::test]
+async fn test_workbench_run_with_signal_shutdown_during_active_operations() {
+    let node = Postgres::default()
+        .with_tag("16-alpine")
+        .start()
+        .await
+        .expect("start postgres container");
+
+    let host = node.get_host().await.expect("host");
+    let port = node.get_host_port_ipv4(5432).await.expect("port");
+    let db_name = format!("wb_shutdown_{}", uuid::Uuid::new_v4().simple());
+
+    let root_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+    let root_pool = sqlx::PgPool::connect(&root_url)
+        .await
+        .expect("connect root postgres");
+    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+        .execute(&root_pool)
+        .await
+        .expect("create test db");
+
+    let test_url = format!("postgres://postgres:postgres@{host}:{port}/{db_name}");
+    let mut pg_config = DatabaseConfig::new(&test_url);
+    pg_config.max_connections = 15;
+    pg_config.auto_migrate = true;
+
+    let backend = PostgresBackend::connect(&pg_config)
+        .await
+        .expect("connect postgres backend");
+    let pool = DatabasePool::new(backend, pg_config);
+
+    // Bind listener to ephemeral OS port
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind listener");
+    let local_addr = listener.local_addr().expect("local addr");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Spawn Workbench app lifecycle with graceful shutdown
+    let app_task = tokio::spawn(async move {
+        workbench::app::run_with_listener_and_shutdown(listener, pool, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    // Wait until port is accepting connections
+    let mut ready = false;
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(local_addr).await.is_ok() {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(ready, "Workbench server must be accepting TCP connections");
+
+    // Send HTTP health request over TCP
+    let mut stream = tokio::net::TcpStream::connect(local_addr).await.unwrap();
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(b"GET /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.unwrap();
+    let response_str = String::from_utf8_lossy(&response);
+    assert!(
+        response_str.contains("200 OK"),
+        "Health check must return 200 OK: {response_str}"
+    );
+
+    // Fire the graceful shutdown signal while server is active
+    let _ = shutdown_tx.send(());
+
+    // Await complete shutdown sequence (worker drain, relay drain, pool close)
+    let shutdown_result = app_task.await.expect("app task join");
+    assert!(
+        shutdown_result.is_ok(),
+        "Workbench application must terminate cleanly on shutdown signal: {:?}",
+        shutdown_result
+    );
 }

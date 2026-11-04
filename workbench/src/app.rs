@@ -22,11 +22,48 @@ use rume::events::Event;
 
 /// Builds the complete Axum router with state and middleware for Workbench.
 pub fn build_app(state: WorkbenchState, tenant_resolver: HeaderTenantResolver) -> Router {
-    build_api_router(tenant_resolver).with_state(state)
+    build_api_router(state.pool.clone(), tenant_resolver).with_state(state)
 }
 
-/// Runs the full Rume Workbench application lifecycle.
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// Default OS signal handler for SIGINT (Ctrl+C) and SIGTERM.
+pub async fn default_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to install Ctrl+C handler");
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install signal handler")
+            .recv()
+            .await;
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("Received SIGINT (Ctrl+C), initiating graceful shutdown");
+        },
+        _ = terminate => {
+            tracing::info!("Received SIGTERM, initiating graceful shutdown");
+        },
+    }
+}
+
+/// Runs the full Rume Workbench application lifecycle, listening for OS signals (SIGINT / SIGTERM).
+pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_with_shutdown(default_shutdown_signal()).await
+}
+
+/// Runs the Workbench application lifecycle with a custom shutdown signal future.
+pub async fn run_with_shutdown<F>(shutdown: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
     init_tracing();
 
     let env = rume::env::load::<Env>()?;
@@ -41,21 +78,37 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let backend = PostgresBackend::connect(&pg_config).await?;
     let pool = DatabasePool::new(backend, pg_config);
 
-    // 2. Execute Pending Migrations
+    // 2. Bind TCP listener
+    let listener = tokio::net::TcpListener::bind((env.host, env.port)).await?;
+    tracing::info!("Workbench listening on {}:{}", env.host, env.port);
+
+    run_with_listener_and_shutdown(listener, pool, shutdown).await
+}
+
+/// Runs the Workbench application lifecycle with an explicit TCP listener, pool, and shutdown signal future.
+pub async fn run_with_listener_and_shutdown<F>(
+    listener: tokio::net::TcpListener,
+    pool: DatabasePool<PostgresBackend>,
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // 1. Execute Pending Migrations
     let migrator = workbench_migrator();
     pool.apply_auto_migrations(&migrator).await?;
 
-    // 3. Initialize Postgres Job Queue & Registry
+    // 2. Initialize Postgres Job Queue & Registry
     let job_queue = Arc::new(PostgresJobQueue::new(pool.backend().pool().clone()));
     let notification_handler = NotificationHandler::new();
     let mut registry = JobRegistry::new();
     registry.register(notification_handler.clone());
 
-    // 4. Start Background Job Worker
+    // 3. Start Background Job Worker
     let worker = JobWorker::new(Arc::clone(&job_queue), Arc::new(registry));
-    let _worker_handle = worker.start();
+    let worker_handle = worker.start();
 
-    // 5. Initialize & Start Outbox Relay
+    // 4. Initialize & Start Outbox Relay
     // Dispatches IssueCreated events to SendNotificationJob
     let queue_for_relay = Arc::clone(&job_queue);
     let relay = OutboxRelay::new(Arc::new(pool.clone()), move |msg: &OutboxMessage| {
@@ -85,14 +138,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             Ok(())
         }
     });
-    let _relay_handle = relay.start(Duration::from_millis(250));
+    let relay_handle = relay.start(Duration::from_millis(250));
 
-    // 6. Setup Multi-Tenant Resolver
+    // 5. Setup Multi-Tenant Resolver
     let tenant_resolver = HeaderTenantResolver::new()
         .add_tenant(Tenant::new("acme-corp", "acme-corp"))
         .add_tenant(Tenant::new("globex", "globex"));
 
-    // 7. Assemble State & Router
+    // 6. Assemble State & Router
     let state = WorkbenchState {
         pool: pool.clone(),
         job_queue,
@@ -102,16 +155,36 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let app = build_app(state, tenant_resolver);
 
-    // 8. Bind & Serve HTTP Server
-    let listener = tokio::net::TcpListener::bind((env.host, env.port)).await?;
-    tracing::info!("Workbench listening on {}:{}", env.host, env.port);
-    axum::serve(listener, app).await?;
+    // 7. Bind & Serve HTTP Server with Graceful Shutdown
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await?;
 
-    // 9. Graceful Shutdown Drain
-    tracing::info!("Shutting down Workbench...");
-    worker.drain(Duration::from_secs(5)).await;
-    relay.drain(Duration::from_secs(5)).await;
-    pool.close_and_drain(Duration::from_secs(5)).await;
+    // 8. Supervised Graceful Shutdown Drain Sequence
+    tracing::info!("Shutting down Workbench background workers, relay, and connection pool...");
+    let drain_timeout = Duration::from_secs(5);
 
+    let worker_ok = worker_handle.shutdown(drain_timeout).await;
+    let relay_drain_ok = relay.drain(drain_timeout).await;
+    let relay_join_ok = match tokio::time::timeout(drain_timeout, relay_handle).await {
+        Ok(Ok(())) => true,
+        Ok(Err(e)) => {
+            tracing::error!("Relay background task join error: {e}");
+            false
+        }
+        Err(_) => {
+            tracing::error!("Relay background task shutdown timed out");
+            false
+        }
+    };
+    let pool_ok = pool.close_and_drain(drain_timeout).await;
+
+    if !worker_ok || !relay_drain_ok || !relay_join_ok || !pool_ok {
+        return Err(format!(
+            "Workbench graceful shutdown failure: worker_ok={worker_ok}, relay_drain_ok={relay_drain_ok}, relay_join_ok={relay_join_ok}, pool_ok={pool_ok}"
+        ).into());
+    }
+
+    tracing::info!("Workbench stopped cleanly.");
     Ok(())
 }

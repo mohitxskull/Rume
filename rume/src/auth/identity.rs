@@ -26,6 +26,8 @@ pub trait Identity: Send + Sync + 'static {
 pub struct AuthUser {
     /// Unique user or subject identifier.
     pub id: String,
+    /// Optional tenant or organization identifier to enforce multi-tenant authorization boundaries.
+    pub tenant_id: Option<String>,
     /// Roles assigned to this user (e.g., "admin", "editor", "member").
     pub roles: Vec<String>,
     /// Fine-grained permission strings (e.g., "users:read", "billing:write").
@@ -39,10 +41,23 @@ impl AuthUser {
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
+            tenant_id: None,
             roles: Vec::new(),
             permissions: Vec::new(),
             metadata: BTreeMap::new(),
         }
+    }
+
+    /// Binds the user to a specific tenant or organization identifier.
+    pub fn with_tenant_id(mut self, tenant_id: impl Into<String>) -> Self {
+        self.tenant_id = Some(tenant_id.into());
+        self
+    }
+
+    /// Adds a metadata key-value pair to the user.
+    pub fn with_metadata(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.metadata.insert(key.into(), value.into());
+        self
     }
 
     /// Adds a role to the user.

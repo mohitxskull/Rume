@@ -172,10 +172,11 @@ This phase proves that Rume is genuinely easier to build and operate with—not 
 | **STAB-03** | End-to-End Outbox & Background Processing | Atomic issue creation + `IssueCreatedEvent` enrollment in single DB transaction; outbox relay claims and dispatches to `SendNotificationJob`; worker executes with retry, DLQ, and Redis idempotency. | **Completed** |
 | **STAB-04** | Developer Experience (DX) Audit & Polish | Remove friction points: relative path resolution in `rume new`, ergonomic `AppError::bad_request` and `AppError::not_found` constructors, unified `Migration::from_sql` builder, and public schema constants. | **Completed** |
 | **STAB-05** | Multi-Instance Deployment Validation | Run two application instances concurrently with real PostgreSQL and Redis containers, verifying cross-tenant isolation, concurrent claiming via `SKIP LOCKED`, zero message duplicates, and graceful shutdown drain. | **Completed** |
+| **STAB-06** | Phase 6.1 Corrective Closure & Security Hardening | Supervised OS signal lifecycle with `WorkerHandle::shutdown()` panic/cancellation inspection; strict `TenantMembershipLayer` rejecting cross-tenant impersonation with 403 Forbidden; persisted organizations and users with database-backed token authentication; isolated multi-pool deployment validation; tightened queue and outbox repository contracts. | **Completed** |
 
 **Verification Suites:**
-- [`workbench/tests/workbench_test.rs`](../../../workbench/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, auth/authz, transaction-enlisted outbox, worker processing, and graceful drain).
-- [`workbench/tests/deployment_validation.rs`](../../../workbench/tests/deployment_validation.rs) (Multi-instance concurrency across tenants, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
+- [`workbench/tests/workbench_test.rs`](../../../workbench/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, persisted auth, negative tenant authorization tests, transaction-enlisted outbox, worker processing, and signal-based graceful shutdown drain).
+- [`workbench/tests/deployment_validation.rs`](../../../workbench/tests/deployment_validation.rs) (Multi-instance concurrency across tenants with independent connection pools, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
 
 ---
 
