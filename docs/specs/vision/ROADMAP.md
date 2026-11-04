@@ -195,10 +195,15 @@ With runtime durability, multi-tenant isolation, safe transactions, and first-cl
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
-| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Active Sprint** |
+| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Completed** |
 | **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **Completed** |
 | **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export, and zero-downtime rolling upgrades. | **P1** |
 | **REL-11** | Crate Publishing & Semantic Versioning Audit | Final audit of crate dependencies, API surface documentation, `#![forbid(unsafe_code)]` verification across all workspace crates, and v0.1.0 release packaging. | **P1** |
+
+**Verification Suites:**
+- [`workbench/benches/baseline.rs`](../../../workbench/benches/baseline.rs) (Real TCP network benchmark across concurrency levels [1, 8, 32, 64, 128], physical connection checkout & query execution, outbox relay throughput, and worker task scheduling).
+- [`workbench/tests/performance_baseline.rs`](../../../workbench/tests/performance_baseline.rs) (Automated CI performance qualification and SLA budget assertion).
+- [`rume-cli/tests/scaffold_template.rs`](../../../rume-cli/tests/scaffold_template.rs) (Scaffolding template verification with SQL assets, repository patterns, and embed migrations).
 
 ---
 
