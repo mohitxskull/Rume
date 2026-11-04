@@ -1,6 +1,6 @@
 //! Database migration definitions, runner, and preflight verification.
 
-use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction};
+use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::error::PersistenceError;
 
 /// Canonical migration identifier for Rume core persistence schemas.
@@ -10,9 +10,17 @@ const PG_OUTBOX: &str = include_str!("sql/postgres/outbox_schema.sql");
 const PG_JOBS: &str = include_str!("sql/postgres/jobs_schema.sql");
 const PG_LOCKS: &str = include_str!("sql/postgres/locks_schema.sql");
 const PG_LEADER: &str = include_str!("sql/postgres/leader_schema.sql");
+const PG_CORE_DOWN: &str = include_str!("sql/postgres/core_down.sql");
 
 const MYSQL_OUTBOX: &str = include_str!("sql/mysql/outbox_schema.sql");
+const MYSQL_CORE_DOWN: &str = include_str!("sql/mysql/core_down.sql");
+
 const SQLITE_OUTBOX: &str = include_str!("sql/sqlite/outbox_schema.sql");
+const SQLITE_CORE_DOWN: &str = include_str!("sql/sqlite/core_down.sql");
+
+const PG_MIGRATIONS_SCHEMA: &str = include_str!("sql/postgres/migrations_schema.sql");
+const MYSQL_MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.sql");
+const SQLITE_MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
 
 /// Canonical DDL for the migration tracking ledger table across all database backends.
 pub const CREATE_MIGRATIONS_TABLE_DDL: &str =
@@ -21,6 +29,51 @@ pub const CREATE_MIGRATIONS_TABLE_DDL: &str =
      name VARCHAR(255) NOT NULL DEFAULT '', \
      applied_at BIGINT NOT NULL, \
      checksum VARCHAR(64) NOT NULL DEFAULT '')";
+
+/// Returns the dialect-specific DDL for creating the `rume_migrations` table.
+pub fn migrations_schema_ddl(dialect: &str) -> &'static str {
+    match dialect {
+        "postgres" => PG_MIGRATIONS_SCHEMA,
+        "mysql" => MYSQL_MIGRATIONS_SCHEMA,
+        "sqlite" => SQLITE_MIGRATIONS_SCHEMA,
+        _ => CREATE_MIGRATIONS_TABLE_DDL,
+    }
+}
+
+fn find_checksum_query(dialect: &str) -> &'static str {
+    if dialect == "postgres" {
+        "SELECT checksum FROM rume_migrations WHERE id = $1"
+    } else {
+        "SELECT checksum FROM rume_migrations WHERE id = ?"
+    }
+}
+
+fn insert_migration_query(dialect: &str) -> &'static str {
+    if dialect == "postgres" {
+        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ($1, $2, $3, $4)"
+    } else {
+        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES (?, ?, ?, ?)"
+    }
+}
+
+fn delete_migration_query(dialect: &str) -> &'static str {
+    if dialect == "postgres" {
+        "DELETE FROM rume_migrations WHERE id = $1"
+    } else {
+        "DELETE FROM rume_migrations WHERE id = ?"
+    }
+}
+
+fn find_migration_id_query(dialect: &str) -> &'static str {
+    if dialect == "postgres" {
+        "SELECT id FROM rume_migrations WHERE id = $1"
+    } else {
+        "SELECT id FROM rume_migrations WHERE id = ?"
+    }
+}
+
+const LIST_APPLIED_MIGRATIONS_SQL: &str =
+    "SELECT id, applied_at FROM rume_migrations ORDER BY applied_at ASC";
 
 /// A single versioned database migration step.
 #[derive(Clone)]
@@ -108,26 +161,10 @@ impl Migrator {
                     "{}\n{}\n{}\n{}",
                     PG_OUTBOX, PG_JOBS, PG_LOCKS, PG_LEADER
                 );
-                let down = r#"
-DROP TABLE IF EXISTS rume_leaders;
-DROP TABLE IF EXISTS rume_locks;
-DROP TABLE IF EXISTS rume_jobs;
-DROP TABLE IF EXISTS rume_outbox;
-DROP SEQUENCE IF EXISTS rume_leader_term_seq;
-DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
-"#;
-                (up, down)
+                (up, PG_CORE_DOWN)
             }
-            "mysql" => {
-                let up = MYSQL_OUTBOX.to_string();
-                let down = "DROP TABLE IF EXISTS rume_outbox;";
-                (up, down)
-            }
-            "sqlite" => {
-                let up = SQLITE_OUTBOX.to_string();
-                let down = "DROP TABLE IF EXISTS rume_outbox;";
-                (up, down)
-            }
+            "mysql" => (MYSQL_OUTBOX.to_string(), MYSQL_CORE_DOWN),
+            "sqlite" => (SQLITE_OUTBOX.to_string(), SQLITE_CORE_DOWN),
             _ => {
                 return self;
             }
@@ -161,17 +198,14 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<Vec<String>, PersistenceError> {
-        backend
-            .execute(CREATE_MIGRATIONS_TABLE_DDL)
-            .await?;
+        let ddl = migrations_schema_ddl(backend.dialect());
+        backend.execute(ddl).await?;
 
+        let check_sql = find_checksum_query(backend.dialect());
         let mut pending = Vec::new();
         for migration in &self.migrations {
-            let check_sql = format!(
-                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
-                migration.id.replace('\'', "''")
-            );
-            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            let id_param = [DbValue::from(migration.id.as_str())];
+            let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
                 if !actual.is_empty() && actual != expected {
@@ -193,12 +227,10 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<Vec<(String, i64)>, PersistenceError> {
-        backend.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+        let ddl = migrations_schema_ddl(backend.dialect());
+        backend.execute(ddl).await?;
         let rows = backend
-            .fetch_all(
-                "SELECT id, applied_at FROM rume_migrations ORDER BY applied_at ASC",
-                &[],
-            )
+            .fetch_all(LIST_APPLIED_MIGRATIONS_SQL, &[])
             .await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -243,14 +275,13 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<(), PersistenceError> {
-        backend.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+        let ddl = migrations_schema_ddl(backend.dialect());
+        backend.execute(ddl).await?;
 
+        let check_sql = find_checksum_query(backend.dialect());
         for migration in &self.migrations {
-            let check_sql = format!(
-                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
-                migration.id.replace('\'', "''")
-            );
-            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            let id_param = [DbValue::from(migration.id.as_str())];
+            let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
                 if !actual.is_empty() && actual != expected {
@@ -271,18 +302,19 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         backend: &B,
     ) -> Result<MigrationSummary, PersistenceError> {
         let dialect = backend.dialect();
+        let ddl = migrations_schema_ddl(dialect);
+        let check_sql = find_checksum_query(dialect);
+        let insert_sql = insert_migration_query(dialect);
+
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
             tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
-            tx.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+            tx.execute(ddl).await?;
 
             let mut applied = Vec::new();
             for migration in &self.migrations {
-                let check_sql = format!(
-                    "SELECT checksum FROM rume_migrations WHERE id = '{}'",
-                    migration.id.replace('\'', "''")
-                );
-                let stored_checksum = tx.query_scalar(&check_sql).await?;
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
                 if let Some(actual) = stored_checksum {
                     let expected = migration.checksum();
                     if !actual.is_empty() && actual != expected {
@@ -313,16 +345,13 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
                             .unwrap_or_default()
                             .as_secs()
                     };
-                    let name = migration.description.replace('\'', "''");
-                    let checksum = migration.checksum();
-                    let insert_sql = format!(
-                        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ('{}', '{}', {}, '{}')",
-                        migration.id.replace('\'', "''"),
-                        name,
-                        now,
-                        checksum
-                    );
-                    tx.execute(&insert_sql).await?;
+                    let params = [
+                        DbValue::from(migration.id.as_str()),
+                        DbValue::from(migration.description.as_str()),
+                        DbValue::Int(now as i64),
+                        DbValue::from(migration.checksum().as_str()),
+                    ];
+                    tx.execute_params(insert_sql, &params).await?;
                     applied.push(migration.id.clone());
                 }
             }
@@ -330,17 +359,12 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
             return Ok(MigrationSummary { applied });
         }
 
-        backend
-            .execute(CREATE_MIGRATIONS_TABLE_DDL)
-            .await?;
+        backend.execute(ddl).await?;
 
         let mut applied = Vec::new();
         for migration in &self.migrations {
-            let check_sql = format!(
-                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
-                migration.id.replace('\'', "''")
-            );
-            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            let id_param = [DbValue::from(migration.id.as_str())];
+            let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
                 if !actual.is_empty() && actual != expected {
@@ -360,8 +384,7 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
                             message: err.to_string(),
                         })?;
                 }
-                let clock_query = match backend.dialect() {
-                    "postgres" => Some("SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text"),
+                let clock_query = match dialect {
                     "mysql" => Some("SELECT UNIX_TIMESTAMP()"),
                     "sqlite" => Some("SELECT CAST(strftime('%s', 'now') AS TEXT)"),
                     _ => None,
@@ -377,16 +400,13 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
                         .unwrap_or_default()
                         .as_secs()
                 };
-                let name = migration.description.replace('\'', "''");
-                let checksum = migration.checksum();
-                let insert_sql = format!(
-                    "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ('{}', '{}', {}, '{}')",
-                    migration.id.replace('\'', "''"),
-                    name,
-                    now,
-                    checksum
-                );
-                tx.execute(&insert_sql).await?;
+                let params = [
+                    DbValue::from(migration.id.as_str()),
+                    DbValue::from(migration.description.as_str()),
+                    DbValue::Int(now as i64),
+                    DbValue::from(migration.checksum().as_str()),
+                ];
+                tx.execute_params(insert_sql, &params).await?;
                 tx.commit().await?;
                 applied.push(migration.id.clone());
             }
@@ -401,17 +421,18 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         backend: &B,
     ) -> Result<Option<String>, PersistenceError> {
         let dialect = backend.dialect();
+        let ddl = migrations_schema_ddl(dialect);
+        let check_sql = find_migration_id_query(dialect);
+        let delete_sql = delete_migration_query(dialect);
+
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
             tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
-            tx.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+            tx.execute(ddl).await?;
 
             for migration in self.migrations.iter().rev() {
-                let check_sql = format!(
-                    "SELECT id FROM rume_migrations WHERE id = '{}'",
-                    migration.id.replace('\'', "''")
-                );
-                let applied = tx.query_scalar(&check_sql).await?;
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let applied = tx.query_scalar_params(check_sql, &id_param).await?;
                 if applied.is_some() {
                     let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
                         PersistenceError::IrreversibleMigration(migration.id.clone())
@@ -422,11 +443,7 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
                             migration: migration.id.clone(),
                             message: err.to_string(),
                         })?;
-                    let delete_sql = format!(
-                        "DELETE FROM rume_migrations WHERE id = '{}'",
-                        migration.id.replace('\'', "''")
-                    );
-                    tx.execute(&delete_sql).await?;
+                    tx.execute_params(delete_sql, &id_param).await?;
                     tx.commit().await?;
                     return Ok(Some(migration.id.clone()));
                 }
@@ -435,16 +452,11 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
             return Ok(None);
         }
 
-        backend
-            .execute(CREATE_MIGRATIONS_TABLE_DDL)
-            .await?;
+        backend.execute(ddl).await?;
 
         for migration in self.migrations.iter().rev() {
-            let check_sql = format!(
-                "SELECT id FROM rume_migrations WHERE id = '{}'",
-                migration.id.replace('\'', "''")
-            );
-            let exists = backend.query_scalar(&check_sql).await?;
+            let id_param = [DbValue::from(migration.id.as_str())];
+            let exists = backend.query_scalar_params(check_sql, &id_param).await?;
             if exists.is_some() {
                 let Some(sql) = &migration.down_sql else {
                     return Err(PersistenceError::IrreversibleMigration(
@@ -460,11 +472,7 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
                         message: err.to_string(),
                     })?;
 
-                let delete_sql = format!(
-                    "DELETE FROM rume_migrations WHERE id = '{}'",
-                    migration.id.replace('\'', "''")
-                );
-                tx.execute(&delete_sql).await?;
+                tx.execute_params(delete_sql, &id_param).await?;
                 tx.commit().await?;
                 return Ok(Some(migration.id.clone()));
             }
@@ -478,17 +486,14 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         &self,
         backend: &B,
     ) -> Result<(), PersistenceError> {
-        backend
-            .execute(CREATE_MIGRATIONS_TABLE_DDL)
-            .await?;
+        let ddl = migrations_schema_ddl(backend.dialect());
+        backend.execute(ddl).await?;
 
+        let check_sql = find_checksum_query(backend.dialect());
         let mut pending = Vec::new();
         for migration in &self.migrations {
-            let check_sql = format!(
-                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
-                migration.id.replace('\'', "''")
-            );
-            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            let id_param = [DbValue::from(migration.id.as_str())];
+            let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
                 if !actual.is_empty() && actual != expected {
