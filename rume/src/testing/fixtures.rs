@@ -33,12 +33,17 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
         Ok(())
     }
 
-    /// Discards and rolls back the transaction explicitly.
+    /// Discards and rolls back the transaction explicitly, awaiting completion.
     pub async fn rollback(mut self) -> Result<(), PersistenceError> {
         if let Some(tx) = self.tx.take() {
             tx.rollback().await?;
         }
         Ok(())
+    }
+
+    /// Discards and rolls back the transaction explicitly, awaiting completion.
+    pub async fn close(self) -> Result<(), PersistenceError> {
+        self.rollback().await
     }
 }
 
@@ -75,6 +80,7 @@ impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
 pub struct SqliteTestFixture {
     path: PathBuf,
     pool: DatabasePool<crate::persistence::SqliteBackend>,
+    closed: bool,
 }
 
 #[cfg(feature = "sqlite")]
@@ -90,7 +96,11 @@ impl SqliteTestFixture {
         let config = DatabaseConfig::new(format!("sqlite://{path_str}"));
         let pool = DatabasePool::new(backend, config);
 
-        Ok(Self { path, pool })
+        Ok(Self {
+            path,
+            pool,
+            closed: false,
+        })
     }
 
     /// Returns a reference to the database pool.
@@ -108,6 +118,27 @@ impl SqliteTestFixture {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
     }
+
+    /// Explicitly drains the pool and deletes temporary files, returning any errors to the test runner.
+    pub async fn close(mut self) -> Result<(), PersistenceError> {
+        self.closed = true;
+        // 1. Drain and close connection pool
+        self.pool.close_async().await;
+        // 2. Remove files deterministically
+        let path = self.path.clone();
+        let wal = PathBuf::from(format!("{}-wal", path.display()));
+        let shm = PathBuf::from(format!("{}-shm", path.display()));
+        if wal.exists() {
+            let _ = std::fs::remove_file(wal);
+        }
+        if shm.exists() {
+            let _ = std::fs::remove_file(shm);
+        }
+        if path.exists() {
+            std::fs::remove_file(&path).map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "sqlite")]
@@ -123,6 +154,7 @@ impl std::fmt::Debug for SqliteTestFixture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteTestFixture")
             .field("path", &self.path)
+            .field("closed", &self.closed)
             .finish()
     }
 }
@@ -130,10 +162,12 @@ impl std::fmt::Debug for SqliteTestFixture {
 #[cfg(feature = "sqlite")]
 impl Drop for SqliteTestFixture {
     fn drop(&mut self) {
-        let path = self.path.clone();
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(format!("{}-wal", path.display()));
-        let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+        if !self.closed {
+            let path = self.path.clone();
+            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+            let _ = std::fs::remove_file(format!("{}-shm", path.display()));
+            let _ = std::fs::remove_file(&path);
+        }
     }
 }
 
@@ -143,6 +177,7 @@ pub struct PostgresSchemaFixture {
     schema_name: String,
     pool: DatabasePool<crate::persistence::PostgresBackend>,
     admin_pool: Option<DatabasePool<crate::persistence::PostgresBackend>>,
+    closed: bool,
 }
 
 #[cfg(feature = "postgres")]
@@ -172,6 +207,7 @@ impl PostgresSchemaFixture {
             schema_name,
             pool,
             admin_pool: Some(admin_pool.clone()),
+            closed: false,
         })
     }
 
@@ -190,6 +226,19 @@ impl PostgresSchemaFixture {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
     }
+
+    /// Explicitly drains the pool and drops the schema, returning any cleanup errors to the test runner.
+    pub async fn close(mut self) -> Result<(), PersistenceError> {
+        self.closed = true;
+        self.pool.close_async().await;
+        if let Some(admin) = self.admin_pool.take() {
+            admin
+                .backend()
+                .execute(&format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema_name))
+                .await?;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(feature = "postgres")]
@@ -205,6 +254,7 @@ impl std::fmt::Debug for PostgresSchemaFixture {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PostgresSchemaFixture")
             .field("schema_name", &self.schema_name)
+            .field("closed", &self.closed)
             .finish()
     }
 }
@@ -212,7 +262,9 @@ impl std::fmt::Debug for PostgresSchemaFixture {
 #[cfg(feature = "postgres")]
 impl Drop for PostgresSchemaFixture {
     fn drop(&mut self) {
-        if let Some(admin) = self.admin_pool.take() {
+        if !self.closed
+            && let Some(admin) = self.admin_pool.take()
+        {
             let schema = self.schema_name.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
@@ -275,5 +327,56 @@ mod tests {
 
         let count2: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM items").await.expect("count");
         assert_eq!(count2.as_deref(), Some("1"), "committed transaction must persist");
+        fixture.close().await.expect("fixture close");
+    }
+
+    #[tokio::test]
+    async fn test_sqlite_test_fixture_explicit_close_and_cleanup() {
+        let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+        let path = fixture.path().to_path_buf();
+        assert!(path.exists());
+
+        fixture.pool().backend().execute("CREATE TABLE t (id INT)").await.expect("execute");
+        fixture.close().await.expect("explicit close should succeed");
+
+        assert!(!path.exists(), "database file must be cleaned up on close");
+        assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
+        assert!(!PathBuf::from(format!("{}-shm", path.display())).exists());
+    }
+
+    #[tokio::test]
+    async fn test_transaction_fixture_explicit_rollback() {
+        let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+        fixture.pool().backend().execute("CREATE TABLE t (v INT)").await.expect("create");
+
+        let tx = fixture.begin_test_tx().await.expect("tx");
+        tx.execute("INSERT INTO t VALUES (42)").await.expect("insert");
+        tx.rollback().await.expect("explicit rollback should succeed");
+
+        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM t").await.expect("count");
+        assert_eq!(count.as_deref(), Some("0"));
+
+        fixture.close().await.expect("close");
+    }
+
+    #[tokio::test]
+    async fn test_parallel_fixtures_deterministic_isolation() {
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            handles.push(tokio::spawn(async move {
+                let fixture = SqliteTestFixture::create().await.expect("create");
+                fixture.pool().backend().execute("CREATE TABLE p (v INT)").await.expect("create");
+                fixture.pool().backend().execute(&format!("INSERT INTO p VALUES ({i})")).await.expect("insert");
+                let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM p").await.expect("count");
+                assert_eq!(count.as_deref(), Some("1"));
+                let path = fixture.path().to_path_buf();
+                fixture.close().await.expect("close");
+                assert!(!path.exists());
+            }));
+        }
+
+        for h in handles {
+            h.await.expect("task completes successfully");
+        }
     }
 }

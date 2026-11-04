@@ -140,11 +140,40 @@ impl TraceContext {
         }
         true
     }
+
+    /// Serializes the trace context into a persistent string preserving both `traceparent` and `tracestate`.
+    pub fn to_serialized(&self) -> String {
+        if let Some(ref ts) = self.tracestate {
+            format!("{}\n{}", self.traceparent, ts)
+        } else {
+            self.traceparent.clone()
+        }
+    }
+
+    /// Parses a serialized trace context string, reconstructing both `traceparent` and `tracestate`.
+    pub fn parse_serialized(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some((tp, ts)) = s.split_once('\n') {
+            let tp = tp.trim();
+            let ts = ts.trim();
+            if Self::is_valid_traceparent(tp) {
+                return Some(Self {
+                    traceparent: tp.to_string(),
+                    tracestate: if ts.is_empty() { None } else { Some(ts.to_string()) },
+                });
+            }
+        }
+        if Self::is_valid_traceparent(s) {
+            Some(Self::from_traceparent(s))
+        } else {
+            None
+        }
+    }
 }
 
 impl Display for TraceContext {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.traceparent)
+        write!(f, "{}", self.to_serialized())
     }
 }
 
@@ -329,10 +358,12 @@ where
             .get::<axum::extract::MatchedPath>()
             .map(|mp| mp.as_str().to_string());
 
+        let tracestate_str = trace_context.tracestate.clone();
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
             traceparent = %trace_context.traceparent,
+            tracestate = trace_context.tracestate.as_deref().unwrap_or(""),
             method = %method,
             route = tracing::field::Empty,
             status = tracing::field::Empty,
@@ -378,6 +409,11 @@ where
                 }
                 if let Ok(hdr_val) = HeaderValue::from_str(&trace_parent_str) {
                     response.headers_mut().insert(TRACEPARENT.clone(), hdr_val);
+                }
+                if let Some(ref ts) = tracestate_str
+                    && let Ok(hdr_val) = HeaderValue::from_str(ts)
+                {
+                    response.headers_mut().insert(TRACESTATE.clone(), hdr_val);
                 }
 
                 // If response is RFC 9457 Problem Details, ensure request_id is populated safely.
@@ -491,5 +527,69 @@ mod tests {
         init_tracing();
         let second_try = try_init_tracing();
         assert!(second_try.is_err());
+    }
+
+    #[test]
+    fn trace_context_serialization_and_deserialization() {
+        let parent = TraceContext {
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            tracestate: Some("rojo=1,congo=2".to_string()),
+        };
+
+        let serialized = parent.to_serialized();
+        assert_eq!(
+            serialized,
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01\nrojo=1,congo=2"
+        );
+
+        let parsed = TraceContext::parse_serialized(&serialized).expect("must parse successfully");
+        assert_eq!(parsed.traceparent, parent.traceparent);
+        assert_eq!(parsed.tracestate.as_deref(), Some("rojo=1,congo=2"));
+
+        let child = parsed.new_child();
+        assert_eq!(child.trace_id(), parent.trace_id());
+        assert_ne!(child.span_id(), parent.span_id());
+        assert_eq!(child.tracestate.as_deref(), Some("rojo=1,congo=2"));
+
+        // Single-line backwards compatibility
+        let single_line = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let parsed_single =
+            TraceContext::parse_serialized(single_line).expect("must parse single line");
+        assert_eq!(parsed_single.traceparent, single_line);
+        assert_eq!(parsed_single.tracestate, None);
+    }
+
+    #[tokio::test]
+    async fn observability_service_injects_and_propagates_tracestate() {
+        use tower::{Layer, Service};
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(
+            |_req: Request<Body>| async {
+                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+            },
+        ));
+
+        let req = Request::builder()
+            .uri("/test")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .header("tracestate", "vendor=val1,other=val2")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.expect("service call succeeds");
+        assert_eq!(
+            resp.headers()
+                .get("traceparent")
+                .and_then(|h| h.to_str().ok()),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+        assert_eq!(
+            resp.headers()
+                .get("tracestate")
+                .and_then(|h| h.to_str().ok()),
+            Some("vendor=val1,other=val2")
+        );
     }
 }

@@ -91,13 +91,7 @@ impl JobRegistry {
         let tc = job
             .trace_context
             .as_deref()
-            .and_then(|s| {
-                if crate::app::TraceContext::is_valid_traceparent(s) {
-                    Some(crate::app::TraceContext::from_traceparent(s).new_child())
-                } else {
-                    None
-                }
-            })
+            .and_then(|s| crate::app::TraceContext::parse_serialized(s).map(|c| c.new_child()))
             .unwrap_or_else(crate::app::TraceContext::generate);
 
         let span = tracing::info_span!(

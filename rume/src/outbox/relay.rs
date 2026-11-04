@@ -287,13 +287,8 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let tc = message
                 .trace_context
                 .as_deref()
-                .and_then(|s| {
-                    if crate::app::TraceContext::is_valid_traceparent(s) {
-                        Some(crate::app::TraceContext::from_traceparent(s).new_child())
-                    } else {
-                        None
-                    }
-                })
+                .and_then(crate::app::TraceContext::parse_serialized)
+                .map(|ctx| ctx.new_child())
                 .unwrap_or_else(crate::app::TraceContext::generate);
 
             let span = tracing::info_span!(
@@ -301,6 +296,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 message.id = %message.id,
                 message.event_type = %message.event_type,
                 traceparent = %tc.traceparent,
+                tracestate = tc.tracestate.as_deref().unwrap_or(""),
             );
             use tracing::Instrument;
 
