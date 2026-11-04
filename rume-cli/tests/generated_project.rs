@@ -357,9 +357,15 @@ fn make_migration_and_db_commands_workflow() {
         .filter_map(Result::ok)
         .map(|e| e.file_name().to_string_lossy().to_string())
         .collect();
-    assert_eq!(entries.len(), 2);
-    let up_file = entries.iter().find(|n| n.ends_with(".up.sql")).unwrap();
-    let down_file = entries.iter().find(|n| n.ends_with(".down.sql")).unwrap();
+    assert_eq!(entries.len(), 4);
+    let up_file = entries
+        .iter()
+        .find(|n| n.contains("create_users_table") && n.ends_with(".up.sql"))
+        .unwrap();
+    let down_file = entries
+        .iter()
+        .find(|n| n.contains("create_users_table") && n.ends_with(".down.sql"))
+        .unwrap();
 
     // 3. Run `rume db status` (offline / without DB URL)
     let status_offline = Command::new(rume_binary())

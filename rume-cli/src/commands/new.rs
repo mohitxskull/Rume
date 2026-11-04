@@ -78,6 +78,38 @@ const TEMPLATES: &[(&str, &str)] = &[
         include_str!("../../templates/src/handlers/health.rs.tpl"),
     ),
     (
+        "src/migrations.rs",
+        include_str!("../../templates/src/migrations.rs.tpl"),
+    ),
+    (
+        "src/queries.rs",
+        include_str!("../../templates/src/queries.rs.tpl"),
+    ),
+    (
+        "src/repository.rs",
+        include_str!("../../templates/src/repository.rs.tpl"),
+    ),
+    (
+        "sql/items/create.sql",
+        include_str!("../../templates/sql/items/create.sql.tpl"),
+    ),
+    (
+        "sql/items/find.sql",
+        include_str!("../../templates/sql/items/find.sql.tpl"),
+    ),
+    (
+        "sql/items/list.sql",
+        include_str!("../../templates/sql/items/list.sql.tpl"),
+    ),
+    (
+        "migrations/00000000000000_init.up.sql",
+        include_str!("../../templates/migrations/00000000000000_init.up.sql.tpl"),
+    ),
+    (
+        "migrations/00000000000000_init.down.sql",
+        include_str!("../../templates/migrations/00000000000000_init.down.sql.tpl"),
+    ),
+    (
         "tests/smoke.rs",
         include_str!("../../templates/tests/smoke.rs.tpl"),
     ),
