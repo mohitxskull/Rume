@@ -195,8 +195,8 @@ With runtime durability, multi-tenant isolation, safe transactions, and first-cl
 
 | ID | Task | Acceptance Criteria | Target |
 |---|---|---|---|
-| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **P1** |
-| **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **P1** |
+| **REL-08** | Production Benchmarks & Load Testing | Benchmark throughput and latency overhead of Rume middleware pipelines, connection pooling, outbox relay throughput under high concurrency, and worker task scheduling. | **Completed** |
+| **REL-09** | CLI & Scaffolding Template Hardening | Update `rume new` templates to scaffold repository layering with first-class `rume::sql_assets!`, compile-time conventional migrations via `rume::embed_migrations!`, and core persistence schema chaining via `.with_rume_core()`. | **Completed** |
 | **REL-10** | Production Deployment Guides & Observability | Comprehensive documentation for Kubernetes deployment, health probes, Prometheus metrics scraping, OpenTelemetry tracing export, and zero-downtime rolling upgrades. | **P1** |
 | **REL-11** | Crate Publishing & Semantic Versioning Audit | Final audit of crate dependencies, API surface documentation, `#![forbid(unsafe_code)]` verification across all workspace crates, and v0.1.0 release packaging. | **P1** |
 
