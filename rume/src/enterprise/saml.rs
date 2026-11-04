@@ -1,9 +1,25 @@
 //! SAML 2.0 assertion parsing, claim extraction, and condition validation.
+//!
+//! **Stability: Experimental.**
+//! This module is currently experimental while cryptographic trust boundaries and XMLDSig
+//! verification continue hardening.
 
 use std::collections::BTreeMap;
 use quick_xml::events::Event;
+use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
 use thiserror::Error;
+
+const SAML_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
+const SAML_PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
+const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
+
+fn is_ns(res: &ResolveResult<'_>, expected: &str) -> bool {
+    match res {
+        ResolveResult::Bound(ns) => ns.as_ref() == expected,
+        _ => false,
+    }
+}
 
 /// SAML processing and validation errors.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -61,11 +77,9 @@ pub trait SamlSignatureVerifier: Send + Sync {
     fn verify_assertion_signature(
         &self,
         raw_xml: &str,
-        _assertion_id: &str,
-        _assertion_xml: &str,
-    ) -> Result<(), SamlError> {
-        self.verify_signature(raw_xml)
-    }
+        assertion_id: &str,
+        assertion_xml: &str,
+    ) -> Result<(), SamlError>;
 }
 
 /// A validated SAML 2.0 authentication assertion.
@@ -116,9 +130,22 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
         .and_then(|p| p.parse().ok())
         .ok_or_else(|| SamlError::Malformed(format!("invalid day in timestamp '{s}'")))?;
 
-    if year < 1970 || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if year < 1970 || !(1..=12).contains(&month) {
         return Err(SamlError::Malformed(format!(
             "timestamp '{s}' out of valid date bounds"
+        )));
+    }
+
+    let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
+    let max_days = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => if is_leap { 29 } else { 28 },
+        _ => 0,
+    };
+    if day == 0 || day > max_days {
+        return Err(SamlError::Malformed(format!(
+            "timestamp '{s}' day {day} is invalid for month {month} in year {year}"
         )));
     }
 
@@ -321,7 +348,7 @@ impl SamlParser {
 
         let mut signature_references: Vec<String> = Vec::new();
 
-        let mut element_stack: Vec<String> = Vec::new();
+        let mut element_stack: Vec<(String, bool)> = Vec::new();
         let mut in_assertion = false;
         let mut current_attr_name: Option<String> = None;
 
@@ -329,11 +356,19 @@ impl SamlParser {
             let event_start = reader.buffer_position() as usize;
 
             match reader.read_resolved_event() {
-                Ok((_res, Event::Start(ref e))) => {
+                Ok((res, Event::Start(ref e))) => {
                     let local = e.local_name();
                     let local_name = local.as_ref();
+                    let is_saml_ns = is_ns(&res, SAML_ASSERTION_NS);
+                    let is_protocol_ns = is_ns(&res, SAML_PROTOCOL_NS);
+                    let is_dsig_ns = is_ns(&res, XMLDSIG_NS);
 
                     if local_name == "Assertion" {
+                        if !is_saml_ns {
+                            return Err(SamlError::SignatureWrappingDetected(
+                                "Assertion element has invalid or foreign namespace URI".into(),
+                            ));
+                        }
                         assertion_count += 1;
                         if assertion_count > 1 {
                             return Err(SamlError::SignatureWrappingDetected(
@@ -349,7 +384,7 @@ impl SamlParser {
                                 assertion_id = Some(attr.value.as_ref().to_string());
                             }
                         }
-                    } else if local_name == "Response" {
+                    } else if local_name == "Response" && is_protocol_ns {
                         for attr in e.attributes().flatten() {
                             let local_k = attr.key.local_name();
                             let k = local_k.as_ref();
@@ -359,7 +394,7 @@ impl SamlParser {
                                 destination = Some(attr.value.as_ref().to_string());
                             }
                         }
-                    } else if local_name == "Reference" {
+                    } else if local_name == "Reference" && is_dsig_ns {
                         for attr in e.attributes().flatten() {
                             let local_k = attr.key.local_name();
                             if local_k.as_ref() == "URI" {
@@ -368,7 +403,7 @@ impl SamlParser {
                                 signature_references.push(ref_id.to_string());
                             }
                         }
-                    } else if in_assertion {
+                    } else if in_assertion && is_saml_ns {
                         if local_name == "Conditions" {
                             for attr in e.attributes().flatten() {
                                 let local_k = attr.key.local_name();
@@ -389,24 +424,24 @@ impl SamlParser {
                         }
                     }
 
-                    element_stack.push(local_name.to_string());
+                    element_stack.push((local_name.to_string(), is_saml_ns));
                 }
-                Ok((_res, Event::End(ref e))) => {
+                Ok((res, Event::End(ref e))) => {
                     let local = e.local_name();
                     let local_name = local.as_ref();
-                    if local_name == "Assertion" {
+                    if local_name == "Assertion" && is_ns(&res, SAML_ASSERTION_NS) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
-                    } else if local_name == "Attribute" {
+                    } else if local_name == "Attribute" && is_ns(&res, SAML_ASSERTION_NS) {
                         current_attr_name = None;
                     }
                     element_stack.pop();
                 }
                 Ok((_res, Event::Text(ref t))) => {
                     if in_assertion {
-                        let parent = element_stack.last().map(|s| s.as_str());
+                        let parent = element_stack.last();
                         let grand_parent = if element_stack.len() >= 2 {
-                            Some(element_stack[element_stack.len() - 2].as_str())
+                            element_stack.get(element_stack.len() - 2)
                         } else {
                             None
                         };
@@ -415,17 +450,20 @@ impl SamlParser {
                             .map(|c| c.trim().to_string())
                             .unwrap_or_else(|_| t.as_ref().trim().to_string());
 
-                        if !text.is_empty() {
-                            if parent == Some("Issuer") && issuer.is_none() {
+                        if !text.is_empty()
+                            && let Some((p_name, true)) = parent
+                        {
+                            if p_name == "Issuer" && issuer.is_none() {
                                 issuer = Some(text);
-                            } else if parent == Some("NameID")
-                                && grand_parent == Some("Subject")
+                            } else if p_name == "NameID"
                                 && subject.is_none()
+                                && let Some((gp_name, true)) = grand_parent
+                                && gp_name == "Subject"
                             {
                                 subject = Some(text);
-                            } else if parent == Some("Audience") && audience.is_none() {
+                            } else if p_name == "Audience" && audience.is_none() {
                                 audience = Some(text);
-                            } else if parent == Some("AttributeValue") && current_attr_name.is_some() {
+                            } else if p_name == "AttributeValue" && current_attr_name.is_some() {
                                 attributes
                                     .entry(current_attr_name.clone().unwrap())
                                     .or_default()
@@ -436,26 +474,28 @@ impl SamlParser {
                 }
                 Ok((_res, Event::CData(ref c))) => {
                     if in_assertion {
-                        let parent = element_stack.last().map(|s| s.as_str());
+                        let parent = element_stack.last();
                         let grand_parent = if element_stack.len() >= 2 {
-                            Some(element_stack[element_stack.len() - 2].as_str())
+                            element_stack.get(element_stack.len() - 2)
                         } else {
                             None
                         };
 
                         let text = c.as_ref().trim().to_string();
-
-                        if !text.is_empty() {
-                            if parent == Some("Issuer") && issuer.is_none() {
+                        if !text.is_empty()
+                            && let Some((p_name, true)) = parent
+                        {
+                            if p_name == "Issuer" && issuer.is_none() {
                                 issuer = Some(text);
-                            } else if parent == Some("NameID")
-                                && grand_parent == Some("Subject")
+                            } else if p_name == "NameID"
                                 && subject.is_none()
+                                && let Some((gp_name, true)) = grand_parent
+                                && gp_name == "Subject"
                             {
                                 subject = Some(text);
-                            } else if parent == Some("Audience") && audience.is_none() {
+                            } else if p_name == "Audience" && audience.is_none() {
                                 audience = Some(text);
-                            } else if parent == Some("AttributeValue") && current_attr_name.is_some() {
+                            } else if p_name == "AttributeValue" && current_attr_name.is_some() {
                                 attributes
                                     .entry(current_attr_name.clone().unwrap())
                                     .or_default()

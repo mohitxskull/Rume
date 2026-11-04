@@ -20,10 +20,20 @@ use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 /// Metrics and status information for a database connection pool.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct PoolStatus {
+    /// Logical connection leases currently held by application callers via `acquire_lease`.
+    pub leased_connections: u32,
+    /// Physical active (busy) connections in the underlying driver pool (`total - idle`),
+    /// or equal to `leased_connections` if in-memory/mock backend without a separate pool.
     pub active_connections: u32,
+    /// Physical idle connections available in the underlying driver pool.
+    pub idle_connections: u32,
+    /// Physical total connections opened by the underlying driver pool.
     pub total_connections: u32,
+    /// Configured maximum connection limit.
     pub max_connections: u32,
+    /// In-flight transaction handles.
     pub in_flight_transactions: u32,
+    /// Whether the pool is closed.
     pub is_closed: bool,
 }
 
@@ -109,10 +119,13 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     pub fn status(&self) -> PoolStatus {
         let is_closed = self.is_closed.load(Ordering::Relaxed) || self.backend.is_closed();
         let total = self.backend.pool_size();
+        let idle = self.backend.pool_idle();
         self.total_connections.store(total, Ordering::Relaxed);
-        let active = self.active_connections.load(Ordering::Relaxed);
+        let leased = self.active_connections.load(Ordering::Relaxed);
         PoolStatus {
-            active_connections: active,
+            leased_connections: leased,
+            active_connections: leased,
+            idle_connections: idle,
             total_connections: total,
             max_connections: self.config.max_connections,
             in_flight_transactions: self.in_flight_transactions.load(Ordering::Relaxed),
@@ -305,8 +318,16 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
             let status = pool.status();
             let mut meta = BTreeMap::new();
             meta.insert(
+                "leased_connections".to_string(),
+                serde_json::json!(status.leased_connections),
+            );
+            meta.insert(
                 "active_connections".to_string(),
                 serde_json::json!(status.active_connections),
+            );
+            meta.insert(
+                "idle_connections".to_string(),
+                serde_json::json!(status.idle_connections),
             );
             meta.insert(
                 "total_connections".to_string(),

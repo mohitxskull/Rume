@@ -88,7 +88,11 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
         max_lease_age_secs: u64,
     ) -> BoxFuture<'_, Result<usize, OutboxError>> {
         let _ = max_lease_age_secs;
-        Box::pin(async move { Ok(0) })
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(
+                "recover_expired_claims not supported by this repository backend".into(),
+            ))
+        })
     }
 
     /// Returns the number of currently pending outbox messages.
@@ -99,7 +103,11 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
 
     /// Returns the number of permanently failed (dead-lettered) messages.
     fn failed_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move { Ok(0) })
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(
+                "failed_count not supported by this repository backend".into(),
+            ))
+        })
     }
 
     /// Fetches up to `limit` permanently failed (dead-lettered) messages for inspection.
@@ -107,12 +115,21 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
         &self,
         _limit: usize,
     ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        Box::pin(async move { Ok(vec![]) })
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(
+                "fetch_failed not supported by this repository backend".into(),
+            ))
+        })
     }
 
     /// Resets a permanently failed message back to `Pending` status with reset retry count.
-    fn reprocess_failed(&self, _id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
-        Box::pin(async move { Ok(()) })
+    fn reprocess_failed(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let msg_id = id.to_string();
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(format!(
+                "reprocess_failed not supported by this repository backend (id={msg_id})"
+            )))
+        })
     }
 }
 

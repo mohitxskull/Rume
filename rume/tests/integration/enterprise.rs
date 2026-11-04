@@ -139,6 +139,15 @@ fn test_saml_signature_verifier() {
                 Err(SamlError::InvalidSignature("bad digest".into()))
             }
         }
+
+        fn verify_assertion_signature(
+            &self,
+            raw_xml: &str,
+            _assertion_id: &str,
+            _assertion_xml: &str,
+        ) -> Result<(), SamlError> {
+            self.verify_signature(raw_xml)
+        }
     }
 
     let saml_xml = r#"
@@ -377,6 +386,42 @@ fn test_saml_malformed_conditions_fail_closed() {
     assert!(
         matches!(res_date, Err(SamlError::Malformed(_))),
         "out of bounds timestamp must fail closed"
+    );
+
+    // Day 29 on non-leap year 2026 must fail closed
+    let xml_non_leap = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_bad_feb">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions NotBefore="2026-02-29T12:00:00Z" />
+    </saml2:Assertion>
+    "#;
+    assert!(matches!(SamlParser::parse_unverified(xml_non_leap), Err(SamlError::Malformed(_))));
+
+    // Day 31 on 30-day month April must fail closed
+    let xml_bad_apr = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_bad_apr">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        <saml2:Conditions NotBefore="2026-04-31T12:00:00Z" />
+    </saml2:Assertion>
+    "#;
+    assert!(matches!(SamlParser::parse_unverified(xml_bad_apr), Err(SamlError::Malformed(_))));
+}
+
+#[test]
+fn test_saml_foreign_namespace_assertion_rejected() {
+    // Assertion element bound to foreign namespace must be rejected as wrapping attack
+    let foreign_xml = r#"
+    <evil:Assertion xmlns:evil="http://evil.com/fake-saml" ID="_hacked">
+        <evil:Issuer>https://evil.com</evil:Issuer>
+        <evil:Subject><evil:NameID>attacker@evil.com</evil:NameID></evil:Subject>
+    </evil:Assertion>
+    "#;
+    let res = SamlParser::parse_unverified(foreign_xml);
+    assert!(
+        matches!(res, Err(SamlError::SignatureWrappingDetected(_))),
+        "foreign namespace assertion must fail closed with SignatureWrappingDetected"
     );
 }
 

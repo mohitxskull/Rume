@@ -95,8 +95,7 @@ impl JobQueue for PostgresJobQueue {
             let payload =
                 serde_json::to_vec(&job).map_err(|e| JobError::Serialization(e.to_string()))?;
 
-            let now = current_epoch_millis();
-            let available_at = now.saturating_add(delay.as_millis() as i64);
+            let delay_ms = delay.as_millis() as i64;
             let max_attempts = retry_policy.max_attempts as i32;
             let initial_backoff_ms = retry_policy.initial_backoff_ms as i64;
             let max_backoff_ms = retry_policy.max_backoff_ms as i64;
@@ -114,8 +113,7 @@ impl JobQueue for PostgresJobQueue {
                 .bind(timeout_ms)
                 .bind(&idempotency_key)
                 .bind(&tenant_id)
-                .bind(available_at)
-                .bind(now)
+                .bind(delay_ms)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;

@@ -167,10 +167,12 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<RelayPollResult, OutboxError> {
         // Automatically reclaim any expired in-flight message leases before polling new items.
-        // Propagate errors directly so callers/operators are aware of database failures.
-        self.repository
-            .recover_expired_claims(self.config.lease_duration_secs)
-            .await?;
+        // Propagate errors directly unless the backend explicitly does not support lease recovery.
+        match self.repository.recover_expired_claims(self.config.lease_duration_secs).await {
+            Ok(_) => {}
+            Err(OutboxError::Unsupported(_)) => {}
+            Err(e) => return Err(e),
+        }
 
         let pending = self
             .repository
@@ -311,7 +313,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     }
 
     /// Spawns the background polling loop using configured interval and batch size.
-    pub fn start_with_config(&self) {
+    /// Spawns the background polling loop using configured interval and batch size.
+    ///
+    /// Returns a [`tokio::task::JoinHandle`] enabling background task supervision and cancellation.
+    pub fn start_with_config(&self) -> tokio::task::JoinHandle<()> {
         let relay = self.clone();
         tokio::spawn(async move {
             let interval = relay.config.poll_interval;
@@ -334,33 +339,18 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 }
                 sleep(interval).await;
             }
-        });
+        })
     }
 
     /// Spawns the background polling loop with explicit interval.
-    pub fn start(&self, interval: Duration) {
-        let relay = self.clone();
-        let batch = relay.config.batch_size;
-        tokio::spawn(async move {
-            while !relay.is_stopping.load(Ordering::Relaxed) {
-                match relay.poll_and_dispatch(batch).await {
-                    Ok(res) => {
-                        if !res.is_success() {
-                            tracing::error!(
-                                published = res.published,
-                                retried = res.retried,
-                                failed_transitions = res.failed_transitions,
-                                "Outbox relay encountered failed message state transitions"
-                            );
-                        }
-                    }
-                    Err(err) => {
-                        tracing::error!(error = %err, "Outbox relay background dispatch error");
-                    }
-                }
-                sleep(interval).await;
-            }
-        });
+    ///
+    /// Returns a [`tokio::task::JoinHandle`] enabling background task supervision and cancellation.
+    pub fn start(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
+        let mut config = self.config.clone();
+        config.poll_interval = interval;
+        let mut relay = self.clone();
+        relay.config = config;
+        relay.start_with_config()
     }
 
     /// Requests shutdown and drains remaining pending messages within `timeout`.
