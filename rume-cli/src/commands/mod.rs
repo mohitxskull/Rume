@@ -84,9 +84,9 @@ pub async fn run(cli: Cli) {
             require_rume_project();
             db::run(crate::cli::DbCommands::Rollback).await;
         }
-        Some(Commands::SqlCheck { path, format, json }) => {
+        Some(Commands::SqlCheck { path, dialect, db, format, json }) => {
             require_rume_project();
-            sql_check::run(&path, &format, json);
+            sql_check::run(&path, &format, json, dialect.as_deref(), db).await;
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

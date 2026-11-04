@@ -236,6 +236,35 @@ DROP SEQUENCE IF EXISTS rume_lock_fencing_seq;
         self.verify_no_pending_backend(backend).await
     }
 
+    /// Verifies checksums of all applied migrations against local definitions on any [`DatabaseBackend`].
+    ///
+    /// Fails closed with [`PersistenceError::MigrationChecksumMismatch`] if any applied migration has drifted.
+    pub async fn verify_applied_checksums<B: DatabaseBackend>(
+        &self,
+        backend: &B,
+    ) -> Result<(), PersistenceError> {
+        backend.execute(CREATE_MIGRATIONS_TABLE_DDL).await?;
+
+        for migration in &self.migrations {
+            let check_sql = format!(
+                "SELECT checksum FROM rume_migrations WHERE id = '{}'",
+                migration.id.replace('\'', "''")
+            );
+            let stored_checksum = backend.query_scalar(&check_sql).await?;
+            if let Some(actual) = stored_checksum {
+                let expected = migration.checksum();
+                if !actual.is_empty() && actual != expected {
+                    return Err(PersistenceError::MigrationChecksumMismatch {
+                        migration: migration.id.clone(),
+                        expected,
+                        actual,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Executes all unapplied pending migrations in order on any [`DatabaseBackend`].
     pub async fn run_pending_backend<B: DatabaseBackend>(
         &self,

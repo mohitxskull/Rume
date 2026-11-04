@@ -22,7 +22,7 @@ pub struct SqlFileStatus {
     pub error: Option<String>,
 }
 
-pub fn run(path_str: &str, format: &str, is_json: bool) {
+pub async fn run(path_str: &str, format: &str, is_json: bool, target_dialect: Option<&str>, db_dry_run: bool) {
     let target_dir = Path::new(path_str);
     let mut files = Vec::new();
     if target_dir.exists() {
@@ -31,13 +31,54 @@ pub fn run(path_str: &str, format: &str, is_json: bool) {
 
     files.sort();
 
+    let mut db_handle = None;
+    if db_dry_run
+        && let Some(url) = crate::commands::db::resolve_db_url()
+        && let Ok((handle, dialect)) = crate::commands::db::connect_backend(&url).await
+    {
+        db_handle = Some((handle, dialect));
+    }
+
     let mut statuses = Vec::with_capacity(files.len());
     let mut all_ok = true;
     let mut valid_count = 0;
 
     for file_path in &files {
         let display_path = file_path.display().to_string();
-        match validate_sql_file(file_path) {
+        let val_res = validate_sql_file(file_path, target_dialect);
+        let final_res = match val_res {
+            Ok(()) => {
+                if let Some((handle, _dialect)) = &db_handle {
+                    if let Ok(content) = fs::read_to_string(file_path) {
+                        let trimmed = content.trim();
+                        // Dry-run with EXPLAIN if it's a DML statement
+                        let first_word = trimmed.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
+                        if matches!(first_word.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE") {
+                            let explain_sql = format!("EXPLAIN {trimmed}");
+                            use rume::persistence::DatabaseBackend;
+                            let explain_res = match handle {
+                                crate::commands::db::BackendHandle::Postgres(b) => b.execute(&explain_sql).await,
+                                crate::commands::db::BackendHandle::Sqlite(b) => b.execute(&explain_sql).await,
+                                crate::commands::db::BackendHandle::Mysql(b) => b.execute(&explain_sql).await,
+                            };
+                            match explain_res {
+                                Ok(_) => Ok(()),
+                                Err(e) => Err(format!("live DB dry-run failed: {e}")),
+                            }
+                        } else {
+                            Ok(())
+                        }
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+            Err(e) => Err(e),
+        };
+
+        match final_res {
             Ok(()) => {
                 valid_count += 1;
                 statuses.push(SqlFileStatus {
@@ -123,7 +164,7 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn validate_sql_file(path: &Path) -> Result<(), String> {
+fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), String> {
     let content = fs::read_to_string(path)
         .map_err(|e| format!("cannot read file: {e}"))?;
 
@@ -208,7 +249,109 @@ fn validate_sql_file(path: &Path) -> Result<(), String> {
         return Err(format!("query starts with unrecognized SQL statement keyword `{first_word}`"));
     }
 
+    // Dialect placeholder checks
+    let effective_dialect = target_dialect.or_else(|| infer_dialect_from_path(path));
+    if let Some(dialect) = effective_dialect {
+        match dialect {
+            "postgres" if contains_unquoted_char(&content, '?') => {
+                return Err("PostgreSQL query uses unnumbered '?' parameter placeholder instead of '$1, $2, ...'".to_string());
+            }
+            "sqlite" | "mysql" if contains_unquoted_dollar_param(&content) => {
+                return Err(format!("{dialect} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"));
+            }
+            _ => {}
+        }
+    }
+
     Ok(())
+}
+
+fn infer_dialect_from_path(path: &Path) -> Option<&'static str> {
+    for comp in path.components() {
+        let s = comp.as_os_str().to_string_lossy().to_ascii_lowercase();
+        if s == "postgres" || s == "postgresql" || s == "pg" {
+            return Some("postgres");
+        } else if s == "sqlite" || s == "sqlite3" {
+            return Some("sqlite");
+        } else if s == "mysql" || s == "mariadb" {
+            return Some("mysql");
+        }
+    }
+    None
+}
+
+fn contains_unquoted_char(sql: &str, target: char) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut prev = '\0';
+
+    for ch in sql.chars() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+        } else if in_single {
+            if ch == '\'' && prev != '\\' {
+                in_single = false;
+            }
+        } else if in_double {
+            if ch == '"' && prev != '\\' {
+                in_double = false;
+            }
+        } else if prev == '-' && ch == '-' {
+            in_line_comment = true;
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                c if c == target => return true,
+                _ => {}
+            }
+        }
+        prev = ch;
+    }
+    false
+}
+
+fn contains_unquoted_dollar_param(sql: &str) -> bool {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_line_comment = false;
+    let mut prev = '\0';
+    let mut saw_dollar = false;
+
+    for ch in sql.chars() {
+        if in_line_comment {
+            if ch == '\n' {
+                in_line_comment = false;
+            }
+        } else if in_single {
+            if ch == '\'' && prev != '\\' {
+                in_single = false;
+            }
+        } else if in_double {
+            if ch == '"' && prev != '\\' {
+                in_double = false;
+            }
+        } else if prev == '-' && ch == '-' {
+            in_line_comment = true;
+        } else if saw_dollar {
+            if ch.is_ascii_digit() {
+                return true;
+            }
+            saw_dollar = false;
+        } else {
+            match ch {
+                '\'' => in_single = true,
+                '"' => in_double = true,
+                '$' => saw_dollar = true,
+                _ => {}
+            }
+        }
+        prev = ch;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -219,27 +362,43 @@ mod tests {
     fn test_validate_valid_sql() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), "SELECT * FROM users WHERE id = $1;").unwrap();
-        assert!(validate_sql_file(temp.path()).is_ok());
+        assert!(validate_sql_file(temp.path(), Some("postgres")).is_ok());
+    }
+
+    #[test]
+    fn test_validate_dialect_mismatch_postgres_with_question_mark() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temp.path(), "SELECT * FROM users WHERE id = ?;").unwrap();
+        let err = validate_sql_file(temp.path(), Some("postgres")).unwrap_err();
+        assert!(err.contains("PostgreSQL query uses unnumbered '?' parameter placeholder"));
+    }
+
+    #[test]
+    fn test_validate_dialect_mismatch_sqlite_with_dollar_param() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        fs::write(temp.path(), "SELECT * FROM users WHERE id = $1;").unwrap();
+        let err = validate_sql_file(temp.path(), Some("sqlite")).unwrap_err();
+        assert!(err.contains("sqlite query uses PostgreSQL-style '$N' parameter placeholder"));
     }
 
     #[test]
     fn test_validate_unmatched_paren() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), "SELECT * FROM users WHERE id IN (1, 2;").unwrap();
-        assert!(validate_sql_file(temp.path()).is_err());
+        assert!(validate_sql_file(temp.path(), None).is_err());
     }
 
     #[test]
     fn test_validate_empty_sql() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), "-- Just a comment\n").unwrap();
-        assert!(validate_sql_file(temp.path()).is_err());
+        assert!(validate_sql_file(temp.path(), None).is_err());
     }
 
     #[test]
     fn test_validate_unrecognized_keyword() {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), "FOOBAR something").unwrap();
-        assert!(validate_sql_file(temp.path()).is_err());
+        assert!(validate_sql_file(temp.path(), None).is_err());
     }
 }

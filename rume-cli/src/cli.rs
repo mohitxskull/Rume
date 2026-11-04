@@ -97,6 +97,12 @@ pub enum Commands {
         /// Path to directory containing SQL files (defaults to `sql`).
         #[arg(long, default_value = "sql")]
         path: String,
+        /// Target dialect to validate against (postgres, sqlite, mysql).
+        #[arg(long)]
+        dialect: Option<String>,
+        /// Verify SQL statements against the live database via EXPLAIN.
+        #[arg(long)]
+        db: bool,
         /// Output format: human (default) or json.
         #[arg(long, default_value = "human")]
         format: String,

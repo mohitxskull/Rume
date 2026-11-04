@@ -245,8 +245,24 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
                 crate::commands::db::BackendHandle::Mysql(b) => migrator.applied_migrations(b).await,
             };
 
-            let migrations_check = match applied_res {
-                Ok(applied) => {
+            let checksum_res = match &handle {
+                crate::commands::db::BackendHandle::Postgres(b) => migrator.verify_applied_checksums(b).await,
+                crate::commands::db::BackendHandle::Sqlite(b) => migrator.verify_applied_checksums(b).await,
+                crate::commands::db::BackendHandle::Mysql(b) => migrator.verify_applied_checksums(b).await,
+            };
+
+            let migrations_check = match (applied_res, checksum_res) {
+                (Err(e), _) => DoctorCheck {
+                    label: "pending migrations".to_string(),
+                    status: format!("failed to inspect migration ledger: {e}"),
+                    ok: false,
+                },
+                (_, Err(e)) => DoctorCheck {
+                    label: "pending migrations".to_string(),
+                    status: format!("checksum drift detected: {e}"),
+                    ok: false,
+                },
+                (Ok(applied), Ok(())) => {
                     let applied_count = applied.len();
                     let pending = total_migrations.saturating_sub(applied_count);
                     if pending == 0 {
@@ -263,11 +279,6 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
                         }
                     }
                 }
-                Err(e) => DoctorCheck {
-                    label: "pending migrations".to_string(),
-                    status: format!("warning: failed to inspect migration ledger: {e}"),
-                    ok: true,
-                },
             };
 
             (db_check, migrations_check)
@@ -310,58 +321,34 @@ fn check_redis_connectivity() -> DoctorCheck {
         };
     }
 
-    let host_port = if let Some(stripped) = trimmed.strip_prefix("redis://") {
-        stripped
-    } else if let Some(stripped) = trimmed.strip_prefix("rediss://") {
-        stripped
-    } else {
-        trimmed
-    };
-
-    let without_auth = if let Some(idx) = host_port.find('@') {
-        &host_port[idx + 1..]
-    } else {
-        host_port
-    };
-
-    let without_path = if let Some(idx) = without_auth.find('/') {
-        &without_auth[..idx]
-    } else {
-        without_auth
-    };
-
-    let (host, port) = if let Some(idx) = without_path.find(':') {
-        (&without_path[..idx], without_path[idx + 1..].parse::<u16>().unwrap_or(6379))
-    } else {
-        (without_path, 6379)
-    };
-
-    use std::net::ToSocketAddrs;
-    let addrs = match format!("{host}:{port}").to_socket_addrs() {
-        Ok(addrs) => addrs.collect::<Vec<_>>(),
-        Err(e) => {
-            return DoctorCheck {
+    match redis::Client::open(trimmed) {
+        Ok(client) => match client.get_connection_with_timeout(std::time::Duration::from_secs(2)) {
+            Ok(mut conn) => {
+                let ping_res: Result<String, redis::RedisError> = redis::cmd("PING").query(&mut conn);
+                match ping_res {
+                    Ok(resp) => DoctorCheck {
+                        label: "redis connectivity".to_string(),
+                        status: format!("connected to Redis (PING -> {resp})"),
+                        ok: true,
+                    },
+                    Err(e) => DoctorCheck {
+                        label: "redis connectivity".to_string(),
+                        status: format!("connected but PING failed: {e}"),
+                        ok: false,
+                    },
+                }
+            }
+            Err(e) => DoctorCheck {
                 label: "redis connectivity".to_string(),
-                status: format!("failed to resolve Redis host `{host}`: {e}"),
+                status: format!("failed to connect to Redis: {e}"),
                 ok: false,
-            };
-        }
-    };
-
-    for addr in addrs {
-        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).is_ok() {
-            return DoctorCheck {
-                label: "redis connectivity".to_string(),
-                status: format!("connected to Redis at {host}:{port}"),
-                ok: true,
-            };
-        }
-    }
-
-    DoctorCheck {
-        label: "redis connectivity".to_string(),
-        status: format!("failed to connect to Redis at {host}:{port}"),
-        ok: false,
+            },
+        },
+        Err(e) => DoctorCheck {
+            label: "redis connectivity".to_string(),
+            status: format!("invalid REDIS_URL: {e}"),
+            ok: false,
+        },
     }
 }
 

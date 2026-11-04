@@ -26,3 +26,4 @@ tempfile.workspace = true
 unicode-width = "0.2"
 chrono = "0.4"
 dotenvy.workspace = true
+redis.workspace = true
