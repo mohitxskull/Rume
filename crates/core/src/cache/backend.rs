@@ -61,9 +61,7 @@ type CacheMap = std::sync::Arc<
     tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<std::time::Instant>)>>,
 >;
 type TagMap = std::sync::Arc<
-    tokio::sync::RwLock<
-        std::collections::HashMap<String, std::collections::HashSet<String>>,
-    >,
+    tokio::sync::RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 >;
 
 /// Thread-safe in-memory cache backend suitable for testing and single-instance deployments.

@@ -10,15 +10,15 @@ The Rume distributed coordination and multi-tenancy subsystems provide foundatio
 
 In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings and architectural decisions from `docs/reports/reviews/v02/` intersecting with distributed coordination, multi-tenancy, cache isolation, and rate limiting have been audited against the codebase:
 
-- **v02 Security C2 (Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning)** — **REAFFIRMED (Partial / Needs hardening)**. Verified in `rume/src/tenant/cache.rs:15–22`. `scoped_cache_key` and `tenant_cache_tag` now format keys and tags using explicit length prefixing (`format!("tenant:{}:{}:{key}", tenant_id.len(), tenant_id)`), successfully preventing colon-delimiter collision attacks across tenant IDs and keys. However, new vulnerabilities were introduced in v03: `RedisTenantQuotaStore` never decrements quota counters when cached keys expire via TTL (finding M1), and `RedisCacheBackend` leaks dead keys in Redis tag sets indefinitely (finding M2).
-- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Verified in `rume/src/tenant/resolver.rs:158–176` and `rume/tests/tenant_suite.rs:104–121`. The resolver normalizes `base_domain` with a leading dot (`.{base_domain}`) and verifies that extracted subdomains contain no interior dots (`!subdomain.contains('.')`) and strictly adhere to ASCII alphanumeric/hyphen syntax, successfully rejecting suffix-spoofing and multi-level subdomain hijacking. (Note minor case-sensitivity and IPv6 parsing gap in finding m1).
-- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED (Partial)**. Verified in `rume/src/tenant/resolver.rs:30–62, 85–109`. Tenant IDs and vanity slugs are now stored in separate maps (`by_id` and `by_slug`), and `resolve()` queries `by_id` first before falling back to `by_slug`. However, `add_tenant` silently overwrites duplicate slug registrations without conflict checks, and ID-over-slug lookup precedence can shadow tenant vanity slugs without warning (finding M6).
+- **v02 Security C2 (Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning)** — **REAFFIRMED (Partial / Needs hardening)**. Verified in `crates/core/src/tenant/cache.rs:15–22`. `scoped_cache_key` and `tenant_cache_tag` now format keys and tags using explicit length prefixing (`format!("tenant:{}:{}:{key}", tenant_id.len(), tenant_id)`), successfully preventing colon-delimiter collision attacks across tenant IDs and keys. However, new vulnerabilities were introduced in v03: `RedisTenantQuotaStore` never decrements quota counters when cached keys expire via TTL (finding M1), and `RedisCacheBackend` leaks dead keys in Redis tag sets indefinitely (finding M2).
+- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Verified in `crates/core/src/tenant/resolver.rs:158–176` and `crates/core/tests/tenant_suite.rs:104–121`. The resolver normalizes `base_domain` with a leading dot (`.{base_domain}`) and verifies that extracted subdomains contain no interior dots (`!subdomain.contains('.')`) and strictly adhere to ASCII alphanumeric/hyphen syntax, successfully rejecting suffix-spoofing and multi-level subdomain hijacking. (Note minor case-sensitivity and IPv6 parsing gap in finding m1).
+- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED (Partial)**. Verified in `crates/core/src/tenant/resolver.rs:30–62, 85–109`. Tenant IDs and vanity slugs are now stored in separate maps (`by_id` and `by_slug`), and `resolve()` queries `by_id` first before falling back to `by_slug`. However, `add_tenant` silently overwrites duplicate slug registrations without conflict checks, and ID-over-slug lookup precedence can shadow tenant vanity slugs without warning (finding M6).
 - **v02 Enterprise-Reliability M6 (`LeaderElector` lacks monotonic fencing tokens or epoch tracking)** — **CHALLENGED (Defective Remediation)**. While `LeaderLease` now carries a `term: u64` across `PostgresLeaderElector` and `RedisLeaderElector`, the remediation is defective:
   1. In `PostgresLeaderElector` (`leader_acquire.sql`), if a leader's lease expires and that same leader re-acquires the lease, the term is NOT incremented, allowing a recovered leader to execute conflicting mutations with the old term (finding C2).
   2. Both `PostgresDistributedLock` and `PostgresLeaderElector` rely on client `SystemTime::now()` rather than database server time, permitting clock-skewed nodes to steal locks and leadership before leases expire (finding C1).
   3. In `RedisLeaderElector`, multi-key Lua scripts lack Redis hash tags (`{role}`), causing immediate `CROSSSLOT` failures on Redis Cluster (finding C3).
   4. Candidate IDs and terms are concatenated with an unescaped colon delimiter (`candidate_id:term`), causing `get_leader` to fail when IDs contain colons (finding M3).
-- **v02 Enterprise-Reliability M3 (`RateLimiter` permanently leaks memory for inactive clients)** — **CHALLENGED (Defective Remediation)**. While passive eviction when `clients.len() > 256` and `prune_expired()` were introduced in `rume/src/resilience/rate_limiter.rs:92–115`, the remediation introduces critical performance defects: the check performs an $O(N)$ full-scan retention loop inside an exclusive write lock on every single request once client count exceeds 256 (finding M4). Furthermore, client identification remains hardcoded to unvalidated `x-forwarded-for` with no tenant isolation support (finding M5), and `RedisRateLimiter` misclassifies connection failures as `CircuitOpen` (finding m2).
+- **v02 Enterprise-Reliability M3 (`RateLimiter` permanently leaks memory for inactive clients)** — **CHALLENGED (Defective Remediation)**. While passive eviction when `clients.len() > 256` and `prune_expired()` were introduced in `crates/core/src/resilience/rate_limiter.rs:92–115`, the remediation introduces critical performance defects: the check performs an $O(N)$ full-scan retention loop inside an exclusive write lock on every single request once client count exceeds 256 (finding M4). Furthermore, client identification remains hardcoded to unvalidated `x-forwarded-for` with no tenant isolation support (finding M5), and `RedisRateLimiter` misclassifies connection failures as `CircuitOpen` (finding m2).
 - **v02 Enterprise-Reliability m4 (`TenantScopedCache` and `Cache` omit tag prefix namespacing and tenant memory quotas)** — **CHALLENGED (Defective Remediation)**. While tags are now scoped via `scoped_tag` (`tenant:{len}:{id}:tag:{tag}`) and `TenantQuotaStore` / `RedisTenantQuotaStore` was introduced, quota permits are never released on TTL expiration, permanently locking out tenants from caching data once the quota ceiling is hit (finding M1). Additionally, `invalidate_tag` multi-key `DEL` fails on Redis Cluster (finding C3).
 - **Production PostgreSQL & Redis Coordination Backends (`PostgresDistributedLock`, `RedisDistributedLock`, `PostgresLeaderElector`, `RedisLeaderElector`)** — **NOTE-NEW**. New production distributed coordination implementations introduced in Phase 5 / SQLx modernization; audited in findings C1, C2, C3, M3, m3, m4, and m5.
 - **Tenant Context Propagation & Extraction (`TenantContext`, `OptionalTenant`, `TenantLayer`)** — **NOTE-NEW**. Axum 0.8 / Tower tenant extraction middleware audited in finding M5 and Positive Notes.
@@ -29,9 +29,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C1 Split-brain leadership and lock theft via client wall-clock skew in PostgreSQL coordination
 
-- **Where:** `rume/src/coordination/postgres.rs:14–19, 74–85, 102–113, 186–198, 220–232, 248–257`, `rume/src/persistence/sql/postgres/lock_acquire.sql:7`, `rume/src/persistence/sql/postgres/leader_acquire.sql:10`, `rume/src/persistence/sql/postgres/leader_renew.sql:3`
+- **Where:** `crates/core/src/coordination/postgres.rs:14–19, 74–85, 102–113, 186–198, 220–232, 248–257`, `crates/core/src/persistence/sql/postgres/lock_acquire.sql:7`, `crates/core/src/persistence/sql/postgres/leader_acquire.sql:10`, `crates/core/src/persistence/sql/postgres/leader_renew.sql:3`
 - **What it says:**
-  In `rume/src/coordination/postgres.rs`:
+  In `crates/core/src/coordination/postgres.rs`:
   ```rust
   fn current_epoch_millis() -> i64 {
       std::time::SystemTime::now()
@@ -86,7 +86,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C2 Stale leader re-acquisition fails to increment election term, violating monotonic fencing
 
-- **Where:** `rume/src/persistence/sql/postgres/leader_acquire.sql:3–10`
+- **Where:** `crates/core/src/persistence/sql/postgres/leader_acquire.sql:3–10`
 - **What it says:**
   ```sql
   INSERT INTO rume_leaders (role, candidate_id, term, expires_at)
@@ -120,7 +120,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C3 Redis coordination and cache Lua scripts break under Redis Cluster due to missing hash tags (`CROSSSLOT`)
 
-- **Where:** `rume/src/coordination/redis.rs:87–107, 268–289`, `rume/src/cache/redis.rs:215–224`
+- **Where:** `crates/core/src/coordination/redis.rs:87–107, 268–289`, `crates/core/src/cache/redis.rs:215–224`
 - **What it says:**
   In `RedisDistributedLock::acquire`:
   ```rust
@@ -185,7 +185,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C4 Cross-tenant job and idempotency key collisions permit cross-tenant rejection and result leakage
 
-- **Where:** `rume/src/persistence/sql/postgres/jobs_schema.sql:1–21`, `rume/src/jobs/redis.rs:190–202, 230–257`, `rume/src/jobs/queue.rs:20–45`
+- **Where:** `crates/core/src/persistence/sql/postgres/jobs_schema.sql:1–21`, `crates/core/src/jobs/redis.rs:190–202, 230–257`, `crates/core/src/jobs/queue.rs:20–45`
 - **What it says:**
   In `jobs_schema.sql`:
   ```sql
@@ -229,7 +229,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M1 `TenantScopedCache` quota leak on TTL expiration permanently locks out tenant caching
 
-- **Where:** `rume/src/tenant/cache.rs:101–126, 131–137, 142–150`, `rume/src/tenant/quota.rs:81–109`
+- **Where:** `crates/core/src/tenant/cache.rs:101–126, 131–137, 142–150`, `crates/core/src/tenant/quota.rs:81–109`
 - **What it says:**
   In `TenantScopedCache::set_with_tags`:
   ```rust
@@ -271,7 +271,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M2 Monotonic memory leak in Redis tag invalidation sets from expired TTL keys
 
-- **Where:** `rume/src/cache/redis.rs:129–158, 199–234`
+- **Where:** `crates/core/src/cache/redis.rs:129–158, 199–234`
 - **What it says:**
   ```rust
   let tag_keys: Vec<String> = tags.iter().map(|t| self.tag_set_key(t)).collect();
@@ -302,7 +302,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M3 Delimiter collision in `RedisLeaderElector` candidate IDs breaks leader recovery
 
-- **Where:** `rume/src/coordination/redis.rs:273, 325–329, 372–383, 403–407`
+- **Where:** `crates/core/src/coordination/redis.rs:273, 325–329, 372–383, 403–407`
 - **What it says:**
   In `try_acquire`:
   ```lua
@@ -342,7 +342,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M4 Global lock contention and O(N) eviction loop in `RateLimiter::check`
 
-- **Where:** `rume/src/resilience/rate_limiter.rs:66–98`
+- **Where:** `crates/core/src/resilience/rate_limiter.rs:66–98`
 - **What it says:**
   ```rust
   pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
@@ -374,7 +374,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M5 Complete lack of multi-tenant resource isolation in rate limiting and database pools
 
-- **Where:** `rume/src/resilience/rate_limiter.rs:168–175`, `rume/src/tenant/layer.rs:83–101`, `rume/src/persistence/pool.rs:18–48`
+- **Where:** `crates/core/src/resilience/rate_limiter.rs:168–175`, `crates/core/src/tenant/layer.rs:83–101`, `crates/core/src/persistence/pool.rs:18–48`
 - **What it says:**
   In `RateLimitService::call`:
   ```rust
@@ -406,7 +406,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M6 `HeaderTenantResolver::add_tenant` silently overwrites conflicting slugs and precedence shadows vanity slugs
 
-- **Where:** `rume/src/tenant/resolver.rs:54–62, 85–109`
+- **Where:** `crates/core/src/tenant/resolver.rs:54–62, 85–109`
 - **What it says:**
   ```rust
   pub fn add_tenant(self, tenant: Tenant) -> Self {
@@ -440,7 +440,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m1 Subdomain tenant resolver fails on case-insensitive hosts and IPv6 addresses
 
-- **Where:** `rume/src/tenant/resolver.rs:153–175`
+- **Where:** `crates/core/src/tenant/resolver.rs:153–175`
 - **What it says:**
   ```rust
   let host_no_port = host_str.split(':').next().unwrap_or(host_str);
@@ -458,7 +458,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m2 `RedisRateLimiter` misclassifies Redis connection and script errors as `CircuitOpen`
 
-- **Where:** `rume/src/resilience/redis.rs:60, 104`
+- **Where:** `crates/core/src/resilience/redis.rs:60, 104`
 - **What it says:**
   ```rust
   let mut conn = self
@@ -479,7 +479,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m3 `LockGuard` and `LeaderLease` lack expiration timestamp telemetry
 
-- **Where:** `rume/src/coordination/lock.rs:16–23`, `rume/src/coordination/leader.rs:9–17`
+- **Where:** `crates/core/src/coordination/lock.rs:16–23`, `crates/core/src/coordination/leader.rs:9–17`
 - **What it says:**
   ```rust
   pub struct LockGuard {
@@ -501,7 +501,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m4 Unused global sequence burn in `PostgresDistributedLock::acquire` conflict path
 
-- **Where:** `rume/src/persistence/sql/postgres/lock_acquire.sql:1–8`
+- **Where:** `crates/core/src/persistence/sql/postgres/lock_acquire.sql:1–8`
 - **What it says:**
   ```sql
   INSERT INTO rume_locks (resource, lease_id, fencing_token, expires_at)
@@ -520,7 +520,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m5 Expired rows in `rume_locks` and `rume_leaders` are retained indefinitely until next access
 
-- **Where:** `rume/src/persistence/sql/postgres/locks_schema.sql`, `leader_schema.sql`
+- **Where:** `crates/core/src/persistence/sql/postgres/locks_schema.sql`, `leader_schema.sql`
 - **What it says:** `rume_locks` and `rume_leaders` use `PRIMARY KEY (resource)` and `PRIMARY KEY (role)` without indexes on `expires_at` or background pruning.
 - **Why it's a problem:** In systems with dynamically generated ephemeral lock resource names (e.g. `lock:user:123`, `lock:export:456`), expired rows remain in PostgreSQL indefinitely unless re-acquired, creating unbounded table bloat.
 - **Suggested fix:** Add `CREATE INDEX IF NOT EXISTS idx_rume_locks_expires_at ON rume_locks (expires_at)` and provide a background cleanup function `prune_expired()`.
@@ -552,7 +552,7 @@ While the coordination interfaces and multi-tenant abstractions are well-structu
 
 1. **C1** — Replace client-side `current_epoch_millis()` in PostgreSQL coordination queries with database-authoritative `(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT` to eliminate clock-skewed lock and leadership theft.
 2. **C2** — Advance election terms unconditionally when re-acquiring expired leases in `leader_acquire.sql` to maintain monotonic fencing across crashes and pauses.
-3. **C3** — Add Redis hash tags `{...}` to lock, term, and leader keys in `rume/src/coordination/redis.rs` and pipeline `DEL` in `invalidate_tag` to eliminate `CROSSSLOT` crashes on Redis Cluster.
+3. **C3** — Add Redis hash tags `{...}` to lock, term, and leader keys in `crates/core/src/coordination/redis.rs` and pipeline `DEL` in `invalidate_tag` to eliminate `CROSSSLOT` crashes on Redis Cluster.
 4. **C4** — Scope job queues and `RedisIdempotencyStore` by tenant ID to prevent cross-tenant job rejection and payload result leakage.
 5. **M1** — Reconcile tenant cache quotas with TTL expirations and handle request cancellations to prevent permanent tenant cache lockouts.
 6. **M2** — Set TTLs or prune expired key references in Redis tag sets to prevent unbounded Redis RAM growth.

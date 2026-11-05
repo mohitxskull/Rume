@@ -13,12 +13,12 @@
 //! 6. Explicit SLA budgets: 0% error rate, hard throughput minimums, and P95/P99 latency thresholds.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
-use axum::routing::get;
 use axum::Router;
+use axum::routing::get;
 use rume::app::ObservabilityLayer;
 use rume::events::Event;
 use rume::jobs::postgres::PostgresJobQueue;
@@ -29,8 +29,8 @@ use rume::persistence::pool::DatabasePool;
 use rume::testing::SqliteTestFixture;
 use serde::{Deserialize, Serialize};
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -88,11 +88,16 @@ impl HeartbeatRegistry for InMemoryHeartbeatRegistry {
         let wid = worker_id.to_string();
         Box::pin(async move {
             let lock = self.heartbeats.read().unwrap();
-            Ok(lock.get(&wid).map(|exp| Instant::now() < *exp).unwrap_or(false))
+            Ok(lock
+                .get(&wid)
+                .map(|exp| Instant::now() < *exp)
+                .unwrap_or(false))
         })
     }
 
-    fn reap_dead_workers(&self) -> rume::module::BoxFuture<'_, Result<Vec<String>, rume::jobs::JobError>> {
+    fn reap_dead_workers(
+        &self,
+    ) -> rume::module::BoxFuture<'_, Result<Vec<String>, rume::jobs::JobError>> {
         Box::pin(async move {
             let mut lock = self.heartbeats.write().unwrap();
             let now = Instant::now();
@@ -617,13 +622,14 @@ pub async fn run_full_job_worker_benchmark(
     let mut worker_handles = Vec::with_capacity(worker_count);
     for idx in 0..worker_count {
         let worker_id = format!("job-worker-{idx}");
-        let worker = JobWorker::with_concurrency_limit(Arc::clone(&queue), Arc::clone(&registry), 4)
-            .with_worker_id(worker_id)
-            .with_heartbeat(
-                Arc::clone(&heartbeat_registry),
-                Duration::from_secs(30),
-                Duration::from_millis(500),
-            );
+        let worker =
+            JobWorker::with_concurrency_limit(Arc::clone(&queue), Arc::clone(&registry), 4)
+                .with_worker_id(worker_id)
+                .with_heartbeat(
+                    Arc::clone(&heartbeat_registry),
+                    Duration::from_secs(30),
+                    Duration::from_millis(500),
+                );
         worker_handles.push(worker.start());
     }
 
@@ -718,7 +724,8 @@ pub async fn run_full_production_suite(
     let mut concurrency_results = Vec::new();
 
     for &c in concurrencies {
-        let raw_stats = run_concurrent_network_benchmark(raw_server.addr, requests_per_tier, c).await;
+        let raw_stats =
+            run_concurrent_network_benchmark(raw_server.addr, requests_per_tier, c).await;
         let rume_stats =
             run_concurrent_network_benchmark(rume_server.addr, requests_per_tier, c).await;
         concurrency_results.push((c, raw_stats, rume_stats));
@@ -731,8 +738,7 @@ pub async fn run_full_production_suite(
     let sqlite_fixture = SqliteTestFixture::create()
         .await
         .expect("create sqlite fixture");
-    let sqlite_db_stats =
-        run_physical_database_benchmark(sqlite_fixture.pool(), 1_000, 16).await;
+    let sqlite_db_stats = run_physical_database_benchmark(sqlite_fixture.pool(), 1_000, 16).await;
 
     // 4. PostgreSQL Database, Competing Outbox Relays, and Durable Job Workers
     let pg_node = Postgres::default()
@@ -758,7 +764,8 @@ pub async fn run_full_production_suite(
         .await
         .expect("run core postgres migrations");
 
-    let pg_db_config = rume::persistence::config::DatabaseConfig::new(&pg_url).with_max_connections(20);
+    let pg_db_config =
+        rume::persistence::config::DatabaseConfig::new(&pg_url).with_max_connections(20);
     let pg_db_pool = Arc::new(DatabasePool::new(pg_backend, pg_db_config));
 
     // Measure physical checkout against PostgreSQL
@@ -770,12 +777,14 @@ pub async fn run_full_production_suite(
 
     // 6. Durable Job Worker Benchmark (8 competing tasks on PostgresJobQueue)
     let job_queue = Arc::new(PostgresJobQueue::new(pg_pool.clone()));
-    job_queue.init_schema().await.expect("job queue init schema");
+    job_queue
+        .init_schema()
+        .await
+        .expect("job queue init schema");
     let job_stats = run_durable_job_worker_benchmark(Arc::clone(&job_queue), 300, 8).await;
 
     // 7. Full JobWorker Runtime Benchmark (8 distinct workers, handlers, heartbeats, acks, DB reconciliation)
-    let worker_runtime_stats =
-        run_full_job_worker_benchmark(pg_pool, job_queue, 200, 8).await;
+    let worker_runtime_stats = run_full_job_worker_benchmark(pg_pool, job_queue, 200, 8).await;
 
     sqlite_fixture.close().await.expect("close sqlite fixture");
 
@@ -801,9 +810,15 @@ pub fn format_dur(d: Duration) -> String {
 
 pub fn print_suite_report(results: &BenchmarkSuiteResult) {
     println!();
-    println!("==========================================================================================================");
-    println!("                           RUME PRODUCTION QUALIFICATION BENCHMARK (REL-08)                               ");
-    println!("==========================================================================================================");
+    println!(
+        "=========================================================================================================="
+    );
+    println!(
+        "                           RUME PRODUCTION QUALIFICATION BENCHMARK (REL-08)                               "
+    );
+    println!(
+        "=========================================================================================================="
+    );
     println!(
         " Environment: OS={} | Arch={} | Cores={} | Profile={} | Postgres={}",
         results.environment.os,
@@ -812,11 +827,21 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
         results.environment.profile,
         results.environment.postgres_image
     );
-    println!("==========================================================================================================");
-    println!(" 1. REAL TCP HTTP SERVER OVERHEAD ACROSS CONCURRENCY TIERS                                                ");
-    println!("----------------------------------------------------------------------------------------------------------");
-    println!(" Conc  Engine          Reqs    Throughput       P50          P95          P99         Mean     Errors ");
-    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        "=========================================================================================================="
+    );
+    println!(
+        " 1. REAL TCP HTTP SERVER OVERHEAD ACROSS CONCURRENCY TIERS                                                "
+    );
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
+    println!(
+        " Conc  Engine          Reqs    Throughput       P50          P95          P99         Mean     Errors "
+    );
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
 
     for (c, raw, rume) in &results.concurrency_results {
         println!(
@@ -859,12 +884,16 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
             format_dur(mean_diff),
             format_dur(budget)
         );
-        println!("----------------------------------------------------------------------------------------------------------");
+        println!(
+            "----------------------------------------------------------------------------------------------------------"
+        );
     }
 
     println!();
     println!(" 2. PHYSICAL DATABASE CONNECTION CHECKOUT & QUERY EXECUTION (SELECT 1)");
-    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "  SQLite:     Queries: {} (concurrency: {}) | Throughput: {:.0} queries/sec | Errors: {}",
         results.sqlite_db_stats.count,
@@ -888,7 +917,9 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
 
     println!();
     println!(" 3. COMPETING TRANSACTIONAL OUTBOX RELAYS THROUGHPUT");
-    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "  Messages: {} | Relays: {} | Throughput: {:.0} msg/sec | Errors: {}",
         results.outbox_stats.count,
@@ -906,7 +937,9 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
 
     println!();
     println!(" 4. DURABLE JOB QUEUE CONCURRENT CLAIM & ACKNOWLEDGEMENT");
-    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "  Jobs: {} | Tasks: {} | Throughput: {:.0} jobs/sec | Errors: {}",
         results.job_stats.count,
@@ -923,8 +956,12 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
     );
 
     println!();
-    println!(" 5. FULL JOBWORKER RUNTIME (8 WORKERS, TYPED HANDLERS, HEARTBEATS, DB RECONCILIATION)");
-    println!("----------------------------------------------------------------------------------------------------------");
+    println!(
+        " 5. FULL JOBWORKER RUNTIME (8 WORKERS, TYPED HANDLERS, HEARTBEATS, DB RECONCILIATION)"
+    );
+    println!(
+        "----------------------------------------------------------------------------------------------------------"
+    );
     println!(
         "  Jobs: {} | Workers: {} | Throughput: {:.0} jobs/sec | Errors: {}",
         results.worker_runtime_stats.count,
@@ -940,9 +977,15 @@ pub fn print_suite_report(results: &BenchmarkSuiteResult) {
         format_dur(results.worker_runtime_stats.mean)
     );
 
-    println!("==========================================================================================================");
-    println!("  [PASS] ALL REL-08 PRODUCTION QUALIFICATION CRITERIA CONFORM TO BUDGET & SLA TARGETS                    ");
-    println!("==========================================================================================================");
+    println!(
+        "=========================================================================================================="
+    );
+    println!(
+        "  [PASS] ALL REL-08 PRODUCTION QUALIFICATION CRITERIA CONFORM TO BUDGET & SLA TARGETS                    "
+    );
+    println!(
+        "=========================================================================================================="
+    );
     println!();
 }
 

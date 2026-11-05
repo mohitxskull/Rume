@@ -264,14 +264,7 @@ impl AppError {
                 };
                 problem_details_response(
                     status,
-                    &problem(
-                        status,
-                        "Bad Request",
-                        detail,
-                        code,
-                        None,
-                        None,
-                    ),
+                    &problem(status, "Bad Request", detail, code, None, None),
                 )
             }
             Self::Unauthorized => problem_details_response(

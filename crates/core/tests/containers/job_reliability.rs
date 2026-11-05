@@ -250,7 +250,10 @@ async fn test_worker_heartbeat_and_abandoned_job_recovery() {
         .await
         .unwrap();
     let claimed = queue.dequeue_for("crashed-worker-99").await.unwrap();
-    assert!(claimed.is_some(), "fixture job claimed under crashed worker");
+    assert!(
+        claimed.is_some(),
+        "fixture job claimed under crashed worker"
+    );
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // Wait for crashed-worker-99 heartbeat to expire

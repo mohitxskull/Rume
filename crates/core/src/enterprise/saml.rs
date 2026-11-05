@@ -10,10 +10,10 @@
 //! > module as a production-supported authentication path until genuine cryptographic XMLDSig verification
 //! > against real IdP certificates and adversarial wrapping test fixtures is formally certified.
 
-use std::collections::BTreeMap;
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 const SAML_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
@@ -118,9 +118,9 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
         return Ok(epoch);
     }
 
-    let (date_str, time_with_tz) = s
-        .split_once('T')
-        .ok_or_else(|| SamlError::Malformed(format!("invalid ISO 8601 timestamp '{s}': missing 'T'")))?;
+    let (date_str, time_with_tz) = s.split_once('T').ok_or_else(|| {
+        SamlError::Malformed(format!("invalid ISO 8601 timestamp '{s}': missing 'T'"))
+    })?;
 
     let mut date_parts = date_str.split('-');
     let year: u64 = date_parts
@@ -146,7 +146,13 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
     let max_days = match month {
         1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
         4 | 6 | 9 | 11 => 30,
-        2 => if is_leap { 29 } else { 28 },
+        2 => {
+            if is_leap {
+                29
+            } else {
+                28
+            }
+        }
         _ => 0,
     };
     if day == 0 || day > max_days {
@@ -254,7 +260,9 @@ fn parse_tz_offset(s: &str) -> Result<i64, SamlError> {
             .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
         Ok(h * 3600)
     } else {
-        Err(SamlError::Malformed(format!("invalid timezone offset '{s}'")))
+        Err(SamlError::Malformed(format!(
+            "invalid timezone offset '{s}'"
+        )))
     }
 }
 
@@ -297,7 +305,9 @@ impl SamlParser {
     ///
     /// Deprecated: Unverified assertion parsing in production is insecure.
     /// Prefer [`SamlParser::parse_signed`] with an injected [`SamlSignatureVerifier`].
-    #[deprecated(note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests")]
+    #[deprecated(
+        note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests"
+    )]
     pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {
         Self::parse_unverified(xml)
     }
@@ -417,7 +427,8 @@ impl SamlParser {
                                 if k == "NotBefore" {
                                     not_before = Some(parse_iso8601_strict(attr.value.as_ref())?);
                                 } else if k == "NotOnOrAfter" {
-                                    not_on_or_after = Some(parse_iso8601_strict(attr.value.as_ref())?);
+                                    not_on_or_after =
+                                        Some(parse_iso8601_strict(attr.value.as_ref())?);
                                 }
                             }
                         } else if local_name == "Attribute" {
@@ -519,17 +530,22 @@ impl SamlParser {
         }
 
         if assertion_count == 0 {
-            return Err(SamlError::Malformed("missing Assertion element in SAML payload".into()));
+            return Err(SamlError::Malformed(
+                "missing Assertion element in SAML payload".into(),
+            ));
         }
 
         // Validate signature references against assertion ID or response ID
         for ref_id in &signature_references {
             let matches_assertion = assertion_id.as_deref() == Some(ref_id.as_str());
             let matches_response = response_id.as_deref() == Some(ref_id.as_str());
-            let matches_root_document = ref_id.is_empty() && (response_id.is_some() || assertion_id.is_some());
+            let matches_root_document =
+                ref_id.is_empty() && (response_id.is_some() || assertion_id.is_some());
             if !matches_assertion && !matches_response && !matches_root_document {
                 let expected = match (&assertion_id, &response_id) {
-                    (Some(a), Some(r)) => format!("assertion ID '{a}', response ID '{r}', or root document URI=''"),
+                    (Some(a), Some(r)) => {
+                        format!("assertion ID '{a}', response ID '{r}', or root document URI=''")
+                    }
                     (Some(a), None) => format!("assertion ID '{a}' or root document URI=''"),
                     (None, Some(r)) => format!("response ID '{r}' or root document URI=''"),
                     (None, None) => "known element ID".to_string(),
@@ -545,7 +561,8 @@ impl SamlParser {
             return Err(SamlError::Malformed("missing Issuer element".into()));
         }
 
-        let subject = subject.ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?;
+        let subject =
+            subject.ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?;
         if subject.is_empty() {
             return Err(SamlError::Malformed("missing NameID in Subject".into()));
         }

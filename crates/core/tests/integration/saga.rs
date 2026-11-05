@@ -275,9 +275,22 @@ async fn test_saga_multi_step_partial_compensation_runs_all_steps() {
     let report = saga.run(initial).await;
 
     // Even though step_2 compensation failed, step_3 AND step_1 compensations MUST run!
-    assert!(matches!(report.status, SagaStatus::CompensationFailed { .. }));
-    assert!(report.context.events.contains(&"step_3_compensated".to_string()));
-    assert!(report.context.events.contains(&"step_1_compensated".to_string()));
+    assert!(matches!(
+        report.status,
+        SagaStatus::CompensationFailed { .. }
+    ));
+    assert!(
+        report
+            .context
+            .events
+            .contains(&"step_3_compensated".to_string())
+    );
+    assert!(
+        report
+            .context
+            .events
+            .contains(&"step_1_compensated".to_string())
+    );
 }
 
 #[tokio::test]
@@ -307,7 +320,12 @@ async fn test_saga_step_panic_isolation() {
 
     // Panic must not crash thread; must compensate step 1
     assert!(matches!(report.status, SagaStatus::Compensated { .. }));
-    assert!(report.context.events.contains(&"step_1_compensated".to_string()));
+    assert!(
+        report
+            .context
+            .events
+            .contains(&"step_1_compensated".to_string())
+    );
 }
 
 #[tokio::test]
@@ -362,7 +380,10 @@ async fn test_saga_persistence_and_crash_resume() {
         compensated_steps: Vec::new(),
         updated_at: 1000,
     };
-    store.save_record(&crashed_record).await.expect("save crashed record");
+    store
+        .save_record(&crashed_record)
+        .await
+        .expect("save crashed record");
 
     // 2. Query incomplete sagas - it must show up
     let incomplete = store.list_incomplete().await.expect("list incomplete");
@@ -388,7 +409,11 @@ async fn test_saga_persistence_and_crash_resume() {
     );
 
     // 4. Verify terminal record in store
-    let persisted = store.load_record(saga_id).await.expect("load").expect("exists");
+    let persisted = store
+        .load_record(saga_id)
+        .await
+        .expect("load")
+        .expect("exists");
     assert_eq!(persisted.status, SagaStatus::Success);
     assert_eq!(persisted.completed_steps.len(), 3);
 
@@ -438,7 +463,10 @@ async fn test_saga_persistence_and_crashed_compensation() {
         compensated_steps: vec!["step_2_charge".into()],
         updated_at: 2000,
     };
-    store.save_record(&crashed_record).await.expect("save crashed record");
+    store
+        .save_record(&crashed_record)
+        .await
+        .expect("save crashed record");
 
     let initial = OrderContext {
         order_id: "ord-compensate".into(),
@@ -446,7 +474,10 @@ async fn test_saga_persistence_and_crashed_compensation() {
         ..Default::default()
     };
 
-    let report = saga.compensate_crashed(saga_id, initial).await.expect("compensate crashed");
+    let report = saga
+        .compensate_crashed(saga_id, initial)
+        .await
+        .expect("compensate crashed");
 
     assert!(matches!(report.status, SagaStatus::Compensated { .. }));
     // Step 1 was compensated during resume
@@ -459,6 +490,10 @@ async fn test_saga_persistence_and_crashed_compensation() {
         vec!["step_2_undone", "step_1_undone"]
     );
 
-    let persisted = store.load_record(saga_id).await.expect("load").expect("exists");
+    let persisted = store
+        .load_record(saga_id)
+        .await
+        .expect("load")
+        .expect("exists");
     assert!(matches!(persisted.status, SagaStatus::Compensated { .. }));
 }

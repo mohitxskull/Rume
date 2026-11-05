@@ -4,8 +4,8 @@ use axum::Json;
 use axum::http::StatusCode;
 use axum::routing::post;
 use rume::persistence::{
-    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, Migration,
-    Migrator, PersistenceError, SqliteBackend,
+    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, Migration, Migrator,
+    PersistenceError, SqliteBackend,
 };
 use rume::prelude::*;
 
@@ -375,11 +375,20 @@ async fn test_persistence_via_rume_test_harness() {
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(TestApp::body_text(resp).await, "pong");
 
-    let count = harness.execute("CREATE TABLE harness_users (id INT, name TEXT);").await.unwrap();
+    let count = harness
+        .execute("CREATE TABLE harness_users (id INT, name TEXT);")
+        .await
+        .unwrap();
     assert_eq!(count, 0);
 
-    harness.execute("INSERT INTO harness_users VALUES (1, 'alice');").await.unwrap();
-    let name = harness.query_scalar("SELECT name FROM harness_users WHERE id = 1;").await.unwrap();
+    harness
+        .execute("INSERT INTO harness_users VALUES (1, 'alice');")
+        .await
+        .unwrap();
+    let name = harness
+        .query_scalar("SELECT name FROM harness_users WHERE id = 1;")
+        .await
+        .unwrap();
     assert_eq!(name, Some("alice".to_string()));
 }
 
@@ -397,11 +406,17 @@ async fn migration_checksum_mismatch_fails_closed_in_preflight_and_runner() {
     );
 
     // Apply valid migration
-    let summary = initial_migrator.run_pending_backend(&backend).await.unwrap();
+    let summary = initial_migrator
+        .run_pending_backend(&backend)
+        .await
+        .unwrap();
     assert_eq!(summary.applied.len(), 1);
 
     // Preflight check succeeds with matching checksum
-    initial_migrator.verify_no_pending_backend(&backend).await.unwrap();
+    initial_migrator
+        .verify_no_pending_backend(&backend)
+        .await
+        .unwrap();
 
     // Now tamper with the migration script
     let tampered_migrator = Migrator::new().add_migration(
@@ -450,7 +465,10 @@ async fn migrator_with_rume_core_registers_and_applies_core_persistence() {
 
     let summary = migrator.run_pending_backend(&backend).await.unwrap();
     assert_eq!(summary.applied.len(), 2);
-    assert_eq!(summary.applied[0], rume::persistence::migration::RUME_CORE_MIGRATION_ID);
+    assert_eq!(
+        summary.applied[0],
+        rume::persistence::migration::RUME_CORE_MIGRATION_ID
+    );
     assert_eq!(summary.applied[1], "20261104_002_custom_app");
 
     migrator.verify_no_pending_backend(&backend).await.unwrap();
@@ -491,21 +509,21 @@ async fn test_db_row_and_from_row_query_operations() {
         "items.insert",
         "sql/items/insert.sql",
         None,
-        "INSERT INTO items (id, title, count, active, note) VALUES (?1, ?2, ?3, ?4, ?5);"
+        "INSERT INTO items (id, title, count, active, note) VALUES (?1, ?2, ?3, ?4, ?5);",
     );
 
     let query_find = rume::persistence::SqlQuery::new(
         "items.find",
         "sql/items/find.sql",
         None,
-        "SELECT id, title, count, active, note FROM items WHERE id = ?1;"
+        "SELECT id, title, count, active, note FROM items WHERE id = ?1;",
     );
 
     let query_list = rume::persistence::SqlQuery::new(
         "items.list",
         "sql/items/list.sql",
         None,
-        "SELECT id, title, count, active, note FROM items ORDER BY count ASC;"
+        "SELECT id, title, count, active, note FROM items ORDER BY count ASC;",
     );
 
     // 1. Insert via query_insert.execute_pool
@@ -523,7 +541,13 @@ async fn test_db_row_and_from_row_query_operations() {
     let affected_tx = query_insert
         .execute(
             &tx,
-            &rume::params!["item-2", "Second Item", 20i64, false, None as Option<String>],
+            &rume::params![
+                "item-2",
+                "Second Item",
+                20i64,
+                false,
+                None as Option<String>
+            ],
         )
         .await
         .unwrap();
@@ -569,17 +593,17 @@ async fn test_db_row_and_from_row_query_operations() {
     assert_eq!(missing, None);
 
     // 5. fetch_all_as
-    let all: Vec<TestItem> = query_list
-        .fetch_all_as(&pool, &[])
-        .await
-        .unwrap();
+    let all: Vec<TestItem> = query_list.fetch_all_as(&pool, &[]).await.unwrap();
     assert_eq!(all.len(), 2);
     assert_eq!(all[0].id, "item-1");
     assert_eq!(all[1].id, "item-2");
 
     // 6. Direct pool fetch_all_as
     let direct_all: Vec<TestItem> = pool
-        .fetch_all_as("SELECT id, title, count, active, note FROM items ORDER BY count ASC", &[])
+        .fetch_all_as(
+            "SELECT id, title, count, active, note FROM items ORDER BY count ASC",
+            &[],
+        )
         .await
         .unwrap();
     assert_eq!(direct_all.len(), 2);

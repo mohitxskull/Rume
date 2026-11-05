@@ -1,11 +1,11 @@
 //! In-process typed event bus with synchronous dispatch and asynchronous background delivery.
 
+use futures_util::FutureExt;
 use std::any::{Any, TypeId};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, RwLock};
-use futures_util::FutureExt;
 use tracing::Instrument;
 
 use crate::events::error::EventError;
@@ -146,23 +146,22 @@ impl EventBus {
             );
             tokio::spawn(
                 crate::app::CURRENT_TRACE_CONTEXT
-                    .scope(
-                        current_tc,
-                        async move {
-                            for listener in listeners {
-                                let fut = listener(Arc::clone(&event_arc));
-                                match AssertUnwindSafe(fut).catch_unwind().await {
-                                    Ok(Ok(())) => {}
-                                    Ok(Err(err)) => {
-                                        tracing::error!("async event listener returned error: {err}");
-                                    }
-                                    Err(panic_payload) => {
-                                        tracing::error!("async event listener panicked: {panic_payload:?}");
-                                    }
+                    .scope(current_tc, async move {
+                        for listener in listeners {
+                            let fut = listener(Arc::clone(&event_arc));
+                            match AssertUnwindSafe(fut).catch_unwind().await {
+                                Ok(Ok(())) => {}
+                                Ok(Err(err)) => {
+                                    tracing::error!("async event listener returned error: {err}");
+                                }
+                                Err(panic_payload) => {
+                                    tracing::error!(
+                                        "async event listener panicked: {panic_payload:?}"
+                                    );
                                 }
                             }
-                        },
-                    )
+                        }
+                    })
                     .instrument(span),
             );
         }

@@ -56,10 +56,7 @@ pub fn build_api_router(
             "/organizations",
             post(organizations::create_organization).get(organizations::list_organizations),
         )
-        .route(
-            "/organizations/{id}",
-            get(organizations::get_organization),
-        )
+        .route("/organizations/{id}", get(organizations::get_organization))
         .layer(RateLimitLayer::new(org_limiter));
 
     Router::new()

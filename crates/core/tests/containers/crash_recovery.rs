@@ -95,7 +95,9 @@ async fn test_process_crash_during_worker_execution_and_recovery() {
     let mut line = String::new();
 
     // Wait until Process A claims the job and is actively holding the lease
-    reader_a.read_line(&mut line).expect("read line from child a");
+    reader_a
+        .read_line(&mut line)
+        .expect("read line from child a");
     assert!(
         line.starts_with("CLAIM_ACQUIRED:"),
         "expected CLAIM_ACQUIRED, got: {line}"
@@ -154,7 +156,10 @@ async fn test_process_crash_after_business_tx_and_outbox_recovery() {
     // Initialize core schema
     let backend = rume::persistence::postgres::PostgresBackend::from_pool(pool.clone());
     let migrator = rume::persistence::migration::Migrator::new().with_rume_core("postgres");
-    migrator.run_pending(&backend).await.expect("core migrations");
+    migrator
+        .run_pending(&backend)
+        .await
+        .expect("core migrations");
 
     let bin = crash_harness_binary();
 
@@ -199,8 +204,13 @@ async fn test_process_crash_after_business_tx_and_outbox_recovery() {
     let stdout_a2 = child_a2.stdout.take().expect("capture child a2 stdout");
     let mut reader_a2 = BufReader::new(stdout_a2);
     let mut line = String::new();
-    reader_a2.read_line(&mut line).expect("read line from child a2");
-    assert!(line.starts_with("OUTBOX_CLAIMED:"), "expected OUTBOX_CLAIMED, got: {line}");
+    reader_a2
+        .read_line(&mut line)
+        .expect("read line from child a2");
+    assert!(
+        line.starts_with("OUTBOX_CLAIMED:"),
+        "expected OUTBOX_CLAIMED, got: {line}"
+    );
 
     // Terminate Process A2 abruptly
     child_a2.kill().expect("kill process a2");
@@ -220,16 +230,26 @@ async fn test_process_crash_after_business_tx_and_outbox_recovery() {
         .output()
         .expect("run process b");
 
-    assert!(output_b.status.success(), "process b must exit 0: {:?}", String::from_utf8_lossy(&output_b.stderr));
+    assert!(
+        output_b.status.success(),
+        "process b must exit 0: {:?}",
+        String::from_utf8_lossy(&output_b.stderr)
+    );
     let stdout_b = String::from_utf8_lossy(&output_b.stdout);
-    assert!(stdout_b.contains("OUTBOX_RECOVERED:published=1"), "relay must publish recovered message: {stdout_b}");
+    assert!(
+        stdout_b.contains("OUTBOX_RECOVERED:published=1"),
+        "relay must publish recovered message: {stdout_b}"
+    );
 
     // 5. Verify outbox table reflects published status
     let outbox_status: (String,) = sqlx::query_as("SELECT status FROM rume_outbox LIMIT 1")
         .fetch_one(&pool)
         .await
         .expect("query outbox status");
-    assert_eq!(outbox_status.0, "published", "outbox message must be published");
+    assert_eq!(
+        outbox_status.0, "published",
+        "outbox message must be published"
+    );
 }
 
 #[tokio::test]
@@ -270,7 +290,9 @@ async fn test_process_crash_distributed_leader_takeover() {
     let stdout_a = child_a.stdout.take().expect("capture child a stdout");
     let mut reader_a = BufReader::new(stdout_a);
     let mut line = String::new();
-    reader_a.read_line(&mut line).expect("read line from child a");
+    reader_a
+        .read_line(&mut line)
+        .expect("read line from child a");
     assert!(
         line.starts_with("LEADER_ACQUIRED:leader-node-a:"),
         "child a must output LEADER_ACQUIRED with term: {line}"
@@ -370,7 +392,10 @@ async fn test_raw_redis_ttl_lock_recovery() {
     let _redis = common::containers::shared_redis().await;
     let redis_url = common::containers::shared_redis_url().await;
     let client = redis::Client::open(redis_url).expect("redis client");
-    let mut conn = client.get_multiplexed_async_connection().await.expect("connection");
+    let mut conn = client
+        .get_multiplexed_async_connection()
+        .await
+        .expect("connection");
 
     let key = format!("test:crash:raw_lock:{}", uuid::Uuid::new_v4());
 

@@ -2,47 +2,47 @@
 
 ## Summary
 
-This diff review evaluates the security protocols, enterprise integrations, and authentication subsystems in Rume across commits `cf82559..HEAD`, auditing `rume/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `rume/src/enterprise/` (`saml.rs`, `scim.rs`), `rume/src/auth/` (`schemes.rs`, `session.rs`), `rume/src/env/` (`secrets.rs`), and associated integration test suites. Substantial security hardening has landed: SQL injection in `SqlAuditLogger` has been eliminated with correlation IDs preserved (v03 C3), unverified SAML assertion consumption in production is deprecated in favor of mandatory signature verification (v03 C2), SAML claim extraction is now strictly anchored to the assertion subtree (v03 C1), multi-cookie inspection defeats cookie-tossing denial of service in CSRF validation (v03 M2), metadata secrets are redacted during audit serialization (v03 M3), SCIM entities support ETag versioning (v03 M4), and `SessionScheme` no longer degrades authenticated sessions to guests on provider faults (v03 M6). However, the diff **fails** review and cannot be accepted as-is: the new signature reference binding in `SamlParser` erroneously rejects standard signed SAML Response envelopes (finding M1), and `CsrfConfig` continues to default to unauthenticated, insecure tokens vulnerable to subdomain tossing (finding M2).
+This diff review evaluates the security protocols, enterprise integrations, and authentication subsystems in Rume across commits `cf82559..HEAD`, auditing `crates/core/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `crates/core/src/enterprise/` (`saml.rs`, `scim.rs`), `crates/core/src/auth/` (`schemes.rs`, `session.rs`), `crates/core/src/env/` (`secrets.rs`), and associated integration test suites. Substantial security hardening has landed: SQL injection in `SqlAuditLogger` has been eliminated with correlation IDs preserved (v03 C3), unverified SAML assertion consumption in production is deprecated in favor of mandatory signature verification (v03 C2), SAML claim extraction is now strictly anchored to the assertion subtree (v03 C1), multi-cookie inspection defeats cookie-tossing denial of service in CSRF validation (v03 M2), metadata secrets are redacted during audit serialization (v03 M3), SCIM entities support ETag versioning (v03 M4), and `SessionScheme` no longer degrades authenticated sessions to guests on provider faults (v03 M6). However, the diff **fails** review and cannot be accepted as-is: the new signature reference binding in `SamlParser` erroneously rejects standard signed SAML Response envelopes (finding M1), and `CsrfConfig` continues to default to unauthenticated, insecure tokens vulnerable to subdomain tossing (finding M2).
 
 ---
 
 ## Prior decisions
 
 - **v03 Security C1 (SAML 2.0 Parser Vulnerable to XML Signature Wrapping (XSW) Attacks via Unbound Global Tag Extraction and Namespace Prefix Evasion)** — **CHALLENGED (Defective Remediation)**.
-  Dynamic namespace prefix scanning (`:Assertion` with alphanumeric prefix validation) and subtree isolation were added in `rume/src/enterprise/saml.rs:214–261`. All identity claims (`Issuer`, `Subject`, `Audience`, `Conditions`, `Attributes`) are now extracted strictly from `assertion_xml`, successfully preventing Type-1 Envelope Injection attacks. However, the newly added cryptographic Reference URI validation in lines 276–287 is defective: it assumes that only the `<Assertion>` element can be signed, causing valid enterprise SAML responses where the `<Response>` envelope is signed (standard in Okta, Azure AD, and ADFS) to be erroneously rejected with `SignatureWrappingDetected`, while remaining fragile against quote and namespace variants. Reported as finding M1.
+  Dynamic namespace prefix scanning (`:Assertion` with alphanumeric prefix validation) and subtree isolation were added in `crates/core/src/enterprise/saml.rs:214–261`. All identity claims (`Issuer`, `Subject`, `Audience`, `Conditions`, `Attributes`) are now extracted strictly from `assertion_xml`, successfully preventing Type-1 Envelope Injection attacks. However, the newly added cryptographic Reference URI validation in lines 276–287 is defective: it assumes that only the `<Assertion>` element can be signed, causing valid enterprise SAML responses where the `<Response>` envelope is signed (standard in Okta, Azure AD, and ADFS) to be erroneously rejected with `SignatureWrappingDetected`, while remaining fragile against quote and namespace variants. Reported as finding M1.
 
 - **v03 Security C2 (Public `SamlParser::parse()` Bypasses Cryptographic Verification in Production)** — **RESOLVED**.
-  `SamlParser::parse(xml)` in `rume/src/enterprise/saml.rs:183–186` is now annotated with `#[deprecated(note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests")]`. Production code is directed to `SamlParser::parse_signed(xml, verifier)`, which mandates a reference to `&dyn SamlSignatureVerifier`. Offline testing and diagnostic parsing are segregated into `SamlParser::parse_unverified(xml)`.
+  `SamlParser::parse(xml)` in `crates/core/src/enterprise/saml.rs:183–186` is now annotated with `#[deprecated(note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests")]`. Production code is directed to `SamlParser::parse_signed(xml, verifier)`, which mandates a reference to `&dyn SamlSignatureVerifier`. Offline testing and diagnostic parsing are segregated into `SamlParser::parse_unverified(xml)`.
 
 - **v03 Security C3 (SQL Injection Vulnerability in `SqlAuditLogger::record()` via String Formatting and Incomplete MySQL Escape Handling)** — **RESOLVED**.
-  `SqlAuditLogger::record()` in `rume/src/security/audit.rs:158–215` no longer relies on naive single-quote replacement. All text fields and JSON payloads are processed through `escape_sql_literal()`, which escapes `'`, `\`, `\0`, `\n`, `\r`, and `\x1a` (`\Z`), neutralizing backslash evasion attacks under MySQL's default escape mode. Furthermore, `record.id` is preserved during insertion (`let id = escape_sql_literal(&record.id);`), fixing the correlation ID overwrite. Verified by integration test `test_audit_logging_sql_injection_resilience_and_id_preservation` in `rume/tests/integration/security.rs:280–302`. (Note: Cross-dialect escaping trade-offs in PostgreSQL/SQLite are noted in finding m2).
+  `SqlAuditLogger::record()` in `crates/core/src/security/audit.rs:158–215` no longer relies on naive single-quote replacement. All text fields and JSON payloads are processed through `escape_sql_literal()`, which escapes `'`, `\`, `\0`, `\n`, `\r`, and `\x1a` (`\Z`), neutralizing backslash evasion attacks under MySQL's default escape mode. Furthermore, `record.id` is preserved during insertion (`let id = escape_sql_literal(&record.id);`), fixing the correlation ID overwrite. Verified by integration test `test_audit_logging_sql_injection_resilience_and_id_preservation` in `crates/core/tests/integration/security.rs:280–302`. (Note: Cross-dialect escaping trade-offs in PostgreSQL/SQLite are noted in finding m2).
 
 - **v03 Security M1 (Insecure Defaults in `CsrfConfig` Permit Subdomain Cookie-Tossing and Lack Mandatory HMAC Signing)** — **REAFFIRMED (Unresolved)**.
-  `CsrfConfig::default()` in `rume/src/security/csrf.rs:64–77` remains unchanged with `secret: None` and `cookie_secure: false`. When instantiated via `CsrfLayer::new()`, `verify_token` accepts any non-empty string, and CSRF cookies are transmitted without `Secure` transport flags. Double-submit validation remains vulnerable to subdomain cookie-tossing out of the box unless developers manually supply an HMAC key. Re-reported as finding M2.
+  `CsrfConfig::default()` in `crates/core/src/security/csrf.rs:64–77` remains unchanged with `secret: None` and `cookie_secure: false`. When instantiated via `CsrfLayer::new()`, `verify_token` accepts any non-empty string, and CSRF cookies are transmitted without `Secure` transport flags. Double-submit validation remains vulnerable to subdomain cookie-tossing out of the box unless developers manually supply an HMAC key. Re-reported as finding M2.
 
 - **v03 Security M2 (Subdomain Cookie-Tossing Causes Denial of Service via First-Cookie Selection Bias in `CsrfService`)** — **RESOLVED**.
-  In `rume/src/security/csrf.rs:324–379`, `CsrfService::call` replaces `find_map` with a full-header filter collecting all matching cookie values into `Vec<&str>`. It verifies whether *any* matching cookie possesses a valid signature (`any_valid`) and whether *any* valid cookie matches the incoming header token (`has_valid_match`) using `safe_equal`. An attacker tossing an invalid cookie on a parent domain can no longer mask a valid host-scoped signed cookie. Verified in `test_csrf_signed_tokens_and_cookie_tossing_protection` in `rume/tests/integration/security.rs:145–205`.
+  In `crates/core/src/security/csrf.rs:324–379`, `CsrfService::call` replaces `find_map` with a full-header filter collecting all matching cookie values into `Vec<&str>`. It verifies whether *any* matching cookie possesses a valid signature (`any_valid`) and whether *any* valid cookie matches the incoming header token (`has_valid_match`) using `safe_equal`. An attacker tossing an invalid cookie on a parent domain can no longer mask a valid host-scoped signed cookie. Verified in `test_csrf_signed_tokens_and_cookie_tossing_protection` in `crates/core/tests/integration/security.rs:145–205`.
 
 - **v03 Security M3 (Lack of Secret Redaction in Audit Logging Metadata)** — **RESOLVED**.
-  In `rume/src/security/audit.rs:184–190`, before serializing metadata into JSON, `record.metadata` is iterated through `crate::env::secrets::redact_value(k, v)`. Any key matching secret heuristics (`APIKEY`, `PASSWORD`, `TOKEN`, `AUTHORIZATION`, `SESSION`, etc.) or values matching credential URLs have their values scrubbed to `[redacted]` before persistent storage in `rume_audit_log`.
+  In `crates/core/src/security/audit.rs:184–190`, before serializing metadata into JSON, `record.metadata` is iterated through `crate::env::secrets::redact_value(k, v)`. Any key matching secret heuristics (`APIKEY`, `PASSWORD`, `TOKEN`, `AUTHORIZATION`, `SESSION`, etc.) or values matching credential URLs have their values scrubbed to `[redacted]` before persistent storage in `rume_audit_log`.
 
 - **v03 Security M4 (SCIM 2.0 Entities Lack `meta.version` (ETag) for Optimistic Concurrency Control and Replay Protection)** — **RESOLVED**.
-  `ScimMeta` in `rume/src/enterprise/scim.rs:33–50` now includes `pub version: Option<String>` and builder method `with_version(mut self, version: impl Into<String>)`. Additionally, `ScimGroup` (`scim.rs:117, 128–131`) now includes `pub meta: Option<ScimMeta>`, populated by default with `resource_type: "Group"`.
+  `ScimMeta` in `crates/core/src/enterprise/scim.rs:33–50` now includes `pub version: Option<String>` and builder method `with_version(mut self, version: impl Into<String>)`. Additionally, `ScimGroup` (`scim.rs:117, 128–131`) now includes `pub meta: Option<ScimMeta>`, populated by default with `resource_type: "Group"`.
 
 - **v03 Security M5 (Missing Session ID Rotation (Regeneration) Exposes Applications to Session Fixation Attacks)** — **RESOLVED**.
-  `SessionStore` in `rume/src/auth/session.rs:85–103` now defines `regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>>` with a default implementation that loads the session, generates a fresh UUID v4 identifier, and re-persists the session data under the new key. (Note: Non-atomic destroy-before-save sequencing is tracked in finding m1).
+  `SessionStore` in `crates/core/src/auth/session.rs:85–103` now defines `regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>>` with a default implementation that loads the session, generates a fresh UUID v4 identifier, and re-persists the session data under the new key. (Note: Non-atomic destroy-before-save sequencing is tracked in finding m1).
 
 - **v03 Security M6 (`SessionScheme` Silently Degrades Authenticated Users to Guests on Session Store Failures)** — **RESOLVED**.
-  In `rume/src/auth/schemes.rs:194–213`, `SessionScheme` replaces `if let Ok(Some(session))` with an explicit `match self.store.load(val).await`. While `Ok(None)` cleanly returns `Ok(None)` to allow multi-scheme fallback on expired cookies, `Err(err)` immediately returns `Err(err)`, surfacing backend storage timeouts (e.g. Redis connection errors) as HTTP 500 internal server errors rather than silently treating authenticated users as anonymous guests.
+  In `crates/core/src/auth/schemes.rs:194–213`, `SessionScheme` replaces `if let Ok(Some(session))` with an explicit `match self.store.load(val).await`. While `Ok(None)` cleanly returns `Ok(None)` to allow multi-scheme fallback on expired cookies, `Err(err)` immediately returns `Err(err)`, surfacing backend storage timeouts (e.g. Redis connection errors) as HTTP 500 internal server errors rather than silently treating authenticated users as anonymous guests.
 
 - **v03 Security m1 (Unvalidated Reverse Proxy Trust for `x-forwarded-proto` and Axum Relative URI Blindness in `SecurityHeadersService`)** — **RESOLVED**.
-  `SecurityHeadersConfig` in `rume/src/security/headers.rs:38–44, 95–105` added `native_tls: bool` (for in-process TLS termination) and `trust_proxy_headers: bool` (defaulting to `true`, configurable to `false` when running without trusted reverse proxies). In addition, RFC 7239 `Forwarded: proto=https` header inspection was added alongside `x-forwarded-proto`.
+  `SecurityHeadersConfig` in `crates/core/src/security/headers.rs:38–44, 95–105` added `native_tls: bool` (for in-process TLS termination) and `trust_proxy_headers: bool` (defaulting to `true`, configurable to `false` when running without trusted reverse proxies). In addition, RFC 7239 `Forwarded: proto=https` header inspection was added alongside `x-forwarded-proto`.
 
-- **v03 Security m2 (Substring Heuristic Blind Spots and Leaky URL Parsing in `rume/src/env/secrets.rs`)** — **RESOLVED**.
-  In `rume/src/env/secrets.rs:22–52`, `is_secret_key` was expanded to cover `APIKEY`, `AUTHORIZATION`, `BEARER`, `SESSION`, and `SESSION_ID` in both substring and exact matches. In `redact_credential_urls_in_text` (`secrets.rs:97`), `authority.find('@')` was corrected to `authority.rfind('@')`, properly isolating user credentials when passwords contain `@` characters.
+- **v03 Security m2 (Substring Heuristic Blind Spots and Leaky URL Parsing in `crates/core/src/env/secrets.rs`)** — **RESOLVED**.
+  In `crates/core/src/env/secrets.rs:22–52`, `is_secret_key` was expanded to cover `APIKEY`, `AUTHORIZATION`, `BEARER`, `SESSION`, and `SESSION_ID` in both substring and exact matches. In `redact_credential_urls_in_text` (`secrets.rs:97`), `authority.find('@')` was corrected to `authority.rfind('@')`, properly isolating user credentials when passwords contain `@` characters.
 
 - **v03 Security m3 (SAML Parser Comment Truncation and Tag Extraction Fragility)** — **RESOLVED**.
-  `strip_comments()` in `rume/src/enterprise/saml.rs:76–89` now returns `Result<String, SamlError>`, returning `Err(SamlError::Malformed("unclosed XML comment".into()))` instead of truncating remaining XML. In addition, `extract_attribute()` (`saml.rs:141–157`) supports single quotes, double quotes, and arbitrary whitespace around the equals sign (`attr="`, `attr='`, `attr ="`, `attr = "`, `attr= "`).
+  `strip_comments()` in `crates/core/src/enterprise/saml.rs:76–89` now returns `Result<String, SamlError>`, returning `Err(SamlError::Malformed("unclosed XML comment".into()))` instead of truncating remaining XML. In addition, `extract_attribute()` (`saml.rs:141–157`) supports single quotes, double quotes, and arbitrary whitespace around the equals sign (`attr="`, `attr='`, `attr ="`, `attr = "`, `attr= "`).
 
 ---
 
@@ -50,7 +50,7 @@ This diff review evaluates the security protocols, enterprise integrations, and 
 
 ### M1 SAML 2.0 Signature Reference binding in `SamlParser` rejects standard signed Response envelopes and is fragile to namespace variants
 
-- **Where:** `rume/src/enterprise/saml.rs:263–287`
+- **Where:** `crates/core/src/enterprise/saml.rs:263–287`
 - **What it says:**
   ```rust
   // Optional Assertion ID bound to the verified assertion subtree
@@ -93,7 +93,7 @@ This diff review evaluates the security protocols, enterprise integrations, and 
 
 ### M2 Insecure defaults in `CsrfConfig` persist: missing mandatory HMAC secret and insecure cookies by default
 
-- **Where:** `rume/src/security/csrf.rs:64–77, 167–172`
+- **Where:** `crates/core/src/security/csrf.rs:64–77, 167–172`
 - **What it says:**
   ```rust
   impl Default for CsrfConfig {
@@ -131,7 +131,7 @@ This diff review evaluates the security protocols, enterprise integrations, and 
 
 ### m1 Non-atomic session ID rotation in `SessionStore::regenerate_id` risks state loss on write failures
 
-- **Where:** `rume/src/auth/session.rs:86–103`
+- **Where:** `crates/core/src/auth/session.rs:86–103`
 - **What it says:**
   ```rust
   fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>> {
@@ -168,7 +168,7 @@ This diff review evaluates the security protocols, enterprise integrations, and 
 
 ### m2 Audit logger SQL literal escaping causes data distortion in PostgreSQL and SQLite
 
-- **Where:** `rume/src/security/audit.rs:158–174`
+- **Where:** `crates/core/src/security/audit.rs:158–174`
 - **What it says:**
   ```rust
   fn escape_sql_literal(s: &str) -> String {

@@ -2,8 +2,8 @@ use rume::persistence::error::PersistenceError;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 
-use crate::models::Organization;
 use super::queries;
+use crate::models::Organization;
 
 pub struct OrganizationRepository;
 
@@ -13,14 +13,7 @@ impl OrganizationRepository {
         org: &Organization,
     ) -> Result<(), PersistenceError> {
         queries::organizations::CREATE
-            .execute_pool(
-                pool,
-                &rume::params![
-                    &org.id,
-                    &org.name,
-                    org.created_at,
-                ],
-            )
+            .execute_pool(pool, &rume::params![&org.id, &org.name, org.created_at,])
             .await
             .map(|_| ())
     }
@@ -37,8 +30,6 @@ impl OrganizationRepository {
     pub async fn list_all(
         pool: &DatabasePool<PostgresBackend>,
     ) -> Result<Vec<Organization>, PersistenceError> {
-        queries::organizations::LIST
-            .fetch_all_as(pool, &[])
-            .await
+        queries::organizations::LIST.fetch_all_as(pool, &[]).await
     }
 }

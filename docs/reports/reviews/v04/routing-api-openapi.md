@@ -11,16 +11,16 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 > [!NOTE]
 > No v03 review lens covered routing, validation, error contracts, or OpenAPI generation. The prior decision baseline is derived from `docs/reports/reviews/v01/correctness.md`, `docs/reports/reviews/v02/correctness.md`, `docs/reports/reviews/v02/dx-tooling.md`, and `docs/reports/reviews/v02/testing.md`.
 
-- **v01 C1 (`ValidatedParam<M>` cannot compile with `AppContext` state)** — **REAFFIRMED**. Verified in `rume/src/routing/spec.rs:166–302` and `rume/src/routing/validated_param.rs:1–64`. HTTP parameter validation was decoupled from handler-level state extraction and moved to `ParamValidationLayer` applied to `MethodRouter` on `RouteSpec`. `ValidatedParam` was refactored into a value container populated via `ValidatedParam::from_value`, and typed parameter extraction is provided by `ValidatedPath<T>` in `rume/src/validation.rs:161–184`. Handlers compile with any state.
-- **v01 m1 (`Matcher::Number` doc "digits only" does not match `u64`-bounded parsing)** — **REAFFIRMED**. Verified in `rume/src/routing/matchers.rs:15–17, 24–25`. The documentation and inline comments explicitly specify that the value must parse as `u64`, and overflowing digit strings are rejected.
-- **v01 m2 (`RouteGroup::add` does not normalize path separators)** — **REAFFIRMED**. Verified in `rume/src/routing/registry.rs:137–158` and `rume/src/routing/group.rs:42, 53, 64, 75, 86, 93, 104, 126, 162`. `join_path` normalizes adjacent and missing slashes across all route mounting methods.
-- **v01 m3 (`RouteSpec::build()` registers in global registry even when unmounted)** — **REAFFIRMED**. Verified in `rume/src/routing/spec.rs:162–164` and `rume/src/routing/router.rs:221–252`. Global singleton `ROUTE_REGISTRY` was eliminated; `RouteRegistry` is application-scoped, `RouteSpec::build()` is pure and side-effect free, and route registration occurs only upon explicit router mounting.
-- **v01 m4 (`health_routes` `/health/ready` returns 503 for `Warning`, not just failures)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs:141–143, 238–251, 618–626`. The architectural decision that readiness requires full health (`is_healthy == false` on `Warning`) was maintained, and documentation and tests explicitly affirm that degraded warning status yields HTTP 503.
-- **v02 m1 (`ValidatedParam` documentation refers to "extractor", but `FromRequestParts` is no longer implemented)** — **REAFFIRMED**. Verified in `rume/src/routing/validated_param.rs:6–8`. Documentation clarifies that `ValidatedParam` is a validated value container populated via `from_value`, not an Axum request extractor.
-- **v02 DX M1 (OpenAPI 3.1 generator discards route parameter matchers and infers schemas via parameter-name substring heuristics)** — **REAFFIRMED**. Verified in `rume/src/routing/registry.rs:40`, `rume/src/routing/router.rs:230, 250`, and `rume/src/openapi/spec.rs:164–174`. Route metadata now retains declared `matchers: Vec<(String, Matcher)>`, and `generate_openapi` directly inspects matchers to generate schema types (`Matcher::Number` $\to$ integer, `Matcher::Uuid` $\to$ uuid format, `Matcher::Slug` $\to$ regex string).
-- **v02 DX m4 (`RouteGroup` lacks fluent `.layer()` middleware mounting method)** — **REAFFIRMED**. Verified in `rume/src/routing/group.rs:142–154`. `RouteGroup::layer` applies Tower layers group-wide.
-- **v02 DX m5 / Architecture m5 (`Router` lacks fluent `.openapi()` and `.metrics()` methods)** — **REAFFIRMED**. Verified in `rume/src/routing/router.rs:362–383`. Both endpoints can be mounted fluently on `Router`.
-- **v02 Testing / insta snapshot remediation (OpenAPI and Problem Details snapshot tests)** — **REAFFIRMED**. Verified in `rume/tests/integration/openapi.rs:30–86` and `rume/tests/integration/error.rs:62–72, 91–101`. `insta::assert_json_snapshot!` is integrated into integration test suites.
+- **v01 C1 (`ValidatedParam<M>` cannot compile with `AppContext` state)** — **REAFFIRMED**. Verified in `crates/core/src/routing/spec.rs:166–302` and `crates/core/src/routing/validated_param.rs:1–64`. HTTP parameter validation was decoupled from handler-level state extraction and moved to `ParamValidationLayer` applied to `MethodRouter` on `RouteSpec`. `ValidatedParam` was refactored into a value container populated via `ValidatedParam::from_value`, and typed parameter extraction is provided by `ValidatedPath<T>` in `crates/core/src/validation.rs:161–184`. Handlers compile with any state.
+- **v01 m1 (`Matcher::Number` doc "digits only" does not match `u64`-bounded parsing)** — **REAFFIRMED**. Verified in `crates/core/src/routing/matchers.rs:15–17, 24–25`. The documentation and inline comments explicitly specify that the value must parse as `u64`, and overflowing digit strings are rejected.
+- **v01 m2 (`RouteGroup::add` does not normalize path separators)** — **REAFFIRMED**. Verified in `crates/core/src/routing/registry.rs:137–158` and `crates/core/src/routing/group.rs:42, 53, 64, 75, 86, 93, 104, 126, 162`. `join_path` normalizes adjacent and missing slashes across all route mounting methods.
+- **v01 m3 (`RouteSpec::build()` registers in global registry even when unmounted)** — **REAFFIRMED**. Verified in `crates/core/src/routing/spec.rs:162–164` and `crates/core/src/routing/router.rs:221–252`. Global singleton `ROUTE_REGISTRY` was eliminated; `RouteRegistry` is application-scoped, `RouteSpec::build()` is pure and side-effect free, and route registration occurs only upon explicit router mounting.
+- **v01 m4 (`health_routes` `/health/ready` returns 503 for `Warning`, not just failures)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs:141–143, 238–251, 618–626`. The architectural decision that readiness requires full health (`is_healthy == false` on `Warning`) was maintained, and documentation and tests explicitly affirm that degraded warning status yields HTTP 503.
+- **v02 m1 (`ValidatedParam` documentation refers to "extractor", but `FromRequestParts` is no longer implemented)** — **REAFFIRMED**. Verified in `crates/core/src/routing/validated_param.rs:6–8`. Documentation clarifies that `ValidatedParam` is a validated value container populated via `from_value`, not an Axum request extractor.
+- **v02 DX M1 (OpenAPI 3.1 generator discards route parameter matchers and infers schemas via parameter-name substring heuristics)** — **REAFFIRMED**. Verified in `crates/core/src/routing/registry.rs:40`, `crates/core/src/routing/router.rs:230, 250`, and `crates/core/src/openapi/spec.rs:164–174`. Route metadata now retains declared `matchers: Vec<(String, Matcher)>`, and `generate_openapi` directly inspects matchers to generate schema types (`Matcher::Number` $\to$ integer, `Matcher::Uuid` $\to$ uuid format, `Matcher::Slug` $\to$ regex string).
+- **v02 DX m4 (`RouteGroup` lacks fluent `.layer()` middleware mounting method)** — **REAFFIRMED**. Verified in `crates/core/src/routing/group.rs:142–154`. `RouteGroup::layer` applies Tower layers group-wide.
+- **v02 DX m5 / Architecture m5 (`Router` lacks fluent `.openapi()` and `.metrics()` methods)** — **REAFFIRMED**. Verified in `crates/core/src/routing/router.rs:362–383`. Both endpoints can be mounted fluently on `Router`.
+- **v02 Testing / insta snapshot remediation (OpenAPI and Problem Details snapshot tests)** — **REAFFIRMED**. Verified in `crates/core/tests/integration/openapi.rs:30–86` and `crates/core/tests/integration/error.rs:62–72, 91–101`. `insta::assert_json_snapshot!` is integrated into integration test suites.
 
 ---
 
@@ -28,9 +28,9 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### C1 Readiness probe `/health/ready` returns 200 OK during startup (`AvailabilityState::Live`), routing traffic before modules and startup hooks are ready
 
-- **Where:** `rume/src/routing/health.rs:327–358` and `rume/src/app/builder.rs:1261–1342`
+- **Where:** `crates/core/src/routing/health.rs:327–358` and `crates/core/src/app/builder.rs:1261–1342`
 - **What it says:**
-  In `rume/src/routing/health.rs`:
+  In `crates/core/src/routing/health.rs`:
   ```rust
   .get(
       "/health/ready",
@@ -59,7 +59,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
       },
   )
   ```
-  In `rume/src/app/builder.rs`:
+  In `crates/core/src/app/builder.rs`:
   ```rust
   // Step 3: Booted & Live
   serve_ctx.lifecycle.set(LifecycleState::Booted);
@@ -97,7 +97,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### M1 Eager OpenAPI generation in `Router::openapi()` captures static snapshot at registration time, discarding all subsequent routes and merged subrouters
 
-- **Where:** `rume/src/routing/router.rs:361–369` (corresponds with Lens 7 finding M1 on `RumeBuilder::openapi`)
+- **Where:** `crates/core/src/routing/router.rs:361–369` (corresponds with Lens 7 finding M1 on `RumeBuilder::openapi`)
 - **What it says:**
   ```rust
   /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
@@ -134,9 +134,9 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### M2 OpenAPI parameter schema regex pattern for `Matcher::Slug` contradicts `Matcher::Slug::validate` runtime validation
 
-- **Where:** `rume/src/openapi/spec.rs:169–173` vs `rume/src/routing/matchers.rs:66–85`
+- **Where:** `crates/core/src/openapi/spec.rs:169–173` vs `crates/core/src/routing/matchers.rs:66–85`
 - **What it says:**
-  In `rume/src/openapi/spec.rs`:
+  In `crates/core/src/openapi/spec.rs`:
   ```rust
   crate::routing::Matcher::Slug => OpenApiSchema {
       r#type: "string".into(),
@@ -144,7 +144,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
       pattern: Some("^[a-z0-9]+(?:-[a-z0-9]+)*$".into()),
   },
   ```
-  In `rume/src/routing/matchers.rs`:
+  In `crates/core/src/routing/matchers.rs`:
   ```rust
   fn is_valid_slug(value: &str) -> bool {
       if value.len() < 3 {
@@ -185,7 +185,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### M3 Health check probe race on cache expiry causes thundering herd stampede and serial lock churn
 
-- **Where:** `rume/src/routing/health.rs:147–176, 178–221`
+- **Where:** `crates/core/src/routing/health.rs:147–176, 178–221`
 - **What it says:**
   ```rust
   if let Some(ttl) = self.cache_ttl {
@@ -236,7 +236,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### m1 `/health/ready` endpoint collapses `Warning` status into `"error"` in response body while returning 503
 
-- **Where:** `rume/src/routing/health.rs:350–356`
+- **Where:** `crates/core/src/routing/health.rs:350–356`
 - **What it says:**
   ```rust
   let status = if report.is_healthy { "ok" } else { "error" };
@@ -262,7 +262,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### m2 `MetricsLayer` hardcodes bypass for exact path `"/metrics"`, tracking scraper requests when metrics endpoint is mounted on custom paths
 
-- **Where:** `rume/src/metrics/layer.rs:67–70`
+- **Where:** `crates/core/src/metrics/layer.rs:67–70`
 - **What it says:**
   ```rust
   if req.uri().path() == "/metrics" {
@@ -280,9 +280,9 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### m3 Route parameter matcher declaration does not validate parameter existence against path template
 
-- **Where:** `rume/src/routing/spec.rs:101–104, 268–278` and `rume/src/routing/router.rs:221–252`
+- **Where:** `crates/core/src/routing/spec.rs:101–104, 268–278` and `crates/core/src/routing/router.rs:221–252`
 - **What it says:**
-  In `rume/src/routing/spec.rs`:
+  In `crates/core/src/routing/spec.rs`:
   ```rust
   for (name, matcher) in &*matchers {
       let value = match params.get(name) {
@@ -313,7 +313,7 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ### m4 OpenAPI 3.1 generator lacks Request Body, Security Scheme, and Component Schema definitions
 
-- **Where:** `rume/src/openapi/spec.rs:83–147, 230–235`
+- **Where:** `crates/core/src/openapi/spec.rs:83–147, 230–235`
 - **What it says:**
   `OpenApiOperation` only declares `operation_id`, `summary`, `parameters: Vec<OpenApiParameter>`, and `responses: OpenApiResponses`.
   `OpenApiSpec` contains only `openapi`, `info`, and `paths`.
@@ -329,11 +329,11 @@ This lens conducted a comprehensive whole-document audit of Rume's HTTP routing 
 
 ## Positive notes
 
-- **RFC 9457 Problem Details discipline:** `rume/src/error.rs` is exceptionally rigorous. Error responses consistently use `application/problem+json`, emit the standard fields (`type`, `title`, `status`, `detail`, `instance`, `code`, `request_id`), log internal diagnostic error chains strictly server-side (S-M4), and sanitize client-visible error details against credential and connection-string leaks.
-- **ParamValidationLayer fail-closed enforcement:** Parameter matching on `RouteSpec` (`rume/src/routing/spec.rs`) executes in a dedicated Tower service before the handler runs, correctly rejecting invalid input or malformed percent-encoding with 400 Problem Details without invoking downstream business logic.
-- **Validation extractor taxonomy:** `rume/src/validation.rs` cleanly separates syntactical deserialization errors (400 Bad Request) from semantic `garde` validation failures (422 Unprocessable Entity with structured field-level error details) across JSON, Query, Path, and Form extractors.
-- **Strictly bounded metrics cardinality:** `rume/src/metrics/registry.rs` avoids high-cardinality label explosion by partitioning metrics strictly by HTTP method and status code, avoiding raw path parameter keys; latency histograms use fixed static buckets, and `InFlightGuard` guarantees RAII decrement on dropped futures.
-- **Health check data leakage prevention:** `rume/src/routing/health.rs` explicitly strips sensitive diagnostic metadata, database connection strings, and debug info from public `/health/ready` responses, exposing only safe overall status strings to HTTP clients.
+- **RFC 9457 Problem Details discipline:** `crates/core/src/error.rs` is exceptionally rigorous. Error responses consistently use `application/problem+json`, emit the standard fields (`type`, `title`, `status`, `detail`, `instance`, `code`, `request_id`), log internal diagnostic error chains strictly server-side (S-M4), and sanitize client-visible error details against credential and connection-string leaks.
+- **ParamValidationLayer fail-closed enforcement:** Parameter matching on `RouteSpec` (`crates/core/src/routing/spec.rs`) executes in a dedicated Tower service before the handler runs, correctly rejecting invalid input or malformed percent-encoding with 400 Problem Details without invoking downstream business logic.
+- **Validation extractor taxonomy:** `crates/core/src/validation.rs` cleanly separates syntactical deserialization errors (400 Bad Request) from semantic `garde` validation failures (422 Unprocessable Entity with structured field-level error details) across JSON, Query, Path, and Form extractors.
+- **Strictly bounded metrics cardinality:** `crates/core/src/metrics/registry.rs` avoids high-cardinality label explosion by partitioning metrics strictly by HTTP method and status code, avoiding raw path parameter keys; latency histograms use fixed static buckets, and `InFlightGuard` guarantees RAII decrement on dropped futures.
+- **Health check data leakage prevention:** `crates/core/src/routing/health.rs` explicitly strips sensitive diagnostic metadata, database connection strings, and debug info from public `/health/ready` responses, exposing only safe overall status strings to HTTP clients.
 
 ---
 

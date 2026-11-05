@@ -2,8 +2,8 @@ use rume::persistence::error::PersistenceError;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 
-use crate::models::Project;
 use super::queries;
+use crate::models::Project;
 
 pub struct ProjectRepository;
 

@@ -290,13 +290,18 @@ async fn test_audit_logging_sql_injection_resilience_and_id_preservation() {
         .with_meta("key", "val\\' OR '1'='1");
     let record_id = malicious_record.id.clone();
 
-    logger.record(malicious_record).await.expect("record with backslashes and quotes must succeed");
+    logger
+        .record(malicious_record)
+        .await
+        .expect("record with backslashes and quotes must succeed");
     assert_eq!(logger.count().await.unwrap(), 1);
 
     // Verify record.id was preserved in the database
     let saved_id = logger
         .backend()
-        .query_scalar(&format!("SELECT id FROM rume_audit_log WHERE id = '{record_id}'"))
+        .query_scalar(&format!(
+            "SELECT id FROM rume_audit_log WHERE id = '{record_id}'"
+        ))
         .await
         .unwrap();
     assert_eq!(saved_id.as_deref(), Some(record_id.as_str()));

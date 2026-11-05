@@ -1,11 +1,13 @@
 #![cfg(feature = "redis")]
 
-use std::time::Duration;
-use rume::coordination::*;
 use crate::common;
+use rume::coordination::*;
+use std::time::Duration;
 
 async fn start_redis_coordination() -> (
-    &'static testcontainers_modules::testcontainers::ContainerAsync<testcontainers_modules::redis::Redis>,
+    &'static testcontainers_modules::testcontainers::ContainerAsync<
+        testcontainers_modules::redis::Redis,
+    >,
     RedisDistributedLock,
     RedisLeaderElector,
 ) {
@@ -64,7 +66,10 @@ async fn test_distributed_lock_ttl_auto_expiration() {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(guard_b.is_some(), "Client B should acquire once A's lease expires");
+    assert!(
+        guard_b.is_some(),
+        "Client B should acquire once A's lease expires"
+    );
 }
 
 #[tokio::test]
@@ -110,7 +115,10 @@ async fn test_leader_election_lifecycle() {
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(lease3.is_some(), "Node 3 should acquire leadership after TTL expiry");
+    assert!(
+        lease3.is_some(),
+        "Node 3 should acquire leadership after TTL expiry"
+    );
     let lease3 = lease3.unwrap();
     assert_eq!(lease3.candidate_id, "node-3");
     assert_eq!(lease3.term, 3);

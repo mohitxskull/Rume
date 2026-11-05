@@ -63,7 +63,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M1 `RateLimitService` reads a tenant extension type the framework never inserts — tenant limiting is inert and the header fallback is trivially bypassed
 
-- **Where:** `rume/src/resilience/rate_limiter.rs:188-207`; insertion site `rume/src/tenant/layer.rs:84-87`; type definition `rume/src/tenant/model.rs:40`
+- **Where:** `crates/core/src/resilience/rate_limiter.rs:188-207`; insertion site `crates/core/src/tenant/layer.rs:84-87`; type definition `crates/core/src/tenant/model.rs:40`
 - **What it says:**
   ```rust
   let tenant_key = req
@@ -87,7 +87,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M2 `RedisCacheBackend` default prefix `rume:` collides with every other subsystem namespace — cache writes can overwrite auth sessions and coordination state
 
-- **Where:** `rume/src/cache/redis.rs:42, 50` (`prefix: "rume:"`); colliding namespaces: `auth/redis.rs:39` (`rume:session:`), `coordination/redis.rs:39, 221` (`rume:lock:`, `rume:leader:`), `jobs/redis.rs:172` (`rume:idempotency:`), `jobs/redis.rs:43, 51` (`rume:jobs:heartbeats`), `resilience/redis.rs:38` (`rume:ratelimit:`), `tenant/quota.rs:143` (`rume:quota:`), `cache/redis.rs:69-71` (`tag_set_key` → `rume:tag:*`)
+- **Where:** `crates/core/src/cache/redis.rs:42, 50` (`prefix: "rume:"`); colliding namespaces: `auth/redis.rs:39` (`rume:session:`), `coordination/redis.rs:39, 221` (`rume:lock:`, `rume:leader:`), `jobs/redis.rs:172` (`rume:idempotency:`), `jobs/redis.rs:43, 51` (`rume:jobs:heartbeats`), `resilience/redis.rs:38` (`rume:ratelimit:`), `tenant/quota.rs:143` (`rume:quota:`), `cache/redis.rs:69-71` (`tag_set_key` → `rume:tag:*`)
 - **What it says:** `RedisCacheBackend::new/from_pool` default `prefix` to `"rume:"`, so cache key `"session:abc"` is stored at `"rume:session:abc"` — byte-identical to the session store’s key for session `abc` (`auth/redis.rs:39` + `"abc"`).
 - **Why it's a problem:** The cache and the security/coordination subsystems share one flat logical namespace distinguished only by app-chosen key strings. Any application caching a key shaped like `<subsystem>:<id>` — or caching attacker-influenced content at such keys — silently **overwrites or reads** another subsystem’s records: destroying auth sessions (integrity + forced re-login), corrupting idempotency records (duplicate side effects on retry), or clobbering lock/leader keys (mutual exclusion degraded). The cache backend offers no reserved sub-namespace, so the collision is silent — the `SET` succeeds, the victim just vanishes on next read. Notably, auth session loss is not only availability: a poisoned `rume:session:<id>` value parsed by `RedisSessionStore::load` can forge a session for any *predictable* session id an attacker can pre-pollute, elevating this from nuisance to auth-state corruption.
 - **Suggested fix:** Change the default (and `from_pool`) cache prefix to `rume:cache:` (and tag sets to `rume:cache:tag:`), with the same for `with_prefix` docs; keep a `why:` note at the constant citing this finding (there is no scenario where cache sharing the global `rume:` root is safe). Existing deployments must FLUSHDB-or-migrate the `rume:` root or accept stale cross-keys — call it out in the changelog. Add a unit test asserting `RedisCacheBackend::new("redis://…").pool()` uses a prefix disjoint from the other subsystems’ prefixes.
@@ -96,7 +96,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M3 `Cache::clear()` executes `FLUSHDB` — one cache call wipes sessions, locks, idempotency records and foreign tenants on the shared Redis logical DB
 
-- **Where:** `rume/src/cache/redis.rs:245-254` (via `Cache::clear`, `typed.rs:238-243`)
+- **Where:** `crates/core/src/cache/redis.rs:245-254` (via `Cache::clear`, `typed.rs:238-243`)
 - **What it says:**
   ```rust
   let mut conn = self.pool.get().await…;
@@ -109,7 +109,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M4 Tag-set `PEXPIRE` unconditionally *shortens* the tag lifetime — tag invalidation silently no-ops; stale data served until key TTL
 
-- **Where:** `rume/src/cache/redis.rs:148-163` (set path), `208-237` (invalidation path); tag key format `cache/redis.rs:69-71`; secondary consumer `tenant/cache.rs:146-155`
+- **Where:** `crates/core/src/cache/redis.rs:148-163` (set path), `208-237` (invalidation path); tag key format `cache/redis.rs:69-71`; secondary consumer `tenant/cache.rs:146-155`
 - **What it says:**
   ```rust
   cmd.arg(&k).arg(&value);
@@ -138,7 +138,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M5 `TenantScopedCache::invalidate_tag` releases quota permits for the *oldest* tracked keys, not the deleted ones — tenant quotas drift into overshoot
 
-- **Where:** `rume/src/tenant/cache.rs:146-155`; member removal `rume/src/tenant/quota.rs:250-275` (`release` → `ZRANGE 0 0` + `ZREM`), pruning `quota.rs:199-209, 290-304`; count consumed at `cache.rs:103-111, 167-174`
+- **Where:** `crates/core/src/tenant/cache.rs:146-155`; member removal `crates/core/src/tenant/quota.rs:250-275` (`release` → `ZRANGE 0 0` + `ZREM`), pruning `quota.rs:199-209, 290-304`; count consumed at `cache.rs:103-111, 167-174`
 - **What it says:**
   ```rust
   // tenant/cache.rs
@@ -166,7 +166,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M6 PostgreSQL `try_acquire` retains `OR rume_leaders.candidate_id = $2` — incumbent re-acquire diverges from Redis and self-fences in-flight writes
 
-- **Where:** `rume/src/persistence/sql/postgres/leader_acquire.sql:7-8`; caller `rume/src/coordination/postgres.rs:186-217`; counterpart semantics `rume/src/coordination/redis.rs:249-303` (`if not current then … return nil`)
+- **Where:** `crates/core/src/persistence/sql/postgres/leader_acquire.sql:7-8`; caller `crates/core/src/coordination/postgres.rs:186-217`; counterpart semantics `crates/core/src/coordination/redis.rs:249-303` (`if not current then … return nil`)
 - **What it says:**
   ```sql
   WHERE rume_leaders.expires_at <= clock_timestamp()…
@@ -187,7 +187,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M7 Tenant registration admits silent collisions — cross-namespace ID/slug shadowing, unguarded subdomain overwrite, warn-and-continue at boot
 
-- **Where:** `rume/src/tenant/resolver.rs:54-92` (`try_add_tenant`, `add_tenant`), `resolver.rs:160-165` (`SubdomainTenantResolver::add_tenant`); precedence rule `resolver.rs:115-127`; consequence `tests/integration/tenant.rs:122-166` (documented behavior)
+- **Where:** `crates/core/src/tenant/resolver.rs:54-92` (`try_add_tenant`, `add_tenant`), `resolver.rs:160-165` (`SubdomainTenantResolver::add_tenant`); precedence rule `resolver.rs:115-127`; consequence `tests/integration/tenant.rs:122-166` (documented behavior)
 - **What it says:**
   ```rust
   // try_add_tenant checks same-namespace only:
@@ -207,7 +207,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### M8 `remember_with_tags` stampede waiters can block forever — `Notified` created after `notify_waiters()` ran is never woken
 
-- **Where:** `rume/src/cache/typed.rs:167-208`; waiter registration `typed.rs:179-185` vs slot-release/notify `typed.rs:199-205`
+- **Where:** `crates/core/src/cache/typed.rs:167-208`; waiter registration `typed.rs:179-185` vs slot-release/notify `typed.rs:199-205`
 - **What it says:**
   ```rust
   let waiter = { … if let Some(existing) = flights.get(&full_key) { Some(Arc::clone(existing)) } … };  // mutex dropped here
@@ -236,7 +236,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m1 Host wall-clock drives Redis rate-limit and quota window math — cross-node clock skew blurs cluster-wide windows
 
-- **Where:** `rume/src/resilience/redis.rs:62-65` (`now_ms = SystemTime::now()`), `rume/src/tenant/quota.rs:164, 179-185, 279-282` (lease id + prune/score base)
+- **Where:** `crates/core/src/resilience/redis.rs:62-65` (`now_ms = SystemTime::now()`), `crates/core/src/tenant/quota.rs:164, 179-185, 279-282` (lease id + prune/score base)
 - **What it says:** `now_ms` and the sorted-set scores/prune bounds are computed from each app node’s local `SystemTime::now()` and passed as `ARGV` into single-node Lua scripts.
 - **Why it's a problem:** cluster nodes with skewed clocks disagree on which window members are “expired” — a node behind the fleet keeps members longer (inflating counts, fail-closed-ish), a node ahead prunes live members early (deflating counts → **over-admission**: limits exceeded cluster-wide when traffic shifts between skewed nodes). The PostgreSQL side of the codebase was decisively moved to DB time (v03 C1); the Redis side still trusts each writer’s clock. Not a fencing or safety issue (window semantics only), but a silent accuracy defect with trivial remediation.
 - **Suggested fix:** Inside the Lua scripts, derive time from the server: `local now = tonumber(redis.call('TIME')[1]) * 1000 + math.floor(tonumber(redis.call('TIME')[2]) / 1000)`. Pass only the window/max/ttl as args. For the quota ZSET, score by server time identically (`redis.call('TIME')` in `record_key` + `count`), eliminating the `now_ms` param entirely. Keep host time only for telemetry.
@@ -244,7 +244,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m2 `InMemoryTenantQuotaStore` never prunes on TTL — permanent tenant lockout in the in-memory mode
 
-- **Where:** `rume/src/tenant/quota.rs:53-112` (whole store), trait default `quota.rs:26-35`
+- **Where:** `crates/core/src/tenant/quota.rs:53-112` (whole store), trait default `quota.rs:26-35`
 - **What it says:** `acquire` increments a per-tenant counter `if *count < max_keys`; `record_key` is **not overridden**, so the trait default discards `key`/`ttl` and calls `acquire`; nothing ever decrements on expiry.
 - **Why it's a problem:** this is exactly the v03 M1 failure mode — after `max_keys_per_tenant` writes cumulatively, the tenant is permanently refused cached writes even if every key expired — retained in the “testing and single-instance deployments” store (its own doc comment). Test fixtures that set/expire many keys will flake into `QuotaExceeded`; a small production single-node app hits it by Tuesday. Consistency with the Redis store (the fixed path) is also lost — behavior differs across backends.
 - **Suggested fix:** Mirror the Redis design in-memory: `HashMap<String /*tenant*/, HashMap<String /*key*/, Instant /*expires_at*/>>`; `acquire`/`record_key` purge expired entries first (or store a `BTreeMap<Instant, String>` plus per-key map); `release` no longer decrements a blind counter. Alternatively restrict the in-memory store to no-TTL semantics and document — but that re-creates the lockout, so the purge is the honest fix. Add a unit test: fill to max with 1-minute TTL, advance `tokio::time::pause()` past TTL, next `set` succeeds.
@@ -252,7 +252,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m3 `RedisTenantQuotaStore::acquire()` mints permanent `lease-<nanos>` members scored `i64::MAX`
 
-- **Where:** `rume/src/tenant/quota.rs:158-168` (+ `record_key` score computation `quota.rs:183-186`)
+- **Where:** `crates/core/src/tenant/quota.rs:158-168` (+ `record_key` score computation `quota.rs:183-186`)
 - **What it says:** `acquire` synthesizes `unique_id = format!("lease-{}", now_nanos)` and calls `record_key(…, ttl: None)` → score `i64::MAX`, pruned by nothing, removed by nothing (`ZREMRANGEBYSCORE -inf now` never reaches it).
 - **Why it's a problem:** any caller using the trait’s `acquire` (its purpose-built API for “reserve a slot without a key”) leaks an unremovable member per call; at `max_keys` such calls the tenant is permanently quota-exceeded with an invisible leak — debugging requires ZRANGE-archaeology. Currently uncalled by the framework (only `record_key` is used, `tenant/cache.rs:104`), so this is a loaded footgun in a public trait impl, not an active outage.
 - **Suggested fix:** Delete `acquire`’s special case: implement it as `record_key` with an explicit TTL, or make `acquire` take `ttl: Duration` (breaking, honest). Cheapest correct: have `acquire` refuse (`Err(CacheError::Backend("acquire requires a key; use record_key"))`) or delegate to a transient reservation that `release` can remove by identity. Simplest of all: remove `acquire` from the trait’s required surface — nothing needs it; keep `record_key`/`remove_key`.
@@ -260,7 +260,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m4 `LockGuard`/`LeaderLease::expires_at` derives from the host clock — `is_expired()` certifies dead leases as live after a host pause; `get_leader` reports `expires_at: None`
 
-- **Where:** `rume/src/coordination/lock.rs:23-25, 44-55`; `coordination/leader.rs:17-19, 38-49`; population sites `coordination/postgres.rs:93, 211, 244, 270` (`get_leader` sets `None`), `coordination/redis.rs:113, 297, 351`, `cohort` renew path `leader.rs` via `CoordinationError` — and DB-authoritative comparison in `leader_renew.sql:3`
+- **Where:** `crates/core/src/coordination/lock.rs:23-25, 44-55`; `coordination/leader.rs:17-19, 38-49`; population sites `coordination/postgres.rs:93, 211, 244, 270` (`get_leader` sets `None`), `coordination/redis.rs:113, 297, 351`, `cohort` renew path `leader.rs` via `CoordinationError` — and DB-authoritative comparison in `leader_renew.sql:3`
 - **What it says:** guards carry `expires_at = Some(Instant::now() + ttl)` — host monotonic, unrelated to the `clock_timestamp()` basis the SQL actually enforces; `get_leader` populates `expires_at: None`, making `is_expired()` vacuously `false` there.
 - **Why it's a problem:** the telemetry added by the v03/diff m3 fix tells the operator “2.1 s remain” while PostgreSQL — the authority — may already consider the lease dead (host froze: hypervisor pause, SIGSTOP, long GC; on Linux `Instant` uses `CLOCK_MONOTONIC`, which does **not** count suspend time). An operator/auto-renew loop gating work on `is_expired()` will extend a lease the DB already re-granted to a peer — or skip renewal of one it thinks is fine. `get_leader` returning `expires_at: None` additionally breaks any caller expecting a coherent lease object. Fail-operational in the unsafe direction (thinks it holds), even though the DB still fences the writes.
 - **Suggested fix:** populate guard expiry from the same basis the backend uses — either have acquire/renew return the server-computed `expires_at` (add `expires_at_ms` to SQL `RETURNING` — PG: `RETURNING fencing_token, (EXTRACT(EPOCH FROM clock_timestamp())*1000)::BIGINT + $ttl`; Redis: use server `TIME` in the script or `PTTL` round-trip), or document `expires_at` explicitly as “host-local advisory; not for fencing decisions” and have `is_expired()` consult the backend. Minimal viable: document + `get_leader` sets `None` by contract, and renew results overwrite it. The disclaimer is one doc line; the full fix is half a day.
@@ -268,7 +268,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m5 `RateLimiter::spawn_background_eviction()` is never called — in-memory limiter’s expired entries accumulate forever by default
 
-- **Where:** `rume/src/resilience/rate_limiter.rs:126-135` (helper), `rate_limiter.rs:113-123` (`prune_expired`); no call sites anywhere (`grep -rn spawn_background_eviction` → only its definition and a unit test of `prune_expired` at `tests/integration/resilience.rs:244-263`)
+- **Where:** `crates/core/src/resilience/rate_limiter.rs:126-135` (helper), `rate_limiter.rs:113-123` (`prune_expired`); no call sites anywhere (`grep -rn spawn_background_eviction` → only its definition and a unit test of `prune_expired` at `tests/integration/resilience.rs:244-263`)
 - **What it says:** expiry pruning exists as a public method plus a `tokio::spawn` helper, but no framework code, builder, or doc ever invokes them; expired keys persist in the 16 shards indefinitely.
 - **Why it's a problem:** default deployment (app calls `RateLimiter::new`, stacks `RateLimitLayer`) leaks one map entry per unique client key ever seen — the v02 M3/v03 M4 leak, reduced but not closed: sharding fixed contention, not retention. Memory growth on a long-lived public endpoint is unbounded; the fix the operator needs is invisible.
 - **Suggested fix:** wire it: `RateLimitLayer::new` (or the builder, Lens 7 territory) spawns `limiter.spawn_background_eviction(Duration::from_secs(30))` when the layer is constructed, or make the limiter lazy-prune every N `check` calls (amortized O(1)) — the latter needs no runtime support and survives `RateLimiter` being cloned across layers. Document the retention bound. Test: pause time, insert 1000 keys, advance past window, assert map size shrinks after interval.
@@ -276,7 +276,7 @@ No area in this lens was previously unreviewed — every subsystem audited here 
 
 ### m6 `InMemoryCacheBackend` tag sets grow monotonically — `delete()` never removes tag members; abandoned tags leak forever
 
-- **Where:** `rume/src/cache/backend.rs:54-58, 107-128, 130-136, 155-169`
+- **Where:** `crates/core/src/cache/backend.rs:54-58, 107-128, 130-136, 155-169`
 - **What it says:** `set_with_tags` inserts into `TagMap`; `delete` removes only from `entries`; nothing removes members from tag sets on TTL expiry (checks happen at read time) or on delete; `invalidate_tag` does `tag_map.remove(&tag)` wholesale, which clears one tag’s set — but un-tagged-invalidated tags and explicit deletes leave stale members behind forever.
 - **Why it's a problem:** memory grows without bound in “single-instance deployments” (the backend’s stated use) proportionally to total historical tagged writes; `invalidate_tag` later iterates those dead members (`map.remove` returns `None`) — correctness holds, memory and latency degrade silently. It is the in-memory analogue of v03 M2 (which the Redis path remediated via set TTLs), unremediated.
 - **Suggested fix:** on `get`/`exists` miss due to expiry, evict the entry *and* scrub it from all tag sets (requires a reverse `key → tags` index, or accept sweep semantics); simpler: in `delete`, iterate `tag_map` and retain only keys != deleted key (O(tags)); plus periodic `retain` of tag sets in `invalidate_tag` and a TTL-aware purge pass mirroring `entries` expiry checks. If scope is refused, document the bound (“tags accumulate for process lifetime; restart to reclaim”).

@@ -79,7 +79,11 @@ impl HealthCheckResult {
     }
 
     /// Attaches metadata to the health check result.
-    pub fn with_meta(mut self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Self {
+    pub fn with_meta(
+        mut self,
+        key: impl Into<String>,
+        value: impl Into<serde_json::Value>,
+    ) -> Self {
         self.meta.insert(key.into(), value.into());
         self
     }
@@ -126,7 +130,8 @@ pub struct HealthChecks {
     timeout: Duration,
     cache_ttl: Option<Duration>,
     cache: Arc<RwLock<BTreeMap<String, (Instant, HealthCheckResult)>>>,
-    singleflight: Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<Option<HealthReport>>>>>,
+    singleflight:
+        Arc<tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<Option<HealthReport>>>>>,
     metrics: Option<crate::metrics::MetricsRegistry>,
 }
 
@@ -479,7 +484,11 @@ where
                 // infrastructure details, or credentials) are not exposed over
                 // HTTP. Use `HealthChecks::run()` programmatically for full
                 // diagnostics.
-                let status = if report.is_healthy { "ok" } else { &report.status };
+                let status = if report.is_healthy {
+                    "ok"
+                } else {
+                    &report.status
+                };
                 let code = if report.is_healthy {
                     StatusCode::OK
                 } else {
@@ -1028,7 +1037,11 @@ mod tests {
             .uri("/health/ready")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.expect("request failed");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request failed");
         // Must reject with 503 during Live/startup phase
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
@@ -1063,7 +1076,11 @@ mod tests {
             .uri("/health/live")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.expect("request failed");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request failed");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         // Live state -> 200 OK
@@ -1072,7 +1089,11 @@ mod tests {
             .uri("/health/live")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.expect("request failed");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request failed");
         assert_eq!(response.status(), StatusCode::OK);
 
         // Ready state -> 200 OK
@@ -1081,7 +1102,11 @@ mod tests {
             .uri("/health/live")
             .body(axum::body::Body::empty())
             .unwrap();
-        let response = router.clone().oneshot(request).await.expect("request failed");
+        let response = router
+            .clone()
+            .oneshot(request)
+            .await
+            .expect("request failed");
         assert_eq!(response.status(), StatusCode::OK);
 
         // Broken state -> 503

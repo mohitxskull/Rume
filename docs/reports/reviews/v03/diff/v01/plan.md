@@ -26,10 +26,10 @@ Run 2 reviewer subagents in parallel to audit the underlying database and outbox
 1. **`outbox-data-integrity`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/outbox-data-integrity.md`
    - **Scope:**
-     - `rume/src/outbox/` (`relay.rs`, `repository.rs`, `mod.rs`)
-     - SQL schemas & queries: `rume/src/persistence/sql/*/outbox_*.sql`
-     - Driver implementations in `rume/src/persistence/{postgres,mysql,sqlite}.rs`
-     - Tests in `rume/tests/integration/outbox.rs`
+     - `crates/core/src/outbox/` (`relay.rs`, `repository.rs`, `mod.rs`)
+     - SQL schemas & queries: `crates/core/src/persistence/sql/*/outbox_*.sql`
+     - Driver implementations in `crates/core/src/persistence/{postgres,mysql,sqlite}.rs`
+     - Tests in `crates/core/tests/integration/outbox.rs`
    - **Focus:**
      - Lease token enforcement in `mark_published` and `mark_failed`.
      - Removal of message age `created_at` clause from `outbox_recover.sql`.
@@ -41,9 +41,9 @@ Run 2 reviewer subagents in parallel to audit the underlying database and outbox
 2. **`pool-lifecycle-persistence`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/pool-lifecycle-persistence.md`
    - **Scope:**
-     - `rume/src/persistence/` (`pool.rs`, `backend.rs`, `migration.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`)
-     - SQL schemas: `rume/src/persistence/sql/*/migrations_schema.sql`
-     - Tests in `rume/tests/integration/persistence.rs` and `rume/tests/containers/{postgres,mysql}.rs`
+     - `crates/core/src/persistence/` (`pool.rs`, `backend.rs`, `migration.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`)
+     - SQL schemas: `crates/core/src/persistence/sql/*/migrations_schema.sql`
+     - Tests in `crates/core/tests/integration/persistence.rs` and `crates/core/tests/containers/{postgres,mysql}.rs`
    - **Focus:**
      - Physical connection pool delegation on `close()` and `close_and_drain()`.
      - Forwarding of `min_connections`, `idle_timeout_secs`, `connect_timeout_secs` to SQLx `PoolOptions`.
@@ -60,9 +60,9 @@ Run 3 reviewer subagents in parallel:
 3. **`jobs-worker-concurrency`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/jobs-worker-concurrency.md`
    - **Scope:**
-     - `rume/src/jobs/` (`queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `job.rs`, `retry.rs`)
-     - SQL queries: `rume/src/persistence/sql/postgres/jobs_*.sql`
-     - Tests in `rume/tests/containers/jobs.rs` and `rume/tests/containers/job_reliability.rs`
+     - `crates/core/src/jobs/` (`queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `job.rs`, `retry.rs`)
+     - SQL queries: `crates/core/src/persistence/sql/postgres/jobs_*.sql`
+     - Tests in `crates/core/tests/containers/jobs.rs` and `crates/core/tests/containers/job_reliability.rs`
    - **Focus:**
      - Worker token and lease expiration check in `ack()`, `nack()`, `dead_letter()`.
      - `renew_lease` API and background heartbeat task in `JobWorker`.
@@ -75,11 +75,11 @@ Run 3 reviewer subagents in parallel:
 4. **`coordination-multi-tenant`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/coordination-multi-tenant.md`
    - **Scope:**
-     - `rume/src/coordination/` (`postgres.rs`, `redis.rs`, `lock.rs`, `leader.rs`)
-     - `rume/src/tenant/` (`cache.rs`, `quota.rs`, `resolver.rs`, `error.rs`)
-     - `rume/src/resilience/` (`rate_limiter.rs`, `redis.rs`, `error.rs`)
-     - SQL queries: `rume/src/persistence/sql/postgres/leader_*.sql`, `lock_*.sql`
-     - Tests in `rume/tests/integration/{coordination,tenant}.rs` and `rume/tests/containers/redis.rs`
+     - `crates/core/src/coordination/` (`postgres.rs`, `redis.rs`, `lock.rs`, `leader.rs`)
+     - `crates/core/src/tenant/` (`cache.rs`, `quota.rs`, `resolver.rs`, `error.rs`)
+     - `crates/core/src/resilience/` (`rate_limiter.rs`, `redis.rs`, `error.rs`)
+     - SQL queries: `crates/core/src/persistence/sql/postgres/leader_*.sql`, `lock_*.sql`
+     - Tests in `crates/core/tests/integration/{coordination,tenant}.rs` and `crates/core/tests/containers/redis.rs`
    - **Focus:**
      - Server-side timestamps (`CURRENT_TIMESTAMP`) in Postgres lock/leader SQL.
      - Unconditional monotonic term increment in `leader_acquire.sql`.
@@ -92,11 +92,11 @@ Run 3 reviewer subagents in parallel:
 5. **`security-protocols`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/security-protocols.md`
    - **Scope:**
-     - `rume/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`)
-     - `rume/src/enterprise/` (`saml.rs`, `scim.rs`)
-     - `rume/src/auth/` (`schemes.rs`, `session.rs`)
-     - `rume/src/env/` (`secrets.rs`)
-     - Tests in `rume/tests/integration/{security,enterprise}.rs`
+     - `crates/core/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`)
+     - `crates/core/src/enterprise/` (`saml.rs`, `scim.rs`)
+     - `crates/core/src/auth/` (`schemes.rs`, `session.rs`)
+     - `crates/core/src/env/` (`secrets.rs`)
+     - Tests in `crates/core/tests/integration/{security,enterprise}.rs`
    - **Focus:**
      - Parameterized SQL queries in `SqlAuditLogger` (eliminating string formatting SQL injection).
      - SAML XSW attack mitigation via strict subtree assertion extraction and cryptographic binding.
@@ -114,8 +114,8 @@ Run 1 reviewer subagent to audit the consolidated test suite and cargo build mat
 6. **`testing-feature-matrix`**
    - **Output:** `docs/reports/reviews/v03/diff/v01/testing-feature-matrix.md`
    - **Scope:**
-     - `rume/Cargo.toml` and root `Cargo.toml`
-     - `rume/tests/` (`integration.rs`, `containers.rs`, `common/`, `integration/`, `containers/`)
+     - `crates/core/Cargo.toml` and root `Cargo.toml`
+     - `crates/core/tests/` (`integration.rs`, `containers.rs`, `common/`, `integration/`, `containers/`)
    - **Focus:**
      - Consolidation from 32 flat binaries down to 2 (`integration` and `containers`), eliminating the 11 GB build bloat.
      - Feature gate consistency across single-feature and multi-feature permutations (`sqlite`, `postgres`, `mysql`, `redis`, `no-default-features`).

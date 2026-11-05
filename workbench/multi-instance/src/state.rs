@@ -1,9 +1,9 @@
-use std::sync::Arc;
-use rume::jobs::postgres::PostgresJobQueue;
 use rume::jobs::JobWorker;
+use rume::jobs::postgres::PostgresJobQueue;
 use rume::outbox::OutboxRelay;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
+use std::sync::Arc;
 
 use crate::jobs::NotificationHandler;
 

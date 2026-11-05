@@ -145,13 +145,19 @@ impl JobQueue for PostgresJobQueue {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
                 if let Some(erow) = existing {
-                    let existing_id: String = erow.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+                    let existing_id: String = erow
+                        .try_get(0)
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                     Ok(existing_id)
                 } else {
-                    Err(JobError::Fatal("idempotency conflict race: conflicting row is no longer active".into()))
+                    Err(JobError::Fatal(
+                        "idempotency conflict race: conflicting row is no longer active".into(),
+                    ))
                 }
             } else {
-                Err(JobError::Fatal("conflict detected but no idempotency key was supplied".into()))
+                Err(JobError::Fatal(
+                    "conflict detected but no idempotency key was supplied".into(),
+                ))
             }
         })
     }
@@ -191,8 +197,10 @@ impl JobQueue for PostgresJobQueue {
                 let assigned_worker: Option<String> = r.try_get(11).ok();
                 let available_at_ms: i64 = r.try_get(12).unwrap_or(0);
                 let lease_token: Option<String> = r.try_get(13).ok();
-                let trace_context: Option<String> =
-                    r.try_get(14).ok().or_else(|| r.try_get("trace_context").ok());
+                let trace_context: Option<String> = r
+                    .try_get(14)
+                    .ok()
+                    .or_else(|| r.try_get("trace_context").ok());
 
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
@@ -389,10 +397,7 @@ impl JobQueue for PostgresJobQueue {
         })
     }
 
-    fn list_dead_letters(
-        &self,
-        limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
+    fn list_dead_letters(&self, limit: usize) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
         Box::pin(async move {
             let rows = sqlx::query(
                 "SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token FROM rume_jobs WHERE status = 'dead_letter' ORDER BY dead_lettered_at DESC LIMIT $1"
@@ -444,10 +449,7 @@ impl JobQueue for PostgresJobQueue {
         })
     }
 
-    fn replay_dead_letter(
-        &self,
-        job_id: &str,
-    ) -> BoxFuture<'_, Result<(), JobError>> {
+    fn replay_dead_letter(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let jid = job_id.to_string();
         Box::pin(async move {
             let res = sqlx::query(
@@ -459,7 +461,9 @@ impl JobQueue for PostgresJobQueue {
             .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
-                return Err(JobError::Fatal(format!("dead letter job {jid} not found or not in dead_letter status")));
+                return Err(JobError::Fatal(format!(
+                    "dead letter job {jid} not found or not in dead_letter status"
+                )));
             }
             Ok(())
         })

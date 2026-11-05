@@ -46,8 +46,7 @@ async fn setup_postgres_pool(
     DatabasePool<PostgresBackend>,
 ) {
     let node = common::containers::shared_postgres().await;
-    let (_db_name, pool) =
-        common::containers::create_isolated_postgres_pool(max_connections).await;
+    let (_db_name, pool) = common::containers::create_isolated_postgres_pool(max_connections).await;
     (node, pool)
 }
 
@@ -95,7 +94,10 @@ async fn test_postgres_pool_lifecycle_and_health() {
     assert!(pool.backend().is_closed());
 
     // Invariant: leases must be rejected after pool closure
-    assert!(matches!(pool.acquire_lease(), Err(PersistenceError::Closed)));
+    assert!(matches!(
+        pool.acquire_lease(),
+        Err(PersistenceError::Closed)
+    ));
     assert!(matches!(
         pool.acquire_lease_timeout(Duration::from_millis(50)).await,
         Err(PersistenceError::Closed)
@@ -875,7 +877,11 @@ async fn test_postgres_job_queue_abandoned_worker_reclaim_and_dlq() {
     // Move to Dead-Letter Queue with lease token
     let retried_token = retried.lease_token.clone().unwrap();
     queue
-        .dead_letter(retried, &retried_token, "database unrecoverable error".into())
+        .dead_letter(
+            retried,
+            &retried_token,
+            "database unrecoverable error".into(),
+        )
         .await
         .expect("dead_letter failed");
 
@@ -1054,7 +1060,10 @@ async fn test_postgres_realistic_enterprise_transaction_pipeline() {
 
     // Acknowledge job completion
     let job_token = queued_job.lease_token.as_deref().unwrap();
-    queue.ack(&queued_job.id, job_token).await.expect("ack failed");
+    queue
+        .ack(&queued_job.id, job_token)
+        .await
+        .expect("ack failed");
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // 8. Injected Failure Scenario: Rollback aborts both business write and outbox message
@@ -1234,7 +1243,9 @@ async fn test_postgres_job_queue_lease_expiry_rejects_ack_nack_dead_letter_befor
 
     tokio::time::sleep(Duration::from_millis(250)).await;
 
-    let dl_res = queue.dead_letter(job3, &token3, "expired lease".into()).await;
+    let dl_res = queue
+        .dead_letter(job3, &token3, "expired lease".into())
+        .await;
     assert!(
         dl_res.is_err(),
         "dead_letter must be rejected when lease has expired"
@@ -1318,7 +1329,10 @@ async fn test_postgres_job_queue_valid_lease_renewal_prevents_recovery() {
 
     // Worker can still successfully ack with renewed lease
     let ack_res = queue.ack(&job_id, &token).await;
-    assert!(ack_res.is_ok(), "ack with active renewed lease must succeed");
+    assert!(
+        ack_res.is_ok(),
+        "ack with active renewed lease must succeed"
+    );
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1403,7 +1417,10 @@ async fn test_postgres_job_worker_heartbeat_renewal_keeps_long_running_job_valid
 async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
     let (_container, pool) = setup_postgres_pool(4).await;
     let backend = Arc::new(pool.backend().clone());
-    backend.init_outbox_table().await.expect("init outbox table failed");
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
 
     let event = OrderPlacedEvent {
         order_id: "order-relay-heartbeat-1".into(),
@@ -1434,7 +1451,10 @@ async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatc
     })
     .with_config(config);
 
-    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch failed");
+    let res = relay
+        .poll_and_dispatch(10)
+        .await
+        .expect("poll_and_dispatch failed");
 
     // Heartbeat kept lease renewed, so mark_published succeeded
     assert_eq!(res.published, 1);
@@ -1448,7 +1468,10 @@ async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatc
 async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
     let (_container, pool) = setup_postgres_pool(4).await;
     let backend = Arc::new(pool.backend().clone());
-    backend.init_outbox_table().await.expect("init outbox table failed");
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
 
     // Enqueue 2 messages
     let msg1 = OutboxMessage::new("msg-batch-1", "order.placed", b"{}".to_vec());
@@ -1486,7 +1509,10 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
     })
     .with_config(config);
 
-    let res = relay.poll_and_dispatch(2).await.expect("poll_and_dispatch failed");
+    let res = relay
+        .poll_and_dispatch(2)
+        .await
+        .expect("poll_and_dispatch failed");
 
     assert_eq!(res.published, 2);
     assert_eq!(res.failed_transitions, 0);
@@ -1496,9 +1522,13 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
 }
 
 #[tokio::test]
-async fn test_postgres_database_pool_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
+async fn test_postgres_database_pool_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid()
+ {
     let (_container, pool) = setup_postgres_pool(4).await;
-    pool.backend().init_outbox_table().await.expect("init outbox table failed");
+    pool.backend()
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
     let pool_arc = Arc::new(pool);
 
     let event = OrderPlacedEvent {
@@ -1530,7 +1560,10 @@ async fn test_postgres_database_pool_outbox_relay_heartbeat_renewal_keeps_long_r
     })
     .with_config(config);
 
-    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch failed");
+    let res = relay
+        .poll_and_dispatch(10)
+        .await
+        .expect("poll_and_dispatch failed");
 
     assert_eq!(res.published, 1);
     assert_eq!(res.failed_transitions, 0);
@@ -1557,12 +1590,7 @@ async fn test_postgres_parameterized_transaction_and_native_escape_hatch() {
     let rows = tx
         .execute_params(
             "INSERT INTO test_params (id, title, amount, note) VALUES ($1, $2, $3, $4)",
-            &rume::params![
-                "row-1",
-                injection_str,
-                123456_i64,
-                unicode_note,
-            ],
+            &rume::params!["row-1", injection_str, 123456_i64, unicode_note,],
         )
         .await
         .expect("execute_params should succeed");
@@ -1585,7 +1613,10 @@ async fn test_postgres_parameterized_transaction_and_native_escape_hatch() {
 
     // Query scalar params inside transaction
     let retrieved = tx
-        .query_scalar_params("SELECT title FROM test_params WHERE id = $1", &rume::params!["row-1"])
+        .query_scalar_params(
+            "SELECT title FROM test_params WHERE id = $1",
+            &rume::params!["row-1"],
+        )
         .await
         .expect("query scalar")
         .expect("found title");

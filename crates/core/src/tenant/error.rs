@@ -52,7 +52,9 @@ impl From<TenantError> for AppError {
             TenantError::QuotaExceeded { tenant_id, limit } => AppError::Public {
                 status: axum::http::StatusCode::TOO_MANY_REQUESTS,
                 code: "TENANT_QUOTA_EXCEEDED",
-                message: format!("Tenant '{tenant_id}' has exceeded its tiered quota limit of {limit}"),
+                message: format!(
+                    "Tenant '{tenant_id}' has exceeded its tiered quota limit of {limit}"
+                ),
             },
         }
     }

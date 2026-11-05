@@ -14,11 +14,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use axum::Json;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
-use axum::Json;
 use futures_util::stream;
 use rume::app::Rume;
 use rume::testing::TestServer;
@@ -37,16 +37,14 @@ struct GreetingResponse {
 
 #[tokio::test]
 async fn live_test_server_exercises_middleware_and_sockets() {
-    let app = Rume::new()
-        .route("/health", get(|| async { "ok" }))
-        .route(
-            "/greet",
-            post(|Json(req): Json<GreetingRequest>| async move {
-                Json(GreetingResponse {
-                    greeting: format!("Hello, {}!", req.name),
-                })
-            }),
-        );
+    let app = Rume::new().route("/health", get(|| async { "ok" })).route(
+        "/greet",
+        post(|Json(req): Json<GreetingRequest>| async move {
+            Json(GreetingResponse {
+                greeting: format!("Hello, {}!", req.name),
+            })
+        }),
+    );
 
     let server = TestServer::from_builder(app)
         .await
@@ -94,7 +92,8 @@ async fn test_persistent_connections_keep_alive() {
     // Execute multiple sequential requests using the shared keep-alive client
     for _ in 0..10 {
         let resp = server.get("/ping").await.expect("ping succeeds");
-        resp.assert_status(StatusCode::OK).assert_text_equals("pong");
+        resp.assert_status(StatusCode::OK)
+            .assert_text_equals("pong");
     }
 
     server.shutdown().await.expect("shutdown succeeds");
@@ -166,7 +165,10 @@ async fn test_client_disconnect_during_response_streaming() {
                         }
                         tokio::time::sleep(Duration::from_millis(50)).await;
                         flag.store(true, Ordering::SeqCst);
-                        Some((Ok::<_, std::io::Error>(format!("data-{step}\n")), (step + 1, flag)))
+                        Some((
+                            Ok::<_, std::io::Error>(format!("data-{step}\n")),
+                            (step + 1, flag),
+                        ))
                     });
                     Body::from_stream(stream).into_response()
                 }
@@ -195,7 +197,9 @@ async fn test_client_disconnect_during_response_streaming() {
 
     // Server remains completely healthy and handles subsequent traffic
     let health = server.get("/health").await.expect("health succeeds");
-    health.assert_status(StatusCode::OK).assert_text_equals("healthy");
+    health
+        .assert_status(StatusCode::OK)
+        .assert_text_equals("healthy");
 
     server.shutdown().await.expect("shutdown succeeds");
 }
@@ -216,9 +220,7 @@ async fn test_graceful_shutdown_with_active_in_flight_requests() {
     let url = server.url("/slow-work");
 
     // Start in-flight request
-    let request_task = tokio::spawn(async move {
-        client.get(&url).send().await
-    });
+    let request_task = tokio::spawn(async move { client.get(&url).send().await });
 
     // Wait 30ms to ensure the request has arrived and is executing
     tokio::time::sleep(Duration::from_millis(30)).await;
@@ -227,7 +229,10 @@ async fn test_graceful_shutdown_with_active_in_flight_requests() {
     server.shutdown().await.expect("shutdown initiated");
 
     // Verify the in-flight request completed successfully before termination
-    let resp = request_task.await.expect("task joins").expect("request finishes");
+    let resp = request_task
+        .await
+        .expect("task joins")
+        .expect("request finishes");
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.text().await.unwrap(), "work-completed");
 }
@@ -278,7 +283,8 @@ async fn test_server_lifecycle_retains_modules_until_explicit_shutdown() {
 
     // 2. Server handles traffic while module lifecycle is active
     let resp = server.get("/ping").await.expect("request ping");
-    resp.assert_status(StatusCode::OK).assert_text_equals("pong");
+    resp.assert_status(StatusCode::OK)
+        .assert_text_equals("pong");
 
     // Module must still be active and not shut down
     assert_eq!(*events.lock().unwrap(), vec!["start"]);

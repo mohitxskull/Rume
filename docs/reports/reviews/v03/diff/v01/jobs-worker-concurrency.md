@@ -2,20 +2,20 @@
 
 ## Summary
 
-This diff review evaluates the background jobs and worker concurrency subsystem in Rume across commits `cf82559..HEAD`, auditing `rume/src/jobs/` (`queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `job.rs`, `retry.rs`, `reliability.rs`), SQL queries and schemas (`rume/src/persistence/sql/postgres/jobs_*.sql`), and container test suites (`rume/tests/containers/jobs.rs`, `rume/tests/containers/job_reliability.rs`). The vast majority of the critical concurrency and data-loss vulnerabilities identified in v03 have been resolved: strict lease token fencing (`WHERE lease_token = $3 AND status = 'in_flight'`) is enforced across `ack()`, `nack()`, and `dead_letter()`; completed jobs are retained with soft status (`status = 'completed'`) preserving partial unique index deduplication; active lease heartbeat renewals (`renew_lease`) prevent long-running tasks from being stolen; and graceful cancellation tokens are propagated through `JobContext`. However, the change **fails** diff review and cannot be accepted into production because the remediation for job handler panic isolation (v03 M1) is defective: `std::panic::catch_unwind` wraps only the future's construction closure rather than its asynchronous execution, allowing handler panics to unwind uncaught, abandon jobs indefinitely in `in_flight` status without DLQ recording, and break `test_worker_panic_does_not_leak_in_flight_count` in the test suite (Finding M1). In addition, `test_worker_heartbeat_and_abandoned_job_recovery` in the container reliability suite suffers from an inverted startup race that causes deterministic test failures (Finding M2).
+This diff review evaluates the background jobs and worker concurrency subsystem in Rume across commits `cf82559..HEAD`, auditing `crates/core/src/jobs/` (`queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `job.rs`, `retry.rs`, `reliability.rs`), SQL queries and schemas (`crates/core/src/persistence/sql/postgres/jobs_*.sql`), and container test suites (`crates/core/tests/containers/jobs.rs`, `crates/core/tests/containers/job_reliability.rs`). The vast majority of the critical concurrency and data-loss vulnerabilities identified in v03 have been resolved: strict lease token fencing (`WHERE lease_token = $3 AND status = 'in_flight'`) is enforced across `ack()`, `nack()`, and `dead_letter()`; completed jobs are retained with soft status (`status = 'completed'`) preserving partial unique index deduplication; active lease heartbeat renewals (`renew_lease`) prevent long-running tasks from being stolen; and graceful cancellation tokens are propagated through `JobContext`. However, the change **fails** diff review and cannot be accepted into production because the remediation for job handler panic isolation (v03 M1) is defective: `std::panic::catch_unwind` wraps only the future's construction closure rather than its asynchronous execution, allowing handler panics to unwind uncaught, abandon jobs indefinitely in `in_flight` status without DLQ recording, and break `test_worker_panic_does_not_leak_in_flight_count` in the test suite (Finding M1). In addition, `test_worker_heartbeat_and_abandoned_job_recovery` in the container reliability suite suffers from an inverted startup race that causes deterministic test failures (Finding M2).
 
 ---
 
 ## Prior decisions
 
 - **v03 Jobs C1 (Job state mutations (`ack`, `nack`, `dead_letter`) lack lease token and worker ownership verification)** — **RESOLVED**.
-  `JobQueue` trait signatures in `rume/src/jobs/queue.rs:37–54` now mandate `lease_token: &str`:
+  `JobQueue` trait signatures in `crates/core/src/jobs/queue.rs:37–54` now mandate `lease_token: &str`:
   ```rust
   fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>>;
   fn nack(&self, job: QueuedJob, lease_token: &str, delay: Duration) -> BoxFuture<'_, Result<(), JobError>>;
   fn dead_letter(&self, job: QueuedJob, lease_token: &str, reason: String) -> BoxFuture<'_, Result<(), JobError>>;
   ```
-  In `rume/src/persistence/sql/postgres/jobs_claim.sql:5`, a cryptographic UUID `lease_token` is generated per claim and stored in `rume_jobs.lease_token`. In `rume/src/jobs/postgres.rs:224–301`, `ack()`, `nack()`, and `dead_letter()` enforce `WHERE id = $X AND lease_token = $Y AND status = 'in_flight'` and assert `res.rows_affected() > 0`. If another worker has re-claimed an expired job, any mutation by the superseded worker fails with `JobError::Fatal("cannot ...: lease lost, expired, or invalid token")`.
+  In `crates/core/src/persistence/sql/postgres/jobs_claim.sql:5`, a cryptographic UUID `lease_token` is generated per claim and stored in `rume_jobs.lease_token`. In `crates/core/src/jobs/postgres.rs:224–301`, `ack()`, `nack()`, and `dead_letter()` enforce `WHERE id = $X AND lease_token = $Y AND status = 'in_flight'` and assert `res.rows_affected() > 0`. If another worker has re-claimed an expired job, any mutation by the superseded worker fails with `JobError::Fatal("cannot ...: lease lost, expired, or invalid token")`.
 
 - **v03 Jobs C2 (Missing job-level lease renewal / heartbeat API causes duplicate concurrent execution of legitimate long-running jobs)** — **RESOLVED**.
   `renew_lease(&self, job_id: &str, lease_token: &str, extension: Duration) -> BoxFuture<'_, Result<(), JobError>>` was added to `JobQueue` (`queue.rs:57–64`) and implemented in `PostgresJobQueue` (`postgres.rs:304–335`) with strict validation (`WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > $4`). In `JobWorker::execute_job` (`worker.rs:344–364`), an active background task is spawned using `tokio::time::interval(Duration::from_secs(20))` to renew the 60-second claim lease every 20 seconds throughout handler execution, with teardown on job completion.
@@ -27,7 +27,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   SET status = 'completed', completed_at = $1, lease_expires_at = NULL
   WHERE id = $2 AND lease_token = $3 AND status = 'in_flight'
   ```
-  In `rume/src/persistence/sql/postgres/jobs_schema.sql:18–26`, `completed_at BIGINT` was added, and the unique index was updated to:
+  In `crates/core/src/persistence/sql/postgres/jobs_schema.sql:18–26`, `completed_at BIGINT` was added, and the unique index was updated to:
   ```sql
   CREATE UNIQUE INDEX IF NOT EXISTS idx_rume_jobs_idempotency
   ON rume_jobs (COALESCE(tenant_id, ''), idempotency_key)
@@ -36,13 +36,13 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   `jobs_insert.sql:7` mirrors this clause (`WHERE idempotency_key IS NOT NULL AND status NOT IN ('dead_letter', 'purged') DO NOTHING`). Completed jobs retain their idempotency records in PostgreSQL, guaranteeing deduplication across client redeliveries.
 
 - **v03 Jobs M1 (Job handler panic abandons in-flight jobs without DLQ recording and leaves idempotency locks permanently held)** — **CHALLENGED (Defective Remediation)**.
-  Commit `77c4db3` attempted to resolve this in `rume/src/jobs/worker.rs:366–371` by wrapping `registry.dispatch_with_cancellation` in `std::panic::catch_unwind`. However, because `dispatch_with_cancellation` returns an asynchronous `BoxFuture`, `catch_unwind` wraps only the future's instantiation closure, while `fut.await` is evaluated outside `catch_unwind`. An asynchronous panic inside a job handler unwinds uncaught through `execute_job`, leaving the job permanently locked in `status = 'in_flight'`, leaking the heartbeat task, skipping idempotency lock release, and causing `worker_panic_does_not_leak_in_flight_count` in `rume/tests/containers/jobs.rs:340` to fail. Re-reported as Finding M1.
+  Commit `77c4db3` attempted to resolve this in `crates/core/src/jobs/worker.rs:366–371` by wrapping `registry.dispatch_with_cancellation` in `std::panic::catch_unwind`. However, because `dispatch_with_cancellation` returns an asynchronous `BoxFuture`, `catch_unwind` wraps only the future's instantiation closure, while `fut.await` is evaluated outside `catch_unwind`. An asynchronous panic inside a job handler unwinds uncaught through `execute_job`, leaving the job permanently locked in `status = 'in_flight'`, leaking the heartbeat task, skipping idempotency lock release, and causing `worker_panic_does_not_leak_in_flight_count` in `crates/core/tests/containers/jobs.rs:340` to fail. Re-reported as Finding M1.
 
 - **v03 Jobs M2 (Releasing idempotency keys on retryable failures permits concurrent duplicate execution during the backoff delay)** — **RESOLVED**.
-  In `rume/src/jobs/worker.rs:392–402`, `store.release(key).await` was removed from the retryable branch. When `job.retry_policy.next_backoff(job.attempt)` returns `Some(backoff)`, the worker calls only `queue.nack(job, &token, backoff)`. The idempotency key in Redis remains locked in `IN_PROGRESS` throughout the backoff interval, preventing concurrent submissions from executing duplicate tasks. The lock is released only when retries are exhausted and the job transitions to `dead_letter` (line 397).
+  In `crates/core/src/jobs/worker.rs:392–402`, `store.release(key).await` was removed from the retryable branch. When `job.retry_policy.next_backoff(job.attempt)` returns `Some(backoff)`, the worker calls only `queue.nack(job, &token, backoff)`. The idempotency key in Redis remains locked in `IN_PROGRESS` throughout the backoff interval, preventing concurrent submissions from executing duplicate tasks. The lock is released only when retries are exhausted and the job transitions to `dead_letter` (line 397).
 
 - **v03 Jobs M3 (`IdempotencyStatus::InProgress` silently drops jobs from the worker without acknowledgment or delayed re-queue)** — **RESOLVED**.
-  In `rume/src/jobs/worker.rs:336–339`, the empty `return;` was replaced with an explicit delayed re-queue:
+  In `crates/core/src/jobs/worker.rs:336–339`, the empty `return;` was replaced with an explicit delayed re-queue:
   ```rust
   Ok(IdempotencyStatus::InProgress) => {
       let _ = queue.nack(job, &token, Duration::from_secs(2)).await;
@@ -52,7 +52,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   Jobs encountering a concurrent in-flight claim are cleanly returned to `status = 'pending'` with a 2-second backoff delay rather than stranded in `status = 'in_flight'` until lease expiration.
 
 - **v03 Jobs M4 (Non-retryable error types (`UnknownJob`, `Serialization`) are treated as retryable, exhausting max retries before DLQ)** — **RESOLVED**.
-  In `rume/src/jobs/worker.rs:383–390`, non-retryable error variants are explicitly pattern-matched alongside `JobError::Fatal`:
+  In `crates/core/src/jobs/worker.rs:383–390`, non-retryable error variants are explicitly pattern-matched alongside `JobError::Fatal`:
   ```rust
   Err(JobError::Fatal(msg))
   | Err(JobError::UnknownJob(msg))
@@ -66,7 +66,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   Unknown job handlers and corrupted payloads route directly to the dead-letter queue without burning retry attempts or wasting execution permits.
 
 - **v03 Jobs M5 (Redis `IdempotencyStore::release` and `complete` perform unverified mutations, risking cross-worker lock deletion)** — **RESOLVED (Partially)**.
-  In `rume/src/jobs/redis.rs:284–302, 318–334`, `complete()` and `release()` were converted to atomic Lua scripts verifying that the key's current value is `'IN_PROGRESS'` before updating or deleting:
+  In `crates/core/src/jobs/redis.rs:284–302, 318–334`, `complete()` and `release()` were converted to atomic Lua scripts verifying that the key's current value is `'IN_PROGRESS'` before updating or deleting:
   ```lua
   local current = redis.call('GET', KEYS[1])
   if current == 'IN_PROGRESS' then
@@ -79,25 +79,25 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   This prevents a slow or failed worker from deleting a `COMPLETED:` cache entry. (Note: Because `IdempotencyStore` trait methods do not take a unique owner token, a worker whose key expired can still delete a successor worker's `IN_PROGRESS` lock, tracked as minor finding m1).
 
 - **v03 Jobs M6 (`PostgresJobQueue::enqueue_delayed` returns fictitious IDs on duplicate conflict resolution race)** — **RESOLVED**.
-  In `rume/src/jobs/postgres.rs:126–144`, if an `ON CONFLICT DO NOTHING` collision occurs and the subsequent fallback `SELECT id` returns `None` (because the conflicting row was removed or transitioned to dead-letter concurrently), `enqueue_delayed` no longer returns the generated phantom UUID. Instead, it returns an explicit error:
+  In `crates/core/src/jobs/postgres.rs:126–144`, if an `ON CONFLICT DO NOTHING` collision occurs and the subsequent fallback `SELECT id` returns `None` (because the conflicting row was removed or transitioned to dead-letter concurrently), `enqueue_delayed` no longer returns the generated phantom UUID. Instead, it returns an explicit error:
   ```rust
   Err(JobError::Fatal("idempotency conflict race: conflicting row is no longer active".into()))
   ```
 
 - **v03 Jobs m1 (Wall-clock underflow panic in `PostgresJobQueue::dequeue_for` on systems with low monotonic uptime)** — **RESOLVED**.
-  In `rume/src/jobs/postgres.rs:194–198`, the unsafe subtraction `Instant::now() - Duration::from_millis(...)` was eliminated. When `available_at_ms <= now`, the queue sets `available_at = Instant::now()`, preventing monotonic clock underflow panics on newly booted hosts.
+  In `crates/core/src/jobs/postgres.rs:194–198`, the unsafe subtraction `Instant::now() - Duration::from_millis(...)` was eliminated. When `available_at_ms <= now`, the queue sets `available_at = Instant::now()`, preventing monotonic clock underflow panics on newly booted hosts.
 
 - **v03 Jobs m2 (Exponential backoff in `RetryPolicy` lacks randomized jitter and is vulnerable to NaN/overflow)** — **RESOLVED**.
-  In `rume/src/jobs/retry.rs:68–81`, `backoff_factor` is validated with `self.backoff_factor.is_finite() && self.backoff_factor >= 1.0` (defaulting to `2.0` if invalid). Multiplier exponentiation checks `factor_pow.is_finite()`, capping at `self.max_backoff_ms` on float overflow or NaN.
+  In `crates/core/src/jobs/retry.rs:68–81`, `backoff_factor` is validated with `self.backoff_factor.is_finite() && self.backoff_factor >= 1.0` (defaulting to `2.0` if invalid). Multiplier exponentiation checks `factor_pow.is_finite()`, capping at `self.max_backoff_ms` on float overflow or NaN.
 
 - **v03 Jobs m3 (`JobWorker` lacks cancellation token propagation to `JobContext` during graceful drain)** — **RESOLVED**.
-  `JobContext` in `rume/src/jobs/job.rs:56–82` now includes `pub cancellation: Option<Arc<AtomicBool>>` with `is_cancelled(&self) -> bool`. In `rume/src/jobs/worker.rs:290, 295, 367`, `self.is_stopping` is forwarded through `registry.dispatch_with_cancellation`, allowing long-running handlers to observe graceful drain requests.
+  `JobContext` in `crates/core/src/jobs/job.rs:56–82` now includes `pub cancellation: Option<Arc<AtomicBool>>` with `is_cancelled(&self) -> bool`. In `crates/core/src/jobs/worker.rs:290, 295, 367`, `self.is_stopping` is forwarded through `registry.dispatch_with_cancellation`, allowing long-running handlers to observe graceful drain requests.
 
 - **v03 Jobs m4 (DLQ lacks failure timestamp and query/replay administrative APIs)** — **RESOLVED**.
   `rume_jobs` schema added `dead_lettered_at BIGINT` and index `idx_rume_jobs_dead_letter` (`jobs_schema.sql:18, 25`). `JobQueue` introduced `list_dead_letters(limit)` and `replay_dead_letter(job_id)` in `queue.rs:73–86`, fully implemented with parameterized SQL in `PostgresJobQueue` (`postgres.rs:377–448`).
 
 - **v03 Jobs m5 (Worker poll error loop busy-spins every 50ms during database outages)** — **RESOLVED**.
-  In `rume/src/jobs/worker.rs:275, 284, 299, 304–308`, `consecutive_errors` tracks consecutive database poll failures, applying exponential backoff:
+  In `crates/core/src/jobs/worker.rs:275, 284, 299, 304–308`, `consecutive_errors` tracks consecutive database poll failures, applying exponential backoff:
   ```rust
   let backoff_ms = (50u64 * 2u64.pow(consecutive_errors.min(6))).min(5000);
   sleep(Duration::from_millis(backoff_ms)).await;
@@ -105,7 +105,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   Poller sleep scales from 100ms up to 3200ms and caps at 5000ms, resetting to 0 on any successful dequeue.
 
 - **v03 Jobs m6 (Dual lease expiration recovery between `jobs_claim.sql` and `jobs_reap.sql` lacks coordination)** — **RESOLVED**.
-  In `rume/src/persistence/sql/postgres/jobs_reap.sql:1–11`, `lease_expires_at <= $2` was excised, and `FOR UPDATE SKIP LOCKED` was added. Reaping is now strictly restricted to dead worker nodes (`assigned_worker = ANY($1)`), while claim lease expiration recovery is consolidated solely into `jobs_claim.sql`.
+  In `crates/core/src/persistence/sql/postgres/jobs_reap.sql:1–11`, `lease_expires_at <= $2` was excised, and `FOR UPDATE SKIP LOCKED` was added. Reaping is now strictly restricted to dead worker nodes (`assigned_worker = ANY($1)`), while claim lease expiration recovery is consolidated solely into `jobs_claim.sql`.
 
 ---
 
@@ -113,9 +113,9 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
 
 ### M1 Unhandled asynchronous job handler panics bypass `catch_unwind`, stranding jobs in `in_flight` status and breaking DLQ routing
 
-- **Where:** `rume/src/jobs/worker.rs:366–371`, `rume/tests/containers/jobs.rs:319–342`
+- **Where:** `crates/core/src/jobs/worker.rs:366–371`, `crates/core/tests/containers/jobs.rs:319–342`
 - **What it says:**
-  In `rume/src/jobs/worker.rs`:
+  In `crates/core/src/jobs/worker.rs`:
   ```rust
   let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
       registry.dispatch_with_cancellation(&job, Some(stopping))
@@ -154,19 +154,19 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   3. The job is never transitioned to `dead_letter` via `queue.dead_letter()`. In PostgreSQL, the job row remains permanently stuck in `status = 'in_flight'`.
   4. Any held Redis idempotency lock (`store.try_acquire`) is never released via `store.release()`, locking out subsequent submissions for 300 seconds.
   5. The spawned heartbeat task continues running in the background until the receiver channel is dropped.
-  6. The container integration test `jobs::worker_panic_does_not_leak_in_flight_count` in `rume/tests/containers/jobs.rs:319–342` asserts this durable queue invariant:
+  6. The container integration test `jobs::worker_panic_does_not_leak_in_flight_count` in `crates/core/tests/containers/jobs.rs:319–342` asserts this durable queue invariant:
      ```rust
      assert_eq!(queue.dead_letter_count().await.unwrap(), 1, "panicked job must be routed to DLQ");
      ```
      Running `cargo test --test containers --features postgres -- jobs::worker_panic_does_not_leak_in_flight_count` fails deterministically on `HEAD`:
      ```
-     thread 'jobs::worker_panic_does_not_leak_in_flight_count' panicked at rume/tests/containers/jobs.rs:340:5:
+     thread 'jobs::worker_panic_does_not_leak_in_flight_count' panicked at crates/core/tests/containers/jobs.rs:340:5:
      assertion `left == right` failed: panicked job must be routed to DLQ
        left: 0
       right: 1
      ```
 - **Suggested fix:**
-  Catch unwinding panics during the polling/awaiting of the future itself. Either add `futures-util = { workspace = true }` to `rume/Cargo.toml` and use `FutureExt::catch_unwind`:
+  Catch unwinding panics during the polling/awaiting of the future itself. Either add `futures-util = { workspace = true }` to `crates/core/Cargo.toml` and use `FutureExt::catch_unwind`:
   ```rust
   use futures_util::FutureExt;
 
@@ -195,7 +195,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
 
 ### M2 Race condition and uncoordinated worker execution in `test_worker_heartbeat_and_abandoned_job_recovery` causes deterministic container test failure
 
-- **Where:** `rume/tests/containers/job_reliability.rs:227–258`
+- **Where:** `crates/core/tests/containers/job_reliability.rs:227–258`
 - **What it says:**
   ```rust
   // Worker 1 starts with heartbeat and abandoned recovery
@@ -239,7 +239,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
   
   Line 256 panics immediately:
   ```
-  thread 'job_reliability::test_worker_heartbeat_and_abandoned_job_recovery' panicked at rume/tests/containers/job_reliability.rs:256:5:
+  thread 'job_reliability::test_worker_heartbeat_and_abandoned_job_recovery' panicked at crates/core/tests/containers/job_reliability.rs:256:5:
   assertion failed: claimed.is_some()
   ```
   Furthermore, because `worker1` was initialized with an empty registry (`let registry = Arc::new(rume::jobs::JobRegistry::new());`), when `worker1` steals the job, `dispatch` returns `JobError::UnknownJob`, which immediately routes the stolen job to `dead_letter`. The abandoned job recovery logic on lines 260–263 is never exercised. This test fails 100% of the time when running `cargo test --test containers --features postgres,redis -- test_worker_heartbeat_and_abandoned_job_recovery`.
@@ -280,9 +280,9 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
 
 ### m1 Redis `IdempotencyStore::release` and `complete` perform unverified mutations across expired lease renewals
 
-- **Where:** `rume/src/jobs/redis.rs:284–302, 318–334`
+- **Where:** `crates/core/src/jobs/redis.rs:284–302, 318–334`
 - **What it says:**
-  In `rume/src/jobs/redis.rs`:
+  In `crates/core/src/jobs/redis.rs`:
   ```lua
   local current = redis.call('GET', KEYS[1])
   if current == 'IN_PROGRESS' then
@@ -303,7 +303,7 @@ This diff review evaluates the background jobs and worker concurrency subsystem 
 
 ### m2 Job lease renewal failure in `JobWorker` heartbeat does not signal cancellation to running job handler
 
-- **Where:** `rume/src/jobs/worker.rs:356–361`
+- **Where:** `crates/core/src/jobs/worker.rs:356–361`
 - **What it says:**
   ```rust
   if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, Duration::from_secs(60)).await {

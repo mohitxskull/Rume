@@ -366,7 +366,10 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
-        if tokio::time::timeout(remaining, self.backend.close()).await.is_err() {
+        if tokio::time::timeout(remaining, self.backend.close())
+            .await
+            .is_err()
+        {
             return false;
         }
 
@@ -485,7 +488,10 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
                 Err(_) => HealthCheckResult {
                     name,
                     status: HealthStatus::Failed,
-                    message: format!("database connection check timed out after {}s", ping_timeout.as_secs()),
+                    message: format!(
+                        "database connection check timed out after {}s",
+                        ping_timeout.as_secs()
+                    ),
                     meta,
                     cached: false,
                     duration_ms: None,
@@ -565,7 +571,11 @@ where
         })
     }
 
-    fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
+    fn mark_published(
+        &self,
+        id: &str,
+        lease_token: &str,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id = id.to_string();
         let lease_token = lease_token.to_string();
         Box::pin(async move {
@@ -612,7 +622,9 @@ where
             let _lease = self
                 .acquire_lease()
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().recover_expired_claims(max_lease_age_secs).await
+            self.backend()
+                .recover_expired_claims(max_lease_age_secs)
+                .await
         })
     }
 

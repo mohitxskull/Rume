@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 async fn setup_real_outbox() -> Arc<SqliteBackend> {
     let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
-    backend.init_outbox_table().await.expect("init outbox table");
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table");
     Arc::new(backend)
 }
 
@@ -108,7 +111,11 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
     // Verify backoff and failure tracking directly with lease token fencing
     use rume::persistence::DatabaseBackend;
     for _ in 0..3 {
-        repo.execute(&format!("UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'")).await.unwrap();
+        repo.execute(&format!(
+            "UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'"
+        ))
+        .await
+        .unwrap();
         let claimed = repo.claim_pending(1).await.unwrap();
         assert_eq!(claimed.len(), 1);
         let token = claimed[0].lease_token.as_ref().unwrap();
@@ -118,7 +125,11 @@ async fn outbox_relay_tracks_failures_and_exhaustion() {
     }
 
     // 5th failure -> status transitions to Failed (DLQ)
-    repo.execute(&format!("UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'")).await.unwrap();
+    repo.execute(&format!(
+        "UPDATE rume_outbox SET next_retry_at = NULL WHERE id = '{msg_id}'"
+    ))
+    .await
+    .unwrap();
     let claimed = repo.claim_pending(1).await.unwrap();
     assert_eq!(claimed.len(), 1);
     let token = claimed[0].lease_token.as_ref().unwrap();
@@ -465,11 +476,17 @@ async fn outbox_superseded_worker_cannot_mark_published_or_failed() {
 
     // 4. Superseded Worker A attempts mark_published with token_a -> rejected!
     let a_pub_res = repo.mark_published(&msg_id, &token_a).await;
-    assert!(a_pub_res.is_err(), "superseded worker A must not mark published");
+    assert!(
+        a_pub_res.is_err(),
+        "superseded worker A must not mark published"
+    );
 
     // 5. Superseded Worker A attempts mark_failed with token_a -> rejected!
     let a_fail_res = repo.mark_failed(&msg_id, &token_a, "failed".into()).await;
-    assert!(a_fail_res.is_err(), "superseded worker A must not mark failed");
+    assert!(
+        a_fail_res.is_err(),
+        "superseded worker A must not mark failed"
+    );
 
     // 6. Active Worker B marks published with token_b -> succeeds
     let b_pub_res = repo.mark_published(&msg_id, &token_b).await;
@@ -491,9 +508,11 @@ async fn outbox_recovery_does_not_prematurely_revoke_valid_lease_on_old_message(
 
     // Simulate message queued for 100 seconds
     use rume::persistence::DatabaseBackend;
-    repo.execute(&format!("UPDATE rume_outbox SET created_at = created_at - 100 WHERE id = '{msg_id}'"))
-        .await
-        .unwrap();
+    repo.execute(&format!(
+        "UPDATE rume_outbox SET created_at = created_at - 100 WHERE id = '{msg_id}'"
+    ))
+    .await
+    .unwrap();
 
     // Worker claims message with a 60-second lease
     let claimed = repo.claim_pending_with_lease(1, 60).await.unwrap();
@@ -503,7 +522,10 @@ async fn outbox_recovery_does_not_prematurely_revoke_valid_lease_on_old_message(
     // Another relay executes recovery (e.g. recover_expired_claims(30))
     // Message is 100s old, but its lease expires in 60s, so it MUST NOT be reclaimed!
     let recovered = repo.recover_expired_claims(30).await.unwrap();
-    assert_eq!(recovered, 0, "active 60s lease on old message must NOT be revoked");
+    assert_eq!(
+        recovered, 0,
+        "active 60s lease on old message must NOT be revoked"
+    );
 
     // Original worker completes successfully
     repo.mark_published(&msg_id, &token).await.unwrap();
@@ -569,11 +591,12 @@ async fn outbox_relay_recovers_from_async_dispatcher_panic() {
 
     // Durable outbox invariant: message failure recorded with panic error and retry backoff scheduled
     use sqlx::Row;
-    let row = sqlx::query("SELECT retry_count, last_error, lease_token FROM rume_outbox WHERE id = ?1")
-        .bind(&msg_id)
-        .fetch_one(repo.pool())
-        .await
-        .unwrap();
+    let row =
+        sqlx::query("SELECT retry_count, last_error, lease_token FROM rume_outbox WHERE id = ?1")
+            .bind(&msg_id)
+            .fetch_one(repo.pool())
+            .await
+            .unwrap();
     let retry_count: i32 = row.get(0);
     let last_error: Option<String> = row.get(1);
     let lease_token: Option<String> = row.get(2);
@@ -630,11 +653,17 @@ struct FaultyOutboxRepo {
 }
 
 impl OutboxRepository for FaultyOutboxRepo {
-    fn save<'a>(&'a self, message: OutboxMessage) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
+    fn save<'a>(
+        &'a self,
+        message: OutboxMessage,
+    ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
         self.inner.save(message)
     }
 
-    fn fetch_pending<'a>(&'a self, limit: usize) -> rume::outbox::BoxFuture<'a, Result<Vec<OutboxMessage>, OutboxError>> {
+    fn fetch_pending<'a>(
+        &'a self,
+        limit: usize,
+    ) -> rume::outbox::BoxFuture<'a, Result<Vec<OutboxMessage>, OutboxError>> {
         self.inner.fetch_pending(limit)
     }
 
@@ -643,7 +672,8 @@ impl OutboxRepository for FaultyOutboxRepo {
         limit: usize,
         lease_duration_secs: u64,
     ) -> rume::outbox::BoxFuture<'a, Result<Vec<OutboxMessage>, OutboxError>> {
-        self.inner.claim_pending_with_lease(limit, lease_duration_secs)
+        self.inner
+            .claim_pending_with_lease(limit, lease_duration_secs)
     }
 
     fn renew_outbox_lease<'a>(
@@ -654,10 +684,13 @@ impl OutboxRepository for FaultyOutboxRepo {
     ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
         if self.fail_renew_outbox_lease.load(Ordering::SeqCst) {
             Box::pin(async move {
-                Err(OutboxError::Repository("database dropped during heartbeat renewal".into()))
+                Err(OutboxError::Repository(
+                    "database dropped during heartbeat renewal".into(),
+                ))
             })
         } else {
-            self.inner.renew_outbox_lease(id, lease_token, extension_secs)
+            self.inner
+                .renew_outbox_lease(id, lease_token, extension_secs)
         }
     }
 
@@ -668,7 +701,9 @@ impl OutboxRepository for FaultyOutboxRepo {
     ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
         if self.fail_mark_published {
             Box::pin(async move {
-                Err(OutboxError::Repository("database connection drop during mark_published".into()))
+                Err(OutboxError::Repository(
+                    "database connection drop during mark_published".into(),
+                ))
             })
         } else {
             self.inner.mark_published(id, lease_token)
@@ -682,7 +717,8 @@ impl OutboxRepository for FaultyOutboxRepo {
         error: String,
         max_retries: u32,
     ) -> rume::outbox::BoxFuture<'a, Result<(), OutboxError>> {
-        self.inner.mark_failed_with_max_retries(id, lease_token, error, max_retries)
+        self.inner
+            .mark_failed_with_max_retries(id, lease_token, error, max_retries)
     }
 
     fn recover_expired_claims<'a>(
@@ -691,7 +727,9 @@ impl OutboxRepository for FaultyOutboxRepo {
     ) -> rume::outbox::BoxFuture<'a, Result<usize, OutboxError>> {
         if self.fail_recovery {
             Box::pin(async move {
-                Err(OutboxError::Repository("database connection failure during recovery".into()))
+                Err(OutboxError::Repository(
+                    "database connection failure during recovery".into(),
+                ))
             })
         } else {
             self.inner.recover_expired_claims(lease_duration_secs)
@@ -725,7 +763,10 @@ async fn outbox_relay_database_failure_during_recovery_is_returned_and_visible()
 
     // Calling poll_and_dispatch must return the repository failure rather than logging and returning Ok(0)
     let res = relay.poll_and_dispatch(10).await;
-    assert!(res.is_err(), "database failure during recovery must return Err");
+    assert!(
+        res.is_err(),
+        "database failure during recovery must return Err"
+    );
     match res {
         Err(OutboxError::Repository(msg)) => {
             assert!(msg.contains("database connection failure during recovery"));
@@ -770,12 +811,17 @@ async fn outbox_relay_failed_transition_is_distinguished_and_drain_fails() {
 
     // try_drain immediately propagates the failed transition error rather than reporting success
     let drain_res = relay.try_drain(Duration::from_millis(500)).await;
-    assert!(drain_res.is_err(), "try_drain must return Err on failed state transitions");
+    assert!(
+        drain_res.is_err(),
+        "try_drain must return Err on failed state transitions"
+    );
 }
 
 #[derive(Debug, Default)]
 struct MockIdempotencyStore {
-    records: std::sync::Mutex<std::collections::HashMap<String, rume::jobs::reliability::IdempotencyStatus>>,
+    records: std::sync::Mutex<
+        std::collections::HashMap<String, rume::jobs::reliability::IdempotencyStatus>,
+    >,
 }
 
 impl rume::jobs::reliability::IdempotencyStore for MockIdempotencyStore {
@@ -783,13 +829,19 @@ impl rume::jobs::reliability::IdempotencyStore for MockIdempotencyStore {
         &self,
         key: &str,
         _ttl: Duration,
-    ) -> rume::jobs::job::BoxFuture<'_, Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>> {
+    ) -> rume::jobs::job::BoxFuture<
+        '_,
+        Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>,
+    > {
         let mut map = self.records.lock().unwrap();
         if let Some(status) = map.get(key) {
             let status = status.clone();
             Box::pin(async move { Ok(status) })
         } else {
-            map.insert(key.to_string(), rume::jobs::reliability::IdempotencyStatus::InProgress);
+            map.insert(
+                key.to_string(),
+                rume::jobs::reliability::IdempotencyStatus::InProgress,
+            );
             Box::pin(async move { Ok(rume::jobs::reliability::IdempotencyStatus::New) })
         }
     }
@@ -799,7 +851,10 @@ impl rume::jobs::reliability::IdempotencyStore for MockIdempotencyStore {
         key: &str,
         _token: &str,
         ttl: Duration,
-    ) -> rume::jobs::job::BoxFuture<'_, Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>> {
+    ) -> rume::jobs::job::BoxFuture<
+        '_,
+        Result<rume::jobs::reliability::IdempotencyStatus, rume::jobs::error::JobError>,
+    > {
         self.try_acquire(key, ttl)
     }
 
@@ -825,7 +880,10 @@ impl rume::jobs::reliability::IdempotencyStore for MockIdempotencyStore {
         self.complete(key, payload)
     }
 
-    fn release(&self, key: &str) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
+    fn release(
+        &self,
+        key: &str,
+    ) -> rume::jobs::job::BoxFuture<'_, Result<(), rume::jobs::error::JobError>> {
         let mut map = self.records.lock().unwrap();
         map.remove(key);
         Box::pin(async move { Ok(()) })
@@ -855,7 +913,10 @@ async fn duplicate_event_delivery_consumer_idempotency_prevents_duplicate_effect
         counter: &AtomicUsize,
     ) -> Result<&'static str, &'static str> {
         let key = scoped_idempotency_key(tenant_id, event_id);
-        let status = store.try_acquire(&key, Duration::from_secs(60)).await.unwrap();
+        let status = store
+            .try_acquire(&key, Duration::from_secs(60))
+            .await
+            .unwrap();
 
         match status {
             IdempotencyStatus::Completed(_) => {
@@ -865,7 +926,10 @@ async fn duplicate_event_delivery_consumer_idempotency_prevents_duplicate_effect
             IdempotencyStatus::New => {
                 // First delivery: execute critical business effect (e.g., balance charge, invoice generation)
                 counter.fetch_add(500, Ordering::SeqCst);
-                store.complete(&key, Some(b"processed".to_vec())).await.unwrap();
+                store
+                    .complete(&key, Some(b"processed".to_vec()))
+                    .await
+                    .unwrap();
                 Ok("processed")
             }
             IdempotencyStatus::InProgress => Err("concurrent_in_progress"),
@@ -950,13 +1014,24 @@ impl OutboxRepository for MockBareOutboxRepo {
     fn save(&self, _msg: OutboxMessage) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
         Box::pin(async move { Ok(()) })
     }
-    fn fetch_pending(&self, _limit: usize) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+    fn fetch_pending(
+        &self,
+        _limit: usize,
+    ) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move { Ok(vec![]) })
     }
-    fn claim_pending_with_lease(&self, _limit: usize, _secs: u64) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+    fn claim_pending_with_lease(
+        &self,
+        _limit: usize,
+        _secs: u64,
+    ) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move { Ok(vec![]) })
     }
-    fn mark_published(&self, _id: &str, _token: &str) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+    fn mark_published(
+        &self,
+        _id: &str,
+        _token: &str,
+    ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
         Box::pin(async move { Ok(()) })
     }
     fn pending_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
@@ -982,7 +1057,10 @@ async fn test_outbox_repository_unsupported_renewal_default_returns_error() {
 #[tokio::test]
 async fn database_pool_sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid() {
     let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
-    backend.init_outbox_table().await.expect("init outbox table");
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table");
     let pool = Arc::new(rume::persistence::pool::DatabasePool::new(
         backend,
         rume::persistence::config::DatabaseConfig::default(),
@@ -1024,7 +1102,8 @@ async fn database_pool_sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_
 }
 
 #[tokio::test]
-async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_cancellation_and_failed_transition() {
+async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_cancellation_and_failed_transition()
+ {
     let inner = setup_real_outbox().await;
     let event = OrderPaidEvent {
         order_id: "order_active_fail_hb".into(),
@@ -1073,11 +1152,20 @@ async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_c
     })
     .with_config(config);
 
-    let res = relay.poll_and_dispatch(10).await.expect("poll_and_dispatch should return Ok with failed_transitions");
+    let res = relay
+        .poll_and_dispatch(10)
+        .await
+        .expect("poll_and_dispatch should return Ok with failed_transitions");
     assert_eq!(res.published, 0);
-    assert_eq!(res.failed_transitions, 1, "failed heartbeat must be counted as failed_transitions");
+    assert_eq!(
+        res.failed_transitions, 1,
+        "failed heartbeat must be counted as failed_transitions"
+    );
     assert!(!res.is_success());
-    assert!(observed_cancellation.load(Ordering::SeqCst), "dispatcher must observe cancellation signal when heartbeat fails");
+    assert!(
+        observed_cancellation.load(Ordering::SeqCst),
+        "dispatcher must observe cancellation signal when heartbeat fails"
+    );
 }
 
 #[tokio::test]

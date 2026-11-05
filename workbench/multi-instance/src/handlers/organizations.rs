@@ -1,6 +1,6 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use rume::error::AppError;
 
 use crate::models::{CreateOrganizationRequest, Organization};
@@ -14,7 +14,9 @@ pub async fn create_organization(
     let id = payload.id.trim();
     let name = payload.name.trim();
     if id.is_empty() || name.is_empty() {
-        return Err(AppError::bad_request("Organization id and name cannot be empty"));
+        return Err(AppError::bad_request(
+            "Organization id and name cannot be empty",
+        ));
     }
 
     let now = std::time::SystemTime::now()

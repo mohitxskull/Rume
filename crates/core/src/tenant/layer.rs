@@ -210,7 +210,9 @@ where
 }
 
 /// Tier classification for a tenant.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum TenantTier {
     Free,
     Pro,
@@ -403,7 +405,9 @@ where
                     Err(err) => {
                         tracing::error!(tenant_id = %tenant.id, error = %err, "Tenant quota store error");
                         let app_err = AppError::Internal {
-                            source: crate::error::InternalSource::new(format!("Quota verification error: {err}")),
+                            source: crate::error::InternalSource::new(format!(
+                                "Quota verification error: {err}"
+                            )),
                             request_id: None,
                         };
                         Ok(app_err.into_response())
@@ -419,10 +423,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::Router;
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     use axum::routing::get;
-    use axum::Router;
     use tower::ServiceExt;
 
     use crate::auth::identity::AuthUser;
@@ -438,12 +442,10 @@ mod tests {
             .route("/test", get(ok_handler))
             .layer(TenantMembershipLayer::new());
 
-        let mut req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         req.extensions_mut().insert(Tenant::new("acme", "acme"));
-        req.extensions_mut().insert(AuthUser::new("user-1").with_tenant_id("acme"));
+        req.extensions_mut()
+            .insert(AuthUser::new("user-1").with_tenant_id("acme"));
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
@@ -455,12 +457,10 @@ mod tests {
             .route("/test", get(ok_handler))
             .layer(TenantMembershipLayer::new());
 
-        let mut req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         req.extensions_mut().insert(Tenant::new("globex", "globex"));
-        req.extensions_mut().insert(AuthUser::new("user-1").with_tenant_id("acme"));
+        req.extensions_mut()
+            .insert(AuthUser::new("user-1").with_tenant_id("acme"));
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -473,10 +473,7 @@ mod tests {
             .layer(TenantMembershipLayer::strict());
 
         // Without tenant association in AuthUser -> rejected under strict mode
-        let mut req = Request::builder()
-            .uri("/test")
-            .body(Body::empty())
-            .unwrap();
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
         req.extensions_mut().insert(Tenant::new("acme", "acme"));
         req.extensions_mut().insert(AuthUser::new("user-no-tenant"));
 
@@ -523,7 +520,13 @@ mod tests {
 
         let res_overflow = app.clone().oneshot(req_overflow).await.unwrap();
         assert_eq!(res_overflow.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(res_overflow.headers().get(axum::http::header::RETRY_AFTER).unwrap(), "60");
+        assert_eq!(
+            res_overflow
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "60"
+        );
 
         // 3. Pro tenant can still make requests up to pro_limit
         let mut req_pro = Request::builder()

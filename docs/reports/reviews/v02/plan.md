@@ -14,7 +14,7 @@ The plan governs the review only; it never outranks the code (`.opencode/rules/2
 |---|---|
 | `rume` (Core Library) | `src/app/` (builder, context, lifecycle, observability, paths, shutdown, state, mode)<br>`src/auth/` (layer, policy, scheme, session, user)<br>`src/cache/` (backend, config, error, health, typed)<br>`src/config/` (builder, error, loader)<br>`src/coordination/` (error, leader, lock)<br>`src/enterprise/` (saml, scim)<br>`src/env/` (error, interpolation, loading, provenance, secrets)<br>`src/error.rs` (RFC 9457 Problem Details contracts)<br>`src/events/` (bus, error, event, handler)<br>`src/helpers/` (bytes, cases, duration, html, mask, ordinal, safe_equal, sentence, slug, truncate, whitespace)<br>`src/jobs/` (context, error, handler, model, queue, registry, reliability, retry, worker)<br>`src/metrics/` (counter, exporter, gauge, layer, registry)<br>`src/module/` (architecture, context, dependency, error, harness, lifecycle, traits)<br>`src/openapi/` (builder, generator, model)<br>`src/outbox/` (error, model, relay, repository)<br>`src/persistence/` (backend, config, error, health, memory, migration, migrator, pool, transaction)<br>`src/prelude.rs` & `src/lib.rs` (public surface and re-exports)<br>`src/resilience/` (circuit_breaker, concurrency, config, error, layer, rate_limiter, timeout)<br>`src/routing/` (group, health, info, matcher, registry, rejection, router, spec, validated_param)<br>`src/saga/` (coordinator, error, step)<br>`src/security/` (audit, csrf, headers)<br>`src/tenant/` (cache, error, layer, model, resolver)<br>`src/testing.rs` & `src/validation.rs` |
 | `rume-cli` (CLI Tooling) | `src/main.rs`, `cli.rs`, `prompts.rs`<br>`src/commands/` (`new.rs`, `doctor.rs`, `codegen/`, `generate/`, `env/`, `config/`)<br>`src/ui/` (`logger.rs`, `sticker.rs`, `table.rs`, `tasks.rs`) |
-| Integration Tests | `rume/tests/` (18 test suites: `progressive_composition.rs`, `validation_suite.rs`, `persistence_integration.rs`, `auth_suite.rs`, `cache_suite.rs`, `jobs_suite.rs`, `events_suite.rs`, `openapi_suite.rs`, `outbox_suite.rs`, `job_reliability_suite.rs`, `resilience_suite.rs`, `metrics_suite.rs`, `module_testing_and_architecture_suite.rs`, `tenant_suite.rs`, `security_suite.rs`, `saga_suite.rs`, `coordination_suite.rs`, `enterprise_suite.rs`, `http_smoke.rs`, `env_and_config_loading.rs`) |
+| Integration Tests | `crates/core/tests/` (18 test suites: `progressive_composition.rs`, `validation_suite.rs`, `persistence_integration.rs`, `auth_suite.rs`, `cache_suite.rs`, `jobs_suite.rs`, `events_suite.rs`, `openapi_suite.rs`, `outbox_suite.rs`, `job_reliability_suite.rs`, `resilience_suite.rs`, `metrics_suite.rs`, `module_testing_and_architecture_suite.rs`, `tenant_suite.rs`, `security_suite.rs`, `saga_suite.rs`, `coordination_suite.rs`, `enterprise_suite.rs`, `http_smoke.rs`, `env_and_config_loading.rs`) |
 
 **Out of Scope**:
 - `lab/` (experimental scratch space excluded from workspace).
@@ -83,14 +83,14 @@ flowchart TD
 #### Lens 1: Correctness & Runtime Contracts — `correctness.md`
 - **Charter:** State machines, lifecycle sequencing, graceful shutdown drain order, transactional atomicity, outbox relay contracts, job worker graceful termination, saga forward/compensation ordering, distributed lock monotonic fencing, and RFC 9457 Problem Details consistency.
 - **Code Covered:**
-  - `rume/src/app/{builder,lifecycle,state,shutdown,observability}.rs`
-  - `rume/src/error.rs`
-  - `rume/src/persistence/{transaction,migrator,pool,memory}.rs`
-  - `rume/src/outbox/{relay,repository,model}.rs`
-  - `rume/src/jobs/{worker,reliability,retry,queue}.rs`
-  - `rume/src/saga/{coordinator,step,error}.rs`
-  - `rume/src/coordination/{lock,leader}.rs`
-  - `rume/src/routing/{router,spec,validated_param}.rs`
+  - `crates/core/src/app/{builder,lifecycle,state,shutdown,observability}.rs`
+  - `crates/core/src/error.rs`
+  - `crates/core/src/persistence/{transaction,migrator,pool,memory}.rs`
+  - `crates/core/src/outbox/{relay,repository,model}.rs`
+  - `crates/core/src/jobs/{worker,reliability,retry,queue}.rs`
+  - `crates/core/src/saga/{coordinator,step,error}.rs`
+  - `crates/core/src/coordination/{lock,leader}.rs`
+  - `crates/core/src/routing/{router,spec,validated_param}.rs`
 - **Mandatory Prior Context:** `docs/reports/reviews/v01/correctness.md`, `docs/reports/reviews/v01/todo.md`.
 - **Key Invariants to Check:**
   - Graceful shutdown readiness sequencing: availability transitions to `RefusingTraffic` before HTTP drain.
@@ -102,13 +102,13 @@ flowchart TD
 #### Lens 2: Security, Isolation & Safety — `security.md`
 - **Charter:** Authentication schemes, session hijacking defenses, CSRF token validation (constant-time check), security headers (CSP, HSTS, X-Frame-Options), secret masking and zero-leakage error handling, path traversal sandboxing in env loading, multi-tenant data boundaries, SAML XML parsing robustness, and SCIM protocol schemas.
 - **Code Covered:**
-  - `rume/src/auth/{layer,policy,scheme,session,user}.rs`
-  - `rume/src/security/{audit,csrf,headers}.rs`
-  - `rume/src/tenant/{cache,layer,model,resolver}.rs`
-  - `rume/src/enterprise/{saml,scim}.rs`
-  - `rume/src/env/{loading,secrets,interpolation}.rs`
-  - `rume/src/helpers/{mask,safe_equal}.rs`
-  - `rume/src/error.rs`
+  - `crates/core/src/auth/{layer,policy,scheme,session,user}.rs`
+  - `crates/core/src/security/{audit,csrf,headers}.rs`
+  - `crates/core/src/tenant/{cache,layer,model,resolver}.rs`
+  - `crates/core/src/enterprise/{saml,scim}.rs`
+  - `crates/core/src/env/{loading,secrets,interpolation}.rs`
+  - `crates/core/src/helpers/{mask,safe_equal}.rs`
+  - `crates/core/src/error.rs`
 - **Mandatory Prior Context:** `docs/reports/reviews/v01/security.md`, `docs/reports/reviews/v01/todo.md`.
 - **Key Invariants to Check:**
   - `file:` env resolution rejects traversal (`..`) and absolute paths.
@@ -120,11 +120,11 @@ flowchart TD
 #### Lens 3: Architecture & Modularity — `architecture.md`
 - **Charter:** Progressive complexity model, first-class `Module` composition, DAG cycle detection, topological dependency ordering, clean API surface of `rume::prelude`, lack of magic DI/reflection, fail-closed preflight, and encapsulation between subsystems.
 - **Code Covered:**
-  - `rume/src/module/{architecture,context,dependency,harness,lifecycle,traits}.rs`
-  - `rume/src/app/{builder,context,mode}.rs`
-  - `rume/src/events/bus.rs`
-  - `rume/src/routing/{group,router}.rs`
-  - `rume/src/lib.rs` & `rume/src/prelude.rs`
+  - `crates/core/src/module/{architecture,context,dependency,harness,lifecycle,traits}.rs`
+  - `crates/core/src/app/{builder,context,mode}.rs`
+  - `crates/core/src/events/bus.rs`
+  - `crates/core/src/routing/{group,router}.rs`
+  - `crates/core/src/lib.rs` & `crates/core/src/prelude.rs`
 - **Mandatory Prior Context:** `docs/reports/reviews/v01/architecture.md`, `docs/reports/reviews/v01/todo.md`.
 - **Key Invariants to Check:**
   - 3-line progressive composition (`Rume::new()`) works cleanly alongside full module builds.
@@ -139,13 +139,13 @@ flowchart TD
 #### Lens 4: Enterprise Scale & Reliability — `enterprise-reliability.md`
 - **Charter:** High availability, rate limiting and shed-load concurrency bounds, distributed worker heartbeats, transactional outbox atomicity, cache-aside TTL eviction and tag-based invalidation, metrics recording and scraping overhead, multi-tenant resource boundaries, and leader election failover.
 - **Code Covered:**
-  - `rume/src/resilience/{circuit_breaker,concurrency,rate_limiter,timeout}.rs`
-  - `rume/src/jobs/reliability.rs`
-  - `rume/src/outbox/{relay,repository}.rs`
-  - `rume/src/cache/{backend,health,typed}.rs`
-  - `rume/src/metrics/{exporter,layer,registry}.rs`
-  - `rume/src/coordination/{leader,lock}.rs`
-  - `rume/src/tenant/cache.rs`
+  - `crates/core/src/resilience/{circuit_breaker,concurrency,rate_limiter,timeout}.rs`
+  - `crates/core/src/jobs/reliability.rs`
+  - `crates/core/src/outbox/{relay,repository}.rs`
+  - `crates/core/src/cache/{backend,health,typed}.rs`
+  - `crates/core/src/metrics/{exporter,layer,registry}.rs`
+  - `crates/core/src/coordination/{leader,lock}.rs`
+  - `crates/core/src/tenant/cache.rs`
 - **Dependencies & Mandatory Prior Context:** Stage 1 reports (`correctness.md`, `security.md`, `architecture.md`), `docs/reports/reviews/v01/architecture.md`.
 - **Key Invariants to Check:**
   - Circuit breaker trips to Open under threshold failures, transitions to HalfOpen, and recovers.
@@ -156,12 +156,12 @@ flowchart TD
 #### Lens 5: Developer Experience, CLI & Usability — `dx-tooling.md`
 - **Charter:** Public API ergonomics, constructor and builder fluency, route definition elegance, error message clarity, CLI scaffolding (`rume new`, `rume doctor`, generators), configuration provenance reporting, OpenAPI schema extraction fidelity, and template portability.
 - **Code Covered:**
-  - `rume-cli/src/main.rs`, `cli.rs`, `commands/`, `ui/`
-  - `rume/src/openapi/{builder,generator,model}.rs`
-  - `rume/src/config/{builder,loader}.rs`
-  - `rume/src/env/{loading,provenance}.rs`
-  - `rume/src/validation.rs`
-  - `rume/src/helpers/`
+  - `crates/cli/src/main.rs`, `cli.rs`, `commands/`, `ui/`
+  - `crates/core/src/openapi/{builder,generator,model}.rs`
+  - `crates/core/src/config/{builder,loader}.rs`
+  - `crates/core/src/env/{loading,provenance}.rs`
+  - `crates/core/src/validation.rs`
+  - `crates/core/src/helpers/`
 - **Dependencies & Mandatory Prior Context:** Stage 1 reports, `docs/reports/reviews/v01/dx-usability.md`.
 - **Key Invariants to Check:**
   - `AppContext` builder replaces 6 positional arguments (reaffirming `D-M1`).
@@ -172,10 +172,10 @@ flowchart TD
 #### Lens 6: Testing Rigor & Architecture CI — `testing.md`
 - **Charter:** Verification depth, test harness design (`TestApp`, `ModuleHarness`), CI architecture enforcement rules (`ArchitectureRules`), integration coverage of newly introduced subsystems, edge-case and failure-mode testing, deterministic simulation of async shutdowns and timeouts.
 - **Code Covered:**
-  - `rume/src/testing.rs`
-  - `rume/src/module/harness.rs`
-  - `rume/src/module/architecture.rs`
-  - `rume/tests/` (all 18 test suites)
+  - `crates/core/src/testing.rs`
+  - `crates/core/src/module/harness.rs`
+  - `crates/core/src/module/architecture.rs`
+  - `crates/core/tests/` (all 18 test suites)
 - **Dependencies & Mandatory Prior Context:** Stage 1 reports, `docs/reports/reviews/v01/testing.md`.
 - **Key Invariants to Check:**
   - `routing.rs` and all subsystems now have comprehensive test coverage (reaffirming `T-T1`).

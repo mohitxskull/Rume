@@ -26,7 +26,11 @@ pub struct LockGuard {
 
 impl LockGuard {
     /// Creates a new LockGuard.
-    pub fn new(resource: impl Into<String>, lease_id: impl Into<String>, fencing_token: u64) -> Self {
+    pub fn new(
+        resource: impl Into<String>,
+        lease_id: impl Into<String>,
+        fencing_token: u64,
+    ) -> Self {
         Self {
             resource: resource.into(),
             lease_id: lease_id.into(),

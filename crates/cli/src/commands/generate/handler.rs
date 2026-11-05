@@ -14,9 +14,8 @@ pub fn run(name: &str) {
 
     // Pre-flight check: ensure routes.rs is present and has the marker BEFORE creating files
     let routes_path = "src/routes.rs";
-    let route_line = format!(
-        "    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n"
-    );
+    let route_line =
+        format!("    router = router.get(\"/{name}\", crate::handlers::{module_name}::index);\n");
     let routes_content = match fs::read_to_string(routes_path) {
         Ok(existing) => {
             if !existing.contains(&route_line) && !existing.contains("    // rume:routes") {

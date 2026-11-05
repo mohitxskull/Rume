@@ -8,7 +8,7 @@ Rume's security surface is small and the code shows deliberate intent: a `redact
 
 ### M1 — `file:` env resolution permits path traversal, enabling arbitrary file read
 
-**Where:** `rume/src/env.rs` §`resolve_value`, lines 212–234; the `file:` branch at lines 218–223.
+**Where:** `crates/core/src/env.rs` §`resolve_value`, lines 212–234; the `file:` branch at lines 218–223.
 
 **What it says:**
 
@@ -33,7 +33,7 @@ A `.env` value such as `APP_KEY=file:../../etc/secrets/app.key` or `APP_KEY=file
 
 ### M2 — Secrets held as plain `String` in `ResolvedEnv`, not `secrecy::SecretBox`
 
-**Where:** `rume/src/env.rs` lines 29–37 (`ResolvedEnv.values: BTreeMap<String, String>`); doc example at lines 8–14 advertises `secrecy::SecretBox<String>`.
+**Where:** `crates/core/src/env.rs` lines 29–37 (`ResolvedEnv.values: BTreeMap<String, String>`); doc example at lines 8–14 advertises `secrecy::SecretBox<String>`.
 
 **What it says:**
 
@@ -53,7 +53,7 @@ The `secrecy` crate is a pinned dependency and the module doc example shows `app
 
 ### M3 — CLI inspection commands print secrets to the terminal in plaintext
 
-**Where:** `rume-cli/src/commands/env/check.rs` lines 36–52 (`--all` process-env dump) and `rume-cli/src/commands/config/check.rs` lines 1–4 (raw config TOML dump).
+**Where:** `crates/cli/src/commands/env/check.rs` lines 36–52 (`--all` process-env dump) and `crates/cli/src/commands/config/check.rs` lines 1–4 (raw config TOML dump).
 
 **What it says:**
 
@@ -88,7 +88,7 @@ pub fn run() {
 
 ### M4 — `AppError` renders `to_string()` into the client-facing JSON `error` field
 
-**Where:** `rume/src/error.rs` lines 56–76 (`IntoResponse`), specifically lines 68–73; `Internal(String)` at lines 34–36.
+**Where:** `crates/core/src/error.rs` lines 56–76 (`IntoResponse`), specifically lines 68–73; `Internal(String)` at lines 34–36.
 
 **What it says:**
 
@@ -109,7 +109,7 @@ For `Internal`, `BadRequest`, `NotFound`, `Unauthorized`, and `Forbidden`, the b
 
 ### m1 — `redact()` heuristic has false negatives: secrets under non-matching key names print plaintext
 
-**Where:** `rume/src/env.rs` lines 237–263 (`is_secret_key`, `value_looks_sensitive`, `redact`).
+**Where:** `crates/core/src/env.rs` lines 237–263 (`is_secret_key`, `value_looks_sensitive`, `redact`).
 
 **What it says:**
 
@@ -143,7 +143,7 @@ Redaction is key-name-based plus a URL-credential heuristic. A secret stored und
 
 ### m2 — `/health/ready` exposes pid and platform in `debug_info`
 
-**Where:** `rume/src/routing.rs` line 458 (`HealthReport.debug_info`) and lines 531–542 (`debug_info()`).
+**Where:** `crates/core/src/routing.rs` line 458 (`HealthReport.debug_info`) and lines 531–542 (`debug_info()`).
 
 **What it says:**
 
@@ -164,7 +164,7 @@ fn debug_info() -> BTreeMap<String, serde_json::Value> {
 
 ### m3 — `Rejection` echoes parameter values and names in JSON error responses
 
-**Where:** `rume/src/routing.rs` lines 57–81 (`Matcher::validate` builds `"{value} is not a valid ..."`) and lines 599–610 (`Rejection::IntoResponse` returns `{"error": message}`).
+**Where:** `crates/core/src/routing.rs` lines 57–81 (`Matcher::validate` builds `"{value} is not a valid ..."`) and lines 599–610 (`Rejection::IntoResponse` returns `{"error": message}`).
 
 **What it says:**
 
@@ -184,7 +184,7 @@ The raw parameter value and its name are interpolated into rejection messages an
 
 ## Positive notes
 
-- `redact()` is applied consistently to both `.env`-sourced and process-env values in `env:check` (`rume-cli/src/commands/env/check.rs:30,48`), and process env is hidden by default without `--all` (`check.rs:10–13,53–61`) — a good secure default.
+- `redact()` is applied consistently to both `.env`-sourced and process-env values in `env:check` (`crates/cli/src/commands/env/check.rs:30,48`), and process env is hidden by default without `--all` (`check.rs:10–13,53–61`) — a good secure default.
 - `value_looks_sensitive()` catches `user:pass@host` credential URLs (`env.rs:247–254`), and `is_secret_key()` covers common secret key names (`env.rs:237–244`).
 - `secrecy` is a pinned dependency and the `env.rs` doc example advertises `secrecy::SecretBox<String>` (`env.rs:13`) — the right building block exists, it just isn't used for `ResolvedEnv` yet (see M2).
 - `Validation` errors use structured `details` rather than raw `to_string()` (`error.rs:61–67`), avoiding the leakage pattern found in M4 for that variant.

@@ -81,7 +81,10 @@ pub struct TraceContext {
 impl TraceContext {
     /// Returns the currently active trace context from task-local storage, if any.
     pub fn current() -> Option<Self> {
-        CURRENT_TRACE_CONTEXT.try_with(|ctx| ctx.clone()).ok().flatten()
+        CURRENT_TRACE_CONTEXT
+            .try_with(|ctx| ctx.clone())
+            .ok()
+            .flatten()
     }
 
     /// Extracts the 32-character hex trace ID from the `traceparent`.
@@ -173,7 +176,11 @@ impl TraceContext {
             if Self::is_valid_traceparent(tp) {
                 return Some(Self {
                     traceparent: tp.to_string(),
-                    tracestate: if ts.is_empty() { None } else { Some(ts.to_string()) },
+                    tracestate: if ts.is_empty() {
+                        None
+                    } else {
+                        Some(ts.to_string())
+                    },
                 });
             }
         }
@@ -396,115 +403,114 @@ where
 
         use tracing::Instrument;
         Box::pin(
-            CURRENT_TRACE_CONTEXT.scope(
-                scope_tc,
-                async move {
-                let start = Instant::now();
+            CURRENT_TRACE_CONTEXT
+                .scope(scope_tc, async move {
+                    let start = Instant::now();
 
-                let mut response = inner.call(req).await?;
-                let elapsed = start.elapsed();
-                let latency_ms = elapsed.as_millis() as u64;
-                let status = response.status();
+                    let mut response = inner.call(req).await?;
+                    let elapsed = start.elapsed();
+                    let latency_ms = elapsed.as_millis() as u64;
+                    let status = response.status();
 
-                span_clone.record("status", status.as_u16());
-                span_clone.record("latency_ms", latency_ms);
+                    span_clone.record("status", status.as_u16());
+                    span_clone.record("latency_ms", latency_ms);
 
-                if status.is_server_error() {
-                    tracing::error!(status = status.as_u16(), latency_ms, "request failed");
-                } else if status.is_client_error() {
-                    tracing::warn!(status = status.as_u16(), latency_ms, "request error");
-                } else {
-                    tracing::info!(status = status.as_u16(), latency_ms, "request completed");
-                }
-
-                // Always add X-Request-ID and traceparent to response headers
-                if let Ok(hdr_val) = HeaderValue::from_str(&req_id_str) {
-                    response.headers_mut().insert(X_REQUEST_ID.clone(), hdr_val);
-                }
-                if let Ok(hdr_val) = HeaderValue::from_str(&trace_parent_str) {
-                    response.headers_mut().insert(TRACEPARENT.clone(), hdr_val);
-                }
-                if let Some(ref ts) = tracestate_str
-                    && let Ok(hdr_val) = HeaderValue::from_str(ts)
-                {
-                    response.headers_mut().insert(TRACESTATE.clone(), hdr_val);
-                }
-
-                // If response is RFC 9457 Problem Details, ensure request_id is populated safely.
-                let is_problem_json = response
-                    .headers()
-                    .get(&CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(|ct| ct.starts_with("application/problem+json"))
-                    .unwrap_or(false);
-
-                if is_problem_json {
-                    const MAX_PROBLEM_DETAILS_INSPECT: usize = 1024 * 1024; // 1 MiB
-                    let (mut parts, body) = response.into_parts();
-
-                    let is_oversized = parts
-                        .headers
-                        .get(CONTENT_LENGTH)
-                        .and_then(|val| val.to_str().ok())
-                        .and_then(|val| val.parse::<usize>().ok())
-                        .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
-                        .unwrap_or_else(|| {
-                            body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64)
-                        });
-
-                    if is_oversized {
-                        // Never destroy or truncate oversized responses! Return untouched.
-                        return Ok(Response::from_parts(parts, body));
+                    if status.is_server_error() {
+                        tracing::error!(status = status.as_u16(), latency_ms, "request failed");
+                    } else if status.is_client_error() {
+                        tracing::warn!(status = status.as_u16(), latency_ms, "request error");
+                    } else {
+                        tracing::info!(status = status.as_u16(), latency_ms, "request completed");
                     }
 
-                    match axum::body::to_bytes(body, MAX_PROBLEM_DETAILS_INSPECT).await {
-                        Ok(bytes) => {
-                            let mut final_bytes = bytes;
-                            let mut body_modified = false;
+                    // Always add X-Request-ID and traceparent to response headers
+                    if let Ok(hdr_val) = HeaderValue::from_str(&req_id_str) {
+                        response.headers_mut().insert(X_REQUEST_ID.clone(), hdr_val);
+                    }
+                    if let Ok(hdr_val) = HeaderValue::from_str(&trace_parent_str) {
+                        response.headers_mut().insert(TRACEPARENT.clone(), hdr_val);
+                    }
+                    if let Some(ref ts) = tracestate_str
+                        && let Ok(hdr_val) = HeaderValue::from_str(ts)
+                    {
+                        response.headers_mut().insert(TRACESTATE.clone(), hdr_val);
+                    }
 
-                            if let Ok(mut json) =
-                                serde_json::from_slice::<serde_json::Value>(&final_bytes)
-                                && let Some(obj) = json.as_object_mut()
-                            {
-                                let should_inject = matches!(
-                                    obj.get("request_id"),
-                                    None | Some(serde_json::Value::Null)
-                                );
-                                if should_inject {
-                                    obj.insert(
-                                        "request_id".to_string(),
-                                        serde_json::Value::String(req_id_str),
+                    // If response is RFC 9457 Problem Details, ensure request_id is populated safely.
+                    let is_problem_json = response
+                        .headers()
+                        .get(&CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(|ct| ct.starts_with("application/problem+json"))
+                        .unwrap_or(false);
+
+                    if is_problem_json {
+                        const MAX_PROBLEM_DETAILS_INSPECT: usize = 1024 * 1024; // 1 MiB
+                        let (mut parts, body) = response.into_parts();
+
+                        let is_oversized = parts
+                            .headers
+                            .get(CONTENT_LENGTH)
+                            .and_then(|val| val.to_str().ok())
+                            .and_then(|val| val.parse::<usize>().ok())
+                            .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
+                            .unwrap_or_else(|| {
+                                body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64)
+                            });
+
+                        if is_oversized {
+                            // Never destroy or truncate oversized responses! Return untouched.
+                            return Ok(Response::from_parts(parts, body));
+                        }
+
+                        match axum::body::to_bytes(body, MAX_PROBLEM_DETAILS_INSPECT).await {
+                            Ok(bytes) => {
+                                let mut final_bytes = bytes;
+                                let mut body_modified = false;
+
+                                if let Ok(mut json) =
+                                    serde_json::from_slice::<serde_json::Value>(&final_bytes)
+                                    && let Some(obj) = json.as_object_mut()
+                                {
+                                    let should_inject = matches!(
+                                        obj.get("request_id"),
+                                        None | Some(serde_json::Value::Null)
                                     );
-                                    if let Ok(new_bytes) = serde_json::to_vec(&obj) {
-                                        final_bytes = axum::body::Bytes::from(new_bytes);
-                                        body_modified = true;
+                                    if should_inject {
+                                        obj.insert(
+                                            "request_id".to_string(),
+                                            serde_json::Value::String(req_id_str),
+                                        );
+                                        if let Ok(new_bytes) = serde_json::to_vec(&obj) {
+                                            final_bytes = axum::body::Bytes::from(new_bytes);
+                                            body_modified = true;
+                                        }
                                     }
                                 }
-                            }
 
-                            if body_modified {
-                                // If Content-Length was present, update it to match new body length
-                                if parts.headers.contains_key(CONTENT_LENGTH)
-                                    && let Ok(len_val) =
-                                        HeaderValue::from_str(&final_bytes.len().to_string())
-                                {
-                                    parts.headers.insert(CONTENT_LENGTH, len_val);
+                                if body_modified {
+                                    // If Content-Length was present, update it to match new body length
+                                    if parts.headers.contains_key(CONTENT_LENGTH)
+                                        && let Ok(len_val) =
+                                            HeaderValue::from_str(&final_bytes.len().to_string())
+                                    {
+                                        parts.headers.insert(CONTENT_LENGTH, len_val);
+                                    }
                                 }
-                            }
 
-                            return Ok(Response::from_parts(parts, Body::from(final_bytes)));
-                        }
-                        Err(_) => {
-                            parts.headers.remove(CONTENT_LENGTH);
-                            return Ok(Response::from_parts(parts, Body::empty()));
+                                return Ok(Response::from_parts(parts, Body::from(final_bytes)));
+                            }
+                            Err(_) => {
+                                parts.headers.remove(CONTENT_LENGTH);
+                                return Ok(Response::from_parts(parts, Body::empty()));
+                            }
                         }
                     }
-                }
 
-                Ok(response)
-            },
+                    Ok(response)
+                })
+                .instrument(span),
         )
-        .instrument(span))
     }
 }
 
@@ -576,11 +582,9 @@ mod tests {
     #[tokio::test]
     async fn observability_service_injects_and_propagates_tracestate() {
         use tower::{Layer, Service};
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(
-            |_req: Request<Body>| async {
-                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
-            },
-        ));
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(|_req: Request<Body>| async {
+            Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+        }));
 
         let req = Request::builder()
             .uri("/test")

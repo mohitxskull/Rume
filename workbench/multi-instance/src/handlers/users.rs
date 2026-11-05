@@ -1,8 +1,8 @@
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
-use rume::auth::identity::AuthUser;
 use rume::auth::Authenticated;
+use rume::auth::identity::AuthUser;
 use rume::error::AppError;
 use rume::tenant::TenantContext;
 

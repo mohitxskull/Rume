@@ -1,12 +1,12 @@
 //! End-to-end qualification test for the Modular Monolith application scenario.
 
-use std::sync::Arc;
 use axum::http::StatusCode;
 use rume::events::EventBus;
 use rume::testing::TestServer;
 use serde_json::json;
+use std::sync::Arc;
 use tokio::sync::{Notify, RwLock};
-use workbench_modular_monolith::{build_modular_monolith_instrumented, Order, Product};
+use workbench_modular_monolith::{Order, Product, build_modular_monolith_instrumented};
 
 #[tokio::test]
 async fn test_modular_monolith_domain_isolation_and_events() {

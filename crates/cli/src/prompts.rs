@@ -1,8 +1,8 @@
 //! Interactive prompt helpers using `inquire`.
 
-use std::io::IsTerminal;
 use inquire::InquireError;
 use inquire::Text;
+use std::io::IsTerminal;
 
 fn handle_prompt_error<T>(res: Result<T, InquireError>) -> Option<T> {
     match res {

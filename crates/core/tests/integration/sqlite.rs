@@ -21,7 +21,9 @@ async fn test_sqlite_unified_database_conformance_suite() {
 
 #[tokio::test]
 async fn sqlite_pool_lifecycle_and_ping() {
-    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite should initialize");
+    let backend = SqliteBackend::in_memory()
+        .await
+        .expect("in-memory sqlite should initialize");
     let pool = DatabasePool::new(
         backend,
         DatabaseConfig::new("sqlite::memory:")
@@ -124,10 +126,7 @@ async fn sqlite_auto_migrate_applies_pending_migrations() {
     let backend2 = SqliteBackend::in_memory().await.expect("in-memory sqlite");
     let config2 = DatabaseConfig::default().with_auto_migrate(false);
     let pool2 = DatabasePool::new(backend2, config2);
-    let res2 = pool2
-        .apply_auto_migrations(&migrator)
-        .await
-        .expect("no-op");
+    let res2 = pool2.apply_auto_migrations(&migrator).await.expect("no-op");
     assert!(res2.is_none());
 }
 
@@ -338,12 +337,7 @@ async fn sqlite_parameterized_transaction_and_safe_values() {
     let rows = tx
         .execute_params(
             sql,
-            &rume::params![
-                "prod-1",
-                malicious_name,
-                99.95,
-                unicode_desc,
-            ],
+            &rume::params!["prod-1", malicious_name, 99.95, unicode_desc,],
         )
         .await
         .expect("parameterized insert should succeed");
@@ -353,12 +347,7 @@ async fn sqlite_parameterized_transaction_and_safe_values() {
     let rows_null = tx
         .execute_params(
             sql,
-            &rume::params![
-                "prod-2",
-                "Standard Widget",
-                19.99,
-                None as Option<String>,
-            ],
+            &rume::params!["prod-2", "Standard Widget", 19.99, None as Option<String>,],
         )
         .await
         .expect("insert with null should succeed");
@@ -366,7 +355,10 @@ async fn sqlite_parameterized_transaction_and_safe_values() {
 
     // Query scalar with parameter inside transaction
     let queried_name = tx
-        .query_scalar_params("SELECT name FROM products WHERE id = ?", &rume::params!["prod-1"])
+        .query_scalar_params(
+            "SELECT name FROM products WHERE id = ?",
+            &rume::params!["prod-1"],
+        )
         .await
         .expect("query scalar with param")
         .expect("product name found");

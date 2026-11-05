@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -16,8 +16,8 @@ use rume::tenant::model::Tenant;
 use rume::tenant::resolver::HeaderTenantResolver;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 use workbench::app::build_app;
@@ -56,7 +56,10 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
         .await
         .expect("start redis container");
     let redis_host = redis_node.get_host().await.expect("redis host");
-    let redis_port = redis_node.get_host_port_ipv4(6379).await.expect("redis port");
+    let redis_port = redis_node
+        .get_host_port_ipv4(6379)
+        .await
+        .expect("redis port");
     let redis_url = format!("redis://{redis_host}:{redis_port}");
 
     let test_url = format!("postgres://postgres:postgres@{pg_host}:{pg_port}/{db_name}");
@@ -106,10 +109,14 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
     // Two background workers with independent job queues and shared redis idempotency store
     let worker1 = JobWorker::new(Arc::clone(&job_queue1), Arc::new(registry1))
         .with_worker_id("worker-inst-1")
-        .with_idempotency_store(Arc::clone(&idempotency_store) as Arc<dyn rume::jobs::IdempotencyStore>);
+        .with_idempotency_store(
+            Arc::clone(&idempotency_store) as Arc<dyn rume::jobs::IdempotencyStore>
+        );
     let worker2 = JobWorker::new(Arc::clone(&job_queue2), Arc::new(registry2))
         .with_worker_id("worker-inst-2")
-        .with_idempotency_store(Arc::clone(&idempotency_store) as Arc<dyn rume::jobs::IdempotencyStore>);
+        .with_idempotency_store(
+            Arc::clone(&idempotency_store) as Arc<dyn rume::jobs::IdempotencyStore>
+        );
 
     let worker1_handle = worker1.start();
     let worker2_handle = worker2.start();
@@ -258,7 +265,11 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
         let (tenant, token, proj_id) = if i % 2 == 0 {
             ("acme-corp", "Bearer member-token", acme_proj_id.clone())
         } else {
-            ("globex", "Bearer globex-member-token", globex_proj_id.clone())
+            (
+                "globex",
+                "Bearer globex-member-token",
+                globex_proj_id.clone(),
+            )
         };
 
         handles.push(tokio::spawn(async move {
@@ -302,8 +313,7 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
     let total_delivered = notification_handler1.deliveries.load(Ordering::SeqCst)
         + notification_handler2.deliveries.load(Ordering::SeqCst);
     assert_eq!(
-        total_delivered,
-        total_issues,
+        total_delivered, total_issues,
         "Every created issue must result in exactly one processed notification across instances"
     );
 

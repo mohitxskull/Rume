@@ -47,8 +47,8 @@ No unassigned production subsystem found.
 
 ## 4. Workspace manifests & CI
 
-- Root `Cargo.toml`, `rume/Cargo.toml` → Lens 6 / Lens 10
-- `rume-cli/Cargo.toml` → Lens 9
+- Root `Cargo.toml`, `crates/core/Cargo.toml` → Lens 6 / Lens 10
+- `crates/cli/Cargo.toml` → Lens 9
 - No CI configuration present (`.github/` absent; no other CI dirs found). If added before the
   run, it is in scope per §1.0 step 3.
 

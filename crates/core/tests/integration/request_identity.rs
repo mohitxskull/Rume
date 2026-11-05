@@ -418,7 +418,8 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
             let queue = Arc::clone(&queue_clone);
             async move {
                 // Inside HTTP handler, TraceContext::current() must be available
-                let current_tc = TraceContext::current().expect("TraceContext must be present in HTTP handler");
+                let current_tc =
+                    TraceContext::current().expect("TraceContext must be present in HTTP handler");
                 assert_eq!(current_tc.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
 
                 // OutboxMessage::new automatically inherits current trace_context
@@ -472,11 +473,19 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     assert_eq!(resp_traceparent, incoming_traceparent);
 
     // 2. Outbox message inherited exact incoming traceparent
-    let outbox_tc = captured_outbox_tc.lock().await.clone().expect("outbox trace context captured");
+    let outbox_tc = captured_outbox_tc
+        .lock()
+        .await
+        .clone()
+        .expect("outbox trace context captured");
     assert_eq!(outbox_tc, incoming_traceparent);
 
     // 3. Queued job inherited exact incoming traceparent
-    let job_tc = captured_job_tc.lock().await.clone().expect("job trace context captured");
+    let job_tc = captured_job_tc
+        .lock()
+        .await
+        .clone()
+        .expect("job trace context captured");
     assert_eq!(job_tc, incoming_traceparent);
 
     // 4. Now dispatch the queued job through JobRegistry and verify child span creation
@@ -484,17 +493,18 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     let job_handler_sid = Arc::new(tokio::sync::Mutex::new(None));
 
     let mut registry = JobRegistry::new();
-    registry.register(
-        TraceJobHandler {
-            received_trace_id: Arc::clone(&job_handler_tid),
-            received_span_id: Arc::clone(&job_handler_sid),
-        },
-    );
+    registry.register(TraceJobHandler {
+        received_trace_id: Arc::clone(&job_handler_tid),
+        received_span_id: Arc::clone(&job_handler_sid),
+    });
 
     let queued_job = QueuedJob {
         id: "job-123".into(),
         name: TraceJob::NAME.to_string(),
-        payload: serde_json::to_vec(&TraceJob { data: "test".into() }).unwrap(),
+        payload: serde_json::to_vec(&TraceJob {
+            data: "test".into(),
+        })
+        .unwrap(),
         attempt: 1,
         retry_policy: Default::default(),
         timeout: None,
@@ -507,10 +517,21 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
         trace_context: Some(incoming_traceparent.clone()),
     };
 
-    registry.dispatch_with_cancellation(&queued_job, None).await.expect("dispatch succeeds");
+    registry
+        .dispatch_with_cancellation(&queued_job, None)
+        .await
+        .expect("dispatch succeeds");
 
-    let worker_tid = job_handler_tid.lock().await.clone().expect("worker received trace id");
-    let worker_sid = job_handler_sid.lock().await.clone().expect("worker received span id");
+    let worker_tid = job_handler_tid
+        .lock()
+        .await
+        .clone()
+        .expect("worker received trace id");
+    let worker_sid = job_handler_sid
+        .lock()
+        .await
+        .clone()
+        .expect("worker received span id");
 
     // Worker execution preserved trace_id
     assert_eq!(worker_tid, incoming_trace_id);

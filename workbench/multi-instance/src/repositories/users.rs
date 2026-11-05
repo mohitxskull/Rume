@@ -3,8 +3,8 @@ use rume::persistence::error::PersistenceError;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 
-use crate::models::User;
 use super::queries;
+use crate::models::User;
 
 pub struct UserRepository;
 

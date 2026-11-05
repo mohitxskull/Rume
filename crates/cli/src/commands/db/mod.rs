@@ -63,12 +63,10 @@ pub fn make_migration(name: Option<String>) {
     let up_path = migrations_dir.join(&up_filename);
     let down_path = migrations_dir.join(&down_filename);
 
-    let up_content = format!(
-        "-- Migration: {clean_name} (Up)\n-- Write your SQL migration statements here.\n"
-    );
-    let down_content = format!(
-        "-- Migration: {clean_name} (Down)\n-- Write your SQL rollback statements here.\n"
-    );
+    let up_content =
+        format!("-- Migration: {clean_name} (Up)\n-- Write your SQL migration statements here.\n");
+    let down_content =
+        format!("-- Migration: {clean_name} (Down)\n-- Write your SQL rollback statements here.\n");
 
     if let Err(e) = fs::write(&up_path, up_content) {
         eprintln!(
@@ -264,17 +262,20 @@ pub async fn status() {
         }
     } else {
         if db_url.is_none() {
-            println!("{}", style("Note: DATABASE_URL not set (showing local migrations only)").dim());
+            println!(
+                "{}",
+                style("Note: DATABASE_URL not set (showing local migrations only)").dim()
+            );
         } else {
-            println!("{}", style("Note: Database offline or unreachable (showing local migrations only)").dim());
+            println!(
+                "{}",
+                style("Note: Database offline or unreachable (showing local migrations only)")
+                    .dim()
+            );
         }
         for m in local_migrator.migrations() {
             row_count += 1;
-            builder.row_colored(&[
-                (&m.id, None),
-                ("Local", Some(Color::Blue)),
-                ("-", None),
-            ]);
+            builder.row_colored(&[(&m.id, None), ("Local", Some(Color::Blue)), ("-", None)]);
         }
     }
 
@@ -313,16 +314,22 @@ pub async fn migrate() {
     match summary_res {
         Ok(summary) => {
             if summary.applied.is_empty() {
-                println!("{}", style("All migrations are already up to date.").green());
+                println!(
+                    "{}",
+                    style("All migrations are already up to date.").green()
+                );
             } else {
                 for id in &summary.applied {
                     println!("{}", style(format!("✓ Applied: {id}")).green().bold());
                 }
                 println!(
                     "{}",
-                    style(format!("Successfully applied {} migration(s).", summary.applied.len()))
-                        .green()
-                        .bold()
+                    style(format!(
+                        "Successfully applied {} migration(s).",
+                        summary.applied.len()
+                    ))
+                    .green()
+                    .bold()
                 );
             }
         }

@@ -8,9 +8,9 @@ The Rume v02 codebase introduces foundational enterprise capabilities: circuit b
 
 In the v01 review cycle, enterprise reliability was not evaluated as a dedicated lens. The following prior decisions from `docs/reports/reviews/v01/` intersect with operational reliability, high availability, and lifecycle resilience:
 
-- **D-M3 (Overlapping `health_routes()` and `ops_router()` health APIs)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs` and `rume/src/app/shutdown.rs:58–88`. The two divergent endpoints still coexist with disjoint state models, creating operational ambiguity for Kubernetes readiness and liveness probe configuration. Tracked in Stage 1 Architecture Review finding `m1`.
-- **C-m4 (`/health/ready` returns 503 for `Warning` status)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs:140–144, 243–248`. `is_healthy` remains false for `Warning` status, enforcing strict readiness fail-closed behavior at the ingress load balancer during degraded subsystem operation.
-- **C-C3 / m2 (`Lifecycle` and `Availability` state discriminant safety)** — **REAFFIRMED**. Verified in `rume/src/app/state.rs:47–54, 114–121`. Discriminants are pinned via `#[repr(u8)]` with `MAX_DISCRIMINANT` validation, guaranteeing that atomic availability transitions remain sound across compiler reorderings.
+- **D-M3 (Overlapping `health_routes()` and `ops_router()` health APIs)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs` and `crates/core/src/app/shutdown.rs:58–88`. The two divergent endpoints still coexist with disjoint state models, creating operational ambiguity for Kubernetes readiness and liveness probe configuration. Tracked in Stage 1 Architecture Review finding `m1`.
+- **C-m4 (`/health/ready` returns 503 for `Warning` status)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs:140–144, 243–248`. `is_healthy` remains false for `Warning` status, enforcing strict readiness fail-closed behavior at the ingress load balancer during degraded subsystem operation.
+- **C-C3 / m2 (`Lifecycle` and `Availability` state discriminant safety)** — **REAFFIRMED**. Verified in `crates/core/src/app/state.rs:47–54, 114–121`. Discriminants are pinned via `#[repr(u8)]` with `MAX_DISCRIMINANT` validation, guaranteeing that atomic availability transitions remain sound across compiler reorderings.
 - **Resilience middleware (`circuit_breaker`, `concurrency`, `rate_limiter`, `timeout`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in findings M3, Positive Notes, and Stage 1 Correctness Review findings M1 and m2.
 - **Distributed worker heartbeats & job reliability (`jobs/reliability.rs`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in findings M1 and M2.
 - **Transactional outbox pattern & relay (`outbox/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in findings C2, m2, and m3.
@@ -25,7 +25,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### C1 Prometheus metrics recording stores unbounded raw float samples, causing heap memory exhaustion (OOM) and scraping stalls
 
-- **Where:** `rume/src/metrics/registry.rs:57, 73–80, 134–149`
+- **Where:** `crates/core/src/metrics/registry.rs:57, 73–80, 134–149`
 - **What it says:**
   ```rust
   #[derive(Debug, Clone, Default)]
@@ -79,9 +79,9 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### C2 Concurrent `OutboxRelay` instances lack claiming locks, causing duplicate message publication across HA replicas
 
-- **Where:** `rume/src/outbox/relay.rs:59–78, 83–89` and `rume/src/outbox/repository.rs:20–25, 64–83`
+- **Where:** `crates/core/src/outbox/relay.rs:59–78, 83–89` and `crates/core/src/outbox/repository.rs:20–25, 64–83`
 - **What it says:**
-  In `rume/src/outbox/relay.rs`:
+  In `crates/core/src/outbox/relay.rs`:
   ```rust
   pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
       let pending = self.repository.fetch_pending(batch_size).await?;
@@ -104,7 +104,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
       Ok(published_count)
   }
   ```
-  In `rume/src/outbox/repository.rs`:
+  In `crates/core/src/outbox/repository.rs`:
   ```rust
   fn fetch_pending(
       &self,
@@ -141,7 +141,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M1 `JobWorker` lacks concurrency bounds, spawning unbounded Tokio tasks during queue spikes
 
-- **Where:** `rume/src/jobs/worker.rs:130–151`
+- **Where:** `crates/core/src/jobs/worker.rs:130–151`
 - **What it says:**
   ```rust
   async fn run_loop(&self) {
@@ -177,9 +177,9 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M2 Distributed worker heartbeats and abandoned job recovery are disconnected dead code
 
-- **Where:** `rume/src/jobs/reliability.rs:135–224` and `rume/src/jobs/worker.rs:79–151`
+- **Where:** `crates/core/src/jobs/reliability.rs:135–224` and `crates/core/src/jobs/worker.rs:79–151`
 - **What it says:**
-  The module doc of `rume/src/jobs/reliability.rs` states:
+  The module doc of `crates/core/src/jobs/reliability.rs` states:
   `//! Job reliability: idempotency keys, worker heartbeats, and abandoned job recovery.`
   The file defines:
   ```rust
@@ -205,7 +205,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M3 `RateLimiter` permanently leaks memory for inactive clients and serializes all requests on a global `RwLock`
 
-- **Where:** `rume/src/resilience/rate_limiter.rs:50–53, 65–96, 148–155`
+- **Where:** `crates/core/src/resilience/rate_limiter.rs:50–53, 65–96, 148–155`
 - **What it says:**
   ```rust
   pub struct RateLimiter {
@@ -246,7 +246,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M4 `MemoryCacheBackend` retains expired entries indefinitely without TTL eviction sweep or memory bounds
 
-- **Where:** `rume/src/cache/backend.rs:60–67, 136–144, 169–194`
+- **Where:** `crates/core/src/cache/backend.rs:60–67, 136–144, 169–194`
 - **What it says:**
   ```rust
   impl CacheEntry {
@@ -299,7 +299,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M5 `Cache::remember` lacks stampede (thundering herd) protection on cache miss
 
-- **Where:** `rume/src/cache/typed.rs:127–161`
+- **Where:** `crates/core/src/cache/typed.rs:127–161`
 - **What it says:**
   ```rust
   pub async fn remember_with_tags<T, F, Fut>(
@@ -334,7 +334,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### M6 `LeaderElector` lacks monotonic fencing tokens or epoch tracking for split-brain protection
 
-- **Where:** `rume/src/coordination/leader.rs:13–35, 38–41, 73–100`
+- **Where:** `crates/core/src/coordination/leader.rs:13–35, 38–41, 73–100`
 - **What it says:**
   ```rust
   pub trait LeaderElector: Debug + Send + Sync + 'static {
@@ -351,7 +351,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
       expires_at: Instant,
   }
   ```
-- **Why it's a problem:** Unlike `DistributedLock` (`rume/src/coordination/lock.rs:21–28`), which returns a `LockGuard` containing a monotonically increasing `fencing_token: u64`, `LeaderElector::try_acquire` returns only a bare `bool`.
+- **Why it's a problem:** Unlike `DistributedLock` (`crates/core/src/coordination/lock.rs:21–28`), which returns a `LockGuard` containing a monotonically increasing `fencing_token: u64`, `LeaderElector::try_acquire` returns only a bare `bool`.
   In distributed systems with active-passive failover:
   1. If Leader A experiences a temporary network pause or prolonged garbage collection/task stall, its lease expires in the election registry.
   2. Leader B is elected as the new leader.
@@ -363,7 +363,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### m1 `MetricsService` leaks `in_flight` gauge on cancelled request futures due to missing RAII drop guard
 
-- **Where:** `rume/src/metrics/layer.rs:69–75`
+- **Where:** `crates/core/src/metrics/layer.rs:69–75`
 - **What it says:**
   ```rust
   registry.inc_in_flight();
@@ -380,7 +380,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### m2 `OutboxRelay` lacks retry backoff, rapidly exhausting retry thresholds during downstream outages
 
-- **Where:** `rume/src/outbox/relay.rs:59–78` and `rume/src/outbox/repository.rs:102–120`
+- **Where:** `crates/core/src/outbox/relay.rs:59–78` and `crates/core/src/outbox/repository.rs:102–120`
 - **What it says:**
   ```rust
   if let Some(msg) = messages.get_mut(&id_str) {
@@ -398,7 +398,7 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ### m3 `MemoryOutboxRepository::fetch_pending` dispatches messages in random UUID hash order rather than chronological sequence
 
-- **Where:** `rume/src/outbox/repository.rs:64–83`
+- **Where:** `crates/core/src/outbox/repository.rs:64–83`
 - **What it says:**
   ```rust
   let pending = messages
@@ -408,16 +408,16 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
       .cloned()
       .collect();
   ```
-- **Why it's a problem:** `messages` is a `BTreeMap<String, OutboxMessage>` keyed by `msg.id`, which is generated via `Uuid::new_v4().to_string()` (`rume/src/outbox/message.rs:59`). Iterating `messages.values()` traverses messages in alphabetical order of their random UUID strings, completely ignoring the `created_at` timestamp. Messages are dispatched out-of-order, violating causal and temporal event delivery guarantees for downstream consumers.
+- **Why it's a problem:** `messages` is a `BTreeMap<String, OutboxMessage>` keyed by `msg.id`, which is generated via `Uuid::new_v4().to_string()` (`crates/core/src/outbox/message.rs:59`). Iterating `messages.values()` traverses messages in alphabetical order of their random UUID strings, completely ignoring the `created_at` timestamp. Messages are dispatched out-of-order, violating causal and temporal event delivery guarantees for downstream consumers.
 - **Suggested fix:** Sort pending messages by `created_at` (or maintain an ordered index by `(created_at, id)` or monotonic sequence number) when returning batches from `fetch_pending`.
 
 ---
 
 ### m4 `TenantScopedCache` and `Cache` omit tag prefix namespacing and tenant memory quotas
 
-- **Where:** `rume/src/tenant/cache.rs:23–66` and `rume/src/cache/typed.rs:61–68, 116–124, 182–187`
+- **Where:** `crates/core/src/tenant/cache.rs:23–66` and `crates/core/src/cache/typed.rs:61–68, 116–124, 182–187`
 - **What it says:**
-  In `rume/src/cache/typed.rs`:
+  In `crates/core/src/cache/typed.rs`:
   ```rust
   fn format_key(&self, key: &str) -> String {
       if let Some(prefix) = &self.config.prefix {
@@ -449,13 +449,13 @@ In the v01 review cycle, enterprise reliability was not evaluated as a dedicated
 
 ## Positive notes
 
-- **Monotonic distributed lock fencing:** `MemoryDistributedLock` (`rume/src/coordination/lock.rs:91–112`) issues strictly monotonic fencing tokens (`fencing_token: u64`) on every lock acquisition and lease expiration, providing correct fencing primitives to protect storage engines against split-brain writes.
-- **RAII concurrency permits:** `ConcurrencyLimiter` (`rume/src/resilience/concurrency.rs:55–63`) uses an RAII `ConcurrencyPermit` struct whose `Drop` implementation unconditionally decrements the active concurrency counter, preventing permit leaks on request completion or failure.
-- **Non-blocking request timeouts:** `TimeoutLayer` (`rume/src/resilience/timeout.rs:66–73`) wraps request execution in `tokio::time::timeout` and returns RFC 9457 Problem Details (`504 GATEWAY_TIMEOUT`) with structured JSON error details without blocking the Tokio reactor.
-- **Exclusion of `/metrics` scraping from telemetry counters:** `MetricsService` (`rume/src/metrics/layer.rs:59–62`) explicitly filters out requests to `/metrics`, avoiding self-referential counter inflation during Prometheus scraping sweeps.
-- **Standard Prometheus exposition formatting:** `MetricsRegistry::render_prometheus` (`rume/src/metrics/registry.rs:98–152`) produces fully valid Prometheus exposition format output, correctly partitioned by HTTP method and status code with `# HELP` and `# TYPE` headers.
-- **Seamless cache health check integration:** `Cache::health_check` (`rume/src/cache/typed.rs:203–209`) implements Rume's standard `HealthCheck` trait, allowing cache connectivity and closed-state diagnostics to be reported automatically via `/health/ready`.
-- **Sliding-window rate limit headers:** `RateLimitService` (`rume/src/resilience/rate_limiter.rs:161–182`) injects standard rate-limiting headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, and `Retry-After`) into both accepted responses and 429 Problem Details rejections.
+- **Monotonic distributed lock fencing:** `MemoryDistributedLock` (`crates/core/src/coordination/lock.rs:91–112`) issues strictly monotonic fencing tokens (`fencing_token: u64`) on every lock acquisition and lease expiration, providing correct fencing primitives to protect storage engines against split-brain writes.
+- **RAII concurrency permits:** `ConcurrencyLimiter` (`crates/core/src/resilience/concurrency.rs:55–63`) uses an RAII `ConcurrencyPermit` struct whose `Drop` implementation unconditionally decrements the active concurrency counter, preventing permit leaks on request completion or failure.
+- **Non-blocking request timeouts:** `TimeoutLayer` (`crates/core/src/resilience/timeout.rs:66–73`) wraps request execution in `tokio::time::timeout` and returns RFC 9457 Problem Details (`504 GATEWAY_TIMEOUT`) with structured JSON error details without blocking the Tokio reactor.
+- **Exclusion of `/metrics` scraping from telemetry counters:** `MetricsService` (`crates/core/src/metrics/layer.rs:59–62`) explicitly filters out requests to `/metrics`, avoiding self-referential counter inflation during Prometheus scraping sweeps.
+- **Standard Prometheus exposition formatting:** `MetricsRegistry::render_prometheus` (`crates/core/src/metrics/registry.rs:98–152`) produces fully valid Prometheus exposition format output, correctly partitioned by HTTP method and status code with `# HELP` and `# TYPE` headers.
+- **Seamless cache health check integration:** `Cache::health_check` (`crates/core/src/cache/typed.rs:203–209`) implements Rume's standard `HealthCheck` trait, allowing cache connectivity and closed-state diagnostics to be reported automatically via `/health/ready`.
+- **Sliding-window rate limit headers:** `RateLimitService` (`crates/core/src/resilience/rate_limiter.rs:161–182`) injects standard rate-limiting headers (`x-ratelimit-limit`, `x-ratelimit-remaining`, and `Retry-After`) into both accepted responses and 429 Problem Details rejections.
 
 ---
 

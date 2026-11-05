@@ -6,13 +6,14 @@ use rume::persistence::pool::DatabasePool;
 use rume::persistence::sqlite::SqliteBackend;
 use rume::testing::TestServer;
 use serde_json::json;
-use workbench_simple_api::{build_app, migrator, Item};
+use workbench_simple_api::{Item, build_app, migrator};
 
 #[tokio::test]
 async fn test_simple_api_lifecycle_validation_and_crud() {
     // 0. Verify Rume configuration system loads typed AppConfig from config/app.toml
     let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let app_cfg = workbench_simple_api::load_config(&manifest_dir).expect("load config from config/app.toml");
+    let app_cfg =
+        workbench_simple_api::load_config(&manifest_dir).expect("load config from config/app.toml");
     assert_eq!(app_cfg.app_name, "simple-api");
     assert_eq!(app_cfg.port, 8080);
 
@@ -24,14 +25,18 @@ async fn test_simple_api_lifecycle_validation_and_crud() {
 
     // Apply migrations
     let m = migrator();
-    m.run_pending(pool.backend()).await.expect("migrations apply");
+    m.run_pending(pool.backend())
+        .await
+        .expect("migrations apply");
 
     let router = build_app(pool);
     let server = TestServer::start(router).await.expect("test server starts");
 
     // 1. Health check
     let health = server.get("/health").await.expect("health check");
-    health.assert_status(StatusCode::OK).assert_text_equals("ok");
+    health
+        .assert_status(StatusCode::OK)
+        .assert_text_equals("ok");
 
     // 2. Validation failure: title too short
     let invalid_body = json!({

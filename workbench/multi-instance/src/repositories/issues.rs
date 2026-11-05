@@ -3,13 +3,16 @@ use rume::persistence::error::PersistenceError;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 
-use crate::models::Issue;
 use super::queries;
+use crate::models::Issue;
 
 pub struct IssueRepository;
 
 impl IssueRepository {
-    pub async fn create_in_tx<T: DatabaseTransaction>(tx: &T, issue: &Issue) -> Result<(), PersistenceError> {
+    pub async fn create_in_tx<T: DatabaseTransaction>(
+        tx: &T,
+        issue: &Issue,
+    ) -> Result<(), PersistenceError> {
         queries::issues::CREATE
             .execute(
                 tx,
@@ -30,7 +33,10 @@ impl IssueRepository {
             .map(|_| ())
     }
 
-    pub async fn update_in_tx<T: DatabaseTransaction>(tx: &T, issue: &Issue) -> Result<(), PersistenceError> {
+    pub async fn update_in_tx<T: DatabaseTransaction>(
+        tx: &T,
+        issue: &Issue,
+    ) -> Result<(), PersistenceError> {
         queries::issues::UPDATE
             .execute(
                 tx,

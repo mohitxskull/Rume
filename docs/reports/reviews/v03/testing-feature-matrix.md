@@ -11,15 +11,15 @@ The Rume verification suite has expanded into a comprehensive test ecosystem spa
 All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and tracked in `docs/reports/reviews/v02/todo.md` have been audited against the v03 codebase:
 
 - **v02 M1 (Happy-path test bias across newly introduced subsystems fails to verify failure modes)** — **REAFFIRMED (Recurred in v03 Subsystems)**. The specific tests mandated in v02 were introduced (e.g. `circuit_breaker_trips_on_service_transport_errors` in `resilience_suite.rs:189`, `rollback_last_fails_when_down_sql_is_none` in `persistence_integration.rs:163`, `saml_assertion_expired_returns_error` in `enterprise_suite.rs:104`, and `tenant_cache_delimiter_isolation` in `tenant_suite.rs:175`). However, with the Phase 5 introduction of SQLx 0.8.6 persistence, PostgreSQL job queues, distributed locks, and outbox leasing, the exact same happy-path bias recurred: tests omit negative assertions for superseded worker lease theft, active lease revocation during long-running execution, crashed worker takeover fencing, and physical connection termination on pool close (findings C2, C3).
-- **v02 M2 (`ArchitectureRules::verify` only inspects direct dependencies and ignores transitive violations, undeclared modules, and cycles)** — **REAFFIRMED in part, RESOLVED in part**. Commit `819a857` added dependency graph construction and breadth-first search transitive reachability calculation to `ArchitectureRules::verify` (`rume/src/module/architecture.rs:84–120`), successfully enforcing forbidden transitive dependencies (`A -> B -> C`). Cycle detection and undeclared module validation remain delegated to `ModuleRegistry::resolve_startup_order`.
-- **v02 M3 (Widespread non-deterministic wall-clock sleeps across async tests create flaky test risks and slow execution)** — **CHALLENGED (Superficial Remediation)**. Item 146 in `docs/reports/reviews/v02/todo.md` was marked resolved (`[x]`), claiming migration to `tokio::time::pause()`. In reality, only 3 tests in `rume/tests/resilience_suite.rs:12, 211, 245` adopted `tokio::time::pause()`. Across the remaining 14 test suites, 34 raw `tokio::time::sleep()` calls remain in active code (`cache_suite.rs`, `coordination_suite.rs`, `jobs_suite.rs`, `job_reliability_suite.rs`, `lifecycle_shutdown.rs`, `mysql_container_suite.rs`, `redis_container_suite.rs`), preserving CI flakiness and non-deterministic timing races (evaluated in finding M3).
-- **v02 M4 (`TestApp` and `RumeBuilder::test_app()` bypass module lifecycle hooks)** — **REAFFIRMED (Resolved)**. Verified in `rume/src/app/builder.rs:545–595` and `rume/src/testing.rs:37–46`. `RumeBuilder::build_test_app()` and `TestApp::from_builder()` resolve module dependency order, execute all `on_start()` hooks with rollback on failure, and wire module `on_shutdown()` hooks to `TestApp::teardown()` and `Drop`.
-- **v02 m1 (`ModuleHarness` lacks health check verification and error-path test coverage)** — **REAFFIRMED (Resolved)**. Verified in `rume/src/module/harness.rs:76–95`. `ModuleHarness::health_checks()` and `ModuleHarness::run_health_checks()` expose module diagnostic checks for isolated domain testing.
-- **v02 m2 (Process environment mutation in `env_and_config_loading.rs` is not hermetically restored)** — **REAFFIRMED (Resolved)**. Verified in `rume/tests/env_and_config_loading.rs:11–43`. An RAII `EnvVarGuard` saves prior environment variable states and automatically restores or unsets them upon `Drop`.
-- **v02 m3 (Config unit tests use hardcoded `/tmp` paths rather than isolated `tempfile::tempdir()`)** — **REAFFIRMED (Resolved)**. Verified in `rume/src/config.rs:259–325`. All configuration file loader unit tests now allocate unique, cryptographically random temporary directories via `tempfile::tempdir()`.
+- **v02 M2 (`ArchitectureRules::verify` only inspects direct dependencies and ignores transitive violations, undeclared modules, and cycles)** — **REAFFIRMED in part, RESOLVED in part**. Commit `819a857` added dependency graph construction and breadth-first search transitive reachability calculation to `ArchitectureRules::verify` (`crates/core/src/module/architecture.rs:84–120`), successfully enforcing forbidden transitive dependencies (`A -> B -> C`). Cycle detection and undeclared module validation remain delegated to `ModuleRegistry::resolve_startup_order`.
+- **v02 M3 (Widespread non-deterministic wall-clock sleeps across async tests create flaky test risks and slow execution)** — **CHALLENGED (Superficial Remediation)**. Item 146 in `docs/reports/reviews/v02/todo.md` was marked resolved (`[x]`), claiming migration to `tokio::time::pause()`. In reality, only 3 tests in `crates/core/tests/resilience_suite.rs:12, 211, 245` adopted `tokio::time::pause()`. Across the remaining 14 test suites, 34 raw `tokio::time::sleep()` calls remain in active code (`cache_suite.rs`, `coordination_suite.rs`, `jobs_suite.rs`, `job_reliability_suite.rs`, `lifecycle_shutdown.rs`, `mysql_container_suite.rs`, `redis_container_suite.rs`), preserving CI flakiness and non-deterministic timing races (evaluated in finding M3).
+- **v02 M4 (`TestApp` and `RumeBuilder::test_app()` bypass module lifecycle hooks)** — **REAFFIRMED (Resolved)**. Verified in `crates/core/src/app/builder.rs:545–595` and `crates/core/src/testing.rs:37–46`. `RumeBuilder::build_test_app()` and `TestApp::from_builder()` resolve module dependency order, execute all `on_start()` hooks with rollback on failure, and wire module `on_shutdown()` hooks to `TestApp::teardown()` and `Drop`.
+- **v02 m1 (`ModuleHarness` lacks health check verification and error-path test coverage)** — **REAFFIRMED (Resolved)**. Verified in `crates/core/src/module/harness.rs:76–95`. `ModuleHarness::health_checks()` and `ModuleHarness::run_health_checks()` expose module diagnostic checks for isolated domain testing.
+- **v02 m2 (Process environment mutation in `env_and_config_loading.rs` is not hermetically restored)** — **REAFFIRMED (Resolved)**. Verified in `crates/core/tests/env_and_config_loading.rs:11–43`. An RAII `EnvVarGuard` saves prior environment variable states and automatically restores or unsets them upon `Drop`.
+- **v02 m3 (Config unit tests use hardcoded `/tmp` paths rather than isolated `tempfile::tempdir()`)** — **REAFFIRMED (Resolved)**. Verified in `crates/core/src/config.rs:259–325`. All configuration file loader unit tests now allocate unique, cryptographically random temporary directories via `tempfile::tempdir()`.
 - **SQLx 0.8 Multi-Backend Feature Matrix Isolation** — **NOTE-NEW**. Evaluated in finding C1.
 - **Testcontainers Live Infrastructure Matrix** — **NOTE-NEW**. Evaluated in findings M1, M2, and m3.
-- **Enterprise Failure-Oriented Pipeline Verification** — **NOTE-NEW**. Evaluated in `rume/tests/enterprise_integration_pipeline.rs` and finding C1.
+- **Enterprise Failure-Oriented Pipeline Verification** — **NOTE-NEW**. Evaluated in `crates/core/tests/enterprise_integration_pipeline.rs` and finding C1.
 
 ---
 
@@ -27,19 +27,19 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### C1 Broken feature matrix: ungated backend dependencies break `cargo test` and `cargo check` under single-feature and default configurations
 
-- **Where:** `rume/tests/` across 10 integration test files:
-  - `rume/tests/coordination_suite.rs:9–24`
-  - `rume/tests/auth_suite.rs:12–25`
-  - `rume/tests/cache_suite.rs:8`
-  - `rume/tests/tenant_suite.rs:5, 218–225`
-  - `rume/tests/jobs_suite.rs:7, 21–26`
-  - `rume/tests/job_reliability_suite.rs:5–7, 23–42`
-  - `rume/tests/enterprise_integration_pipeline.rs:18, 25, 91`
-  - `rume/tests/security_suite.rs:3`
-  - `rume/tests/persistence_integration.rs:5`
-  - `rume/tests/outbox_suite.rs:9`
+- **Where:** `crates/core/tests/` across 10 integration test files:
+  - `crates/core/tests/coordination_suite.rs:9–24`
+  - `crates/core/tests/auth_suite.rs:12–25`
+  - `crates/core/tests/cache_suite.rs:8`
+  - `crates/core/tests/tenant_suite.rs:5, 218–225`
+  - `crates/core/tests/jobs_suite.rs:7, 21–26`
+  - `crates/core/tests/job_reliability_suite.rs:5–7, 23–42`
+  - `crates/core/tests/enterprise_integration_pipeline.rs:18, 25, 91`
+  - `crates/core/tests/security_suite.rs:3`
+  - `crates/core/tests/persistence_integration.rs:5`
+  - `crates/core/tests/outbox_suite.rs:9`
 - **What it says:**
-  In `rume/Cargo.toml:46–51`, the package defines isolated feature flags with `sqlite` enabled by default:
+  In `crates/core/Cargo.toml:46–51`, the package defines isolated feature flags with `sqlite` enabled by default:
   ```toml
   [features]
   default = ["sqlite"]
@@ -48,7 +48,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
   sqlite = ["dep:sqlx", "sqlx/sqlite"]
   mysql = ["dep:sqlx", "sqlx/mysql"]
   ```
-  However, out of 32 integration test files in `rume/tests/`, only 4 contain crate-level `#![cfg(feature = "...")]` attributes (`mysql_container_suite.rs`, `postgres_container_suite.rs`, `redis_container_suite.rs`, and `sqlite_suite.rs`). The remaining 28 test files contain no inner crate attributes, yet directly import backend-specific symbols:
+  However, out of 32 integration test files in `crates/core/tests/`, only 4 contain crate-level `#![cfg(feature = "...")]` attributes (`mysql_container_suite.rs`, `postgres_container_suite.rs`, `redis_container_suite.rs`, and `sqlite_suite.rs`). The remaining 28 test files contain no inner crate attributes, yet directly import backend-specific symbols:
   - `jobs_suite.rs` imports `PostgresJobQueue` and `sqlx::postgres::PgPoolOptions` without `#![cfg(feature = "postgres")]`.
   - `coordination_suite.rs`, `auth_suite.rs`, `cache_suite.rs`, and `tenant_suite.rs` import `RedisDistributedLock`, `RedisLeaderElector`, `RedisSessionStore`, `RedisCacheBackend`, `RedisTenantQuotaStore`, and `deadpool_redis` without `#![cfg(feature = "redis")]`.
   - `job_reliability_suite.rs` imports `PostgresJobQueue`, `RedisHeartbeatRegistry`, `RedisIdempotencyStore`, and `deadpool_redis` without `#![cfg(all(feature = "postgres", feature = "redis"))]`.
@@ -76,7 +76,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### C2 False-positive assertion and panic masking in `jobs_suite.rs` leaves corrupted durable database state undetected
 
-- **Where:** `rume/tests/jobs_suite.rs:293–310`
+- **Where:** `crates/core/tests/jobs_suite.rs:293–310`
 - **What it says:**
   ```rust
   #[tokio::test]
@@ -114,13 +114,13 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
   assert_eq!(queue.dead_letter_count().await.unwrap(), 1, "panicked job must be routed to DLQ");
   assert_eq!(queue.pending_count().await.unwrap(), 0);
   ```
-  Fix the underlying worker in `rume/src/jobs/worker.rs` to wrap handler execution in `std::panic::AssertUnwindSafe(future).catch_unwind()` and route caught panics to `dead_letter` with panic payload telemetry.
+  Fix the underlying worker in `crates/core/src/jobs/worker.rs` to wrap handler execution in `std::panic::AssertUnwindSafe(future).catch_unwind()` and route caught panics to `dead_letter` with panic payload telemetry.
 
 ---
 
 ### C3 Potemkin pool lifecycle test in `postgres_container_suite.rs` asserts boolean flags instead of physical connection drain
 
-- **Where:** `rume/tests/postgres_container_suite.rs:103–107`
+- **Where:** `crates/core/tests/postgres_container_suite.rs:103–107`
 - **What it says:**
   ```rust
   // Verify graceful closure
@@ -152,9 +152,9 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### M1 Test directory binary explosion: 32 flat test crates cause 11 GB build bloat and extreme link overhead
 
-- **Where:** `rume/tests/` (32 flat `.rs` files) and `rume/Cargo.toml:53–55`
+- **Where:** `crates/core/tests/` (32 flat `.rs` files) and `crates/core/Cargo.toml:53–55`
 - **What it says:**
-  The `rume/tests/` directory contains 32 separate `.rs` files:
+  The `crates/core/tests/` directory contains 32 separate `.rs` files:
   `auth_suite.rs`, `cache_suite.rs`, `coordination_suite.rs`, `enterprise_integration_pipeline.rs`, `enterprise_suite.rs`, `env_and_config_loading.rs`, `error_contract.rs`, `error_redaction.rs`, `events_suite.rs`, `health_routes.rs`, `http_smoke.rs`, `job_reliability_suite.rs`, `jobs_suite.rs`, `lifecycle_shutdown.rs`, `metrics_suite.rs`, `module_testing_and_architecture_suite.rs`, `mysql_container_suite.rs`, `openapi_suite.rs`, `outbox_suite.rs`, `persistence_integration.rs`, `postgres_container_suite.rs`, `progressive_composition.rs`, `redis_container_suite.rs`, `request_identity.rs`, `resilience_suite.rs`, `route_metadata.rs`, `routing.rs`, `saga_suite.rs`, `security_suite.rs`, `sqlite_suite.rs`, `tenant_suite.rs`, `validation_suite.rs`.
 - **Why it's a problem:**
   In Cargo's compilation model, each `.rs` file in `tests/` constitutes an independent compilation unit (crate). Each test binary links the entire dependency graph: `axum`, `tokio`, `sqlx` (with SQLite, Postgres, MySQL drivers), `deadpool-redis`, `testcontainers-modules`, `bollard`, `tonic`, `hyper`, `secrecy`, and `garde`.
@@ -164,9 +164,9 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
   3. **Linker Thrashing**: When running `cargo test`, the linker must execute 32 separate linking steps, each copying and linking ~115 MB of code. Over 80% of total CI compilation time is spent waiting on the linker.
   4. **Inability to Separate Fast vs Slow Tests**: Developers cannot easily run fast in-memory unit/integration tests without Cargo compiling all 32 binaries, including heavy container-backed suites.
 - **Suggested fix:**
-  Consolidate `rume/tests/` into 2 canonical entrypoints and 1 uncompiled common module:
+  Consolidate `crates/core/tests/` into 2 canonical entrypoints and 1 uncompiled common module:
   ```
-  rume/tests/
+  crates/core/tests/
   ├── integration.rs             # Entrypoint 1: Fast zero-docker integration suites
   │   └── integration/
   │       ├── auth.rs
@@ -201,7 +201,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### M2 Per-test container spin-up overhead adds 3+ minutes of idle latency and risks Docker daemon exhaustion
 
-- **Where:** Across container suites in `rume/tests/`:
+- **Where:** Across container suites in `crates/core/tests/`:
   - `postgres_container_suite.rs:38–73` (15 tests)
   - `mysql_container_suite.rs:14–36` (7 tests)
   - `redis_container_suite.rs:29–50` (12 tests)
@@ -309,7 +309,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### M4 Absence of a first-party declarative test harness (`RumeTestHarness`) forces repetitive boilerplate across test suites
 
-- **Where:** `rume/src/testing.rs:10–173`, `rume/tests/enterprise_integration_pipeline.rs:75–100`, `rume/tests/persistence_integration.rs:18–45`, `rume/tests/outbox_suite.rs:12–16`, `rume/tests/sqlite_suite.rs:14–26`
+- **Where:** `crates/core/src/testing.rs:10–173`, `crates/core/tests/enterprise_integration_pipeline.rs:75–100`, `crates/core/tests/persistence_integration.rs:18–45`, `crates/core/tests/outbox_suite.rs:12–16`, `crates/core/tests/sqlite_suite.rs:14–26`
 - **What it says:**
   `rume::testing` currently exports only `TestApp` and `TestAppBuilder` (for bare Axum HTTP routers) and `status()`. There are zero testing utilities for database persistence, transactional outbox enlistment, background job runners, or distributed coordination.
 - **Why it's a problem:**
@@ -322,7 +322,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 - **Suggested fix:**
   Introduce a declarative, fluent `RumeTestHarness` in `rume::testing`:
   ```rust
-  // rume/src/testing/harness.rs
+  // crates/core/src/testing/harness.rs
   pub struct RumeTestHarness<B: DatabaseBackend> {
       pub pool: DatabasePool<B>,
       pub outbox: Option<Arc<OutboxRelay<B>>>,
@@ -356,9 +356,9 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### M5 Lack of modern testing ecosystem tooling (`insta`, `rstest`, `wiremock`) hinders snapshot and protocol verification
 
-- **Where:** `rume/Cargo.toml:53–55`, `rume/tests/openapi_suite.rs:30–120`, `rume/tests/error_contract.rs:50–160`, `rume/tests/enterprise_suite.rs:31–120`
+- **Where:** `crates/core/Cargo.toml:53–55`, `crates/core/tests/openapi_suite.rs:30–120`, `crates/core/tests/error_contract.rs:50–160`, `crates/core/tests/enterprise_suite.rs:31–120`
 - **What it says:**
-  In `rume/Cargo.toml`, dev-dependencies are limited to:
+  In `crates/core/Cargo.toml`, dev-dependencies are limited to:
   ```toml
   [dev-dependencies]
   tempfile = "3.27.0"
@@ -370,7 +370,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
   2. **Test Permutation Duplication**: Tests in `validation_suite.rs`, `route_metadata.rs`, and `routing.rs` duplicate 10–15 nearly identical test functions to test HTTP methods (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`) or parameter validation regexes.
   3. **Zero External HTTP Protocol Simulation**: Enterprise protocols in `enterprise_suite.rs` (SAML 2.0 and SCIM 2.0) test only string serialization in memory. There is **zero HTTP wire testing** of external identity providers (IdP metadata discovery, SAML artifact resolution, OAuth token introspection) or outbound webhook dispatchers.
 - **Suggested fix:**
-  Adopt standard Rust testing ecosystem crates in `rume/Cargo.toml` `[dev-dependencies]`:
+  Adopt standard Rust testing ecosystem crates in `crates/core/Cargo.toml` `[dev-dependencies]`:
   1. **`insta` (Snapshot Testing)**:
      Add `insta = { version = "1.42", features = ["json"] }`. Replace verbose manual assertions in `openapi_suite.rs` and `error_contract.rs` with `insta::assert_json_snapshot!(spec)` and `insta::assert_json_snapshot!(problem_details)`.
   2. **`rstest` (Parameterized & Fixture Testing)**:
@@ -387,9 +387,9 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ---
 
-### m1 Inconsistent test file naming conventions across `rume/tests/`
+### m1 Inconsistent test file naming conventions across `crates/core/tests/`
 
-- **Where:** `rume/tests/` directory structure
+- **Where:** `crates/core/tests/` directory structure
 - **What it says:**
   Test suite files use five competing naming patterns:
   - `*_suite.rs` (`auth_suite.rs`, `cache_suite.rs`, `coordination_suite.rs`, `jobs_suite.rs`, `outbox_suite.rs`)
@@ -406,9 +406,9 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### m2 Redundant test coverage between unit tests and integration tests
 
-- **Where:** `rume/src/error.rs:286–455` vs `rume/tests/error_contract.rs:49–165`; `rume/src/routing/health.rs:362–660` vs `rume/tests/health_routes.rs:20–120`
+- **Where:** `crates/core/src/error.rs:286–455` vs `crates/core/tests/error_contract.rs:49–165`; `crates/core/src/routing/health.rs:362–660` vs `crates/core/tests/health_routes.rs:20–120`
 - **What it says:**
-  `error_contract.rs` and `health_routes.rs` replicate nearly identical test cases and assertions already verified in unit tests in `rume/src/error.rs` (testing each `AppError` variant's status and JSON schema) and `rume/src/routing/health.rs` (testing health check transitions and degraded statuses).
+  `error_contract.rs` and `health_routes.rs` replicate nearly identical test cases and assertions already verified in unit tests in `crates/core/src/error.rs` (testing each `AppError` variant's status and JSON schema) and `crates/core/src/routing/health.rs` (testing health check transitions and degraded statuses).
 - **Why it's a problem:**
   Exact-duplicate test coverage increases build and test execution time without providing additional defect detection.
 - **Suggested fix:**
@@ -418,7 +418,7 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 
 ### m3 Duplicate container spin-up logic across PostgreSQL and Redis suites
 
-- **Where:** `rume/tests/postgres_container_suite.rs:38–73`, `rume/tests/jobs_suite.rs:14–29`, `rume/tests/job_reliability_suite.rs:30–45`, `rume/tests/enterprise_integration_pipeline.rs:88–98`
+- **Where:** `crates/core/tests/postgres_container_suite.rs:38–73`, `crates/core/tests/jobs_suite.rs:14–29`, `crates/core/tests/job_reliability_suite.rs:30–45`, `crates/core/tests/enterprise_integration_pipeline.rs:88–98`
 - **What it says:**
   Each test suite implements its own private container setup helper (`setup_postgres_pool`, `start_postgres_queue`, `start_redis_pool`) that sets up `Postgres::default()`, queries port 5432, formats connection strings, and connects a pool.
 - **Why it's a problem:**
@@ -431,11 +431,11 @@ All prior testing findings recorded in `docs/reports/reviews/v02/testing.md` and
 ## Positive notes
 
 - **Real Database Integration Depth**: Retaining live container integration suites for PostgreSQL, MySQL, and Redis ensures that real SQL engine dialects (`FOR UPDATE SKIP LOCKED`, row locking, UUID generation, Redis TTLs) are exercised against actual database servers rather than in-memory mocks.
-- **Atomic Transactional Outbox Verification**: `rume/tests/outbox_suite.rs:260–340` thoroughly tests both successful two-phase atomic commitment and clean rollback of outbox events alongside business database mutations on SQLite.
-- **Comprehensive Extractor Validation**: `rume/tests/validation_suite.rs` exercises compound parameter extractors (`ValidatedPath`, `ValidatedQuery`, `ValidatedJson`) and confirms structured field-level error detail aggregation.
-- **Module Dependency Transitive Enforcement**: `rume/src/module/architecture.rs` successfully resolved v02 M2 by computing transitive dependency reachability closures via BFS, preventing indirect architecture violations.
-- **Process Environment Isolation**: The introduction of `EnvVarGuard` in `rume/tests/env_and_config_loading.rs` guarantees hermetic restoration of process environment variables, preventing cross-test state leakage.
-- **Deterministic Time Simulation in Resilience Suite**: `rume/tests/resilience_suite.rs` demonstrates the correct use of `tokio::time::pause()` for instantaneous, deterministic circuit breaker half-open probe testing.
+- **Atomic Transactional Outbox Verification**: `crates/core/tests/outbox_suite.rs:260–340` thoroughly tests both successful two-phase atomic commitment and clean rollback of outbox events alongside business database mutations on SQLite.
+- **Comprehensive Extractor Validation**: `crates/core/tests/validation_suite.rs` exercises compound parameter extractors (`ValidatedPath`, `ValidatedQuery`, `ValidatedJson`) and confirms structured field-level error detail aggregation.
+- **Module Dependency Transitive Enforcement**: `crates/core/src/module/architecture.rs` successfully resolved v02 M2 by computing transitive dependency reachability closures via BFS, preventing indirect architecture violations.
+- **Process Environment Isolation**: The introduction of `EnvVarGuard` in `crates/core/tests/env_and_config_loading.rs` guarantees hermetic restoration of process environment variables, preventing cross-test state leakage.
+- **Deterministic Time Simulation in Resilience Suite**: `crates/core/tests/resilience_suite.rs` demonstrates the correct use of `tokio::time::pause()` for instantaneous, deterministic circuit breaker half-open probe testing.
 
 ---
 
@@ -448,7 +448,7 @@ The test suite provides extensive verification depth across real database engine
 1. **C1** — Fix feature gate consistency across all test suites by adding `#![cfg(feature = "...")]` to ungated test crates, ensuring `cargo test` compiles under default features and `cargo check --tests` succeeds across all single-feature matrix configurations (`sqlite`, `postgres`, `mysql`, `no-default-features`).
 2. **C2** — Eliminate false-positive test assertions in `jobs_suite.rs` by asserting durable database state in PostgreSQL following worker panics.
 3. **C3** — Update `test_postgres_pool_lifecycle_and_health` to verify physical connection closure and ensure queries on closed pools return `Err(PersistenceError::PoolClosed)`.
-4. **M1** — Reorganize `rume/tests/` from 32 flat files into consolidated entrypoints (`tests/integration.rs`, `tests/containers.rs`, `tests/common/`) to eliminate the 11 GB multi-binary compile explosion and link overhead.
+4. **M1** — Reorganize `crates/core/tests/` from 32 flat files into consolidated entrypoints (`tests/integration.rs`, `tests/containers.rs`, `tests/common/`) to eliminate the 11 GB multi-binary compile explosion and link overhead.
 5. **M2** — Implement shared container fixtures with `tokio::sync::OnceCell` and per-test database isolation (`CREATE DATABASE test_<uuid>`), reducing container launches from 46 to 3 and eliminating 3+ minutes of CI latency.
 6. **M3** — Replace the 34 remaining wall-clock `sleep()` calls with explicit synchronization primitives (`Notify`, channels) and Tokio paused virtual time (`tokio::time::pause()`).
 7. **M4** — Provide a declarative `RumeTestHarness` in `rume::testing` to eliminate repetitive pool, outbox, and worker setup boilerplate.

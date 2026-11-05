@@ -10,9 +10,9 @@ review only; it never outranks the code (`.opencode/rules/20-doc-tree.md`).
 
 | Crate | Files |
 |---|---|
-| `rume` (core lib) | `rume/src/lib.rs`, `prelude.rs`, `app.rs`, `config.rs`, `env.rs`, `error.rs`, `routing.rs`, `testing.rs`, `validation.rs` |
-| `rume-cli` (binary) | `rume-cli/src/main.rs`, `cli.rs`, `commands/mod.rs`, `commands/env/mod.rs`, `commands/env/check.rs`, `commands/config/mod.rs`, `commands/config/check.rs`, `commands/doctor.rs`, `commands/new.rs`, `commands/codegen/mod.rs`, `commands/generate/mod.rs` (+ `generate/{handler,model,service,middleware}.rs`), `prompts.rs`, `ui/{mod,tasks,logger,sticker,table}.rs` |
-| Integration tests | `rume/tests/http_smoke.rs`, `rume/tests/env_and_config_loading.rs` |
+| `rume` (core lib) | `crates/core/src/lib.rs`, `prelude.rs`, `app.rs`, `config.rs`, `env.rs`, `error.rs`, `routing.rs`, `testing.rs`, `validation.rs` |
+| `rume-cli` (binary) | `crates/cli/src/main.rs`, `cli.rs`, `commands/mod.rs`, `commands/env/mod.rs`, `commands/env/check.rs`, `commands/config/mod.rs`, `commands/config/check.rs`, `commands/doctor.rs`, `commands/new.rs`, `commands/codegen/mod.rs`, `commands/generate/mod.rs` (+ `generate/{handler,model,service,middleware}.rs`), `prompts.rs`, `ui/{mod,tasks,logger,sticker,table}.rs` |
+| Integration tests | `crates/core/tests/http_smoke.rs`, `crates/core/tests/env_and_config_loading.rs` |
 
 **Out of scope**: `lab/` (excluded from the workspace, experimental scratch), `target/`,
 `Cargo.lock` (dependency pins are fixed by `10-tech-stack.md`, not reviewed here),
@@ -37,21 +37,21 @@ logic, error mapping, and route/health behavior must match their docs and
 signatures.
 
 **Code covered**:
-- `rume/src/routing.rs` — `Matcher::{Number,Uuid,Slug}::validate`, `ValidatedParam<M>`
+- `crates/core/src/routing.rs` — `Matcher::{Number,Uuid,Slug}::validate`, `ValidatedParam<M>`
   extractor (pulls from `Path<BTreeMap<String,String>>`, validates, maps to
   `Rejection`), `RouteSpec::{get,post,put,patch,delete,where_param,r#where,r#as,build}`
   (registers into the global `ROUTE_REGISTRY` static and returns metadata),
   `RouteGroup<S>::{new,prefix,r#as,add,build}`, `health_routes<E,C>` (`/health/live`,
   `/health/ready` via `State<AppContext<E,C>>`), `registered_routes()`, `Rejection`
   → `IntoResponse` status mapping.
-- `rume/src/app.rs` — `Lifecycle`/`Availability` atomic `u8` state machines
+- `crates/core/src/app.rs` — `Lifecycle`/`Availability` atomic `u8` state machines
   (`Created=0 … Terminated=4`), `RumeBuilder::run()` (bind, `on_ready`/`on_shutdown`
   hooks, graceful shutdown, availability transitions
   `Live→Ready→RefusingTraffic→Unknown`), `ops_router<S>` (captures
   `Availability` directly, not from Axum state).
-- `rume/src/error.rs` — `AppError::status_code()` mapping and `IntoResponse`
+- `crates/core/src/error.rs` — `AppError::status_code()` mapping and `IntoResponse`
   bodies (`Validation` includes `details`; all others render `to_string()`).
-- `rume/src/validation.rs` — `Validated<T>` extractor (`Json` extraction then
+- `crates/core/src/validation.rs` — `Validated<T>` extractor (`Json` extraction then
   `garde::Validate`; `BadRequest` 400 vs `Validation` 422 mapping).
 
 **Checks**:
@@ -79,21 +79,21 @@ that reaches the network, the filesystem, logs, or the terminal from
 untrusted or configured input.
 
 **Code covered**:
-- `rume/src/env.rs` — `resolve_value` `file:` prefix resolution (relative paths
+- `crates/core/src/env.rs` — `resolve_value` `file:` prefix resolution (relative paths
   joined with `dir`, **no `..` traversal guard**), `file\:` escape, secrets
   held as plain `String` in `ResolvedEnv.values` (not `secrecy::SecretBox`),
   `redact()` heuristic (`SECRET`/`PASSWORD`/`TOKEN`/`_KEY`/`KEY`,
   `value_looks_sensitive` URL-with-`@` credentials), `resolve_env_name()`
   precedence (`RUME_ENV` > `RAILS_ENV` > `NODE_ENV` > `development`).
-- `rume/src/error.rs` — `AppError::into_response` renders `self.to_string()`
+- `crates/core/src/error.rs` — `AppError::into_response` renders `self.to_string()`
   into the JSON `error` field for `Internal`/`BadRequest`/`NotFound`/`Unauthorized`/`Forbidden`
   (internal detail leakage to clients); `Validation` details echo field paths
   and garde messages.
-- `rume/src/routing.rs` — `health_routes` `/health/ready` `debug_info` includes
+- `crates/core/src/routing.rs` — `health_routes` `/health/ready` `debug_info` includes
   `pid` and `platform`; `Rejection` messages echo parameter names and values
   (`"{value} is not a valid number"`); `ValidatedParam` rejection includes
   param name.
-- `rume-cli/src/commands/env/check.rs` — `env:check --all` prints process
+- `crates/cli/src/commands/env/check.rs` — `env:check --all` prints process
   environment variables to the terminal (possible secret disclosure).
 - Workspace `Cargo.toml`: `secrecy` is a pinned dependency; verify it is
   actually used for secret-typed config/env (doc example in `env.rs` shows
@@ -108,19 +108,19 @@ untrusted or configured input.
 Config split; core must not depend on heavy optional crates; CLI in `rume-cli`).
 
 **Code covered**:
-- `rume/src/lib.rs` — module graph, `#![forbid(unsafe_code)]`, re-exports of
+- `crates/core/src/lib.rs` — module graph, `#![forbid(unsafe_code)]`, re-exports of
   `axum`/`serde`/`serde_json`/`tokio`/`tracing` from core (heavy re-exports
   vs "core must not depend on heavy optional crates"), `cfg(feature =
   "schemars")` on `config::schema` (feature gating boundary).
-- `rume/src/app.rs` — `AppContext<E, C>` carries env/config/paths/availability/lifecycle/health_checks;
+- `crates/core/src/app.rs` — `AppContext<E, C>` carries env/config/paths/availability/lifecycle/health_checks;
   `Rume::builder(ctx)` is the single entry point (`builder()`,
   `builder_with_state()`, `builder_with_context()` removed); handlers access
   everything via `State<AppContext<E, C>>`; lifecycle hooks are visible `FnOnce`
   closures, not proxied.
-- `rume/src/env.rs` vs `rume/src/config.rs` — Env/Config split: layered `.env`
+- `crates/core/src/env.rs` vs `crates/core/src/config.rs` — Env/Config split: layered `.env`
   files + process env (`dotenvy` + figment `Serialized`) vs layered TOML under
   `config/` (`figment` `Toml` provider); both validated into Rust types at boot.
-- `rume/src/prelude.rs` — re-export surface and discoverability.
+- `crates/core/src/prelude.rs` — re-export surface and discoverability.
 - `rume-cli/` — depends on `rume`, no code generation by scanning; `codegen`
   regenerates barrel/registration files explicitly; `doctor` validates project
   setup.
@@ -135,21 +135,21 @@ fluent builders, error messages, CLI UX. Depends on stage 1 for the stability
 of the APIs being judged.
 
 **Code covered**:
-- `rume/src/app.rs` — `Rume::builder(ctx)` single entry point; `AppContext::new`
+- `crates/core/src/app.rs` — `Rume::builder(ctx)` single entry point; `AppContext::new`
   6-argument constructor generic over `E, C`; `RumeBuilder` fluent setters
   (`route`/`router`/`bind`/`mode`/`environment`/`paths`/`on_ready`/`on_shutdown`);
   `ops_router` vs `routing::health_routes` — two health-route implementations
   with different names, state sources, and status shapes (post-rename confusion
   surface).
-- `rume/src/routing.rs` — `RouteSpec` fluent API (`r#where`/`r#as` raw-identifier
+- `crates/core/src/routing.rs` — `RouteSpec` fluent API (`r#where`/`r#as` raw-identifier
   aliases, `where_param`), `RouteGroup`, `Matcher` enum, `ValidatedParam`
   deref-to-`str` + `into_inner`.
-- `rume/src/prelude.rs` and `lib.rs` — what is re-exported and where users
+- `crates/core/src/prelude.rs` and `lib.rs` — what is re-exported and where users
   find it; doc examples use `#[ignore]` (not compiled as doctests).
-- `rume-cli/src/cli.rs` + commands — `new`, `env check [--all]`, `config check`,
+- `crates/cli/src/cli.rs` + commands — `new`, `env check [--all]`, `config check`,
   `doctor`, `completions`, `codegen`, `generate` (removed `dev`/`test`,
   added `list`/`completions` per context); UX of inspection/output.
-- `rume/src/error.rs` — rejection/AppError message wording for end users.
+- `crates/core/src/error.rs` — rejection/AppError message wording for end users.
 
 **Dependencies**: stage 1 (Correctness, Architecture, Security).
 
@@ -161,9 +161,9 @@ of the APIs being judged.
 `todo_*` stubs / review-tracked known-broken; fails-before proof required.
 
 **Code covered**:
-- `rume/tests/http_smoke.rs` — one HTTP smoke test (bare `/health` router,
+- `crates/core/tests/http_smoke.rs` — one HTTP smoke test (bare `/health` router,
   not the real `health_routes`/`ops_router`).
-- `rume/tests/env_and_config_loading.rs` — layered env files, `.env.local`
+- `crates/core/tests/env_and_config_loading.rs` — layered env files, `.env.local`
   skipping in test mode, `file:` resolution, merged config, typed env.
 - Hermetic unit modules in `src/` — `app.rs` (env/availability/lifecycle),
 - `env.rs` (redaction/secret detection), `validation.rs` (Validated extractor
@@ -172,7 +172,7 @@ of the APIs being judged.
   `RouteSpec`, matchers, `ValidatedParam`, `RouteGroup`, `HealthChecks::run`,
   `health_routes`, `Rejection`, `registered_routes`); `config.rs` (no tests);
 - `testing.rs` (`TestApp`/`TestAppBuilder` harness itself, untested).
-- `rume/src/env.rs` uses `unsafe { std::env::set_var/remove_var }` in tests
+- `crates/core/src/env.rs` uses `unsafe { std::env::set_var/remove_var }` in tests
   with an `ENV_LOCK` Mutex — global-process-env mutation and test isolation;
 - Global `ROUTE_REGISTRY` static — cross-test pollution via `RouteSpec::build`.
 

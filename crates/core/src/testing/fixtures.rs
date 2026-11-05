@@ -1,12 +1,12 @@
 //! Isolated database and transaction fixtures for test isolation.
 
 #[cfg(feature = "sqlite")]
-use std::path::{Path, PathBuf};
-#[cfg(feature = "sqlite")]
 use crate::persistence::DatabaseConfig;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
 use crate::persistence::{DatabaseBackend, DatabasePool};
 use crate::persistence::{DatabaseTransaction, PersistenceError};
+#[cfg(feature = "sqlite")]
+use std::path::{Path, PathBuf};
 
 /// An RAII transaction guard that automatically rolls back the transaction on Drop
 /// unless explicitly committed.
@@ -119,7 +119,10 @@ impl SqliteTestFixture {
     }
 
     /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
-    pub async fn begin_test_tx(&self) -> Result<TestTransactionFixture<crate::persistence::SqliteTransaction>, PersistenceError> {
+    pub async fn begin_test_tx(
+        &self,
+    ) -> Result<TestTransactionFixture<crate::persistence::SqliteTransaction>, PersistenceError>
+    {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
     }
@@ -140,7 +143,8 @@ impl SqliteTestFixture {
             let _ = std::fs::remove_file(shm);
         }
         if path.exists() {
-            std::fs::remove_file(&path).map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
+            std::fs::remove_file(&path)
+                .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
         }
         Ok(())
     }
@@ -188,7 +192,9 @@ pub struct PostgresSchemaFixture {
 #[cfg(feature = "postgres")]
 impl PostgresSchemaFixture {
     /// Creates a unique schema in the target PostgreSQL instance and returns a pool scoped to that schema.
-    pub async fn create(admin_pool: &DatabasePool<crate::persistence::PostgresBackend>) -> Result<Self, PersistenceError> {
+    pub async fn create(
+        admin_pool: &DatabasePool<crate::persistence::PostgresBackend>,
+    ) -> Result<Self, PersistenceError> {
         let schema_name = format!("test_{}", uuid::Uuid::new_v4().simple());
 
         admin_pool
@@ -227,7 +233,10 @@ impl PostgresSchemaFixture {
     }
 
     /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
-    pub async fn begin_test_tx(&self) -> Result<TestTransactionFixture<crate::persistence::PostgresTransaction>, PersistenceError> {
+    pub async fn begin_test_tx(
+        &self,
+    ) -> Result<TestTransactionFixture<crate::persistence::PostgresTransaction>, PersistenceError>
+    {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
     }
@@ -239,7 +248,10 @@ impl PostgresSchemaFixture {
         if let Some(admin) = self.admin_pool.take() {
             admin
                 .backend()
-                .execute(&format!("DROP SCHEMA IF EXISTS \"{}\" CASCADE", self.schema_name))
+                .execute(&format!(
+                    "DROP SCHEMA IF EXISTS \"{}\" CASCADE",
+                    self.schema_name
+                ))
                 .await?;
         }
         Ok(())
@@ -293,10 +305,25 @@ mod tests {
         let path = fixture.path().to_path_buf();
         assert!(path.exists(), "database file must exist on disk");
 
-        fixture.pool().backend().execute("CREATE TABLE users (id INT, name TEXT)").await.expect("execute");
-        fixture.pool().backend().execute("INSERT INTO users VALUES (1, 'Alice')").await.expect("insert");
+        fixture
+            .pool()
+            .backend()
+            .execute("CREATE TABLE users (id INT, name TEXT)")
+            .await
+            .expect("execute");
+        fixture
+            .pool()
+            .backend()
+            .execute("INSERT INTO users VALUES (1, 'Alice')")
+            .await
+            .expect("insert");
 
-        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM users").await.expect("count");
+        let count: Option<String> = fixture
+            .pool()
+            .backend()
+            .query_scalar("SELECT COUNT(*) FROM users")
+            .await
+            .expect("count");
         assert_eq!(count.as_deref(), Some("1"));
 
         // Drop fixture
@@ -309,29 +336,56 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_fixture_auto_rollback_on_drop() {
         let fixture = SqliteTestFixture::create().await.expect("fixture creates");
-        fixture.pool().backend().execute("CREATE TABLE items (val INT)").await.expect("create table");
+        fixture
+            .pool()
+            .backend()
+            .execute("CREATE TABLE items (val INT)")
+            .await
+            .expect("create table");
 
         // Transaction 1: inserted but dropped without commit
         {
             let tx = fixture.begin_test_tx().await.expect("begin tx");
-            tx.execute("INSERT INTO items VALUES (999)").await.expect("insert in tx");
+            tx.execute("INSERT INTO items VALUES (999)")
+                .await
+                .expect("insert in tx");
             // drop tx
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM items").await.expect("count");
-        assert_eq!(count.as_deref(), Some("0"), "uncommitted transaction must be rolled back on drop");
+        let count: Option<String> = fixture
+            .pool()
+            .backend()
+            .query_scalar("SELECT COUNT(*) FROM items")
+            .await
+            .expect("count");
+        assert_eq!(
+            count.as_deref(),
+            Some("0"),
+            "uncommitted transaction must be rolled back on drop"
+        );
 
         // Transaction 2: committed
         {
             let tx = fixture.begin_test_tx().await.expect("begin tx");
-            tx.execute("INSERT INTO items VALUES (123)").await.expect("insert in tx");
+            tx.execute("INSERT INTO items VALUES (123)")
+                .await
+                .expect("insert in tx");
             tx.commit().await.expect("commit");
         }
 
-        let count2: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM items").await.expect("count");
-        assert_eq!(count2.as_deref(), Some("1"), "committed transaction must persist");
+        let count2: Option<String> = fixture
+            .pool()
+            .backend()
+            .query_scalar("SELECT COUNT(*) FROM items")
+            .await
+            .expect("count");
+        assert_eq!(
+            count2.as_deref(),
+            Some("1"),
+            "committed transaction must persist"
+        );
         fixture.close().await.expect("fixture close");
     }
 
@@ -341,8 +395,16 @@ mod tests {
         let path = fixture.path().to_path_buf();
         assert!(path.exists());
 
-        fixture.pool().backend().execute("CREATE TABLE t (id INT)").await.expect("execute");
-        fixture.close().await.expect("explicit close should succeed");
+        fixture
+            .pool()
+            .backend()
+            .execute("CREATE TABLE t (id INT)")
+            .await
+            .expect("execute");
+        fixture
+            .close()
+            .await
+            .expect("explicit close should succeed");
 
         assert!(!path.exists(), "database file must be cleaned up on close");
         assert!(!PathBuf::from(format!("{}-wal", path.display())).exists());
@@ -352,13 +414,27 @@ mod tests {
     #[tokio::test]
     async fn test_transaction_fixture_explicit_rollback() {
         let fixture = SqliteTestFixture::create().await.expect("fixture creates");
-        fixture.pool().backend().execute("CREATE TABLE t (v INT)").await.expect("create");
+        fixture
+            .pool()
+            .backend()
+            .execute("CREATE TABLE t (v INT)")
+            .await
+            .expect("create");
 
         let tx = fixture.begin_test_tx().await.expect("tx");
-        tx.execute("INSERT INTO t VALUES (42)").await.expect("insert");
-        tx.rollback().await.expect("explicit rollback should succeed");
+        tx.execute("INSERT INTO t VALUES (42)")
+            .await
+            .expect("insert");
+        tx.rollback()
+            .await
+            .expect("explicit rollback should succeed");
 
-        let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM t").await.expect("count");
+        let count: Option<String> = fixture
+            .pool()
+            .backend()
+            .query_scalar("SELECT COUNT(*) FROM t")
+            .await
+            .expect("count");
         assert_eq!(count.as_deref(), Some("0"));
 
         fixture.close().await.expect("close");
@@ -370,9 +446,24 @@ mod tests {
         for i in 0..5 {
             handles.push(tokio::spawn(async move {
                 let fixture = SqliteTestFixture::create().await.expect("create");
-                fixture.pool().backend().execute("CREATE TABLE p (v INT)").await.expect("create");
-                fixture.pool().backend().execute(&format!("INSERT INTO p VALUES ({i})")).await.expect("insert");
-                let count: Option<String> = fixture.pool().backend().query_scalar("SELECT COUNT(*) FROM p").await.expect("count");
+                fixture
+                    .pool()
+                    .backend()
+                    .execute("CREATE TABLE p (v INT)")
+                    .await
+                    .expect("create");
+                fixture
+                    .pool()
+                    .backend()
+                    .execute(&format!("INSERT INTO p VALUES ({i})"))
+                    .await
+                    .expect("insert");
+                let count: Option<String> = fixture
+                    .pool()
+                    .backend()
+                    .query_scalar("SELECT COUNT(*) FROM p")
+                    .await
+                    .expect("count");
                 assert_eq!(count.as_deref(), Some("1"));
                 let path = fixture.path().to_path_buf();
                 fixture.close().await.expect("close");

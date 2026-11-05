@@ -8,25 +8,25 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ## Prior decisions
 
-- **v01 S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:254–267`. `resolve_value` canonicalizes both root dir and resolved path, rejecting escapes with `AppError::PermissionDenied`.
-- **v01 S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:27–36, 174–188`. Secrets are encapsulated inside `secrecy::SecretBox<String>` and scrubbed from general debug representations.
-- **v01 S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/env/check.rs:47–51` and `rume-cli/src/commands/config/check.rs:38–48`. Secrets and database URLs require `--unredacted` to display.
-- **v01 S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `rume/src/error.rs:173–275`. RFC 9457 Problem Details (`application/problem+json`) sanitize client responses while retaining server diagnostics in logs.
-- **v01 S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Broadened in `rume/src/env/secrets.rs:18–42` to cover `_PASS`, `_PWD`, `_CRED`, `_KEY`, and `STRIPE_*`. Further heuristic extensions evaluated in finding m2.
-- **v01 S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs:289–294`. Returns an empty `BTreeMap`.
-- **v01 S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `rume/src/routing/rejection.rs:19–42`. Rejections convert to generic Problem Details.
+- **v01 S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:254–267`. `resolve_value` canonicalizes both root dir and resolved path, rejecting escapes with `AppError::PermissionDenied`.
+- **v01 S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:27–36, 174–188`. Secrets are encapsulated inside `secrecy::SecretBox<String>` and scrubbed from general debug representations.
+- **v01 S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/env/check.rs:47–51` and `crates/cli/src/commands/config/check.rs:38–48`. Secrets and database URLs require `--unredacted` to display.
+- **v01 S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `crates/core/src/error.rs:173–275`. RFC 9457 Problem Details (`application/problem+json`) sanitize client responses while retaining server diagnostics in logs.
+- **v01 S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Broadened in `crates/core/src/env/secrets.rs:18–42` to cover `_PASS`, `_PWD`, `_CRED`, `_KEY`, and `STRIPE_*`. Further heuristic extensions evaluated in finding m2.
+- **v01 S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs:289–294`. Returns an empty `BTreeMap`.
+- **v01 S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `crates/core/src/routing/rejection.rs:19–42`. Rejections convert to generic Problem Details.
 - **v02 Security C1 (SAML assertion parser hardcodes expiration timestamps and lacks signature verification)** — **CHALLENGED (Defective Remediation & Incomplete Signature Binding)**. While `NotBefore` / `NotOnOrAfter` parsing was added alongside a `SamlSignatureVerifier` trait, the remediation is structurally incomplete: `SamlParser` continues to use naive substring searches rather than a verified XML DOM tree, leaves assertion data unanchored from the verified signature element, fails against prefix-evading XML Signature Wrapping (XSW) attacks, and retains `parse()` as an unverified public bypass (findings C1, C2).
-- **v02 Security C2 (Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning)** — **REAFFIRMED**. Validated in `rume/src/tenant/cache.rs` where tenant IDs and cache keys disallow delimiter colons or enforce length-prefixed key boundaries (audited in Lens 4).
-- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Validated in `rume/src/tenant/resolver.rs:133–149` where `base_domain` normalization requires a leading dot (audited in Lens 4).
-- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED**. Validated in `rume/src/tenant/resolver.rs:49–56` where IDs and slugs are indexed into distinct lookup structures (audited in Lens 4).
-- **v02 Security M3 (`ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan)** — **REAFFIRMED**. Verified in `rume/src/auth/schemes.rs:86–114, 139–148`. Keys are hashed via SHA-256 upon registration into `HashMap<[u8; 32], AuthUser>` and looked up in O(1) time without linear scan timing side-channels.
+- **v02 Security C2 (Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning)** — **REAFFIRMED**. Validated in `crates/core/src/tenant/cache.rs` where tenant IDs and cache keys disallow delimiter colons or enforce length-prefixed key boundaries (audited in Lens 4).
+- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Validated in `crates/core/src/tenant/resolver.rs:133–149` where `base_domain` normalization requires a leading dot (audited in Lens 4).
+- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED**. Validated in `crates/core/src/tenant/resolver.rs:49–56` where IDs and slugs are indexed into distinct lookup structures (audited in Lens 4).
+- **v02 Security M3 (`ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan)** — **REAFFIRMED**. Verified in `crates/core/src/auth/schemes.rs:86–114, 139–148`. Keys are hashed via SHA-256 upon registration into `HashMap<[u8; 32], AuthUser>` and looked up in O(1) time without linear scan timing side-channels.
 - **v02 Security M4 (Double-submit CSRF layer lacks token issuance and is vulnerable to subdomain tossing)** — **CHALLENGED (Defective Remediation & Insecure Defaults)**. Token issuance and HMAC signing were added, but `CsrfConfig::default()` disables HMAC signing (`secret: None`), disables `cookie_secure`, and disables auto-injection by default. Naive double-submit without HMAC remains active by default, and cookie parsing suffers from first-cookie bias enabling denial-of-service via tossed cookies (findings M1, M2).
-- **v02 Security m1 (`AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500)** — **REAFFIRMED**. Verified in `rume/src/auth/error.rs:38`. `ProviderError` maps to `AppError::internal`, returning HTTP 500 without blaming the client.
-- **v02 Security m2 (Stale session cookie in `SessionScheme` immediately aborts authentication chain)** — **REAFFIRMED**. Verified in `rume/src/auth/schemes.rs:194–203`. Stale/missing cookies return `Ok(None)`, enabling fallback schemes in multi-scheme setups.
+- **v02 Security m1 (`AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500)** — **REAFFIRMED**. Verified in `crates/core/src/auth/error.rs:38`. `ProviderError` maps to `AppError::internal`, returning HTTP 500 without blaming the client.
+- **v02 Security m2 (Stale session cookie in `SessionScheme` immediately aborts authentication chain)** — **REAFFIRMED**. Verified in `crates/core/src/auth/schemes.rs:194–203`. Stale/missing cookies return `Ok(None)`, enabling fallback schemes in multi-scheme setups.
 - **v02 Security m3 (`SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP)** — **CHALLENGED (Partial Remediation & Proxy Header Spoofing Risk)**. `hsts_require_tls` was added, but the middleware blindly trusts `x-forwarded-proto: https` from unverified upstream network connections and fails to recognize native TLS termination in Hyper/Axum due to relative request URIs (finding m1).
-- **Persistent Structured Audit Logging (`rume/src/security/audit.rs`)** — **NOTE-NEW**. Evaluated in C3 and M3.
-- **Enterprise SCIM 2.0 Concurrency & Versioning (`rume/src/enterprise/scim.rs`)** — **NOTE-NEW**. Evaluated in M4.
-- **Session Lifecycle & Management (`rume/src/auth/session.rs`, `redis.rs`)** — **NOTE-NEW**. Evaluated in M5 and M6.
+- **Persistent Structured Audit Logging (`crates/core/src/security/audit.rs`)** — **NOTE-NEW**. Evaluated in C3 and M3.
+- **Enterprise SCIM 2.0 Concurrency & Versioning (`crates/core/src/enterprise/scim.rs`)** — **NOTE-NEW**. Evaluated in M4.
+- **Session Lifecycle & Management (`crates/core/src/auth/session.rs`, `redis.rs`)** — **NOTE-NEW**. Evaluated in M5 and M6.
 
 ---
 
@@ -34,7 +34,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### C1 SAML 2.0 Parser Vulnerable to XML Signature Wrapping (XSW) Attacks via Unbound Global Tag Extraction and Namespace Prefix Evasion
 
-- **Where:** `rume/src/enterprise/saml.rs:182–258`
+- **Where:** `crates/core/src/enterprise/saml.rs:182–258`
 - **What it says:**
   ```rust
   pub fn parse_with_verifier(
@@ -81,7 +81,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### C2 Public `SamlParser::parse()` Bypasses Cryptographic Verification in Production
 
-- **Where:** `rume/src/enterprise/saml.rs:170–172, 182–190`
+- **Where:** `crates/core/src/enterprise/saml.rs:170–172, 182–190`
 - **What it says:**
   ```rust
   /// Parses an XML string containing a SAML 2.0 Assertion.
@@ -107,7 +107,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### C3 SQL Injection Vulnerability in `SqlAuditLogger::record()` via String Formatting and Incomplete MySQL Escape Handling
 
-- **Where:** `rume/src/security/audit.rs:161, 173–188`
+- **Where:** `crates/core/src/security/audit.rs:161, 173–188`
 - **What it says:**
   ```rust
   let id = uuid::Uuid::new_v4().to_string();
@@ -145,7 +145,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M1 Insecure Defaults in `CsrfConfig` Permit Subdomain Cookie-Tossing and Lack Mandatory HMAC Signing
 
-- **Where:** `rume/src/security/csrf.rs:64–77, 159–163`
+- **Where:** `crates/core/src/security/csrf.rs:64–77, 159–163`
 - **What it says:**
   ```rust
   impl Default for CsrfConfig {
@@ -181,7 +181,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M2 Subdomain Cookie-Tossing Causes Denial of Service via First-Cookie Selection Bias in `CsrfService`
 
-- **Where:** `rume/src/security/csrf.rs:271–280, 332–342`
+- **Where:** `crates/core/src/security/csrf.rs:271–280, 332–342`
 - **What it says:**
   ```rust
   let cookie_token = req
@@ -209,7 +209,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M3 Lack of Secret Redaction in Audit Logging Metadata
 
-- **Where:** `rume/src/security/audit.rs:167–168`
+- **Where:** `crates/core/src/security/audit.rs:167–168`
 - **What it says:**
   ```rust
   let meta_json = serde_json::to_string(&record.metadata)
@@ -224,7 +224,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M4 SCIM 2.0 Entities Lack `meta.version` (ETag) for Optimistic Concurrency Control and Replay Protection
 
-- **Where:** `rume/src/enterprise/scim.rs:36–41, 72–75`
+- **Where:** `crates/core/src/enterprise/scim.rs:36–41, 72–75`
 - **What it says:**
   ```rust
   /// SCIM Metadata sub-attribute.
@@ -246,7 +246,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M5 Missing Session ID Rotation (Regeneration) Exposes Applications to Session Fixation Attacks
 
-- **Where:** `rume/src/auth/session.rs:74–84`, `rume/src/auth/redis.rs:84–111`
+- **Where:** `crates/core/src/auth/session.rs:74–84`, `crates/core/src/auth/redis.rs:84–111`
 - **What it says:**
   ```rust
   pub trait SessionStore: Send + Sync + 'static {
@@ -264,7 +264,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### M6 `SessionScheme` Silently Degrades Authenticated Users to Guests on Session Store Failures
 
-- **Where:** `rume/src/auth/schemes.rs:194–203`
+- **Where:** `crates/core/src/auth/schemes.rs:194–203`
 - **What it says:**
   ```rust
   if let Ok(Some(session)) = self.store.load(val).await {
@@ -289,7 +289,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### m1 Unvalidated Reverse Proxy Trust for `x-forwarded-proto` and Axum Relative URI Blindness in `SecurityHeadersService`
 
-- **Where:** `rume/src/security/headers.rs:156–163`
+- **Where:** `crates/core/src/security/headers.rs:156–163`
 - **What it says:**
   ```rust
   let is_https = req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
@@ -310,9 +310,9 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ---
 
-### m2 Substring Heuristic Blind Spots and Leaky URL Parsing in `rume/src/env/secrets.rs`
+### m2 Substring Heuristic Blind Spots and Leaky URL Parsing in `crates/core/src/env/secrets.rs`
 
-- **Where:** `rume/src/env/secrets.rs:18–42, 87–97`
+- **Where:** `crates/core/src/env/secrets.rs:18–42, 87–97`
 - **What it says:**
   In `is_secret_key`:
   ```rust
@@ -346,7 +346,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ### m3 SAML Parser Comment Truncation and Tag Extraction Fragility
 
-- **Where:** `rume/src/enterprise/saml.rs:76–89, 282–323`
+- **Where:** `crates/core/src/enterprise/saml.rs:76–89, 282–323`
 - **What it says:**
   In `strip_comments`:
   ```rust
@@ -375,7 +375,7 @@ The Rume security, authentication, and protocol hardening subsystems provide ess
 
 ## Positive notes
 
-- `#![forbid(unsafe_code)]` remains strictly enforced across the core crate (`rume/src/lib.rs:7`).
+- `#![forbid(unsafe_code)]` remains strictly enforced across the core crate (`crates/core/src/lib.rs:7`).
 - Constant-time string and byte comparisons are uniformly implemented with `safe_equal` using `std::hint::black_box` to defeat compiler short-circuit optimizations.
 - `ApiKeyScheme` was successfully hardened against heap memory exposure and timing leaks by migrating from plaintext linear scanning to SHA-256 hashed keys indexed in O(1) maps.
 - `AuthError::ProviderError` correctly maps to `AppError::Internal` (HTTP 500), preserving RFC 9457 Problem Details semantics and distinguishing client credential errors from server infrastructure faults.

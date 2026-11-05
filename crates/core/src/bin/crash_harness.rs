@@ -9,11 +9,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rume::jobs::{JobQueue, PostgresJobQueue};
-use rume::outbox::{OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, TransactionalOutbox};
+use rume::outbox::{
+    OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository, TransactionalOutbox,
+};
+use rume::persistence::DatabaseTransaction;
 use rume::persistence::config::DatabaseConfig;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
-use rume::persistence::DatabaseTransaction;
 use sqlx::postgres::PgPoolOptions;
 
 #[tokio::main]
@@ -40,16 +42,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     Ok(())
 }
 
-async fn handle_worker(action: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_worker(
+    action: &str,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db_url = get_arg(args, "--db-url").expect("--db-url required");
-    let pool = PgPoolOptions::new().max_connections(5).connect(&db_url).await?;
-    let lease_ms: u64 = get_arg(args, "--lease-ms").unwrap_or_else(|| "1000".into()).parse()?;
-    let queue = PostgresJobQueue::new(pool.clone()).with_lease_duration(Duration::from_millis(lease_ms));
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await?;
+    let lease_ms: u64 = get_arg(args, "--lease-ms")
+        .unwrap_or_else(|| "1000".into())
+        .parse()?;
+    let queue =
+        PostgresJobQueue::new(pool.clone()).with_lease_duration(Duration::from_millis(lease_ms));
     queue.init_schema().await?;
 
     match action {
         "claim-and-hold" => {
-            let _worker_id = get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-a".into());
+            let _worker_id =
+                get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-a".into());
             let job = queue.dequeue().await?;
             if let Some(j) = job {
                 println!("CLAIM_ACQUIRED:{}", j.id);
@@ -62,7 +74,8 @@ async fn handle_worker(action: &str, args: &[String]) -> Result<(), Box<dyn std:
             }
         }
         "execute-and-crash-before-ack" => {
-            let worker_id = get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-a".into());
+            let worker_id =
+                get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-a".into());
             let job = queue.dequeue().await?;
             if let Some(j) = job {
                 // Perform side-effect: insert into test audit marker table
@@ -85,11 +98,15 @@ async fn handle_worker(action: &str, args: &[String]) -> Result<(), Box<dyn std:
             }
         }
         "recover-worker" => {
-            let _worker_id = get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-b".into());
+            let _worker_id =
+                get_arg(args, "--worker-id").unwrap_or_else(|| "worker-process-b".into());
             // Attempt to claim the expired job
             let job = queue.dequeue().await?;
             if let Some(j) = job {
-                let lease_token = j.lease_token.clone().expect("claimed job must have lease token");
+                let lease_token = j
+                    .lease_token
+                    .clone()
+                    .expect("claimed job must have lease token");
                 queue.ack(&j.id, &lease_token).await?;
                 println!("JOB_ACKED:{}", j.id);
                 std::io::stdout().flush()?;
@@ -106,17 +123,23 @@ async fn handle_worker(action: &str, args: &[String]) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn handle_outbox(action: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_outbox(
+    action: &str,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db_url = get_arg(args, "--db-url").expect("--db-url required");
     let config = DatabaseConfig::new(&db_url).with_max_connections(5);
     let backend = PostgresBackend::connect(&config).await?;
     let pool = Arc::new(DatabasePool::new(backend, config));
 
-    let lease_secs: u64 = get_arg(args, "--lease-secs").unwrap_or_else(|| "1".into()).parse()?;
+    let lease_secs: u64 = get_arg(args, "--lease-secs")
+        .unwrap_or_else(|| "1".into())
+        .parse()?;
 
     match action {
         "tx-commit-and-crash" => {
-            let payload = get_arg(args, "--payload").unwrap_or_else(|| "{\"event\":\"order_created\"}".into());
+            let payload = get_arg(args, "--payload")
+                .unwrap_or_else(|| "{\"event\":\"order_created\"}".into());
             let outbox_id = uuid::Uuid::new_v4().to_string();
             let saved_id = outbox_id.clone();
             let pool_ref = Arc::clone(&pool);
@@ -163,8 +186,9 @@ async fn handle_outbox(action: &str, args: &[String]) -> Result<(), Box<dyn std:
                 poll_interval: Duration::from_millis(50),
                 max_retries: 3,
             };
-            let relay = OutboxRelay::new(Arc::clone(&pool), |_msg: &OutboxMessage| async { Ok(()) })
-                .with_config(relay_config);
+            let relay =
+                OutboxRelay::new(Arc::clone(&pool), |_msg: &OutboxMessage| async { Ok(()) })
+                    .with_config(relay_config);
             let poll_result = relay.poll_and_dispatch(10).await?;
 
             println!("OUTBOX_RECOVERED:published={}", poll_result.published);
@@ -178,21 +202,28 @@ async fn handle_outbox(action: &str, args: &[String]) -> Result<(), Box<dyn std:
     Ok(())
 }
 
-async fn handle_leader(action: &str, args: &[String]) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn handle_leader(
+    action: &str,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let redis_url = get_arg(args, "--redis-url").expect("--redis-url required");
     let backend = rume::cache::redis::RedisCacheBackend::new(&redis_url)?;
     let role = get_arg(args, "--role").unwrap_or_else(|| "crash-cluster".into());
     let prefix = get_arg(args, "--prefix").unwrap_or_else(|| "test:crash:leader:".into());
     let identity = get_arg(args, "--identity").unwrap_or_else(|| "leader-process-a".into());
-    let ttl_ms: u64 = get_arg(args, "--ttl-ms").unwrap_or_else(|| "500".into()).parse()?;
+    let ttl_ms: u64 = get_arg(args, "--ttl-ms")
+        .unwrap_or_else(|| "500".into())
+        .parse()?;
     let ttl = Duration::from_millis(ttl_ms);
 
-    let elector = rume::coordination::RedisLeaderElector::new(backend.pool().clone())
-        .with_prefix(prefix);
+    let elector =
+        rume::coordination::RedisLeaderElector::new(backend.pool().clone()).with_prefix(prefix);
 
     match action {
         "acquire-and-hold" => {
-            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl).await? {
+            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl)
+                .await?
+            {
                 Some(lease) => {
                     println!("LEADER_ACQUIRED:{}:{}", lease.candidate_id, lease.term);
                     std::io::stdout().flush()?;
@@ -205,7 +236,9 @@ async fn handle_leader(action: &str, args: &[String]) -> Result<(), Box<dyn std:
             }
         }
         "takeover" => {
-            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl).await? {
+            match rume::coordination::LeaderElector::try_acquire(&elector, &role, &identity, ttl)
+                .await?
+            {
                 Some(lease) => {
                     println!("TAKEOVER_SUCCESS:{}:{}", lease.candidate_id, lease.term);
                     std::io::stdout().flush()?;

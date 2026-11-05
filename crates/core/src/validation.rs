@@ -292,7 +292,9 @@ impl SchemaBuilder {
 
 /// Helper returning a string [`OpenApiSchema`] with min/max length matching garde `#[garde(length(min = ..., max = ...))]`.
 pub fn string_length(min: usize, max: usize) -> OpenApiSchema {
-    OpenApiSchema::string().with_min_length(min).with_max_length(max)
+    OpenApiSchema::string()
+        .with_min_length(min)
+        .with_max_length(max)
 }
 
 /// Helper returning an integer [`OpenApiSchema`] with min/max range matching garde `#[garde(range(min = ..., max = ...))]`.
@@ -526,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_openapi_validation_synergy_reflects_garde_rules() {
-        use crate::openapi::{generate_openapi, OpenApiInfo};
+        use crate::openapi::{OpenApiInfo, generate_openapi};
         use crate::routing::{RouteRegistry, RouteSpec};
 
         // 1. ValidatedJson schema reflects garde rules
@@ -555,7 +557,10 @@ mod tests {
         let path_item = doc.paths.get("/users").expect("users path exists");
         let post_op = path_item.post.as_ref().expect("post operation exists");
 
-        let body_json = post_op.request_body.as_ref().expect("request_body is generated");
+        let body_json = post_op
+            .request_body
+            .as_ref()
+            .expect("request_body is generated");
         let schema_val = &body_json["content"]["application/json"]["schema"];
         assert_eq!(schema_val["properties"]["username"]["minLength"], 3);
         assert_eq!(schema_val["properties"]["username"]["maxLength"], 50);

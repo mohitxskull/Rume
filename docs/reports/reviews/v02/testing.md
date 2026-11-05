@@ -8,18 +8,18 @@ Rume v02 achieves massive expansion in verification breadth, growing from an ini
 
 All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and tracked as `T-T1`–`T-T9` in `docs/reports/reviews/v01/todo.md`) have been audited against the v02 codebase:
 
-- **T1 — `rume/src/routing.rs` has ZERO unit tests** — **REAFFIRMED**. In v02, `routing` was decomposed into dedicated modules, each equipped with comprehensive unit tests: `group.rs` (lines 177–241), `health.rs` (lines 362–660), `matchers.rs` (lines 87–151), `registry.rs` (lines 133–182), `rejection.rs` (lines 45–73), `resource.rs` (lines 126–187), and `validated_param.rs` (lines 89–130). In addition, three dedicated integration suites (`tests/routing.rs`, `tests/health_routes.rs`, and `tests/route_metadata.rs`) verify HTTP parameter validation, route merging, and metadata introspection end-to-end.
+- **T1 — `crates/core/src/routing.rs` has ZERO unit tests** — **REAFFIRMED**. In v02, `routing` was decomposed into dedicated modules, each equipped with comprehensive unit tests: `group.rs` (lines 177–241), `health.rs` (lines 362–660), `matchers.rs` (lines 87–151), `registry.rs` (lines 133–182), `rejection.rs` (lines 45–73), `resource.rs` (lines 126–187), and `validated_param.rs` (lines 89–130). In addition, three dedicated integration suites (`tests/routing.rs`, `tests/health_routes.rs`, and `tests/route_metadata.rs`) verify HTTP parameter validation, route merging, and metadata introspection end-to-end.
 - **T2 — No fails-before proof anywhere in the suite** — **REAFFIRMED**. Commit history confirms that v01 bug fixes and their accompanying regression tests were merged in single atomic commits without preserving failing test artifacts or `todo_*` reproduction harnesses. While rigorous regression assertions were added for v01 findings, the underlying failure mode recurred in v02: several newly introduced test suites exercise only happy paths and benign inputs, passing cleanly while severe failure modes and dead code remained undetected (evaluated in finding M1).
-- **T3 — `rume/src/config.rs` is entirely untested** — **REAFFIRMED**. In v02, `rume/src/config.rs` lines 104–182 adds unit tests covering `load_raw_not_found_when_no_config`, `load_raw_reads_app_toml`, `load_raw_pretty_returns_valid_toml`, and `load_raw_local_toml_is_loaded`. (A minor defect regarding fixed `/tmp` paths is recorded in finding m3).
-- **T4 — `TestApp`/`TestAppBuilder` test harness is itself untested** — **REAFFIRMED**. In v02, `rume/src/testing.rs` lines 151–268 introduces 7 unit tests explicitly labeled `T-T4`, verifying `TestApp::new`, `post_json`, `TestAppBuilder::http`, custom state binding, cleanup hooks on `Drop`, explicit `teardown`, and the `status` helper.
-- **T5 — `app.rs` tests miss boundary, Inspect-mode, and lifecycle-ordering surface** — **REAFFIRMED**. In v02, `rume/src/app/state.rs` lines 205–234 tests that invalid `u8` values map deterministically to `Created` and `Unknown`; `rume/src/app/builder.rs` lines 1381–1440 tests that `ApplicationMode::Inspect` never binds listeners or executes ready/shutdown hooks; and `rume/tests/lifecycle_shutdown.rs` verifies lifecycle and availability transitions across server shutdown.
-- **T6 — `error.rs` tests cover 3 of 6 `AppError` variants and assert no response bodies** — **REAFFIRMED**. In v02, `rume/src/error.rs` lines 286–455 tests all variants (`NotFound`, `Unauthorized`, `Forbidden`, `BadRequest`, `Internal`, `Validation`, and `Public`), asserts RFC 9457 Problem Details JSON bodies, and verifies that internal diagnostics are never leaked to HTTP clients.
-- **T7 — `env.rs` has no `file:` traversal test, and integration env tests mutate global process env** — **REAFFIRMED in part, CHALLENGED in part**. Path traversal rejection is now thoroughly tested by `file_value_traversal_is_rejected` and `file_value_absolute_path_is_rejected` in `rume/src/env/loading.rs:300–319`. However, the challenge remains for hermeticity: `rume/tests/env_and_config_loading.rs` still mutates the global process environment with `unsafe { std::env::set_var }` without restoring original environment values on test completion (tracked in finding m2).
-- **T8 — `http_smoke.rs` tests a bare router, not the real health surface** — **REAFFIRMED**. While `http_smoke.rs` was retained as a minimal sanity check, a dedicated integration suite `rume/tests/health_routes.rs` was added to thoroughly test `health_routes()` with `AppContext` state, `HealthChecks::run`, degraded `Warning` (503), failed checks (503), and empty `debug_info`.
-- **T9 — No test isolates or cleans up `ROUTE_REGISTRY` global state across tests** — **REAFFIRMED**. The root cause was eliminated: the process-global `ROUTE_REGISTRY` singleton was abolished in favor of an application-scoped `RouteRegistry` struct embedded in `AppContext` and `Router` (`rume/src/routing/registry.rs:39–50`), preventing parallel test pollution.
-- **NOTE-NEW — `ModuleHarness` isolated module test harness (`rume/src/module/harness.rs`)** — Introduced in v02; evaluated in findings M4 and m1.
-- **NOTE-NEW — `ArchitectureRules` CI enforcement (`rume/src/module/architecture.rs`)** — Introduced in v02; evaluated in finding M2.
-- **NOTE-NEW — Subsystem integration test suites (`rume/tests/`)** — 18 new integration suites covering auth, cache, coordination, enterprise, events, jobs, metrics, outbox, persistence, resilience, routing, sagas, security, and multi-tenancy; evaluated in findings M1 and M3.
+- **T3 — `crates/core/src/config.rs` is entirely untested** — **REAFFIRMED**. In v02, `crates/core/src/config.rs` lines 104–182 adds unit tests covering `load_raw_not_found_when_no_config`, `load_raw_reads_app_toml`, `load_raw_pretty_returns_valid_toml`, and `load_raw_local_toml_is_loaded`. (A minor defect regarding fixed `/tmp` paths is recorded in finding m3).
+- **T4 — `TestApp`/`TestAppBuilder` test harness is itself untested** — **REAFFIRMED**. In v02, `crates/core/src/testing.rs` lines 151–268 introduces 7 unit tests explicitly labeled `T-T4`, verifying `TestApp::new`, `post_json`, `TestAppBuilder::http`, custom state binding, cleanup hooks on `Drop`, explicit `teardown`, and the `status` helper.
+- **T5 — `app.rs` tests miss boundary, Inspect-mode, and lifecycle-ordering surface** — **REAFFIRMED**. In v02, `crates/core/src/app/state.rs` lines 205–234 tests that invalid `u8` values map deterministically to `Created` and `Unknown`; `crates/core/src/app/builder.rs` lines 1381–1440 tests that `ApplicationMode::Inspect` never binds listeners or executes ready/shutdown hooks; and `crates/core/tests/lifecycle_shutdown.rs` verifies lifecycle and availability transitions across server shutdown.
+- **T6 — `error.rs` tests cover 3 of 6 `AppError` variants and assert no response bodies** — **REAFFIRMED**. In v02, `crates/core/src/error.rs` lines 286–455 tests all variants (`NotFound`, `Unauthorized`, `Forbidden`, `BadRequest`, `Internal`, `Validation`, and `Public`), asserts RFC 9457 Problem Details JSON bodies, and verifies that internal diagnostics are never leaked to HTTP clients.
+- **T7 — `env.rs` has no `file:` traversal test, and integration env tests mutate global process env** — **REAFFIRMED in part, CHALLENGED in part**. Path traversal rejection is now thoroughly tested by `file_value_traversal_is_rejected` and `file_value_absolute_path_is_rejected` in `crates/core/src/env/loading.rs:300–319`. However, the challenge remains for hermeticity: `crates/core/tests/env_and_config_loading.rs` still mutates the global process environment with `unsafe { std::env::set_var }` without restoring original environment values on test completion (tracked in finding m2).
+- **T8 — `http_smoke.rs` tests a bare router, not the real health surface** — **REAFFIRMED**. While `http_smoke.rs` was retained as a minimal sanity check, a dedicated integration suite `crates/core/tests/health_routes.rs` was added to thoroughly test `health_routes()` with `AppContext` state, `HealthChecks::run`, degraded `Warning` (503), failed checks (503), and empty `debug_info`.
+- **T9 — No test isolates or cleans up `ROUTE_REGISTRY` global state across tests** — **REAFFIRMED**. The root cause was eliminated: the process-global `ROUTE_REGISTRY` singleton was abolished in favor of an application-scoped `RouteRegistry` struct embedded in `AppContext` and `Router` (`crates/core/src/routing/registry.rs:39–50`), preventing parallel test pollution.
+- **NOTE-NEW — `ModuleHarness` isolated module test harness (`crates/core/src/module/harness.rs`)** — Introduced in v02; evaluated in findings M4 and m1.
+- **NOTE-NEW — `ArchitectureRules` CI enforcement (`crates/core/src/module/architecture.rs`)** — Introduced in v02; evaluated in finding M2.
+- **NOTE-NEW — Subsystem integration test suites (`crates/core/tests/`)** — 18 new integration suites covering auth, cache, coordination, enterprise, events, jobs, metrics, outbox, persistence, resilience, routing, sagas, security, and multi-tenancy; evaluated in findings M1 and M3.
 
 ---
 
@@ -27,7 +27,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### M1 Happy-path test bias across newly introduced subsystems fails to verify critical failure modes, error paths, and security boundaries
 
-- **Where:** `rume/tests/jobs_suite.rs`, `rume/tests/resilience_suite.rs`, `rume/tests/persistence_integration.rs`, `rume/tests/enterprise_suite.rs`, `rume/tests/tenant_suite.rs`, and `rume/tests/auth_suite.rs`.
+- **Where:** `crates/core/tests/jobs_suite.rs`, `crates/core/tests/resilience_suite.rs`, `crates/core/tests/persistence_integration.rs`, `crates/core/tests/enterprise_suite.rs`, `crates/core/tests/tenant_suite.rs`, and `crates/core/tests/auth_suite.rs`.
 - **What it says:**
   The integration suites for newly introduced v02 subsystems almost exclusively verify successful executions and expected HTTP status codes, omitting negative test cases, error propagation, panics, timeouts, and boundary collisions:
   1. *Background Jobs (`jobs_suite.rs`)*: Lines 228–251 test `worker.drain` waiting for `SlowJob`. There are **zero tests** verifying worker behavior when a job handler panics, and **zero tests** verifying job timeouts (`Job::timeout()`). This blindspot allowed Correctness C1 (handler panic permanently leaks `in_flight_count` and hangs `drain()`) and Correctness M2 (`Job::timeout()` is dead code) to pass CI completely unnoticed.
@@ -50,7 +50,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### M2 `ArchitectureRules::verify` only inspects direct dependencies and ignores transitive violations, undeclared modules, and cycles
 
-- **Where:** `rume/src/module/architecture.rs:60–93` and `rume/tests/module_testing_and_architecture_suite.rs:91–133`.
+- **Where:** `crates/core/src/module/architecture.rs:60–93` and `crates/core/tests/module_testing_and_architecture_suite.rs:91–133`.
 - **What it says:**
   ```rust
   // 2. Verify forbidden dependencies
@@ -85,7 +85,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### M3 Widespread non-deterministic wall-clock sleeps across async tests create flaky test risks and slow execution
 
-- **Where:** Across 9 test suites in `rume/tests/`:
+- **Where:** Across 9 test suites in `crates/core/tests/`:
   - `lifecycle_shutdown.rs`: lines 103, 122, 172, 180, 194 (`sleep(Duration::from_millis(30..250))`)
   - `jobs_suite.rs`: lines 80, 131, 189, 220, 244 (`sleep(Duration::from_millis(20..80))`)
   - `job_reliability_suite.rs`: line 79 (`sleep(Duration::from_millis(30))`)
@@ -125,9 +125,9 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### M4 `TestApp` and `RumeBuilder::test_app()` bypass module lifecycle hooks, forcing full TCP socket binds for multi-module integration testing
 
-- **Where:** `rume/src/app/builder.rs:536–543`, `rume/src/testing.rs:8–86`, and `rume/tests/progressive_composition.rs:215–225, 365–385`.
+- **Where:** `crates/core/src/app/builder.rs:536–543`, `crates/core/src/testing.rs:8–86`, and `crates/core/tests/progressive_composition.rs:215–225, 365–385`.
 - **What it says:**
-  In `rume/src/app/builder.rs`:
+  In `crates/core/src/app/builder.rs`:
   ```rust
   pub fn test_app(self) -> Result<crate::testing::TestApp, std::io::Error> {
       let ctx = self.ctx.clone();
@@ -151,7 +151,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### m1 `ModuleHarness` lacks health check verification and error-path test coverage
 
-- **Where:** `rume/src/module/harness.rs:70–75` and `rume/tests/module_testing_and_architecture_suite.rs:41–67`.
+- **Where:** `crates/core/src/module/harness.rs:70–75` and `crates/core/tests/module_testing_and_architecture_suite.rs:41–67`.
 - **What it says:**
   `ModuleHarness<M>` provides `context()`, `module()`, `start()`, `shutdown()`, and `test_app()`. However, it provides no helper to inspect or execute the health checks registered by the module (`module.register_health_checks(&mut checks)`). Furthermore, `module_testing_and_architecture_suite.rs` tests only the happy path of `ModuleHarness`: `start()` failing with `ModuleError::StartupFailed`, calling `shutdown()` when `start()` was never called, or repeated shutdowns are completely untested.
 - **Why it's a problem:** Developers using `ModuleHarness` to test domain modules in isolation have no ergonomic way to verify that their module's diagnostic health checks function correctly. Gaps in harness error handling remain unverified.
@@ -163,7 +163,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### m2 Process environment mutation in `env_and_config_loading.rs` is not hermetically restored
 
-- **Where:** `rume/tests/env_and_config_loading.rs:8–20, 26–153`.
+- **Where:** `crates/core/tests/env_and_config_loading.rs:8–20, 26–153`.
 - **What it says:**
   ```rust
   static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -180,7 +180,7 @@ All prior decisions recorded in `docs/reports/reviews/v01/testing.md` (and track
 
 ### m3 Config unit tests use hardcoded `/tmp` paths rather than isolated `tempfile::tempdir()`
 
-- **Where:** `rume/src/config.rs:114–181`.
+- **Where:** `crates/core/src/config.rs:114–181`.
 - **What it says:**
   ```rust
   let dir = std::env::temp_dir().join("rume_config_test_not_found");

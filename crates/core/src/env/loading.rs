@@ -112,12 +112,11 @@ where
         .collect();
 
     for (key, value) in resolved.values {
-        let value = value
-            .parse::<figment::value::Value>()
-            .map_err(|err| {
-                let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-                EnvError::Validation(redacted)
-            })?;
+        let value = value.parse::<figment::value::Value>().map_err(|err| {
+            let redacted =
+                crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+            EnvError::Validation(redacted)
+        })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
@@ -126,7 +125,8 @@ where
             .expose_secret()
             .parse::<figment::value::Value>()
             .map_err(|err| {
-                let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+                let redacted =
+                    crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
                 EnvError::Validation(redacted)
             })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
@@ -134,7 +134,9 @@ where
     }
 
     let figment = Figment::from(Serialized::defaults(parsed));
-    figment.extract::<T>().map_err(|err| EnvError::from_figment_with_secrets(&err, &known_secrets))
+    figment
+        .extract::<T>()
+        .map_err(|err| EnvError::from_figment_with_secrets(&err, &known_secrets))
 }
 
 /// Load the merged environment map for the current directory.

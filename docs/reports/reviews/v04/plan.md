@@ -23,12 +23,12 @@ in §1.1 is in scope regardless of whether v03 covered it.
 Before dispatching Stage 1, the conductor verifies this plan's scope rather than trusting it
 blindly:
 
-1. Inventory every top-level module under `rume/src/` (e.g. `ls rume/src`) and every
+1. Inventory every top-level module under `crates/core/src/` (e.g. `ls rume/src`) and every
    `rume-cli/` source/test path.
 2. Match each inventory entry against exactly one of: a lens in §4, or the out-of-scope list in
    §1.3, or an explicit "out of scope" ruling recorded in the run's verification note.
-3. Do the same for the workspace manifests (`Cargo.toml`, `rume/Cargo.toml`,
-   `rume-cli/Cargo.toml`) and for any CI configuration present. None exists today (`.github/`
+3. Do the same for the workspace manifests (`Cargo.toml`, `crates/core/Cargo.toml`,
+   `crates/cli/Cargo.toml`) and for any CI configuration present. None exists today (`.github/`
    is absent); if one is added before the run, it is in scope.
 4. **Resolve every unassigned production subsystem before dispatch.** If a match cannot be made,
    assign it, carve it out with a stated reason, and record the ruling in the review folder —
@@ -41,8 +41,8 @@ blindly:
 | Target | Subsystems & source files |
 |---|---|
 | `rume` (core library) | `src/outbox/` · `src/events/` · `src/saga/`<br>`src/persistence/` (`backend.rs`, `config.rs`, `error.rs`, `migration.rs`, `pool.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`, `sql/`)<br>`src/jobs/` (`job.rs`, `queue.rs`, `error.rs`, `reliability.rs`, `retry.rs`, `worker.rs`, `postgres.rs`, `redis.rs`)<br>`src/coordination/` (`error.rs`, `leader.rs`, `lock.rs`, `postgres.rs`, `redis.rs`)<br>`src/tenant/` (`cache.rs`, `layer.rs`, `model.rs`, `quota.rs`, `resolver.rs`, `error.rs`)<br>`src/cache/` (`backend.rs`, `config.rs`, `error.rs`, `typed.rs`, `redis.rs`)<br>`src/resilience/` (`circuit_breaker.rs`, `concurrency.rs`, `rate_limiter.rs`, `redis.rs`, `timeout.rs`, `error.rs`)<br>`src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`) · `src/auth/` (`error.rs`, `identity.rs`, `layer.rs`, `policy.rs`, `schemes.rs`, `session.rs`, `redis.rs`)<br>`src/enterprise/` (`saml.rs`, `scim.rs`) · `src/env/` (`error.rs`, `interpolation.rs`, `loading.rs`, `secrets.rs`)<br>`src/app/` (`builder.rs`, `context.rs`, `observability.rs`, `paths.rs`, `shutdown.rs`, `state.rs`)<br>`src/routing/` (`group.rs`, `health.rs`, `matchers.rs`, `registry.rs`, `rejection.rs`, `resource.rs`, `router.rs`, `spec.rs`, `validated_param.rs`)<br>`src/openapi/` (`spec.rs`) · `src/validation.rs` · `src/error.rs`<br>`src/module/` (`architecture.rs`, `context.rs`, `error.rs`, `harness.rs`, `registry.rs`)<br>`src/metrics/` (`layer.rs`, `registry.rs`) · `src/helpers/` (all) · `src/testing/` (`app.rs`, `harness.rs`, `mod.rs`)<br>`src/lib.rs` · `src/prelude.rs` · `src/config.rs` |
-| `rume-cli` | `src/main.rs`, `cli.rs`, `prompts.rs`, `commands/` (incl. `doctor.rs`, `new.rs`, `list_routes.rs`, `codegen/`, `generate/`, `env/`, `config/`), `ui/`, `templates/` (scaffold output is part of the DX contract), `rume-cli/tests/` |
-| Integration tests | `rume/tests/` — `integration.rs`, `containers.rs`, `integration/*.rs` (25 suites), `containers/*.rs` (7 suites), `common/` |
+| `rume-cli` | `src/main.rs`, `cli.rs`, `prompts.rs`, `commands/` (incl. `doctor.rs`, `new.rs`, `list_routes.rs`, `codegen/`, `generate/`, `env/`, `config/`), `ui/`, `templates/` (scaffold output is part of the DX contract), `crates/cli/tests/` |
+| Integration tests | `crates/core/tests/` — `integration.rs`, `containers.rs`, `integration/*.rs` (25 suites), `containers/*.rs` (7 suites), `common/` |
 
 ### 1.2 Context: what changed since v03 (subject remains the whole codebase)
 
@@ -168,7 +168,7 @@ not prescriptive.
 
 #### Lens 1 — Outbox & Data Integrity (incl. event bus & saga)
 - **Output**: `docs/reports/reviews/v04/outbox-data-integrity.md`
-- **Lead subject**: `rume/src/outbox/` (`message.rs`, `relay.rs`, `repository.rs`, `error.rs`), `rume/src/events/`, `rume/src/saga/`, `rume/src/persistence/sql/{postgres,mysql,sqlite}/outbox_*.sql`, outbox paths in `{postgres,mysql,sqlite}.rs`, `tests/integration/outbox.rs`, `tests/integration/events.rs`, `tests/integration/saga.rs`
+- **Lead subject**: `crates/core/src/outbox/` (`message.rs`, `relay.rs`, `repository.rs`, `error.rs`), `crates/core/src/events/`, `crates/core/src/saga/`, `crates/core/src/persistence/sql/{postgres,mysql,sqlite}/outbox_*.sql`, outbox paths in `{postgres,mysql,sqlite}.rs`, `tests/integration/outbox.rs`, `tests/integration/events.rs`, `tests/integration/saga.rs`
 - **Charter**:
   1. **Lease-token fencing, all backends**: `mark_published` / `mark_failed` / lease renewal take and validate `lease_token`; superseded relays cannot complete messages; rows-affected asserted. Verify across Postgres, MySQL, SQLite — including the DB-clock authority refactor (`a59bab0`, `11bbe3a`, `bd397cd`): expiry now evaluated by the database, not the host.
   2. **Heartbeat loss & active cancellation**: `d58b2bc` propagates heartbeat loss to dispatchers and supports cancellation — verify dispatchers actually observe cancellation mid-dispatch, claimed messages are released/failed (not stranded), and shutdown during an in-flight dispatch cannot corrupt message state. **Do not require exactly-once.** A relay that loses its lease after an external side effect but before `mark_published` cannot be cancelled retroactively; delivery there is **at-least-once**. The verifiable invariants are: (a) a stale relay cannot renew/complete with an obsolete lease token; (b) heartbeat loss triggers cancellation of the in-flight dispatcher; (c) a cancelled or crashed dispatch is recoverable without corrupting message state; (d) where the external side effect cannot be committed atomically with the outbox, dispatch must be explicitly at-least-once and the consumer contract must carry an idempotency strategy; (e) the failure window between successful external publication and `mark_published` is **named and tested**, not assumed away.
@@ -180,7 +180,7 @@ not prescriptive.
 
 #### Lens 2 — Persistence & Pool Lifecycle
 - **Output**: `docs/reports/reviews/v04/pool-lifecycle-persistence.md`
-- **Lead subject**: `rume/src/persistence/` (`pool.rs`, `backend.rs`, `config.rs`, `error.rs`, `migration.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`, `sql/`), `tests/integration/persistence.rs`, `tests/containers/{postgres,mysql}.rs`
+- **Lead subject**: `crates/core/src/persistence/` (`pool.rs`, `backend.rs`, `config.rs`, `error.rs`, `migration.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`, `sql/`), `tests/integration/persistence.rs`, `tests/containers/{postgres,mysql}.rs`
 - **Charter**:
   1. **Physical pool delegation**: `DatabasePool` reflects the underlying SQLx pool (`is_closed`, size/idle telemetry); `close()` / `close_and_drain()` terminate physical connections and in-flight transactions; `DatabaseBackend::close()` implemented per backend.
   2. **Config forwarding**: `min_connections`, `idle_timeout`, `connect_timeout`/`acquire_timeout`, `max_connections` forwarded to `*PoolOptions` on all backends; `auto_migrate` — wired or explicitly removed (v03/diff m1).
@@ -192,7 +192,7 @@ not prescriptive.
 
 #### Lens 3 — Jobs & Worker Concurrency
 - **Output**: `docs/reports/reviews/v04/jobs-worker-concurrency.md`
-- **Lead subject**: `rume/src/jobs/` (`job.rs`, `queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `retry.rs`, `reliability.rs`, `error.rs`), `rume/src/persistence/sql/postgres/jobs_*.sql`, `tests/containers/jobs.rs`, `tests/containers/job_reliability.rs`
+- **Lead subject**: `crates/core/src/jobs/` (`job.rs`, `queue.rs`, `worker.rs`, `postgres.rs`, `redis.rs`, `retry.rs`, `reliability.rs`, `error.rs`), `crates/core/src/persistence/sql/postgres/jobs_*.sql`, `tests/containers/jobs.rs`, `tests/containers/job_reliability.rs`
 - **Charter**:
   1. **Lease fencing**: `ack`/`nack`/`dead_letter` enforce worker + lease token; completed jobs retained with TTL (no physical delete destroying the partial unique index); `jobs_claim.sql`/`jobs_reap.sql` DB-clock evaluation.
   2. **Heartbeat & cancellation**: `renew_lease` API and `JobWorker` background heartbeat; heartbeat-loss propagation to `JobContext` (`d58b2bc`); cancellation token honored mid-handler; DLQ routing on heartbeat loss (not silent abandonment).
@@ -203,7 +203,7 @@ not prescriptive.
 
 #### Lens 4 — Coordination & Multi-Tenancy
 - **Output**: `docs/reports/reviews/v04/coordination-multi-tenant.md`
-- **Lead subject**: `rume/src/coordination/` (`postgres.rs`, `redis.rs`, `lock.rs`, `leader.rs`), `rume/src/tenant/` (`cache.rs`, `quota.rs`, `resolver.rs`, `layer.rs`, `model.rs`), `rume/src/cache/`, `rume/src/resilience/` (`rate_limiter.rs`, `redis.rs`, `circuit_breaker.rs`), `rume/src/persistence/sql/postgres/{lock,leader}_*.sql`, `tests/integration/{coordination,tenant,cache,resilience}.rs`, `tests/containers/{redis,coordination}.rs`
+- **Lead subject**: `crates/core/src/coordination/` (`postgres.rs`, `redis.rs`, `lock.rs`, `leader.rs`), `crates/core/src/tenant/` (`cache.rs`, `quota.rs`, `resolver.rs`, `layer.rs`, `model.rs`), `crates/core/src/cache/`, `crates/core/src/resilience/` (`rate_limiter.rs`, `redis.rs`, `circuit_breaker.rs`), `crates/core/src/persistence/sql/postgres/{lock,leader}_*.sql`, `tests/integration/{coordination,tenant,cache,resilience}.rs`, `tests/containers/{redis,coordination}.rs`
 - **Charter**:
   1. **Fencing & leader terms**: monotonic terms on *every* acquisition (incl. crash re-acquire); server-side `clock_timestamp()` evaluation; renewal fails after expiry; fencing tokens surfaced to callers for downstream validation.
   2. **Redis Cluster safety**: `{...}` hash tags on all multi-key scripts (lock, leader, idempotency, cache tags); Lua script atomicity; timeout safety; `RedisRateLimiter` error classification (not everything = `CircuitOpen`).
@@ -215,7 +215,7 @@ not prescriptive.
 
 #### Lens 5 — Security, SAML & Protocol Hardening
 - **Output**: `docs/reports/reviews/v04/security-protocols.md`
-- **Lead subject**: `rume/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `rume/src/auth/`, `rume/src/enterprise/` (`saml.rs`, `scim.rs`), `rume/src/env/` (`secrets.rs`, `loading.rs`, `interpolation.rs`), `rume/src/helpers/` (`safe_equal.rs`, `html.rs`, `mask.rs`), `tests/integration/{security,enterprise,auth}.rs`
+- **Lead subject**: `crates/core/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `crates/core/src/auth/`, `crates/core/src/enterprise/` (`saml.rs`, `scim.rs`), `crates/core/src/env/` (`secrets.rs`, `loading.rs`, `interpolation.rs`), `crates/core/src/helpers/` (`safe_equal.rs`, `html.rs`, `mask.rs`), `tests/integration/{security,enterprise,auth}.rs`
 - **This lens is large by design. Findings and evidence must be per subsystem** — SAML, SCIM, CSRF, sessions, audit/secrets, headers, auth policy each get their own findings, file:line and verdict. One blended "security is fine/weak" verdict is a process failure; if a subsystem cannot be assessed, say so explicitly rather than covering it with a general statement.
 - **Charter**:
   1. **SAML after `c550731`**: namespace-aware parser; XSW resistance — is the signed element cryptographically bound to the assertion actually consumed (Response vs Assertion envelope signing, Okta/Azure/ADFS compatibility)? Fail-closed conditions (`NotBefore`/`NotOnOrAfter`, clock skew); trust-boundary verification of audience/issuer; comment truncation; verifier mandatory on every production path.
@@ -227,7 +227,7 @@ not prescriptive.
 
 #### Lens 6 — Architecture & Module Boundaries (restored; dropped in v03)
 - **Output**: `docs/reports/reviews/v04/architecture-module-boundaries.md`
-- **Lead subject**: `rume/src/lib.rs`, `src/prelude.rs`, `src/module/` (`architecture.rs`, `context.rs`, `error.rs`, `harness.rs`, `registry.rs`), `src/config.rs`, `src/env/` (loading/interpolation — architecture, not secrets), `src/helpers/` (remainder), `rume/Cargo.toml` + root `Cargo.toml`, `tests/integration/{architecture,composition}.rs`
+- **Lead subject**: `crates/core/src/lib.rs`, `src/prelude.rs`, `src/module/` (`architecture.rs`, `context.rs`, `error.rs`, `harness.rs`, `registry.rs`), `src/config.rs`, `src/env/` (loading/interpolation — architecture, not secrets), `src/helpers/` (remainder), `crates/core/Cargo.toml` + root `Cargo.toml`, `tests/integration/{architecture,composition}.rs`
 - **Charter**:
   1. **Refusal constraints** (from `.opencode/rules/60-architecture.md`, non-negotiable): no runtime DI container; no classpath/module scanning; no hidden AOP (`@Transactional`-style); no mandatory ORM/database; typed config validated at boot (no stringly templating). Flag any drift, however small.
   2. **Crate boundaries & features**: `rume` core free of heavy optional deps (all persistence/redis behind features — verify `cargo tree`-level hygiene from manifests); `rume-cli` depends on `rume`, never reimplements core logic; optional features additive-only; `--no-default-features` surface compiles; `#![forbid(unsafe_code)]` intact.
@@ -238,7 +238,7 @@ not prescriptive.
 
 #### Lens 7 — Application Lifecycle & Composition
 - **Output**: `docs/reports/reviews/v04/app-lifecycle.md`
-- **Lead subject**: `rume/src/app/` (`builder.rs`, `context.rs`, `state.rs`, `shutdown.rs`, `observability.rs`, `paths.rs`), `src/routing/health.rs` only as it binds to availability, `tests/integration/{lifecycle,http_smoke,composition,health}.rs`
+- **Lead subject**: `crates/core/src/app/` (`builder.rs`, `context.rs`, `state.rs`, `shutdown.rs`, `observability.rs`, `paths.rs`), `src/routing/health.rs` only as it binds to availability, `tests/integration/{lifecycle,http_smoke,composition,health}.rs`
 - **Charter**:
   1. **Lifecycle/availability state machine**: atomic `u8` states in `state.rs` (incl. `ApplicationMode`, `LifecycleState`), transition validity, terminal states, unknown-value mapping; refusal-to-serve semantics.
   2. **Build & middleware fail-closed**: duplicate/unknown middleware/group names error before serving; group membership validation; `build_router` vs `run` parity; module-merge collisions.
@@ -251,7 +251,7 @@ not prescriptive.
 
 #### Lens 8 — Routing, Validation, Errors & OpenAPI
 - **Output**: `docs/reports/reviews/v04/routing-api-openapi.md`
-- **Lead subject**: `rume/src/routing/` (`group.rs`, `health.rs`, `matchers.rs`, `registry.rs`, `rejection.rs`, `resource.rs`, `router.rs`, `spec.rs`, `validated_param.rs`), `src/openapi/`, `src/validation.rs`, `src/error.rs`, `src/metrics/`, `tests/integration/{routing,validation,openapi,metrics,route_metadata,error,error_redaction,health,request_identity}.rs`
+- **Lead subject**: `crates/core/src/routing/` (`group.rs`, `health.rs`, `matchers.rs`, `registry.rs`, `rejection.rs`, `resource.rs`, `router.rs`, `spec.rs`, `validated_param.rs`), `src/openapi/`, `src/validation.rs`, `src/error.rs`, `src/metrics/`, `tests/integration/{routing,validation,openapi,metrics,route_metadata,error,error_redaction,health,request_identity}.rs`
 - **Charter**:
   1. **Matcher & routing correctness**: `Number`/`Uuid`/`Slug` edge cases; `ValidatedParam`; route registry (`ROUTE_REGISTRY` poisoning, side-effect-in-`build()`); `RouteSpec`/`RouteGroup`/`Resource` semantics; rejection → status mapping.
   2. **Health subsystem** (869-line `routing/health.rs` — audit hard): check aggregation, caching/TTL, timeouts, partial failure reporting, probe-race behavior, `debug_info` minimality.
@@ -273,7 +273,7 @@ not prescriptive.
 
 #### Lens 10 — Testing & Feature Matrix
 - **Output**: `docs/reports/reviews/v04/testing-feature-matrix.md`
-- **Lead subject**: `rume/Cargo.toml`, root `Cargo.toml`, `rume/tests/` (`integration.rs`, `containers.rs`, `integration/*.rs`, `containers/*.rs`, `common/`), `rume/src/testing/`
+- **Lead subject**: `crates/core/Cargo.toml`, root `Cargo.toml`, `crates/core/tests/` (`integration.rs`, `containers.rs`, `integration/*.rs`, `containers/*.rs`, `common/`), `crates/core/src/testing/`
 - **Charter**:
   1. **Feature matrix builds**: `cargo check`/`test` under `--no-default-features`, `--features sqlite|postgres|mysql|redis`, `--all-features`; `[[test]]` gates; dev-dependencies available to all feature combos; `#![forbid(unsafe_code)]` in test entrypoints vs `#![deny]` consistency.
   2. **2-binary architecture**: `integration` (zero-docker) vs `containers` (live) — is the zero-docker contract real (no container spin-ups sneaking in)? Feature gates on shared `common/` modules.

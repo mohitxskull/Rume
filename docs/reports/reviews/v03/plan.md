@@ -16,7 +16,7 @@ The plan governs the review only; it never outranks the code (`.opencode/rules/2
 |---|---|
 | `rume` (Core Library) | `src/persistence/` (`backend.rs`, `config.rs`, `error.rs`, `migration.rs`, `pool.rs`, `postgres.rs`, `mysql.rs`, `sqlite.rs`, `sql/`)<br>`src/outbox/` (`message.rs`, `relay.rs`, `repository.rs`, `error.rs`, `mod.rs`)<br>`src/jobs/` (`context.rs`, `error.rs`, `job.rs`, `queue.rs`, `registry.rs`, `reliability.rs`, `retry.rs`, `worker.rs`, `postgres.rs`, `redis.rs`)<br>`src/coordination/` (`error.rs`, `leader.rs`, `lock.rs`, `postgres.rs`, `redis.rs`)<br>`src/app/` (`builder.rs`, `context.rs`, `lifecycle.rs`, `observability.rs`, `paths.rs`, `shutdown.rs`, `state.rs`, `mode.rs`)<br>`src/auth/` (`identity.rs`, `layer.rs`, `policy.rs`, `scheme.rs`, `session.rs`)<br>`src/cache/` (`backend.rs`, `config.rs`, `error.rs`, `typed.rs`, `redis.rs`)<br>`src/enterprise/` (`saml.rs`, `scim.rs`)<br>`src/env/` (`error.rs`, `interpolation.rs`, `loading.rs`, `secrets.rs`)<br>`src/metrics/` (`layer.rs`, `registry.rs`)<br>`src/module/` (`architecture.rs`, `context.rs`, `dependency.rs`, `lifecycle.rs`, `traits.rs`)<br>`src/resilience/` (`circuit_breaker.rs`, `rate_limiter.rs`)<br>`src/routing/` (`group.rs`, `health.rs`, `matcher.rs`, `registry.rs`, `rejection.rs`, `router.rs`, `spec.rs`, `validated_param.rs`)<br>`src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`)<br>`src/tenant/` (`cache.rs`, `layer.rs`, `model.rs`, `resolver.rs`) |
 | `rume-cli` (CLI Tooling) | `src/main.rs`, `cli.rs`, `prompts.rs`, `commands/`, `ui/` |
-| Integration Tests | `rume/tests/` (All 24 test suites including live Testcontainers suites for PostgreSQL, MySQL, Redis, and SQLite) |
+| Integration Tests | `crates/core/tests/` (All 24 test suites including live Testcontainers suites for PostgreSQL, MySQL, Redis, and SQLite) |
 
 **Out of Scope**:
 - `lab/` (experimental scratch space).
@@ -80,7 +80,7 @@ flowchart TD
 
 #### Lens 1: Outbox & Data Integrity
 - **Output File**: `docs/reports/reviews/v03/outbox-data-integrity.md`
-- **Lead Subject**: `rume/src/outbox/`, `rume/src/persistence/{postgres,mysql,sqlite}.rs`, `rume/src/persistence/sql/*/outbox_*.sql`
+- **Lead Subject**: `crates/core/src/outbox/`, `crates/core/src/persistence/{postgres,mysql,sqlite}.rs`, `crates/core/src/persistence/sql/*/outbox_*.sql`
 - **Charter**:
   1. **Lease Token Ownership**: Verify whether `mark_published()` and `mark_failed()` take and validate the `lease_token`. A superseded worker whose lease expired must not be able to mark a message published/failed after another relay reclaimed it.
   2. **Expiration Recovery SQL**: Verify `outbox_recover.sql`. Audit the condition `(lease_expires_at <= $1 OR ($1 - created_at) >= $2)`. Does reclaiming based on message age (`created_at`) violate active leases and cause double delivery?
@@ -90,7 +90,7 @@ flowchart TD
 
 #### Lens 2: Persistence & Connection Pool Lifecycle
 - **Output File**: `docs/reports/reviews/v03/pool-lifecycle-persistence.md`
-- **Lead Subject**: `rume/src/persistence/pool.rs`, `rume/src/persistence/backend.rs`, `rume/src/persistence/config.rs`, `rume/src/persistence/{postgres,mysql,sqlite}.rs`
+- **Lead Subject**: `crates/core/src/persistence/pool.rs`, `crates/core/src/persistence/backend.rs`, `crates/core/src/persistence/config.rs`, `crates/core/src/persistence/{postgres,mysql,sqlite}.rs`
 - **Charter**:
   1. **Pool Abstraction Delegation**: Audit `DatabasePool`. Does it maintain a disconnected semaphore and fictitious connection counters (`total_connections`), or does it honestly reflect and delegate to the underlying SQLx pool (`PgPool`, `MySqlPool`, `SqlitePool`)?
   2. **Physical Pool Lifecycle**: Does `pool.close()` actually close the underlying database pool (`PgPool::close`), and does `close_and_drain()` prove that physical connections and in-flight transactions are terminated?
@@ -99,7 +99,7 @@ flowchart TD
 
 #### Lens 3: Jobs & Worker Concurrency
 - **Output File**: `docs/reports/reviews/v03/jobs-worker-concurrency.md`
-- **Lead Subject**: `rume/src/jobs/`, `rume/src/jobs/postgres.rs`, `rume/src/jobs/redis.rs`, `rume/src/jobs/worker.rs`, `rume/src/jobs/reliability.rs`
+- **Lead Subject**: `crates/core/src/jobs/`, `crates/core/src/jobs/postgres.rs`, `crates/core/src/jobs/redis.rs`, `crates/core/src/jobs/worker.rs`, `crates/core/src/jobs/reliability.rs`
 - **Charter**:
   1. **Job Claim Lease Ownership**: Does `ack()`, `nack()`, and `dead_letter()` enforce lease token / worker ownership? Can a worker that lost its lease alter job status?
   2. **Active Job Lease Renewal / Heartbeat**: Can a long-running job (>60s) renew its lease while executing? Is there an API (`renew_lease` / `heartbeat`) on `JobQueue` and in `JobWorker`?
@@ -112,16 +112,16 @@ flowchart TD
 
 #### Lens 4: Distributed Coordination & Multi-Tenancy
 - **Output File**: `docs/reports/reviews/v03/coordination-multi-tenant.md`
-- **Lead Subject**: `rume/src/coordination/`, `rume/src/tenant/`, `rume/src/resilience/rate_limiter.rs`, `rume/src/cache/redis.rs`
+- **Lead Subject**: `crates/core/src/coordination/`, `crates/core/src/tenant/`, `crates/core/src/resilience/rate_limiter.rs`, `crates/core/src/cache/redis.rs`
 - **Charter**:
   1. **Distributed Lock Fencing**: In `PostgresDistributedLock` and `RedisDistributedLock`, are fencing tokens monotonically increasing and strictly validated? Does lock renewal fail if the lease expired?
   2. **Leader Election Leases & Failover**: In `PostgresLeaderElector` and `RedisLeaderElector`, verify term monotonic increments and candidate takeover semantics upon lease expiration.
   3. **Multi-Tenant Boundary Isolation**: Audit `TenantContext`, `TenantScopedCache`, and `HeaderTenantResolver`/`SubdomainTenantResolver`. Are cross-tenant data leaks impossible across cache, rate limiting, and database connections?
-  4. **Redis Coordination Scripts**: Audit Lua scripts in `rume/src/coordination/redis.rs` and `rume/src/jobs/redis.rs` for atomic key updates and script timeout safety.
+  4. **Redis Coordination Scripts**: Audit Lua scripts in `crates/core/src/coordination/redis.rs` and `crates/core/src/jobs/redis.rs` for atomic key updates and script timeout safety.
 
 #### Lens 5: Security, SAML & Protocol Hardening
 - **Output File**: `docs/reports/reviews/v03/security-protocols.md`
-- **Lead Subject**: `rume/src/enterprise/saml.rs`, `rume/src/security/`, `rume/src/auth/`
+- **Lead Subject**: `crates/core/src/enterprise/saml.rs`, `crates/core/src/security/`, `crates/core/src/auth/`
 - **Charter**:
   1. **SAML XML Parsing & XSW Resistance**: Does `SamlParser` resist XML Signature Wrapping (XSW) attacks? Is the signed XML element cryptographically bound to the assertion extracted and consumed?
   2. **SAML Verification Enforcement**: Does `SamlParser::parse()` allow unverified assertions to be consumed in production, or should `parse_verified()` be the mandatory path?
@@ -130,7 +130,7 @@ flowchart TD
 
 #### Lens 6: Testing & Feature Matrix Verification
 - **Output File**: `docs/reports/reviews/v03/testing-feature-matrix.md`
-- **Lead Subject**: `rume/Cargo.toml`, `Cargo.toml`, `rume/tests/` (all 24 suites)
+- **Lead Subject**: `crates/core/Cargo.toml`, `Cargo.toml`, `crates/core/tests/` (all 24 suites)
 - **Charter**:
   1. **Feature Gate Consistency**: Audit `enterprise_integration_pipeline.rs` and other test files. Are all feature dependencies properly gated (e.g. `#![cfg(feature = "postgres")]`) so `cargo check --no-default-features` or single-feature configurations compile cleanly?
   2. **Feature Matrix Testing**: Check buildability and test execution under matrix combinations:
@@ -140,7 +140,7 @@ flowchart TD
      - `--all-features`
   3. **Test Invariants & Flakiness**: Audit live container test timeouts, port allocations, cleanup on failure, and race conditions in concurrent tests.
   4. **Negative & Error Invariant Coverage**: Verify that tests assert real failure conditions (e.g., connection drop, lease loss, duplicate ID rejection) rather than only happy paths.
-  5. **Test Directory Structure & Binary Explosion**: Audit `rume/tests/` (24 flat `.rs` files). Measure compilation overhead of compiling 24 distinct binaries and specify reorganization into consolidated test entrypoints (`tests/integration.rs`, `tests/containers.rs`, `tests/common/`).
+  5. **Test Directory Structure & Binary Explosion**: Audit `crates/core/tests/` (24 flat `.rs` files). Measure compilation overhead of compiling 24 distinct binaries and specify reorganization into consolidated test entrypoints (`tests/integration.rs`, `tests/containers.rs`, `tests/common/`).
   6. **Testcontainers Lifecycle & Reuse**: Audit container spin-up overhead across test suites. Specify reusable container fixtures with database/schema isolation (`UUID` DB names) to eliminate multi-second container restarts per test function.
   7. **Declarative Test Harness**: Audit setup boilerplate across test suites. Specify a first-party `RumeTestHarness` in `rume::testing` providing fluent test orchestration.
   8. **Testing Tooling Integration**: Evaluate adoption of `rstest` (fixtures/parameters), `insta` (snapshot testing for OpenAPI & RFC 9457 Problem Details), and `wiremock` (external HTTP IdP/webhook mocks).

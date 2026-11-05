@@ -53,11 +53,7 @@ pub trait IdempotencyStore: Debug + Send + Sync + 'static {
     }
 
     /// Releases an in-progress lock with owner token validation, permitting re-execution.
-    fn release_with_token(
-        &self,
-        key: &str,
-        _token: &str,
-    ) -> BoxFuture<'_, Result<(), JobError>> {
+    fn release_with_token(&self, key: &str, _token: &str) -> BoxFuture<'_, Result<(), JobError>> {
         self.release(key)
     }
 }

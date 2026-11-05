@@ -122,11 +122,14 @@ pub struct SqlAuditLogger<B: DatabaseBackend> {
 
 impl<B: DatabaseBackend> SqlAuditLogger<B> {
     /// Schema DDL for audit log table in PostgreSQL.
-    pub const POSTGRES_SCHEMA: &'static str = include_str!("../persistence/sql/postgres/audit_schema.sql");
+    pub const POSTGRES_SCHEMA: &'static str =
+        include_str!("../persistence/sql/postgres/audit_schema.sql");
     /// Schema DDL for audit log table in MySQL.
-    pub const MYSQL_SCHEMA: &'static str = include_str!("../persistence/sql/mysql/audit_schema.sql");
+    pub const MYSQL_SCHEMA: &'static str =
+        include_str!("../persistence/sql/mysql/audit_schema.sql");
     /// Schema DDL for audit log table in SQLite.
-    pub const SQLITE_SCHEMA: &'static str = include_str!("../persistence/sql/sqlite/audit_schema.sql");
+    pub const SQLITE_SCHEMA: &'static str =
+        include_str!("../persistence/sql/sqlite/audit_schema.sql");
 
     /// Backward compatibility alias.
     pub const SCHEMA: &'static str = Self::POSTGRES_SCHEMA;
@@ -168,7 +171,9 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
             .await
             .map_err(|e| AuditError::Sink(e.to_string()))?
             .unwrap_or_else(|| "0".to_string());
-        count_str.parse().map_err(|e| AuditError::Sink(format!("{e}")))
+        count_str
+            .parse()
+            .map_err(|e| AuditError::Sink(format!("{e}")))
     }
 }
 

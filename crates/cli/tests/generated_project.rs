@@ -342,7 +342,10 @@ fn make_migration_and_db_commands_workflow() {
         .current_dir(&project_dir)
         .output()
         .expect("run make:migration");
-    assert!(make_res.status.success(), "make:migration should exit with code 0");
+    assert!(
+        make_res.status.success(),
+        "make:migration should exit with code 0"
+    );
 
     let stdout = String::from_utf8_lossy(&make_res.stdout);
     assert!(stdout.contains("Created migrations/"));
@@ -388,11 +391,7 @@ fn make_migration_and_db_commands_workflow() {
         "CREATE TABLE test_users (id TEXT PRIMARY KEY, name TEXT NOT NULL);\n",
     )
     .unwrap();
-    fs::write(
-        migrations_dir.join(down_file),
-        "DROP TABLE test_users;\n",
-    )
-    .unwrap();
+    fs::write(migrations_dir.join(down_file), "DROP TABLE test_users;\n").unwrap();
 
     // 5. Run `rume db:migrate` with DATABASE_URL
     let migrate_res = Command::new(rume_binary())

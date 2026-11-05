@@ -8,8 +8,8 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -466,7 +466,7 @@ where
                 name: Some(r.name.clone()),
                 params: r.params.clone(),
                 matchers: Vec::new(),
-            request_schema: None,
+                request_schema: None,
             });
         }
         self
@@ -1005,10 +1005,9 @@ where
                 let new_method = r.method.to_string();
                 let new_path = &r.path;
                 // App M4: Check ANY method overlap against existing routes to avoid Axum panics
-                if seen_routes
-                    .iter()
-                    .any(|(m, p)| p == new_path && (m == &new_method || m == "ANY" || new_method == "ANY"))
-                {
+                if seen_routes.iter().any(|(m, p)| {
+                    p == new_path && (m == &new_method || m == "ANY" || new_method == "ANY")
+                }) {
                     return Err(BuildError::DuplicateRoute {
                         method: new_method,
                         path: r.path.clone(),

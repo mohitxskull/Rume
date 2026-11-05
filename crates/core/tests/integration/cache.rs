@@ -127,7 +127,10 @@ async fn cache_typed_wrapper_convenience() {
     };
 
     // First call computes
-    let p1: Product = cache.remember("expensive_item", None, compute).await.unwrap();
+    let p1: Product = cache
+        .remember("expensive_item", None, compute)
+        .await
+        .unwrap();
     assert_eq!(p1.id, "computed_1");
     assert_eq!(compute_counter.load(Ordering::SeqCst), 1);
 

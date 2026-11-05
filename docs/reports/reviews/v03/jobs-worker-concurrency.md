@@ -8,11 +8,11 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ## Prior decisions
 
-- **v02 Correctness C1 (Panic during job execution permanently leaks `in_flight_count` and hangs `drain()`)** — **CHALLENGED (Partial Remediation)**. The RAII drop guard `InFlightGuard` (`rume/src/jobs/worker.rs:89–95`) successfully decrements `in_flight_count` during task unwinding, preventing `JobWorker::drain()` from hanging. However, the second requirement of the prior fix—catching task panics via `catch_unwind` and transitioning the job to the dead-letter queue—was not implemented. Unhandled panics escape `execute_job`, leaving the job orphaned in `in_flight` status in PostgreSQL, failing to release or dead-letter the job, and leaving idempotency locks held until TTL. Evaluated in finding M1.
-- **v02 Correctness M2 (`Job::timeout()` is never enforced during job execution)** — **REAFFIRMED**. Verified in `rume/src/jobs/worker.rs:77–82`, `rume/src/jobs/job.rs:69`, and `rume/src/jobs/postgres.rs:184`. Job timeouts are preserved in `QueuedJob.timeout` and strictly enforced during handler dispatch via `tokio::time::timeout`, converting exceeded deadlines into `JobError::Timeout`.
-- **v02 Enterprise-Reliability M1 (`JobWorker` lacks shed-load concurrency bounds)** — **REAFFIRMED**. Verified in `rume/src/jobs/worker.rs:104–105, 156–175, 264–267`. `JobWorker` enforces bounded concurrency defaulting to 50 tasks (or custom limits) using an owned `tokio::sync::Semaphore` permit acquired prior to `dequeue_for`.
-- **v02 Enterprise-Reliability M2 (Distributed worker heartbeats and abandoned job recovery are disconnected dead code)** — **CHALLENGED**. While `JobWorker::start` now spawns periodic worker node heartbeat and abandoned worker recovery loops (`rume/src/jobs/worker.rs:229–258`), the implementation operates exclusively at the coarse *worker node* level (`RedisHeartbeatRegistry`) rather than the *job claim lease* level. A healthy worker running a legitimate job that exceeds the 60-second database claim lease duration has no lease renewal API, resulting in peer workers reclaiming and duplicating the job while the first worker is still active. Furthermore, worker heartbeats live in Redis while jobs live in PostgreSQL, creating split-brain divergence. Evaluated in findings C1 and C2.
-- **v02 Testing M1 (Happy-path test bias across newly introduced subsystems)** — **REAFFIRMED**. Tests in `rume/tests/jobs_suite.rs` and `rume/tests/job_reliability_suite.rs` verify retry backoff, DLQ on max attempts, timeout enforcement, bounded concurrency, and worker panic drop safety. However, concurrent race tests for superseded worker lease theft, worker crash mid-retry, and unacknowledged in-progress idempotency skips are missing.
+- **v02 Correctness C1 (Panic during job execution permanently leaks `in_flight_count` and hangs `drain()`)** — **CHALLENGED (Partial Remediation)**. The RAII drop guard `InFlightGuard` (`crates/core/src/jobs/worker.rs:89–95`) successfully decrements `in_flight_count` during task unwinding, preventing `JobWorker::drain()` from hanging. However, the second requirement of the prior fix—catching task panics via `catch_unwind` and transitioning the job to the dead-letter queue—was not implemented. Unhandled panics escape `execute_job`, leaving the job orphaned in `in_flight` status in PostgreSQL, failing to release or dead-letter the job, and leaving idempotency locks held until TTL. Evaluated in finding M1.
+- **v02 Correctness M2 (`Job::timeout()` is never enforced during job execution)** — **REAFFIRMED**. Verified in `crates/core/src/jobs/worker.rs:77–82`, `crates/core/src/jobs/job.rs:69`, and `crates/core/src/jobs/postgres.rs:184`. Job timeouts are preserved in `QueuedJob.timeout` and strictly enforced during handler dispatch via `tokio::time::timeout`, converting exceeded deadlines into `JobError::Timeout`.
+- **v02 Enterprise-Reliability M1 (`JobWorker` lacks shed-load concurrency bounds)** — **REAFFIRMED**. Verified in `crates/core/src/jobs/worker.rs:104–105, 156–175, 264–267`. `JobWorker` enforces bounded concurrency defaulting to 50 tasks (or custom limits) using an owned `tokio::sync::Semaphore` permit acquired prior to `dequeue_for`.
+- **v02 Enterprise-Reliability M2 (Distributed worker heartbeats and abandoned job recovery are disconnected dead code)** — **CHALLENGED**. While `JobWorker::start` now spawns periodic worker node heartbeat and abandoned worker recovery loops (`crates/core/src/jobs/worker.rs:229–258`), the implementation operates exclusively at the coarse *worker node* level (`RedisHeartbeatRegistry`) rather than the *job claim lease* level. A healthy worker running a legitimate job that exceeds the 60-second database claim lease duration has no lease renewal API, resulting in peer workers reclaiming and duplicating the job while the first worker is still active. Furthermore, worker heartbeats live in Redis while jobs live in PostgreSQL, creating split-brain divergence. Evaluated in findings C1 and C2.
+- **v02 Testing M1 (Happy-path test bias across newly introduced subsystems)** — **REAFFIRMED**. Tests in `crates/core/tests/jobs_suite.rs` and `crates/core/tests/job_reliability_suite.rs` verify retry backoff, DLQ on max attempts, timeout enforcement, bounded concurrency, and worker panic drop safety. However, concurrent race tests for superseded worker lease theft, worker crash mid-retry, and unacknowledged in-progress idempotency skips are missing.
 - **PostgreSQL Durable Job Queue (`PostgresJobQueue`) & Redis Reliability Store (`RedisIdempotencyStore`)** — **NOTE-NEW**. New production implementations introduced in the Phase 5 / SQLx modernization; audited in findings C1, C2, C3, M2, M3, M5, M6, m1, and m6.
 
 ---
@@ -21,9 +21,9 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### C1 Job state mutations (`ack`, `nack`, `dead_letter`) lack lease token and worker ownership verification, enabling superseded workers to corrupt or delete active jobs
 
-- **Where:** `rume/src/jobs/queue.rs:37–45` and `rume/src/jobs/postgres.rs:209–252`
+- **Where:** `crates/core/src/jobs/queue.rs:37–45` and `crates/core/src/jobs/postgres.rs:209–252`
 - **What it says:**
-  In `rume/src/jobs/queue.rs`:
+  In `crates/core/src/jobs/queue.rs`:
   ```rust
   /// Acknowledges successful execution, removing the job from the queue.
   fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>>;
@@ -34,7 +34,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
   /// Moves a permanently failed job to the dead-letter queue (DLQ).
   fn dead_letter(&self, job: QueuedJob, reason: String) -> BoxFuture<'_, Result<(), JobError>>;
   ```
-  In `rume/src/jobs/postgres.rs`:
+  In `crates/core/src/jobs/postgres.rs`:
   ```rust
   fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
       let jid = job_id.to_string();
@@ -107,9 +107,9 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### C2 Missing job-level lease renewal / heartbeat API causes duplicate concurrent execution of legitimate long-running jobs
 
-- **Where:** `rume/src/jobs/queue.rs:10–51`, `rume/src/jobs/postgres.rs:32, 48–53, 151–159`, and `rume/src/jobs/worker.rs:296–343`
+- **Where:** `crates/core/src/jobs/queue.rs:10–51`, `crates/core/src/jobs/postgres.rs:32, 48–53, 151–159`, and `crates/core/src/jobs/worker.rs:296–343`
 - **What it says:**
-  In `rume/src/jobs/postgres.rs`:
+  In `crates/core/src/jobs/postgres.rs`:
   ```rust
   pub fn new(pool: PgPool) -> Self {
       Self {
@@ -118,9 +118,9 @@ The Rume background jobs subsystem introduces robust foundations for distributed
       }
   }
   ```
-  In `rume/src/jobs/queue.rs`:
+  In `crates/core/src/jobs/queue.rs`:
   The `JobQueue` trait exposes only `enqueue`, `enqueue_delayed`, `dequeue`, `dequeue_for`, `reclaim_abandoned_jobs`, `ack`, `nack`, `dead_letter`, `pending_count`, and `dead_letter_count`. There is no `renew_lease` or `heartbeat_job` method.
-  In `rume/src/jobs/worker.rs`:
+  In `crates/core/src/jobs/worker.rs`:
   ```rust
   async fn execute_job(
       queue: Arc<Q>,
@@ -161,22 +161,22 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### C3 `ack()` physically deletes jobs upon completion, destroying PostgreSQL partial unique index deduplication and causing duplicate execution on redelivery
 
-- **Where:** `rume/src/jobs/postgres.rs:209–219`, `rume/src/persistence/sql/postgres/jobs_schema.sql:21`, and `rume/src/persistence/sql/postgres/jobs_insert.sql:6–7`
+- **Where:** `crates/core/src/jobs/postgres.rs:209–219`, `crates/core/src/persistence/sql/postgres/jobs_schema.sql:21`, and `crates/core/src/persistence/sql/postgres/jobs_insert.sql:6–7`
 - **What it says:**
-  In `rume/src/persistence/sql/postgres/jobs_schema.sql`:
+  In `crates/core/src/persistence/sql/postgres/jobs_schema.sql`:
   ```sql
   CREATE UNIQUE INDEX IF NOT EXISTS idx_rume_jobs_idempotency
   ON rume_jobs (idempotency_key)
   WHERE idempotency_key IS NOT NULL AND status != 'dead_letter';
   ```
-  In `rume/src/persistence/sql/postgres/jobs_insert.sql`:
+  In `crates/core/src/persistence/sql/postgres/jobs_insert.sql`:
   ```sql
   INSERT INTO rume_jobs (...) VALUES (...)
   ON CONFLICT (idempotency_key) WHERE idempotency_key IS NOT NULL AND status != 'dead_letter'
   DO NOTHING
   RETURNING id;
   ```
-  In `rume/src/jobs/postgres.rs`:
+  In `crates/core/src/jobs/postgres.rs`:
   ```rust
   fn ack(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
       let jid = job_id.to_string();
@@ -205,9 +205,9 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M1 Job handler panic abandons in-flight jobs without DLQ recording and leaves idempotency locks permanently held
 
-- **Where:** `rume/src/jobs/worker.rs:277–281, 296–343`
+- **Where:** `crates/core/src/jobs/worker.rs:277–281, 296–343`
 - **What it says:**
-  In `rume/src/jobs/worker.rs`:
+  In `crates/core/src/jobs/worker.rs`:
   ```rust
   tokio::spawn(async move {
       let _permit = permit;
@@ -278,7 +278,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M2 Releasing idempotency keys on retryable failures permits concurrent duplicate execution during the backoff delay
 
-- **Where:** `rume/src/jobs/worker.rs:330–337`
+- **Where:** `crates/core/src/jobs/worker.rs:330–337`
 - **What it says:**
   ```rust
   Err(err) => {
@@ -309,7 +309,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M3 `IdempotencyStatus::InProgress` silently drops jobs from the worker without acknowledgment or delayed re-queue
 
-- **Where:** `rume/src/jobs/worker.rs:304–315`
+- **Where:** `crates/core/src/jobs/worker.rs:304–315`
 - **What it says:**
   ```rust
   if let (Some(store), Some(key)) = (&idempotency_store, &job.idempotency_key) {
@@ -344,9 +344,9 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M4 Non-retryable error types (`UnknownJob`, `Serialization`) are treated as retryable, exhausting max retries before DLQ
 
-- **Where:** `rume/src/jobs/worker.rs:324–342` and `rume/src/jobs/error.rs:20–26`
+- **Where:** `crates/core/src/jobs/worker.rs:324–342` and `crates/core/src/jobs/error.rs:20–26`
 - **What it says:**
-  In `rume/src/jobs/worker.rs`:
+  In `crates/core/src/jobs/worker.rs`:
   ```rust
   match registry.dispatch(&job).await {
       Ok(()) => { ... }
@@ -399,7 +399,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M5 Redis `IdempotencyStore::release` and `complete` perform unverified mutations, risking cross-worker lock deletion
 
-- **Where:** `rume/src/jobs/redis.rs:263–309`
+- **Where:** `crates/core/src/jobs/redis.rs:263–309`
 - **What it says:**
   ```rust
   fn complete(&self, key: &str, result: Option<Vec<u8>>) -> BoxFuture<'_, Result<(), JobError>> {
@@ -461,7 +461,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### M6 `PostgresJobQueue::enqueue_delayed` returns fictitious IDs on duplicate conflict resolution race
 
-- **Where:** `rume/src/jobs/postgres.rs:120–140`
+- **Where:** `crates/core/src/jobs/postgres.rs:120–140`
 - **What it says:**
   ```rust
   if let Some(r) = row {
@@ -497,7 +497,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m1 Wall-clock underflow panic in `PostgresJobQueue::dequeue_for` on systems with low monotonic uptime
 
-- **Where:** `rume/src/jobs/postgres.rs:186–190`
+- **Where:** `crates/core/src/jobs/postgres.rs:186–190`
 - **What it says:**
   ```rust
   let available_at = if available_at_ms <= now {
@@ -514,7 +514,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m2 Exponential backoff in `RetryPolicy` lacks randomized jitter and is vulnerable to NaN/overflow
 
-- **Where:** `rume/src/jobs/retry.rs:68–73`
+- **Where:** `crates/core/src/jobs/retry.rs:68–73`
 - **What it says:**
   ```rust
   let exponent = (attempt.saturating_sub(1)) as i32;
@@ -533,7 +533,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m3 `JobWorker` lacks cancellation token propagation to `JobContext` during graceful drain
 
-- **Where:** `rume/src/jobs/job.rs:40–47` and `rume/src/jobs/worker.rs:70–75, 346–358`
+- **Where:** `crates/core/src/jobs/job.rs:40–47` and `crates/core/src/jobs/worker.rs:70–75, 346–358`
 - **What it says:**
   `JobContext` contains only `id`, `attempt`, and `max_attempts`.
   In `JobWorker::drain(timeout)`, the worker sets `is_stopping = true` and polls `in_flight_count`.
@@ -545,7 +545,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m4 DLQ lacks failure timestamp and query/replay administrative APIs
 
-- **Where:** `rume/src/jobs/queue.rs:43–50` and `rume/src/persistence/sql/postgres/jobs_schema.sql:1–18`
+- **Where:** `crates/core/src/jobs/queue.rs:43–50` and `crates/core/src/persistence/sql/postgres/jobs_schema.sql:1–18`
 - **What it says:**
   `rume_jobs` stores `dead_letter_reason TEXT`, but contains no `dead_lettered_at` timestamp.
   `JobQueue` exposes only `dead_letter_count(&self)`.
@@ -557,7 +557,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m5 Worker poll error loop busy-spins every 50ms during database outages
 
-- **Where:** `rume/src/jobs/worker.rs:287–290`
+- **Where:** `crates/core/src/jobs/worker.rs:287–290`
 - **What it says:**
   ```rust
   Err(_) => {
@@ -573,7 +573,7 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ### m6 Dual lease expiration recovery between `jobs_claim.sql` and `jobs_reap.sql` lacks coordination
 
-- **Where:** `rume/src/persistence/sql/postgres/jobs_claim.sql:9` and `rume/src/persistence/sql/postgres/jobs_reap.sql:5–6`
+- **Where:** `crates/core/src/persistence/sql/postgres/jobs_claim.sql:9` and `crates/core/src/persistence/sql/postgres/jobs_reap.sql:5–6`
 - **What it says:**
   Both `jobs_claim.sql` (`OR (status = 'in_flight' AND lease_expires_at <= $3)`) and `jobs_reap.sql` (`WHERE status = 'in_flight' AND (assigned_worker = ANY($1) OR lease_expires_at <= $2)`) attempt to recover expired claims.
 - **Why it's a problem:** `jobs_claim.sql` claims and increments `attempt` directly, whereas `jobs_reap.sql` resets status to `'pending'` without touching `attempt`. When a reaped job is subsequently claimed, `attempt` is incremented again. Furthermore, `jobs_reap.sql` lacks `FOR UPDATE SKIP LOCKED`, causing lock contention with `jobs_claim.sql`.
@@ -584,10 +584,10 @@ The Rume background jobs subsystem introduces robust foundations for distributed
 
 ## Positive notes
 
-- **Row-level concurrency via `FOR UPDATE SKIP LOCKED`:** In `rume/src/persistence/sql/postgres/jobs_claim.sql:12`, using `FOR UPDATE SKIP LOCKED` guarantees that concurrent worker nodes never block each other or claim overlapping jobs, providing clean $O(1)$ lock-free dequeueing.
-- **RAII-guarded in-flight accounting:** `InFlightGuard` in `rume/src/jobs/worker.rs:89–95` ensures that worker in-flight counts and concurrency permits are unconditionally decremented upon task drop or panic, fixing the graceful shutdown hang from v02.
-- **Tokio semaphore concurrency limiting:** Bounding background worker tasks via `tokio::sync::Semaphore` (`rume/src/jobs/worker.rs:169, 264–278`) prevents queue spikes from spawning unbounded async tasks, protecting memory and database connection pools.
-- **Execution timeout enforcement:** Wrapping handler dispatch in `tokio::time::timeout` (`rume/src/jobs/worker.rs:77–82`) ensures that hanging handlers are reliably aborted with `JobError::Timeout`.
+- **Row-level concurrency via `FOR UPDATE SKIP LOCKED`:** In `crates/core/src/persistence/sql/postgres/jobs_claim.sql:12`, using `FOR UPDATE SKIP LOCKED` guarantees that concurrent worker nodes never block each other or claim overlapping jobs, providing clean $O(1)$ lock-free dequeueing.
+- **RAII-guarded in-flight accounting:** `InFlightGuard` in `crates/core/src/jobs/worker.rs:89–95` ensures that worker in-flight counts and concurrency permits are unconditionally decremented upon task drop or panic, fixing the graceful shutdown hang from v02.
+- **Tokio semaphore concurrency limiting:** Bounding background worker tasks via `tokio::sync::Semaphore` (`crates/core/src/jobs/worker.rs:169, 264–278`) prevents queue spikes from spawning unbounded async tasks, protecting memory and database connection pools.
+- **Execution timeout enforcement:** Wrapping handler dispatch in `tokio::time::timeout` (`crates/core/src/jobs/worker.rs:77–82`) ensures that hanging handlers are reliably aborted with `JobError::Timeout`.
 - **Clean modular traits:** Decoupling `JobQueue`, `HeartbeatRegistry`, `IdempotencyStore`, and `JobRegistry` provides clean boundaries for testing and backend substitutability.
 
 ---

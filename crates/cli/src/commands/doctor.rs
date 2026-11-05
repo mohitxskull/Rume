@@ -1,8 +1,8 @@
-use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 use rume::config;
 use rume::env;
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 struct DoctorOutput {
@@ -240,15 +240,27 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
             let total_migrations = migrator.migrations().len();
 
             let applied_res = match &handle {
-                crate::commands::db::BackendHandle::Postgres(b) => migrator.applied_migrations(b).await,
-                crate::commands::db::BackendHandle::Sqlite(b) => migrator.applied_migrations(b).await,
-                crate::commands::db::BackendHandle::Mysql(b) => migrator.applied_migrations(b).await,
+                crate::commands::db::BackendHandle::Postgres(b) => {
+                    migrator.applied_migrations(b).await
+                }
+                crate::commands::db::BackendHandle::Sqlite(b) => {
+                    migrator.applied_migrations(b).await
+                }
+                crate::commands::db::BackendHandle::Mysql(b) => {
+                    migrator.applied_migrations(b).await
+                }
             };
 
             let checksum_res = match &handle {
-                crate::commands::db::BackendHandle::Postgres(b) => migrator.verify_applied_checksums(b).await,
-                crate::commands::db::BackendHandle::Sqlite(b) => migrator.verify_applied_checksums(b).await,
-                crate::commands::db::BackendHandle::Mysql(b) => migrator.verify_applied_checksums(b).await,
+                crate::commands::db::BackendHandle::Postgres(b) => {
+                    migrator.verify_applied_checksums(b).await
+                }
+                crate::commands::db::BackendHandle::Sqlite(b) => {
+                    migrator.verify_applied_checksums(b).await
+                }
+                crate::commands::db::BackendHandle::Mysql(b) => {
+                    migrator.verify_applied_checksums(b).await
+                }
             };
 
             let migrations_check = match (applied_res, checksum_res) {
@@ -268,13 +280,17 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
                     if pending == 0 {
                         DoctorCheck {
                             label: "pending migrations".to_string(),
-                            status: format!("all {total_migrations} migration(s) applied (up to date)"),
+                            status: format!(
+                                "all {total_migrations} migration(s) applied (up to date)"
+                            ),
                             ok: true,
                         }
                     } else {
                         DoctorCheck {
                             label: "pending migrations".to_string(),
-                            status: format!("{pending} pending migration(s) (run `rume db migrate`)"),
+                            status: format!(
+                                "{pending} pending migration(s) (run `rume db migrate`)"
+                            ),
                             ok: true,
                         }
                     }
@@ -324,7 +340,8 @@ fn check_redis_connectivity() -> DoctorCheck {
     match redis::Client::open(trimmed) {
         Ok(client) => match client.get_connection_with_timeout(std::time::Duration::from_secs(2)) {
             Ok(mut conn) => {
-                let ping_res: Result<String, redis::RedisError> = redis::cmd("PING").query(&mut conn);
+                let ping_res: Result<String, redis::RedisError> =
+                    redis::cmd("PING").query(&mut conn);
                 match ping_res {
                     Ok(resp) => DoctorCheck {
                         label: "redis connectivity".to_string(),
@@ -387,7 +404,10 @@ fn check_module_dag() -> (String, bool) {
     }
 
     if deps_map.is_empty() {
-        return ("no module declarations found in src/ (acyclic)".to_string(), true);
+        return (
+            "no module declarations found in src/ (acyclic)".to_string(),
+            true,
+        );
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]

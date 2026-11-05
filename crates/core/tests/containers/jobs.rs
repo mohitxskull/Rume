@@ -337,7 +337,11 @@ async fn worker_panic_does_not_leak_in_flight_count() {
     assert!(drained);
 
     // Durable queue invariant: panicked job must not be orphaned in 'in_flight'
-    assert_eq!(queue.dead_letter_count().await.unwrap(), 1, "panicked job must be routed to DLQ");
+    assert_eq!(
+        queue.dead_letter_count().await.unwrap(),
+        1,
+        "panicked job must be routed to DLQ"
+    );
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 }
 
@@ -490,5 +494,8 @@ async fn cross_tenant_job_idempotency_isolation() {
 
     // Idempotent retry within tenant-a returns the same ID
     let id_a_retry = queue.enqueue(job_a).await.unwrap();
-    assert_eq!(id_a, id_a_retry, "tenant-a retry must resolve to existing job ID");
+    assert_eq!(
+        id_a, id_a_retry,
+        "tenant-a retry must resolve to existing job ID"
+    );
 }

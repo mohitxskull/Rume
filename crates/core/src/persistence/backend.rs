@@ -224,9 +224,9 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
         let stmt = statement.to_string();
         let p = params.to_vec();
         Box::pin(async move {
-            self.fetch_optional(&stmt, &p)
-                .await?
-                .ok_or_else(|| PersistenceError::QueryFailed("query returned zero rows, expected one".into()))
+            self.fetch_optional(&stmt, &p).await?.ok_or_else(|| {
+                PersistenceError::QueryFailed("query returned zero rows, expected one".into())
+            })
         })
     }
 
@@ -360,9 +360,9 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
         let stmt = statement.to_string();
         let p = params.to_vec();
         Box::pin(async move {
-            self.fetch_optional(&stmt, &p)
-                .await?
-                .ok_or_else(|| PersistenceError::QueryFailed("query returned zero rows, expected one".into()))
+            self.fetch_optional(&stmt, &p).await?.ok_or_else(|| {
+                PersistenceError::QueryFailed("query returned zero rows, expected one".into())
+            })
         })
     }
 

@@ -10,14 +10,14 @@ pub mod server;
 
 pub use app::{TestApp, TestAppBuilder, TestResponse, status};
 pub use events::TestEventBus;
-pub use fixtures::TestTransactionFixture;
-#[cfg(feature = "testing")]
-pub use server::TestServer;
 #[cfg(feature = "postgres")]
 pub use fixtures::PostgresSchemaFixture;
 #[cfg(feature = "sqlite")]
 pub use fixtures::SqliteTestFixture;
+pub use fixtures::TestTransactionFixture;
 pub use jobs::TestJobQueue;
+#[cfg(feature = "testing")]
+pub use server::TestServer;
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 pub use harness::RumeTestHarness;

@@ -32,13 +32,14 @@ async fn pool_lease_capacity_and_exhaustion_invariants_under_load() {
 
         handles.push(tokio::spawn(async move {
             // Attempt to acquire lease with timeout
-            let lease = pool
-                .acquire_lease_timeout(Duration::from_millis(500))
-                .await;
+            let lease = pool.acquire_lease_timeout(Duration::from_millis(500)).await;
             if let Ok(_lease) = lease {
                 let count = curr.fetch_add(1, Ordering::SeqCst) + 1;
                 peak.fetch_max(count, Ordering::SeqCst);
-                assert!(count <= 5, "invariant violated: active leases ({count}) exceeded max_connections (5)");
+                assert!(
+                    count <= 5,
+                    "invariant violated: active leases ({count}) exceeded max_connections (5)"
+                );
 
                 tokio::time::sleep(Duration::from_millis(10)).await;
                 curr.fetch_sub(1, Ordering::SeqCst);
@@ -52,8 +53,14 @@ async fn pool_lease_capacity_and_exhaustion_invariants_under_load() {
 
     let status = pool.status();
     assert_eq!(status.leased_connections, 0, "all leases must be released");
-    assert!(peak_active.load(Ordering::SeqCst) <= 5, "peak leased must never exceed 5");
-    assert!(peak_active.load(Ordering::SeqCst) > 0, "at least some leases must have succeeded");
+    assert!(
+        peak_active.load(Ordering::SeqCst) <= 5,
+        "peak leased must never exceed 5"
+    );
+    assert!(
+        peak_active.load(Ordering::SeqCst) > 0,
+        "at least some leases must have succeeded"
+    );
 }
 
 #[tokio::test]
@@ -84,9 +91,8 @@ async fn pool_close_and_drain_interleaving_with_active_workers() {
 
     // Concurrently trigger close_and_drain
     let pool_clone = pool.clone();
-    let drain_handle = tokio::spawn(async move {
-        pool_clone.close_and_drain(Duration::from_millis(500)).await
-    });
+    let drain_handle =
+        tokio::spawn(async move { pool_clone.close_and_drain(Duration::from_millis(500)).await });
 
     // Wait until drain has initiated (is_closed is atomic)
     while !pool.status().is_closed {
@@ -96,7 +102,10 @@ async fn pool_close_and_drain_interleaving_with_active_workers() {
     // Concurrently verify that new lease acquisitions are rejected immediately
     for _ in 0..5 {
         let err = pool.acquire_lease();
-        assert!(matches!(err, Err(PersistenceError::Closed)), "new lease requests must fail with Closed during drain");
+        assert!(
+            matches!(err, Err(PersistenceError::Closed)),
+            "new lease requests must fail with Closed during drain"
+        );
     }
 
     for worker in worker_handles {
@@ -138,7 +147,10 @@ async fn singleflight_stampede_protection_interleaving_executes_closure_once() {
     }
 
     for task in tasks {
-        let result = task.await.expect("task finishes").expect("remember_json succeeds");
+        let result = task
+            .await
+            .expect("task finishes")
+            .expect("remember_json succeeds");
         assert_eq!(result, "computed_value");
     }
 

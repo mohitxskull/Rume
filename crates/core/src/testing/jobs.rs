@@ -48,7 +48,8 @@ impl TestJobQueue {
     pub fn assert_enqueued_count<J: Job>(&self, expected: usize) {
         let count = self.enqueued::<J>().len();
         assert_eq!(
-            count, expected,
+            count,
+            expected,
             "expected {} jobs of type '{}', but found {}",
             expected,
             J::NAME,
@@ -144,7 +145,10 @@ impl JobQueue for TestJobQueue {
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
         let worker = worker_id.to_string();
         Box::pin(async move {
-            let mut lock = self.jobs.write().map_err(|e| JobError::Fatal(e.to_string()))?;
+            let mut lock = self
+                .jobs
+                .write()
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
             let now = Instant::now();
             for job in lock.iter_mut() {
                 if job.available_at <= now && job.assigned_worker.is_none() {
@@ -164,7 +168,10 @@ impl JobQueue for TestJobQueue {
     ) -> BoxFuture<'_, Result<usize, JobError>> {
         let workers = dead_workers.to_vec();
         Box::pin(async move {
-            let mut lock = self.jobs.write().map_err(|e| JobError::Fatal(e.to_string()))?;
+            let mut lock = self
+                .jobs
+                .write()
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
             let mut count = 0;
             for job in lock.iter_mut() {
                 let should_reclaim = job
@@ -202,7 +209,10 @@ impl JobQueue for TestJobQueue {
     ) -> BoxFuture<'_, Result<(), JobError>> {
         Box::pin(async move {
             let mut lock_guard = self.jobs.write().ok();
-            if let Some(existing) = lock_guard.as_mut().and_then(|l| l.iter_mut().find(|j| j.id == job.id)) {
+            if let Some(existing) = lock_guard
+                .as_mut()
+                .and_then(|l| l.iter_mut().find(|j| j.id == job.id))
+            {
                 existing.assigned_worker = None;
                 existing.lease_token = None;
                 existing.available_at = Instant::now() + delay;

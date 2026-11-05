@@ -108,10 +108,7 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>>;
 
     /// Lists up to `limit` dead-lettered jobs for administrative inspection.
-    fn list_dead_letters(
-        &self,
-        _limit: usize,
-    ) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
+    fn list_dead_letters(&self, _limit: usize) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
         Box::pin(async move {
             Err(JobError::Unsupported(
                 "list_dead_letters not supported by this queue backend".into(),
@@ -120,10 +117,7 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     }
 
     /// Replays a dead-lettered job by resetting its status back to `pending`.
-    fn replay_dead_letter(
-        &self,
-        job_id: &str,
-    ) -> BoxFuture<'_, Result<(), JobError>> {
+    fn replay_dead_letter(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let id = job_id.to_string();
         Box::pin(async move {
             Err(JobError::Unsupported(format!(

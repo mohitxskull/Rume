@@ -3,12 +3,12 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
-use tokio::sync::OnceCell;
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
-use testcontainers_modules::testcontainers::{runners::AsyncRunner, ContainerAsync};
 #[cfg(any(feature = "postgres", feature = "redis"))]
 use testcontainers_modules::testcontainers::ImageExt;
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
+use testcontainers_modules::testcontainers::{ContainerAsync, runners::AsyncRunner};
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
+use tokio::sync::OnceCell;
 
 // ─── PostgreSQL Shared Container & Isolation ─────────────────────────────────
 

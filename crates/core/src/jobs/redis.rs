@@ -351,11 +351,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
         self.release_with_token(key, "")
     }
 
-    fn release_with_token(
-        &self,
-        key: &str,
-        token: &str,
-    ) -> BoxFuture<'_, Result<(), JobError>> {
+    fn release_with_token(&self, key: &str, token: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let redis_key = self.key(key);
         let token = token.to_string();
         Box::pin(async move {

@@ -11,12 +11,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Json, State};
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::post;
-use axum::Router;
 use serde::{Deserialize, Serialize};
 use tower::ServiceExt;
 
@@ -25,12 +25,12 @@ use rume::app::observability::ObservabilityLayer;
 use rume::app::state::{Availability, AvailabilityState};
 use rume::auth::identity::{AuthUser, Authenticated};
 use rume::auth::layer::{AuthLayer, PolicyLayer};
+use rume::auth::policy::RequirePermission;
 #[cfg(feature = "sqlite")]
 use rume::auth::policy::authorize;
-use rume::auth::policy::RequirePermission;
 use rume::auth::schemes::BearerTokenScheme;
-use rume::coordination::postgres::PostgresLeaderElector;
 use rume::coordination::LeaderElector;
+use rume::coordination::postgres::PostgresLeaderElector;
 use rume::error::AppError;
 use rume::events::Event;
 use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, PostgresJobQueue};
@@ -40,13 +40,12 @@ use rume::outbox::{
     OutboxError, OutboxMessage, OutboxRelay, OutboxRelayConfig, OutboxRepository,
     TransactionalOutbox,
 };
-use rume::persistence::postgres::PostgresBackend;
-use rume::persistence::{
-    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction,
-    PersistenceError,
-};
 #[cfg(feature = "sqlite")]
 use rume::persistence::SqliteBackend;
+use rume::persistence::postgres::PostgresBackend;
+use rume::persistence::{
+    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, PersistenceError,
+};
 use rume::routing::HealthCheck;
 use rume::tenant::layer::TenantLayer;
 use rume::tenant::resolver::HeaderTenantResolver;
@@ -120,7 +119,7 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     .unwrap();
 
     let pool = DatabasePool::new((*db).clone(), DatabaseConfig::default());
-    
+
     let (_db_name, pg_config) = common::containers::create_isolated_postgres_db().await;
     let pg_pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
@@ -377,8 +376,8 @@ async fn enterprise_create_order_endpoint(
         order_id: payload.order_id.clone(),
         amount_cents: payload.amount_cents,
     };
-    let outbox_msg = OutboxMessage::from_event(&event)
-        .map_err(|e| AppError::internal(e.to_string()))?;
+    let outbox_msg =
+        OutboxMessage::from_event(&event).map_err(|e| AppError::internal(e.to_string()))?;
 
     let pool_for_tx = Arc::clone(&state.pool);
     let order_id = payload.order_id.clone();
@@ -438,7 +437,10 @@ impl rume::jobs::JobHandler<FulfillEnterpriseOrderJob> for IdempotentFulfillment
                  ON CONFLICT (order_id) DO UPDATE SET dispatch_count = enterprise_fulfillments.dispatch_count + 1;",
                 job.order_id, job.tenant_id
             );
-            backend.execute(&sql).await.map_err(|e| JobError::Retryable(e.to_string()))?;
+            backend
+                .execute(&sql)
+                .await
+                .map_err(|e| JobError::Retryable(e.to_string()))?;
             executions.fetch_add(1, Ordering::SeqCst);
             notify.notify_one();
             Ok(())
@@ -490,7 +492,10 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
     );
 
     // Initialize transactional outbox table
-    pg_backend.init_outbox_table().await.expect("init outbox table");
+    pg_backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table");
 
     // Initialize business domain tables
     pg_backend
@@ -518,19 +523,20 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
 
     // Initialize PostgreSQL job queue sharing the EXACT same database pool
     let pg_pool = pg_backend.pool().clone();
-    let queue = Arc::new(
-        PostgresJobQueue::new(pg_pool)
-            .with_lease_duration(Duration::from_millis(1500)),
-    );
+    let queue =
+        Arc::new(PostgresJobQueue::new(pg_pool).with_lease_duration(Duration::from_millis(1500)));
     queue.init_schema().await.expect("init jobs schema");
 
-    let pool = Arc::new(DatabasePool::new((*pg_backend).clone(), DatabaseConfig::default()));
+    let pool = Arc::new(DatabasePool::new(
+        (*pg_backend).clone(),
+        DatabaseConfig::default(),
+    ));
 
     // =========================================================================
     // 2. Axum Application Shell with Full Middleware Pipeline
     // =========================================================================
-    let tenant_resolver = HeaderTenantResolver::new()
-        .add_tenant(Tenant::new("acme-corp", "acme-corp"));
+    let tenant_resolver =
+        HeaderTenantResolver::new().add_tenant(Tenant::new("acme-corp", "acme-corp"));
 
     let auth_scheme = BearerTokenScheme::new(|token: String| async move {
         match token.as_str() {
@@ -572,7 +578,10 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        assert!(resp.headers().contains_key("x-request-id"), "x-request-id must be present on failure");
+        assert!(
+            resp.headers().contains_key("x-request-id"),
+            "x-request-id must be present on failure"
+        );
         assert_eq!(
             resp.headers().get("content-type").unwrap(),
             "application/problem+json",
@@ -774,7 +783,10 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
         .expect("peer worker must reclaim the expired job");
     assert_eq!(job2.id, job1.id);
     let token2 = job2.lease_token.clone().expect("new lease token present");
-    assert_ne!(token1, token2, "reclaimed job must be assigned a new lease token");
+    assert_ne!(
+        token1, token2,
+        "reclaimed job must be assigned a new lease token"
+    );
 
     // Crashed Worker 1 attempts to ack with its stale lease -> must be rejected
     let stale_ack_res = queue.ack(&job1.id, &token1).await;
@@ -784,7 +796,10 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
     );
 
     // Worker 2 acks successfully
-    queue.ack(&job2.id, &token2).await.expect("worker 2 ack must succeed");
+    queue
+        .ack(&job2.id, &token2)
+        .await
+        .expect("worker 2 ack must succeed");
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // =========================================================================
@@ -812,13 +827,22 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
 
     // Initiate graceful worker drain while job is in-flight
     let worker_drained = drain_worker.drain(Duration::from_secs(3)).await;
-    assert!(worker_drained, "worker must gracefully drain active in-flight jobs");
-    assert!(drain_completed.load(Ordering::SeqCst), "in-flight slow job must complete before drain finishes");
+    assert!(
+        worker_drained,
+        "worker must gracefully drain active in-flight jobs"
+    );
+    assert!(
+        drain_completed.load(Ordering::SeqCst),
+        "in-flight slow job must complete before drain finishes"
+    );
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // Cleanly close and drain the database pool
     let pool_drained = pool.close_and_drain(Duration::from_secs(3)).await;
-    assert!(pool_drained, "database pool must cleanly drain all active connections");
+    assert!(
+        pool_drained,
+        "database pool must cleanly drain all active connections"
+    );
 }
 
 #[tokio::test]
@@ -832,7 +856,10 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
     );
 
     // Initialize required schemas: outbox, jobs, leader election
-    pg_backend.init_outbox_table().await.expect("init outbox table");
+    pg_backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table");
     let queue = Arc::new(
         PostgresJobQueue::new(pg_backend.pool().clone())
             .with_lease_duration(Duration::from_millis(1500)),
@@ -840,9 +867,15 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
     queue.init_schema().await.expect("init jobs schema");
 
     let leader_elector = PostgresLeaderElector::from_backend(&pg_backend);
-    leader_elector.init_schema().await.expect("init leader election schema");
+    leader_elector
+        .init_schema()
+        .await
+        .expect("init leader election schema");
 
-    let pool = Arc::new(DatabasePool::new((*pg_backend).clone(), DatabaseConfig::default()));
+    let pool = Arc::new(DatabasePool::new(
+        (*pg_backend).clone(),
+        DatabaseConfig::default(),
+    ));
 
     // -------------------------------------------------------------------------
     // 1. Database Disconnection & Health Recovery Story
@@ -870,7 +903,10 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
             .await
             .expect("reconnect to postgres"),
     );
-    let recovered_pool = Arc::new(DatabasePool::new((*recovered_backend).clone(), DatabaseConfig::default()));
+    let recovered_pool = Arc::new(DatabasePool::new(
+        (*recovered_backend).clone(),
+        DatabaseConfig::default(),
+    ));
     let recovered_health = recovered_pool.health_check("postgres_db").run().await;
     assert_eq!(recovered_health.status, rume::routing::HealthStatus::Ok);
 
@@ -893,7 +929,10 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
         .try_acquire(role, "node-beta", Duration::from_millis(1500))
         .await
         .expect("try acquire");
-    assert!(lease_b_premature.is_none(), "standby node cannot steal active unexpired lease");
+    assert!(
+        lease_b_premature.is_none(),
+        "standby node cannot steal active unexpired lease"
+    );
 
     // Node A crashes / hangs (stops renewing) -> sleep past lease expiration
     tokio::time::sleep(Duration::from_millis(1700)).await;
@@ -905,14 +944,20 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
         .expect("acquire expired")
         .expect("standby node must acquire expired leader lease");
     assert_eq!(lease_b.candidate_id, "node-beta");
-    assert!(lease_b.term > lease_a.term, "term sequence must advance on failover");
+    assert!(
+        lease_b.term > lease_a.term,
+        "term sequence must advance on failover"
+    );
 
     // Crashed Node A wakes up and attempts renewal -> must be rejected
     let stale_renew = recovered_leader_elector
         .renew(role, "node-alpha", Duration::from_millis(1500))
         .await
         .expect("renew attempt");
-    assert!(stale_renew.is_none(), "crashed leader must not be permitted to renew after peer takeover");
+    assert!(
+        stale_renew.is_none(),
+        "crashed leader must not be permitted to renew after peer takeover"
+    );
 
     // -------------------------------------------------------------------------
     // 3. Relay Restart / Crash Recovery at Publication-to-Ack Boundary
@@ -924,7 +969,10 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
         amount_cents: 9900,
     };
     let outbox_msg = OutboxMessage::from_event(&test_order_event).expect("outbox msg");
-    recovered_pool.save(outbox_msg).await.expect("save outbox message");
+    recovered_pool
+        .save(outbox_msg)
+        .await
+        .expect("save outbox message");
     assert_eq!(recovered_pool.pending_count().await.unwrap(), 1);
 
     let side_effects_count = Arc::new(AtomicUsize::new(0));
@@ -947,8 +995,14 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
     // Relay 2 starts up, recovers expired claims, and re-dispatches
-    let recovered_claims = recovered_pool.recover_expired_claims(1).await.expect("recover claims");
-    assert_eq!(recovered_claims, 1, "relay 2 must recover abandoned in-flight claim");
+    let recovered_claims = recovered_pool
+        .recover_expired_claims(1)
+        .await
+        .expect("recover claims");
+    assert_eq!(
+        recovered_claims, 1,
+        "relay 2 must recover abandoned in-flight claim"
+    );
 
     // Relay 2 claims the recovered message
     let side_effects_for_relay_2 = Arc::clone(&side_effects_count);
@@ -970,7 +1024,11 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
     let poll_result = relay_2.poll_and_dispatch(5).await.expect("relay 2 poll");
     assert_eq!(poll_result.published, 1);
     assert_eq!(recovered_pool.pending_count().await.unwrap(), 0);
-    assert_eq!(side_effects_count.load(Ordering::SeqCst), 2, "consumer saw 2 dispatches across crash recovery");
+    assert_eq!(
+        side_effects_count.load(Ordering::SeqCst),
+        2,
+        "consumer saw 2 dispatches across crash recovery"
+    );
 
     // -------------------------------------------------------------------------
     // 4. Coordinated Application Shutdown Under Active Workers and Relays
@@ -981,8 +1039,18 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
     );
 
     // Enqueue 2 slow background jobs
-    recovered_queue.enqueue(SlowDrainJob { job_id: "coord_shutdown_job_1".into() }).await.unwrap();
-    recovered_queue.enqueue(SlowDrainJob { job_id: "coord_shutdown_job_2".into() }).await.unwrap();
+    recovered_queue
+        .enqueue(SlowDrainJob {
+            job_id: "coord_shutdown_job_1".into(),
+        })
+        .await
+        .unwrap();
+    recovered_queue
+        .enqueue(SlowDrainJob {
+            job_id: "coord_shutdown_job_2".into(),
+        })
+        .await
+        .unwrap();
 
     let mut shutdown_registry = JobRegistry::new();
     let handler_completed = Arc::new(AtomicBool::new(false));
@@ -1005,9 +1073,15 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
         recovered_pool.close_and_drain(Duration::from_secs(4)),
     );
 
-    assert!(worker_ok, "worker must drain cleanly under active in-flight work");
+    assert!(
+        worker_ok,
+        "worker must drain cleanly under active in-flight work"
+    );
     assert!(relay_ok, "relay must drain cleanly during shutdown");
-    assert!(pool_ok, "pool must cleanly drain connections during shutdown");
+    assert!(
+        pool_ok,
+        "pool must cleanly drain connections during shutdown"
+    );
 
     // Background relay task terminated cleanly
     relay_handle.abort();

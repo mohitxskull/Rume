@@ -17,9 +17,7 @@ impl Environment {
     }
 
     pub fn new(name: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
-        }
+        Self { name: name.into() }
     }
 
     pub fn name(&self) -> &str {
@@ -170,17 +168,19 @@ impl Availability {
 
         // Monotonic transition guard: once in a drain or terminal state (RefusingTraffic or Broken),
         // reject transitions back to Live or Ready to prevent in-flight workers or handlers from bypassing drain.
-        let _ = self.inner.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
-            if (curr == AvailabilityState::RefusingTraffic as u8
-                || curr == AvailabilityState::Broken as u8)
-                && (new_val == AvailabilityState::Live as u8
-                    || new_val == AvailabilityState::Ready as u8)
-            {
-                None
-            } else {
-                Some(new_val)
-            }
-        });
+        let _ = self
+            .inner
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
+                if (curr == AvailabilityState::RefusingTraffic as u8
+                    || curr == AvailabilityState::Broken as u8)
+                    && (new_val == AvailabilityState::Live as u8
+                        || new_val == AvailabilityState::Ready as u8)
+                {
+                    None
+                } else {
+                    Some(new_val)
+                }
+            });
     }
 
     /// Sets the availability state unconditionally, bypassing monotonicity guards.

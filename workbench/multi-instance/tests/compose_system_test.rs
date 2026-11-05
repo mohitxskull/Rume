@@ -1,9 +1,9 @@
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-use serde_json::json;
 
 struct ComposeGuard {
     compose_file: PathBuf,
@@ -90,13 +90,23 @@ async fn test_compose_multi_instance_system_qualification() {
         .parent()
         .and_then(|p| p.parent())
         .expect("cannot determine workspace root");
-    let binary_path = workspace_root.join("target").join("release").join("workbench");
+    let binary_path = workspace_root
+        .join("target")
+        .join("release")
+        .join("workbench");
 
     if !binary_path.exists() {
         println!("[compose_system_test] Building target/release/workbench binary...");
         let build_status = Command::new("cargo")
             .current_dir(workspace_root)
-            .args(["build", "--release", "-p", "workbench", "--bin", "workbench"])
+            .args([
+                "build",
+                "--release",
+                "-p",
+                "workbench",
+                "--bin",
+                "workbench",
+            ])
             .status()
             .expect("failed to invoke cargo build --release");
         assert!(build_status.success(), "cargo build --release failed");
@@ -257,7 +267,9 @@ async fn test_compose_multi_instance_system_qualification() {
         "assignee_id": "user-stark-tony"
     });
     let create_issue_resp = client
-        .post(format!("http://127.0.0.1:8081/api/v1/projects/{proj_id}/issues"))
+        .post(format!(
+            "http://127.0.0.1:8081/api/v1/projects/{proj_id}/issues"
+        ))
         .header("X-Tenant-Id", "acme-corp")
         .header("Authorization", "Bearer admin-token")
         .json(&issue_payload)
@@ -276,14 +288,18 @@ async fn test_compose_multi_instance_system_qualification() {
 
     while start_wait.elapsed() < Duration::from_secs(15) {
         let outbox_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT status, payload FROM rume_outbox WHERE event_type = 'issue.created'"
+            "SELECT status, payload FROM rume_outbox WHERE event_type = 'issue.created'",
         )
         .fetch_all(&pool)
         .await
         .expect("query outbox failed");
 
         for (status, payload) in outbox_rows {
-            if payload.windows(issue_id.len()).any(|w| w == issue_id.as_bytes()) && status == "published" {
+            if payload
+                .windows(issue_id.len())
+                .any(|w| w == issue_id.as_bytes())
+                && status == "published"
+            {
                 outbox_published = true;
             }
         }
@@ -309,8 +325,14 @@ async fn test_compose_multi_instance_system_qualification() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    assert!(outbox_published, "Outbox event for {issue_id} was not published by relay");
-    assert!(job_completed, "Notification job for {issue_id} was not completed by worker");
+    assert!(
+        outbox_published,
+        "Outbox event for {issue_id} was not published by relay"
+    );
+    assert!(
+        job_completed,
+        "Notification job for {issue_id} was not completed by worker"
+    );
 
     // =========================================================================
     // Scenario 4: Instance Failure
@@ -336,7 +358,9 @@ async fn test_compose_multi_instance_system_qualification() {
         "assignee_id": "user-stark-tony"
     });
     let create_issue2_resp = client
-        .post(format!("http://127.0.0.1:8082/api/v1/projects/{proj_id}/issues"))
+        .post(format!(
+            "http://127.0.0.1:8082/api/v1/projects/{proj_id}/issues"
+        ))
         .header("X-Tenant-Id", "acme-corp")
         .header("Authorization", "Bearer admin-token")
         .json(&issue2_payload)
@@ -344,7 +368,10 @@ async fn test_compose_multi_instance_system_qualification() {
         .await
         .expect("failed to create issue on instance 2");
     assert_eq!(create_issue2_resp.status(), 201);
-    let issue2_data: serde_json::Value = create_issue2_resp.json().await.expect("invalid issue 2 json");
+    let issue2_data: serde_json::Value = create_issue2_resp
+        .json()
+        .await
+        .expect("invalid issue 2 json");
     let issue2_id = issue2_data["id"].as_str().expect("issue 2 id missing");
 
     // Verify Instance 2 processes the outbox event and job alone
@@ -355,14 +382,18 @@ async fn test_compose_multi_instance_system_qualification() {
 
     while start_wait2.elapsed() < Duration::from_secs(15) {
         let outbox_rows: Vec<(String, Vec<u8>)> = sqlx::query_as(
-            "SELECT status, payload FROM rume_outbox WHERE event_type = 'issue.created'"
+            "SELECT status, payload FROM rume_outbox WHERE event_type = 'issue.created'",
         )
         .fetch_all(&pool)
         .await
         .expect("query outbox 2 failed");
 
         for (status, payload) in outbox_rows {
-            if payload.windows(issue2_id.len()).any(|w| w == issue2_id.as_bytes()) && status == "published" {
+            if payload
+                .windows(issue2_id.len())
+                .any(|w| w == issue2_id.as_bytes())
+                && status == "published"
+            {
                 outbox2_published = true;
             }
         }
@@ -388,8 +419,14 @@ async fn test_compose_multi_instance_system_qualification() {
         tokio::time::sleep(Duration::from_millis(300)).await;
     }
 
-    assert!(outbox2_published, "Instance 2 failed to publish outbox event while Instance 1 was down");
-    assert!(job2_completed, "Instance 2 failed to complete notification job while Instance 1 was down");
+    assert!(
+        outbox2_published,
+        "Instance 2 failed to publish outbox event while Instance 1 was down"
+    );
+    assert!(
+        job2_completed,
+        "Instance 2 failed to complete notification job while Instance 1 was down"
+    );
 
     // =========================================================================
     // Scenario 5: Restart Recovery
@@ -397,7 +434,10 @@ async fn test_compose_multi_instance_system_qualification() {
     // =========================================================================
     println!("[compose_system_test] Scenario 5: Restart Recovery...");
     let restart_out = guard.run_cmd(&["up", "-d", "workbench-1"]);
-    assert!(restart_out.status.success(), "failed to restart workbench-1");
+    assert!(
+        restart_out.status.success(),
+        "failed to restart workbench-1"
+    );
 
     wait_for_health("http://127.0.0.1:8081/health", timeout)
         .await
@@ -426,8 +466,16 @@ async fn test_compose_multi_instance_system_qualification() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // Both instances still respond
-    let r1 = client.get("http://127.0.0.1:8081/health").send().await.expect("inst 1 after redis restart");
-    let r2 = client.get("http://127.0.0.1:8082/health").send().await.expect("inst 2 after redis restart");
+    let r1 = client
+        .get("http://127.0.0.1:8081/health")
+        .send()
+        .await
+        .expect("inst 1 after redis restart");
+    let r2 = client
+        .get("http://127.0.0.1:8082/health")
+        .send()
+        .await
+        .expect("inst 2 after redis restart");
     assert_eq!(r1.status(), 200);
     assert_eq!(r2.status(), 200);
 
@@ -437,7 +485,10 @@ async fn test_compose_multi_instance_system_qualification() {
     // =========================================================================
     println!("[compose_system_test] Scenario 7: Graceful Shutdown...");
     let stop_out = guard.run_cmd(&["stop", "-t", "10", "workbench-2"]);
-    assert!(stop_out.status.success(), "failed to gracefully stop workbench-2");
+    assert!(
+        stop_out.status.success(),
+        "failed to gracefully stop workbench-2"
+    );
 
     let logs_out = guard.run_cmd(&["logs", "workbench-2"]);
     let log_str = String::from_utf8_lossy(&logs_out.stdout);
@@ -448,7 +499,8 @@ async fn test_compose_multi_instance_system_qualification() {
         log_str
     );
     assert!(
-        log_str.contains("Shutting down Workbench background workers, relay, and connection pool..."),
+        log_str
+            .contains("Shutting down Workbench background workers, relay, and connection pool..."),
         "Missing shutdown drain initiation in logs: {}",
         log_str
     );
@@ -458,5 +510,7 @@ async fn test_compose_multi_instance_system_qualification() {
         log_str
     );
 
-    println!("[compose_system_test] All 8 Docker Compose qualification scenarios PASSED successfully!");
+    println!(
+        "[compose_system_test] All 8 Docker Compose qualification scenarios PASSED successfully!"
+    );
 }

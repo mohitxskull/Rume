@@ -6,24 +6,24 @@ Rume v02 successfully resolves all security findings from v01: path traversal in
 
 ## Prior decisions
 
-- **S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:254–267`. `resolve_value` now canonicalizes both `dir` and target path `full`, rejecting escaping paths via `!canonical_full.starts_with(&canonical_dir)` with `PermissionDenied`. Integration tests `file_value_traversal_is_rejected` and `file_value_absolute_path_is_rejected` confirm the fix.
-- **S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:27–36, 174–188`. `ResolvedEnv` now stores secret variables in `secrets: BTreeMap<String, SecretBox<String>>` separate from plain `values`, wrapping values into `SecretBox` at load time and only exposing plaintext via `expose_secret()` on demand.
-- **S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/env/check.rs:47–51, 74–78` and `rume-cli/src/commands/config/check.rs:38–48, 77–83`. Both `rume env check` and `rume config check` now redact sensitive keys and credential URLs by default, requiring an explicit `--unredacted` flag for plaintext output.
-- **S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `rume/src/error.rs:173–275`. Responses now strictly follow RFC 9457 Problem Details (`application/problem+json`). `BadRequest` and `Internal` log sensitive diagnostics server-side with `warn!` and `error!` while returning static generic detail strings to HTTP clients.
-- **S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Verified in `rume/src/env/secrets.rs:18–42`. `is_secret_key` was broadened to match `_PASS`, `_PWD`, `_CRED`, `_KEY`, `STRIPE_*`, `PRIVATE_KEY`, and `redact_diagnostic_text` scrubs credential URLs and known secrets from diagnostics.
-- **S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs:289–294`. `debug_info()` now returns an empty `BTreeMap::new()`, preventing reconnaissance leakage.
-- **S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `rume/src/routing/rejection.rs:19–42`. `Rejection::into_response` converts into `AppError::BadRequest`, returning generic Problem Details to the client while keeping extraction messages in server logs.
-- **Enterprise SAML 2.0 assertions (`rume/src/enterprise/saml.rs`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in C1.
-- **Enterprise SCIM 2.0 schemas (`rume/src/enterprise/scim.rs`)** — **NOTE-NEW**. New subsystem introduced in v02; reviewed for schema compliance.
-- **Multi-tenant boundaries (`rume/src/tenant/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in C2, M1, and M2.
-- **Authentication schemes & session storage (`rume/src/auth/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in M3, m1, and m2.
-- **Security middleware (`rume/src/security/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in M4 and m3.
+- **S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:254–267`. `resolve_value` now canonicalizes both `dir` and target path `full`, rejecting escaping paths via `!canonical_full.starts_with(&canonical_dir)` with `PermissionDenied`. Integration tests `file_value_traversal_is_rejected` and `file_value_absolute_path_is_rejected` confirm the fix.
+- **S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:27–36, 174–188`. `ResolvedEnv` now stores secret variables in `secrets: BTreeMap<String, SecretBox<String>>` separate from plain `values`, wrapping values into `SecretBox` at load time and only exposing plaintext via `expose_secret()` on demand.
+- **S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/env/check.rs:47–51, 74–78` and `crates/cli/src/commands/config/check.rs:38–48, 77–83`. Both `rume env check` and `rume config check` now redact sensitive keys and credential URLs by default, requiring an explicit `--unredacted` flag for plaintext output.
+- **S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `crates/core/src/error.rs:173–275`. Responses now strictly follow RFC 9457 Problem Details (`application/problem+json`). `BadRequest` and `Internal` log sensitive diagnostics server-side with `warn!` and `error!` while returning static generic detail strings to HTTP clients.
+- **S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Verified in `crates/core/src/env/secrets.rs:18–42`. `is_secret_key` was broadened to match `_PASS`, `_PWD`, `_CRED`, `_KEY`, `STRIPE_*`, `PRIVATE_KEY`, and `redact_diagnostic_text` scrubs credential URLs and known secrets from diagnostics.
+- **S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs:289–294`. `debug_info()` now returns an empty `BTreeMap::new()`, preventing reconnaissance leakage.
+- **S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `crates/core/src/routing/rejection.rs:19–42`. `Rejection::into_response` converts into `AppError::BadRequest`, returning generic Problem Details to the client while keeping extraction messages in server logs.
+- **Enterprise SAML 2.0 assertions (`crates/core/src/enterprise/saml.rs`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in C1.
+- **Enterprise SCIM 2.0 schemas (`crates/core/src/enterprise/scim.rs`)** — **NOTE-NEW**. New subsystem introduced in v02; reviewed for schema compliance.
+- **Multi-tenant boundaries (`crates/core/src/tenant/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in C2, M1, and M2.
+- **Authentication schemes & session storage (`crates/core/src/auth/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in M3, m1, and m2.
+- **Security middleware (`crates/core/src/security/`)** — **NOTE-NEW**. New subsystem introduced in v02; evaluated in M4 and m3.
 
 ## Findings
 
 ### C1 SAML 2.0 assertion parser hardcodes expiration timestamps to `None` and lacks XML signature verification
 
-**Where:** `rume/src/enterprise/saml.rs` lines 49–66 (`extract_tag`), lines 147–156 (`SamlParser::parse`), and lines 159–201 (`SamlParser::validate`).
+**Where:** `crates/core/src/enterprise/saml.rs` lines 49–66 (`extract_tag`), lines 147–156 (`SamlParser::parse`), and lines 159–201 (`SamlParser::validate`).
 
 **What it says:**
 
@@ -53,7 +53,7 @@ Rume v02 successfully resolves all security findings from v01: path traversal in
 
 ### C2 Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning and data leakage
 
-**Where:** `rume/src/tenant/cache.rs` lines 23–29 (`scoped_key` and `tenant_tag`).
+**Where:** `crates/core/src/tenant/cache.rs` lines 23–29 (`scoped_key` and `tenant_tag`).
 
 **What it says:**
 
@@ -75,7 +75,7 @@ Tenant cache keys are constructed by concatenating `tenant_id` and `key` with a 
 
 ### M1 Subdomain tenant resolver permits suffix-matching domain spoofing
 
-**Where:** `rume/src/tenant/resolver.rs` lines 133–149.
+**Where:** `crates/core/src/tenant/resolver.rs` lines 133–149.
 
 **What it says:**
 
@@ -100,7 +100,7 @@ Tenant cache keys are constructed by concatenating `tenant_id` and `key` with a 
             }
 ```
 
-When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` as configured in `rume/tests/tenant_suite.rs:78`), `host_no_port.strip_suffix(&self.base_domain)` matches any host that ends with that string.
+When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` as configured in `crates/core/tests/tenant_suite.rs:78`), `host_no_port.strip_suffix(&self.base_domain)` matches any host that ends with that string.
 
 **Why it's a problem:** An attacker pointing a rogue domain such as `evilapp.platform.io` or `fakeapp.platform.io` to the server will have `app.platform.io` stripped, leaving `evil` or `fake`. If a tenant exists with that slug, the request is accepted and routed to that tenant. Furthermore, multi-level subdomains (such as `attacker.acme.app.platform.io`) produce `attacker.acme`, which does not validate single-label subdomain boundaries.
 
@@ -108,7 +108,7 @@ When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` a
 
 ### M2 `HeaderTenantResolver` shares a single hash map for both ID and slug, causing tenant hijacking via collision
 
-**Where:** `rume/src/tenant/resolver.rs` lines 49–56 (`add_tenant`).
+**Where:** `crates/core/src/tenant/resolver.rs` lines 49–56 (`add_tenant`).
 
 **What it says:**
 
@@ -130,7 +130,7 @@ Both `tenant.id` and `tenant.slug` are inserted into the same flat `BTreeMap<Str
 
 ### M3 `ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan
 
-**Where:** `rume/src/auth/schemes.rs` lines 86 (`keys: Arc<BTreeMap<String, AuthUser>>`) and lines 133–140.
+**Where:** `crates/core/src/auth/schemes.rs` lines 86 (`keys: Arc<BTreeMap<String, AuthUser>>`) and lines 133–140.
 
 **What it says:**
 
@@ -155,7 +155,7 @@ API keys are stored in plaintext in memory. Authenticating a request performs an
 
 ### M4 Double-submit CSRF layer lacks token issuance and is vulnerable to subdomain cookie tossing
 
-**Where:** `rume/src/security/csrf.rs` lines 122–195 (`CsrfService::call`).
+**Where:** `crates/core/src/security/csrf.rs` lines 122–195 (`CsrfService::call`).
 
 **What it says:**
 
@@ -169,7 +169,7 @@ API keys are stored in plaintext in memory. Authenticating a request performs an
 
 ### m1 `AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500 Internal Server Error
 
-**Where:** `rume/src/auth/error.rs` lines 38–41.
+**Where:** `crates/core/src/auth/error.rs` lines 38–41.
 
 **What it says:**
 
@@ -188,7 +188,7 @@ API keys are stored in plaintext in memory. Authenticating a request performs an
 
 ### m2 Stale session cookie in `SessionScheme` immediately aborts authentication chain
 
-**Where:** `rume/src/auth/schemes.rs` lines 188–198.
+**Where:** `crates/core/src/auth/schemes.rs` lines 188–198.
 
 **What it says:**
 
@@ -213,7 +213,7 @@ When an expired or unknown session cookie is received, `SessionScheme` returns `
 
 ### m3 `SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP
 
-**Where:** `rume/src/security/headers.rs` lines 158–163.
+**Where:** `crates/core/src/security/headers.rs` lines 158–163.
 
 **What it says:**
 
@@ -234,7 +234,7 @@ When an expired or unknown session cookie is received, `SessionScheme` returns `
 
 ## Positive notes
 
-- `#![forbid(unsafe_code)]` remains strictly enforced on the core crate (`rume/src/lib.rs:7`).
+- `#![forbid(unsafe_code)]` remains strictly enforced on the core crate (`crates/core/src/lib.rs:7`).
 - Prior findings S-M1 (path traversal sandboxing via canonicalization) and S-M2 (secrecy `SecretBox` storage) have been thoroughly and cleanly implemented.
 - S-M4 (information leakage via `AppError`) was completely eliminated through adoption of RFC 9457 Problem Details (`application/problem+json`), ensuring internal diagnostic details are kept in server logs.
 - CLI inspection commands (`env check` and `config check`) default to redacting secret keys and credential URLs, requiring an explicit `--unredacted` flag to display secrets.

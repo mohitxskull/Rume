@@ -1,10 +1,10 @@
-use std::sync::Arc;
 use axum::http::{Request, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use rume::cache::{Cache, CacheConfig, InMemoryCacheBackend};
 use rume::prelude::*;
 use rume::tenant::*;
+use std::sync::Arc;
 
 #[tokio::test]
 async fn test_header_tenant_resolver_success_and_context_extractor() {
@@ -123,7 +123,9 @@ async fn test_header_tenant_resolver_id_and_slug_namespace_isolation() {
     let resolver = HeaderTenantResolver::new();
 
     // Tenant 1 has slug "acme" with id "t-100"
-    resolver.try_add_tenant(Tenant::new("t-100", "acme")).unwrap();
+    resolver
+        .try_add_tenant(Tenant::new("t-100", "acme"))
+        .unwrap();
 
     // Cross-namespace collision 1: new tenant with id="acme" collides with existing slug="acme"
     let err1 = resolver.try_add_tenant(Tenant::new("acme", "globex"));
@@ -135,9 +137,14 @@ async fn test_header_tenant_resolver_id_and_slug_namespace_isolation() {
 
     // Subdomain resolver conflict check
     let sub_resolver = rume::tenant::SubdomainTenantResolver::new("example.com");
-    sub_resolver.try_add_tenant(Tenant::new("t-1", "acme")).unwrap();
+    sub_resolver
+        .try_add_tenant(Tenant::new("t-1", "acme"))
+        .unwrap();
     let sub_err = sub_resolver.try_add_tenant(Tenant::new("t-2", "acme"));
-    assert!(matches!(sub_err, Err(rume::tenant::TenantError::Conflict(_))));
+    assert!(matches!(
+        sub_err,
+        Err(rume::tenant::TenantError::Conflict(_))
+    ));
 }
 
 #[tokio::test]
@@ -157,8 +164,8 @@ async fn test_header_tenant_resolver_slug_conflict_rejection() {
 
 #[tokio::test]
 async fn test_subdomain_tenant_resolver_case_insensitivity() {
-    let resolver = SubdomainTenantResolver::new("platform.io")
-        .add_tenant(Tenant::new("t-1", "acme"));
+    let resolver =
+        SubdomainTenantResolver::new("platform.io").add_tenant(Tenant::new("t-1", "acme"));
 
     let app = Router::new()
         .route(

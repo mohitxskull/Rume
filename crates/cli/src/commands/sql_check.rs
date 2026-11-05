@@ -1,10 +1,10 @@
 //! Scans SQL files in a directory and validates syntax, non-emptiness, balanced delimiters, and placeholders.
 
-use std::fs;
-use std::path::{Path, PathBuf};
+use crate::ui::table::TableBuilder;
 use console::style;
 use serde::Serialize;
-use crate::ui::table::TableBuilder;
+use std::fs;
+use std::path::{Path, PathBuf};
 
 #[derive(Serialize)]
 pub struct SqlCheckReport {
@@ -22,7 +22,13 @@ pub struct SqlFileStatus {
     pub error: Option<String>,
 }
 
-pub async fn run(path_str: &str, format: &str, is_json: bool, target_dialect: Option<&str>, db_dry_run: bool) {
+pub async fn run(
+    path_str: &str,
+    format: &str,
+    is_json: bool,
+    target_dialect: Option<&str>,
+    db_dry_run: bool,
+) {
     let target_dir = Path::new(path_str);
     let mut files = Vec::new();
     if target_dir.exists() {
@@ -52,14 +58,27 @@ pub async fn run(path_str: &str, format: &str, is_json: bool, target_dialect: Op
                     if let Ok(content) = fs::read_to_string(file_path) {
                         let trimmed = content.trim();
                         // Dry-run with EXPLAIN if it's a DML statement
-                        let first_word = trimmed.split_whitespace().next().unwrap_or("").to_ascii_uppercase();
-                        if matches!(first_word.as_str(), "SELECT" | "INSERT" | "UPDATE" | "DELETE") {
+                        let first_word = trimmed
+                            .split_whitespace()
+                            .next()
+                            .unwrap_or("")
+                            .to_ascii_uppercase();
+                        if matches!(
+                            first_word.as_str(),
+                            "SELECT" | "INSERT" | "UPDATE" | "DELETE"
+                        ) {
                             let explain_sql = format!("EXPLAIN {trimmed}");
                             use rume::persistence::DatabaseBackend;
                             let explain_res = match handle {
-                                crate::commands::db::BackendHandle::Postgres(b) => b.execute(&explain_sql).await,
-                                crate::commands::db::BackendHandle::Sqlite(b) => b.execute(&explain_sql).await,
-                                crate::commands::db::BackendHandle::Mysql(b) => b.execute(&explain_sql).await,
+                                crate::commands::db::BackendHandle::Postgres(b) => {
+                                    b.execute(&explain_sql).await
+                                }
+                                crate::commands::db::BackendHandle::Sqlite(b) => {
+                                    b.execute(&explain_sql).await
+                                }
+                                crate::commands::db::BackendHandle::Mysql(b) => {
+                                    b.execute(&explain_sql).await
+                                }
                             };
                             match explain_res {
                                 Ok(_) => Ok(()),
@@ -106,7 +125,10 @@ pub async fn run(path_str: &str, format: &str, is_json: bool, target_dialect: Op
     };
 
     if is_json || format == "json" {
-        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).unwrap_or_default()
+        );
         if !all_ok {
             std::process::exit(1);
         }
@@ -144,9 +166,26 @@ pub async fn run(path_str: &str, format: &str, is_json: bool, target_dialect: Op
     table.render();
     println!();
     if all_ok {
-        println!("{}", style(format!("All {} SQL file(s) passed validation.", files.len())).green().bold());
+        println!(
+            "{}",
+            style(format!(
+                "All {} SQL file(s) passed validation.",
+                files.len()
+            ))
+            .green()
+            .bold()
+        );
     } else {
-        println!("{}", style(format!("{}/{} SQL file(s) failed validation.", files.len() - valid_count, files.len())).red().bold());
+        println!(
+            "{}",
+            style(format!(
+                "{}/{} SQL file(s) failed validation.",
+                files.len() - valid_count,
+                files.len()
+            ))
+            .red()
+            .bold()
+        );
         std::process::exit(1);
     }
 }
@@ -165,8 +204,7 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), String> {
-    let content = fs::read_to_string(path)
-        .map_err(|e| format!("cannot read file: {e}"))?;
+    let content = fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
 
     // Filter out comments and whitespace to check if query body exists
     let meaningful_sql: String = content
@@ -228,7 +266,9 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
         return Err("unclosed double quote (\")".to_string());
     }
     if paren_depth != 0 {
-        return Err(format!("unclosed parenthesis: {paren_depth} open parenthesis remain unmatched"));
+        return Err(format!(
+            "unclosed parenthesis: {paren_depth} open parenthesis remain unmatched"
+        ));
     }
 
     // Validate that the SQL starts with a recognized SQL keyword
@@ -239,14 +279,36 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
         .to_ascii_uppercase();
 
     const VALID_KEYWORDS: &[&str] = &[
-        "SELECT", "INSERT", "UPDATE", "DELETE", "CREATE", "ALTER", "DROP",
-        "TRUNCATE", "WITH", "BEGIN", "COMMIT", "ROLLBACK", "SET", "PRAGMA",
-        "SHOW", "EXPLAIN", "CALL", "GRANT", "REVOKE", "MERGE", "REPLACE",
-        "UPSERT", "SAVEPOINT", "RELEASE",
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "ALTER",
+        "DROP",
+        "TRUNCATE",
+        "WITH",
+        "BEGIN",
+        "COMMIT",
+        "ROLLBACK",
+        "SET",
+        "PRAGMA",
+        "SHOW",
+        "EXPLAIN",
+        "CALL",
+        "GRANT",
+        "REVOKE",
+        "MERGE",
+        "REPLACE",
+        "UPSERT",
+        "SAVEPOINT",
+        "RELEASE",
     ];
 
     if !VALID_KEYWORDS.contains(&first_word.as_str()) {
-        return Err(format!("query starts with unrecognized SQL statement keyword `{first_word}`"));
+        return Err(format!(
+            "query starts with unrecognized SQL statement keyword `{first_word}`"
+        ));
     }
 
     // Dialect placeholder checks
@@ -257,7 +319,9 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
                 return Err("PostgreSQL query uses unnumbered '?' parameter placeholder instead of '$1, $2, ...'".to_string());
             }
             "sqlite" | "mysql" if contains_unquoted_dollar_param(&content) => {
-                return Err(format!("{dialect} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"));
+                return Err(format!(
+                    "{dialect} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
+                ));
             }
             _ => {}
         }

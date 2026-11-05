@@ -317,7 +317,8 @@ async fn test_tenant_extension_rate_limiting() {
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
-    req1.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    req1.extensions_mut()
+        .insert(Tenant::new("tenant_123", "acme"));
     let res1 = app.request(req1).await;
     assert_eq!(res1.status(), StatusCode::OK);
 
@@ -326,7 +327,8 @@ async fn test_tenant_extension_rate_limiting() {
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
-    req2.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    req2.extensions_mut()
+        .insert(Tenant::new("tenant_123", "acme"));
     let res2 = app.request(req2).await;
     assert_eq!(res2.status(), StatusCode::OK);
 
@@ -335,7 +337,8 @@ async fn test_tenant_extension_rate_limiting() {
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
-    req3.extensions_mut().insert(Tenant::new("tenant_123", "acme"));
+    req3.extensions_mut()
+        .insert(Tenant::new("tenant_123", "acme"));
     let res3 = app.request(req3).await;
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
 
@@ -344,7 +347,9 @@ async fn test_tenant_extension_rate_limiting() {
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
-    req_t2.extensions_mut().insert(Tenant::new("tenant_456", "beta"));
+    req_t2
+        .extensions_mut()
+        .insert(Tenant::new("tenant_456", "beta"));
     let res_t2 = app.request(req_t2).await;
     assert_eq!(res_t2.status(), StatusCode::OK);
 }

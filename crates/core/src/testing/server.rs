@@ -3,9 +3,9 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
-use axum::Router;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
@@ -73,9 +73,7 @@ impl TestServer {
     /// The application lifecycle guard is preserved for the entire duration of the server;
     /// module `on_shutdown` hooks execute in reverse topological order only when [`TestServer::shutdown`]
     /// is awaited or when the server is dropped.
-    pub async fn from_builder<E, C, S>(
-        builder: RumeBuilder<E, C, S>,
-    ) -> Result<Self, BuildError>
+    pub async fn from_builder<E, C, S>(builder: RumeBuilder<E, C, S>) -> Result<Self, BuildError>
     where
         E: Clone + Send + Sync + 'static,
         C: Clone + Send + Sync + 'static,
@@ -176,7 +174,9 @@ impl TestServer {
     }
 
     /// Converts a [`reqwest::Response`] into a fluent [`TestResponse`].
-    pub async fn from_reqwest_response(resp: reqwest::Response) -> Result<TestResponse, std::io::Error> {
+    pub async fn from_reqwest_response(
+        resp: reqwest::Response,
+    ) -> Result<TestResponse, std::io::Error> {
         let status = StatusCode::from_u16(resp.status().as_u16())
             .map_err(|e| std::io::Error::other(format!("invalid status code: {e}")))?;
 
@@ -232,8 +232,8 @@ impl Drop for TestServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::routing::{get, post};
     use axum::Json;
+    use axum::routing::{get, post};
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]
@@ -262,9 +262,7 @@ mod tests {
             .route(
                 "/api/echo",
                 post(|Json(req): Json<EchoRequest>| async move {
-                    Json(EchoResponse {
-                        echo: req.message,
-                    })
+                    Json(EchoResponse { echo: req.message })
                 }),
             );
 

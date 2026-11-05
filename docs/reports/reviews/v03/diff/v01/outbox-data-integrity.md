@@ -2,42 +2,42 @@
 
 ## Summary
 
-This diff review evaluates the outbox and data integrity subsystem in Rume across commits `cf82559..HEAD`, auditing `rume/src/outbox/`, SQL schemas and queries, database backends, and integration tests. All three critical data-loss vulnerabilities from v03 (C1 unvalidated lease tokens in completions, C2 premature lease revocation via message age, and C3 upsert status corruption) have been fully and cleanly resolved with robust integration test verification. However, the change **fails** diff review and cannot be accepted as-is because the remediation for dispatcher panic isolation (v03 M5) is defective: `std::panic::catch_unwind` wraps only the future's construction closure rather than its execution, allowing asynchronous dispatcher panics to unwind uncaught and permanently terminate the background relay loop (Finding M1).
+This diff review evaluates the outbox and data integrity subsystem in Rume across commits `cf82559..HEAD`, auditing `crates/core/src/outbox/`, SQL schemas and queries, database backends, and integration tests. All three critical data-loss vulnerabilities from v03 (C1 unvalidated lease tokens in completions, C2 premature lease revocation via message age, and C3 upsert status corruption) have been fully and cleanly resolved with robust integration test verification. However, the change **fails** diff review and cannot be accepted as-is because the remediation for dispatcher panic isolation (v03 M5) is defective: `std::panic::catch_unwind` wraps only the future's construction closure rather than its execution, allowing asynchronous dispatcher panics to unwind uncaught and permanently terminate the background relay loop (Finding M1).
 
 ---
 
 ## Prior decisions
 
 - **v03 Outbox C1 (Superseded relay worker overwrites active claims and resurrects published messages via unvalidated lease tokens in `mark_published()` and `mark_failed()`)** — **RESOLVED**.
-  `OutboxRepository` signatures in `rume/src/outbox/repository.rs:40–50` now mandate `lease_token: &str`:
+  `OutboxRepository` signatures in `crates/core/src/outbox/repository.rs:40–50` now mandate `lease_token: &str`:
   ```rust
   fn mark_published(&self, id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
   fn mark_failed(&self, id: &str, lease_token: &str, error: String) -> BoxFuture<'_, Result<(), OutboxError>>;
   ```
-  In PostgreSQL (`postgres.rs:394, 435`), MySQL (`mysql.rs:411, 452`), and SQLite (`sqlite.rs:419, 460`), the update statements enforce `WHERE id = $1 AND lease_token = $2 AND status = 'inflight'`. Crucially, all backends assert `res.rows_affected() > 0`; if zero rows are modified, `Err(OutboxError::Repository(...))` is returned, rejecting superseded workers whose lease expired or was revoked. Verified by integration test `outbox_superseded_worker_cannot_mark_published_or_failed` in `rume/tests/integration/outbox.rs:436–478`.
+  In PostgreSQL (`postgres.rs:394, 435`), MySQL (`mysql.rs:411, 452`), and SQLite (`sqlite.rs:419, 460`), the update statements enforce `WHERE id = $1 AND lease_token = $2 AND status = 'inflight'`. Crucially, all backends assert `res.rows_affected() > 0`; if zero rows are modified, `Err(OutboxError::Repository(...))` is returned, rejecting superseded workers whose lease expired or was revoked. Verified by integration test `outbox_superseded_worker_cannot_mark_published_or_failed` in `crates/core/tests/integration/outbox.rs:436–478`.
 
 - **v03 Outbox C2 (Premature lease revocation in `outbox_recover.sql` via message age condition causes unconditional concurrent double-dispatch)** — **RESOLVED**.
-  Across `rume/src/persistence/sql/{postgres,mysql,sqlite}/outbox_recover.sql`, the clause `OR ($1 - created_at) >= $2` was excised. The recovery query evaluates strictly against granted lease expiration:
+  Across `crates/core/src/persistence/sql/{postgres,mysql,sqlite}/outbox_recover.sql`, the clause `OR ($1 - created_at) >= $2` was excised. The recovery query evaluates strictly against granted lease expiration:
   ```sql
   WHERE status = 'inflight'
     AND (lease_expires_at <= $1 OR lease_expires_at IS NULL);
   ```
-  All three persistence drivers bind only the current timestamp `now` as `$1`. Unsigned subtraction underflow under clock skew (MySQL error 1690) is eliminated, and active leases on messages queued for $\ge 30$ seconds remain undisturbed. Verified by integration test `outbox_recovery_does_not_prematurely_revoke_valid_lease_on_old_message` in `rume/tests/integration/outbox.rs:481–511`.
+  All three persistence drivers bind only the current timestamp `now` as `$1`. Unsigned subtraction underflow under clock skew (MySQL error 1690) is eliminated, and active leases on messages queued for $\ge 30$ seconds remain undisturbed. Verified by integration test `outbox_recovery_does_not_prematurely_revoke_valid_lease_on_old_message` in `crates/core/tests/integration/outbox.rs:481–511`.
 
 - **v03 Outbox C3 (Duplicate message insertion with upsert resurrects already-published and in-flight messages)** — **RESOLVED**.
-  `outbox_insert.sql` was replaced with `ON CONFLICT (id) DO NOTHING` in PostgreSQL (`postgres/outbox_insert.sql:5`) and SQLite (`sqlite/outbox_insert.sql:5`), and `ON DUPLICATE KEY UPDATE id = id` in MySQL (`mysql/outbox_insert.sql:5`). Re-inserting an existing message ID (such as during client HTTP idempotency retries or saga step replay) is a no-op that preserves existing publication status, retry counts, and lease locks. Verified by integration test `outbox_duplicate_insert_preserves_published_and_inflight_state` in `rume/tests/integration/outbox.rs:514–539`.
+  `outbox_insert.sql` was replaced with `ON CONFLICT (id) DO NOTHING` in PostgreSQL (`postgres/outbox_insert.sql:5`) and SQLite (`sqlite/outbox_insert.sql:5`), and `ON DUPLICATE KEY UPDATE id = id` in MySQL (`mysql/outbox_insert.sql:5`). Re-inserting an existing message ID (such as during client HTTP idempotency retries or saga step replay) is a no-op that preserves existing publication status, retry counts, and lease locks. Verified by integration test `outbox_duplicate_insert_preserves_published_and_inflight_state` in `crates/core/tests/integration/outbox.rs:514–539`.
 
 - **v03 Outbox M1 (Missing `ORDER BY created_at ASC` in MySQL `outbox_claim.sql` violates FIFO temporal event ordering)** — **RESOLVED**.
-  `rume/src/persistence/sql/mysql/outbox_claim.sql:6` now includes `ORDER BY created_at ASC, id ASC` before `LIMIT ?`. (The clause was also mirrored in PostgreSQL and SQLite with secondary sorting on `id ASC` to break ties). FIFO causal ordering is strictly guaranteed across all database engines.
+  `crates/core/src/persistence/sql/mysql/outbox_claim.sql:6` now includes `ORDER BY created_at ASC, id ASC` before `LIMIT ?`. (The clause was also mirrored in PostgreSQL and SQLite with secondary sorting on `id ASC` to break ties). FIFO causal ordering is strictly guaranteed across all database engines.
 
 - **v03 Outbox M2 (Relay error propagation swallows recovery failures and abandons claimed in-flight messages on partial batch failures)** — **RESOLVED**.
-  In `rume/src/outbox/relay.rs:91–98`, recovery errors are explicitly logged via `tracing::warn!(error = %err, "Failed to recover expired outbox claims")` instead of silently swallowed with `let _ = ...`. In the dispatch loop (`relay.rs:122–144`), errors in `mark_published` and `mark_failed` are logged with `tracing::error!` and do not early-return out of the batch; subsequent claimed messages continue to be processed and dispatched, preventing batch stranding.
+  In `crates/core/src/outbox/relay.rs:91–98`, recovery errors are explicitly logged via `tracing::warn!(error = %err, "Failed to recover expired outbox claims")` instead of silently swallowed with `let _ = ...`. In the dispatch loop (`relay.rs:122–144`), errors in `mark_published` and `mark_failed` are logged with `tracing::error!` and do not early-return out of the batch; subsequent claimed messages continue to be processed and dispatched, preventing batch stranding.
 
 - **v03 Outbox M3 (Non-atomic read-modify-write race condition in `mark_failed()` overwrites concurrent retry counters)** — **RESOLVED**.
   Both `SELECT retry_count` and `UPDATE rume_outbox` in `postgres.rs:416–446`, `mysql.rs:433–463`, and `sqlite.rs:441–471` now enforce `WHERE id = $1 AND lease_token = $2 AND status = 'inflight'`. Because lease tokens are cryptographically random UUIDs uniquely generated per claim, concurrent workers can never hold the same token. If a worker's lease expires and another worker claims the row, any subsequent update by the superseded worker fails with zero rows affected. The lost-update race condition identified in M3 is neutralized.
 
 - **v03 Outbox M4 (Outbox repository lacks dead-letter queue (DLQ) query/reprocess API and visibility)** — **RESOLVED**.
-  `OutboxRepository` trait declares `failed_count()`, `fetch_failed(limit)`, and `reprocess_failed(id)`. Fully implemented with parameterized SQL in `PostgresBackend` (`postgres.rs:498–567`), `MysqlBackend` (`mysql.rs:515–584`), `SqliteBackend` (`sqlite.rs:523–592`), and delegated through `DatabasePool<B>` with pool admission permits (`pool.rs:437–469`). Verified by integration test `outbox_relay_tracks_failures_and_exhaustion` in `rume/tests/integration/outbox.rs:83–144`.
+  `OutboxRepository` trait declares `failed_count()`, `fetch_failed(limit)`, and `reprocess_failed(id)`. Fully implemented with parameterized SQL in `PostgresBackend` (`postgres.rs:498–567`), `MysqlBackend` (`mysql.rs:515–584`), `SqliteBackend` (`sqlite.rs:523–592`), and delegated through `DatabasePool<B>` with pool admission permits (`pool.rs:437–469`). Verified by integration test `outbox_relay_tracks_failures_and_exhaustion` in `crates/core/tests/integration/outbox.rs:83–144`.
 
 - **v03 Outbox M5 (Unhandled dispatcher panics permanently terminate `OutboxRelay::start()` background worker loop)** — **CHALLENGED (Defective Remediation)**.
   The fix in `relay.rs:113–120` wrapped `(self.dispatcher)(&message)` in `std::panic::catch_unwind(...)`. However, `self.dispatcher` returns a pinned future (`Pin<Box<dyn Future>>`), and creating the future does not execute the async code. The async body executes only when `fut.await` is evaluated outside `catch_unwind`. An async panic inside user dispatcher code still unwinds through `poll_and_dispatch()` and kills the spawned Tokio task in `start()`. Re-reported as finding M1.
@@ -52,7 +52,7 @@ This diff review evaluates the outbox and data integrity subsystem in Rume acros
   `ORDER BY created_at ASC, id ASC` was added to `outbox_claim.sql` across PostgreSQL, MySQL, and SQLite. Even when hundreds of messages are inserted within the same second, the secondary sort on `id ASC` enforces deterministic tie-breaking.
 
 - **v03 Outbox m4 (Outbox operations on `DatabasePool<B>` bypass pool semaphores and in-flight accounting)** — **RESOLVED**.
-  In `rume/src/persistence/pool.rs:334–469`, all 10 `OutboxRepository` methods now call `let _lease = self.acquire_lease().map_err(|e| OutboxError::Repository(e.to_string()))?;` before delegating to `self.backend()`. Outbox background operations are now properly bound by pool admission limits and connection metrics.
+  In `crates/core/src/persistence/pool.rs:334–469`, all 10 `OutboxRepository` methods now call `let _lease = self.acquire_lease().map_err(|e| OutboxError::Repository(e.to_string()))?;` before delegating to `self.backend()`. Outbox background operations are now properly bound by pool admission limits and connection metrics.
 
 ---
 
@@ -60,7 +60,7 @@ This diff review evaluates the outbox and data integrity subsystem in Rume acros
 
 ### M1 Unhandled asynchronous dispatcher panics bypass `catch_unwind` and terminate `OutboxRelay` background loop
 
-- **Where:** `rume/src/outbox/relay.rs:113–120`
+- **Where:** `crates/core/src/outbox/relay.rs:113–120`
 - **What it says:**
   ```rust
   let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -85,9 +85,9 @@ This diff review evaluates the outbox and data integrity subsystem in Rume acros
   
   Furthermore, because the panic unwinds out of `poll_and_dispatch()`, the panicked message is never marked failed via `mark_failed()`. It remains stuck in `InFlight` status with an active lease until `recover_expired_claims()` reclaims it, and any remaining messages in the claimed batch are abandoned until their leases expire as well.
   
-  *(Note for `jobs-worker-concurrency` reviewer: `rume/src/jobs/worker.rs:366–371` contains the identical anti-pattern on job dispatch).*
+  *(Note for `jobs-worker-concurrency` reviewer: `crates/core/src/jobs/worker.rs:366–371` contains the identical anti-pattern on job dispatch).*
 - **Suggested fix:**
-  Catch unwinding panics during the polling/awaiting of the future itself. Either add `futures-util` to `rume/Cargo.toml` (`futures-util = { workspace = true }`) and invoke `FutureExt::catch_unwind`:
+  Catch unwinding panics during the polling/awaiting of the future itself. Either add `futures-util` to `crates/core/Cargo.toml` (`futures-util = { workspace = true }`) and invoke `FutureExt::catch_unwind`:
   ```rust
   use futures_util::FutureExt;
 
@@ -105,7 +105,7 @@ This diff review evaluates the outbox and data integrity subsystem in Rume acros
 
 ### m1 Hardcoded `max_retries` threshold of 5 remains unconfigurable across database drivers
 
-- **Where:** `rume/src/persistence/postgres.rs:430`, `rume/src/persistence/mysql.rs:447`, `rume/src/persistence/sqlite.rs:455`
+- **Where:** `crates/core/src/persistence/postgres.rs:430`, `crates/core/src/persistence/mysql.rs:447`, `crates/core/src/persistence/sqlite.rs:455`
 - **What it says:**
   ```rust
   let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
@@ -126,7 +126,7 @@ This diff review evaluates the outbox and data integrity subsystem in Rume acros
 - **First-class DLQ administration**: The addition of `failed_count()`, `fetch_failed()`, and `reprocess_failed()` provides full visibility and operational recovery for poison-pill events across all backends.
 - **Comprehensive pool admission gating**: Delegating all `OutboxRepository` operations through `DatabasePool::acquire_lease()` binds outbox traffic to pool semaphore limits and in-flight tracking, preventing outbox background loops from exhausting database connections.
 - **Deterministic ordering**: Secondary sorting on `ORDER BY created_at ASC, id ASC` across all engines eliminates tie-breaking jitter for events generated within the same epoch second.
-- **Exemplary integration test suite**: `rume/tests/integration/outbox.rs` contains 13 robust, deterministically synchronized tests covering all edge cases, from lease recovery to transactional rollback.
+- **Exemplary integration test suite**: `crates/core/tests/integration/outbox.rs` contains 13 robust, deterministically synchronized tests covering all edge cases, from lease recovery to transactional rollback.
 
 ---
 

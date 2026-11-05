@@ -10,13 +10,13 @@ Rume v02 achieves noteworthy improvements in its developer experience: `rume new
 
 All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and summarized in `docs/reports/reviews/v01/todo.md`) have been re-evaluated against the current implementation:
 
-- **D-M1 — `AppContext::new()` takes 6 positional args of mixed types** — **CHALLENGED**. While `AppContext::builder` was introduced in `rume/src/app/context.rs:85–170`, the builder fails to infer the state generic parameter `S` without explicit type annotations (`AppContext::<_, _, ()>::builder(...)`), and `AppContextBuilder::build()` requires `where S: Default`. As a result, non-`Default` application state cannot use the builder, and the generated project template (`rume-cli/templates/src/app.rs.tpl:23–30`) still calls the 6-positional-arg `AppContext::new(...)` constructor. Evaluated under finding M2.
-- **D-M2 — `Rume::builder()` documented as sole entry point, but `RumeBuilder::new()` is public** — **REAFFIRMED**. Verified in `rume/src/app/builder.rs:295`. `RumeBuilder::new` was made `pub(crate)`, establishing `Rume::builder(ctx)` (for typed custom context) and `Rume::new()` (for 3-line progressive defaults) as the canonical public entry points.
-- **D-M3 — `health_routes()` and `ops_router()` are two overlapping health-endpoint APIs** — **CHALLENGED**. Rather than unifying the APIs into one canonical health check interface, `ops_router` was retained in `rume/src/app/shutdown.rs:58–88` and merely re-routed to `/ops/live` and `/ops/ready` on `Router<Availability>`, ignoring `HealthChecks`. It remains an orphaned duplicate operational route API with an incompatible state model, re-exported in `prelude.rs:7`. Evaluated under finding m1.
-- **D-m1 — Prelude re-exports whole third-party crates, polluting the namespace** — **REAFFIRMED**. Verified in `rume/src/lib.rs:34–100` and `rume/src/prelude.rs:75–78`. Whole third-party crate re-exports (`pub use axum;`, `pub use tokio;`, `pub use serde;`, etc.) have been completely removed. (Note: Prelude breadth regarding internal subsystem types is evaluated in Architecture v02 M1).
+- **D-M1 — `AppContext::new()` takes 6 positional args of mixed types** — **CHALLENGED**. While `AppContext::builder` was introduced in `crates/core/src/app/context.rs:85–170`, the builder fails to infer the state generic parameter `S` without explicit type annotations (`AppContext::<_, _, ()>::builder(...)`), and `AppContextBuilder::build()` requires `where S: Default`. As a result, non-`Default` application state cannot use the builder, and the generated project template (`rume-cli/templates/src/app.rs.tpl:23–30`) still calls the 6-positional-arg `AppContext::new(...)` constructor. Evaluated under finding M2.
+- **D-M2 — `Rume::builder()` documented as sole entry point, but `RumeBuilder::new()` is public** — **REAFFIRMED**. Verified in `crates/core/src/app/builder.rs:295`. `RumeBuilder::new` was made `pub(crate)`, establishing `Rume::builder(ctx)` (for typed custom context) and `Rume::new()` (for 3-line progressive defaults) as the canonical public entry points.
+- **D-M3 — `health_routes()` and `ops_router()` are two overlapping health-endpoint APIs** — **CHALLENGED**. Rather than unifying the APIs into one canonical health check interface, `ops_router` was retained in `crates/core/src/app/shutdown.rs:58–88` and merely re-routed to `/ops/live` and `/ops/ready` on `Router<Availability>`, ignoring `HealthChecks`. It remains an orphaned duplicate operational route API with an incompatible state model, re-exported in `prelude.rs:7`. Evaluated under finding m1.
+- **D-m1 — Prelude re-exports whole third-party crates, polluting the namespace** — **REAFFIRMED**. Verified in `crates/core/src/lib.rs:34–100` and `crates/core/src/prelude.rs:75–78`. Whole third-party crate re-exports (`pub use axum;`, `pub use tokio;`, `pub use serde;`, etc.) have been completely removed. (Note: Prelude breadth regarding internal subsystem types is evaluated in Architecture v02 M1).
 - **D-m2 — `rume generate handler` uses fragile string-marker codegen with silent degradation** — **REAFFIRMED** with new finding. The generator now terminates with `std::process::exit(1)` when `// rume:routes` is absent rather than continuing with a warning. However, string-marker matching remains fragile, does not roll back created handler files on failure, and does not detect duplicate route paths. Evaluated under findings M5 and m3.
-- **D-m3 — `rume new` scaffolds a `Cargo.toml` with a local path dependency and no warning** — **REAFFIRMED**. Verified in `rume-cli/src/commands/new.rs:28–48, 126–137`. Project generation now defaults to a published `rume = "{version}"` dependency. When `--path` or `RUME_DEV_PATH` is passed, it injects the local path and prints an explicit post-scaffold note advising the user before publishing.
-- **D-m4 — Generated code imports via `rume::axum` / `rume::serde`** — **REAFFIRMED**. Verified in `rume-cli/src/commands/generate/handler.rs:23–24`, `resource.rs:19–22`, and `rume-cli/templates/Cargo.toml.tpl:8–10`. Generated code now imports directly from `axum` and `serde`, and `Cargo.toml.tpl` declares direct dependencies on both.
+- **D-m3 — `rume new` scaffolds a `Cargo.toml` with a local path dependency and no warning** — **REAFFIRMED**. Verified in `crates/cli/src/commands/new.rs:28–48, 126–137`. Project generation now defaults to a published `rume = "{version}"` dependency. When `--path` or `RUME_DEV_PATH` is passed, it injects the local path and prints an explicit post-scaffold note advising the user before publishing.
+- **D-m4 — Generated code imports via `rume::axum` / `rume::serde`** — **REAFFIRMED**. Verified in `crates/cli/src/commands/generate/handler.rs:23–24`, `resource.rs:19–22`, and `rume-cli/templates/Cargo.toml.tpl:8–10`. Generated code now imports directly from `axum` and `serde`, and `Cargo.toml.tpl` declares direct dependencies on both.
 - **D-m5 — No machine-readable output (`--json`) for `doctor`, `env check`, `config check`** — **REAFFIRMED** with new finding. Machine-readable JSON output was added to `doctor`, `env check`, and `config check` via `--format json`, and `list:routes` via `--json`. However, the flag syntax is inconsistent between inspection commands. Evaluated under finding m2.
 
 ---
@@ -25,9 +25,9 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### M1 OpenAPI 3.1 generator discards route parameter matchers and infers schemas via parameter-name substring heuristics
 
-- **Where:** `rume/src/openapi/spec.rs:163–177` and `rume/src/routing/router.rs:235–240`
+- **Where:** `crates/core/src/openapi/spec.rs:163–177` and `crates/core/src/routing/router.rs:235–240`
 - **What it says:**
-  In `rume/src/openapi/spec.rs`:
+  In `crates/core/src/openapi/spec.rs`:
   ```rust
   let mut parameters = Vec::new();
   for param in &route.params {
@@ -46,7 +46,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
       });
   }
   ```
-  In `rume/src/routing/router.rs`:
+  In `crates/core/src/routing/router.rs`:
   ```rust
   self.registry.register(RouteInfo {
       method,
@@ -73,9 +73,9 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### M2 `AppContext::builder` fails to infer state generic and requires `S: Default`, forcing template and call sites to use 6 positional arguments
 
-- **Where:** `rume/src/app/context.rs:85–95, 151–170` and `rume-cli/templates/src/app.rs.tpl:23–30`
+- **Where:** `crates/core/src/app/context.rs:85–95, 151–170` and `rume-cli/templates/src/app.rs.tpl:23–30`
 - **What it says:**
-  In `rume/src/app/context.rs`:
+  In `crates/core/src/app/context.rs`:
   ```rust
   impl<E, C, S> AppContext<E, C, S>
   where ...
@@ -137,13 +137,13 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### M3 Configuration provenance reporting is entirely absent despite layered configuration support and `Cargo.toml` claims
 
-- **Where:** `rume/src/config.rs:40–89`, `rume/Cargo.toml:22`, and `rume-cli/src/commands/config/`
+- **Where:** `crates/core/src/config.rs:40–89`, `crates/core/Cargo.toml:22`, and `crates/cli/src/commands/config/`
 - **What it says:**
-  In `rume/Cargo.toml`:
+  In `crates/core/Cargo.toml`:
   ```toml
   # Layered configuration with provenance.
   ```
-  In `rume/src/config.rs`:
+  In `crates/core/src/config.rs`:
   ```rust
   fn build_figment(dir: &Path) -> Result<Figment> {
       let env_name = crate::env::resolve_env_name();
@@ -163,7 +163,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
   }
   ```
 - **Why it's a problem:**
-  While environment loading (`rume/src/env/loading.rs`) explicitly tracks provenance via `ResolvedEnv.sources: BTreeMap<String, String>` and CLI `rume env explain <key>`, configuration loading (`rume/src/config.rs`) provides no provenance tracking whatsoever:
+  While environment loading (`crates/core/src/env/loading.rs`) explicitly tracks provenance via `ResolvedEnv.sources: BTreeMap<String, String>` and CLI `rume env explain <key>`, configuration loading (`crates/core/src/config.rs`) provides no provenance tracking whatsoever:
   1. `config::load<T>()` and `config::load_raw()` return opaque values with no metadata recording which configuration file (`app.toml`, `app.development.toml`, `app.local.toml`, etc.) supplied each key.
   2. The CLI provides `rume config check` (printing the merged TOML) but has no `rume config explain <key>` command to diagnose which candidate file took precedence for a given configuration setting.
   3. The whole-document review charter explicitly mandates "configuration provenance reporting." Developers troubleshooting configuration overrides in staging and production environments have no framework tooling to inspect configuration provenance.
@@ -176,7 +176,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### M4 Environment interpolation error formatting hides the variable name by escaping format braces (`${{variable}}`)
 
-- **Where:** `rume/src/env/error.rs:23–27`
+- **Where:** `crates/core/src/env/error.rs:23–27`
 - **What it says:**
   ```rust
   #[error("failed to interpolate ${{variable}}: variable not found")]
@@ -250,7 +250,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m1 Orphaned `ops_router` in `shutdown.rs` preserves duplicate health check API with conflicting state model
 
-- **Where:** `rume/src/app/shutdown.rs:58–88` and `rume/src/prelude.rs:7`
+- **Where:** `crates/core/src/app/shutdown.rs:58–88` and `crates/core/src/prelude.rs:7`
 - **What it says:**
   ```rust
   pub fn ops_router(router: Router<Availability>) -> Router<Availability> {
@@ -265,13 +265,13 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
   - `rume::app::ops_router()` operates on `Router<Availability>` at `/ops/live` and `/ops/ready`, ignoring `HealthChecks`.
   `ops_router` is located in `shutdown.rs` despite having nothing to do with graceful shutdown, is completely unused across all templates and integration tests, and is exported in `prelude.rs`, confusing developers about which endpoints to configure for infrastructure liveness/readiness probes.
 - **Suggested fix:**
-  Deprecate or remove `ops_router` from `app/shutdown.rs` and `prelude.rs`. If a standalone ops router without `AppContext` is required for minimal applications, consolidate it into `rume/src/routing/health.rs` under a unified naming convention.
+  Deprecate or remove `ops_router` from `app/shutdown.rs` and `prelude.rs`. If a standalone ops router without `AppContext` is required for minimal applications, consolidate it into `crates/core/src/routing/health.rs` under a unified naming convention.
 
 ---
 
 ### m2 Inconsistent JSON CLI flags across inspection commands (`--format json` vs `--json`)
 
-- **Where:** `rume-cli/src/cli.rs:40–51, 67–98`
+- **Where:** `crates/cli/src/cli.rs:40–51, 67–98`
 - **What it says:**
   `rume list:routes` declares `#[arg(long)] json: bool`.
   `rume doctor`, `rume env check`, and `rume config check` declare `#[arg(long, default_value = "human")] format: String`.
@@ -287,7 +287,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m3 CLI generators use naive first-letter `capitalize` rather than `rume::helpers::pascal_case`, generating non-idiomatic struct names
 
-- **Where:** `rume-cli/src/commands/generate/resource.rs:192–198, 224`, `handler.rs:100–106`, `model.rs:57–63`, `service.rs:57–63`
+- **Where:** `crates/cli/src/commands/generate/resource.rs:192–198, 224`, `handler.rs:100–106`, `model.rs:57–63`, `service.rs:57–63`
 - **What it says:**
   ```rust
   fn capitalize(value: &str) -> String {
@@ -310,7 +310,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m4 `RouteGroup` lacks fluent `.layer()` middleware mounting method
 
-- **Where:** `rume/src/routing/group.rs:21–156`
+- **Where:** `crates/core/src/routing/group.rs:21–156`
 - **What it says:**
   `RouteGroup<S>` provides `.prefix()`, `.get()`, `.post()`, `.put()`, `.patch()`, `.delete()`, `.add()`, `.route_spec()`, and `.resource()`, but provides no `.layer<L>(self, layer: L)` method.
 - **Why it's a problem:**
@@ -333,7 +333,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m5 `RumeBuilder` lacks fluent `.openapi()` and `.metrics()` methods available on `Router`
 
-- **Where:** `rume/src/app/builder.rs:240–250, 480–550` and `rume/src/routing/router.rs:374–402`
+- **Where:** `crates/core/src/app/builder.rs:240–250, 480–550` and `crates/core/src/routing/router.rs:374–402`
 - **What it says:**
   `rume::routing::Router` provides fluent helpers:
   ```rust
@@ -350,7 +350,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m6 Stale "extractor" docstrings and unused phantom type parameter on `ValidatedParam`
 
-- **Where:** `rume/src/routing/validated_param.rs:1–4, 35–39, 61–64` and `rume/src/prelude.rs:60`
+- **Where:** `crates/core/src/routing/validated_param.rs:1–4, 35–39, 61–64` and `crates/core/src/prelude.rs:60`
 - **What it says:**
   ```rust
   //! Validated parameter extraction.
@@ -364,7 +364,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
   pub fn into_inner(self) -> String {
   ```
 - **Why it's a problem:**
-  In v01 finding C1, `ValidatedParam`'s broken `FromRequestParts<()>` implementation was removed, moving route parameter validation to `ParamValidationLayer` on `RouteSpec` and `ValidatedPath<T>` in `rume/src/validation.rs`. However, `ValidatedParam` retains stale docstrings calling it an "extractor", retains a phantom marker `M` that is completely disconnected from the runtime `matcher: Matcher` argument in `from_value()`, and is re-exported in `prelude.rs`. Attempting to use `ValidatedParam` as a handler extractor fails compilation, misleading developers.
+  In v01 finding C1, `ValidatedParam`'s broken `FromRequestParts<()>` implementation was removed, moving route parameter validation to `ParamValidationLayer` on `RouteSpec` and `ValidatedPath<T>` in `crates/core/src/validation.rs`. However, `ValidatedParam` retains stale docstrings calling it an "extractor", retains a phantom marker `M` that is completely disconnected from the runtime `matcher: Matcher` argument in `from_value()`, and is re-exported in `prelude.rs`. Attempting to use `ValidatedParam` as a handler extractor fails compilation, misleading developers.
 - **Suggested fix:**
   Remove the unused phantom generic `M` from `ValidatedParam`, update documentation to clarify that it is a manual validation utility, direct developers to `RouteSpec::where_param` and `ValidatedPath` for Axum handler extraction, and remove `ValidatedParam` from `rume::prelude`.
 
@@ -399,7 +399,7 @@ All prior findings recorded in `docs/reports/reviews/v01/dx-usability.md` (and s
 
 ### m8 Terminal UI `Sticker` calculates box padding using byte length instead of display width
 
-- **Where:** `rume-cli/src/ui/sticker.rs:25–32`
+- **Where:** `crates/cli/src/ui/sticker.rs:25–32`
 - **What it says:**
   ```rust
   let max_len = self.lines.iter().map(|l| l.len()).max().unwrap_or(0);

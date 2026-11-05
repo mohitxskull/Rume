@@ -1,19 +1,21 @@
 //! Declarative test harness coordinating database pools, lifecycle hooks, outbox relays, and router integration.
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+use super::app::TestApp;
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use axum::body::Body;
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 use axum::http::Response;
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-use super::app::TestApp;
 
 /// Declarative, fluent test harness coordinating database pools, lifecycle hooks, outbox relays, and test app routing.
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-pub struct RumeTestHarness<B: crate::persistence::DatabaseBackend + crate::outbox::OutboxRepository> {
+pub struct RumeTestHarness<B: crate::persistence::DatabaseBackend + crate::outbox::OutboxRepository>
+{
     /// Active database pool configured for testing.
     pub pool: crate::persistence::DatabasePool<B>,
     /// Optional outbox relay configured for event dispatch.
-    pub outbox: Option<std::sync::Arc<crate::outbox::OutboxRelay<crate::persistence::DatabasePool<B>>>>,
+    pub outbox:
+        Option<std::sync::Arc<crate::outbox::OutboxRelay<crate::persistence::DatabasePool<B>>>>,
     /// Optional test app for issuing simulated HTTP requests.
     pub app: Option<TestApp>,
 }
@@ -45,19 +47,26 @@ where
         F: Fn(&crate::outbox::OutboxMessage) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), crate::outbox::OutboxError>> + Send + 'static,
     {
-        let relay = crate::outbox::OutboxRelay::new(std::sync::Arc::new(self.pool.clone()), dispatcher);
+        let relay =
+            crate::outbox::OutboxRelay::new(std::sync::Arc::new(self.pool.clone()), dispatcher);
         self.outbox = Some(std::sync::Arc::new(relay));
         self
     }
 
     /// Returns a reference to the active test app, panicking if no router was configured.
     pub fn app(&self) -> &TestApp {
-        self.app.as_ref().expect("no router configured on test harness")
+        self.app
+            .as_ref()
+            .expect("no router configured on test harness")
     }
 
     /// Returns a reference to the active outbox relay, panicking if no outbox was configured.
-    pub fn outbox(&self) -> &std::sync::Arc<crate::outbox::OutboxRelay<crate::persistence::DatabasePool<B>>> {
-        self.outbox.as_ref().expect("no outbox configured on test harness")
+    pub fn outbox(
+        &self,
+    ) -> &std::sync::Arc<crate::outbox::OutboxRelay<crate::persistence::DatabasePool<B>>> {
+        self.outbox
+            .as_ref()
+            .expect("no outbox configured on test harness")
     }
 
     /// Executes a SQL statement directly against the test harness database pool.
@@ -66,7 +75,10 @@ where
     }
 
     /// Evaluates a scalar query directly against the test harness database pool.
-    pub async fn query_scalar(&self, query: &str) -> Result<Option<String>, crate::persistence::PersistenceError> {
+    pub async fn query_scalar(
+        &self,
+        query: &str,
+    ) -> Result<Option<String>, crate::persistence::PersistenceError> {
         self.pool.backend().query_scalar(query).await
     }
 
@@ -95,7 +107,9 @@ impl RumeTestHarness<crate::persistence::SqliteBackend> {
 #[cfg(feature = "postgres")]
 impl RumeTestHarness<crate::persistence::PostgresBackend> {
     /// Builds a PostgreSQL test harness wrapping the provided pool.
-    pub fn postgres(pool: crate::persistence::DatabasePool<crate::persistence::PostgresBackend>) -> Self {
+    pub fn postgres(
+        pool: crate::persistence::DatabasePool<crate::persistence::PostgresBackend>,
+    ) -> Self {
         Self::new(pool)
     }
 }

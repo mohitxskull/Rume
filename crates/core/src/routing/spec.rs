@@ -198,8 +198,8 @@ impl RouteSpec {
         let req_schema = self.request_schema.clone();
         let (path, method, params, name) = self.build();
         let param_names = params.iter().map(|(p, _)| p.clone()).collect();
-        let mut info = crate::routing::RouteInfo::new(method, path, name, param_names)
-            .with_matchers(params);
+        let mut info =
+            crate::routing::RouteInfo::new(method, path, name, param_names).with_matchers(params);
         if let Some(schema) = req_schema {
             info = info.with_request_schema(schema);
         }

@@ -1,9 +1,9 @@
 //! Single-binary executable entry point for the Simple API scenario.
 
-use std::path::Path;
 use rume::persistence::config::DatabaseConfig;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::sqlite::SqliteBackend;
+use std::path::Path;
 use workbench_simple_api::{build_app, load_config, migrator};
 
 #[tokio::main]

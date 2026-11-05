@@ -6,18 +6,18 @@ Rume v02 successfully realizes its architectural vision of a progressive, zero-m
 
 ## Prior decisions
 
-- **A-M1 (Public API surface leaks unrelated third-party crates; prelude too broad)** — **REAFFIRMED**. Verified in `rume/src/lib.rs:34–100` and `rume/src/prelude.rs:75–78`. Whole third-party crate re-exports (`pub use axum;`, `pub use tokio;`, `pub use serde;`, `pub use serde_json;`, `pub use tracing;`) have been completely removed from `lib.rs`. In `prelude.rs`, only standard extractors and derives (`Json`, `Path`, `State` from Axum, `Deserialize`, `Serialize` from Serde) remain. However, the internal breadth of `prelude.rs` has expanded with v02 subsystem types, which is evaluated under finding M1.
-- **A-M2 (`Rume::builder` documented as sole entry point, but `RumeBuilder::new` is public)** — **REAFFIRMED**. Verified in `rume/src/app/builder.rs:295`. `RumeBuilder::new` was made `pub(crate)`, making `Rume::builder(ctx)` (for typed custom context) and `Rume::new()` (for progressive defaults) the only public entry points for constructing an application.
-- **m1 (`init_tracing()` silently discards subscriber initialization failure)** — **CHALLENGED**. Verified in `rume/src/app/shutdown.rs:16–19`. The v01 review recommended returning a `Result` or logging the failure. In v02, `let _ = fmt().with_env_filter(filter).try_init();` was replaced with `fmt::fmt().with_env_filter(filter).init();`. Calling `.init()` panics if a global dispatcher is already registered (e.g. in multi-test harnesses, nested test runners, or embedding applications that initialize tracing prior to Rume). The recommendation to provide a fallible or non-panicking initialization path remains unresolved and is tracked under finding m4.
-- **m2 (Lifecycle/Availability atomic state coupled to enum declaration order)** — **REAFFIRMED**. Verified in `rume/src/app/state.rs:47–54, 114–121`. Both `LifecycleState` and `AvailabilityState` now carry explicit discriminants and `#[repr(u8)]` pinning (`Created = 0`, `Booted = 1`, `Ready = 2`, `Terminating = 3`, `Terminated = 4` and `Unknown = 0`, `Live = 1`, `Ready = 2`, `RefusingTraffic = 3`, `Broken = 4`). In addition, `set()` methods now accept the typed enum directly and guard against out-of-range discriminants with `MAX_DISCRIMINANT`. Verified in unit tests `lifecycle_invalid_u8_maps_to_created` and `availability_invalid_u8_maps_to_unknown`.
-- **NOTE-NEW (ARCH-01: First-Class Module System and Progressive Composition)** — Introduced in `rume/src/module/` and `rume/src/app/builder.rs:196–210, 319–334`. Provides `Rume::new()`, `Module` traits, scoped state encapsulation, DAG cycle detection, and topological startup/shutdown lifecycle sequencing. Evaluated throughout this report.
-- **NOTE-NEW (ARCH-02: CI Architecture Enforcement via `ArchitectureRules`)** — Introduced in `rume/src/module/architecture.rs`. Provides static validation for required modules and forbidden cross-module dependencies in CI test suites. Evaluated in finding M2.
+- **A-M1 (Public API surface leaks unrelated third-party crates; prelude too broad)** — **REAFFIRMED**. Verified in `crates/core/src/lib.rs:34–100` and `crates/core/src/prelude.rs:75–78`. Whole third-party crate re-exports (`pub use axum;`, `pub use tokio;`, `pub use serde;`, `pub use serde_json;`, `pub use tracing;`) have been completely removed from `lib.rs`. In `prelude.rs`, only standard extractors and derives (`Json`, `Path`, `State` from Axum, `Deserialize`, `Serialize` from Serde) remain. However, the internal breadth of `prelude.rs` has expanded with v02 subsystem types, which is evaluated under finding M1.
+- **A-M2 (`Rume::builder` documented as sole entry point, but `RumeBuilder::new` is public)** — **REAFFIRMED**. Verified in `crates/core/src/app/builder.rs:295`. `RumeBuilder::new` was made `pub(crate)`, making `Rume::builder(ctx)` (for typed custom context) and `Rume::new()` (for progressive defaults) the only public entry points for constructing an application.
+- **m1 (`init_tracing()` silently discards subscriber initialization failure)** — **CHALLENGED**. Verified in `crates/core/src/app/shutdown.rs:16–19`. The v01 review recommended returning a `Result` or logging the failure. In v02, `let _ = fmt().with_env_filter(filter).try_init();` was replaced with `fmt::fmt().with_env_filter(filter).init();`. Calling `.init()` panics if a global dispatcher is already registered (e.g. in multi-test harnesses, nested test runners, or embedding applications that initialize tracing prior to Rume). The recommendation to provide a fallible or non-panicking initialization path remains unresolved and is tracked under finding m4.
+- **m2 (Lifecycle/Availability atomic state coupled to enum declaration order)** — **REAFFIRMED**. Verified in `crates/core/src/app/state.rs:47–54, 114–121`. Both `LifecycleState` and `AvailabilityState` now carry explicit discriminants and `#[repr(u8)]` pinning (`Created = 0`, `Booted = 1`, `Ready = 2`, `Terminating = 3`, `Terminated = 4` and `Unknown = 0`, `Live = 1`, `Ready = 2`, `RefusingTraffic = 3`, `Broken = 4`). In addition, `set()` methods now accept the typed enum directly and guard against out-of-range discriminants with `MAX_DISCRIMINANT`. Verified in unit tests `lifecycle_invalid_u8_maps_to_created` and `availability_invalid_u8_maps_to_unknown`.
+- **NOTE-NEW (ARCH-01: First-Class Module System and Progressive Composition)** — Introduced in `crates/core/src/module/` and `crates/core/src/app/builder.rs:196–210, 319–334`. Provides `Rume::new()`, `Module` traits, scoped state encapsulation, DAG cycle detection, and topological startup/shutdown lifecycle sequencing. Evaluated throughout this report.
+- **NOTE-NEW (ARCH-02: CI Architecture Enforcement via `ArchitectureRules`)** — Introduced in `crates/core/src/module/architecture.rs`. Provides static validation for required modules and forbidden cross-module dependencies in CI test suites. Evaluated in finding M2.
 
 ## Findings
 
 ### M1 Over-broad `prelude.rs` leaks niche enterprise schemas, coordination primitives, and string utilities
 
-**Where:** `rume/src/prelude.rs` lines 8–74.
+**Where:** `crates/core/src/prelude.rs` lines 8–74.
 
 **What it says:**
 `prelude.rs` re-exports 70+ types and functions across all 24 subsystems, including enterprise protocol schemas (`SCIM_USER_SCHEMA`, `ScimUser`, `ScimEmail`, `SamlAssertion`, `SamlParser`), distributed coordination primitives (`DistributedLock`, `LeaderElector`, `LockGuard`), saga orchestration (`Saga`, `Step`, `FunctionalStep`), background jobs (`Job`, `QueuedJob`, `RetryPolicy`), outbox patterns (`OutboxMessage`, `OutboxRelay`), metrics counters, tenant helpers, and raw string utilities (`slug`, `truncate`, `mask_email`, `safe_equal`).
@@ -36,7 +36,7 @@ Remove `enterprise` (`SCIM_*`, `Saml*`), `saga`, `coordination`, `jobs`, `outbox
 
 ### M2 `ArchitectureRules::verify` only inspects direct dependencies, allowing indirect forbidden cross-domain dependencies
 
-**Where:** `rume/src/module/architecture.rs` lines 76–90.
+**Where:** `crates/core/src/module/architecture.rs` lines 76–90.
 
 **What it says:**
 
@@ -68,7 +68,7 @@ Update `ArchitectureRules::verify` to compute the transitive dependency closure 
 
 ### M3 Route merge collisions between modules or application routes trigger unhandled runtime panics instead of failing preflight
 
-**Where:** `rume/src/app/builder.rs` lines 788–791.
+**Where:** `crates/core/src/app/builder.rs` lines 788–791.
 
 **What it says:**
 
@@ -89,7 +89,7 @@ Before calling `router.merge(adapted)`, inspect `module_routes` for duplicate `(
 
 ### m1 Orphaned `ops_router` duplicates `health_routes` with divergent paths and state models
 
-**Where:** `rume/src/app/shutdown.rs` lines 58–88.
+**Where:** `crates/core/src/app/shutdown.rs` lines 58–88.
 
 **What it says:**
 
@@ -111,28 +111,28 @@ pub fn ops_router(router: Router<Availability>) -> Router<Availability> {
 Rume maintains two disconnected health-route APIs: `health_routes()` in `routing/health.rs` (mounted on `Router<AppContext<E, C, S>>` at `/health/live` and `/health/ready`, running `HealthChecks`) and `ops_router()` in `app/shutdown.rs` (operating on `Router<Availability>` at `/ops/live` and `/ops/ready`, ignoring `HealthChecks`). `ops_router` is located in `shutdown.rs` despite having nothing to do with graceful shutdown, is not used anywhere in the codebase or test suite, and confuses developers regarding which endpoint to use for kubernetes/monitoring probes.
 
 **Suggested fix:**
-Deprecate or remove `ops_router` in favor of the canonical `health_routes()` API. If a standalone ops router without `AppContext` is required for minimal apps, move it to `rume/src/routing/health.rs` as `minimal_health_routes(availability: Availability)` and align the route paths (`/health/live`, `/health/ready`).
+Deprecate or remove `ops_router` in favor of the canonical `health_routes()` API. If a standalone ops router without `AppContext` is required for minimal apps, move it to `crates/core/src/routing/health.rs` as `minimal_health_routes(availability: Availability)` and align the route paths (`/health/live`, `/health/ready`).
 
 ---
 
 ### m2 Misplaced tracing and ops helpers in `shutdown.rs` violate subsystem cohesion
 
-**Where:** `rume/src/app/shutdown.rs` lines 16–19 and lines 58–88.
+**Where:** `crates/core/src/app/shutdown.rs` lines 16–19 and lines 58–88.
 
 **What it says:**
-`init_tracing()` and `ops_router()` are defined inside `rume/src/app/shutdown.rs`, whose module doc comment states: `"//! Shutdown signal handling, operational routes, and tracing initialization."`
+`init_tracing()` and `ops_router()` are defined inside `crates/core/src/app/shutdown.rs`, whose module doc comment states: `"//! Shutdown signal handling, operational routes, and tracing initialization."`
 
 **Why it's a problem:**
-`shutdown.rs` has a clear responsibility: OS signal handling (`shutdown_signal`) and graceful termination coordination. Tracing initialization belongs in `rume/src/app/observability.rs` (which already defines structured spans, request logging, and `ObservabilityLayer`), and ops routes belong in `rume/src/routing/health.rs`. Placing unrelated initialization routines into `shutdown.rs` degrades subsystem cohesion and discoverability.
+`shutdown.rs` has a clear responsibility: OS signal handling (`shutdown_signal`) and graceful termination coordination. Tracing initialization belongs in `crates/core/src/app/observability.rs` (which already defines structured spans, request logging, and `ObservabilityLayer`), and ops routes belong in `crates/core/src/routing/health.rs`. Placing unrelated initialization routines into `shutdown.rs` degrades subsystem cohesion and discoverability.
 
 **Suggested fix:**
-Move `init_tracing()` to `rume/src/app/observability.rs` (and provide `try_init_tracing()` as well), move `ops_router` to `rume/src/routing/health.rs` (or deprecate it), leaving `shutdown.rs` solely focused on signal handling and graceful drain.
+Move `init_tracing()` to `crates/core/src/app/observability.rs` (and provide `try_init_tracing()` as well), move `ops_router` to `crates/core/src/routing/health.rs` (or deprecate it), leaving `shutdown.rs` solely focused on signal handling and graceful drain.
 
 ---
 
-### m3 Stale crate architecture doc comment in `rume/src/lib.rs`
+### m3 Stale crate architecture doc comment in `crates/core/src/lib.rs`
 
-**Where:** `rume/src/lib.rs` lines 3–5.
+**Where:** `crates/core/src/lib.rs` lines 3–5.
 
 **What it says:**
 
@@ -152,7 +152,7 @@ Update `lib.rs` module-level documentation to accurately describe Rume's archite
 
 ### m4 `init_tracing()` panics on already-initialized subscriber rather than providing fallible alternative
 
-**Where:** `rume/src/app/shutdown.rs` lines 16–19.
+**Where:** `crates/core/src/app/shutdown.rs` lines 16–19.
 
 **What it says:**
 
@@ -173,7 +173,7 @@ Provide `pub fn try_init_tracing() -> Result<(), tracing::subscriber::SetGlobalD
 
 ### m5 `RumeBuilder::state()` cannot transition state generic `S` on `Rume::new()`
 
-**Where:** `rume/src/app/builder.rs` lines 203–209 and lines 619–623.
+**Where:** `crates/core/src/app/builder.rs` lines 203–209 and lines 619–623.
 
 **What it says:**
 

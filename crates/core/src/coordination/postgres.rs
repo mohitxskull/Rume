@@ -85,7 +85,9 @@ impl DistributedLock for PostgresDistributedLock {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if let Some(r) = row {
-                let fencing_token: i64 = r.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let fencing_token: i64 = r
+                    .try_get(0)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LockGuard {
                     resource: res,
                     lease_id,
@@ -203,7 +205,9 @@ impl LeaderElector for PostgresLeaderElector {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if let Some(row_data) = row {
-                let term: i64 = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let term: i64 = row_data
+                    .try_get(0)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: cid,
@@ -236,7 +240,9 @@ impl LeaderElector for PostgresLeaderElector {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if let Some(row_data) = row {
-                let term: i64 = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let term: i64 = row_data
+                    .try_get(0)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: cid,
@@ -260,9 +266,15 @@ impl LeaderElector for PostgresLeaderElector {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if let Some(row_data) = row {
-                let role: String = row_data.try_get(0).map_err(|e| CoordinationError::Backend(e.to_string()))?;
-                let candidate_id: String = row_data.try_get(1).map_err(|e| CoordinationError::Backend(e.to_string()))?;
-                let term: i64 = row_data.try_get(2).map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let role: String = row_data
+                    .try_get(0)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let candidate_id: String = row_data
+                    .try_get(1)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let term: i64 = row_data
+                    .try_get(2)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 Ok(Some(LeaderLease {
                     role,
                     candidate_id,

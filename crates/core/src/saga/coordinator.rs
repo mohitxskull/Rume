@@ -261,7 +261,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             )
             .await;
 
-            let res = AssertUnwindSafe(step.execute(&mut ctx)).catch_unwind().await;
+            let res = AssertUnwindSafe(step.execute(&mut ctx))
+                .catch_unwind()
+                .await;
             let step_result = match res {
                 Ok(r) => r,
                 Err(payload) => {
@@ -306,7 +308,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 let msg = payload
                                     .downcast_ref::<&str>()
                                     .copied()
-                                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                                    .or_else(|| {
+                                        payload.downcast_ref::<String>().map(|s| s.as_str())
+                                    })
                                     .unwrap_or("compensation panicked");
                                 Err(SagaError::Aborted {
                                     saga: self.name.clone(),
@@ -339,8 +343,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         SagaStatus::Compensated { error: err }
                     };
 
-                    self.persist_state(saga_id, status.clone(), &completed_names, &compensated_names)
-                        .await;
+                    self.persist_state(
+                        saga_id,
+                        status.clone(),
+                        &completed_names,
+                        &compensated_names,
+                    )
+                    .await;
 
                     return SagaReport {
                         context: ctx,
@@ -386,17 +395,15 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             })?;
 
         match record.status {
-            SagaStatus::Success | SagaStatus::Compensated { .. } | SagaStatus::CompensationFailed { .. } => {
-                Ok(SagaReport {
-                    context: ctx,
-                    status: record.status,
-                    completed_steps: record.completed_steps,
-                    compensated_steps: record.compensated_steps,
-                })
-            }
-            SagaStatus::Compensating { .. } => {
-                self.resume_compensation(saga_id, record, ctx).await
-            }
+            SagaStatus::Success
+            | SagaStatus::Compensated { .. }
+            | SagaStatus::CompensationFailed { .. } => Ok(SagaReport {
+                context: ctx,
+                status: record.status,
+                completed_steps: record.completed_steps,
+                compensated_steps: record.compensated_steps,
+            }),
+            SagaStatus::Compensating { .. } => self.resume_compensation(saga_id, record, ctx).await,
             SagaStatus::Pending | SagaStatus::Running { .. } => {
                 self.resume_forward(saga_id, record, ctx).await
             }
@@ -415,7 +422,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
 
         // Map existing completed names to step indices
         for name in &completed_names {
-            if let Some((idx, _)) = self.steps.iter().enumerate().find(|(_, s)| s.name() == name) {
+            if let Some((idx, _)) = self
+                .steps
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.name() == name)
+            {
                 completed_indices.push(idx);
             }
         }
@@ -433,7 +445,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             )
             .await;
 
-            let res = AssertUnwindSafe(step.execute(&mut ctx)).catch_unwind().await;
+            let res = AssertUnwindSafe(step.execute(&mut ctx))
+                .catch_unwind()
+                .await;
             let step_result = match res {
                 Ok(r) => r,
                 Err(payload) => {
@@ -482,7 +496,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 let msg = payload
                                     .downcast_ref::<&str>()
                                     .copied()
-                                    .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+                                    .or_else(|| {
+                                        payload.downcast_ref::<String>().map(|s| s.as_str())
+                                    })
                                     .unwrap_or("compensation panicked");
                                 Err(SagaError::Aborted {
                                     saga: self.name.clone(),
@@ -515,8 +531,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         SagaStatus::Compensated { error: err }
                     };
 
-                    self.persist_state(saga_id, status.clone(), &completed_names, &compensated_names)
-                        .await;
+                    self.persist_state(
+                        saga_id,
+                        status.clone(),
+                        &completed_names,
+                        &compensated_names,
+                    )
+                    .await;
 
                     return Ok(SagaReport {
                         context: ctx,
@@ -555,7 +576,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let mut compensated_names = record.compensated_steps.clone();
 
         for name in &completed_names {
-            if let Some((idx, _)) = self.steps.iter().enumerate().find(|(_, s)| s.name() == name) {
+            if let Some((idx, _)) = self
+                .steps
+                .iter()
+                .enumerate()
+                .find(|(_, s)| s.name() == name)
+            {
                 completed_indices.push(idx);
             }
         }
@@ -627,8 +653,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             }
         };
 
-        self.persist_state(saga_id, status.clone(), &completed_names, &compensated_names)
-            .await;
+        self.persist_state(
+            saga_id,
+            status.clone(),
+            &completed_names,
+            &compensated_names,
+        )
+        .await;
 
         Ok(SagaReport {
             context: ctx,
@@ -639,7 +670,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     }
 
     /// Forces rollback and compensation for all completed steps recorded under `saga_id`.
-    pub async fn compensate_crashed(&self, saga_id: &str, ctx: Ctx) -> Result<SagaReport<Ctx>, SagaError> {
+    pub async fn compensate_crashed(
+        &self,
+        saga_id: &str,
+        ctx: Ctx,
+    ) -> Result<SagaReport<Ctx>, SagaError> {
         let store = self.store.as_ref().ok_or_else(|| SagaError::Storage {
             message: "cannot compensate crashed saga without a configured SagaStore".into(),
         })?;

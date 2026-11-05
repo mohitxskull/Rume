@@ -42,7 +42,10 @@ impl TestEventBus {
     }
 
     /// Dispatches an event synchronously, recording it in the test log.
-    pub async fn publish_sync<E: Event>(&self, event: &E) -> Result<usize, crate::events::EventError> {
+    pub async fn publish_sync<E: Event>(
+        &self,
+        event: &E,
+    ) -> Result<usize, crate::events::EventError> {
         let count = self.inner.publish_sync(event).await?;
         if let Ok(mut recorded) = self.recorded.write() {
             recorded.push((TypeId::of::<E>(), E::TYPE, Arc::new(event.clone())));
@@ -73,7 +76,8 @@ impl TestEventBus {
     pub fn assert_published_count<E: Event>(&self, expected: usize) {
         let count = self.published::<E>().len();
         assert_eq!(
-            count, expected,
+            count,
+            expected,
             "expected {} '{}' events, but found {}",
             expected,
             E::TYPE,

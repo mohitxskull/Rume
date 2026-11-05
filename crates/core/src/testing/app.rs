@@ -276,7 +276,8 @@ impl TestResponse {
     /// Asserts that the response status equals `expected`.
     pub fn assert_status(self, expected: StatusCode) -> Self {
         assert_eq!(
-            self.status, expected,
+            self.status,
+            expected,
             "expected HTTP status {}, got {} with body: {}",
             expected,
             self.status,
@@ -312,17 +313,20 @@ impl TestResponse {
         let mut current = &json_body;
         for segment in path.split('.') {
             current = match current {
-                serde_json::Value::Object(map) => map
-                    .get(segment)
-                    .unwrap_or_else(|| panic!("path segment '{segment}' not found in JSON: {json_body}")),
+                serde_json::Value::Object(map) => map.get(segment).unwrap_or_else(|| {
+                    panic!("path segment '{segment}' not found in JSON: {json_body}")
+                }),
                 serde_json::Value::Array(arr) => {
-                    let idx = segment
-                        .parse::<usize>()
-                        .unwrap_or_else(|_| panic!("expected array index at '{segment}' in path '{path}'"));
-                    arr.get(idx)
-                        .unwrap_or_else(|| panic!("array index '{idx}' out of bounds in JSON: {json_body}"))
+                    let idx = segment.parse::<usize>().unwrap_or_else(|_| {
+                        panic!("expected array index at '{segment}' in path '{path}'")
+                    });
+                    arr.get(idx).unwrap_or_else(|| {
+                        panic!("array index '{idx}' out of bounds in JSON: {json_body}")
+                    })
                 }
-                _ => panic!("cannot navigate path segment '{segment}' on scalar in JSON: {json_body}"),
+                _ => panic!(
+                    "cannot navigate path segment '{segment}' on scalar in JSON: {json_body}"
+                ),
             };
         }
 
@@ -358,8 +362,12 @@ impl TestResponse {
 
     /// Deserializes the response body JSON into typed `T`.
     pub fn json<T: serde::de::DeserializeOwned>(&self) -> T {
-        serde_json::from_slice(&self.body)
-            .unwrap_or_else(|e| panic!("failed to deserialize response body as JSON: {e}\nbody was: {}", self.text()))
+        serde_json::from_slice(&self.body).unwrap_or_else(|e| {
+            panic!(
+                "failed to deserialize response body as JSON: {e}\nbody was: {}",
+                self.text()
+            )
+        })
     }
 }
 

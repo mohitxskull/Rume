@@ -57,7 +57,8 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     }
 
     /// Marks a message as successfully published with the worker's active lease token.
-    fn mark_published(&self, id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
+    fn mark_published(&self, id: &str, lease_token: &str)
+    -> BoxFuture<'_, Result<(), OutboxError>>;
 
     /// Marks a message as failed with an error message and increments its retry counter,
     /// fenced by the worker's active lease token.

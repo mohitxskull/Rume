@@ -23,30 +23,30 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### From v01 (`docs/reports/reviews/v01/dx-usability.md` & `v01/todo.md`)
 
-- **v01 D-M1 (`AppContext::new()` takes 6 positional args of mixed types)** — **REAFFIRMED**. Verified in `rume/src/app/context.rs:82–107, 155–171` and `rume-cli/templates/src/app.rs.tpl:26–28`. The 6-arg constructor was superseded by `AppContext::builder(env, config).state(AppState).build()`, eliminating positional argument swap hazards and manual clone decisions in the template.
-- **v01 D-M2 (`Rume::builder()` documented as sole entry point, but `RumeBuilder::new()` is public)** — **REAFFIRMED**. Verified in `rume/src/app/builder.rs:295, 310`. `RumeBuilder::new` is `pub(crate)`. Scaffolding and documentation exclusively standardize on `Rume::builder(ctx)`.
-- **v01 D-M3 (`health_routes()` and `ops_router()` are two overlapping health-endpoint APIs)** — **REAFFIRMED**. Verified in `rume/src/app/shutdown.rs:42–46` and `rume-cli/templates/src/app.rs.tpl:5, 14`. `ops_router` is marked `#[deprecated(since = "0.2.0")]`, removed from `rume::prelude`, and `rume::routing::health_routes` is the canonical health check interface.
-- **v01 D-m1 (Prelude re-exports whole third-party crates, polluting the namespace)** — **REAFFIRMED**. Verified in `rume/src/lib.rs` and `rume/src/prelude.rs`. Whole third-party crate re-exports (`axum`, `tokio`, `serde`, `tracing`) remain purged from the prelude.
+- **v01 D-M1 (`AppContext::new()` takes 6 positional args of mixed types)** — **REAFFIRMED**. Verified in `crates/core/src/app/context.rs:82–107, 155–171` and `rume-cli/templates/src/app.rs.tpl:26–28`. The 6-arg constructor was superseded by `AppContext::builder(env, config).state(AppState).build()`, eliminating positional argument swap hazards and manual clone decisions in the template.
+- **v01 D-M2 (`Rume::builder()` documented as sole entry point, but `RumeBuilder::new()` is public)** — **REAFFIRMED**. Verified in `crates/core/src/app/builder.rs:295, 310`. `RumeBuilder::new` is `pub(crate)`. Scaffolding and documentation exclusively standardize on `Rume::builder(ctx)`.
+- **v01 D-M3 (`health_routes()` and `ops_router()` are two overlapping health-endpoint APIs)** — **REAFFIRMED**. Verified in `crates/core/src/app/shutdown.rs:42–46` and `rume-cli/templates/src/app.rs.tpl:5, 14`. `ops_router` is marked `#[deprecated(since = "0.2.0")]`, removed from `rume::prelude`, and `rume::routing::health_routes` is the canonical health check interface.
+- **v01 D-m1 (Prelude re-exports whole third-party crates, polluting the namespace)** — **REAFFIRMED**. Verified in `crates/core/src/lib.rs` and `crates/core/src/prelude.rs`. Whole third-party crate re-exports (`axum`, `tokio`, `serde`, `tracing`) remain purged from the prelude.
 - **v01 D-m2 (`rume generate handler` uses fragile string-marker codegen with silent degradation)** — **CHALLENGED (Defective remediation & lack of transactionality)**. While missing `// rume:routes` now terminates with `exit(1)` rather than continuing with a warning, the generator writes the handler file and updates `mod.rs` before checking the marker, lacking transactional rollback. Failed generation leaves orphaned files that permanently block subsequent runs. Re-reported under finding **M4**.
-- **v01 D-m3 (`rume new` scaffolds a `Cargo.toml` with local path dependency and no warning)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/new.rs:28–48, 126–138` and `tests/generated_project.rs:29–54`. Scaffolding defaults to portable published versions (`rume = "0.1.0"`). Local path overrides require explicit `--path` or `RUME_DEV_PATH`, accompanied by an explicit warning note.
-- **v01 D-m4 (Generated code imports via `rume::axum` / `rume::serde`)** — **REAFFIRMED**. Verified in `rume-cli/templates/Cargo.toml.tpl:8–9` and `rume-cli/src/commands/generate/handler.rs:23–24`. Generated code and templates directly declare dependencies on and import from `axum` and `serde`.
-- **v01 D-m5 (No machine-readable output (`--json`) for inspection commands)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/doctor.rs:136–143`, `env/check.rs:98–103`, and `config/check.rs:103–115`. Structured JSON output is supported across inspection commands. (Residual flag asymmetry is evaluated under finding **m1**).
+- **v01 D-m3 (`rume new` scaffolds a `Cargo.toml` with local path dependency and no warning)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/new.rs:28–48, 126–138` and `tests/generated_project.rs:29–54`. Scaffolding defaults to portable published versions (`rume = "0.1.0"`). Local path overrides require explicit `--path` or `RUME_DEV_PATH`, accompanied by an explicit warning note.
+- **v01 D-m4 (Generated code imports via `rume::axum` / `rume::serde`)** — **REAFFIRMED**. Verified in `rume-cli/templates/Cargo.toml.tpl:8–9` and `crates/cli/src/commands/generate/handler.rs:23–24`. Generated code and templates directly declare dependencies on and import from `axum` and `serde`.
+- **v01 D-m5 (No machine-readable output (`--json`) for inspection commands)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/doctor.rs:136–143`, `env/check.rs:98–103`, and `config/check.rs:103–115`. Structured JSON output is supported across inspection commands. (Residual flag asymmetry is evaluated under finding **m1**).
 
 ### From v02 (`docs/reports/reviews/v02/dx-tooling.md` & `v02/todo.md`)
 
 - **v02 M1 (OpenAPI 3.1 generator discards route parameter matchers and infers schemas via substring heuristics)** — **REAFFIRMED**. Core routing and OpenAPI schema extraction is governed by Lens 8 (`routing-api-openapi.md`).
-- **v02 M2 (`AppContext::builder` fails to infer state generic and requires `S: Default`)** — **REAFFIRMED**. Verified in `rume/src/app/context.rs:82–107`. `AppContext::builder(env, config)` initializes with state `()` and `.state(S)` transitions the state generic without requiring `S: Default`. Scaffolded `app.rs.tpl` correctly utilizes the builder.
+- **v02 M2 (`AppContext::builder` fails to infer state generic and requires `S: Default`)** — **REAFFIRMED**. Verified in `crates/core/src/app/context.rs:82–107`. `AppContext::builder(env, config)` initializes with state `()` and `.state(S)` transitions the state generic without requiring `S: Default`. Scaffolded `app.rs.tpl` correctly utilizes the builder.
 - **v02 M3 (Configuration provenance reporting is entirely absent)** — **CHALLENGED (Defective remediation: unredacted secret leakage)**. While `config::source_map` and `rume config explain <key>` were added to report winning configuration files and precedence hierarchies, `rume config explain` completely omits secret redaction and provides no `--unredacted` gate, dumping raw database credentials in plaintext. Re-reported under finding **M1**.
-- **v02 M4 (Environment interpolation error formatting hides variable name via escaped braces)** — **REAFFIRMED**. Verified in `rume/src/env/error.rs:23–27`. Format strings use `${{{variable}}}`, correctly displaying failing variable names in error messages.
+- **v02 M4 (Environment interpolation error formatting hides variable name via escaped braces)** — **REAFFIRMED**. Verified in `crates/core/src/env/error.rs:23–27`. Format strings use `${{{variable}}}`, correctly displaying failing variable names in error messages.
 - **v02 M5 (Scaffolding template README advertises non-existent `/health` route while `routes.rs.tpl` squats `/users` and `/posts`)** — **REAFFIRMED**. Verified in `rume-cli/templates/README.md.tpl:11`, `src/routes.rs.tpl:10–13`, `src/handlers/health.rs.tpl:18–23`, and `tests/smoke.rs.tpl:28–31`. Scaffolding registers and documents `/health` consistently. Dummy route squatting on `/users` and `/posts` was completely eliminated.
 - **v02 m1 (Orphaned `ops_router` preserves duplicate health check API)** — **REAFFIRMED**. Verified: deprecated with `#[deprecated]`, removed from `prelude.rs`.
 - **v02 m2 (Inconsistent JSON CLI flags across inspection commands: `--format json` vs `--json`)** — **CHALLENGED (Incomplete remediation)**. While `--json` was added to `doctor`, `env check`, and `config check`, `--format json` was never added to `list:routes`. Running `rume list:routes --format json` fails with `error: unexpected argument '--format' found`. Re-reported under finding **m1**.
-- **v02 m3 (CLI generators use naive first-letter `capitalize` rather than `rume::helpers::pascal_case`)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/generate/resource.rs:10`, `handler.rs:14`, `model.rs:16`, and `service.rs:16`. All generators call `rume::helpers::pascal_case(&module_name)`, verified by unit test `module_name_and_struct_name_derivation`.
+- **v02 m3 (CLI generators use naive first-letter `capitalize` rather than `rume::helpers::pascal_case`)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/generate/resource.rs:10`, `handler.rs:14`, `model.rs:16`, and `service.rs:16`. All generators call `rume::helpers::pascal_case(&module_name)`, verified by unit test `module_name_and_struct_name_derivation`.
 - **v02 m4 (`RouteGroup` lacks fluent `.layer()` middleware mounting method)** — **REAFFIRMED**. Governed by Lens 8.
 - **v02 m5 (`RumeBuilder` lacks fluent `.openapi()` and `.metrics()` methods)** — **REAFFIRMED**. Evaluated under Lens 7 and Lens 8.
 - **v02 m6 (Stale "extractor" docstrings and unused phantom type parameter on `ValidatedParam`)** — **REAFFIRMED**. Governed by Lens 8.
 - **v02 m7 (Generated project `tests/smoke.rs.tpl` tests throwaway inline router)** — **REAFFIRMED**. Verified in `rume-cli/templates/tests/smoke.rs.tpl:25–29`. Smoke test builds the actual application router via `build_router(ctx.clone()).with_state(ctx)` and executes tests against `TestApp`.
-- **v02 m8 (Terminal UI `Sticker` calculates box padding using byte length instead of display width)** — **REAFFIRMED**. Verified in `rume-cli/src/ui/sticker.rs:29–37`. `Sticker` uses `unicode_width::UnicodeWidthStr::width`, verified by unit test `sticker_aligns_with_unicode_characters` covering emojis and multi-byte characters.
+- **v02 m8 (Terminal UI `Sticker` calculates box padding using byte length instead of display width)** — **REAFFIRMED**. Verified in `crates/cli/src/ui/sticker.rs:29–37`. `Sticker` uses `unicode_width::UnicodeWidthStr::width`, verified by unit test `sticker_aligns_with_unicode_characters` covering emojis and multi-byte characters.
 
 ---
 
@@ -54,7 +54,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### C1 Multi-line secret leakage in `rume config check` human-readable mode
 
-- **Where:** `rume-cli/src/commands/config/check.rs:29–51, 117–127`.
+- **Where:** `crates/cli/src/commands/config/check.rs:29–51, 117–127`.
 - **What it says:**
   ```rust
   fn redact_toml_line(line: &str) -> String {
@@ -142,9 +142,9 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### M1 `rume config explain` outputs secret keys and credential URLs in plaintext without redaction or `--unredacted` gating
 
-- **Where:** `rume-cli/src/commands/config/explain.rs:20–42` and `rume-cli/src/cli.rs:110–117`.
+- **Where:** `crates/cli/src/commands/config/explain.rs:20–42` and `crates/cli/src/cli.rs:110–117`.
 - **What it says:**
-  In `rume-cli/src/commands/config/explain.rs`:
+  In `crates/cli/src/commands/config/explain.rs`:
   ```rust
   let explanation = source_map.explain(key);
   match &explanation.value {
@@ -161,7 +161,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
           }
       }
   ```
-  In `rume-cli/src/cli.rs`:
+  In `crates/cli/src/cli.rs`:
   ```rust
   /// Explain how a configuration key was resolved and its source provenance.
   Explain {
@@ -202,15 +202,15 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
   ```
   Any developer, script, or CI pipeline querying configuration provenance exposes passwords, API keys, and database connection strings in plaintext.
 - **Suggested fix:**
-  1. Add an `#[arg(long)] unredacted: bool` flag to `ConfigCommands::Explain` in `rume-cli/src/cli.rs`.
-  2. In `rume-cli/src/commands/config/explain.rs`, if `!unredacted`, check `is_secret_key(key)` or serialize the value to string and run `redact_value(key, &val_str)`. If redacted, replace `val` with `toml::Value::String("[redacted]".to_string())`.
+  1. Add an `#[arg(long)] unredacted: bool` flag to `ConfigCommands::Explain` in `crates/cli/src/cli.rs`.
+  2. In `crates/cli/src/commands/config/explain.rs`, if `!unredacted`, check `is_secret_key(key)` or serialize the value to string and run `redact_value(key, &val_str)`. If redacted, replace `val` with `toml::Value::String("[redacted]".to_string())`.
   3. Mirror `rume env explain` by emitting a note in human mode: `"Note: this value is treated as a secret and is redacted in output. Use --unredacted to display."`.
 
 ---
 
 ### M2 `rume doctor` port availability check reports false positive `ok: true` when port binding fails
 
-- **Where:** `rume-cli/src/commands/doctor.rs:110–128, 149–153`.
+- **Where:** `crates/cli/src/commands/doctor.rs:110–128, 149–153`.
 - **What it says:**
   ```rust
   match std::net::TcpListener::bind((host, port)) {
@@ -273,7 +273,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### M3 Component generators accept digit-prefixed and non-identifier names, creating uncompilable project syntax
 
-- **Where:** `rume-cli/src/commands/generate/handler.rs:4–11`, `resource.rs:185–190`, `model.rs:6–13`, `service.rs:6–13`, `middleware.rs:6–13`.
+- **Where:** `crates/cli/src/commands/generate/handler.rs:4–11`, `resource.rs:185–190`, `model.rs:6–13`, `service.rs:6–13`, `middleware.rs:6–13`.
 - **What it says:**
   In `handler.rs`:
   ```rust
@@ -318,7 +318,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### M4 Non-transactional component generation: route marker failure leaves orphaned handler files and blocks future runs
 
-- **Where:** `rume-cli/src/commands/generate/handler.rs:38–86`, `resource.rs:92–171`.
+- **Where:** `crates/cli/src/commands/generate/handler.rs:38–86`, `resource.rs:92–171`.
 - **What it says:**
   In `handler.rs`:
   ```rust
@@ -367,9 +367,9 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### M5 Interactive prompts in `prompts.rs` swallow cancellation (Ctrl+C) and fail silently in non-TTY environments
 
-- **Where:** `rume-cli/src/prompts.rs:9–48`, `rume-cli/src/commands/generate/mod.rs:25–35`, `rume-cli/src/commands/mod.rs:41–48`.
+- **Where:** `crates/cli/src/prompts.rs:9–48`, `crates/cli/src/commands/generate/mod.rs:25–35`, `crates/cli/src/commands/mod.rs:41–48`.
 - **What it says:**
-  In `rume-cli/src/prompts.rs`:
+  In `crates/cli/src/prompts.rs`:
   ```rust
   pub fn ask(prompt: &str) -> String {
       Text::new(prompt).prompt().unwrap_or_default()
@@ -394,9 +394,9 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### m1 Inconsistent CLI argument flags for JSON output (`--format json` fails on `list:routes`)
 
-- **Where:** `rume-cli/src/cli.rs:48–54` and `rume-cli/src/commands/list_routes.rs:16–35`.
+- **Where:** `crates/cli/src/cli.rs:48–54` and `crates/cli/src/commands/list_routes.rs:16–35`.
 - **What it says:**
-  In `rume-cli/src/cli.rs`:
+  In `crates/cli/src/cli.rs`:
   ```rust
   Doctor {
       #[arg(long, default_value = "human")]
@@ -425,7 +425,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### m2 Unused and dead UI code with crate-level `#![allow(dead_code)]`
 
-- **Where:** `rume-cli/src/main.rs:1`, `rume-cli/src/ui/logger.rs`, `rume-cli/src/ui/tasks.rs`, `rume-cli/src/prompts.rs:14–48`.
+- **Where:** `crates/cli/src/main.rs:1`, `crates/cli/src/ui/logger.rs`, `crates/cli/src/ui/tasks.rs`, `crates/cli/src/prompts.rs:14–48`.
 - **What it says:**
   `main.rs` opens with `#![allow(dead_code)]`.
   Entire modules exist in isolation and are never referenced anywhere in `rume-cli`:
@@ -463,7 +463,7 @@ Every prior finding across v01 and v02 in this lens's charter is classified belo
 
 ### m4 `rume codegen` lacks dry-run/diff support and blindly includes invalid module files
 
-- **Where:** `rume-cli/src/commands/codegen/mod.rs:38–81`.
+- **Where:** `crates/cli/src/commands/codegen/mod.rs:38–81`.
 - **What it says:**
   ```rust
   for entry in entries.flatten() {

@@ -1,5 +1,3 @@
-use std::sync::Arc;
-use std::time::Duration;
 use axum::Router;
 use rume::app::init_tracing;
 use rume::jobs::postgres::PostgresJobQueue;
@@ -10,6 +8,8 @@ use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 use rume::tenant::model::Tenant;
 use rume::tenant::resolver::HeaderTenantResolver;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::config::Config;
 use crate::env::Env;
@@ -22,7 +22,9 @@ use rume::events::Event;
 
 /// Builds the complete Axum router with state and middleware for Workbench.
 pub fn build_app(state: WorkbenchState, tenant_resolver: HeaderTenantResolver) -> Router {
-    build_api_router(state.pool.clone(), tenant_resolver).into_inner().with_state(state)
+    build_api_router(state.pool.clone(), tenant_resolver)
+        .into_inner()
+        .with_state(state)
 }
 
 /// Default OS signal handler for SIGINT (Ctrl+C) and SIGTERM.
@@ -60,7 +62,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 /// Runs the Workbench application lifecycle with a custom shutdown signal future.
-pub async fn run_with_shutdown<F>(shutdown: F) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+pub async fn run_with_shutdown<F>(
+    shutdown: F,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {

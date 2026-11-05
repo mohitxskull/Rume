@@ -2,16 +2,16 @@
 
 **Report file:** `docs/reports/reviews/v01/testing.md`
 **Lens:** Testing — sufficient coverage? fails-before proof? Are tests hermetic?
-**Code reviewed:** `rume/src/{app,error,env,validation,routing,config,testing}.rs`; `rume/tests/{env_and_config_loading,http_smoke}.rs`
+**Code reviewed:** `crates/core/src/{app,error,env,validation,routing,config,testing}.rs`; `crates/core/tests/{env_and_config_loading,http_smoke}.rs`
 **Method:** whole-document, stage 2 (depends on stage 1: correctness.md, security.md, architecture.md). No behavior was executed; this lens judges test coverage, fails-before proof, and hermeticity against the code and the stage-1 gaps.
 
 ---
 
 ## Findings
 
-### T1 (Major) — `rume/src/routing.rs` has ZERO unit tests despite being the largest new module
+### T1 (Major) — `crates/core/src/routing.rs` has ZERO unit tests despite being the largest new module
 
-**Where:** `rume/src/routing.rs` (entire file, lines 1–611) — no `#[cfg(test)] mod tests` anywhere.
+**Where:** `crates/core/src/routing.rs` (entire file, lines 1–611) — no `#[cfg(test)] mod tests` anywhere.
 
 **What is missing:** Every behavior in the module is untested:
 - `Matcher::{Number,Uuid,Slug}::validate` (lines 57–81) — no edge-case coverage for UUID segment lengths/hex digits, slug leading/trailing `-`/`_`, `--`/`__`, empty values, or `Number`'s `u64` overflow (correctness m1).
@@ -27,15 +27,15 @@
 
 ### T2 (Major) — No fails-before proof anywhere in the suite
 
-**Where:** Every test file: `rume/src/{app,error,env,validation}.rs` `#[cfg(test)]` modules and `rume/tests/{env_and_config_loading,http_smoke}.rs`.
+**Where:** Every test file: `crates/core/src/{app,error,env,validation}.rs` `#[cfg(test)]` modules and `crates/core/tests/{env_and_config_loading,http_smoke}.rs`.
 
 **What it says:** `cargo test` passes (19 tests per plan.md:21), but no test in the repository was demonstrated to fail before its fix. There is no committed failing test, no `todo_*` stub, no "this test fails on the unfixed code" artifact for any finding. The testing convention (`.opencode/rules/testing.md`) makes TDD the default and requires fails-before proof: "Regression tests must demonstrably fail before the fix (fails-before), pass after."
 
 **What breaks:** Without fails-before evidence, a test that passes on current code is indistinguishable from a tautological test that sleeps through bugs. A reviewer cannot tell whether `maps_status_codes` (error.rs:83) guards the status mapping or merely restates it; whether `invalid_payload_returns_422_with_details` (validation.rs:107) catches a real garde-mapping regression or a copy-paste of the implementation. The break: regressions introduced after this review can pass the suite undetected because no test has proven it catches anything.
 
-### T3 (minor) — `rume/src/config.rs` is entirely untested
+### T3 (minor) — `crates/core/src/config.rs` is entirely untested
 
-**Where:** `rume/src/config.rs` (lines 1–100) — no `#[cfg(test)]` module.
+**Where:** `crates/core/src/config.rs` (lines 1–100) — no `#[cfg(test)]` module.
 
 **What is missing:** `load`/`load_in`/`load_raw`/`load_raw_pretty` (lines 32–58), `build_figment` candidate precedence (lines 60–88), the `NotFound` error path when no TOML file exists (lines 81–85), env-layering (`app.toml` → `app.{env}.toml` → `app.local.toml` → `app.{env}.local.toml`), and the `schemars` feature path (lines 93–100).
 
@@ -43,7 +43,7 @@
 
 ### T4 (minor) — the `TestApp`/`TestAppBuilder` test harness is itself untested
 
-**Where:** `rume/src/testing.rs` (lines 1–145) — no `#[cfg(test)]` module.
+**Where:** `crates/core/src/testing.rs` (lines 1–145) — no `#[cfg(test)]` module.
 
 **What is missing:** `TestApp::{new,with_cleanup,get,post_json,request,body_bytes,body_text,teardown,Drop}`, `TestAppBuilder::{new,router,route,with_cleanup,build,http}`, and the `status` helper (lines 143–145). `validation.rs` tests (lines 97–142) depend on `TestApp::new`, `post_json`, and `body_text`; if the harness is broken, those tests' results are untrusted.
 
@@ -51,7 +51,7 @@
 
 ### T5 (minor) — `app.rs` tests miss the boundary, Inspect-mode, and lifecycle-ordering surface
 
-**Where:** `rume/src/app.rs` tests (lines 481–506): `environment_normalizes`, `availability_transitions`, `lifecycle_transitions`.
+**Where:** `crates/core/src/app.rs` tests (lines 481–506): `environment_normalizes`, `availability_transitions`, `lifecycle_transitions`.
 
 **What is missing:**
 - `Lifecycle::set`/`Availability::set` with an invalid `u8` (5, 255) — correctness C3: any `u8` is stored; `state()` default arm silently maps to `Created`/`Unknown`. No test asserts behavior for out-of-range input.
@@ -63,7 +63,7 @@
 
 ### T6 (minor) — `error.rs` tests cover 3 of 6 `AppError` variants and assert no response bodies
 
-**Where:** `rume/src/error.rs` tests (lines 82–93): `maps_status_codes`.
+**Where:** `crates/core/src/error.rs` tests (lines 82–93): `maps_status_codes`.
 
 **What is missing:** `BadRequest`, `Unauthorized`, `Forbidden` variants are never passed to `status_code()`. No `IntoResponse` test asserts the JSON body shape (`{"error": …}` vs `{"error": …, "details": …}`) or the status/body pairing for any variant. Security M4 (error bodies echo internals to clients) has no test.
 
@@ -71,7 +71,7 @@
 
 ### T7 (minor) — `env.rs` has no `file:` traversal test, and the integration env tests mutate global process env (not hermetic)
 
-**Where:** `rume/src/env.rs` tests (lines 269–296): `redacts_secret_keys`, `redacts_credential_urls`, `detects_secret_keys`; `rume/tests/env_and_config_loading.rs` (lines 10–20): `set_env`/`remove_env` use `unsafe { std::env::set_var/remove_var }` guarded by `ENV_LOCK` Mutex.
+**Where:** `crates/core/src/env.rs` tests (lines 269–296): `redacts_secret_keys`, `redacts_credential_urls`, `detects_secret_keys`; `crates/core/tests/env_and_config_loading.rs` (lines 10–20): `set_env`/`remove_env` use `unsafe { std::env::set_var/remove_var }` guarded by `ENV_LOCK` Mutex.
 
 **What is missing (src):** No test for `file:` path traversal — security M1 (`APP_KEY=file:../../etc/secrets/app.key` or `file:/etc/passwd` read arbitrary files, no `..` guard). No test for `resolve_env_name` precedence (`RUME_ENV` > `RAILS_ENV` > `NODE_ENV` > `development`). No test that `file\:` escape works.
 
@@ -81,7 +81,7 @@
 
 ### T8 (minor) — `http_smoke.rs` tests a bare router, not the real health surface
 
-**Where:** `rume/tests/http_smoke.rs` (lines 1–24): `health_endpoint_returns_ok` builds `Router::new().route("/health", get(health))` with a hand-rolled handler.
+**Where:** `crates/core/tests/http_smoke.rs` (lines 1–24): `health_endpoint_returns_ok` builds `Router::new().route("/health", get(health))` with a hand-rolled handler.
 
 **What is missing:** No test exercises the real `health_routes` (`routing.rs:553`) or `ops_router` (`app.rs:536`) — the production health endpoints `/health/live` and `/health/ready` with `AppContext` state, availability transitions, and `HealthChecks::run`. The smoke test's `/health` path does not even match the real `/health/live`/`/health/ready` routes.
 
@@ -89,7 +89,7 @@
 
 ### T9 (minor) — No test isolates or cleans up `ROUTE_REGISTRY` global state across tests
 
-**Where:** `rume/src/routing.rs` lines 229–248 (`ROUTE_REGISTRY: OnceLock<Mutex<Vec<RouteInfo>>>`, `register_route`, `registered_routes`); `RouteSpec::build` calls `register_route` unconditionally (line 360).
+**Where:** `crates/core/src/routing.rs` lines 229–248 (`ROUTE_REGISTRY: OnceLock<Mutex<Vec<RouteInfo>>>`, `register_route`, `registered_routes`); `RouteSpec::build` calls `register_route` unconditionally (line 360).
 
 **What is missing:** No test asserts that `registered_routes()` reflects only mounted routes, no test clears/resets the registry between tests, and no test demonstrates that building a route without mounting it pollutes the registry (correctness m3).
 

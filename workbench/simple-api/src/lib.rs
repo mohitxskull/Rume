@@ -10,11 +10,11 @@ use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use garde::Validate;
+use rume::persistence::PersistenceError;
 use rume::persistence::migration::Migrator;
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::row::{DbRow, FromRow};
 use rume::persistence::sqlite::SqliteBackend;
-use rume::persistence::PersistenceError;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -151,7 +151,9 @@ impl<'a> SqlQuery<'a> {
     ) -> Result<Option<R>, PersistenceError> {
         self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
-        pool.fetch_optional_as(self.sql, params).instrument(span).await
+        pool.fetch_optional_as(self.sql, params)
+            .instrument(span)
+            .await
     }
 
     /// Executes the query within a transaction and fetches an optional row as [`DbRow`].
@@ -213,7 +215,9 @@ impl<'a> SqlQuery<'a> {
     ) -> Result<Option<String>, PersistenceError> {
         self.check_dialect(pool.backend().dialect())?;
         let span = self.span();
-        pool.query_scalar_params(self.sql, params).instrument(span).await
+        pool.query_scalar_params(self.sql, params)
+            .instrument(span)
+            .await
     }
 
     /// Executes the query within a transaction and returns an optional scalar string.
@@ -224,7 +228,9 @@ impl<'a> SqlQuery<'a> {
     ) -> Result<Option<String>, PersistenceError> {
         self.check_dialect(tx.dialect())?;
         let span = self.span();
-        tx.query_scalar_params(self.sql, params).instrument(span).await
+        tx.query_scalar_params(self.sql, params)
+            .instrument(span)
+            .await
     }
 }
 
@@ -250,7 +256,12 @@ mod tests {
         assert!(generic_query.check_dialect("postgres").is_ok());
         assert!(generic_query.check_dialect("sqlite").is_ok());
 
-        let pg_query = SqlQuery::new("users.list", "queries/users.sql", Some("postgres"), "SELECT $1");
+        let pg_query = SqlQuery::new(
+            "users.list",
+            "queries/users.sql",
+            Some("postgres"),
+            "SELECT $1",
+        );
         assert!(pg_query.check_dialect("postgres").is_ok());
 
         let mismatch = pg_query.check_dialect("sqlite").unwrap_err();

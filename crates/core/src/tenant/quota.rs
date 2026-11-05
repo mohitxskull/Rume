@@ -117,8 +117,8 @@ pub use redis_store::RedisTenantQuotaStore;
 #[cfg(feature = "redis")]
 mod redis_store {
     use super::*;
-    use std::fmt::Debug;
     use deadpool_redis::Pool;
+    use std::fmt::Debug;
 
     /// Production Redis-backed [`TenantQuotaStore`] coordinating tenant cache quotas across a cluster.
     #[derive(Clone)]
@@ -161,10 +161,14 @@ mod redis_store {
             tenant_id: &'a str,
             max_keys: usize,
         ) -> BoxFuture<'a, Result<bool, CacheError>> {
-            let unique_id = format!("lease-{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos());
-            Box::pin(async move {
-                self.record_key(tenant_id, &unique_id, None, max_keys).await
-            })
+            let unique_id = format!(
+                "lease-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos()
+            );
+            Box::pin(async move { self.record_key(tenant_id, &unique_id, None, max_keys).await })
         }
 
         fn record_key<'a>(

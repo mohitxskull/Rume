@@ -10,13 +10,13 @@ Extracted from `docs/reports/reviews/v02/todo.md` and `docs/reports/reviews/v02/
 > Root cause: Delimiter collisions and unanchored suffix matching allow cross-tenant spoofing and cache contamination.
 
 - [ ] **Security C2 — Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning** (`security.md` C2).
-      `rume/src/tenant/cache.rs:23–29`: Scoped keys use naive format `tenant:{tenant_id}:{key}`; tenant ID `"a:b"` with key `"c"` produces `tenant:a:b:c`, colliding with tenant `"a"` and key `"b:c"`. Disallow `:` in tenant IDs and keys or length-prefix/escape delimiters.
+      `crates/core/src/tenant/cache.rs:23–29`: Scoped keys use naive format `tenant:{tenant_id}:{key}`; tenant ID `"a:b"` with key `"c"` produces `tenant:a:b:c`, colliding with tenant `"a"` and key `"b:c"`. Disallow `:` in tenant IDs and keys or length-prefix/escape delimiters.
 - [ ] **Security M1 — Subdomain tenant resolver permits suffix-matching domain spoofing** (`security.md` M1).
-      `rume/src/tenant/resolver.rs:126–140`: `host_no_port.strip_suffix(&self.base_domain)` permits `evilapp.platform.io` to match `app.platform.io`. Require strict `.` separator (`.{base_domain}`) when matching subdomains.
+      `crates/core/src/tenant/resolver.rs:126–140`: `host_no_port.strip_suffix(&self.base_domain)` permits `evilapp.platform.io` to match `app.platform.io`. Require strict `.` separator (`.{base_domain}`) when matching subdomains.
 - [ ] **Security M2 — `HeaderTenantResolver` shares a single map for IDs and slugs** (`security.md` M2).
-      `rume/src/tenant/resolver.rs:47–53`: Registering both ID and slug into one `BTreeMap` allows an attacker tenant whose slug matches another tenant's ID to hijack requests. Separate ID and slug lookups into distinct maps or qualify keys (`id:`, `slug:`).
+      `crates/core/src/tenant/resolver.rs:47–53`: Registering both ID and slug into one `BTreeMap` allows an attacker tenant whose slug matches another tenant's ID to hijack requests. Separate ID and slug lookups into distinct maps or qualify keys (`id:`, `slug:`).
 - [ ] **Security C1 — SAML 2.0 assertion parser hardcodes expiration timestamps and lacks signature verification** (`security.md` C1).
-      `rume/src/enterprise/saml.rs:149–155`: `SamlParser::parse` hardcodes `not_before: None` and `not_on_or_after: None`, leaving assertions perpetually valid regardless of XML conditions. Parse `NotBefore` and `NotOnOrAfter` from `<saml2:Conditions>` and verify XML digital signatures.
+      `crates/core/src/enterprise/saml.rs:149–155`: `SamlParser::parse` hardcodes `not_before: None` and `not_on_or_after: None`, leaving assertions perpetually valid regardless of XML conditions. Parse `NotBefore` and `NotOnOrAfter` from `<saml2:Conditions>` and verify XML digital signatures.
 
 ---
 
@@ -24,7 +24,7 @@ Extracted from `docs/reports/reviews/v02/todo.md` and `docs/reports/reviews/v02/
 
 ### C2 Multi-tenant cache key delimiter collision permits cross-tenant cache poisoning and data leakage
 
-**Where:** `rume/src/tenant/cache.rs` lines 23–29 (`scoped_key` and `tenant_tag`).
+**Where:** `crates/core/src/tenant/cache.rs` lines 23–29 (`scoped_key` and `tenant_tag`).
 
 **What it says:**
 
@@ -48,7 +48,7 @@ Tenant cache keys are constructed by concatenating `tenant_id` and `key` with a 
 
 ### M1 Subdomain tenant resolver permits suffix-matching domain spoofing
 
-**Where:** `rume/src/tenant/resolver.rs` lines 133–149.
+**Where:** `crates/core/src/tenant/resolver.rs` lines 133–149.
 
 **What it says:**
 
@@ -73,7 +73,7 @@ Tenant cache keys are constructed by concatenating `tenant_id` and `key` with a 
             }
 ```
 
-When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` as configured in `rume/tests/tenant_suite.rs:78`), `host_no_port.strip_suffix(&self.base_domain)` matches any host that ends with that string.
+When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` as configured in `crates/core/tests/tenant_suite.rs:78`), `host_no_port.strip_suffix(&self.base_domain)` matches any host that ends with that string.
 
 **Why it's a problem:** An attacker pointing a rogue domain such as `evilapp.platform.io` or `fakeapp.platform.io` to the server will have `app.platform.io` stripped, leaving `evil` or `fake`. If a tenant exists with that slug, the request is accepted and routed to that tenant. Furthermore, multi-level subdomains (such as `attacker.acme.app.platform.io`) produce `attacker.acme`, which does not validate single-label subdomain boundaries.
 
@@ -83,7 +83,7 @@ When `base_domain` is provided without a leading dot (e.g. `"app.platform.io"` a
 
 ### M2 `HeaderTenantResolver` shares a single hash map for both ID and slug, causing tenant hijacking via collision
 
-**Where:** `rume/src/tenant/resolver.rs` lines 49–56 (`add_tenant`).
+**Where:** `crates/core/src/tenant/resolver.rs` lines 49–56 (`add_tenant`).
 
 **What it says:**
 
@@ -107,7 +107,7 @@ Both `tenant.id` and `tenant.slug` are inserted into the same flat `BTreeMap<Str
 
 ### C1 SAML 2.0 assertion parser hardcodes expiration timestamps to `None` and lacks XML signature verification
 
-**Where:** `rume/src/enterprise/saml.rs` lines 49–66 (`extract_tag`), lines 147–156 (`SamlParser::parse`), and lines 159–201 (`SamlParser::validate`).
+**Where:** `crates/core/src/enterprise/saml.rs` lines 49–66 (`extract_tag`), lines 147–156 (`SamlParser::parse`), and lines 159–201 (`SamlParser::validate`).
 
 **What it says:**
 
@@ -139,18 +139,18 @@ Both `tenant.id` and `tenant.slug` are inserted into the same flat `BTreeMap<Str
 
 ## Current Tree Inspection & Re-check Status
 
-1. **Security C2 (`rume/src/tenant/cache.rs:23–29`)**:
+1. **Security C2 (`crates/core/src/tenant/cache.rs:23–29`)**:
    - Current code: Lines 23–29 implement `scoped_key` as `format!("tenant:{tenant_id}:{key}")` and `tenant_tag` as `format!("tenant:{tenant_id}")`. No delimiter escaping, colon rejection, or length prefixing is present.
    - Status: **holds**
 
-2. **Security M1 (`rume/src/tenant/resolver.rs:133–149`)**:
+2. **Security M1 (`crates/core/src/tenant/resolver.rs:133–149`)**:
    - Current code: Subdomain resolution strips suffix with `host_no_port.strip_suffix(&self.base_domain)` without requiring a leading dot separator (`.{base_domain}`) or validating single subdomain label constraints.
    - Status: **holds**
 
-3. **Security M2 (`rume/src/tenant/resolver.rs:50–56`)**:
+3. **Security M2 (`crates/core/src/tenant/resolver.rs:50–56`)**:
    - Current code: `HeaderTenantResolver::add_tenant` inserts both `tenant.id` and `tenant.slug` into `self.tenants` (`Arc<RwLock<BTreeMap<String, Tenant>>>`) without namespacing or collision checking.
    - Status: **holds**
 
-4. **Security C1 (`rume/src/enterprise/saml.rs:147–156`)**:
+4. **Security C1 (`crates/core/src/enterprise/saml.rs:147–156`)**:
    - Current code: `SamlParser::parse` hardcodes `not_before: None` and `not_on_or_after: None`. No XML signature verification or `<saml2:Conditions>` parsing exists.
    - Status: **holds**

@@ -13,22 +13,22 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 | Prior finding | Disposition | Evidence & Analysis |
 |---|---|---|
-| **v01 C2 — `ApplicationMode::Inspect` still serves HTTP traffic** (`v01/correctness.md:40–46`) | **REAFFIRMED** | `rume/src/app/builder.rs:1108–1129, 1190–1211`: In `Inspect` mode, the context transitions to `LifecycleState::Booted` and `AvailabilityState::Live`, outputs route metadata when requested, and immediately returns `Ok(())` without binding listeners or serving traffic. Executed: unit tests `inspect_mode_sets_booted_live_then_returns`, `inspect_mode_does_not_run_on_ready_hooks`, and `inspect_mode_does_not_run_on_shutdown_hooks` pass. |
-| **v01 C3 — `Lifecycle::set` / `Availability::set` accept any `u8`** (`v01/correctness.md:48–54`) | **REAFFIRMED** | `rume/src/app/state.rs:77–101, 144–167`: Discriminants are pinned with `#[repr(u8)]` and `MAX_DISCRIMINANT = 4`. Out-of-range memory reads map deterministically to `Created` and `Unknown`. Executed: unit tests `lifecycle_invalid_u8_maps_to_created` and `availability_invalid_u8_maps_to_unknown` pass. *(Residual state machine transition flaws are filed as NOTE-NEW M5).* |
-| **v01 m3 — `RouteSpec::build` registers in global registry even when unmounted** (`v01/correctness.md:72–78`) | **REAFFIRMED** | `rume/src/routing/spec.rs:153–164`: Global `ROUTE_REGISTRY` singleton was eliminated. `RouteRegistry` is strictly application-scoped on `AppContext` and `Router`. `RouteSpec::build()` returns metadata without registration side effects. |
-| **v01 positive note — `run()` lifecycle ordering** (`v01/correctness.md:94`) | **REAFFIRMED** | `rume/src/app/builder.rs:1261–1390`: Sequence `Booted`/`Live` → (module `on_start`) → (app `on_ready`) → `Ready`/`Ready` → `axum::serve` + graceful shutdown (`Terminating`/`RefusingTraffic`) → (app `on_shutdown`) → (module `on_shutdown`) → `Terminated`/`Unknown` verified. Executed: `lifecycle::graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flight` passes. |
-| **v01 positive note — `/health/live` returns 503 only when `Broken`** (`v01/correctness.md:96`) | **REAFFIRMED** | `rume/src/routing/health.rs:315–323`: Returns 503 only on `AvailabilityState::Broken`, matching liveness probe contracts. Executed: `health::health_live_returns_ok_when_not_broken` passes. |
-| **v02 A-M2 — `RumeBuilder::new` is public** (`v02/architecture.md:10`) | **REAFFIRMED** | `rume/src/app/builder.rs:303`: `RumeBuilder::new` is `pub(crate)`. Canonical public entry points are `Rume::builder(ctx)` and `Rume::new()`. |
-| **v02 M3 — Route merge collisions trigger unhandled runtime panics** (`v02/architecture.md:69–88`) | **CHALLENGED (defective remediation)** | `rume/src/app/builder.rs:964–984`: While direct `(method, path)` module collisions now return `BuildError::DuplicateRoute`, the preflight check keys strictly on `(method.to_string(), path)`. Collisions involving `ANY` routes and direct `Router::merge` / `RumeBuilder::merge` still trigger unhandled runtime panics in Axum. Filed as **M4**. |
-| **v02 m1 / DX m1 — Orphaned `ops_router` duplicates `health_routes`** (`v02/architecture.md:90–115`, `v02/dx-tooling.md:251–269`) | **REAFFIRMED** | `rume/src/app/shutdown.rs:42–46`: `ops_router` is marked `#[deprecated(since = "0.2.0", note = "Use canonical rume::routing::health_routes instead")]` and was removed from `prelude.rs`. Retained with deprecation annotations to preserve backward compatibility. |
-| **v02 m2 — Misplaced tracing and ops helpers in `shutdown.rs`** (`v02/architecture.md:118–131`) | **REAFFIRMED** | `rume/src/app/observability.rs:30–43`: Tracing initialization logic moved to `observability.rs`. `shutdown.rs` re-exports them and focuses on signal handling and graceful drain. |
-| **v02 m4 — `init_tracing()` panics on already-initialized subscriber** (`v02/architecture.md:153–172`) | **REAFFIRMED** | `rume/src/app/observability.rs:30–43`: `try_init_tracing()` returns `Result<(), Box<dyn Error>>`, and `init_tracing()` safely ignores `Err`. Executed: unit test `tracing_initializer_idempotency_and_try_init` passes. |
-| **v02 m5 / DX m5 — `RumeBuilder` lacks `.openapi()`, `.metrics()`, state transition** (`v02/architecture.md:174–193`, `v02/dx-tooling.md:334–348`) | **CHALLENGED (defective remediation)** | `rume/src/app/builder.rs:739–760`: Methods were added, but `RumeBuilder::openapi()` freezes the route registry eagerly at invocation time, completely omitting all module routes. Filed as **M1**. |
-| **v02 D-M1 / M2 — `AppContext::builder` requires `S: Default`** (`v02/dx-tooling.md:74–135`) | **REAFFIRMED** | `rume/src/app/context.rs:82–107, 155–171`: `AppContext::builder(env, config)` initializes with state `()`, and `.state(new_state)` transitions type without requiring `S: Default`. Executed: unit test `app_context_builder_non_default_state_and_inference` passes. |
-| **v02 T4 — `TestApp`/`TestAppBuilder` test harness is untested** (`v02/testing.md:14`) | **REAFFIRMED** | `rume/src/testing/app.rs:180–290`: 7 unit tests explicitly verify HTTP methods, drop hooks, teardown, and status helpers. All pass. |
-| **v02 T5 — `app.rs` tests miss boundary, Inspect-mode, lifecycle surface** (`v02/testing.md:15`) | **REAFFIRMED** | `rume/src/app/builder.rs:1577–1686`, `rume/src/app/state.rs:205–231`, `rume/tests/integration/lifecycle.rs`: Comprehensive unit and integration suites cover inspect mode, startup failure rollbacks, and shutdown transitions. |
-| **v02 T8 — `http_smoke.rs` tests bare router, not real health surface** (`v02/testing.md:18`) | **REAFFIRMED** | `rume/tests/integration/health.rs`: Dedicated 199-line integration suite thoroughly tests `health_routes()` with `AppContext` state, `HealthChecks::run`, degraded `Warning` (503), failed checks (503), and empty `debug_info`. |
-| **v02 M4 — `TestApp` / `RumeBuilder::test_app()` bypasses module lifecycle hooks** (`v02/testing.md:126–150`) | **CHALLENGED (defective remediation)** | `rume/src/app/builder.rs:567–697`: `build_test_app()` was introduced, but its teardown ordering inverts `run()` sequencing, startup failure skips application `on_shutdown` hooks, and it ignores `ApplicationMode::Inspect`. Filed as **M2**. |
+| **v01 C2 — `ApplicationMode::Inspect` still serves HTTP traffic** (`v01/correctness.md:40–46`) | **REAFFIRMED** | `crates/core/src/app/builder.rs:1108–1129, 1190–1211`: In `Inspect` mode, the context transitions to `LifecycleState::Booted` and `AvailabilityState::Live`, outputs route metadata when requested, and immediately returns `Ok(())` without binding listeners or serving traffic. Executed: unit tests `inspect_mode_sets_booted_live_then_returns`, `inspect_mode_does_not_run_on_ready_hooks`, and `inspect_mode_does_not_run_on_shutdown_hooks` pass. |
+| **v01 C3 — `Lifecycle::set` / `Availability::set` accept any `u8`** (`v01/correctness.md:48–54`) | **REAFFIRMED** | `crates/core/src/app/state.rs:77–101, 144–167`: Discriminants are pinned with `#[repr(u8)]` and `MAX_DISCRIMINANT = 4`. Out-of-range memory reads map deterministically to `Created` and `Unknown`. Executed: unit tests `lifecycle_invalid_u8_maps_to_created` and `availability_invalid_u8_maps_to_unknown` pass. *(Residual state machine transition flaws are filed as NOTE-NEW M5).* |
+| **v01 m3 — `RouteSpec::build` registers in global registry even when unmounted** (`v01/correctness.md:72–78`) | **REAFFIRMED** | `crates/core/src/routing/spec.rs:153–164`: Global `ROUTE_REGISTRY` singleton was eliminated. `RouteRegistry` is strictly application-scoped on `AppContext` and `Router`. `RouteSpec::build()` returns metadata without registration side effects. |
+| **v01 positive note — `run()` lifecycle ordering** (`v01/correctness.md:94`) | **REAFFIRMED** | `crates/core/src/app/builder.rs:1261–1390`: Sequence `Booted`/`Live` → (module `on_start`) → (app `on_ready`) → `Ready`/`Ready` → `axum::serve` + graceful shutdown (`Terminating`/`RefusingTraffic`) → (app `on_shutdown`) → (module `on_shutdown`) → `Terminated`/`Unknown` verified. Executed: `lifecycle::graceful_shutdown_transitions_to_refusing_traffic_while_request_in_flight` passes. |
+| **v01 positive note — `/health/live` returns 503 only when `Broken`** (`v01/correctness.md:96`) | **REAFFIRMED** | `crates/core/src/routing/health.rs:315–323`: Returns 503 only on `AvailabilityState::Broken`, matching liveness probe contracts. Executed: `health::health_live_returns_ok_when_not_broken` passes. |
+| **v02 A-M2 — `RumeBuilder::new` is public** (`v02/architecture.md:10`) | **REAFFIRMED** | `crates/core/src/app/builder.rs:303`: `RumeBuilder::new` is `pub(crate)`. Canonical public entry points are `Rume::builder(ctx)` and `Rume::new()`. |
+| **v02 M3 — Route merge collisions trigger unhandled runtime panics** (`v02/architecture.md:69–88`) | **CHALLENGED (defective remediation)** | `crates/core/src/app/builder.rs:964–984`: While direct `(method, path)` module collisions now return `BuildError::DuplicateRoute`, the preflight check keys strictly on `(method.to_string(), path)`. Collisions involving `ANY` routes and direct `Router::merge` / `RumeBuilder::merge` still trigger unhandled runtime panics in Axum. Filed as **M4**. |
+| **v02 m1 / DX m1 — Orphaned `ops_router` duplicates `health_routes`** (`v02/architecture.md:90–115`, `v02/dx-tooling.md:251–269`) | **REAFFIRMED** | `crates/core/src/app/shutdown.rs:42–46`: `ops_router` is marked `#[deprecated(since = "0.2.0", note = "Use canonical rume::routing::health_routes instead")]` and was removed from `prelude.rs`. Retained with deprecation annotations to preserve backward compatibility. |
+| **v02 m2 — Misplaced tracing and ops helpers in `shutdown.rs`** (`v02/architecture.md:118–131`) | **REAFFIRMED** | `crates/core/src/app/observability.rs:30–43`: Tracing initialization logic moved to `observability.rs`. `shutdown.rs` re-exports them and focuses on signal handling and graceful drain. |
+| **v02 m4 — `init_tracing()` panics on already-initialized subscriber** (`v02/architecture.md:153–172`) | **REAFFIRMED** | `crates/core/src/app/observability.rs:30–43`: `try_init_tracing()` returns `Result<(), Box<dyn Error>>`, and `init_tracing()` safely ignores `Err`. Executed: unit test `tracing_initializer_idempotency_and_try_init` passes. |
+| **v02 m5 / DX m5 — `RumeBuilder` lacks `.openapi()`, `.metrics()`, state transition** (`v02/architecture.md:174–193`, `v02/dx-tooling.md:334–348`) | **CHALLENGED (defective remediation)** | `crates/core/src/app/builder.rs:739–760`: Methods were added, but `RumeBuilder::openapi()` freezes the route registry eagerly at invocation time, completely omitting all module routes. Filed as **M1**. |
+| **v02 D-M1 / M2 — `AppContext::builder` requires `S: Default`** (`v02/dx-tooling.md:74–135`) | **REAFFIRMED** | `crates/core/src/app/context.rs:82–107, 155–171`: `AppContext::builder(env, config)` initializes with state `()`, and `.state(new_state)` transitions type without requiring `S: Default`. Executed: unit test `app_context_builder_non_default_state_and_inference` passes. |
+| **v02 T4 — `TestApp`/`TestAppBuilder` test harness is untested** (`v02/testing.md:14`) | **REAFFIRMED** | `crates/core/src/testing/app.rs:180–290`: 7 unit tests explicitly verify HTTP methods, drop hooks, teardown, and status helpers. All pass. |
+| **v02 T5 — `app.rs` tests miss boundary, Inspect-mode, lifecycle surface** (`v02/testing.md:15`) | **REAFFIRMED** | `crates/core/src/app/builder.rs:1577–1686`, `crates/core/src/app/state.rs:205–231`, `crates/core/tests/integration/lifecycle.rs`: Comprehensive unit and integration suites cover inspect mode, startup failure rollbacks, and shutdown transitions. |
+| **v02 T8 — `http_smoke.rs` tests bare router, not real health surface** (`v02/testing.md:18`) | **REAFFIRMED** | `crates/core/tests/integration/health.rs`: Dedicated 199-line integration suite thoroughly tests `health_routes()` with `AppContext` state, `HealthChecks::run`, degraded `Warning` (503), failed checks (503), and empty `debug_info`. |
+| **v02 M4 — `TestApp` / `RumeBuilder::test_app()` bypasses module lifecycle hooks** (`v02/testing.md:126–150`) | **CHALLENGED (defective remediation)** | `crates/core/src/app/builder.rs:567–697`: `build_test_app()` was introduced, but its teardown ordering inverts `run()` sequencing, startup failure skips application `on_shutdown` hooks, and it ignores `ApplicationMode::Inspect`. Filed as **M2**. |
 
 **Areas with no prior coverage (NOTE-NEW):** Unmonitored shutdown signal during startup hooks (M3), public unconstrained `Availability::set` (M5), stale code rationale comment on `RumeBuilder::route` (m1), empty `MatchedPath` in `ObservabilityLayer` spans (m2), rigid `SocketAddr` hostname rejection (m3), `/health/live` returning 200 on `Unknown` (m4), `build_test_app()` ignoring `Inspect` mode (m5), and `TestApp` drop blocking runtime threads (m6).
 
@@ -38,7 +38,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### M1 `RumeBuilder::openapi()` freezes route registry eagerly, permanently omitting all module routes and later-registered routes
 
-- **Where:** `rume/src/app/builder.rs:739–746` and `rume/src/app/builder.rs:1088–1091`
+- **Where:** `crates/core/src/app/builder.rs:739–746` and `crates/core/src/app/builder.rs:1088–1091`
 - **What it says:**
   ```rust
   pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
@@ -77,7 +77,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### M2 `build_test_app()` lifecycle teardown inverts shutdown hook ordering and diverges from `run()` rollback semantics
 
-- **Where:** `rume/src/app/builder.rs:602–613, 663–674` vs `rume/src/app/builder.rs:1284–1297, 1364–1375`
+- **Where:** `crates/core/src/app/builder.rs:602–613, 663–674` vs `crates/core/src/app/builder.rs:1284–1297, 1364–1375`
 - **What it says:**
   In `run()` (production drain, lines 1364–1375):
   ```rust
@@ -115,7 +115,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### M3 Shutdown signal is unmonitored during application and module startup hooks, preventing graceful cancellation of hanging boots
 
-- **Where:** `rume/src/app/builder.rs:1157–1168` and `rume/src/app/builder.rs:1261–1358`
+- **Where:** `crates/core/src/app/builder.rs:1157–1168` and `crates/core/src/app/builder.rs:1261–1358`
 - **What it says:**
   In `run_with_bound_listener`:
   ```rust
@@ -149,7 +149,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### M4 Module route collision preflight ignores `ANY` matcher overlap, triggering unhandled Axum runtime panics
 
-- **Where:** `rume/src/app/builder.rs:964–984`
+- **Where:** `crates/core/src/app/builder.rs:964–984`
 - **What it says:**
   ```rust
   let mut seen_routes = HashSet::new();
@@ -188,9 +188,9 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### M5 `Availability::set` is public and unconstrained, allowing handlers to bypass `RefusingTraffic` during graceful drain
 
-- **Where:** `rume/src/app/state.rs:159–167` and `rume/src/routing/health.rs:327–341`
+- **Where:** `crates/core/src/app/state.rs:159–167` and `crates/core/src/routing/health.rs:327–341`
 - **What it says:**
-  In `rume/src/app/state.rs`:
+  In `crates/core/src/app/state.rs`:
   ```rust
   pub fn set(&self, state: AvailabilityState) {
       let value = state as u8;
@@ -216,7 +216,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m1 Stale code rationale comment on `RumeBuilder::route` contradicts active registration behavior
 
-- **Where:** `rume/src/app/builder.rs:701–722`
+- **Where:** `crates/core/src/app/builder.rs:701–722`
 - **What it says:**
   ```rust
   /// Add a route to the application.
@@ -256,7 +256,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m2 `ObservabilityLayer` checks `MatchedPath` outside Axum router, leaving span `route` field permanently empty
 
-- **Where:** `rume/src/app/observability.rs:190–212` and `rume/src/app/builder.rs:1072`
+- **Where:** `crates/core/src/app/observability.rs:190–212` and `crates/core/src/app/builder.rs:1072`
 - **What it says:**
   In `ObservabilityService::call`:
   ```rust
@@ -281,7 +281,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m3 `RumeBuilder::run` rejects valid hostnames (`localhost`) due to rigid `SocketAddr` parsing
 
-- **Where:** `rume/src/app/builder.rs:1093–1096`
+- **Where:** `crates/core/src/app/builder.rs:1093–1096`
 - **What it says:**
   ```rust
   let addr: SocketAddr = self
@@ -299,7 +299,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m4 `/health/live` returns 200 OK for `AvailabilityState::Unknown`, reporting terminated or unbooted applications as alive
 
-- **Where:** `rume/src/routing/health.rs:315–323`
+- **Where:** `crates/core/src/routing/health.rs:315–323`
 - **What it says:**
   ```rust
   if ctx.availability.state() == AvailabilityState::Broken {
@@ -318,7 +318,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m5 `build_test_app()` completely ignores `ApplicationMode::Inspect`
 
-- **Where:** `rume/src/app/builder.rs:567–697`
+- **Where:** `crates/core/src/app/builder.rs:567–697`
 - **What it says:**
   `pub async fn build_test_app(mut self) -> Result<crate::testing::TestApp, BuildError>` never reads `self.mode`.
 - **Why it's a problem:**
@@ -331,7 +331,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 
 ### m6 `TestApp` drop blocks Tokio runtime thread via OS thread `join`
 
-- **Where:** `rume/src/app/builder.rs:680–691` and `rume/src/testing/app.rs:113–121`
+- **Where:** `crates/core/src/app/builder.rs:680–691` and `crates/core/src/testing/app.rs:113–121`
 - **What it says:**
   ```rust
   let _ = std::thread::spawn(move || {
@@ -354,7 +354,7 @@ Rume's application lifecycle and progressive composition subsystem demonstrates 
 ## Positive notes
 
 - **Progressive Composition Architecture:** `Rume::new()` authentically delivers a 3-line progressive entry point that defaults cleanly to sensible paths, availability, lifecycle, and health checks, yet scales smoothly to first-class modules without changing programming models.
-- **Safe Problem Details Request ID Injection:** `ObservabilityService` (`rume/src/app/observability.rs:243–314`) inspects RFC 9457 Problem Details responses with strict 1 MiB bounds and streaming safety: oversized payloads are returned untouched without truncation, and only valid JSON bodies with missing/null `request_id` are modified, safely updating `Content-Length`.
+- **Safe Problem Details Request ID Injection:** `ObservabilityService` (`crates/core/src/app/observability.rs:243–314`) inspects RFC 9457 Problem Details responses with strict 1 MiB bounds and streaming safety: oversized payloads are returned untouched without truncation, and only valid JSON bodies with missing/null `request_id` are modified, safely updating `Content-Length`.
 - **Non-Panicking Tracing Initialization:** Addressing v02 finding m4, `init_tracing()` (`observability.rs:41–43`) uses `try_init_tracing()` to safely ignore duplicate subscriber installations during multi-threaded test runs and reboots.
 - **Topological Boot and Reverse-Topological Failure Rollback:** In `run()`, modules boot in strict DAG dependency order and shut down in reverse order. If any module fails during `on_start`, previously started modules are rolled back in reverse order bounded by `shutdown_timeout`.
 - **Readiness-Before-Drain Graceful Shutdown:** When a shutdown signal is received, availability immediately transitions to `AvailabilityState::RefusingTraffic`, causing `/health/ready` to return 503 while in-flight requests finish draining.

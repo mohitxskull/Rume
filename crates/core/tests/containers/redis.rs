@@ -582,25 +582,45 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
     assert!(server_2.load("session_temp").await.unwrap().is_none());
 
     // 5. Session ID regeneration (rotation): preserves data and destroys old key
-    let reg_session = Session::new("session_old", "user_rot", 300)
-        .with_role("editor");
+    let reg_session = Session::new("session_old", "user_rot", 300).with_role("editor");
     server_1.save(reg_session).await.expect("save before regen");
-    let rotated = server_1.regenerate_id("session_old").await.expect("regenerate id");
+    let rotated = server_1
+        .regenerate_id("session_old")
+        .await
+        .expect("regenerate id");
     assert_ne!(rotated.id, "session_old");
     assert_eq!(rotated.user_id, "user_rot");
     assert_eq!(rotated.roles, vec!["editor"]);
-    assert!(server_2.load("session_old").await.unwrap().is_none(), "old session key destroyed");
-    assert!(server_2.load(&rotated.id).await.unwrap().is_some(), "new session key active");
+    assert!(
+        server_2.load("session_old").await.unwrap().is_none(),
+        "old session key destroyed"
+    );
+    assert!(
+        server_2.load(&rotated.id).await.unwrap().is_some(),
+        "new session key active"
+    );
 
     // 6. Regeneration error paths: non-existent and expired sessions
-    let non_existent_err = server_1.regenerate_id("session_does_not_exist").await.unwrap_err();
-    assert!(matches!(non_existent_err, rume::auth::AuthError::InvalidCredentials(_)));
+    let non_existent_err = server_1
+        .regenerate_id("session_does_not_exist")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        non_existent_err,
+        rume::auth::AuthError::InvalidCredentials(_)
+    ));
 
     let expired_session = Session::new("session_to_expire", "user_exp", 1);
     server_1.save(expired_session).await.expect("save expired");
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    let expired_err = server_1.regenerate_id("session_to_expire").await.unwrap_err();
-    assert!(matches!(expired_err, rume::auth::AuthError::InvalidCredentials(_)));
+    let expired_err = server_1
+        .regenerate_id("session_to_expire")
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        expired_err,
+        rume::auth::AuthError::InvalidCredentials(_)
+    ));
 }
 
 #[tokio::test]
@@ -614,8 +634,14 @@ async fn test_redis_cache_clear_does_not_wipe_sessions() {
     session_store.save(session).await.expect("save session");
 
     // Cache operations on the same Redis
-    backend.set("cached_key_1", b"val_1".to_vec(), None).await.expect("set cache 1");
-    backend.set("cached_key_2", b"val_2".to_vec(), None).await.expect("set cache 2");
+    backend
+        .set("cached_key_1", b"val_1".to_vec(), None)
+        .await
+        .expect("set cache 1");
+    backend
+        .set("cached_key_2", b"val_2".to_vec(), None)
+        .await
+        .expect("set cache 2");
 
     // Clear the cache
     backend.clear().await.expect("clear cache");
@@ -625,8 +651,14 @@ async fn test_redis_cache_clear_does_not_wipe_sessions() {
     assert!(backend.get("cached_key_2").await.unwrap().is_none());
 
     // Session key is STILL PRESENT and completely intact
-    let loaded_session = session_store.load("session_survive_clear").await.expect("load session");
-    assert!(loaded_session.is_some(), "cache clear must not wipe sessions from logical database");
+    let loaded_session = session_store
+        .load("session_survive_clear")
+        .await
+        .expect("load session");
+    assert!(
+        loaded_session.is_some(),
+        "cache clear must not wipe sessions from logical database"
+    );
     assert_eq!(loaded_session.unwrap().user_id, "user_persist");
 }
 
@@ -673,10 +705,19 @@ async fn test_redis_cache_tag_invalidation_does_not_shrink_longer_ttl() {
     assert!(backend.get("key_n").await.unwrap().is_some());
 
     // Invalidate tag "shared_tag"
-    let deleted_count = backend.invalidate_tag("shared_tag").await.expect("invalidate shared_tag");
+    let deleted_count = backend
+        .invalidate_tag("shared_tag")
+        .await
+        .expect("invalidate shared_tag");
     assert_eq!(deleted_count, 2, "must delete live members A and N");
 
     // Both A and N must now be gone
-    assert!(backend.get("key_a").await.unwrap().is_none(), "key A must be invalidated");
-    assert!(backend.get("key_n").await.unwrap().is_none(), "key N must be invalidated");
+    assert!(
+        backend.get("key_a").await.unwrap().is_none(),
+        "key A must be invalidated"
+    );
+    assert!(
+        backend.get("key_n").await.unwrap().is_none(),
+        "key N must be invalidated"
+    );
 }

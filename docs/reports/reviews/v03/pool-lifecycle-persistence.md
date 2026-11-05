@@ -10,8 +10,8 @@ The modernized persistence subsystem introduces asynchronous SQLx 0.8 connection
 
 In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings and architectural decisions from `v02` intersecting with persistence, transactions, and pool lifecycle have been audited against the modernized codebase:
 
-- **Correctness M3 (`Migrator::rollback_last` silently unmarks migrations when `down_sql` is `None`)** — **REAFFIRMED**. Verified in `rume/src/persistence/migration.rs:208–212`. When `migration.down_sql.is_none()`, `rollback_last_backend` fails closed by returning `Err(PersistenceError::IrreversibleMigration(migration.id))` and preserves the tracking record in `rume_migrations`.
-- **Positive Note v02 (`MemoryTransaction` automatic rollback on drop)** — **REAFFIRMED**. Verified across SQLx backends in `rume/tests/sqlite_suite.rs:126–140` and `rume/tests/mysql_container_suite.rs:118–144`. Dropping a transaction handle (`PostgresTransaction`, `MysqlTransaction`, `SqliteTransaction`) without an explicit `commit()` delegates to `sqlx::Transaction` drop semantics, successfully rolling back uncommitted mutations.
+- **Correctness M3 (`Migrator::rollback_last` silently unmarks migrations when `down_sql` is `None`)** — **REAFFIRMED**. Verified in `crates/core/src/persistence/migration.rs:208–212`. When `migration.down_sql.is_none()`, `rollback_last_backend` fails closed by returning `Err(PersistenceError::IrreversibleMigration(migration.id))` and preserves the tracking record in `rume_migrations`.
+- **Positive Note v02 (`MemoryTransaction` automatic rollback on drop)** — **REAFFIRMED**. Verified across SQLx backends in `crates/core/tests/sqlite_suite.rs:126–140` and `crates/core/tests/mysql_container_suite.rs:118–144`. Dropping a transaction handle (`PostgresTransaction`, `MysqlTransaction`, `SqliteTransaction`) without an explicit `commit()` delegates to `sqlx::Transaction` drop semantics, successfully rolling back uncommitted mutations.
 - **Enterprise-Reliability C2 / Group B (`TransactionalOutbox::save_tx` transactional participation)** — **REAFFIRMED**. In v02, `OutboxRepository` lacked transactional atomicity. In v03, `TransactionalOutbox<B::Transaction>` is implemented across `PostgresBackend`, `MysqlBackend`, `SqliteBackend`, and `DatabasePool`, ensuring outbox messages can be written within active database transactions.
 - **Connection pool abstraction delegation (`DatabasePool` vs `sqlx::Pool`)** — **NOTE-NEW**. Connection pooling and backend abstraction were modernized to SQLx 0.8 in commit `819a857`. Evaluated in findings C1, C2, and M1.
 - **Pool configuration forwarding (`DatabaseConfig`)** — **NOTE-NEW**. Configuration options (`min_connections`, `idle_timeout_secs`, `connect_timeout_secs`) were expanded in v03. Evaluated in finding M1.
@@ -23,9 +23,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C1 False shutdown success and physical connection leak in `DatabasePool::close()` and `close_and_drain()`
 
-- **Where:** `rume/src/persistence/pool.rs:187–208`, `rume/src/persistence/backend.rs:13–28`, `rume/src/persistence/postgres.rs:26–37`, `rume/src/persistence/mysql.rs:26–43`, `rume/src/persistence/sqlite.rs:28–39`
+- **Where:** `crates/core/src/persistence/pool.rs:187–208`, `crates/core/src/persistence/backend.rs:13–28`, `crates/core/src/persistence/postgres.rs:26–37`, `crates/core/src/persistence/mysql.rs:26–43`, `crates/core/src/persistence/sqlite.rs:28–39`
 - **What it says:**
-  In `rume/src/persistence/pool.rs`:
+  In `crates/core/src/persistence/pool.rs`:
   ```rust
   pub fn close(&self) {
       self.is_closed.store(true, Ordering::SeqCst);
@@ -61,9 +61,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### C2 Disconnected "potemkin" concurrency abstraction: `DatabasePool` maintains fictional metrics and a shadow semaphore disconnected from SQLx
 
-- **Where:** `rume/src/persistence/pool.rs:31–39, 66–78, 91–98, 107–123`, `rume/src/persistence/backend.rs:13–28`
+- **Where:** `crates/core/src/persistence/pool.rs:31–39, 66–78, 91–98, 107–123`, `crates/core/src/persistence/backend.rs:13–28`
 - **What it says:**
-  In `rume/src/persistence/pool.rs`:
+  In `crates/core/src/persistence/pool.rs`:
   ```rust
   pub struct DatabasePool<B: DatabaseBackend> {
       backend: Arc<B>,
@@ -105,9 +105,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M1 Critical pool configuration properties (`min_connections`, `idle_timeout_secs`, `connect_timeout_secs`, `auto_migrate`) are silently ignored by backends
 
-- **Where:** `rume/src/persistence/postgres.rs:44–62`, `rume/src/persistence/mysql.rs:50–68`, `rume/src/persistence/sqlite.rs:50–57, 73–89`, `rume/src/persistence/config.rs:20–43`
+- **Where:** `crates/core/src/persistence/postgres.rs:44–62`, `crates/core/src/persistence/mysql.rs:50–68`, `crates/core/src/persistence/sqlite.rs:50–57, 73–89`, `crates/core/src/persistence/config.rs:20–43`
 - **What it says:**
-  In `rume/src/persistence/postgres.rs`:
+  In `crates/core/src/persistence/postgres.rs`:
   ```rust
   pub fn new(config: &DatabaseConfig) -> Result<Self, PersistenceError> {
       let pool = PgPoolOptions::new()
@@ -118,7 +118,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
       Ok(Self { pool })
   }
   ```
-  In `rume/src/persistence/mysql.rs`:
+  In `crates/core/src/persistence/mysql.rs`:
   ```rust
   pub fn new(config: &DatabaseConfig) -> Result<Self, PersistenceError> {
       let pool = MySqlPoolOptions::new()
@@ -129,7 +129,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
       Ok(Self { pool })
   }
   ```
-  In `rume/src/persistence/sqlite.rs`:
+  In `crates/core/src/persistence/sqlite.rs`:
   ```rust
   pub async fn open(path: &str) -> Result<Self, PersistenceError> {
       ...
@@ -171,9 +171,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M2 `DatabaseHealthCheck` and `ping()` hang during pool saturation or network partition due to missing acquisition timeouts
 
-- **Where:** `rume/src/persistence/pool.rs:265–307`, `rume/src/persistence/postgres.rs:106–114`, `rume/src/persistence/mysql.rs:115–123`, `rume/src/persistence/sqlite.rs:137–145`
+- **Where:** `crates/core/src/persistence/pool.rs:265–307`, `crates/core/src/persistence/postgres.rs:106–114`, `crates/core/src/persistence/mysql.rs:115–123`, `crates/core/src/persistence/sqlite.rs:137–145`
 - **What it says:**
-  In `rume/src/persistence/pool.rs`:
+  In `crates/core/src/persistence/pool.rs`:
   ```rust
   match pool.backend().ping().await {
       Ok(()) => HealthCheckResult {
@@ -192,7 +192,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
       },
   }
   ```
-  In `rume/src/persistence/postgres.rs`:
+  In `crates/core/src/persistence/postgres.rs`:
   ```rust
   fn ping(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
       Box::pin(async move {
@@ -227,7 +227,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M3 Schema divergence: `init_migrations_table()` creates `rume_migrations` with `NOT NULL` columns (`name`, `checksum`), causing `Migrator::run_pending` to fail
 
-- **Where:** `rume/src/persistence/migration.rs:98–102, 150–154, 177–182`, `rume/src/persistence/sql/postgres/migrations_schema.sql:1–6`, `rume/src/persistence/sql/mysql/migrations_schema.sql:1–6`, `rume/src/persistence/sql/sqlite/migrations_schema.sql:1–6`, `rume/src/persistence/postgres.rs:81–84`, `rume/src/persistence/mysql.rs:87–90`, `rume/src/persistence/sqlite.rs:109–112`
+- **Where:** `crates/core/src/persistence/migration.rs:98–102, 150–154, 177–182`, `crates/core/src/persistence/sql/postgres/migrations_schema.sql:1–6`, `crates/core/src/persistence/sql/mysql/migrations_schema.sql:1–6`, `crates/core/src/persistence/sql/sqlite/migrations_schema.sql:1–6`, `crates/core/src/persistence/postgres.rs:81–84`, `crates/core/src/persistence/mysql.rs:87–90`, `crates/core/src/persistence/sqlite.rs:109–112`
 - **What it says:**
   In `sql/postgres/migrations_schema.sql`, `sql/mysql/migrations_schema.sql`, and `sql/sqlite/migrations_schema.sql`:
   ```sql
@@ -239,7 +239,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
   );
   ```
   `PostgresBackend::init_migrations_table()`, `MysqlBackend::init_migrations_table()`, and `SqliteBackend::init_migrations_table()` execute `MIGRATIONS_SCHEMA`.
-  However, in `rume/src/persistence/migration.rs`:
+  However, in `crates/core/src/persistence/migration.rs`:
   ```rust
   backend
       .execute(
@@ -277,9 +277,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M4 Non-atomic migration application and lack of distributed migration lock in HA environments
 
-- **Where:** `rume/src/persistence/migration.rs:164–184, 214–227`
+- **Where:** `crates/core/src/persistence/migration.rs:164–184, 214–227`
 - **What it says:**
-  In `rume/src/persistence/migration.rs`:
+  In `crates/core/src/persistence/migration.rs`:
   ```rust
   if let Some(sql) = &migration.up_sql {
       backend
@@ -323,7 +323,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### M5 Error variant flattening: SQLx errors are unconditionally mapped to `TransactionError` or `QueryFailed`, masking `PoolExhausted`, `Timeout`, and `Closed`
 
-- **Where:** `rume/src/persistence/postgres.rs:109–112, 122, 133, 145`, `rume/src/persistence/mysql.rs:118–121, 131, 142, 154`, `rume/src/persistence/sqlite.rs:140–143, 153, 164, 176`
+- **Where:** `crates/core/src/persistence/postgres.rs:109–112, 122, 133, 145`, `crates/core/src/persistence/mysql.rs:118–121, 131, 142, 154`, `crates/core/src/persistence/sqlite.rs:140–143, 153, 164, 176`
 - **What it says:**
   Across `PostgresBackend`, `MysqlBackend`, and `SqliteBackend`:
   ```rust
@@ -371,7 +371,7 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m1 Multi-statement execution failure in `MysqlBackend::execute`, `SqliteBackend::execute`, and `PostgresTransaction::execute` due to `sqlx::query` vs `sqlx::raw_sql`
 
-- **Where:** `rume/src/persistence/mysql.rs:128`, `rume/src/persistence/sqlite.rs:150`, `rume/src/persistence/postgres.rs:174`
+- **Where:** `crates/core/src/persistence/mysql.rs:128`, `crates/core/src/persistence/sqlite.rs:150`, `crates/core/src/persistence/postgres.rs:174`
 - **What it says:**
   In `PostgresBackend::execute`:
   ```rust
@@ -398,9 +398,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ### m2 Inconsistent transaction auto-commit collision in `DatabasePool::transaction`
 
-- **Where:** `rume/src/persistence/pool.rs:174–183`
+- **Where:** `crates/core/src/persistence/pool.rs:174–183`
 - **What it says:**
-  In `rume/src/persistence/pool.rs`:
+  In `crates/core/src/persistence/pool.rs`:
   ```rust
   match f(tx).await {
       Ok(value) => {
@@ -422,9 +422,9 @@ In accordance with `.opencode/skills/review-authoring/SKILL.md`, prior findings 
 
 ## Positive notes
 
-- **Strict isolation for MySQL row claiming:** In `rume/src/persistence/mysql.rs:326–333`, `claim_pending_with_lease` explicitly sets `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` on the acquired connection before beginning the claiming transaction. This correctly prevents MySQL's default `REPEATABLE READ` snapshot isolation from seeing stale outbox rows during concurrent worker sweeps.
+- **Strict isolation for MySQL row claiming:** In `crates/core/src/persistence/mysql.rs:326–333`, `claim_pending_with_lease` explicitly sets `SET TRANSACTION ISOLATION LEVEL READ COMMITTED` on the acquired connection before beginning the claiming transaction. This correctly prevents MySQL's default `REPEATABLE READ` snapshot isolation from seeing stale outbox rows during concurrent worker sweeps.
 - **Comprehensive outbox integration across drivers:** All three relational drivers (`PostgresBackend`, `MysqlBackend`, `SqliteBackend`) implement the complete `OutboxRepository` interface and `TransactionalOutbox` contract with driver-native SQL scripts, enabling transactional outbox patterns across heterogeneous databases.
-- **Fail-closed irreversible migration guard:** `Migrator::rollback_last_backend` (`rume/src/persistence/migration.rs:208–212`) strictly enforces that migrations lacking `down_sql` reject rollback attempts with `PersistenceError::IrreversibleMigration`, preventing silent de-registration of un-reverted database schema changes.
+- **Fail-closed irreversible migration guard:** `Migrator::rollback_last_backend` (`crates/core/src/persistence/migration.rs:208–212`) strictly enforces that migrations lacking `down_sql` reject rollback attempts with `PersistenceError::IrreversibleMigration`, preventing silent de-registration of un-reverted database schema changes.
 - **Safe transaction rollback on drop:** In `SqliteTransaction`, `MysqlTransaction`, and `PostgresTransaction`, transaction handles wrap `sqlx::Transaction` in an `Arc<tokio::sync::Mutex<Option<...>>>`. If a task panics or drops the handle before calling `commit()`, SQLx's drop handler automatically rolls back the in-flight transaction, preventing leaked transaction locks.
 - **Idempotent migration runner:** `Migrator::run_pending_backend` inspects existing records in `rume_migrations` prior to applying each step, ensuring subsequent runs are idempotent and safe to invoke on every application startup.
 

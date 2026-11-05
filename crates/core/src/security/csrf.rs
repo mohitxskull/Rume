@@ -378,9 +378,9 @@ where
             }
 
             // 1. Verify if ANY matching cookie has a valid signature (guards against invalid tossed cookies)
-            let any_valid = matching_cookies.iter().any(|&cookie_token| {
-                config.verify_token(cookie_token)
-            });
+            let any_valid = matching_cookies
+                .iter()
+                .any(|&cookie_token| config.verify_token(cookie_token));
 
             if !any_valid {
                 let err = AppError::Public {

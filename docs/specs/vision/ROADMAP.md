@@ -30,7 +30,7 @@ Rume follows four development phases:
 | **ARCH-06** | Topological Lifecycle Orchestration | Modules start in topological dependency order (`on_start`); shut down and roll back on failure in reverse topological order (`on_shutdown`). | **Completed** |
 | **ARCH-07** | Module-Scoped Middleware & Health | Modules register domain-owned Tower layers and diagnostic health checks without global coupling. | **Completed** |
 
-**Verification Suite:** [`rume/tests/progressive_composition.rs`](../../../rume/tests/progressive_composition.rs) (8/8 integration tests passing).
+**Verification Suite:** [`crates/core/tests/progressive_composition.rs`](../../../crates/core/tests/progressive_composition.rs) (8/8 integration tests passing).
 
 ---
 
@@ -53,13 +53,13 @@ This phase transitions Rume into a complete application framework providing inte
 | **CAP-08** | API Schema Integration | Automatic OpenAPI / JSON Schema generation reflecting canonical route registry metadata and validated parameter types. | **Completed** |
 
 **Verification Suites:**
-- [`rume/tests/validation_suite.rs`](../../../rume/tests/validation_suite.rs)
-- [`rume/tests/persistence_integration.rs`](../../../rume/tests/persistence_integration.rs)
-- [`rume/tests/auth_suite.rs`](../../../rume/tests/auth_suite.rs)
-- [`rume/tests/cache_suite.rs`](../../../rume/tests/cache_suite.rs)
-- [`rume/tests/jobs_suite.rs`](../../../rume/tests/jobs_suite.rs)
-- [`rume/tests/events_suite.rs`](../../../rume/tests/events_suite.rs)
-- [`rume/tests/openapi_suite.rs`](../../../rume/tests/openapi_suite.rs)
+- [`crates/core/tests/validation_suite.rs`](../../../crates/core/tests/validation_suite.rs)
+- [`crates/core/tests/persistence_integration.rs`](../../../crates/core/tests/persistence_integration.rs)
+- [`crates/core/tests/auth_suite.rs`](../../../crates/core/tests/auth_suite.rs)
+- [`crates/core/tests/cache_suite.rs`](../../../crates/core/tests/cache_suite.rs)
+- [`crates/core/tests/jobs_suite.rs`](../../../crates/core/tests/jobs_suite.rs)
+- [`crates/core/tests/events_suite.rs`](../../../crates/core/tests/events_suite.rs)
+- [`crates/core/tests/openapi_suite.rs`](../../../crates/core/tests/openapi_suite.rs)
 
 ---
 
@@ -82,13 +82,13 @@ This phase provides enterprise-grade reliability, data consistency, and architec
 | **ENT-08** | Security Hardening | Hardened security headers, CSRF protection, constant-time comparisons, and audit log integration. | **Completed** |
 
 **Verification Suites:**
-- [`rume/tests/outbox_suite.rs`](../../../rume/tests/outbox_suite.rs)
-- [`rume/tests/job_reliability_suite.rs`](../../../rume/tests/job_reliability_suite.rs)
-- [`rume/tests/resilience_suite.rs`](../../../rume/tests/resilience_suite.rs)
-- [`rume/tests/metrics_suite.rs`](../../../rume/tests/metrics_suite.rs)
-- [`rume/tests/module_testing_and_architecture_suite.rs`](../../../rume/tests/module_testing_and_architecture_suite.rs)
-- [`rume/tests/tenant_suite.rs`](../../../rume/tests/tenant_suite.rs)
-- [`rume/tests/security_suite.rs`](../../../rume/tests/security_suite.rs)
+- [`crates/core/tests/outbox_suite.rs`](../../../crates/core/tests/outbox_suite.rs)
+- [`crates/core/tests/job_reliability_suite.rs`](../../../crates/core/tests/job_reliability_suite.rs)
+- [`crates/core/tests/resilience_suite.rs`](../../../crates/core/tests/resilience_suite.rs)
+- [`crates/core/tests/metrics_suite.rs`](../../../crates/core/tests/metrics_suite.rs)
+- [`crates/core/tests/module_testing_and_architecture_suite.rs`](../../../crates/core/tests/module_testing_and_architecture_suite.rs)
+- [`crates/core/tests/tenant_suite.rs`](../../../crates/core/tests/tenant_suite.rs)
+- [`crates/core/tests/security_suite.rs`](../../../crates/core/tests/security_suite.rs)
 
 ---
 
@@ -106,9 +106,9 @@ Specialized enterprise and distributed extensions built on the proven core archi
 | **MAT-03** | Enterprise Protocol Starters | Standard SCIM 2.0 (RFC 7643 / RFC 7644) provisioning envelopes and experimental SAML 2.0 assertion parser (non-production; XMLDSig validation pending). | **Completed** |
 
 **Verification Suites:**
-- [`rume/tests/saga_suite.rs`](../../../rume/tests/saga_suite.rs)
-- [`rume/tests/coordination_suite.rs`](../../../rume/tests/coordination_suite.rs)
-- [`rume/tests/enterprise_suite.rs`](../../../rume/tests/enterprise_suite.rs)
+- [`crates/core/tests/saga_suite.rs`](../../../crates/core/tests/saga_suite.rs)
+- [`crates/core/tests/coordination_suite.rs`](../../../crates/core/tests/coordination_suite.rs)
+- [`crates/core/tests/enterprise_suite.rs`](../../../crates/core/tests/enterprise_suite.rs)
 
 ---
 
@@ -179,8 +179,8 @@ This phase proves that Rume is genuinely easier to build and operate with—not 
 **Verification Suites:**
 - [`workbench/multi-instance/tests/workbench_test.rs`](../../../workbench/multi-instance/tests/workbench_test.rs) (End-to-end multi-tenant CRUD, persisted auth, negative tenant authorization tests, transaction-enlisted outbox, worker processing, signal-based graceful shutdown drain, and SQL injection / Unicode immunity).
 - [`workbench/multi-instance/tests/deployment_validation.rs`](../../../workbench/multi-instance/tests/deployment_validation.rs) (Multi-instance concurrency across tenants with independent connection pools, Redis idempotency deduplication, competing outbox relays, and worker shutdown supervision).
-- [`rume/tests/integration/persistence.rs`](../../../rume/tests/integration/persistence.rs) (Preflight and runner checksum mismatch verification, core persistence schema registration via `with_rume_core`, and generic query asset execution via `SqlQuery` and `FromRow`).
-- [`rume-cli/tests/generated_project.rs`](../../../rume-cli/tests/generated_project.rs) (CLI workflow test for `make:migration`, `db:status`, `db:migrate`, and `db:rollback`).
+- [`crates/core/tests/integration/persistence.rs`](../../../crates/core/tests/integration/persistence.rs) (Preflight and runner checksum mismatch verification, core persistence schema registration via `with_rume_core`, and generic query asset execution via `SqlQuery` and `FromRow`).
+- [`crates/cli/tests/generated_project.rs`](../../../crates/cli/tests/generated_project.rs) (CLI workflow test for `make:migration`, `db:status`, `db:migrate`, and `db:rollback`).
 
 ---
 
@@ -205,9 +205,9 @@ With runtime durability, multi-tenant isolation, safe transactions, and first-cl
 - [`workbench/multi-instance/benches/baseline.rs`](../../../workbench/multi-instance/benches/baseline.rs) (Real TCP network benchmark across concurrency levels [1, 8, 32, 64, 128], physical connection checkout & query execution, competing outbox relay throughput, and durable worker task scheduling).
 - [`workbench/multi-instance/tests/performance_baseline.rs`](../../../workbench/multi-instance/tests/performance_baseline.rs) (Automated performance qualification and hard SLA budget assertion with 0.0% error rate).
 - [`workbench/multi-instance/tests/compose_system_test.rs`](../../../workbench/multi-instance/tests/compose_system_test.rs) (Layer 3 Docker Compose system test suite validating independent container deployment, concurrent startup migration serialization via `pg_advisory_xact_lock`, cross-process outbox/job processing, SIGKILL crash failover, restart recovery, dependency recovery, and SIGTERM graceful drain).
-- [`rume/tests/containers/crash_recovery.rs`](../../../rume/tests/containers/crash_recovery.rs) (Subprocess crash recovery harness exercising `SIGKILL` / `child.kill()` failure injection during worker execution, business transaction outbox commit, and distributed leader takeover).
-- [`rume/tests/integration/test_server.rs`](../../../rume/tests/integration/test_server.rs) (TCP `TestServer` suite verifying connection keep-alive, chunked streaming, 2MB body handling, raw client drop disconnects, and graceful shutdown with active requests).
-- [`rume-cli/tests/scaffold_template.rs`](../../../rume-cli/tests/scaffold_template.rs) (Scaffolding template verification with SQL assets, repository patterns, and embed migrations).
+- [`crates/core/tests/containers/crash_recovery.rs`](../../../crates/core/tests/containers/crash_recovery.rs) (Subprocess crash recovery harness exercising `SIGKILL` / `child.kill()` failure injection during worker execution, business transaction outbox commit, and distributed leader takeover).
+- [`crates/core/tests/integration/test_server.rs`](../../../crates/core/tests/integration/test_server.rs) (TCP `TestServer` suite verifying connection keep-alive, chunked streaming, 2MB body handling, raw client drop disconnects, and graceful shutdown with active requests).
+- [`crates/cli/tests/scaffold_template.rs`](../../../crates/cli/tests/scaffold_template.rs) (Scaffolding template verification with SQL assets, repository patterns, and embed migrations).
 - Reference Application Scenarios:
   - [`workbench/simple-api`](../../../workbench/simple-api) (Minimal single-binary REST API with routing, validation, config, and SQLite persistence).
   - [`workbench/modular-monolith`](../../../workbench/modular-monolith) (Modular monolith with `catalog` and `orders` domain modules, inter-module events, and topological lifecycle startup/shutdown).

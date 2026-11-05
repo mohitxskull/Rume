@@ -324,11 +324,36 @@ impl MetricsRegistry {
             .unwrap();
             writeln!(out, "# TYPE db_pool_connections gauge").unwrap();
             for (pool, m) in pools.iter() {
-                writeln!(out, "db_pool_connections{{pool=\"{pool}\",state=\"active\"}} {}", m.active).unwrap();
-                writeln!(out, "db_pool_connections{{pool=\"{pool}\",state=\"idle\"}} {}", m.idle).unwrap();
-                writeln!(out, "db_pool_connections{{pool=\"{pool}\",state=\"leased\"}} {}", m.leased).unwrap();
-                writeln!(out, "db_pool_connections{{pool=\"{pool}\",state=\"total\"}} {}", m.total).unwrap();
-                writeln!(out, "db_pool_connections{{pool=\"{pool}\",state=\"max\"}} {}", m.max).unwrap();
+                writeln!(
+                    out,
+                    "db_pool_connections{{pool=\"{pool}\",state=\"active\"}} {}",
+                    m.active
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "db_pool_connections{{pool=\"{pool}\",state=\"idle\"}} {}",
+                    m.idle
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "db_pool_connections{{pool=\"{pool}\",state=\"leased\"}} {}",
+                    m.leased
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "db_pool_connections{{pool=\"{pool}\",state=\"total\"}} {}",
+                    m.total
+                )
+                .unwrap();
+                writeln!(
+                    out,
+                    "db_pool_connections{{pool=\"{pool}\",state=\"max\"}} {}",
+                    m.max
+                )
+                .unwrap();
             }
 
             writeln!(
@@ -338,7 +363,12 @@ impl MetricsRegistry {
             .unwrap();
             writeln!(out, "# TYPE db_pool_in_flight_transactions gauge").unwrap();
             for (pool, m) in pools.iter() {
-                writeln!(out, "db_pool_in_flight_transactions{{pool=\"{pool}\"}} {}", m.in_flight_tx).unwrap();
+                writeln!(
+                    out,
+                    "db_pool_in_flight_transactions{{pool=\"{pool}\"}} {}",
+                    m.in_flight_tx
+                )
+                .unwrap();
             }
 
             writeln!(
@@ -348,7 +378,12 @@ impl MetricsRegistry {
             .unwrap();
             writeln!(out, "# TYPE db_pool_is_closed gauge").unwrap();
             for (pool, m) in pools.iter() {
-                writeln!(out, "db_pool_is_closed{{pool=\"{pool}\"}} {}", if m.is_closed { 1 } else { 0 }).unwrap();
+                writeln!(
+                    out,
+                    "db_pool_is_closed{{pool=\"{pool}\"}} {}",
+                    if m.is_closed { 1 } else { 0 }
+                )
+                .unwrap();
             }
         }
 
@@ -372,7 +407,12 @@ impl MetricsRegistry {
             .unwrap();
             writeln!(out, "# TYPE health_check_duration_seconds gauge").unwrap();
             for (name, m) in checks.iter() {
-                writeln!(out, "health_check_duration_seconds{{name=\"{name}\"}} {:.6}", m.duration_secs).unwrap();
+                writeln!(
+                    out,
+                    "health_check_duration_seconds{{name=\"{name}\"}} {:.6}",
+                    m.duration_secs
+                )
+                .unwrap();
             }
 
             writeln!(
@@ -395,7 +435,11 @@ impl MetricsRegistry {
             writeln!(out, "# TYPE health_check_failures_total counter").unwrap();
             if let Ok(fails) = self.health_check_failures_total.read() {
                 for (name, count) in fails.iter() {
-                    writeln!(out, "health_check_failures_total{{name=\"{name}\"}} {count}").unwrap();
+                    writeln!(
+                        out,
+                        "health_check_failures_total{{name=\"{name}\"}} {count}"
+                    )
+                    .unwrap();
                 }
             }
         }

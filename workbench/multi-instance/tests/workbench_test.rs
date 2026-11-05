@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use axum::body::Body;
@@ -15,8 +15,8 @@ use rume::routing::health::{HealthCheck, HealthStatus};
 use rume::tenant::model::Tenant;
 use rume::tenant::resolver::HeaderTenantResolver;
 use testcontainers_modules::postgres::Postgres;
-use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use testcontainers_modules::testcontainers::ImageExt;
+use testcontainers_modules::testcontainers::runners::AsyncRunner;
 use tower::ServiceExt;
 
 use workbench::app::build_app;
@@ -354,7 +354,9 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
     let start_wait = std::time::Instant::now();
     while notification_handler.deliveries.load(Ordering::SeqCst) < 1 {
         if start_wait.elapsed() > Duration::from_secs(10) {
-            panic!("Timed out waiting for outbox relay and notification job handler to deliver message");
+            panic!(
+                "Timed out waiting for outbox relay and notification job handler to deliver message"
+            );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -374,9 +376,7 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
             .header("content-type", "application/json")
             .header("x-tenant-id", "acme-corp")
             .header("authorization", "Bearer member-token")
-            .body(Body::from(
-                r#"{"status":"resolved","priority":"medium"}"#,
-            ))
+            .body(Body::from(r#"{"status":"resolved","priority":"medium"}"#))
             .unwrap();
         let resp = app2.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
@@ -399,7 +399,10 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
     assert!(drained_relay, "relay must drain cleanly within timeout");
 
     let drained_pool = pool.close_and_drain(Duration::from_secs(5)).await;
-    assert!(drained_pool, "pool must close and drain connections cleanly");
+    assert!(
+        drained_pool,
+        "pool must close and drain connections cleanly"
+    );
     assert!(pool.status().is_closed);
 }
 
@@ -525,8 +528,8 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
         .await
         .expect("apply migrations");
 
-    let tenant_resolver = HeaderTenantResolver::new()
-        .add_tenant(Tenant::new("acme-corp", "acme-corp"));
+    let tenant_resolver =
+        HeaderTenantResolver::new().add_tenant(Tenant::new("acme-corp", "acme-corp"));
     let job_queue = Arc::new(PostgresJobQueue::new(pool.backend().pool().clone()));
     let notification_handler = NotificationHandler::new();
     let app = build_app(
@@ -559,7 +562,9 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let proj: Project = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(proj.name, sqli_project_name);
         assert_eq!(proj.description.as_deref(), Some(sqli_desc));
@@ -589,7 +594,9 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(issue.title, sqli_issue_title);
         assert_eq!(issue.description.as_deref(), Some(sqli_issue_desc));
@@ -615,7 +622,9 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(issue.status, "resolved");
         assert_eq!(issue.priority, "low");
@@ -653,7 +662,9 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
             .unwrap();
         let resp = app.clone().oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         let issue: Issue = serde_json::from_slice(&body_bytes).unwrap();
         assert_eq!(issue.id, issue_id);
         assert_eq!(issue.title, sqli_issue_title);

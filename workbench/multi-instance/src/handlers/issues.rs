@@ -1,12 +1,12 @@
-use std::sync::Arc;
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
 use rume::error::AppError;
 use rume::outbox::{OutboxMessage, TransactionalOutbox};
 use rume::persistence::error::PersistenceError;
 use rume::tenant::TenantContext;
 use rume::validation::ValidatedJson;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use crate::models::{

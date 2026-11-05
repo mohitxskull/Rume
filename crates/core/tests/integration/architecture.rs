@@ -404,7 +404,10 @@ async fn openapi_dynamically_includes_module_routes_and_late_registered_routes()
 
     let paths = doc["paths"].as_object().expect("paths object");
     // Verify builder route registered after .openapi() is included
-    assert!(paths.contains_key("/after/openapi"), "missing /after/openapi");
+    assert!(
+        paths.contains_key("/after/openapi"),
+        "missing /after/openapi"
+    );
     // Verify module route registered via Module is included
     assert!(paths.contains_key("/domain/items"), "missing /domain/items");
 }

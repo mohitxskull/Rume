@@ -11,8 +11,14 @@ async fn test_rume_production_benchmark_network_and_concurrent_load() {
 
     // 0. Environment Recording & Integrity Validation
     assert!(!results.environment.os.is_empty(), "OS must be recorded");
-    assert!(!results.environment.arch.is_empty(), "Arch must be recorded");
-    assert!(results.environment.logical_cores >= 1, "Logical cores must be detected");
+    assert!(
+        !results.environment.arch.is_empty(),
+        "Arch must be recorded"
+    );
+    assert!(
+        results.environment.logical_cores >= 1,
+        "Logical cores must be detected"
+    );
     assert_eq!(results.environment.postgres_image, "postgres:16-alpine");
 
     // 1. HTTP Network Concurrency Acceptance Criteria & Latency Gates
@@ -58,24 +64,28 @@ async fn test_rume_production_benchmark_network_and_concurrent_load() {
         assert!(
             rume.p50 <= max_p50,
             "rume P50 ({:?}) must be <= {:?} at concurrency {c}",
-            rume.p50, max_p50
+            rume.p50,
+            max_p50
         );
         assert!(
             rume.p95 <= max_p95,
             "rume P95 ({:?}) must be <= {:?} at concurrency {c}",
-            rume.p95, max_p95
+            rume.p95,
+            max_p95
         );
         assert!(
             rume.p99 <= max_p99,
             "rume P99 ({:?}) must be <= {:?} at concurrency {c}",
-            rume.p99, max_p99
+            rume.p99,
+            max_p99
         );
 
         // Enforce P50 overhead delta budget between Raw Axum and Rume pipeline
         assert!(
             rume.p50 <= raw.p50 + Duration::from_millis(6),
             "rume P50 overhead ({:?}) must not exceed raw axum P50 ({:?}) + 6ms",
-            rume.p50, raw.p50
+            rume.p50,
+            raw.p50
         );
     }
 
@@ -101,10 +111,7 @@ async fn test_rume_production_benchmark_network_and_concurrent_load() {
     );
 
     if let Some(ref pg) = results.postgres_db_stats {
-        assert_eq!(
-            pg.errors, 0,
-            "postgresql checkout error rate must be 0.0%"
-        );
+        assert_eq!(pg.errors, 0, "postgresql checkout error rate must be 0.0%");
         assert!(
             pg.throughput >= 200.0,
             "postgresql checkout throughput ({:.0} q/s) must exceed 200 q/s",

@@ -9,9 +9,7 @@ pub struct Sticker {
 
 impl Sticker {
     pub fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-        }
+        Self { lines: Vec::new() }
     }
 
     pub fn add(&mut self, line: &str) -> &mut Self {

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use proc_macro::TokenStream;
 use quote::quote;
 use syn::parse::{Parse, ParseStream};
-use syn::{parse_macro_input, Ident, LitStr, Token, Visibility};
+use syn::{Ident, LitStr, Token, Visibility, parse_macro_input};
 
 struct SqlAssetsArgs {
     vis: Visibility,
@@ -57,14 +57,24 @@ struct SqlFileItem {
     logical_name: String,
 }
 
-fn walk_sql_files(dir: &Path, span: proc_macro2::Span, out: &mut Vec<PathBuf>) -> Result<(), syn::Error> {
+fn walk_sql_files(
+    dir: &Path,
+    span: proc_macro2::Span,
+    out: &mut Vec<PathBuf>,
+) -> Result<(), syn::Error> {
     let entries = fs::read_dir(dir).map_err(|e| {
-        syn::Error::new(span, format!("sql_assets!: failed to read directory {dir:?}: {e}"))
+        syn::Error::new(
+            span,
+            format!("sql_assets!: failed to read directory {dir:?}: {e}"),
+        )
     })?;
     let mut sorted_entries = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| {
-            syn::Error::new(span, format!("sql_assets!: failed to read directory entry in {dir:?}: {e}"))
+            syn::Error::new(
+                span,
+                format!("sql_assets!: failed to read directory entry in {dir:?}: {e}"),
+            )
         })?;
         sorted_entries.push(entry);
     }
@@ -200,7 +210,11 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
     // Check for collision within the same dialect and namespace
     let mut seen_in_ns: BTreeSet<(Option<String>, String, String)> = BTreeSet::new();
     for item in &items {
-        let key = (item.dialect.clone(), item.namespace.clone(), item.query_ident.clone());
+        let key = (
+            item.dialect.clone(),
+            item.namespace.clone(),
+            item.query_ident.clone(),
+        );
         if !seen_in_ns.insert(key) {
             let dialect_label = item.dialect.as_deref().unwrap_or("common");
             return syn::Error::new(
@@ -378,7 +392,10 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
         Err(err) => {
             return syn::Error::new(
                 dir_lit.span(),
-                format!("embed_migrations!: failed to read directory {:?}: {err}", full_dir),
+                format!(
+                    "embed_migrations!: failed to read directory {:?}: {err}",
+                    full_dir
+                ),
             )
             .to_compile_error()
             .into();
@@ -392,7 +409,10 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
             Err(err) => {
                 return syn::Error::new(
                     dir_lit.span(),
-                    format!("embed_migrations!: failed to read entry in {:?}: {err}", full_dir),
+                    format!(
+                        "embed_migrations!: failed to read entry in {:?}: {err}",
+                        full_dir
+                    ),
                 )
                 .to_compile_error()
                 .into();
@@ -458,7 +478,9 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 
             if is_up {
                 let ver_prefix = extract_migration_version(id);
-                if let Some(existing_file) = seen_versions.insert(ver_prefix.to_string(), file_name.to_string()) {
+                if let Some(existing_file) =
+                    seen_versions.insert(ver_prefix.to_string(), file_name.to_string())
+                {
                     return syn::Error::new(
                         dir_lit.span(),
                         format!(

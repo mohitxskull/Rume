@@ -9,11 +9,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use axum::Json;
-use rume::app::builder::RumeBuilder;
 use rume::app::Rume;
+use rume::app::builder::RumeBuilder;
 use rume::events::{Event, EventBus};
 use rume::module::{BoxFuture, Module, ModuleContext, ModuleHookResult};
 use rume::routing::Router;
@@ -167,7 +167,11 @@ async fn get_product(
     Path(id): Path<String>,
 ) -> Result<Json<Product>, StatusCode> {
     let prods = state.products.read().await;
-    prods.get(&id).cloned().map(Json).ok_or(StatusCode::NOT_FOUND)
+    prods
+        .get(&id)
+        .cloned()
+        .map(Json)
+        .ok_or(StatusCode::NOT_FOUND)
 }
 
 // ------------------------------------------------------------------------------------------------

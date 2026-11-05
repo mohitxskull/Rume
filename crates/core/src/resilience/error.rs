@@ -31,7 +31,9 @@ pub enum ResilienceError {
 impl From<ResilienceError> for AppError {
     fn from(err: ResilienceError) -> Self {
         match err {
-            ResilienceError::Backend(msg) => AppError::internal(format!("Resilience backend error: {msg}")),
+            ResilienceError::Backend(msg) => {
+                AppError::internal(format!("Resilience backend error: {msg}"))
+            }
             ResilienceError::CircuitOpen => AppError::Public {
                 status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
                 code: "CIRCUIT_BREAKER_OPEN",

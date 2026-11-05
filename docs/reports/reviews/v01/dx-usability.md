@@ -3,11 +3,11 @@
 **Report file:** `docs/reports/reviews/v01/dx-usability.md`
 **Lens:** DX/Usability — is the API pleasant and intuitive to use?
 **Code reviewed:**
-- `rume/src/app.rs` — `AppContext::new()` (6 args), `Rume::builder(ctx)`, `RumeBuilder::new`, `ops_router`
-- `rume/src/routing.rs` — `RouteSpec`, `RouteGroup`, `health_routes()` vs `ops_router()` naming, `ValidatedParam`
-- `rume/src/prelude.rs` — re-exports
-- `rume/src/lib.rs` — whole-crate re-exports
-- `rume-cli/src/` — CLI commands (`new`, `env check`, `config check`, `doctor`, `generate`)
+- `crates/core/src/app.rs` — `AppContext::new()` (6 args), `Rume::builder(ctx)`, `RumeBuilder::new`, `ops_router`
+- `crates/core/src/routing.rs` — `RouteSpec`, `RouteGroup`, `health_routes()` vs `ops_router()` naming, `ValidatedParam`
+- `crates/core/src/prelude.rs` — re-exports
+- `crates/core/src/lib.rs` — whole-crate re-exports
+- `crates/cli/src/` — CLI commands (`new`, `env check`, `config check`, `doctor`, `generate`)
 - `rume-cli/templates/` — generated project template
 
 **Method:** whole-document, stage 1 (independent). All claims checked against the actual files above.
@@ -26,7 +26,7 @@ Rume's DX has a clear north star: one documented entry point (`Rume::builder(ctx
 
 ### M1 — `AppContext::new()` takes 6 positional args of mixed types, making call sites fragile and hard to read
 
-**Where:** `rume/src/app.rs:242-249` —
+**Where:** `crates/core/src/app.rs:242-249` —
 ```rust
 pub fn new(
     env: E,
@@ -61,7 +61,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### M2 — `Rume::builder()` documented as the sole entry point, but `RumeBuilder::new()` is public and equivalent
 
-**Where:** `rume/src/app.rs:274-281` (doc on `Rume::builder` — "This is the only way to build a Rume application.") and `rume/src/app.rs:307` (`pub fn new(ctx: AppContext<E, C>) -> Self`).
+**Where:** `crates/core/src/app.rs:274-281` (doc on `Rume::builder` — "This is the only way to build a Rume application.") and `crates/core/src/app.rs:307` (`pub fn new(ctx: AppContext<E, C>) -> Self`).
 
 **What it says:** The doc comment on `Rume::builder` states it is "the only way to build a Rume application," yet `RumeBuilder::new` is `pub` and performs the identical construction. Both are exported from `lib.rs:18-21`.
 
@@ -73,7 +73,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### M3 — `health_routes()` and `ops_router()` are two overlapping health-endpoint APIs with confusingly similar names
 
-**Where:** `rume/src/routing.rs:553-585` (`health_routes<E, C>() -> Router<AppContext<E, C>>`) and `rume/src/app.rs:536-580` (`ops_router<S>(router, availability) -> Router<S>`).
+**Where:** `crates/core/src/routing.rs:553-585` (`health_routes<E, C>() -> Router<AppContext<E, C>>`) and `crates/core/src/app.rs:536-580` (`ops_router<S>(router, availability) -> Router<S>`).
 
 **What it says:** Both register `GET /health/live` and `GET /health/ready`. `health_routes` is generic over `AppContext<E, C>` and reads availability/health-checks from Axum `State`. `ops_router` is generic over any `S`, takes `Availability` directly (not via state), and its doc says "Ops endpoints for infrastructure probes." The template `rume-cli/templates/src/app.rs.tpl:22` uses `health_routes::<Env, Config>().merge(router)`.
 
@@ -85,7 +85,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### m1 — Prelude re-exports whole third-party crates (`axum`, `serde`, `tokio`, `tracing`, `serde_json`) plus `axum::routing`, polluting the namespace
 
-**Where:** `rume/src/prelude.rs:18-24` and `rume/src/lib.rs:30-33` (`pub use axum; pub use serde; pub use serde_json; pub use tokio; pub use tracing;`).
+**Where:** `crates/core/src/prelude.rs:18-24` and `crates/core/src/lib.rs:30-33` (`pub use axum; pub use serde; pub use serde_json; pub use tokio; pub use tracing;`).
 
 **What it says:** `rume::prelude::*` brings `axum`, `serde`, `tokio`, `tracing`, `serde_json`, `axum::routing`, `State`, `Path`, `Json` into scope. `lib.rs` additionally exposes `rume::axum`, `rume::serde`, `rume::tokio`, `rume::tracing` as first-class names.
 
@@ -97,7 +97,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### m2 — `rume generate handler` uses fragile string-marker codegen with silent degradation
 
-**Where:** `rume-cli/src/commands/generate/handler.rs:62-90` — reads `src/routes.rs`, searches for the literal marker `// rume:routes`, and inserts a route line by string concatenation; if the marker is missing it prints a warning but continues without registering the route.
+**Where:** `crates/cli/src/commands/generate/handler.rs:62-90` — reads `src/routes.rs`, searches for the literal marker `// rume:routes`, and inserts a route line by string concatenation; if the marker is missing it prints a warning but continues without registering the route.
 
 **What it says:**
 ```rust
@@ -118,7 +118,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### m3 — `rume new` scaffolds a `Cargo.toml` with a local path dependency and no user-facing warning
 
-**Where:** `rume-cli/src/commands/new.rs:6` — `const FRAMEWORK_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../rume");` and `rume-cli/templates/Cargo.toml.tpl:7` — `rume = { path = "{{framework_path}}" }`.
+**Where:** `crates/cli/src/commands/new.rs:6` — `const FRAMEWORK_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../rume");` and `rume-cli/templates/Cargo.toml.tpl:7` — `rume = { path = "{{framework_path}}" }`.
 
 **What it says:** `rume new myapp` produces `rume = { path = "/.../rume" }` pointing at a local filesystem path that only exists on the developer's machine. The comment at `new.rs:5` acknowledges this ("Switch to a crates.io version before publishing") but the template still ships with it.
 
@@ -130,7 +130,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### m4 — Generated code imports via `rume::axum` / `rume::serde`, teaching the brittle re-export pattern
 
-**Where:** `rume-cli/src/commands/generate/handler.rs:23-24` generates `use rume::axum::Json; use rume::serde::Serialize;` and templates use `rume::axum::routing::get` (`routes.rs.tpl:10-11`) and `rume::prelude::*`.
+**Where:** `crates/cli/src/commands/generate/handler.rs:23-24` generates `use rume::axum::Json; use rume::serde::Serialize;` and templates use `rume::axum::routing::get` (`routes.rs.tpl:10-11`) and `rume::prelude::*`.
 
 **What it says:** Generated handler code reaches through `rume::axum` and `rume::serde` — third-party crates re-exported as if they were Rume's own.
 
@@ -142,7 +142,7 @@ and keep `new` as `pub(crate)` or remove it. Alternatively provide `AppContext::
 
 ### m5 — No machine-readable output (`--json`) for `doctor`, `env check`, `config check`
 
-**Where:** `rume-cli/src/commands/doctor.rs:94-98` (`print_check` prints `[label] value`), `rume-cli/src/commands/env/check.rs:49` (`println!("  {key}={display}  (process env)")`), `rume-cli/src/commands/config/check.rs` (prints raw TOML text).
+**Where:** `crates/cli/src/commands/doctor.rs:94-98` (`print_check` prints `[label] value`), `crates/cli/src/commands/env/check.rs:49` (`println!("  {key}={display}  (process env)")`), `crates/cli/src/commands/config/check.rs` (prints raw TOML text).
 
 **What it says:** All CLI inspection output is human-readable text only. `doctor` prints `[label] value` lines; `env check` prints a table; `config check` prints raw merged TOML.
 

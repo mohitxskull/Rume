@@ -22,9 +22,9 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### C1 Superseded relay worker overwrites active claims and resurrects published messages via unvalidated lease tokens in `mark_published()` and `mark_failed()`
 
-- **Where:** `rume/src/outbox/repository.rs:39–44`, `rume/src/persistence/postgres.rs:353–395`, `rume/src/persistence/mysql.rs:370–413`, `rume/src/persistence/sqlite.rs:384–427`
+- **Where:** `crates/core/src/outbox/repository.rs:39–44`, `crates/core/src/persistence/postgres.rs:353–395`, `crates/core/src/persistence/mysql.rs:370–413`, `crates/core/src/persistence/sqlite.rs:384–427`
 - **What it says:**
-  In `rume/src/outbox/repository.rs`:
+  In `crates/core/src/outbox/repository.rs`:
   ```rust
   /// Marks a message as successfully published.
   fn mark_published(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>>;
@@ -32,7 +32,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
   /// Marks a message as failed with an error message and increments its retry counter.
   fn mark_failed(&self, id: &str, error: String) -> BoxFuture<'_, Result<(), OutboxError>>;
   ```
-  In `rume/src/persistence/postgres.rs` (and identically in `mysql.rs` and `sqlite.rs`):
+  In `crates/core/src/persistence/postgres.rs` (and identically in `mysql.rs` and `sqlite.rs`):
   ```rust
   fn mark_published(&self, id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
       let id_str = id.to_string();
@@ -96,9 +96,9 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### C2 Premature lease revocation in `outbox_recover.sql` via message age condition causes unconditional concurrent double-dispatch
 
-- **Where:** `rume/src/persistence/sql/postgres/outbox_recover.sql:1–6`, `rume/src/persistence/sql/mysql/outbox_recover.sql:1–6`, `rume/src/persistence/sql/sqlite/outbox_recover.sql:1–6`, `rume/src/outbox/relay.rs:60–63`
+- **Where:** `crates/core/src/persistence/sql/postgres/outbox_recover.sql:1–6`, `crates/core/src/persistence/sql/mysql/outbox_recover.sql:1–6`, `crates/core/src/persistence/sql/sqlite/outbox_recover.sql:1–6`, `crates/core/src/outbox/relay.rs:60–63`
 - **What it says:**
-  In `rume/src/persistence/sql/postgres/outbox_recover.sql` (and identically in MySQL and SQLite):
+  In `crates/core/src/persistence/sql/postgres/outbox_recover.sql` (and identically in MySQL and SQLite):
   ```sql
   UPDATE rume_outbox
   SET status = 'pending',
@@ -107,7 +107,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
   WHERE status = 'inflight'
     AND (lease_expires_at <= $1 OR ($1 - created_at) >= $2);
   ```
-  In `rume/src/outbox/relay.rs`:
+  In `crates/core/src/outbox/relay.rs`:
   ```rust
   pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
       // Automatically reclaim any expired in-flight message leases before polling new items
@@ -147,9 +147,9 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### C3 Duplicate message insertion with upsert resurrects already-published and in-flight messages
 
-- **Where:** `rume/src/persistence/sql/postgres/outbox_insert.sql:1–11`, `rume/src/persistence/sql/mysql/outbox_insert.sql:1–11`, `rume/src/persistence/sql/sqlite/outbox_insert.sql:1–11`
+- **Where:** `crates/core/src/persistence/sql/postgres/outbox_insert.sql:1–11`, `crates/core/src/persistence/sql/mysql/outbox_insert.sql:1–11`, `crates/core/src/persistence/sql/sqlite/outbox_insert.sql:1–11`
 - **What it says:**
-  In `rume/src/persistence/sql/postgres/outbox_insert.sql`:
+  In `crates/core/src/persistence/sql/postgres/outbox_insert.sql`:
   ```sql
   INSERT INTO rume_outbox (
       id, event_type, payload, status, retry_count, created_at,
@@ -182,9 +182,9 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### M1 Missing `ORDER BY created_at ASC` in MySQL `outbox_claim.sql` violates FIFO temporal event ordering
 
-- **Where:** `rume/src/persistence/sql/mysql/outbox_claim.sql:1–7`
+- **Where:** `crates/core/src/persistence/sql/mysql/outbox_claim.sql:1–7`
 - **What it says:**
-  In `rume/src/persistence/sql/mysql/outbox_claim.sql`:
+  In `crates/core/src/persistence/sql/mysql/outbox_claim.sql`:
   ```sql
   SELECT id, event_type, payload, status, retry_count,
          created_at, last_error, next_retry_at, lease_token, lease_expires_at
@@ -199,7 +199,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
   ORDER BY created_at ASC
   ```
 - **Why it's a problem:** In PostgreSQL and SQLite, claims are ordered strictly by `created_at ASC`, ensuring FIFO event dispatch. In MySQL, `ORDER BY created_at ASC` was omitted. MySQL returns matching rows in primary key or physical page order. Under continuous event ingestion, older events can starve indefinitely while newer events are claimed, directly violating causal and temporal event delivery guarantees for domain subscribers.
-- **Suggested fix:** Add `ORDER BY created_at ASC` before `LIMIT ?` in `rume/src/persistence/sql/mysql/outbox_claim.sql`:
+- **Suggested fix:** Add `ORDER BY created_at ASC` before `LIMIT ?` in `crates/core/src/persistence/sql/mysql/outbox_claim.sql`:
   ```sql
   SELECT id, event_type, payload, status, retry_count,
          created_at, last_error, next_retry_at, lease_token, lease_expires_at
@@ -215,7 +215,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### M2 Relay error propagation swallows recovery failures and abandons claimed in-flight messages on partial batch failures
 
-- **Where:** `rume/src/outbox/relay.rs:60–78`
+- **Where:** `crates/core/src/outbox/relay.rs:60–78`
 - **What it says:**
   ```rust
   pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<usize, OutboxError> {
@@ -259,7 +259,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### M3 Non-atomic read-modify-write race condition in `mark_failed()` overwrites concurrent retry counters
 
-- **Where:** `rume/src/persistence/postgres.rs:370–390`, `rume/src/persistence/mysql.rs:387–408`, `rume/src/persistence/sqlite.rs:401–422`
+- **Where:** `crates/core/src/persistence/postgres.rs:370–390`, `crates/core/src/persistence/mysql.rs:387–408`, `crates/core/src/persistence/sqlite.rs:401–422`
 - **What it says:**
   ```rust
   let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = $1")
@@ -294,7 +294,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### M4 Outbox repository lacks dead-letter queue (DLQ) query/reprocess API and visibility
 
-- **Where:** `rume/src/outbox/repository.rs:15–60`, `rume/src/persistence/postgres.rs:412–424`, `rume/src/persistence/mysql.rs:430–442`, `rume/src/persistence/sqlite.rs:443–455`
+- **Where:** `crates/core/src/outbox/repository.rs:15–60`, `crates/core/src/persistence/postgres.rs:412–424`, `crates/core/src/persistence/mysql.rs:430–442`, `crates/core/src/persistence/sqlite.rs:443–455`
 - **What it says:**
   `OutboxRepository` defines `pending_count()` and `published_count()`, but no `failed_count()`, `fetch_failed()`, or `reprocess_failed()`.
   In `pending_count()`:
@@ -317,7 +317,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### M5 Unhandled dispatcher panics permanently terminate `OutboxRelay::start()` background worker loop
 
-- **Where:** `rume/src/outbox/relay.rs:84–94`
+- **Where:** `crates/core/src/outbox/relay.rs:84–94`
 - **What it says:**
   ```rust
   pub fn start(&self, interval: Duration) {
@@ -352,7 +352,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### m1 Hardcoded retry thresholds, lease durations, and batch sizes preclude workload tuning
 
-- **Where:** `rume/src/outbox/relay.rs:61, 88`, `rume/src/outbox/repository.rs:29`, `rume/src/persistence/postgres.rs:378`, `rume/src/persistence/mysql.rs:395`, `rume/src/persistence/sqlite.rs:409`
+- **Where:** `crates/core/src/outbox/relay.rs:61, 88`, `crates/core/src/outbox/repository.rs:29`, `crates/core/src/persistence/postgres.rs:378`, `crates/core/src/persistence/mysql.rs:395`, `crates/core/src/persistence/sqlite.rs:409`
 - **What it says:**
   - Max retries is hardcoded to `5` in `postgres.rs:378`, `mysql.rs:395`, and `sqlite.rs:409`.
   - Lease duration is hardcoded to `30` in `repository.rs:29`.
@@ -373,7 +373,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### m2 Missing index on `(status, lease_expires_at)` causes full table scans during recovery polling
 
-- **Where:** `rume/src/persistence/sql/postgres/outbox_schema.sql:14–16`, `rume/src/persistence/sql/mysql/outbox_schema.sql:12`, `rume/src/persistence/sql/sqlite/outbox_schema.sql:14–15`
+- **Where:** `crates/core/src/persistence/sql/postgres/outbox_schema.sql:14–16`, `crates/core/src/persistence/sql/mysql/outbox_schema.sql:12`, `crates/core/src/persistence/sql/sqlite/outbox_schema.sql:14–15`
 - **What it says:**
   In PostgreSQL:
   ```sql
@@ -389,7 +389,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### m3 1-second timestamp resolution creates non-deterministic causal ordering for high-throughput batches
 
-- **Where:** `rume/src/outbox/message.rs:11–16`
+- **Where:** `crates/core/src/outbox/message.rs:11–16`
 - **What it says:**
   ```rust
   pub(crate) fn current_timestamp() -> u64 {
@@ -406,7 +406,7 @@ The Rume transactional outbox subsystem provides an event-publishing architectur
 
 ### m4 Outbox operations on `DatabasePool<B>` bypass pool semaphores and in-flight accounting
 
-- **Where:** `rume/src/persistence/pool.rs:311–377`
+- **Where:** `crates/core/src/persistence/pool.rs:311–377`
 - **What it says:**
   ```rust
   impl<B> OutboxRepository for DatabasePool<B>

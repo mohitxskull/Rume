@@ -234,7 +234,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     }
 
     /// Claims pending messages atomically and dispatches them in order.
-    pub async fn poll_and_dispatch(&self, batch_size: usize) -> Result<RelayPollResult, OutboxError> {
+    pub async fn poll_and_dispatch(
+        &self,
+        batch_size: usize,
+    ) -> Result<RelayPollResult, OutboxError> {
         // Automatically reclaim any expired in-flight message leases before polling new items.
         // Propagate errors directly to prevent silent lease stalls or misconfigured repositories.
         self.repository
@@ -278,9 +281,8 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let hb_repo = Arc::clone(&self.repository);
             let hb_msg_id = message.id.clone();
             let hb_token = token.to_string();
-            let hb_interval = Duration::from_millis(
-                (lease_duration_secs * 1000 / 3).clamp(50, 20_000),
-            );
+            let hb_interval =
+                Duration::from_millis((lease_duration_secs * 1000 / 3).clamp(50, 20_000));
             let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
             let lease_lost = Arc::new(AtomicBool::new(false));
             let lease_lost_hb = Arc::clone(&lease_lost);
@@ -331,7 +333,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let dispatch_result = match fut_result {
                 Ok(fut) => {
                     let scoped_fut = crate::app::CURRENT_TRACE_CONTEXT.scope(scope_tc, fut);
-                    match std::panic::AssertUnwindSafe(scoped_fut.instrument(span)).catch_unwind().await {
+                    match std::panic::AssertUnwindSafe(scoped_fut.instrument(span))
+                        .catch_unwind()
+                        .await
+                    {
                         Ok(res) => res,
                         Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
                     }
@@ -354,21 +359,19 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             }
 
             match dispatch_result {
-                Ok(()) => {
-                    match self.repository.mark_published(&message.id, token).await {
-                        Ok(()) => {
-                            result.published += 1;
-                        }
-                        Err(err) => {
-                            tracing::error!(
-                                message_id = %message.id,
-                                error = %err,
-                                "Failed to mark outbox message as published"
-                            );
-                            result.failed_transitions += 1;
-                        }
+                Ok(()) => match self.repository.mark_published(&message.id, token).await {
+                    Ok(()) => {
+                        result.published += 1;
                     }
-                }
+                    Err(err) => {
+                        tracing::error!(
+                            message_id = %message.id,
+                            error = %err,
+                            "Failed to mark outbox message as published"
+                        );
+                        result.failed_transitions += 1;
+                    }
+                },
                 Err(err) => {
                     match self
                         .repository
@@ -439,7 +442,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         let relay = self.clone();
         tokio::spawn(async move {
             while !relay.is_stopping.load(Ordering::Relaxed) {
-                if let Err(err) = relay.sweep_published(config.retention_secs, config.batch_size).await {
+                if let Err(err) = relay
+                    .sweep_published(config.retention_secs, config.batch_size)
+                    .await
+                {
                     tracing::error!(error = %err, "Outbox background sweeper encountered an error");
                 }
                 tokio::select! {
@@ -614,7 +620,10 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                 "failed_transitions".to_string(),
                 serde_json::json!(status.failed_transitions),
             );
-            meta.insert("is_healthy".to_string(), serde_json::json!(status.is_healthy));
+            meta.insert(
+                "is_healthy".to_string(),
+                serde_json::json!(status.is_healthy),
+            );
             if let Some(err) = &status.last_error {
                 meta.insert("last_error".to_string(), serde_json::json!(err));
             }

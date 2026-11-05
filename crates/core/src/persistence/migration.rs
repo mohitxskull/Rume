@@ -23,8 +23,7 @@ const MYSQL_MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.
 const SQLITE_MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
 
 /// Canonical DDL for the migration tracking ledger table across all database backends.
-pub const CREATE_MIGRATIONS_TABLE_DDL: &str =
-    "CREATE TABLE IF NOT EXISTS rume_migrations (\
+pub const CREATE_MIGRATIONS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS rume_migrations (\
      id VARCHAR(255) PRIMARY KEY, \
      name VARCHAR(255) NOT NULL DEFAULT '', \
      applied_at BIGINT NOT NULL, \
@@ -163,10 +162,7 @@ impl Migrator {
     pub fn with_rume_core(mut self, dialect: &str) -> Self {
         let (up_sql, down_sql) = match dialect {
             "postgres" => {
-                let up = format!(
-                    "{}\n{}\n{}\n{}",
-                    PG_OUTBOX, PG_JOBS, PG_LOCKS, PG_LEADER
-                );
+                let up = format!("{}\n{}\n{}\n{}", PG_OUTBOX, PG_JOBS, PG_LOCKS, PG_LEADER);
                 (up, PG_CORE_DOWN)
             }
             "mysql" => (MYSQL_OUTBOX.to_string(), MYSQL_CORE_DOWN),
@@ -235,9 +231,7 @@ impl Migrator {
     ) -> Result<Vec<(String, i64)>, PersistenceError> {
         let ddl = migrations_schema_ddl(backend.dialect());
         backend.execute(ddl).await?;
-        let rows = backend
-            .fetch_all(LIST_APPLIED_MIGRATIONS_SQL, &[])
-            .await?;
+        let rows = backend.fetch_all(LIST_APPLIED_MIGRATIONS_SQL, &[]).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let id: String = row.get("id")?;
@@ -314,7 +308,8 @@ impl Migrator {
 
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
-            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
+            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)")
+                .await?;
             tx.execute(ddl).await?;
 
             let mut applied = Vec::new();
@@ -340,7 +335,9 @@ impl Migrator {
                             })?;
                     }
                     let now = if let Ok(Some(s)) = tx
-                        .query_scalar("SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text")
+                        .query_scalar(
+                            "SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text",
+                        )
                         .await
                         && let Ok(ts) = s.parse::<u64>()
                     {
@@ -433,7 +430,8 @@ impl Migrator {
 
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
-            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)").await?;
+            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)")
+                .await?;
             tx.execute(ddl).await?;
 
             for migration in self.migrations.iter().rev() {

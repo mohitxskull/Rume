@@ -241,16 +241,25 @@ async fn await_supervised_task(
         Ok(Ok(())) => true,
         Ok(Err(join_err)) => {
             if join_err.is_panic() {
-                tracing::error!(task = task_name, "Worker background task panicked during execution");
+                tracing::error!(
+                    task = task_name,
+                    "Worker background task panicked during execution"
+                );
             } else if join_err.is_cancelled() {
                 tracing::warn!(task = task_name, "Worker background task was cancelled");
             } else {
-                tracing::error!(task = task_name, "Worker background task failed: {join_err}");
+                tracing::error!(
+                    task = task_name,
+                    "Worker background task failed: {join_err}"
+                );
             }
             false
         }
         Err(_) => {
-            tracing::warn!(task = task_name, "Worker background task shutdown timed out");
+            tracing::warn!(
+                task = task_name,
+                "Worker background task shutdown timed out"
+            );
             false
         }
     }
@@ -825,12 +834,12 @@ impl<Q: JobQueue> JobWorker<Q> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Instant;
-    use tokio::sync::{mpsc, Mutex};
     use crate::jobs::job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
     use crate::jobs::retry::RetryPolicy;
     use serde::{Deserialize, Serialize};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Instant;
+    use tokio::sync::{Mutex, mpsc};
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct BlockTestJob {
@@ -880,7 +889,10 @@ mod tests {
             Box::pin(async move { Ok(None) })
         }
 
-        fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        fn dequeue_for(
+            &self,
+            worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
             let worker_id = worker_id.to_string();
             Box::pin(async move {
                 let _ = self.enter_tx.send(()).await;
@@ -985,9 +997,8 @@ mod tests {
 
         // 2. Concurrently initiate drain
         let drain_worker = worker.clone();
-        let drain_task = tokio::spawn(async move {
-            drain_worker.drain(Duration::from_secs(2)).await
-        });
+        let drain_task =
+            tokio::spawn(async move { drain_worker.drain(Duration::from_secs(2)).await });
 
         // Small yield so drain sets is_stopping
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1003,10 +1014,18 @@ mod tests {
         assert!(handle.is_finished());
 
         // 6. Guarantee that no new job started after draining began!
-        assert_eq!(executions.load(Ordering::SeqCst), 0, "job must not execute after drain requested");
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "job must not execute after drain requested"
+        );
 
         // 7. Verify the returned job was immediately nack'd back to queue
-        assert_eq!(nack_count.load(Ordering::SeqCst), 1, "unstarted job must be nack'd immediately");
+        assert_eq!(
+            nack_count.load(Ordering::SeqCst),
+            1,
+            "unstarted job must be nack'd immediately"
+        );
     }
 
     #[tokio::test]
@@ -1031,6 +1050,9 @@ mod tests {
         };
 
         let success = handle.shutdown(Duration::from_secs(1)).await;
-        assert!(!success, "WorkerHandle::shutdown must return false when a task panics");
+        assert!(
+            !success,
+            "WorkerHandle::shutdown must return false when a task panics"
+        );
     }
 }

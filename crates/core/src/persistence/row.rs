@@ -1,8 +1,8 @@
 //! Generic database row representation and typed column extraction.
 
-use std::fmt::Debug;
 use crate::persistence::backend::DbValue;
 use crate::persistence::error::PersistenceError;
+use std::fmt::Debug;
 
 /// Conversion trait from a generic [`DbValue`] into a typed application value.
 pub trait FromDbValue: Sized {
@@ -295,7 +295,11 @@ impl DbRow {
 
     /// Extracts and converts a column value by zero-based index.
     pub fn get_by_index<T: FromDbValue>(&self, index: usize) -> Result<T, PersistenceError> {
-        let col_name = self.columns.get(index).cloned().unwrap_or_else(|| index.to_string());
+        let col_name = self
+            .columns
+            .get(index)
+            .cloned()
+            .unwrap_or_else(|| index.to_string());
         let val = self.get_value_by_index(index)?;
         T::from_db_value(val).map_err(|e| match e {
             PersistenceError::DecodeError { message, .. } => PersistenceError::DecodeError {
@@ -399,7 +403,10 @@ mod tests {
         }
 
         // Value exceeding u32 range
-        let big_u32_row = DbRow::new(vec!["big_u32".into()], vec![DbValue::Text(format!("{}", u64::MAX))]);
+        let big_u32_row = DbRow::new(
+            vec!["big_u32".into()],
+            vec![DbValue::Text(format!("{}", u64::MAX))],
+        );
         let err = big_u32_row.get::<u32>("big_u32").unwrap_err();
         match err {
             PersistenceError::DecodeError { column, message } => {

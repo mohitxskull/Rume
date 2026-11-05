@@ -2,7 +2,7 @@
 
 ## Summary
 
-This review conducts a whole-document audit of Rume's security, authentication, enterprise protocols, and hardening subsystems as of `HEAD`, evaluating `rume/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `rume/src/auth/` (`error.rs`, `identity.rs`, `layer.rs`, `policy.rs`, `schemes.rs`, `session.rs`, `redis.rs`), `rume/src/enterprise/` (`saml.rs`, `scim.rs`), `rume/src/env/` (`secrets.rs`, `loading.rs`, `interpolation.rs`), and `rume/src/helpers/` (`safe_equal.rs`). The remediation wave since v03 and commit `c550731` introduced critical architectural improvements: the SAML parser migrated to a namespace-aware `quick-xml` reader, eliminating Type-1 envelope injection and XML comment attacks while anchoring assertion claim extraction to the verified element slice; CSRF protection defaults to `cookie_secure: true` with multi-cookie inspection; `SessionScheme` propagates backend storage failures as HTTP 500 without silent guest degradation; session ID rotation saves before deleting; and audit logging redacts metadata credentials.
+This review conducts a whole-document audit of Rume's security, authentication, enterprise protocols, and hardening subsystems as of `HEAD`, evaluating `crates/core/src/security/` (`audit.rs`, `csrf.rs`, `headers.rs`), `crates/core/src/auth/` (`error.rs`, `identity.rs`, `layer.rs`, `policy.rs`, `schemes.rs`, `session.rs`, `redis.rs`), `crates/core/src/enterprise/` (`saml.rs`, `scim.rs`), `crates/core/src/env/` (`secrets.rs`, `loading.rs`, `interpolation.rs`), and `crates/core/src/helpers/` (`safe_equal.rs`). The remediation wave since v03 and commit `c550731` introduced critical architectural improvements: the SAML parser migrated to a namespace-aware `quick-xml` reader, eliminating Type-1 envelope injection and XML comment attacks while anchoring assertion claim extraction to the verified element slice; CSRF protection defaults to `cookie_secure: true` with multi-cookie inspection; `SessionScheme` propagates backend storage failures as HTTP 500 without silent guest degradation; session ID rotation saves before deleting; and audit logging redacts metadata credentials.
 
 However, the subsystem is **not ready to ship without a fix pass**. While no Critical data-corruption vulnerabilities remain, **4 Major findings** and **5 Minor findings** undermine production security guarantees: (1) `CsrfConfig` continues to default to unauthenticated tokens (`secret: None`) without fail-closed startup validation or automatic key generation, permitting subdomain cookie-tossing; (2) `SessionScheme` aborts cookie evaluation on the first matching cookie name, enabling denial of service via subdomain cookie tossing; (3) `SamlParser` erroneously rejects standard SAML responses using enveloped signatures with empty reference URIs (`URI=""`), while failing open on assertions omitting `NotOnOrAfter`; and (4) `SqlAuditLogger` still relies on manual string formatting rather than driver-level parameterized statements, while hardcoding the PostgreSQL DDL across all database backends.
 
@@ -19,25 +19,25 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 
 ### Prior Findings from v01 (`docs/reports/reviews/v01/security.md`)
 
-- **v01 S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:252–267`. `resolve_value` canonicalizes both the base directory and the resolved target path, asserting `canonical_full.starts_with(&canonical_dir)` and rejecting escaping paths with `std::io::ErrorKind::PermissionDenied`.
-- **v01 S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `rume/src/env/loading.rs:27–36, 50–60`. `ResolvedEnv` segregates sensitive values into `secrets: BTreeMap<String, SecretBox<String>>`, ensuring plaintext secrets are exposed only at final consumption via `expose_secret()`.
-- **v01 S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `rume-cli/src/commands/env/check.rs:47–51` and `rume-cli/src/commands/config/check.rs:38–48`. Environment and configuration inspection commands redact secret keys and database URLs by default, requiring an explicit `--unredacted` flag for plaintext display.
-- **v01 S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `rume/src/error.rs:173–275`. Client responses strictly follow RFC 9457 Problem Details (`application/problem+json`), suppressing internal database and system diagnostics from network responses.
-- **v01 S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Verified in `rume/src/env/secrets.rs:18–52`. Detection was broadened to match `_PASS`, `_PWD`, `_CRED`, `_KEY`, `APIKEY`, `AUTHORIZATION`, `BEARER`, `SESSION`, `SESSION_ID`, and `STRIPE_*`.
-- **v01 S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `rume/src/routing/health.rs:289–294`. `debug_info()` returns an empty `BTreeMap::new()`.
-- **v01 S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `rume/src/routing/rejection.rs:19–42`. Parameter rejections convert into generic Problem Details without reflecting user input.
+- **v01 S-M1 (Path traversal in `file:` env loading)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:252–267`. `resolve_value` canonicalizes both the base directory and the resolved target path, asserting `canonical_full.starts_with(&canonical_dir)` and rejecting escaping paths with `std::io::ErrorKind::PermissionDenied`.
+- **v01 S-M2 (Secrets held as plain `String` in `ResolvedEnv`)** — **REAFFIRMED**. Verified in `crates/core/src/env/loading.rs:27–36, 50–60`. `ResolvedEnv` segregates sensitive values into `secrets: BTreeMap<String, SecretBox<String>>`, ensuring plaintext secrets are exposed only at final consumption via `expose_secret()`.
+- **v01 S-M3 (CLI commands print secrets to terminal in plaintext)** — **REAFFIRMED**. Verified in `crates/cli/src/commands/env/check.rs:47–51` and `crates/cli/src/commands/config/check.rs:38–48`. Environment and configuration inspection commands redact secret keys and database URLs by default, requiring an explicit `--unredacted` flag for plaintext display.
+- **v01 S-M4 (`AppError` renders raw `to_string()` into client JSON)** — **REAFFIRMED**. Verified in `crates/core/src/error.rs:173–275`. Client responses strictly follow RFC 9457 Problem Details (`application/problem+json`), suppressing internal database and system diagnostics from network responses.
+- **v01 S-m1 (`redact()` heuristic false negatives)** — **REAFFIRMED**. Verified in `crates/core/src/env/secrets.rs:18–52`. Detection was broadened to match `_PASS`, `_PWD`, `_CRED`, `_KEY`, `APIKEY`, `AUTHORIZATION`, `BEARER`, `SESSION`, `SESSION_ID`, and `STRIPE_*`.
+- **v01 S-m2 (`/health/ready` exposes pid and platform in `debug_info`)** — **REAFFIRMED**. Verified in `crates/core/src/routing/health.rs:289–294`. `debug_info()` returns an empty `BTreeMap::new()`.
+- **v01 S-m3 (`Rejection` echoes parameter values and names in error response)** — **REAFFIRMED**. Verified in `crates/core/src/routing/rejection.rs:19–42`. Parameter rejections convert into generic Problem Details without reflecting user input.
 
 ### Prior Findings from v02 (`docs/reports/reviews/v02/security.md`)
 
-- **v02 Security C1 (SAML assertion parser hardcodes expiration timestamps and lacks signature verification)** — **REAFFIRMED (Remediation verified)**. `NotBefore` and `NotOnOrAfter` are parsed via `parse_iso8601_strict` into Unix epoch seconds (`rume/src/enterprise/saml.rs:326–335`), and `SamlSignatureVerifier` enforces cryptographic XML-DSig verification (`saml.rs:467–470`).
-- **v02 Security C2 (Multi-tenant cache key delimiter collision)** — **REAFFIRMED**. Audited and verified under Lens 4 (`rume/src/tenant/cache.rs`).
-- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Audited and verified under Lens 4 (`rume/src/tenant/resolver.rs`).
-- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED**. Audited and verified under Lens 4 (`rume/src/tenant/resolver.rs`).
-- **v02 Security M3 (`ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan)** — **REAFFIRMED**. Verified in `rume/src/auth/schemes.rs:86–114, 139–144`. API keys are hashed via SHA-256 upon registration into `HashMap<[u8; 32], AuthUser>` and looked up in O(1) time without linear scan timing side-channels.
+- **v02 Security C1 (SAML assertion parser hardcodes expiration timestamps and lacks signature verification)** — **REAFFIRMED (Remediation verified)**. `NotBefore` and `NotOnOrAfter` are parsed via `parse_iso8601_strict` into Unix epoch seconds (`crates/core/src/enterprise/saml.rs:326–335`), and `SamlSignatureVerifier` enforces cryptographic XML-DSig verification (`saml.rs:467–470`).
+- **v02 Security C2 (Multi-tenant cache key delimiter collision)** — **REAFFIRMED**. Audited and verified under Lens 4 (`crates/core/src/tenant/cache.rs`).
+- **v02 Security M1 (Subdomain tenant resolver permits suffix-matching domain spoofing)** — **REAFFIRMED**. Audited and verified under Lens 4 (`crates/core/src/tenant/resolver.rs`).
+- **v02 Security M2 (`HeaderTenantResolver` shares a single map for IDs and slugs)** — **REAFFIRMED**. Audited and verified under Lens 4 (`crates/core/src/tenant/resolver.rs`).
+- **v02 Security M3 (`ApiKeyScheme` stores plaintext API keys in memory with early-exit linear scan)** — **REAFFIRMED**. Verified in `crates/core/src/auth/schemes.rs:86–114, 139–144`. API keys are hashed via SHA-256 upon registration into `HashMap<[u8; 32], AuthUser>` and looked up in O(1) time without linear scan timing side-channels.
 - **v02 Security M4 (Double-submit CSRF layer lacks token issuance and is vulnerable to subdomain tossing)** — **CHALLENGED (Defective Remediation & Insecure Defaults)**. Token issuance and HMAC signing were added, but `CsrfConfig::default()` leaves `secret: None`, leaving naive double-submit active by default where any non-empty string is accepted as valid. Re-reported as finding M1.
-- **v02 Security m1 (`AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500)** — **REAFFIRMED**. Verified in `rume/src/auth/error.rs:38`. `ProviderError` maps to `AppError::Internal` (HTTP 500).
-- **v02 Security m2 (Stale session cookie in `SessionScheme` immediately aborts authentication chain)** — **REAFFIRMED**. Verified in `rume/src/auth/schemes.rs:202–204`. Stale or expired cookies return `Ok(None)`, allowing fallback to subsequent schemes in the chain.
-- **v02 Security m3 (`SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP)** — **REAFFIRMED**. Verified in `rume/src/security/headers.rs:174–188, 201–207`. `hsts_require_tls: bool` defaults to `true` and suppresses HSTS emission over plain HTTP.
+- **v02 Security m1 (`AuthError::ProviderError` maps to HTTP 400 Bad Request instead of HTTP 500)** — **REAFFIRMED**. Verified in `crates/core/src/auth/error.rs:38`. `ProviderError` maps to `AppError::Internal` (HTTP 500).
+- **v02 Security m2 (Stale session cookie in `SessionScheme` immediately aborts authentication chain)** — **REAFFIRMED**. Verified in `crates/core/src/auth/schemes.rs:202–204`. Stale or expired cookies return `Ok(None)`, allowing fallback to subsequent schemes in the chain.
+- **v02 Security m3 (`SecurityHeadersLayer` injects HSTS header unconditionally over plain HTTP)** — **REAFFIRMED**. Verified in `crates/core/src/security/headers.rs:174–188, 201–207`. `hsts_require_tls: bool` defaults to `true` and suppresses HSTS emission over plain HTTP.
 
 ### Prior Findings from v03 (`docs/reports/reviews/v03/security-protocols.md`)
 
@@ -45,11 +45,11 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 - **v03 Security C2 (Public `SamlParser::parse()` Bypasses Cryptographic Verification in Production)** — **CHALLENGED (Defective Remediation)**. `SamlParser::parse()` was annotated with `#[deprecated]`, but `parse()` and `parse_unverified()` remain public bypass paths, and `SamlError::MissingSignatureVerifier` is defined as dead code and never returned anywhere in the crate (`saml.rs:31–33, 233–241`). Re-reported as finding m4.
 - **v03 Security C3 (SQL Injection Vulnerability in `SqlAuditLogger::record()` via String Formatting and MySQL Escapes)** — **CHALLENGED (Defective Remediation: Unparameterized Raw SQL Formatting Persists)**. While `escape_sql_literal` added dialect-specific backslash handling for MySQL and preserved `record.id`, `SqlAuditLogger::record()` still constructs raw SQL strings via `format!()` rather than using parameterized database statements (`audit.rs:214–222`). Re-reported as finding M4.
 - **v03 Security M1 (Insecure Defaults in `CsrfConfig` Permit Subdomain Cookie-Tossing and Lack Mandatory HMAC Signing)** — **CHALLENGED (Unresolved Insecure Defaults)**. `cookie_secure` was updated to `true`, but `secret: None` remains the default, meaning `verify_token` accepts any non-empty string out of the box (`csrf.rs:64–77, 169–171`). Re-reported as finding M1.
-- **v03 Security M2 (Subdomain Cookie-Tossing Causes Denial of Service via First-Cookie Selection Bias in `CsrfService`)** — **REAFFIRMED**. In `rume/src/security/csrf.rs:338–385`, `CsrfService::call` collects all matching cookies into `Vec<&str>` and checks `any_valid` and `has_valid_match` using `safe_equal`. Verified in `test_csrf_signed_tokens_and_cookie_tossing_protection`.
-- **v03 Security M3 (Lack of Secret Redaction in Audit Logging Metadata)** — **REAFFIRMED**. Verified in `rume/src/security/audit.rs:188–194`. `record.metadata` is filtered through `redact_value` before JSON serialization.
-- **v03 Security M4 (SCIM 2.0 Entities Lack `meta.version` for Optimistic Concurrency Control)** — **REAFFIRMED**. Verified in `rume/src/enterprise/scim.rs:36–49, 117`. `ScimMeta` and `ScimGroup` carry `version: Option<String>`.
-- **v03 Security M5 (Missing Session ID Rotation Exposes Applications to Session Fixation Attacks)** — **REAFFIRMED**. Verified in `rume/src/auth/session.rs:86–104`. `SessionStore::regenerate_id` is defined and rotates session IDs.
-- **v03 Security M6 (`SessionScheme` Silently Degrades Authenticated Users to Guests on Session Store Failures)** — **REAFFIRMED**. Verified in `rume/src/auth/schemes.rs:206–209`. Store errors return `Err(err)`, returning HTTP 500 rather than falling through to guest.
+- **v03 Security M2 (Subdomain Cookie-Tossing Causes Denial of Service via First-Cookie Selection Bias in `CsrfService`)** — **REAFFIRMED**. In `crates/core/src/security/csrf.rs:338–385`, `CsrfService::call` collects all matching cookies into `Vec<&str>` and checks `any_valid` and `has_valid_match` using `safe_equal`. Verified in `test_csrf_signed_tokens_and_cookie_tossing_protection`.
+- **v03 Security M3 (Lack of Secret Redaction in Audit Logging Metadata)** — **REAFFIRMED**. Verified in `crates/core/src/security/audit.rs:188–194`. `record.metadata` is filtered through `redact_value` before JSON serialization.
+- **v03 Security M4 (SCIM 2.0 Entities Lack `meta.version` for Optimistic Concurrency Control)** — **REAFFIRMED**. Verified in `crates/core/src/enterprise/scim.rs:36–49, 117`. `ScimMeta` and `ScimGroup` carry `version: Option<String>`.
+- **v03 Security M5 (Missing Session ID Rotation Exposes Applications to Session Fixation Attacks)** — **REAFFIRMED**. Verified in `crates/core/src/auth/session.rs:86–104`. `SessionStore::regenerate_id` is defined and rotates session IDs.
+- **v03 Security M6 (`SessionScheme` Silently Degrades Authenticated Users to Guests on Session Store Failures)** — **REAFFIRMED**. Verified in `crates/core/src/auth/schemes.rs:206–209`. Store errors return `Err(err)`, returning HTTP 500 rather than falling through to guest.
 - **v03 m1 (Unvalidated Reverse Proxy Trust for `x-forwarded-proto` and Axum Relative URI Blindness)** — **REAFFIRMED (Remediation verified)**. `native_tls` and `trust_proxy_headers` were added to `SecurityHeadersConfig` (`headers.rs:41–44, 94–105`).
 - **v03 m2 (Substring Heuristic Blind Spots and Leaky URL Parsing in `secrets.rs`)** — **REAFFIRMED**. `is_secret_key` covers `APIKEY`, `AUTHORIZATION`, `BEARER`, `SESSION`, `SESSION_ID`, and `redact_credential_urls_in_text` uses `authority.rfind('@')` (`secrets.rs:22–52, 97`).
 - **v03 m3 (SAML Parser Comment Truncation and Tag Extraction Fragility)** — **REAFFIRMED**. `quick-xml` reader ignores comments without truncation, and tokenizes XML events natively (`saml.rs:257–426`).
@@ -67,7 +67,7 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 
 ### M1 Insecure Defaults in `CsrfConfig`: Unauthenticated Tokens Permitted by Default Without Fail-Closed Startup Validation
 
-- **Where:** `rume/src/security/csrf.rs:64–77, 168–171, 213–220`
+- **Where:** `crates/core/src/security/csrf.rs:64–77, 168–171, 213–220`
 - **What it says:**
   ```rust
   impl Default for CsrfConfig {
@@ -99,14 +99,14 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
   2. Emit a `tracing::warn!` in `CsrfLayer::new()` if `secret` is `None`.
   3. When `secret` is `None`, log an explicit warning or provide an explicit builder `CsrfConfig::insecure_without_secret_for_testing()` so that running without token authentication is deliberate rather than accidental.
 - **Evidence:**
-  - *Static:* `rume/src/security/csrf.rs:64–77, 168–171, 213–220`.
+  - *Static:* `crates/core/src/security/csrf.rs:64–77, 168–171, 213–220`.
   - *Executed:* `cargo test -p rume --test integration -- security::test_csrf_protection_lifecycle` passes, confirming that requests with unauthenticated matching arbitrary strings (`secret-token-xyz`) are accepted when `secret` is `None`.
 
 ---
 
 ### M2 Subdomain Cookie-Tossing Denial of Service via First-Cookie Selection Bias in `SessionScheme`
 
-- **Where:** `rume/src/auth/schemes.rs:189–213`
+- **Where:** `crates/core/src/auth/schemes.rs:189–213`
 - **What it says:**
   ```rust
   // Parse cookies: name=val; name2=val2
@@ -139,14 +139,14 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 - **Suggested fix:**
   Replace `return Ok(None);` with `continue;` inside the loop. The scheme should continue inspecting all cookies matching `self.cookie_name`, returning `Ok(Some(user))` if *any* matching cookie contains a valid active session. Return `Ok(None)` only after all matching cookies have been exhausted without finding a valid session.
 - **Evidence:**
-  - *Static:* `rume/src/auth/schemes.rs:189–213`.
+  - *Static:* `crates/core/src/auth/schemes.rs:189–213`.
   - *Executed:* Verified via `test_stale_session_cookie_falls_back_to_bearer_token` in `tests/integration/auth.rs`.
 
 ---
 
 ### M3 SAML 2.0 Parser Rejects Enveloped Document Signatures (`URI=""`) and Fails Open on Missing Expiration (`NotOnOrAfter`)
 
-- **Where:** `rume/src/enterprise/saml.rs:316–324, 434–448, 498–505`
+- **Where:** `crates/core/src/enterprise/saml.rs:316–324, 434–448, 498–505`
 - **What it says:**
   ```rust
   // In Reference extraction:
@@ -183,14 +183,14 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
   2. In `SamlParser::validate` (and `validate_strict`), require `not_on_or_after` to be present by default (`assertion.not_on_or_after.ok_or_else(|| SamlError::Malformed("missing mandatory NotOnOrAfter condition".into()))?`).
   3. Support a configurable `clock_skew_secs` (e.g. 60 seconds tolerance) during timestamp validation.
 - **Evidence:**
-  - *Static:* `rume/src/enterprise/saml.rs:316–324, 434–448, 498–505`.
+  - *Static:* `crates/core/src/enterprise/saml.rs:316–324, 434–448, 498–505`.
   - *Executed:* `cargo test -p rume --test integration -- enterprise::test_saml_assertion_parsing_and_validation` passes without `NotOnOrAfter` present on line 39 of the test assertion fixture, verifying that assertions lacking expiration timestamps pass validation without errors.
 
 ---
 
 ### M4 `SqlAuditLogger` Remains Unparameterized, Relying on Manual String Formatting and Hardcoding PostgreSQL Schema
 
-- **Where:** `rume/src/security/audit.rs:124–139, 214–223`
+- **Where:** `crates/core/src/security/audit.rs:124–139, 214–223`
 - **What it says:**
   ```rust
   pub const SCHEMA: &'static str = include_str!("../persistence/sql/postgres/audit_schema.sql");
@@ -215,19 +215,19 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
   ```
 - **Why it's a problem:**
   1. **Unparameterized SQL:** While `escape_sql_literal` mitigates basic quotes and MySQL backslash escapes, `SqlAuditLogger` continues to construct SQL commands using string formatting rather than bound query parameters (`sqlx::query` with `$1..$N` or `?`). This leaves audit logging reliant on manual character escape heuristics rather than driver-level AST isolation.
-  2. **Schema Hardcoding:** `SqlAuditLogger::init_table` executes `Self::SCHEMA` unconditionally across all backends. Dialect-specific schema files exist at `rume/src/persistence/sql/mysql/audit_schema.sql` and `rume/src/persistence/sql/sqlite/audit_schema.sql`, but are completely ignored. On MySQL, executing PostgreSQL's DDL omits `ENGINE=InnoDB` and uses `BIGINT NOT NULL` rather than `BIGINT UNSIGNED NOT NULL`. On SQLite, it executes `VARCHAR`/`BIGINT` instead of standard `TEXT`/`INTEGER`.
+  2. **Schema Hardcoding:** `SqlAuditLogger::init_table` executes `Self::SCHEMA` unconditionally across all backends. Dialect-specific schema files exist at `crates/core/src/persistence/sql/mysql/audit_schema.sql` and `crates/core/src/persistence/sql/sqlite/audit_schema.sql`, but are completely ignored. On MySQL, executing PostgreSQL's DDL omits `ENGINE=InnoDB` and uses `BIGINT NOT NULL` rather than `BIGINT UNSIGNED NOT NULL`. On SQLite, it executes `VARCHAR`/`BIGINT` instead of standard `TEXT`/`INTEGER`.
 - **Suggested fix:**
   1. Select the schema string dynamically in `init_table` based on `self.backend.dialect()` (`postgres`, `mysql`, `sqlite`).
   2. Parameterize statement execution on `DatabaseBackend` to pass bound parameters, or use driver-level query binding for audit insertions.
 - **Evidence:**
-  - *Static:* `rume/src/security/audit.rs:124–139, 214–223`.
+  - *Static:* `crates/core/src/security/audit.rs:124–139, 214–223`.
   - *Executed:* `cargo test -p rume --test integration -- security::test_audit_logging` passes against SQLite backend using PostgreSQL DDL.
 
 ---
 
 ### m1 Insecure `Forwarded` Header Substring Matching and Unchecked Reverse Proxy Trust in `SecurityHeadersService`
 
-- **Where:** `rume/src/security/headers.rs:43–44, 60, 176–188`
+- **Where:** `crates/core/src/security/headers.rs:43–44, 60, 176–188`
 - **What it says:**
   ```rust
   let is_https = config.native_tls
@@ -252,13 +252,13 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 - **Suggested fix:**
   Parse RFC 7239 `Forwarded` parameters by splitting on `;` and matching the `proto` parameter specifically (`pair.trim().split_once('=').map(|(k, v)| k == "proto" && v.eq_ignore_ascii_case("https"))`). Provide a trusted proxy IP/subnet configuration before honoring upstream proxy headers.
 - **Evidence:**
-  - *Static:* `rume/src/security/headers.rs:43–44, 176–188`.
+  - *Static:* `crates/core/src/security/headers.rs:43–44, 176–188`.
 
 ---
 
 ### m2 `CsrfService` Reads Only First `Cookie` Header, Ignoring Multi-Header and RFC 7540 Split Cookie Headers
 
-- **Where:** `rume/src/security/csrf.rs:281–295, 338–355`
+- **Where:** `crates/core/src/security/csrf.rs:281–295, 338–355`
 - **What it says:**
   ```rust
   let matching_cookies: Vec<&str> = req
@@ -285,13 +285,13 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
       .collect();
   ```
 - **Evidence:**
-  - *Static:* `rume/src/security/csrf.rs:281–295, 338–355`.
+  - *Static:* `crates/core/src/security/csrf.rs:281–295, 338–355`.
 
 ---
 
 ### m3 Non-Atomic Session ID Rotation in `RedisSessionStore`
 
-- **Where:** `rume/src/auth/session.rs:86–104`, `rume/src/auth/redis.rs:54–131`
+- **Where:** `crates/core/src/auth/session.rs:86–104`, `crates/core/src/auth/redis.rs:54–131`
 - **What it says:**
   `RedisSessionStore` does not implement `regenerate_id`, falling back to the trait default:
   ```rust
@@ -305,14 +305,14 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 - **Suggested fix:**
   Override `regenerate_id` in `RedisSessionStore` using an atomic Redis Lua script or pipeline that reads the existing session TTL, copies the data to the new key, and deletes the old key in a single transaction.
 - **Evidence:**
-  - *Static:* `rume/src/auth/session.rs:86–104`, `rume/src/auth/redis.rs:54–131`.
+  - *Static:* `crates/core/src/auth/session.rs:86–104`, `crates/core/src/auth/redis.rs:54–131`.
   - *Executed:* `containers::test_redis_session_store_save_load_ttl_and_destroy` passes sequential rotation.
 
 ---
 
 ### m4 Dead Error Variant `SamlError::MissingSignatureVerifier` and Unchecked Optional Verifiers
 
-- **Where:** `rume/src/enterprise/saml.rs:31–33, 233–241, 253–256`
+- **Where:** `crates/core/src/enterprise/saml.rs:31–33, 233–241, 253–256`
 - **What it says:**
   ```rust
   /// Missing mandatory digital signature verifier.
@@ -329,13 +329,13 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
 - **Suggested fix:**
   Enforce signature verification by removing `Option` from `parse_with_verifier(xml, verifier: &dyn SamlSignatureVerifier)`. Restrict unverified parsing to explicitly named testing helpers (`parse_unverified_insecure_for_testing`) and return `MissingSignatureVerifier` when signature verification cannot be performed.
 - **Evidence:**
-  - *Static:* `grep -rn MissingSignatureVerifier rume/src/` returns only the enum variant definition in `saml.rs:33`.
+  - *Static:* `grep -rn MissingSignatureVerifier crates/core/src/` returns only the enum variant definition in `saml.rs:33`.
 
 ---
 
 ### m5 SCIM 2.0 Casing and Attribute Type Deviations from RFC 7643 and RFC 7644
 
-- **Where:** `rume/src/enterprise/scim.rs:64, 139–159`
+- **Where:** `crates/core/src/enterprise/scim.rs:64, 139–159`
 - **What it says:**
   ```rust
   #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -357,22 +357,22 @@ Every prior finding in this lens's area across v01, v02, v03, and v03/diff/v01 i
   1. Add `#[serde(rename = "Resources")]` to `ScimListResponse.resources`.
   2. Define `ScimRole { pub value: String, pub primary: bool, pub role_type: Option<String> }` or support both string and object deserialization for `ScimUser.roles`.
 - **Evidence:**
-  - *Static:* `rume/src/enterprise/scim.rs:64, 139–159`.
+  - *Static:* `crates/core/src/enterprise/scim.rs:64, 139–159`.
   - *Executed:* `cargo test -p rume --test integration -- enterprise::test_scim_models_and_json_serialization` passes.
 
 ---
 
 ## Positive notes
 
-- `#![forbid(unsafe_code)]` remains strictly enforced on the core crate (`rume/src/lib.rs:7`).
-- Constant-time comparison `safe_equal` utilizes `std::hint::black_box` to prevent compiler vectorization and short-circuit optimizations (`rume/src/helpers/safe_equal.rs:41`).
-- `ApiKeyScheme` prevents plaintext secret storage and linear scan timing leaks by hashing keys with SHA-256 and storing them in an indexed map (`rume/src/auth/schemes.rs:109–113, 139–144`).
-- SAML claim extraction is now strictly anchored to the assertion subtree using `quick_xml` namespace resolution, completely blocking Type-1 envelope injection and XML comment attacks (`rume/src/enterprise/saml.rs:257–426`).
-- `SessionScheme` no longer degrades authenticated sessions to guests on infrastructure timeouts, surfacing provider errors as HTTP 500 (`rume/src/auth/schemes.rs:206–209`).
-- Session ID rotation in `SessionStore::regenerate_id` commits the fresh session before destroying the old ID, preventing session loss on save failures (`rume/src/auth/session.rs:99–102`).
-- Audit logging automatically redacts sensitive credentials and URLs from `record.metadata` before JSON serialization (`rume/src/security/audit.rs:188–194`).
-- Environment variable `file:` resolution canonicalizes paths and rejects traversal attempts outside the root directory with `std::io::ErrorKind::PermissionDenied` (`rume/src/env/loading.rs:252–267`).
-- Declarative authorization policies (`RequireRole`, `RequirePermission`, `RequireAnyRole`, `RequireAllPermissions`) provide clean, type-safe authorization boundaries separate from identity extraction (`rume/src/auth/policy.rs:26–65`).
+- `#![forbid(unsafe_code)]` remains strictly enforced on the core crate (`crates/core/src/lib.rs:7`).
+- Constant-time comparison `safe_equal` utilizes `std::hint::black_box` to prevent compiler vectorization and short-circuit optimizations (`crates/core/src/helpers/safe_equal.rs:41`).
+- `ApiKeyScheme` prevents plaintext secret storage and linear scan timing leaks by hashing keys with SHA-256 and storing them in an indexed map (`crates/core/src/auth/schemes.rs:109–113, 139–144`).
+- SAML claim extraction is now strictly anchored to the assertion subtree using `quick_xml` namespace resolution, completely blocking Type-1 envelope injection and XML comment attacks (`crates/core/src/enterprise/saml.rs:257–426`).
+- `SessionScheme` no longer degrades authenticated sessions to guests on infrastructure timeouts, surfacing provider errors as HTTP 500 (`crates/core/src/auth/schemes.rs:206–209`).
+- Session ID rotation in `SessionStore::regenerate_id` commits the fresh session before destroying the old ID, preventing session loss on save failures (`crates/core/src/auth/session.rs:99–102`).
+- Audit logging automatically redacts sensitive credentials and URLs from `record.metadata` before JSON serialization (`crates/core/src/security/audit.rs:188–194`).
+- Environment variable `file:` resolution canonicalizes paths and rejects traversal attempts outside the root directory with `std::io::ErrorKind::PermissionDenied` (`crates/core/src/env/loading.rs:252–267`).
+- Declarative authorization policies (`RequireRole`, `RequirePermission`, `RequireAnyRole`, `RequireAllPermissions`) provide clean, type-safe authorization boundaries separate from identity extraction (`crates/core/src/auth/policy.rs:26–65`).
 
 ---
 

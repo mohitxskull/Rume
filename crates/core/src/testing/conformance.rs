@@ -137,7 +137,10 @@ where
     // Verify migration recorded in rume_migrations
     let recorded_checksum: Option<String> = pool
         .query_scalar_params(
-            &format_query("SELECT checksum FROM rume_migrations WHERE id = $1", dialect),
+            &format_query(
+                "SELECT checksum FROM rume_migrations WHERE id = $1",
+                dialect,
+            ),
             &[DbValue::Text("20261104000001".to_string())],
         )
         .await?;
@@ -247,7 +250,10 @@ where
             }
         })
         .await;
-    assert!(rollback_res.is_err(), "transaction should return error on failure");
+    assert!(
+        rollback_res.is_err(),
+        "transaction should return error on failure"
+    );
 
     // Verify rolled-back row was NOT persisted
     let fetched_aborted = pool
@@ -285,10 +291,7 @@ where
     .await?;
 
     let raw_rows = pool
-        .fetch_all(
-            &select_by_id_sql,
-            &[DbValue::Text("rec_nulls".to_string())],
-        )
+        .fetch_all(&select_by_id_sql, &[DbValue::Text("rec_nulls".to_string())])
         .await?;
     assert_eq!(raw_rows.len(), 1);
     let raw_row = &raw_rows[0];
@@ -332,10 +335,8 @@ where
     let queries_per_worker = 50;
     let mut handles = Vec::with_capacity(concurrency);
 
-    let select_title_sql = format_query(
-        "SELECT title FROM rume_conformance WHERE id = $1",
-        dialect,
-    );
+    let select_title_sql =
+        format_query("SELECT title FROM rume_conformance WHERE id = $1", dialect);
 
     for worker_idx in 0..concurrency {
         let pool_clone = pool.clone();
@@ -358,10 +359,7 @@ where
                     .await?;
 
                 let found: Option<String> = pool_clone
-                    .query_scalar_params(
-                        &select_clone,
-                        &[DbValue::Text(id)],
-                    )
+                    .query_scalar_params(&select_clone, &[DbValue::Text(id)])
                     .await?;
                 assert!(found.is_some());
             }

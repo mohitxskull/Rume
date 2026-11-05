@@ -37,14 +37,18 @@ impl FromRow for Issue {
 fn validate_status(status: &str, _ctx: &()) -> garde::Result {
     match status.to_lowercase().as_str() {
         "open" | "in_progress" | "resolved" | "closed" => Ok(()),
-        _ => Err(garde::Error::new("status must be one of: open, in_progress, resolved, closed")),
+        _ => Err(garde::Error::new(
+            "status must be one of: open, in_progress, resolved, closed",
+        )),
     }
 }
 
 fn validate_priority(priority: &str, _ctx: &()) -> garde::Result {
     match priority.to_lowercase().as_str() {
         "low" | "medium" | "high" | "urgent" => Ok(()),
-        _ => Err(garde::Error::new("priority must be one of: low, medium, high, urgent")),
+        _ => Err(garde::Error::new(
+            "priority must be one of: low, medium, high, urgent",
+        )),
     }
 }
 

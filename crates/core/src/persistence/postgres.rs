@@ -12,7 +12,7 @@ use crate::outbox::{
     TransactionalOutbox,
 };
 use crate::persistence::backend::{
-    map_sqlx_error, BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue,
+    BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue, map_sqlx_error,
 };
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
@@ -159,10 +159,7 @@ impl DatabaseBackend for PostgresBackend {
                         DbValue::Bytes(b) => query.bind(b.as_slice()),
                     };
                 }
-                let res = query
-                    .execute(&self.pool)
-                    .await
-                    .map_err(map_sqlx_error)?;
+                let res = query.execute(&self.pool).await.map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             }
         })
@@ -215,10 +212,7 @@ impl DatabaseBackend for PostgresBackend {
                     DbValue::Bytes(b) => query.bind(b.as_slice()),
                 };
             }
-            let rows: Vec<PgRow> = query
-                .fetch_all(&self.pool)
-                .await
-                .map_err(map_sqlx_error)?;
+            let rows: Vec<PgRow> = query.fetch_all(&self.pool).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
     }
@@ -292,11 +286,7 @@ impl DatabaseBackend for PostgresBackend {
 
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
         Box::pin(async move {
-            let tx = self
-                .pool
-                .begin()
-                .await
-                .map_err(map_sqlx_error)?;
+            let tx = self.pool.begin().await.map_err(map_sqlx_error)?;
             Ok(PostgresTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })
@@ -365,9 +355,9 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard
-                .as_mut()
-                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
             let mut query = sqlx::query(&stmt);
             for param in &params_vec {
                 query = match param {
@@ -392,9 +382,9 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard
-                .as_mut()
-                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
             use sqlx::Executor;
             let res = (&mut **tx)
                 .execute(stmt.as_str())
@@ -414,9 +404,9 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard
-                .as_mut()
-                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
             let mut query_obj = sqlx::query(&q);
             for param in &params_vec {
                 query_obj = match param {
@@ -450,9 +440,9 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard
-                .as_mut()
-                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
             let mut query = sqlx::query(&stmt);
             for param in &p {
                 query = match param {
@@ -464,10 +454,7 @@ impl DatabaseTransaction for PostgresTransaction {
                     DbValue::Bytes(b) => query.bind(b.as_slice()),
                 };
             }
-            let rows: Vec<PgRow> = query
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(map_sqlx_error)?;
+            let rows: Vec<PgRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
     }
@@ -482,9 +469,9 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard
-                .as_mut()
-                .ok_or_else(|| PersistenceError::TransactionError("transaction already resolved".into()))?;
+            let tx = guard.as_mut().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
             let mut query = sqlx::query(&stmt);
             for param in &p {
                 query = match param {
@@ -532,10 +519,18 @@ impl DatabaseTransaction for PostgresTransaction {
 }
 
 fn parse_postgres_outbox_row(row: &PgRow) -> Result<OutboxMessage, OutboxError> {
-    let id: String = row.try_get("id").map_err(|e| OutboxError::Repository(e.to_string()))?;
-    let event_type: String = row.try_get("event_type").map_err(|e| OutboxError::Repository(e.to_string()))?;
-    let payload: Vec<u8> = row.try_get("payload").map_err(|e| OutboxError::Repository(e.to_string()))?;
-    let status_str: String = row.try_get("status").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let id: String = row
+        .try_get("id")
+        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let event_type: String = row
+        .try_get("event_type")
+        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let payload: Vec<u8> = row
+        .try_get("payload")
+        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let status_str: String = row
+        .try_get("status")
+        .map_err(|e| OutboxError::Repository(e.to_string()))?;
     let status = match status_str.as_str() {
         "pending" => OutboxStatus::Pending,
         "inflight" | "in_flight" => OutboxStatus::InFlight,
@@ -545,7 +540,9 @@ fn parse_postgres_outbox_row(row: &PgRow) -> Result<OutboxMessage, OutboxError> 
     };
     let retry_count: i32 = row.try_get("retry_count").unwrap_or(0);
     let last_error: Option<String> = row.try_get("last_error").ok();
-    let created_at: i64 = row.try_get("created_at").map_err(|e| OutboxError::Repository(e.to_string()))?;
+    let created_at: i64 = row
+        .try_get("created_at")
+        .map_err(|e| OutboxError::Repository(e.to_string()))?;
     let next_retry_at: Option<i64> = row.try_get("next_retry_at").ok();
     let lease_token: Option<String> = row.try_get("lease_token").ok();
     let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").ok();
@@ -594,7 +591,10 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
-    fn fetch_pending(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+    fn fetch_pending(
+        &self,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let rows = sqlx::query(OUTBOX_CLAIM_SQL)
                 .bind(limit as i64)
@@ -670,7 +670,7 @@ impl OutboxRepository for PostgresBackend {
                 "UPDATE rume_outbox \
                  SET lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $1 \
                  WHERE id = $2 AND lease_token = $3 AND status = 'inflight' \
-                   AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT"
+                   AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT",
             )
             .bind(extension_secs as i64)
             .bind(&id_str)
@@ -689,7 +689,11 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
-    fn mark_published(&self, id: &str, lease_token: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
+    fn mark_published(
+        &self,
+        id: &str,
+        lease_token: &str,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
@@ -711,7 +715,12 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
-    fn mark_failed(&self, id: &str, lease_token: &str, error: String) -> OutboxFuture<'_, Result<(), OutboxError>> {
+    fn mark_failed(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
         self.mark_failed_with_max_retries(id, lease_token, error, 5)
     }
 
@@ -739,7 +748,11 @@ impl OutboxRepository for PostgresBackend {
             };
 
             let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
-            let status = if retry_count >= max_retries as i32 { "failed" } else { "pending" };
+            let status = if retry_count >= max_retries as i32 {
+                "failed"
+            } else {
+                "pending"
+            };
             let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32) as i64;
 
             let res = sqlx::query(
@@ -765,7 +778,10 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
-    fn recover_expired_claims(&self, _max_lease_age_secs: u64) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+    fn recover_expired_claims(
+        &self,
+        _max_lease_age_secs: u64,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
                 .execute(&self.pool)
@@ -779,7 +795,7 @@ impl OutboxRepository for PostgresBackend {
     fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let row = sqlx::query(
-                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'pending' OR status = 'inflight'"
+                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'pending' OR status = 'inflight'",
             )
             .fetch_one(&self.pool)
             .await
@@ -792,12 +808,10 @@ impl OutboxRepository for PostgresBackend {
 
     fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let row = sqlx::query(
-                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'published'"
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let row = sqlx::query("SELECT COUNT(*) FROM rume_outbox WHERE status = 'published'")
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let count: i64 = row.try_get(0).unwrap_or(0);
             Ok(count as usize)
@@ -816,7 +830,10 @@ impl OutboxRepository for PostgresBackend {
         })
     }
 
-    fn fetch_failed(&self, limit: usize) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+    fn fetch_failed(
+        &self,
+        limit: usize,
+    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let rows = sqlx::query(
                 "SELECT id, event_type, payload, status, retry_count, created_at, last_error, next_retry_at, lease_token, lease_expires_at FROM rume_outbox WHERE status = 'failed' ORDER BY created_at ASC LIMIT $1"
@@ -891,7 +908,7 @@ impl OutboxRepository for PostgresBackend {
                        AND created_at <= FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT - $1 \
                      ORDER BY created_at ASC \
                      LIMIT $2 \
-                 )"
+                 )",
             )
             .bind(older_than_secs as i64)
             .bind(limit as i64)
@@ -948,23 +965,24 @@ pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> Result<DbRow, PersistenceErr
     let columns: Vec<String> = row.columns().iter().map(|c| c.name().to_string()).collect();
     let mut values = Vec::with_capacity(columns.len());
     for (i, col_name) in columns.iter().enumerate() {
-        let raw = row.try_get_raw(i).map_err(|e| PersistenceError::DecodeError {
-            column: col_name.clone(),
-            message: format!("failed to read raw column: {e}"),
-        })?;
+        let raw = row
+            .try_get_raw(i)
+            .map_err(|e| PersistenceError::DecodeError {
+                column: col_name.clone(),
+                message: format!("failed to read raw column: {e}"),
+            })?;
         let val = if raw.is_null() {
             DbValue::Null
         } else {
             let type_info = raw.type_info();
             let type_name = type_info.name();
             match type_name {
-                "BOOL" => row
-                    .try_get::<bool, _>(i)
-                    .map(DbValue::Bool)
-                    .map_err(|e| PersistenceError::DecodeError {
+                "BOOL" => row.try_get::<bool, _>(i).map(DbValue::Bool).map_err(|e| {
+                    PersistenceError::DecodeError {
                         column: col_name.clone(),
                         message: format!("failed to decode BOOL: {e}"),
-                    })?,
+                    }
+                })?,
                 "INT2" => row
                     .try_get::<i16, _>(i)
                     .map(|n| DbValue::Int(n as i64))
@@ -979,13 +997,12 @@ pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> Result<DbRow, PersistenceErr
                         column: col_name.clone(),
                         message: format!("failed to decode INT4: {e}"),
                     })?,
-                "INT8" => row
-                    .try_get::<i64, _>(i)
-                    .map(DbValue::Int)
-                    .map_err(|e| PersistenceError::DecodeError {
+                "INT8" => row.try_get::<i64, _>(i).map(DbValue::Int).map_err(|e| {
+                    PersistenceError::DecodeError {
                         column: col_name.clone(),
                         message: format!("failed to decode INT8: {e}"),
-                    })?,
+                    }
+                })?,
                 "FLOAT4" => row
                     .try_get::<f32, _>(i)
                     .map(|f| DbValue::Float(f as f64))
@@ -993,13 +1010,12 @@ pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> Result<DbRow, PersistenceErr
                         column: col_name.clone(),
                         message: format!("failed to decode FLOAT4: {e}"),
                     })?,
-                "FLOAT8" => row
-                    .try_get::<f64, _>(i)
-                    .map(DbValue::Float)
-                    .map_err(|e| PersistenceError::DecodeError {
+                "FLOAT8" => row.try_get::<f64, _>(i).map(DbValue::Float).map_err(|e| {
+                    PersistenceError::DecodeError {
                         column: col_name.clone(),
                         message: format!("failed to decode FLOAT8: {e}"),
-                    })?,
+                    }
+                })?,
                 "BYTEA" => row
                     .try_get::<Vec<u8>, _>(i)
                     .map(DbValue::Bytes)
@@ -1028,7 +1044,9 @@ pub(crate) fn sqlx_pg_row_to_db_row(row: &PgRow) -> Result<DbRow, PersistenceErr
                     } else {
                         return Err(PersistenceError::DecodeError {
                             column: col_name.clone(),
-                            message: format!("unsupported or undecodable column type '{type_name}'"),
+                            message: format!(
+                                "unsupported or undecodable column type '{type_name}'"
+                            ),
                         });
                     }
                 }

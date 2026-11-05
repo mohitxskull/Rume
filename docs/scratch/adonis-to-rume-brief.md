@@ -14,12 +14,12 @@ experimental and may break.
 
 | Adopted | AdonisJS inspiration | How it fits Rume | Status |
 |---|---|---|---|
-| Centralized error model | `AppError` + `ExceptionHandler` handle/report split | `AppError` enum with `IntoResponse` (client) and server-side logging (report) inside `into_response`; RFC 7807-shaped bodies | Implemented in `rume/src/error.rs` |
-| Route parameter matchers | Adonis route param validation (number/uuid/slug patterns) | `Matcher::Number`/`Uuid`/`Slug` + `ValidatedParam` extractor; never echoes raw input in errors | Implemented in `rume/src/routing.rs` |
-| Route groups with prefix normalization | Route groups / prefix grouping | `RouteGroup::prefix`/`as` with single-slash `join_path` | Implemented in `rume/src/routing.rs` |
+| Centralized error model | `AppError` + `ExceptionHandler` handle/report split | `AppError` enum with `IntoResponse` (client) and server-side logging (report) inside `into_response`; RFC 7807-shaped bodies | Implemented in `crates/core/src/error.rs` |
+| Route parameter matchers | Adonis route param validation (number/uuid/slug patterns) | `Matcher::Number`/`Uuid`/`Slug` + `ValidatedParam` extractor; never echoes raw input in errors | Implemented in `crates/core/src/routing.rs` |
+| Route groups with prefix normalization | Route groups / prefix grouping | `RouteGroup::prefix`/`as` with single-slash `join_path` | Implemented in `crates/core/src/routing.rs` |
 | Direct crate imports in generated code | Not Adonis-specific; DX cleanliness | Generated code uses `axum::Json`, `serde::Serialize` etc. rather than whole-crate re-exports | Implemented in CLI templates |
-| Health checks (`/health/live`, `/health/ready`) | Adonis health package (lighter touch than Spring Actuator) | `HealthCheck` trait + `HealthChecks` registry; readiness runs registered checks, liveness is process-only | Implemented in `rume/src/routing.rs` |
-| Typed env (casting/validation) | Adonis `Env` with schema rules | `Env` deserialized from layered `.env` into typed Rust structs at boot; secrets in `SecretBox`, redacted | Implemented in `rume/src/env.rs` |
+| Health checks (`/health/live`, `/health/ready`) | Adonis health package (lighter touch than Spring Actuator) | `HealthCheck` trait + `HealthChecks` registry; readiness runs registered checks, liveness is process-only | Implemented in `crates/core/src/routing.rs` |
+| Typed env (casting/validation) | Adonis `Env` with schema rules | `Env` deserialized from layered `.env` into typed Rust structs at boot; secrets in `SecretBox`, redacted | Implemented in `crates/core/src/env.rs` |
 | CLI generators | Adonis `ace` (`make:controller`, etc.) | `rume new`/`dev`/`test`/`env check`/`doctor`/`generate handler` | Implemented in `rume-cli` |
 
 ---

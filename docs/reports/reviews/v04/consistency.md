@@ -11,7 +11,7 @@ Multiple lenses independently audited interacting surfaces and surfaced overlapp
 
 ### 1.1 Premature Startup Traffic via `/health/ready` (Routing C1 & App Lifecycle M5/m4)
 - **Reports**:
-  - `routing-api-openapi.md` **C1**: Readiness probe returns 200 OK during startup (`AvailabilityState::Live`), routing traffic before modules and startup hooks complete (`rume/src/routing/health.rs:327–358`).
+  - `routing-api-openapi.md` **C1**: Readiness probe returns 200 OK during startup (`AvailabilityState::Live`), routing traffic before modules and startup hooks complete (`crates/core/src/routing/health.rs:327–358`).
   - `app-lifecycle.md` **M5**: `Availability::set` allows unconstrained state mutation, and `state.rs:163` matches `AvailabilityState::Live` alongside `Ready` as healthy.
   - `app-lifecycle.md` **m4**: `/health/live` returns 200 OK for `AvailabilityState::Unknown`.
 - **Synthesis & Canonical Owner**:
@@ -43,7 +43,7 @@ Multiple lenses independently audited interacting surfaces and surfaced overlapp
   - `security-protocols.md` **M3**: `SamlParser` needs `quick-xml` features for enveloped document signatures (`URI=""`).
 - **Synthesis & Canonical Owner**:
   - **Canonical Finding**: `architecture-module-boundaries.md` **M2**.
-  - **Reconciliation**: `quick-xml` is currently an unconditional dependency in `rume/Cargo.toml`, even though SAML 2.0 is an enterprise capability. It should be feature-gated under a dedicated `saml` (or `enterprise`) feature flag, keeping core `rume` minimal.
+  - **Reconciliation**: `quick-xml` is currently an unconditional dependency in `crates/core/Cargo.toml`, even though SAML 2.0 is an enterprise capability. It should be feature-gated under a dedicated `saml` (or `enterprise`) feature flag, keeping core `rume` minimal.
 
 ---
 
@@ -84,38 +84,38 @@ Multiple lenses independently audited interacting surfaces and surfaced overlapp
 
 | ID | Title | Owning Lens | File & Target | Concrete Acceptance Criterion |
 |---|---|---|---|---|
-| **C1** | Startup premature traffic on `/health/ready` | Routing & OpenAPI | `rume/src/routing/health.rs:327` | `/health/ready` returns 503 while state is `Live`; returns 200 OK strictly when state is `Ready`. |
-| **C2** | Multi-line secret leakage in CLI `config check` | CLI & DX | `rume-cli/src/commands/config.rs:114` | Multi-line secrets (RSA/PEM keys) are fully redacted across all continuation lines in human-readable output. |
-| **M1** | Eager OpenAPI freezes route registry | App Lifecycle | `rume/src/app/builder.rs:739` | All routes (including module routes and post-declaration routes) appear in `/openapi.json`. |
-| **M2** | Insecure defaults in `CsrfConfig` | Security & Protocols | `rume/src/security/csrf.rs:56` | Unauthenticated token mode requires explicit opt-in; missing HMAC secret in production config fails preflight. |
-| **M3** | Subdomain cookie-tossing DoS in sessions | Security & Protocols | `rume/src/auth/session.rs:67` | `SessionScheme` evaluates all matching cookie headers/values rather than aborting on first invalid cookie. |
-| **M4** | SAML enveloped document signatures and missing `NotOnOrAfter` | Security & Protocols | `rume/src/enterprise/saml.rs:147` | Enveloped signatures (`URI=""`) accepted; assertions missing `NotOnOrAfter` fail closed in `validate()`. |
-| **M5** | `SqlAuditLogger` unparameterized queries & hardcoded PG DDL | Security & Protocols | `rume/src/security/audit.rs:76` | Audit logger uses parameterized queries and supports MySQL and SQLite schemas. |
-| **M6** | Health check probe thundering herd race | Routing & OpenAPI | `rume/src/routing/health.rs:186` | Cache stampede protection (`singleflight`) wraps background probe execution during cache expiration. |
-| **M7** | Module route preflight ignores `ANY` overlap | App Lifecycle | `rume/src/app/builder.rs:964` | Overlapping method bitsets on identical paths fail preflight with `BuildError::DuplicateRoute`. |
-| **M8** | TestApp lifecycle teardown inverts shutdown hooks | App Lifecycle | `rume/src/app/builder.rs:602` | `build_test_app()` executes application shutdown hooks before module hooks, matching `run()` parity. |
-| **M9** | Startup hooks block shutdown signals | App Lifecycle | `rume/src/app/builder.rs:1157` | Startup hook execution monitors SIGINT/SIGTERM and cancels cleanly if shutdown is signaled during boot. |
-| **M10** | `Availability::set` allows unconstrained drain bypass | App Lifecycle | `rume/src/app/state.rs:159` | `Availability` rejects transitions back to `Ready` once `RefusingTraffic` or `Terminating` is set. |
-| **M11** | `ArchitectureRules::verify` ignores undeclared dependencies | Architecture | `rume/src/module/architecture.rs:84` | Verification traverses transitive dependencies and fails on cycles and undeclared dependencies. |
-| **M12** | Core crate unconditionally depends on `quick-xml` | Architecture | `rume/Cargo.toml:46` | `quick-xml` is gated behind an optional `saml` / `enterprise` feature flag. |
-| **M13** | Crate root `lib.rs` violates re-export discipline | Architecture | `rume/src/lib.rs:35` | Domain-specific internal types removed from `rume::*` root; exposed via subsystem modules. |
-| **M14** | `RateLimitService` reads missing tenant extension | Coordination | `rume/src/resilience/rate_limiter.rs:64` | `RateLimitService` extracts `TenantContext` using standard typed extractor. |
-| **M15** | Redis cache default prefix `rume:` collides with other keys | Coordination | `rume/src/cache/redis.rs:88` | Default cache prefix uses isolated namespace `rume:cache:`. |
-| **M16** | `Cache::clear()` executes dangerous `FLUSHDB` | Coordination | `rume/src/cache/redis.rs:97` | `Cache::clear()` deletes keys matching the configured prefix only, avoiding full database flush. |
-| **M17** | Tag-set `PEXPIRE` shortens tag lifetime | Coordination | `rume/src/cache/redis.rs:110` | Tag TTL uses `MAX` logic or refreshes to longest constituent key TTL. |
-| **M18** | `TenantScopedCache::invalidate_tag` releases quota for oldest keys | Coordination | `rume/src/tenant/cache.rs:139` | Quota release directly tracks the keys deleted by the tag invalidation. |
-| **M19** | PostgreSQL leader `try_acquire` diverges on candidate ID | Coordination | `rume/src/coordination/postgres.rs:167` | Incumbent re-acquisition aligns with Redis semantics and does not self-fence. |
-| **M20** | Tenant registration admits silent collisions | Coordination | `rume/src/tenant/resolver.rs:188` | Duplicate tenant IDs, slugs, or subdomains fail closed at registration. |
-| **M21** | `remember_with_tags` stampede waiters can deadlock | Coordination | `rume/src/cache/typed.rs:208` | `Notify` registration happens before checking in-flight status, preventing missed wakeups. |
-| **M22** | `rume config explain` outputs plaintext secrets | CLI & DX | `rume-cli/src/commands/config.rs:14` | Secrets and credential URLs are masked in `config explain` unless `--unredacted` is supplied. |
-| **M23** | `rume doctor` port check reports false-positive | CLI & DX | `rume-cli/src/commands/doctor.rs:45` | Port check properly distinguishes successful bind from `"port in use"` error string. |
-| **M24** | CLI component generators accept invalid Rust identifiers | CLI & DX | `rume-cli/src/commands/new.rs:88` | Generator validates input against Rust identifier rules (`[a-zA-Z_][a-zA-Z0-9_]*`). |
-| **M25** | Non-transactional CLI component generation leaves orphans | CLI & DX | `rume-cli/src/commands/new.rs:120` | File generation is atomic; failures clean up newly created files. |
-| **M26** | Interactive CLI prompts hang or swallow Ctrl+C in non-TTY | CLI & DX | `rume-cli/src/prompts.rs:25` | Prompts detect `is_terminal()`; fail closed with error in headless non-interactive environments. |
-| **M27** | Severe test determinism regression (33 wall-clock sleeps) | Testing & Matrix | `rume/tests/` | Replace arbitrary test `sleep()` with deterministic barriers (`Notify`, polling timeout). |
-| **M28** | Orphaned `RumeTestHarness` with zero adoption & compiler warnings | Testing & Matrix | `rume/src/testing/harness.rs:12` | Clean up warnings and integrate `RumeTestHarness` into integration test suites. |
-| **M29** | Tautological Wiremock test in enterprise integration | Testing & Matrix | `rume/tests/integration/enterprise.rs:300` | Wiremock test asserts actual Rume IdP metadata resolution client. |
-| **M30** | Missing negative-path and failure-mode test coverage | Testing & Matrix | `rume/tests/` | Add test coverage for event listener panics, saga compensation failures, and lease fences. |
+| **C1** | Startup premature traffic on `/health/ready` | Routing & OpenAPI | `crates/core/src/routing/health.rs:327` | `/health/ready` returns 503 while state is `Live`; returns 200 OK strictly when state is `Ready`. |
+| **C2** | Multi-line secret leakage in CLI `config check` | CLI & DX | `crates/cli/src/commands/config.rs:114` | Multi-line secrets (RSA/PEM keys) are fully redacted across all continuation lines in human-readable output. |
+| **M1** | Eager OpenAPI freezes route registry | App Lifecycle | `crates/core/src/app/builder.rs:739` | All routes (including module routes and post-declaration routes) appear in `/openapi.json`. |
+| **M2** | Insecure defaults in `CsrfConfig` | Security & Protocols | `crates/core/src/security/csrf.rs:56` | Unauthenticated token mode requires explicit opt-in; missing HMAC secret in production config fails preflight. |
+| **M3** | Subdomain cookie-tossing DoS in sessions | Security & Protocols | `crates/core/src/auth/session.rs:67` | `SessionScheme` evaluates all matching cookie headers/values rather than aborting on first invalid cookie. |
+| **M4** | SAML enveloped document signatures and missing `NotOnOrAfter` | Security & Protocols | `crates/core/src/enterprise/saml.rs:147` | Enveloped signatures (`URI=""`) accepted; assertions missing `NotOnOrAfter` fail closed in `validate()`. |
+| **M5** | `SqlAuditLogger` unparameterized queries & hardcoded PG DDL | Security & Protocols | `crates/core/src/security/audit.rs:76` | Audit logger uses parameterized queries and supports MySQL and SQLite schemas. |
+| **M6** | Health check probe thundering herd race | Routing & OpenAPI | `crates/core/src/routing/health.rs:186` | Cache stampede protection (`singleflight`) wraps background probe execution during cache expiration. |
+| **M7** | Module route preflight ignores `ANY` overlap | App Lifecycle | `crates/core/src/app/builder.rs:964` | Overlapping method bitsets on identical paths fail preflight with `BuildError::DuplicateRoute`. |
+| **M8** | TestApp lifecycle teardown inverts shutdown hooks | App Lifecycle | `crates/core/src/app/builder.rs:602` | `build_test_app()` executes application shutdown hooks before module hooks, matching `run()` parity. |
+| **M9** | Startup hooks block shutdown signals | App Lifecycle | `crates/core/src/app/builder.rs:1157` | Startup hook execution monitors SIGINT/SIGTERM and cancels cleanly if shutdown is signaled during boot. |
+| **M10** | `Availability::set` allows unconstrained drain bypass | App Lifecycle | `crates/core/src/app/state.rs:159` | `Availability` rejects transitions back to `Ready` once `RefusingTraffic` or `Terminating` is set. |
+| **M11** | `ArchitectureRules::verify` ignores undeclared dependencies | Architecture | `crates/core/src/module/architecture.rs:84` | Verification traverses transitive dependencies and fails on cycles and undeclared dependencies. |
+| **M12** | Core crate unconditionally depends on `quick-xml` | Architecture | `crates/core/Cargo.toml:46` | `quick-xml` is gated behind an optional `saml` / `enterprise` feature flag. |
+| **M13** | Crate root `lib.rs` violates re-export discipline | Architecture | `crates/core/src/lib.rs:35` | Domain-specific internal types removed from `rume::*` root; exposed via subsystem modules. |
+| **M14** | `RateLimitService` reads missing tenant extension | Coordination | `crates/core/src/resilience/rate_limiter.rs:64` | `RateLimitService` extracts `TenantContext` using standard typed extractor. |
+| **M15** | Redis cache default prefix `rume:` collides with other keys | Coordination | `crates/core/src/cache/redis.rs:88` | Default cache prefix uses isolated namespace `rume:cache:`. |
+| **M16** | `Cache::clear()` executes dangerous `FLUSHDB` | Coordination | `crates/core/src/cache/redis.rs:97` | `Cache::clear()` deletes keys matching the configured prefix only, avoiding full database flush. |
+| **M17** | Tag-set `PEXPIRE` shortens tag lifetime | Coordination | `crates/core/src/cache/redis.rs:110` | Tag TTL uses `MAX` logic or refreshes to longest constituent key TTL. |
+| **M18** | `TenantScopedCache::invalidate_tag` releases quota for oldest keys | Coordination | `crates/core/src/tenant/cache.rs:139` | Quota release directly tracks the keys deleted by the tag invalidation. |
+| **M19** | PostgreSQL leader `try_acquire` diverges on candidate ID | Coordination | `crates/core/src/coordination/postgres.rs:167` | Incumbent re-acquisition aligns with Redis semantics and does not self-fence. |
+| **M20** | Tenant registration admits silent collisions | Coordination | `crates/core/src/tenant/resolver.rs:188` | Duplicate tenant IDs, slugs, or subdomains fail closed at registration. |
+| **M21** | `remember_with_tags` stampede waiters can deadlock | Coordination | `crates/core/src/cache/typed.rs:208` | `Notify` registration happens before checking in-flight status, preventing missed wakeups. |
+| **M22** | `rume config explain` outputs plaintext secrets | CLI & DX | `crates/cli/src/commands/config.rs:14` | Secrets and credential URLs are masked in `config explain` unless `--unredacted` is supplied. |
+| **M23** | `rume doctor` port check reports false-positive | CLI & DX | `crates/cli/src/commands/doctor.rs:45` | Port check properly distinguishes successful bind from `"port in use"` error string. |
+| **M24** | CLI component generators accept invalid Rust identifiers | CLI & DX | `crates/cli/src/commands/new.rs:88` | Generator validates input against Rust identifier rules (`[a-zA-Z_][a-zA-Z0-9_]*`). |
+| **M25** | Non-transactional CLI component generation leaves orphans | CLI & DX | `crates/cli/src/commands/new.rs:120` | File generation is atomic; failures clean up newly created files. |
+| **M26** | Interactive CLI prompts hang or swallow Ctrl+C in non-TTY | CLI & DX | `crates/cli/src/prompts.rs:25` | Prompts detect `is_terminal()`; fail closed with error in headless non-interactive environments. |
+| **M27** | Severe test determinism regression (33 wall-clock sleeps) | Testing & Matrix | `crates/core/tests/` | Replace arbitrary test `sleep()` with deterministic barriers (`Notify`, polling timeout). |
+| **M28** | Orphaned `RumeTestHarness` with zero adoption & compiler warnings | Testing & Matrix | `crates/core/src/testing/harness.rs:12` | Clean up warnings and integrate `RumeTestHarness` into integration test suites. |
+| **M29** | Tautological Wiremock test in enterprise integration | Testing & Matrix | `crates/core/tests/integration/enterprise.rs:300` | Wiremock test asserts actual Rume IdP metadata resolution client. |
+| **M30** | Missing negative-path and failure-mode test coverage | Testing & Matrix | `crates/core/tests/` | Add test coverage for event listener panics, saga compensation failures, and lease fences. |
 
 ---
 

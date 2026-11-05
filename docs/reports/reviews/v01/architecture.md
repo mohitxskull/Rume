@@ -8,7 +8,7 @@ Rume's architecture is largely consistent with its stated constraints: an explic
 
 ### M1 — Public API surface leaks unrelated third-party crates; prelude is too broad
 
-**Where** — `rume/src/lib.rs:30–33`; `rume/src/prelude.rs:18–24`.
+**Where** — `crates/core/src/lib.rs:30–33`; `crates/core/src/prelude.rs:18–24`.
 
 **What it says** — `lib.rs` re-exports whole third-party crates as part of rume's public API:
 
@@ -29,7 +29,7 @@ emains a maintenance burden every time rume upgrades or drops a dependency. The 
 
 ### M2 — `Rume::builder` documented as the sole entry point, but `RumeBuilder::new` is public and equivalent
 
-**Where** — `rume/src/app.rs:276–282` (doc on `builder`); `rume/src/app.rs:307` (`RumeBuilder::new`).
+**Where** — `crates/core/src/app.rs:276–282` (doc on `builder`); `crates/core/src/app.rs:307` (`RumeBuilder::new`).
 
 **What it says** — The doc comment on `Rume::builder` states: "This is the only way to build a Rume application." Yet `RumeBuilder::new(ctx)` (line 307) is `pub` and performs the same construction, so there are two public paths to the same builder.
 
@@ -39,7 +39,7 @@ emains a maintenance burden every time rume upgrades or drops a dependency. The 
 
 ### m1 — `init_tracing()` silently discards subscriber initialization failure
 
-**Where** — `rume/src/app.rs:509–515`.
+**Where** — `crates/core/src/app.rs:509–515`.
 
 **What it says** —
 
@@ -59,7 +59,7 @@ The `try_init()` result is discarded with `let _ =`.
 
 ### m2 — Lifecycle/Availability atomic state is coupled to enum discriminant declaration order
 
-**Where** — `rume/src/app.rs:86–97` (`Lifecycle::state`); `rume/src/app.rs:140–151` (`Availability::state`).
+**Where** — `crates/core/src/app.rs:86–97` (`Lifecycle::state`); `crates/core/src/app.rs:140–151` (`Availability::state`).
 
 **What it says** — Both `state()` methods load a raw `u8` from an `AtomicU8` and match on literal values `1..=4`, defaulting to the first variant, relying on the enum variants being laid out in declaration order (`Created` = 0, `Booted` = 1, `Ready` = 2, ...).
 
@@ -69,11 +69,11 @@ The `try_init()` result is discarded with `let _ =`.
 
 ## Positive notes
 
-- The `Env`/`Config` split is real and clean: `rume/src/env.rs` owns `.env`/process-env loading with explicit precedence, and `rume/src/config.rs` owns declarative TOML under `config/`; both share a single env-name resolver (`env::resolve_env_name`, `env.rs:94`) rather than duplicating it.
+- The `Env`/`Config` split is real and clean: `crates/core/src/env.rs` owns `.env`/process-env loading with explicit precedence, and `crates/core/src/config.rs` owns declarative TOML under `config/`; both share a single env-name resolver (`env::resolve_env_name`, `env.rs:94`) rather than duplicating it.
 - `AppContext<E, C>` passes env and config as separate typed generics (`app.rs:218–235`); dependencies are constructed in code, not discovered by scanning.
 - `Rume::builder(ctx)` + `RumeBuilder` are an explicit builder API; lifecycle hooks (`on_ready`/`on_shutdown`, `app.rs:358–376`) are visible, not proxied/AOP.
 - `#![forbid(unsafe_code)]` in `lib.rs:7`; secrets are modeled with `secrecy` and a `redact()` helper exists (`env.rs:257`).
-- The crate-boundary rule is respected: `rume` is intentionally small (`lib.rs:1–5`), optional concerns live behind features (`schemars`, `config.rs:93`), and `rume-cli` depends on `rume` (`rume-cli/Cargo.toml:14`), not the reverse.
+- The crate-boundary rule is respected: `rume` is intentionally small (`lib.rs:1–5`), optional concerns live behind features (`schemars`, `config.rs:93`), and `rume-cli` depends on `rume` (`crates/cli/Cargo.toml:14`), not the reverse.
 - All six architecture refusals (no DI container, no scanning, no hidden AOP, no mandatory ORM, no hot-reload, explicit/typed) appear to be honored in the reviewed files.
 
 ## Verdict

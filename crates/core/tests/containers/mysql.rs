@@ -56,7 +56,9 @@ async fn test_mysql_execute_and_query_scalar() {
     let (_node, backend, _config) = start_mysql_node().await;
 
     backend
-        .execute("CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL)")
+        .execute(
+            "CREATE TABLE users (id INT PRIMARY KEY AUTO_INCREMENT, name VARCHAR(255) NOT NULL)",
+        )
         .await
         .expect("create table");
 
@@ -239,7 +241,10 @@ async fn test_mysql_outbox_claims_skip_locked_and_lease() {
     // Mark c1 published with lease tokens
     for m in &c1 {
         let token = m.lease_token.as_ref().unwrap();
-        backend.mark_published(&m.id, token).await.expect("mark published");
+        backend
+            .mark_published(&m.id, token)
+            .await
+            .expect("mark published");
     }
 
     assert_eq!(backend.published_count().await.expect("published count"), 5);
@@ -340,12 +345,7 @@ async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
     let rows = tx
         .execute_params(
             "INSERT INTO test_mysql_params (id, title, amount, note) VALUES (?, ?, ?, ?)",
-            &rume::params![
-                "row-1",
-                injection_str,
-                54321_i64,
-                unicode_note,
-            ],
+            &rume::params!["row-1", injection_str, 54321_i64, unicode_note,],
         )
         .await
         .expect("execute_params should succeed");
@@ -368,7 +368,10 @@ async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
 
     // Query scalar params inside transaction
     let retrieved = tx
-        .query_scalar_params("SELECT title FROM test_mysql_params WHERE id = ?", &rume::params!["row-1"])
+        .query_scalar_params(
+            "SELECT title FROM test_mysql_params WHERE id = ?",
+            &rume::params!["row-1"],
+        )
         .await
         .expect("query scalar")
         .expect("found title");

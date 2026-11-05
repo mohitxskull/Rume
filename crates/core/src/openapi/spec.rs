@@ -164,7 +164,11 @@ impl OpenApiSchema {
         self
     }
 
-    pub fn with_required_property(mut self, name: impl Into<String>, schema: OpenApiSchema) -> Self {
+    pub fn with_required_property(
+        mut self,
+        name: impl Into<String>,
+        schema: OpenApiSchema,
+    ) -> Self {
         let name_str = name.into();
         let mut req = self.required.unwrap_or_default();
         if !req.contains(&name_str) {
@@ -194,20 +198,76 @@ impl HasOpenApiSchema for &str {
     }
 }
 
-impl HasOpenApiSchema for i8 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
-impl HasOpenApiSchema for i16 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
-impl HasOpenApiSchema for i32 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
-impl HasOpenApiSchema for i64 { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
-impl HasOpenApiSchema for isize { fn schema() -> OpenApiSchema { OpenApiSchema::integer() } }
-impl HasOpenApiSchema for u8 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
-impl HasOpenApiSchema for u16 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
-impl HasOpenApiSchema for u32 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
-impl HasOpenApiSchema for u64 { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
-impl HasOpenApiSchema for usize { fn schema() -> OpenApiSchema { OpenApiSchema::integer().with_minimum(0) } }
-impl HasOpenApiSchema for f32 { fn schema() -> OpenApiSchema { OpenApiSchema::number() } }
-impl HasOpenApiSchema for f64 { fn schema() -> OpenApiSchema { OpenApiSchema::number() } }
-impl HasOpenApiSchema for bool { fn schema() -> OpenApiSchema { OpenApiSchema::boolean() } }
-impl HasOpenApiSchema for uuid::Uuid { fn schema() -> OpenApiSchema { OpenApiSchema::uuid() } }
+impl HasOpenApiSchema for i8 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer()
+    }
+}
+impl HasOpenApiSchema for i16 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer()
+    }
+}
+impl HasOpenApiSchema for i32 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer()
+    }
+}
+impl HasOpenApiSchema for i64 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer()
+    }
+}
+impl HasOpenApiSchema for isize {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer()
+    }
+}
+impl HasOpenApiSchema for u8 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer().with_minimum(0)
+    }
+}
+impl HasOpenApiSchema for u16 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer().with_minimum(0)
+    }
+}
+impl HasOpenApiSchema for u32 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer().with_minimum(0)
+    }
+}
+impl HasOpenApiSchema for u64 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer().with_minimum(0)
+    }
+}
+impl HasOpenApiSchema for usize {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::integer().with_minimum(0)
+    }
+}
+impl HasOpenApiSchema for f32 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::number()
+    }
+}
+impl HasOpenApiSchema for f64 {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::number()
+    }
+}
+impl HasOpenApiSchema for bool {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::boolean()
+    }
+}
+impl HasOpenApiSchema for uuid::Uuid {
+    fn schema() -> OpenApiSchema {
+        OpenApiSchema::uuid()
+    }
+}
 
 impl<T: HasOpenApiSchema> HasOpenApiSchema for Vec<T> {
     fn schema() -> OpenApiSchema {

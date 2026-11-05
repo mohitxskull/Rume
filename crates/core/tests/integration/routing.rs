@@ -7,8 +7,8 @@
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::get;
-use rume::testing::TestApp;
 use rume::routing::{Matcher, RouteGroup, RouteRegistry, RouteSpec};
+use rume::testing::TestApp;
 use std::collections::BTreeMap;
 
 /// Handler that echoes back the validated `id` parameter.
@@ -145,7 +145,6 @@ async fn route_malformed_percent_encoding_fails_closed_and_does_not_invoke_handl
     let body = TestApp::body_text(response).await;
     assert!(body.contains("INVALID_PARAM"));
 }
-
 
 #[tokio::test]
 async fn route_registry_metadata_is_correct() {

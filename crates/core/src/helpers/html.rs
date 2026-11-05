@@ -89,9 +89,28 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
             }
             let is_block_tag = matches!(
                 tag_name.as_str(),
-                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" | "br" | "hr" | "li"
-                    | "ul" | "ol" | "tr" | "td" | "th" | "blockquote" | "pre" | "article"
-                    | "section" | "header" | "footer" | "nav"
+                "p" | "div"
+                    | "h1"
+                    | "h2"
+                    | "h3"
+                    | "h4"
+                    | "h5"
+                    | "h6"
+                    | "br"
+                    | "hr"
+                    | "li"
+                    | "ul"
+                    | "ol"
+                    | "tr"
+                    | "td"
+                    | "th"
+                    | "blockquote"
+                    | "pre"
+                    | "article"
+                    | "section"
+                    | "header"
+                    | "footer"
+                    | "nav"
             );
             while i < chars.len() && chars[i] != '>' {
                 i += 1;
@@ -115,7 +134,12 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
             if ch == '&' {
                 let mut entity = String::new();
                 let mut j = i + 1;
-                while j < chars.len() && j - i < 10 && chars[j] != ';' && !chars[j].is_whitespace() && chars[j] != '<' {
+                while j < chars.len()
+                    && j - i < 10
+                    && chars[j] != ';'
+                    && !chars[j].is_whitespace()
+                    && chars[j] != '<'
+                {
                     entity.push(chars[j]);
                     j += 1;
                 }
@@ -131,7 +155,8 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
                     };
                     if let Some(dec) = decoded_char {
                         if pending_separator {
-                            let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+                            let prev_is_alnum =
+                                out.chars().last().is_some_and(|c| c.is_alphanumeric());
                             if prev_is_alnum && dec.is_alphanumeric() && !out.ends_with(' ') {
                                 out.push(' ');
                             }
@@ -225,10 +250,7 @@ mod tests {
             strip_html_tags("<span>Hello</span><span>World</span>"),
             "Hello World"
         );
-        assert_eq!(
-            strip_html_tags("Fish &amp; Chips"),
-            "Fish & Chips"
-        );
+        assert_eq!(strip_html_tags("Fish &amp; Chips"), "Fish & Chips");
     }
 
     #[test]

@@ -144,11 +144,9 @@ impl RateLimiter {
                 Self::check_in_memory(&self.config, shards, key)
             }
             #[cfg(feature = "redis")]
-            RateLimiterBackend::Redis(r) => {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(r.check(key))
-                })
-            }
+            RateLimiterBackend::Redis(r) => tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(r.check(key))
+            }),
         }
     }
 
