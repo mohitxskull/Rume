@@ -6,6 +6,9 @@
 //! This is the CI quality gate for Milestone 2: a scaffold or generator that
 //! does not compile or produce valid outputs is a defect.
 
+mod common;
+
+use crate::common::framework_path;
 use std::fs;
 use std::process::Command;
 use tempfile::TempDir;
@@ -14,10 +17,6 @@ fn rume_binary() -> String {
     std::env::var("CARGO_BIN_EXE_rume").expect(
         "CARGO_BIN_EXE_rume is not set — the `rume` binary must be built before running this test",
     )
-}
-
-fn framework_path() -> &'static str {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/core")
 }
 
 fn run_command(cmd: &mut Command) -> bool {

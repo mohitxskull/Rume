@@ -27,3 +27,6 @@ unicode-width = "=0.2.3"
 chrono = "=0.4.45"
 dotenvy.workspace = true
 redis.workspace = true
+
+[dev-dependencies]
+cargo_metadata = "0.23.1"
