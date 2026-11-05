@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+use sqlx::AssertSqlSafe;
 #[cfg(any(feature = "postgres", feature = "redis"))]
 use testcontainers_modules::testcontainers::ImageExt;
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
@@ -42,7 +43,7 @@ pub async fn create_isolated_postgres_db() -> (String, rume::persistence::config
     let root_pool = sqlx::PgPool::connect(&root_url)
         .await
         .expect("connect root postgres");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\";")))
         .execute(&root_pool)
         .await
         .expect("create test db");
@@ -101,7 +102,7 @@ pub async fn create_isolated_mysql_db() -> (String, rume::persistence::config::D
     let root_pool = sqlx::MySqlPool::connect(&root_url)
         .await
         .expect("connect root mysql");
-    sqlx::query(&format!("CREATE DATABASE `{db_name}`;"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE `{db_name}`;")))
         .execute(&root_pool)
         .await
         .expect("create mysql test db");

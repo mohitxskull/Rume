@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::{PgPool, Row};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use uuid::Uuid;
 
 use crate::outbox::{
@@ -155,17 +155,17 @@ impl DatabaseBackend for PostgresBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
             if params_vec.is_empty() {
-                let res = sqlx::raw_sql(&stmt)
+                let res = sqlx::raw_sql(AssertSqlSafe(statement.clone()))
                     .execute(&self.pool)
                     .await
                     .map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             } else {
-                let mut query = sqlx::query(&stmt);
+                let mut query = sqlx::query(AssertSqlSafe(statement));
                 for param in &params_vec {
                     query = match param {
                         DbValue::Null => query.bind(None as Option<String>),
@@ -187,10 +187,10 @@ impl DatabaseBackend for PostgresBackend {
         query: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let q = query.trim().to_string();
+        let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query_obj = sqlx::query(&q);
+            let mut query_obj = sqlx::query(AssertSqlSafe(query));
             for param in &params_vec {
                 query_obj = match param {
                     DbValue::Null => query_obj.bind(None as Option<String>),
@@ -215,11 +215,11 @@ impl DatabaseBackend for PostgresBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
-        let p = params.to_vec();
+        let statement = statement.to_string();
+        let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(&stmt);
-            for param in &p {
+            let mut query = sqlx::query(AssertSqlSafe(statement));
+            for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
                     DbValue::Text(s) => query.bind(s.as_str()),
@@ -239,11 +239,11 @@ impl DatabaseBackend for PostgresBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
-        let p = params.to_vec();
+        let statement = statement.to_string();
+        let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(&stmt);
-            for param in &p {
+            let mut query = sqlx::query(AssertSqlSafe(statement));
+            for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
                     DbValue::Text(s) => query.bind(s.as_str()),
@@ -365,7 +365,7 @@ impl DatabaseTransaction for PostgresTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -373,7 +373,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -393,7 +393,7 @@ impl DatabaseTransaction for PostgresTransaction {
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
@@ -402,7 +402,7 @@ impl DatabaseTransaction for PostgresTransaction {
             })?;
             use sqlx::Executor;
             let res = (&mut **tx)
-                .execute(stmt.as_str())
+                .execute(AssertSqlSafe(statement))
                 .await
                 .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
             Ok(res.rows_affected())
@@ -414,7 +414,7 @@ impl DatabaseTransaction for PostgresTransaction {
         query: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let q = query.trim().to_string();
+        let query = query.trim().to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -422,7 +422,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query_obj = sqlx::query(&q);
+            let mut query_obj = sqlx::query(AssertSqlSafe(query));
             for param in &params_vec {
                 query_obj = match param {
                     DbValue::Null => query_obj.bind(None as Option<String>),
@@ -450,7 +450,7 @@ impl DatabaseTransaction for PostgresTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let p = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -458,7 +458,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &p {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -479,7 +479,7 @@ impl DatabaseTransaction for PostgresTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let p = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -487,7 +487,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &p {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
