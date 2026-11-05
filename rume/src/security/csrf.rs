@@ -167,7 +167,7 @@ impl CsrfConfig {
     pub fn generate_token(&self) -> String {
         let raw = uuid::Uuid::new_v4().simple().to_string();
         if let Some(secret) = &self.secret {
-            use hmac::{Hmac, Mac};
+            use hmac::{Hmac, KeyInit, Mac};
             use sha2::Sha256;
             type HmacSha256 = Hmac<Sha256>;
 
@@ -192,7 +192,7 @@ impl CsrfConfig {
             return false;
         };
 
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
         type HmacSha256 = Hmac<Sha256>;
 
