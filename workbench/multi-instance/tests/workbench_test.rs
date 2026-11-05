@@ -14,6 +14,7 @@ use rume::persistence::postgres::PostgresBackend;
 use rume::routing::health::{HealthCheck, HealthStatus};
 use rume::tenant::model::Tenant;
 use rume::tenant::resolver::HeaderTenantResolver;
+use sqlx::AssertSqlSafe;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ImageExt;
 use testcontainers_modules::testcontainers::runners::AsyncRunner;
@@ -44,7 +45,7 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
     let root_pool = sqlx::PgPool::connect(&root_url)
         .await
         .expect("connect root postgres");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\";")))
         .execute(&root_pool)
         .await
         .expect("create test db");
@@ -422,7 +423,7 @@ async fn test_workbench_run_with_signal_shutdown_during_active_operations() {
     let root_pool = sqlx::PgPool::connect(&root_url)
         .await
         .expect("connect root postgres");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\";")))
         .execute(&root_pool)
         .await
         .expect("create test db");
@@ -508,7 +509,7 @@ async fn test_workbench_sql_injection_resilience_and_special_characters() {
     let root_pool = sqlx::PgPool::connect(&root_url)
         .await
         .expect("connect root postgres");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\";")))
         .execute(&root_pool)
         .await
         .expect("create test db");

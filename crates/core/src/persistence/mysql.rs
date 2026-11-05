@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::sync::Arc;
 
 use sqlx::mysql::{MySqlPoolOptions, MySqlRow};
-use sqlx::{Acquire, MySqlPool, Row};
+use sqlx::{Acquire, AssertSqlSafe, MySqlPool, Row};
 use uuid::Uuid;
 
 use crate::outbox::{
@@ -147,17 +147,17 @@ impl DatabaseBackend for MysqlBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
             if params_vec.is_empty() {
-                let res = sqlx::raw_sql(&stmt)
+                let res = sqlx::raw_sql(AssertSqlSafe(statement.clone()))
                     .execute(&self.pool)
                     .await
                     .map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             } else {
-                let mut query = sqlx::query(&stmt);
+                let mut query = sqlx::query(AssertSqlSafe(statement));
                 for param in &params_vec {
                     query = match param {
                         DbValue::Null => query.bind(None as Option<String>),
@@ -179,10 +179,10 @@ impl DatabaseBackend for MysqlBackend {
         query: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let q = query.trim().to_string();
+        let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query_obj = sqlx::query(&q);
+            let mut query_obj = sqlx::query(AssertSqlSafe(query));
             for param in &params_vec {
                 query_obj = match param {
                     DbValue::Null => query_obj.bind(None as Option<String>),
@@ -207,10 +207,10 @@ impl DatabaseBackend for MysqlBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -231,10 +231,10 @@ impl DatabaseBackend for MysqlBackend {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -359,7 +359,7 @@ impl DatabaseTransaction for MysqlTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -367,7 +367,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -387,7 +387,7 @@ impl DatabaseTransaction for MysqlTransaction {
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
@@ -396,7 +396,7 @@ impl DatabaseTransaction for MysqlTransaction {
             })?;
             use sqlx::Executor;
             let res = (&mut **tx)
-                .execute(stmt.as_str())
+                .execute(AssertSqlSafe(statement))
                 .await
                 .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
             Ok(res.rows_affected())
@@ -408,7 +408,7 @@ impl DatabaseTransaction for MysqlTransaction {
         query: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
-        let q = query.trim().to_string();
+        let query = query.trim().to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -416,7 +416,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query_obj = sqlx::query(&q);
+            let mut query_obj = sqlx::query(AssertSqlSafe(query));
             for param in &params_vec {
                 query_obj = match param {
                     DbValue::Null => query_obj.bind(None as Option<String>),
@@ -440,7 +440,7 @@ impl DatabaseTransaction for MysqlTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -448,7 +448,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),
@@ -472,7 +472,7 @@ impl DatabaseTransaction for MysqlTransaction {
         statement: &str,
         params: &[DbValue],
     ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
-        let stmt = statement.to_string();
+        let statement = statement.to_string();
         let params_vec = params.to_vec();
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
@@ -480,7 +480,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(&stmt);
+            let mut query = sqlx::query(AssertSqlSafe(statement));
             for param in &params_vec {
                 query = match param {
                     DbValue::Null => query.bind(None as Option<String>),

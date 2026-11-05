@@ -14,6 +14,7 @@ use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 use rume::tenant::model::Tenant;
 use rume::tenant::resolver::HeaderTenantResolver;
+use sqlx::AssertSqlSafe;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::redis::Redis;
 use testcontainers_modules::testcontainers::ImageExt;
@@ -45,7 +46,7 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
     let root_pool = sqlx::PgPool::connect(&root_url)
         .await
         .expect("connect root postgres");
-    sqlx::query(&format!("CREATE DATABASE \"{db_name}\";"))
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{db_name}\";")))
         .execute(&root_pool)
         .await
         .expect("create test db");
