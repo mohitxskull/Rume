@@ -11,7 +11,7 @@ fn rume_binary() -> String {
 }
 
 fn framework_path() -> &'static str {
-    concat!(env!("CARGO_MANIFEST_DIR"), "/../rume")
+    concat!(env!("CARGO_MANIFEST_DIR"), "/../../crates/core")
 }
 
 fn run_command(cmd: &mut Command) -> (bool, String, String) {

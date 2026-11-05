@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        crate: [rume, rume-cli, rume-macros, workbench/simple-api, workbench/modular-monolith]
+        crate: [crates/core, crates/cli, crates/macro, workbench/simple-api, workbench/modular-monolith]
     services:
       postgres:
         image: postgres:16-alpine

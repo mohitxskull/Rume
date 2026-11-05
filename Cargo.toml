@@ -1,9 +1,9 @@
 [workspace]
 resolver = "3"
 members = [
-    "rume",
-    "rume-cli",
-    "rume-macros",
+    "crates/core",
+    "crates/cli",
+    "crates/macro",
     "workbench/simple-api",
     "workbench/modular-monolith",
     "workbench/multi-instance",
@@ -11,7 +11,7 @@ members = [
 exclude = [
     "lab",
 ]
-default-members = ["rume", "rume-cli"]
+default-members = ["crates/core", "crates/cli"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,7 +20,7 @@ rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-rume = { path = "rume", version = "0.1.0" }
+rume = { path = "crates/core", version = "0.1.0" }
 
 axum = "=0.8.9"
 tower = "=0.5.3"

@@ -8,7 +8,7 @@ name = "workbench-simple-api"
 path = "src/main.rs"
 
 [dependencies]
-rume = { path = "../../rume", features = ["sqlite", "testing"] }
+rume = { path = "../../crates/core", features = ["sqlite", "testing"] }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

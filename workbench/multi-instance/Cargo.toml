@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rume = { path = "../../rume", features = ["postgres", "redis"] }
+rume = { path = "../../crates/core", features = ["postgres", "redis"] }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

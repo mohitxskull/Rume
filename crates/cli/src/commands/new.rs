@@ -290,9 +290,9 @@ mod tests {
 
     #[test]
     fn resolves_path_override_when_provided() {
-        let (dep, path) = resolve_rume_dependency(Some("../rume"), Some("0.1.0"));
-        assert_eq!(dep, "rume = { version = \"0.1.0\", path = \"../rume\" }");
-        assert_eq!(path, Some("../rume".to_string()));
+        let (dep, path) = resolve_rume_dependency(Some("../crates/core"), Some("0.1.0"));
+        assert_eq!(dep, "rume = { version = \"0.1.0\", path = \"../crates/core\" }");
+        assert_eq!(path, Some("../crates/core".to_string()));
     }
 
     #[test]

@@ -11,7 +11,7 @@ name = "rume"
 path = "src/main.rs"
 
 [dependencies]
-rume = { path = "../rume", features = ["postgres", "sqlite", "mysql"] }
+rume = { path = "../../crates/core", features = ["postgres", "sqlite", "mysql"] }
 clap.workspace = true
 clap_complete = "=4.6.11"
 tokio.workspace = true

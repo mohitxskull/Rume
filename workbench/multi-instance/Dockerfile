@@ -9,15 +9,15 @@ ENV PATH="/root/.cargo/bin:${PATH}"
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
-COPY rume/Cargo.toml rume/Cargo.toml
-COPY rume-macros/Cargo.toml rume-macros/Cargo.toml
-COPY rume-cli/Cargo.toml rume-cli/Cargo.toml
+COPY crates/core/Cargo.toml crates/core/Cargo.toml
+COPY crates/macro/Cargo.toml crates/macro/Cargo.toml
+COPY crates/cli/Cargo.toml crates/cli/Cargo.toml
 COPY workbench/multi-instance/Cargo.toml workbench/multi-instance/Cargo.toml
 COPY workbench/simple-api/Cargo.toml workbench/simple-api/Cargo.toml
 COPY workbench/modular-monolith/Cargo.toml workbench/modular-monolith/Cargo.toml
-COPY rume rume
-COPY rume-macros rume-macros
-COPY rume-cli rume-cli
+COPY crates/core crates/core
+COPY crates/macro crates/macro
+COPY crates/cli crates/cli
 COPY workbench workbench
 RUN cargo build --release -p workbench --bin workbench
 

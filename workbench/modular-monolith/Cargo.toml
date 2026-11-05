@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-rume = { path = "../../rume", features = ["sqlite", "testing"] }
+rume = { path = "../../crates/core", features = ["sqlite", "testing"] }
 axum = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
