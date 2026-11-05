@@ -1,0 +1,26 @@
+# Code owners for automatic review assignment on pull requests.
+# https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/managing-repository-settings/about-code-owners
+
+# Default owners for everything
+*                                                  @mohitxskull
+
+# Core framework crate
+/crates/core/                                      @mohitxskull
+
+# CLI crate
+/crates/cli/                                       @mohitxskull
+
+# Proc-macro crate
+/crates/macro/                                     @mohitxskull
+
+# Workbench reference applications
+/workbench/                                        @mohitxskull
+
+# CI and workflow configuration
+/.github/workflows/                                @mohitxskull
+
+# Dependency configuration
+/.github/dependabot.yml                            @mohitxskull
+
+# Security policy
+/SECURITY.md                                       @mohitxskull

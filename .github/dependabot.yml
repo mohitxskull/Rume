@@ -1,0 +1,25 @@
+version: 2
+updates:
+  # Enable version updates for Rust workspace dependencies
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "mohitxskull"
+    labels:
+      - "dependencies"
+      - "rust"
+
+  # Enable version updates for GitHub Actions workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "mohitxskull"
+    labels:
+      - "dependencies"
+      - "ci"
