@@ -1,0 +1,1 @@
+UPDATE rume_jobs SET status = 'pending', attempt = 0, assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = NULL, dead_lettered_at = NULL, available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $1 AND status = 'dead_letter'

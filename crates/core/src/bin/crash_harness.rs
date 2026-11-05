@@ -18,6 +18,14 @@ use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
 use sqlx::postgres::PgPoolOptions;
 
+// Crash test SQL, externalized from inline string literals.
+const CRASH_SIDE_EFFECTS_TABLE: &str =
+    include_str!("../../persistence/sql/postgres/crash_side_effects_table.sql");
+const CRASH_SIDE_EFFECTS_INSERT: &str =
+    include_str!("../../persistence/sql/postgres/crash_side_effects_insert.sql");
+const CRASH_ORDERS_TABLE: &str =
+    include_str!("../../persistence/sql/postgres/crash_orders_table.sql");
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let args: Vec<String> = std::env::args().collect();
@@ -79,10 +87,8 @@ async fn handle_worker(
             let job = queue.dequeue().await?;
             if let Some(j) = job {
                 // Perform side-effect: insert into test audit marker table
-                sqlx::query("CREATE TABLE IF NOT EXISTS crash_test_side_effects (job_id TEXT PRIMARY KEY, executed_by TEXT, executed_at BIGINT)")
-                    .execute(&pool)
-                    .await?;
-                sqlx::query("INSERT INTO crash_test_side_effects (job_id, executed_by, executed_at) VALUES ($1, $2, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)")
+                sqlx::query(CRASH_SIDE_EFFECTS_TABLE).execute(&pool).await?;
+                sqlx::query(CRASH_SIDE_EFFECTS_INSERT)
                     .bind(&j.id)
                     .bind(&worker_id)
                     .execute(&pool)
@@ -148,16 +154,17 @@ async fn handle_outbox(
 
             pool.transaction(|tx| async move {
                 // Business state table
-                tx.execute("CREATE TABLE IF NOT EXISTS crash_test_orders (id TEXT PRIMARY KEY, amount INT)")
-                    .await?;
-                tx.execute(&format!("INSERT INTO crash_test_orders (id, amount) VALUES ('{}', 100)", saved_id))
-                    .await?;
+                tx.execute(CRASH_ORDERS_TABLE).await?;
+                tx.execute(&format!(
+                    "INSERT INTO crash_test_orders (id, amount) VALUES ('{}', 100)",
+                    saved_id
+                ))
+                .await?;
                 // Enlist outbox message in the same atomic transaction
                 let outbox_msg = OutboxMessage::new(msg_id, "OrderCreated", payload.into_bytes());
-                pool_ref
-                    .save_tx(&tx, outbox_msg)
-                    .await
-                    .map_err(|e| rume::persistence::PersistenceError::TransactionError(e.to_string()))?;
+                pool_ref.save_tx(&tx, outbox_msg).await.map_err(|e| {
+                    rume::persistence::PersistenceError::TransactionError(e.to_string())
+                })?;
                 Ok::<_, rume::persistence::PersistenceError>(())
             })
             .await?;

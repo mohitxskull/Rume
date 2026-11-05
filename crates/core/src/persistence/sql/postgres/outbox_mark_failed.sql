@@ -1,0 +1,1 @@
+UPDATE rume_outbox SET status = $1, retry_count = $2, last_error = $3, next_retry_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $4, lease_token = NULL, lease_expires_at = NULL WHERE id = $5 AND lease_token = $6 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT

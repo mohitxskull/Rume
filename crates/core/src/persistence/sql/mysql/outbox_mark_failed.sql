@@ -1,0 +1,1 @@
+UPDATE rume_outbox SET status = ?, retry_count = ?, last_error = ?, next_retry_at = UNIX_TIMESTAMP() + ?, lease_token = NULL, lease_expires_at = NULL WHERE id = ? AND lease_token = ? AND status = 'inflight' AND lease_expires_at > UNIX_TIMESTAMP()

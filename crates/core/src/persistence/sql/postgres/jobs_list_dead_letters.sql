@@ -1,0 +1,1 @@
+SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token FROM rume_jobs WHERE status = 'dead_letter' ORDER BY dead_lettered_at DESC LIMIT $1

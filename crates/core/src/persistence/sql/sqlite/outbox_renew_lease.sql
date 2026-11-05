@@ -1,0 +1,1 @@
+UPDATE rume_outbox SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?1 WHERE id = ?2 AND lease_token = ?3 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)

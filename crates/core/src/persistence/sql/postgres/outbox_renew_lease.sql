@@ -1,0 +1,1 @@
+UPDATE rume_outbox SET lease_expires_at = FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT + $1 WHERE id = $2 AND lease_token = $3 AND status = 'inflight' AND lease_expires_at > FLOOR(EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT

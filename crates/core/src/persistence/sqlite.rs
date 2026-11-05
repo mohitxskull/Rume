@@ -26,6 +26,25 @@ const MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql")
 const INSERT_OUTBOX_SQL: &str = include_str!("sql/sqlite/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/sqlite/outbox_recover.sql");
 
+// Per-operation SQLite SQL, externalized from inline string literals.
+const SQLITE_PING_SQL: &str = include_str!("sql/sqlite/ping.sql");
+const SQLITE_AUDIT_INSERT_SQL: &str = include_str!("sql/sqlite/audit_insert.sql");
+const SQLITE_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_claim_lease.sql");
+const SQLITE_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_renew_lease.sql");
+const SQLITE_OUTBOX_MARK_PUBLISHED_SQL: &str = include_str!("sql/sqlite/outbox_mark_published.sql");
+const SQLITE_OUTBOX_SELECT_RETRY_COUNT_SQL: &str =
+    include_str!("sql/sqlite/outbox_select_retry_count.sql");
+const SQLITE_OUTBOX_MARK_FAILED_SQL: &str = include_str!("sql/sqlite/outbox_mark_failed.sql");
+const SQLITE_OUTBOX_PENDING_COUNT_SQL: &str = include_str!("sql/sqlite/outbox_pending_count.sql");
+const SQLITE_OUTBOX_PUBLISHED_COUNT_SQL: &str =
+    include_str!("sql/sqlite/outbox_published_count.sql");
+const SQLITE_OUTBOX_FAILED_COUNT_SQL: &str = include_str!("sql/sqlite/outbox_failed_count.sql");
+const SQLITE_OUTBOX_FETCH_FAILED_SQL: &str = include_str!("sql/sqlite/outbox_fetch_failed.sql");
+const SQLITE_OUTBOX_REPROCESS_FAILED_SQL: &str =
+    include_str!("sql/sqlite/outbox_reprocess_failed.sql");
+const SQLITE_OUTBOX_PURGE_PUBLISHED_SQL: &str =
+    include_str!("sql/sqlite/outbox_purge_published.sql");
+
 /// Embedded SQLite database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]
 pub struct SqliteBackend {
@@ -147,7 +166,7 @@ impl DatabaseBackend for SqliteBackend {
     fn ping(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         Box::pin(async move {
             tokio::time::timeout(std::time::Duration::from_secs(3), async {
-                sqlx::query("SELECT 1")
+                sqlx::query(SQLITE_PING_SQL)
                     .execute(&self.pool)
                     .await
                     .map_err(map_sqlx_error)
@@ -290,21 +309,19 @@ impl DatabaseBackend for SqliteBackend {
         let ip_address = ip_address.map(|s| s.to_string());
         let metadata = metadata.to_string();
         Box::pin(async move {
-            sqlx::query(
-                "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)"
-            )
-            .bind(id)
-            .bind(action)
-            .bind(resource)
-            .bind(status)
-            .bind(actor_id)
-            .bind(target_id)
-            .bind(ip_address)
-            .bind(metadata)
-            .bind(created_at)
-            .execute(&self.pool)
-            .await
-            .map_err(map_sqlx_error)?;
+            sqlx::query(SQLITE_AUDIT_INSERT_SQL)
+                .bind(id)
+                .bind(action)
+                .bind(resource)
+                .bind(status)
+                .bind(actor_id)
+                .bind(target_id)
+                .bind(ip_address)
+                .bind(metadata)
+                .bind(created_at)
+                .execute(&self.pool)
+                .await
+                .map_err(map_sqlx_error)?;
             Ok(())
         })
     }
@@ -660,15 +677,13 @@ impl OutboxRepository for SqliteBackend {
             for row in &rows {
                 let mut msg = parse_sqlite_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
-                let updated = sqlx::query(
-                    "UPDATE rume_outbox SET status = 'inflight', lease_token = ?1, lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?2 WHERE id = ?3 RETURNING lease_expires_at"
-                )
-                .bind(&token)
-                .bind(lease_duration_secs as i64)
-                .bind(&msg.id)
-                .fetch_one(&mut *tx)
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+                let updated = sqlx::query(SQLITE_OUTBOX_CLAIM_LEASE_SQL)
+                    .bind(&token)
+                    .bind(lease_duration_secs as i64)
+                    .bind(&msg.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
                 let exp: i64 = updated.try_get(0).unwrap_or(0);
                 msg.status = OutboxStatus::InFlight;
@@ -694,18 +709,13 @@ impl OutboxRepository for SqliteBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_outbox \
-                 SET lease_expires_at = CAST(strftime('%s', 'now') AS INTEGER) + ?1 \
-                 WHERE id = ?2 AND lease_token = ?3 AND status = 'inflight' \
-                   AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)",
-            )
-            .bind(extension_secs as i64)
-            .bind(&id_str)
-            .bind(&token_str)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(SQLITE_OUTBOX_RENEW_LEASE_SQL)
+                .bind(extension_secs as i64)
+                .bind(&id_str)
+                .bind(&token_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
@@ -725,14 +735,12 @@ impl OutboxRepository for SqliteBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'published', lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND lease_token = ?2 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)"
-            )
-            .bind(&id_str)
-            .bind(&token_str)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(SQLITE_OUTBOX_MARK_PUBLISHED_SQL)
+                .bind(&id_str)
+                .bind(&token_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
@@ -762,7 +770,7 @@ impl OutboxRepository for SqliteBackend {
         let id_str = id.to_string();
         let token_str = lease_token.to_string();
         Box::pin(async move {
-            let row = sqlx::query("SELECT retry_count FROM rume_outbox WHERE id = ?1 AND lease_token = ?2 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)")
+            let row = sqlx::query(SQLITE_OUTBOX_SELECT_RETRY_COUNT_SQL)
                 .bind(&id_str)
                 .bind(&token_str)
                 .fetch_optional(&self.pool)
@@ -783,18 +791,16 @@ impl OutboxRepository for SqliteBackend {
             };
             let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
 
-            let res = sqlx::query(
-                "UPDATE rume_outbox SET status = ?1, retry_count = ?2, last_error = ?3, next_retry_at = CAST(strftime('%s', 'now') AS INTEGER) + ?4, lease_token = NULL, lease_expires_at = NULL WHERE id = ?5 AND lease_token = ?6 AND status = 'inflight' AND lease_expires_at > CAST(strftime('%s', 'now') AS INTEGER)"
-            )
-            .bind(status)
-            .bind(retry_count)
-            .bind(&error)
-            .bind(backoff_secs as i64)
-            .bind(&id_str)
-            .bind(&token_str)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(SQLITE_OUTBOX_MARK_FAILED_SQL)
+                .bind(status)
+                .bind(retry_count)
+                .bind(&error)
+                .bind(backoff_secs as i64)
+                .bind(&id_str)
+                .bind(&token_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
@@ -822,12 +828,10 @@ impl OutboxRepository for SqliteBackend {
 
     fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let row = sqlx::query(
-                "SELECT COUNT(*) FROM rume_outbox WHERE status = 'pending' OR status = 'inflight'",
-            )
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let row = sqlx::query(SQLITE_OUTBOX_PENDING_COUNT_SQL)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let count: i64 = row.try_get(0).unwrap_or(0);
             Ok(count as usize)
@@ -836,7 +840,7 @@ impl OutboxRepository for SqliteBackend {
 
     fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let row = sqlx::query("SELECT COUNT(*) FROM rume_outbox WHERE status = 'published'")
+            let row = sqlx::query(SQLITE_OUTBOX_PUBLISHED_COUNT_SQL)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
@@ -848,7 +852,7 @@ impl OutboxRepository for SqliteBackend {
 
     fn failed_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let row = sqlx::query("SELECT COUNT(*) FROM rume_outbox WHERE status = 'failed'")
+            let row = sqlx::query(SQLITE_OUTBOX_FAILED_COUNT_SQL)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
@@ -863,13 +867,11 @@ impl OutboxRepository for SqliteBackend {
         limit: usize,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let rows = sqlx::query(
-                "SELECT id, event_type, payload, status, retry_count, created_at, last_error, next_retry_at, lease_token, lease_expires_at FROM rume_outbox WHERE status = 'failed' ORDER BY created_at ASC LIMIT ?1"
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let rows = sqlx::query(SQLITE_OUTBOX_FETCH_FAILED_SQL)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let mut messages = Vec::with_capacity(rows.len());
             for row in rows {
@@ -905,13 +907,11 @@ impl OutboxRepository for SqliteBackend {
     fn reprocess_failed(&self, id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
         let id_str = id.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_outbox SET status = 'pending', retry_count = 0, last_error = NULL, next_retry_at = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?1 AND status = 'failed'"
-            )
-            .bind(&id_str)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(SQLITE_OUTBOX_REPROCESS_FAILED_SQL)
+                .bind(&id_str)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(OutboxError::Repository(format!(
@@ -928,21 +928,12 @@ impl OutboxRepository for SqliteBackend {
         limit: usize,
     ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
-            let res = sqlx::query(
-                "DELETE FROM rume_outbox \
-                 WHERE id IN ( \
-                     SELECT id FROM rume_outbox \
-                     WHERE status = 'published' \
-                       AND created_at <= unixepoch() - ?1 \
-                     ORDER BY created_at ASC \
-                     LIMIT ?2 \
-                 )",
-            )
-            .bind(older_than_secs as i64)
-            .bind(limit as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            let res = sqlx::query(SQLITE_OUTBOX_PURGE_PUBLISHED_SQL)
+                .bind(older_than_secs as i64)
+                .bind(limit as i64)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             Ok(res.rows_affected() as usize)
         })

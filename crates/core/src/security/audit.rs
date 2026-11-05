@@ -134,6 +134,10 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     /// Backward compatibility alias.
     pub const SCHEMA: &'static str = Self::POSTGRES_SCHEMA;
 
+    /// Count query for total recorded audit logs.
+    pub const AUDIT_COUNT_SQL: &'static str =
+        include_str!("../persistence/sql/postgres/audit_count.sql");
+
     /// Returns the schema DDL for the specified dialect.
     pub fn schema_for_dialect(dialect: &str) -> &'static str {
         match dialect {
@@ -167,7 +171,7 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     pub async fn count(&self) -> Result<usize, AuditError> {
         let count_str = self
             .backend
-            .query_scalar("SELECT count(*) FROM rume_audit_log")
+            .query_scalar(Self::AUDIT_COUNT_SQL)
             .await
             .map_err(|e| AuditError::Sink(e.to_string()))?
             .unwrap_or_else(|| "0".to_string());

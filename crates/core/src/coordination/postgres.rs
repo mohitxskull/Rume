@@ -18,6 +18,18 @@ const LOCK_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/lock_rene
 const LEADER_ACQUIRE_SQL: &str = include_str!("../persistence/sql/postgres/leader_acquire.sql");
 const LEADER_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/leader_renew.sql");
 
+// Per-operation coordination SQL, externalized from inline string literals.
+const COORD_PRUNE_LOCKS_SQL: &str =
+    include_str!("../persistence/sql/postgres/coordination_prune_locks.sql");
+const COORD_RELEASE_LOCK_SQL: &str =
+    include_str!("../persistence/sql/postgres/coordination_release_lock.sql");
+const COORD_PRUNE_LEADERS_SQL: &str =
+    include_str!("../persistence/sql/postgres/coordination_prune_leaders.sql");
+const COORD_GET_LEADER_SQL: &str =
+    include_str!("../persistence/sql/postgres/coordination_get_leader.sql");
+const COORD_RESIGN_LEADER_SQL: &str =
+    include_str!("../persistence/sql/postgres/coordination_resign_leader.sql");
+
 /// PostgreSQL-backed implementation of [`DistributedLock`].
 #[derive(Clone)]
 pub struct PostgresDistributedLock {
@@ -57,7 +69,7 @@ impl PostgresDistributedLock {
 
     /// Prunes expired locks from the database to prevent unbounded table bloat.
     pub async fn prune_expired(&self) -> Result<usize, CoordinationError> {
-        let res = sqlx::query("DELETE FROM rume_locks WHERE expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT")
+        let res = sqlx::query(COORD_PRUNE_LOCKS_SQL)
             .execute(&self.pool)
             .await
             .map_err(|e| CoordinationError::Backend(e.to_string()))?;
@@ -124,7 +136,7 @@ impl DistributedLock for PostgresDistributedLock {
 
     fn release<'a>(&'a self, guard: LockGuard) -> CoordinationFuture<'a, bool> {
         Box::pin(async move {
-            let stmt = "DELETE FROM rume_locks WHERE resource = $1 AND lease_id = $2";
+            let stmt = COORD_RELEASE_LOCK_SQL;
             let res = sqlx::query(stmt)
                 .bind(&guard.resource)
                 .bind(&guard.lease_id)
@@ -176,7 +188,7 @@ impl PostgresLeaderElector {
 
     /// Prunes expired leader leases from the database.
     pub async fn prune_expired(&self) -> Result<usize, CoordinationError> {
-        let res = sqlx::query("DELETE FROM rume_leaders WHERE expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT")
+        let res = sqlx::query(COORD_PRUNE_LEADERS_SQL)
             .execute(&self.pool)
             .await
             .map_err(|e| CoordinationError::Backend(e.to_string()))?;
@@ -258,7 +270,7 @@ impl LeaderElector for PostgresLeaderElector {
     fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<LeaderLease>> {
         let r = role.to_string();
         Box::pin(async move {
-            let stmt = "SELECT role, candidate_id, term FROM rume_leaders WHERE role = $1 AND expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT";
+            let stmt = COORD_GET_LEADER_SQL;
             let row = sqlx::query(stmt)
                 .bind(&r)
                 .fetch_optional(&self.pool)
@@ -291,7 +303,7 @@ impl LeaderElector for PostgresLeaderElector {
         let r = role.to_string();
         let cid = candidate_id.to_string();
         Box::pin(async move {
-            let stmt = "DELETE FROM rume_leaders WHERE role = $1 AND candidate_id = $2";
+            let stmt = COORD_RESIGN_LEADER_SQL;
             let res = sqlx::query(stmt)
                 .bind(&r)
                 .bind(&cid)

@@ -23,11 +23,7 @@ const MYSQL_MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.
 const SQLITE_MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
 
 /// Canonical DDL for the migration tracking ledger table across all database backends.
-pub const CREATE_MIGRATIONS_TABLE_DDL: &str = "CREATE TABLE IF NOT EXISTS rume_migrations (\
-     id VARCHAR(255) PRIMARY KEY, \
-     name VARCHAR(255) NOT NULL DEFAULT '', \
-     applied_at BIGINT NOT NULL, \
-     checksum VARCHAR(64) NOT NULL DEFAULT '')";
+pub const CREATE_MIGRATIONS_TABLE_DDL: &str = PG_MIGRATIONS_SCHEMA;
 
 /// Returns the dialect-specific DDL for creating the `rume_migrations` table.
 pub fn migrations_schema_ddl(dialect: &str) -> &'static str {
@@ -39,40 +35,60 @@ pub fn migrations_schema_ddl(dialect: &str) -> &'static str {
     }
 }
 
+// Per-dialect migration query SQL, externalized from inline string literals.
+const PG_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/postgres/migration_find_checksum.sql");
+const PG_MIGRATION_INSERT: &str = include_str!("sql/postgres/migration_insert.sql");
+const PG_MIGRATION_DELETE: &str = include_str!("sql/postgres/migration_delete.sql");
+const PG_MIGRATION_FIND_ID: &str = include_str!("sql/postgres/migration_find_id.sql");
+const PG_MIGRATION_LIST_APPLIED: &str = include_str!("sql/postgres/migration_list_applied.sql");
+const PG_ADVISORY_LOCK: &str = include_str!("sql/postgres/pg_advisory_lock.sql");
+const PG_CLOCK: &str = include_str!("sql/postgres/pg_clock.sql");
+
+const MYSQL_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/mysql/migration_find_checksum.sql");
+const MYSQL_MIGRATION_INSERT: &str = include_str!("sql/mysql/migration_insert.sql");
+const MYSQL_MIGRATION_DELETE: &str = include_str!("sql/mysql/migration_delete.sql");
+const MYSQL_MIGRATION_FIND_ID: &str = include_str!("sql/mysql/migration_find_id.sql");
+const MYSQL_CLOCK: &str = include_str!("sql/mysql/mysql_clock.sql");
+
+const SQLITE_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/sqlite/migration_find_checksum.sql");
+const SQLITE_MIGRATION_INSERT: &str = include_str!("sql/sqlite/migration_insert.sql");
+const SQLITE_MIGRATION_DELETE: &str = include_str!("sql/sqlite/migration_delete.sql");
+const SQLITE_MIGRATION_FIND_ID: &str = include_str!("sql/sqlite/migration_find_id.sql");
+const SQLITE_CLOCK: &str = include_str!("sql/sqlite/sqlite_clock.sql");
+
 fn find_checksum_query(dialect: &str) -> &'static str {
-    if dialect == "postgres" {
-        "SELECT checksum FROM rume_migrations WHERE id = $1"
-    } else {
-        "SELECT checksum FROM rume_migrations WHERE id = ?"
+    match dialect {
+        "postgres" => PG_MIGRATION_FIND_CHECKSUM,
+        "mysql" => MYSQL_MIGRATION_FIND_CHECKSUM,
+        _ => SQLITE_MIGRATION_FIND_CHECKSUM,
     }
 }
 
 fn insert_migration_query(dialect: &str) -> &'static str {
-    if dialect == "postgres" {
-        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES ($1, $2, $3, $4)"
-    } else {
-        "INSERT INTO rume_migrations (id, name, applied_at, checksum) VALUES (?, ?, ?, ?)"
+    match dialect {
+        "postgres" => PG_MIGRATION_INSERT,
+        "mysql" => MYSQL_MIGRATION_INSERT,
+        _ => SQLITE_MIGRATION_INSERT,
     }
 }
 
 fn delete_migration_query(dialect: &str) -> &'static str {
-    if dialect == "postgres" {
-        "DELETE FROM rume_migrations WHERE id = $1"
-    } else {
-        "DELETE FROM rume_migrations WHERE id = ?"
+    match dialect {
+        "postgres" => PG_MIGRATION_DELETE,
+        "mysql" => MYSQL_MIGRATION_DELETE,
+        _ => SQLITE_MIGRATION_DELETE,
     }
 }
 
 fn find_migration_id_query(dialect: &str) -> &'static str {
-    if dialect == "postgres" {
-        "SELECT id FROM rume_migrations WHERE id = $1"
-    } else {
-        "SELECT id FROM rume_migrations WHERE id = ?"
+    match dialect {
+        "postgres" => PG_MIGRATION_FIND_ID,
+        "mysql" => MYSQL_MIGRATION_FIND_ID,
+        _ => SQLITE_MIGRATION_FIND_ID,
     }
 }
 
-const LIST_APPLIED_MIGRATIONS_SQL: &str =
-    "SELECT id, applied_at FROM rume_migrations ORDER BY applied_at ASC";
+const LIST_APPLIED_MIGRATIONS_SQL: &str = PG_MIGRATION_LIST_APPLIED;
 
 /// A single versioned database migration step.
 #[derive(Clone)]
@@ -308,8 +324,7 @@ impl Migrator {
 
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
-            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)")
-                .await?;
+            tx.execute(PG_ADVISORY_LOCK).await?;
             tx.execute(ddl).await?;
 
             let mut applied = Vec::new();
@@ -334,11 +349,7 @@ impl Migrator {
                                 message: err.to_string(),
                             })?;
                     }
-                    let now = if let Ok(Some(s)) = tx
-                        .query_scalar(
-                            "SELECT (EXTRACT(EPOCH FROM clock_timestamp()))::BIGINT::text",
-                        )
-                        .await
+                    let now = if let Ok(Some(s)) = tx.query_scalar(PG_CLOCK).await
                         && let Ok(ts) = s.parse::<u64>()
                     {
                         ts
@@ -388,8 +399,8 @@ impl Migrator {
                         })?;
                 }
                 let clock_query = match dialect {
-                    "mysql" => Some("SELECT UNIX_TIMESTAMP()"),
-                    "sqlite" => Some("SELECT CAST(strftime('%s', 'now') AS TEXT)"),
+                    "mysql" => Some(MYSQL_CLOCK),
+                    "sqlite" => Some(SQLITE_CLOCK),
                     _ => None,
                 };
                 let now = if let Some(query) = clock_query
@@ -430,8 +441,7 @@ impl Migrator {
 
         if dialect == "postgres" {
             let tx = backend.begin_transaction().await?;
-            tx.execute("SELECT pg_advisory_xact_lock(714285723490812734)")
-                .await?;
+            tx.execute(PG_ADVISORY_LOCK).await?;
             tx.execute(ddl).await?;
 
             for migration in self.migrations.iter().rev() {

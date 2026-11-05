@@ -25,6 +25,22 @@ const JOBS_CLAIM_SQL: &str = include_str!("../persistence/sql/postgres/jobs_clai
 const INSERT_JOB_SQL: &str = include_str!("../persistence/sql/postgres/jobs_insert.sql");
 const JOBS_REAP_SQL: &str = include_str!("../persistence/sql/postgres/jobs_reap.sql");
 
+// Per-operation jobs SQL, externalized from inline string literals.
+const JOBS_PENDING_COUNT_SQL: &str =
+    include_str!("../persistence/sql/postgres/jobs_pending_count.sql");
+const JOBS_DEAD_LETTER_COUNT_SQL: &str =
+    include_str!("../persistence/sql/postgres/jobs_dead_letter_count.sql");
+const JOBS_IDEMPOTENCY_CHECK_SQL: &str =
+    include_str!("../persistence/sql/postgres/jobs_idempotency_check.sql");
+const JOBS_ACK_SQL: &str = include_str!("../persistence/sql/postgres/jobs_ack.sql");
+const JOBS_NACK_SQL: &str = include_str!("../persistence/sql/postgres/jobs_nack.sql");
+const JOBS_DEAD_LETTER_SQL: &str = include_str!("../persistence/sql/postgres/jobs_dead_letter.sql");
+const JOBS_RENEW_LEASE_SQL: &str = include_str!("../persistence/sql/postgres/jobs_renew_lease.sql");
+const JOBS_LIST_DEAD_LETTERS_SQL: &str =
+    include_str!("../persistence/sql/postgres/jobs_list_dead_letters.sql");
+const JOBS_REPLAY_DEAD_LETTER_SQL: &str =
+    include_str!("../persistence/sql/postgres/jobs_replay_dead_letter.sql");
+
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]
 pub struct PostgresJobQueue {
@@ -135,14 +151,12 @@ impl JobQueue for PostgresJobQueue {
                 let inserted_id: String = r.try_get(0).unwrap_or(id);
                 Ok(inserted_id)
             } else if let Some(ref ikey) = idempotency_key {
-                let existing = sqlx::query(
-                    "SELECT id FROM rume_jobs WHERE COALESCE(tenant_id, '') = COALESCE($1, '') AND idempotency_key = $2 AND status NOT IN ('dead_letter', 'purged')"
-                )
-                .bind(&tenant_id)
-                .bind(ikey)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(|e| JobError::Fatal(e.to_string()))?;
+                let existing = sqlx::query(JOBS_IDEMPOTENCY_CHECK_SQL)
+                    .bind(&tenant_id)
+                    .bind(ikey)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
 
                 if let Some(erow) = existing {
                     let existing_id: String = erow
@@ -243,14 +257,12 @@ impl JobQueue for PostgresJobQueue {
         let jid = job_id.to_string();
         let token = lease_token.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'completed', completed_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT, lease_expires_at = NULL WHERE id = $1 AND lease_token = $2 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
-            )
-            .bind(&jid)
-            .bind(&token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_ACK_SQL)
+                .bind(&jid)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
@@ -271,15 +283,13 @@ impl JobQueue for PostgresJobQueue {
         Box::pin(async move {
             let delay_ms = delay.as_millis() as i64;
 
-            let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'pending', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
-            )
-            .bind(delay_ms)
-            .bind(&job.id)
-            .bind(&token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_NACK_SQL)
+                .bind(delay_ms)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
@@ -300,15 +310,13 @@ impl JobQueue for PostgresJobQueue {
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let token = lease_token.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'dead_letter', assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = $1, dead_lettered_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
-            )
-            .bind(&reason)
-            .bind(&job.id)
-            .bind(&token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_DEAD_LETTER_SQL)
+                .bind(&reason)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
@@ -334,18 +342,13 @@ impl JobQueue for PostgresJobQueue {
             // lease decisions are made by the database clock, not the worker clock.
             let extension_ms = extension.as_millis() as i64;
 
-            let res = sqlx::query(
-                "UPDATE rume_jobs \
-                 SET lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 \
-                 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' \
-                   AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT"
-            )
-            .bind(extension_ms)
-            .bind(&jid)
-            .bind(&token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_RENEW_LEASE_SQL)
+                .bind(extension_ms)
+                .bind(&jid)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
@@ -375,7 +378,7 @@ impl JobQueue for PostgresJobQueue {
 
     fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
         Box::pin(async move {
-            let row = sqlx::query("SELECT count(*) FROM rume_jobs WHERE status = 'pending'")
+            let row = sqlx::query(JOBS_PENDING_COUNT_SQL)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -387,7 +390,7 @@ impl JobQueue for PostgresJobQueue {
 
     fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
         Box::pin(async move {
-            let row = sqlx::query("SELECT count(*) FROM rume_jobs WHERE status = 'dead_letter'")
+            let row = sqlx::query(JOBS_DEAD_LETTER_COUNT_SQL)
                 .fetch_one(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -399,13 +402,11 @@ impl JobQueue for PostgresJobQueue {
 
     fn list_dead_letters(&self, limit: usize) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
         Box::pin(async move {
-            let rows = sqlx::query(
-                "SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token FROM rume_jobs WHERE status = 'dead_letter' ORDER BY dead_lettered_at DESC LIMIT $1"
-            )
-            .bind(limit as i64)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let rows = sqlx::query(JOBS_LIST_DEAD_LETTERS_SQL)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             let mut jobs = Vec::new();
             for r in rows {
@@ -452,13 +453,11 @@ impl JobQueue for PostgresJobQueue {
     fn replay_dead_letter(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let jid = job_id.to_string();
         Box::pin(async move {
-            let res = sqlx::query(
-                "UPDATE rume_jobs SET status = 'pending', attempt = 0, assigned_worker = NULL, lease_expires_at = NULL, lease_token = NULL, dead_letter_reason = NULL, dead_lettered_at = NULL, available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT WHERE id = $1 AND status = 'dead_letter'"
-            )
-            .bind(&jid)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_REPLAY_DEAD_LETTER_SQL)
+                .bind(&jid)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(

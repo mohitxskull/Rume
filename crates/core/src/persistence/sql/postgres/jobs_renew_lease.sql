@@ -1,0 +1,1 @@
+UPDATE rume_jobs SET lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 WHERE id = $2 AND lease_token = $3 AND status = 'in_flight' AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT

@@ -10,6 +10,13 @@ use crate::persistence::row::DbRow;
 /// Pinned boxed future type alias for async database traits.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Default audit log insert SQL for PostgreSQL backend.
+const BACKEND_AUDIT_INSERT_POSTGRES: &str = include_str!("sql/postgres/audit_insert.sql");
+/// Default audit log insert SQL for MySQL backend.
+const BACKEND_AUDIT_INSERT_MYSQL: &str = include_str!("sql/mysql/audit_insert.sql");
+/// Default audit log insert SQL for SQLite backend.
+const BACKEND_AUDIT_INSERT_SQLITE: &str = include_str!("sql/sqlite/audit_insert.sql");
+
 /// A portable SQL parameter value supported across database backends.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DbValue {
@@ -274,9 +281,11 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let is_postgres = self.dialect() == "postgres";
         let stmt = if is_postgres {
-            "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)"
+            BACKEND_AUDIT_INSERT_POSTGRES
+        } else if self.dialect() == "mysql" {
+            BACKEND_AUDIT_INSERT_MYSQL
         } else {
-            "INSERT INTO rume_audit_log (id, action, resource, status, actor_id, target_id, ip_address, metadata, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+            BACKEND_AUDIT_INSERT_SQLITE
         };
         let params = vec![
             DbValue::from(id),
