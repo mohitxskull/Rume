@@ -29,23 +29,23 @@ url.workspace = true
 # TOML configuration files.
 toml.workspace = true
 # Optional JSON Schema generation.
-schemars = { version = "1.2.3", optional = true, features = ["derive"] }
-serde_json = "1.0.154"
+schemars = { version = "=1.2.3", optional = true, features = ["derive"] }
+serde_json = "=1.0.154"
 # Tracing/logging.
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 # Tower utilities for testing and middleware.
-tower = "0.5.3"
+tower = "=0.5.3"
 # Request validation.
 garde = { workspace = true, features = ["derive", "email", "url"] }
-uuid = { version = "1.29.0", features = ["v4"] }
-sha2 = "0.10.9"
-hmac = "0.12.1"
+uuid = { version = "=1.29.0", features = ["v4"] }
+sha2 = "=0.11.1"
+hmac = "=0.13.0"
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
-quick-xml = { version = "0.42.0", optional = true }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream"], optional = true }
-rume-macros = { path = "../rume-macros", version = "0.1.0" }
+quick-xml = { version = "=0.42.0", optional = true }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"], optional = true }
+rume-macros = { path = "../rume-macros", version = "=0.1.0" }
 
 [[bin]]
 name = "rume-crash-harness"
@@ -63,13 +63,13 @@ saml = ["dep:quick-xml"]
 enterprise = ["saml"]
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile = "=3.27.0"
 testcontainers-modules = { workspace = true }
-insta = { version = "1.49", features = ["json"] }
-rstest = "0.28"
-wiremock = "0.6"
-ureq = "3.5"
-proptest = "1.6"
+insta = { version = "=1.49.0", features = ["json"] }
+rstest = "=0.28.0"
+wiremock = "=0.6.5"
+ureq = "=3.5.1"
+proptest = "=1.12.0"
 
 [[test]]
 name = "integration"

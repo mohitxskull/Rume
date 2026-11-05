@@ -22,27 +22,27 @@ license = "MIT OR Apache-2.0"
 [workspace.dependencies]
 rume = { path = "rume", version = "0.1.0" }
 
-axum = "0.8.9"
-tower = "0.5.3"
-tokio = { version = "1.54.1", features = ["full", "test-util"] }
-serde = { version = "1.0.229", features = ["derive"] }
-tracing = "0.1.44"
-thiserror = "2.0.21"
-secrecy = { version = "0.10.3", features = ["serde"] }
-figment = { version = "0.10.19", features = ["toml", "env"] }
-dotenvy = "0.15.7"
-url = { version = "2.5.8", features = ["serde"] }
-toml = "1.1.8"
-serde_json = "1.0.139"
+axum = "=0.8.9"
+tower = "=0.5.3"
+tokio = { version = "=1.54.1", features = ["full", "test-util"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+tracing = "=0.1.44"
+thiserror = "=2.0.21"
+secrecy = { version = "=0.10.3", features = ["serde"] }
+figment = { version = "=0.10.19", features = ["toml", "env"] }
+dotenvy = "=0.15.7"
+url = { version = "=2.5.8", features = ["serde"] }
+toml = "1.2.0"
+serde_json = "1.0.154"
 
-clap = { version = "4.6.7", features = ["derive"] }
-tempfile = "3.15.0"
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
-deadpool-redis = "0.23.1"
-redis = { version = "1.8", default-features = false, features = ["tokio-comp", "script"] }
-futures-util = { version = "0.3.34", default-features = false, features = ["std"] }
-testcontainers-modules = { version = "0.15", features = ["postgres", "redis", "mysql"] }
-garde = { version = "0.23.0", features = ["derive", "email", "url"] }
+clap = { version = "=4.6.7", features = ["derive"] }
+tempfile = "3.27.0"
+sqlx = { version = "=0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
+deadpool-redis = "=0.23.1"
+redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
+testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
+garde = { version = "=0.23.0", features = ["derive", "email", "url"] }
 
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,
