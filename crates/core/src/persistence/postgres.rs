@@ -25,7 +25,7 @@ const INSERT_OUTBOX_SQL: &str = include_str!("sql/postgres/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/postgres/outbox_recover.sql");
 
 // Per-operation PostgreSQL SQL, externalized from inline string literals.
-const PG_PING_SQL: &str = include_str!("sql/postgres/ping.sql");
+const PG_PING_SQL: &str = include_str!("sql/common/ping.sql");
 const PG_AUDIT_INSERT_SQL: &str = include_str!("sql/postgres/audit_insert.sql");
 const PG_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/postgres/outbox_claim_lease.sql");
 const PG_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/postgres/outbox_renew_lease.sql");

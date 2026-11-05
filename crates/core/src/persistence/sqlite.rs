@@ -27,7 +27,7 @@ const INSERT_OUTBOX_SQL: &str = include_str!("sql/sqlite/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/sqlite/outbox_recover.sql");
 
 // Per-operation SQLite SQL, externalized from inline string literals.
-const SQLITE_PING_SQL: &str = include_str!("sql/sqlite/ping.sql");
+const SQLITE_PING_SQL: &str = include_str!("sql/common/ping.sql");
 const SQLITE_AUDIT_INSERT_SQL: &str = include_str!("sql/sqlite/audit_insert.sql");
 const SQLITE_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_claim_lease.sql");
 const SQLITE_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_renew_lease.sql");

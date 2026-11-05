@@ -136,7 +136,7 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
 
     /// Count query for total recorded audit logs.
     pub const AUDIT_COUNT_SQL: &'static str =
-        include_str!("../persistence/sql/postgres/audit_count.sql");
+        include_str!("../persistence/sql/common/audit_count.sql");
 
     /// Returns the schema DDL for the specified dialect.
     pub fn schema_for_dialect(dialect: &str) -> &'static str {

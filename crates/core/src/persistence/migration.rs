@@ -40,7 +40,7 @@ const PG_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/postgres/migration_fi
 const PG_MIGRATION_INSERT: &str = include_str!("sql/postgres/migration_insert.sql");
 const PG_MIGRATION_DELETE: &str = include_str!("sql/postgres/migration_delete.sql");
 const PG_MIGRATION_FIND_ID: &str = include_str!("sql/postgres/migration_find_id.sql");
-const PG_MIGRATION_LIST_APPLIED: &str = include_str!("sql/postgres/migration_list_applied.sql");
+const PG_MIGRATION_LIST_APPLIED: &str = include_str!("sql/common/migration_list_applied.sql");
 const PG_ADVISORY_LOCK: &str = include_str!("sql/postgres/pg_advisory_lock.sql");
 const PG_CLOCK: &str = include_str!("sql/postgres/pg_clock.sql");
 

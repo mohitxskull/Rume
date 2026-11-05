@@ -25,7 +25,7 @@ const INSERT_OUTBOX_SQL: &str = include_str!("sql/mysql/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/mysql/outbox_recover.sql");
 
 // Per-operation MySQL SQL, externalized from inline string literals.
-const MYSQL_PING_SQL: &str = include_str!("sql/mysql/ping.sql");
+const MYSQL_PING_SQL: &str = include_str!("sql/common/ping.sql");
 const MYSQL_AUDIT_INSERT_SQL: &str = include_str!("sql/mysql/audit_insert.sql");
 const MYSQL_SET_ISOLATION_LEVEL_SQL: &str = include_str!("sql/mysql/set_isolation_level.sql");
 const MYSQL_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/mysql/outbox_claim_lease.sql");
