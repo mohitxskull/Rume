@@ -304,6 +304,7 @@ async fn test_redis_sliding_window_rate_limiter() {
     let config = RateLimitConfig {
         max_requests: 3,
         window: Duration::from_millis(500),
+        ..Default::default()
     };
 
     let limiter = RedisRateLimiter::new(pool, config);
@@ -533,6 +534,67 @@ async fn test_redis_idempotency_store() {
         .await
         .expect("acquire 4");
     assert_eq!(s4, IdempotencyStatus::New);
+}
+
+#[tokio::test]
+async fn test_redis_idempotency_store_token_fencing_and_heartbeat_renewal() {
+    let (_container, backend) = setup_redis_backend().await;
+    let pool = backend.pool().clone();
+    let store = RedisIdempotencyStore::new(pool);
+    let key = "fencing-test-key-42";
+
+    // 1. Worker A acquires key with token-A
+    let status_a = store
+        .try_acquire_with_token(key, "token-A", Duration::from_secs(60))
+        .await
+        .expect("acquire token-A");
+    assert_eq!(status_a, IdempotencyStatus::New);
+
+    // 2. Worker B attempts to complete or release with token-B -> fails closed with Fatal error
+    let comp_err = store
+        .complete_with_token(key, "token-B", Some(b"fake-completion".to_vec()))
+        .await;
+    assert!(
+        matches!(comp_err, Err(rume::jobs::JobError::Fatal(_))),
+        "complete with wrong token must fail closed with Fatal, got: {comp_err:?}"
+    );
+
+    let rel_err = store.release_with_token(key, "token-B").await;
+    assert!(
+        matches!(rel_err, Err(rume::jobs::JobError::Fatal(_))),
+        "release with wrong token must fail closed with Fatal, got: {rel_err:?}"
+    );
+
+    // 3. Worker B attempts to extend lock with token-B -> fails closed with Fatal error
+    let ext_err = store
+        .extend_lock_with_token(key, "token-B", Duration::from_secs(120))
+        .await;
+    assert!(
+        matches!(ext_err, Err(rume::jobs::JobError::Fatal(_))),
+        "extend with wrong token must fail closed with Fatal, got: {ext_err:?}"
+    );
+
+    // 4. Worker A extends its own lock -> succeeds
+    store
+        .extend_lock_with_token(key, "token-A", Duration::from_secs(120))
+        .await
+        .expect("extend lock with correct token-A must succeed");
+
+    // 5. Worker A completes the key -> succeeds
+    store
+        .complete_with_token(key, "token-A", Some(b"actual-result".to_vec()))
+        .await
+        .expect("complete with correct token-A must succeed");
+
+    // 6. Verification: subsequent acquire sees Completed
+    let status_after = store
+        .try_acquire_with_token(key, "token-C", Duration::from_secs(60))
+        .await
+        .expect("subsequent acquire");
+    assert_eq!(
+        status_after,
+        IdempotencyStatus::Completed(Some(b"actual-result".to_vec()))
+    );
 }
 
 #[tokio::test]

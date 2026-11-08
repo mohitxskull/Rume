@@ -53,7 +53,10 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
 /// Thread-safe in-memory tenant quota store suitable for testing and single-instance deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryTenantQuotaStore {
-    counts: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, usize>>>,
+    keys: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
+    >,
+    leases: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, usize>>>,
 }
 
 impl InMemoryTenantQuotaStore {
@@ -71,12 +74,12 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     ) -> BoxFuture<'a, Result<bool, CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let mut map = self.counts.write().await;
-            let count = map.entry(tid).or_insert(0);
-            if *count >= max_keys {
+            let mut map = self.leases.write().await;
+            let current = map.entry(tid).or_insert(0);
+            if *current >= max_keys {
                 Ok(false)
             } else {
-                *count += 1;
+                *current += 1;
                 Ok(true)
             }
         })
@@ -85,9 +88,49 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     fn release<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let mut map = self.counts.write().await;
-            if let Some(count) = map.get_mut(&tid) {
-                *count = count.saturating_sub(1);
+            let mut map = self.leases.write().await;
+            if let Some(current) = map.get_mut(&tid) {
+                *current = current.saturating_sub(1);
+            }
+            Ok(())
+        })
+    }
+
+    fn record_key<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key: &'a str,
+        _ttl: Option<std::time::Duration>,
+        max_keys: usize,
+    ) -> BoxFuture<'a, Result<bool, CacheError>> {
+        let tid = tenant_id.to_string();
+        let k = key.to_string();
+        Box::pin(async move {
+            let mut map = self.keys.write().await;
+            let set = map.entry(tid).or_default();
+            if set.contains(&k) {
+                // Key already exists for this tenant: repeated writes/updates do not consume additional quota
+                Ok(true)
+            } else if set.len() >= max_keys {
+                Ok(false)
+            } else {
+                set.insert(k);
+                Ok(true)
+            }
+        })
+    }
+
+    fn remove_key<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key: &'a str,
+    ) -> BoxFuture<'a, Result<(), CacheError>> {
+        let tid = tenant_id.to_string();
+        let k = key.to_string();
+        Box::pin(async move {
+            let mut map = self.keys.write().await;
+            if let Some(set) = map.get_mut(&tid) {
+                set.remove(&k);
             }
             Ok(())
         })
@@ -96,16 +139,18 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     fn count<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<usize, CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let map = self.counts.read().await;
-            Ok(map.get(&tid).copied().unwrap_or(0))
+            let map = self.keys.read().await;
+            Ok(map.get(&tid).map(|s| s.len()).unwrap_or(0))
         })
     }
 
     fn reset<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let mut map = self.counts.write().await;
-            map.remove(&tid);
+            let mut keys = self.keys.write().await;
+            keys.remove(&tid);
+            let mut leases = self.leases.write().await;
+            leases.remove(&tid);
             Ok(())
         })
     }

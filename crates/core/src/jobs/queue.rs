@@ -29,14 +29,16 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     }
 
     /// Enqueues a typed job with an initial execution delay and explicit W3C trace context.
+    ///
+    /// This is the canonical enqueue primitive that backends must implement.
+    /// [`JobQueue::enqueue`], [`JobQueue::enqueue_delayed`], and [`JobQueue::enqueue_with_trace`]
+    /// delegate strictly one-way to this method, preventing circular delegation.
     fn enqueue_delayed_with_trace<J: Job>(
         &self,
         job: J,
         delay: Duration,
-        _trace_context: Option<String>,
-    ) -> BoxFuture<'_, Result<String, JobError>> {
-        self.enqueue_delayed(job, delay)
-    }
+        trace_context: Option<String>,
+    ) -> BoxFuture<'_, Result<String, JobError>>;
 
     /// Enqueues a typed job for immediate execution with explicit W3C trace context.
     fn enqueue_with_trace<J: Job>(
@@ -131,5 +133,131 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
                 "replay_dead_letter not supported by this queue backend (job_id={id})"
             )))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct DummyJob {
+        val: u32,
+    }
+
+    impl Job for DummyJob {
+        const NAME: &'static str = "dummy";
+    }
+
+    #[derive(Debug)]
+    struct RecordedJob {
+        name: String,
+        delay: Duration,
+        trace: Option<String>,
+    }
+
+    #[derive(Debug, Default)]
+    struct MinimalQueue {
+        recorded: std::sync::Arc<std::sync::Mutex<Vec<RecordedJob>>>,
+    }
+
+    impl JobQueue for MinimalQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            delay: Duration,
+            trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            let mut list = self.recorded.lock().unwrap();
+            list.push(RecordedJob {
+                name: J::NAME.to_string(),
+                delay,
+                trace: trace_context,
+            });
+            Box::pin(async move { Ok("custom-id-123".to_string()) })
+        }
+
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn renew_lease(
+            &self,
+            _job_id: &str,
+            _worker_id: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn ack(&self, _job_id: &str, _worker_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _worker_id: &str,
+            _backoff: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _worker_id: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_minimal_job_queue_one_way_delegation_no_recursion() {
+        let q = MinimalQueue::default();
+        let id1 = q
+            .enqueue(DummyJob { val: 1 })
+            .await
+            .expect("enqueue succeeds");
+        assert_eq!(id1, "custom-id-123");
+
+        let id2 = q
+            .enqueue_delayed(DummyJob { val: 2 }, Duration::from_millis(50))
+            .await
+            .expect("enqueue_delayed succeeds");
+        assert_eq!(id2, "custom-id-123");
+
+        let id3 = q
+            .enqueue_with_trace(DummyJob { val: 3 }, Some("trace-xyz".into()))
+            .await
+            .expect("enqueue_with_trace succeeds");
+        assert_eq!(id3, "custom-id-123");
+
+        let list = q.recorded.lock().unwrap();
+        assert_eq!(list.len(), 3);
+        assert_eq!(list[0].name, "dummy");
+        assert_eq!(list[0].delay, Duration::ZERO);
+        assert_eq!(list[1].delay, Duration::from_millis(50));
+        assert_eq!(list[2].trace.as_deref(), Some("trace-xyz"));
     }
 }

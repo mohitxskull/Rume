@@ -192,8 +192,8 @@ impl WorkerHandle {
 
     /// Signals the worker to stop, waits for in-flight jobs to complete, and awaits all tasks.
     ///
-    /// Returns `true` if cleanly shut down within `timeout`, or `false` if jobs or tasks remained.
-    pub async fn shutdown(mut self, timeout: Duration) -> bool {
+    /// Does not consume `self`, allowing the caller to inspect task status or retry if shutdown times out.
+    pub async fn try_shutdown(&mut self, timeout: Duration) -> bool {
         self.is_stopping.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
         let start = std::time::Instant::now();
@@ -213,22 +213,35 @@ impl WorkerHandle {
         }
 
         // 3. Await heartbeat task if present
-        if let Some(mut hb) = self.heartbeat_task.take() {
+        if let Some(hb) = self.heartbeat_task.as_mut() {
             let remaining = timeout.saturating_sub(start.elapsed());
-            if !await_supervised_task(&mut hb, remaining, "worker_heartbeat").await {
+            if !await_supervised_task(hb, remaining, "worker_heartbeat").await {
                 return false;
             }
         }
 
         // 4. Await recovery task if present
-        if let Some(mut rec) = self.recovery_task.take() {
+        if let Some(rec) = self.recovery_task.as_mut() {
             let remaining = timeout.saturating_sub(start.elapsed());
-            if !await_supervised_task(&mut rec, remaining, "worker_recovery").await {
+            if !await_supervised_task(rec, remaining, "worker_recovery").await {
                 return false;
             }
         }
 
         true
+    }
+
+    /// Signals the worker to stop, waits for in-flight jobs to complete, and awaits all tasks.
+    ///
+    /// If shutdown times out, all remaining background tasks are automatically aborted to prevent
+    /// leaked or orphaned tasks. Returns `true` if cleanly shut down within `timeout`, or `false`
+    /// if aborted after timeout expiration.
+    pub async fn shutdown(mut self, timeout: Duration) -> bool {
+        let clean = self.try_shutdown(timeout).await;
+        if !clean {
+            self.abort_all();
+        }
+        clean
     }
 }
 
@@ -655,8 +668,18 @@ impl<Q: JobQueue> JobWorker<Q> {
                         job_id = %job_id,
                         key = %key,
                         error = %err,
-                        "Failed to acquire idempotency lock"
+                        "Failed to acquire idempotency lock; nacking job with backoff to fail closed"
                     );
+                    if let Err(nack_err) = queue.nack(job, &token, Duration::from_secs(5)).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %nack_err,
+                            "Failed to nack job after idempotency lock acquisition error"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
+                    return;
                 }
             }
         }
@@ -677,6 +700,8 @@ impl<Q: JobQueue> JobWorker<Q> {
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_stopping = Arc::clone(&stopping);
         let hb_lost_leases = Arc::clone(&lost_leases);
+        let hb_idemp_store = idempotency_store.clone();
+        let hb_idemp_key = effective_key.clone();
 
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(hb_interval);
@@ -696,6 +721,11 @@ impl<Q: JobQueue> JobWorker<Q> {
                             hb_cancelled.store(true, Ordering::SeqCst);
                             hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                             break;
+                        }
+                        if let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
+                            && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
+                        {
+                            tracing::warn!(job_id = %hb_jid, key = %k, error = %e, "Failed to extend idempotency lock heartbeat");
                         }
                     }
                 }
@@ -909,10 +939,11 @@ mod tests {
     }
 
     impl JobQueue for BlockingTestQueue {
-        fn enqueue_delayed<J: Job>(
+        fn enqueue_delayed_with_trace<J: Job>(
             &self,
             _job: J,
             _delay: Duration,
+            _trace_context: Option<String>,
         ) -> BoxFuture<'_, Result<String, JobError>> {
             Box::pin(async move { Ok("test-id".to_string()) })
         }
@@ -1111,6 +1142,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_worker_handle_timeout_aborts_tasks() {
+        let is_stopping = Arc::new(AtomicBool::new(false));
+        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let in_flight_count = Arc::new(AtomicU32::new(0));
+        let active_tasks = Arc::new(AtomicU32::new(1));
+
+        // Long-running task that would sleep forever unless aborted
+        let long_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let abort_handle = long_task.abort_handle();
+
+        let mut handle = WorkerHandle {
+            worker_task: long_task,
+            heartbeat_task: None,
+            recovery_task: None,
+            is_stopping,
+            shutdown_notify,
+            in_flight_count,
+            active_tasks,
+        };
+
+        // 1. try_shutdown preserves handle on timeout without aborting immediately
+        let clean = handle.try_shutdown(Duration::from_millis(50)).await;
+        assert!(!clean, "try_shutdown must return false on timeout");
+        assert!(
+            !abort_handle.is_finished(),
+            "task should still be running after try_shutdown"
+        );
+
+        // 2. consuming shutdown aborts remaining tasks on timeout
+        let success = handle.shutdown(Duration::from_millis(50)).await;
+        assert!(!success, "shutdown must return false on timeout");
+
+        // Brief yield to allow the abort to process
+        tokio::task::yield_now().await;
+        // The worker task must have been aborted
+        assert!(
+            abort_handle.is_finished(),
+            "task must be aborted on shutdown timeout"
+        );
+    }
+
+    #[tokio::test]
     async fn test_purge_completed_queue_api() {
         let (enter_tx, _) = mpsc::channel(1);
         let (_, release_rx) = mpsc::channel(1);
@@ -1209,6 +1284,100 @@ mod tests {
             ack_count.load(Ordering::SeqCst),
             0,
             "heartbeat lost job must not be acked"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingIdempotencyStore;
+
+    impl IdempotencyStore for FailingIdempotencyStore {
+        fn try_acquire_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            Box::pin(async move { Err(JobError::Fatal("redis outage".into())) })
+        }
+
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn release_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_idempotency_store_acquisition_failure_fails_closed_and_nacks() {
+        let (enter_tx, _enter_rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let payload_bytes = serde_json::to_vec(&SlowTestJob).unwrap();
+        let job = QueuedJob {
+            id: "job-fail-closed".to_string(),
+            name: SlowTestJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("idemp-fail-key".into()),
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(SlowTestHandler);
+
+        let failing_store = Arc::new(FailingIdempotencyStore);
+
+        JobWorker::execute_job(
+            Arc::clone(&queue),
+            Arc::new(registry),
+            job,
+            Some(failing_store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            nack_count.load(Ordering::SeqCst),
+            1,
+            "job must be nacked when idempotency acquisition fails"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "handler must NOT execute or ack when idempotency acquisition fails"
         );
     }
 }

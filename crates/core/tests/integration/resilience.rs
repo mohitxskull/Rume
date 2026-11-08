@@ -76,6 +76,7 @@ async fn rate_limiting_sliding_window_and_headers() {
     let limiter = RateLimiter::new(RateLimitConfig {
         max_requests: 3,
         window: Duration::from_secs(60),
+        ..Default::default()
     });
 
     let router = rume::routing::Router::new()
@@ -246,6 +247,7 @@ async fn test_rate_limiter_prune_expired_clients() {
     let limiter = RateLimiter::new(RateLimitConfig {
         max_requests: 5,
         window: Duration::from_millis(30),
+        ..Default::default()
     });
 
     assert!(limiter.check("client_temp_1").is_ok());
@@ -303,6 +305,7 @@ async fn test_tenant_extension_rate_limiting() {
     let config = RateLimitConfig {
         max_requests: 2,
         window: Duration::from_secs(60),
+        ..Default::default()
     };
     let limiter = RateLimiter::new(config);
 
@@ -352,4 +355,98 @@ async fn test_tenant_extension_rate_limiting() {
         .insert(Tenant::new("tenant_456", "beta"));
     let res_t2 = app.request(req_t2).await;
     assert_eq!(res_t2.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_rate_limiter_bounds_cardinality_with_inline_eviction() {
+    use std::hash::{Hash, Hasher};
+
+    fn key_for_shard(shard_target: usize, prefix: &str) -> String {
+        for i in 0..10_000 {
+            let candidate = format!("{prefix}_{i}");
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            candidate.hash(&mut hasher);
+            if ((hasher.finish() as usize) % 16) == shard_target {
+                return candidate;
+            }
+        }
+        panic!("could not find key for shard");
+    }
+
+    let config = RateLimitConfig::default()
+        .with_max_requests(1)
+        .with_window(Duration::from_secs(60))
+        .with_max_entries_per_shard(2);
+    let limiter = RateLimiter::new(config);
+
+    // Pick 3 keys that are guaranteed to map to the exact same shard
+    let key_a = key_for_shard(3, "client_a");
+    let key_b = key_for_shard(3, "client_b");
+    let key_c = key_for_shard(3, "client_c");
+
+    // 1. client_A exhausts its rate limit quota
+    assert!(limiter.check(&key_a).is_ok());
+    assert!(
+        limiter.check(&key_a).is_err(),
+        "second request must be rate limited"
+    );
+
+    // Brief sleep to ensure distinct timestamps for oldest-entry eviction
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // 2. client_B exhausts its rate limit quota; shard now has 2 entries (full capacity)
+    assert!(limiter.check(&key_b).is_ok());
+
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    // 3. client_C comes in, exceeding max_entries_per_shard of 2.
+    // The rate limiter must evict the oldest key (client_A) inline to bound memory.
+    assert!(limiter.check(&key_c).is_ok());
+
+    // 4. client_A was evicted, so its rate limit history was cleared; it can make a request again!
+    assert!(
+        limiter.check(&key_a).is_ok(),
+        "client_A should have been evicted when shard capacity was exceeded"
+    );
+}
+
+#[tokio::test]
+async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
+    let config = RateLimitConfig::default()
+        .with_max_requests(2)
+        .with_window(Duration::from_secs(60));
+    let limiter = RateLimiter::new(config);
+
+    let router = rume::routing::Router::new()
+        .get("/api/unauth", || async { "ok" })
+        .layer(RateLimitLayer::new(limiter));
+
+    let app = TestApp::new(router);
+
+    // Request 1 without ConnectInfo uses client_default
+    let req1 = axum::http::Request::builder()
+        .uri("/api/unauth")
+        .header("x-tenant-id", "attacker_tenant_1")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res1 = app.request(req1).await;
+    assert_eq!(res1.status(), StatusCode::OK);
+
+    // Request 2 with different x-tenant-id STILL shares the client bucket because x-tenant-id is unauthenticated
+    let req2 = axum::http::Request::builder()
+        .uri("/api/unauth")
+        .header("x-tenant-id", "attacker_tenant_2")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res2 = app.request(req2).await;
+    assert_eq!(res2.status(), StatusCode::OK);
+
+    // Request 3 is rejected: client_default limit exhausted! Forged tenant header was not honored.
+    let req3 = axum::http::Request::builder()
+        .uri("/api/unauth")
+        .header("x-tenant-id", "attacker_tenant_3")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res3 = app.request(req3).await;
+    assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
 }

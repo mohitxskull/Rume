@@ -82,7 +82,8 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let schemes = self.schemes.clone();
         let require_auth = self.require_auth;
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -260,7 +261,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let policy = self.policy.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let Some(user) = req.extensions().get::<AuthUser>() else {

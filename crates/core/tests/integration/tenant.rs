@@ -385,3 +385,73 @@ async fn test_tenant_cache_delimiter_isolation() {
     assert!(val1_after.is_none());
     assert_eq!(val2_after.as_deref(), Some("value_a_bc"));
 }
+
+#[tokio::test]
+async fn test_tenant_cache_quota_idempotent_key_updates() {
+    let scoped_cache = start_tenant_cache().with_max_keys_per_tenant(2);
+
+    // Repeated updates to the SAME key k1 do not consume additional quota
+    for i in 0..10 {
+        scoped_cache
+            .set("tenant_quota_test", "k1", &format!("val_{i}"), None)
+            .await
+            .expect("key update must succeed");
+    }
+
+    // Tenant can still write a distinct second key k2 (within quota of 2)
+    scoped_cache
+        .set("tenant_quota_test", "k2", &"val_k2", None)
+        .await
+        .expect("second distinct key within quota must succeed");
+
+    // Attempting a third distinct key k3 exceeds quota of 2
+    let err = scoped_cache
+        .set("tenant_quota_test", "k3", &"val_k3", None)
+        .await;
+    assert!(matches!(
+        err,
+        Err(rume::cache::CacheError::QuotaExceeded(_))
+    ));
+
+    // Updating existing key k2 still succeeds!
+    scoped_cache
+        .set("tenant_quota_test", "k2", &"val_k2_updated", None)
+        .await
+        .expect("updating existing key k2 must succeed even when quota is full");
+}
+
+#[tokio::test]
+async fn test_in_memory_tenant_quota_store_lease_churn_never_bypasses_limit() {
+    use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+
+    let store = InMemoryTenantQuotaStore::new();
+    let tenant_id = "tenant_churn_test";
+    let max_leases = 2;
+
+    // Acquire up to limit
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    // Third acquisition must fail
+    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+
+    // Release 1 lease and acquire again in rapid churn cycles
+    for _ in 0..10 {
+        store.release(tenant_id).await.unwrap();
+        // One slot opened up
+        assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+        // Capacity is full again; exceeding limit MUST fail
+        assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+    }
+
+    // Both leases released
+    store.release(tenant_id).await.unwrap();
+    store.release(tenant_id).await.unwrap();
+    // Releasing beyond 0 saturates cleanly at 0
+    store.release(tenant_id).await.unwrap();
+
+    // Now 2 fresh acquisitions succeed
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    // And 3rd still fails
+    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+}

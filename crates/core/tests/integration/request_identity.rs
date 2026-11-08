@@ -539,3 +539,91 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     assert_ne!(worker_sid, incoming_span_id);
     assert_eq!(worker_sid.len(), 16);
 }
+
+struct StrictReadyService {
+    is_ready: bool,
+}
+
+impl Clone for StrictReadyService {
+    fn clone(&self) -> Self {
+        Self { is_ready: false }
+    }
+}
+
+impl tower::Service<axum::http::Request<axum::body::Body>> for StrictReadyService {
+    type Response = axum::response::Response<axum::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::future::Ready<Result<Self::Response, Self::Error>>;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        self.is_ready = true;
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: axum::http::Request<axum::body::Body>) -> Self::Future {
+        assert!(
+            self.is_ready,
+            "call() was invoked on an unpolled service instance clone, violating Tower readiness!"
+        );
+        self.is_ready = false;
+        std::future::ready(Ok(axum::response::Response::new(axum::body::Body::from(
+            "ok",
+        ))))
+    }
+}
+
+#[tokio::test]
+async fn test_tower_readiness_contract_preservation() {
+    let mut svc = tower::ServiceBuilder::new()
+        .layer(rume::app::observability::ObservabilityLayer::new())
+        .service(StrictReadyService { is_ready: false });
+
+    futures_util::future::poll_fn(|cx| tower::Service::poll_ready(&mut svc, cx))
+        .await
+        .unwrap();
+
+    let req = axum::http::Request::builder()
+        .uri("/test")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res = tower::Service::call(&mut svc, req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn test_problem_details_preserves_streaming_oversized_body() {
+    let large_payload = vec![b'x'; 2 * 1024 * 1024]; // 2 MiB > 1 MiB
+    let payload_clone = large_payload.clone();
+
+    let ctx = test_ctx();
+    let builder = Rume::builder(ctx).route(
+        "/large-problem",
+        get(move || {
+            let data = payload_clone.clone();
+            async move {
+                // Return streaming body with application/problem+json and no Content-Length
+                let stream = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(
+                    axum::body::Bytes::from(data),
+                )]);
+                axum::response::Response::builder()
+                    .status(StatusCode::BAD_REQUEST)
+                    .header("content-type", "application/problem+json")
+                    .body(axum::body::Body::from_stream(stream))
+                    .unwrap()
+            }
+        }),
+    );
+    let router = builder.build_router(test_ctx()).unwrap();
+    let app = TestApp::new(router.with_state(test_ctx()));
+
+    let response = app.get("/large-problem").await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // Body MUST be preserved in full and NOT replaced with Body::empty()
+    let bytes = TestApp::body_bytes(response).await;
+    assert_eq!(bytes.len(), 2 * 1024 * 1024);
+    assert_eq!(bytes, large_payload);
+}

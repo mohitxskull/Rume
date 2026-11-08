@@ -49,12 +49,15 @@ const MYSQL_MIGRATION_INSERT: &str = include_str!("sql/mysql/migration_insert.sq
 const MYSQL_MIGRATION_DELETE: &str = include_str!("sql/mysql/migration_delete.sql");
 const MYSQL_MIGRATION_FIND_ID: &str = include_str!("sql/mysql/migration_find_id.sql");
 const MYSQL_CLOCK: &str = include_str!("sql/mysql/mysql_clock.sql");
+const MYSQL_MIGRATION_LOCK: &str = include_str!("sql/mysql/mysql_migration_lock.sql");
+const MYSQL_MIGRATION_UNLOCK: &str = include_str!("sql/mysql/mysql_migration_unlock.sql");
 
 const SQLITE_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/sqlite/migration_find_checksum.sql");
 const SQLITE_MIGRATION_INSERT: &str = include_str!("sql/sqlite/migration_insert.sql");
 const SQLITE_MIGRATION_DELETE: &str = include_str!("sql/sqlite/migration_delete.sql");
 const SQLITE_MIGRATION_FIND_ID: &str = include_str!("sql/sqlite/migration_find_id.sql");
 const SQLITE_CLOCK: &str = include_str!("sql/sqlite/sqlite_clock.sql");
+const SQLITE_BUSY_TIMEOUT: &str = include_str!("sql/sqlite/sqlite_busy_timeout.sql");
 
 fn find_checksum_query(dialect: &str) -> &'static str {
     match dialect {
@@ -226,7 +229,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -300,7 +303,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -333,7 +336,7 @@ impl Migrator {
                 let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
                 if let Some(actual) = stored_checksum {
                     let expected = migration.checksum();
-                    if !actual.is_empty() && actual != expected {
+                    if actual.is_empty() || actual != expected {
                         return Err(PersistenceError::MigrationChecksumMismatch {
                             migration: migration.id.clone(),
                             expected,
@@ -373,6 +376,116 @@ impl Migrator {
             return Ok(MigrationSummary { applied });
         }
 
+        if dialect == "mysql" {
+            let tx = backend.begin_transaction().await?;
+            let lock_res = tx.query_scalar(MYSQL_MIGRATION_LOCK).await?;
+            if lock_res.as_deref() != Some("1") {
+                return Err(PersistenceError::Timeout);
+            }
+            let mut applied = Vec::new();
+            let run_res: Result<(), PersistenceError> = async {
+                tx.execute(ddl).await?;
+                for migration in &self.migrations {
+                    let id_param = [DbValue::from(migration.id.as_str())];
+                    let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
+                    if let Some(actual) = stored_checksum {
+                        let expected = migration.checksum();
+                        if actual.is_empty() || actual != expected {
+                            return Err(PersistenceError::MigrationChecksumMismatch {
+                                migration: migration.id.clone(),
+                                expected,
+                                actual,
+                            });
+                        }
+                    } else {
+                        if let Some(sql) = &migration.up_sql {
+                            tx.execute(sql).await.map_err(|err| {
+                                PersistenceError::MigrationError {
+                                    migration: migration.id.clone(),
+                                    message: err.to_string(),
+                                }
+                            })?;
+                        }
+                        let now = if let Ok(Some(s)) = tx.query_scalar(MYSQL_CLOCK).await
+                            && let Ok(ts) = s.parse::<u64>()
+                        {
+                            ts
+                        } else {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        };
+                        let params = [
+                            DbValue::from(migration.id.as_str()),
+                            DbValue::from(migration.description.as_str()),
+                            DbValue::Int(now as i64),
+                            DbValue::from(migration.checksum().as_str()),
+                        ];
+                        tx.execute_params(insert_sql, &params).await?;
+                        applied.push(migration.id.clone());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = tx.execute(MYSQL_MIGRATION_UNLOCK).await;
+            run_res?;
+            let _ = tx.commit().await;
+            return Ok(MigrationSummary { applied });
+        }
+
+        if dialect == "sqlite" {
+            backend.execute(SQLITE_BUSY_TIMEOUT).await?;
+            let tx = backend.begin_transaction().await?;
+            tx.execute(ddl).await?;
+
+            let mut applied = Vec::new();
+            for migration in &self.migrations {
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
+                if let Some(actual) = stored_checksum {
+                    let expected = migration.checksum();
+                    if actual.is_empty() || actual != expected {
+                        return Err(PersistenceError::MigrationChecksumMismatch {
+                            migration: migration.id.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                } else {
+                    if let Some(sql) = &migration.up_sql {
+                        tx.execute(sql)
+                            .await
+                            .map_err(|err| PersistenceError::MigrationError {
+                                migration: migration.id.clone(),
+                                message: err.to_string(),
+                            })?;
+                    }
+                    let now = if let Ok(Some(s)) = tx.query_scalar(SQLITE_CLOCK).await
+                        && let Ok(ts) = s.parse::<u64>()
+                    {
+                        ts
+                    } else {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    };
+                    let params = [
+                        DbValue::from(migration.id.as_str()),
+                        DbValue::from(migration.description.as_str()),
+                        DbValue::Int(now as i64),
+                        DbValue::from(migration.checksum().as_str()),
+                    ];
+                    tx.execute_params(insert_sql, &params).await?;
+                    applied.push(migration.id.clone());
+                }
+            }
+            tx.commit().await?;
+            return Ok(MigrationSummary { applied });
+        }
+
         backend.execute(ddl).await?;
 
         let mut applied = Vec::new();
@@ -381,7 +494,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -466,6 +579,69 @@ impl Migrator {
             return Ok(None);
         }
 
+        if dialect == "mysql" {
+            let tx = backend.begin_transaction().await?;
+            let lock_res = tx.query_scalar(MYSQL_MIGRATION_LOCK).await?;
+            if lock_res.as_deref() != Some("1") {
+                return Err(PersistenceError::Timeout);
+            }
+            let mut rolled_back = None;
+            let run_res: Result<(), PersistenceError> = async {
+                tx.execute(ddl).await?;
+                for migration in self.migrations.iter().rev() {
+                    let id_param = [DbValue::from(migration.id.as_str())];
+                    let applied = tx.query_scalar_params(check_sql, &id_param).await?;
+                    if applied.is_some() {
+                        let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                            PersistenceError::IrreversibleMigration(migration.id.clone())
+                        })?;
+                        tx.execute(down_sql).await.map_err(|err| {
+                            PersistenceError::MigrationError {
+                                migration: migration.id.clone(),
+                                message: err.to_string(),
+                            }
+                        })?;
+                        tx.execute_params(delete_sql, &id_param).await?;
+                        rolled_back = Some(migration.id.clone());
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            let _ = tx.execute(MYSQL_MIGRATION_UNLOCK).await;
+            run_res?;
+            let _ = tx.commit().await;
+            return Ok(rolled_back);
+        }
+
+        if dialect == "sqlite" {
+            backend.execute(SQLITE_BUSY_TIMEOUT).await?;
+            let tx = backend.begin_transaction().await?;
+            tx.execute(ddl).await?;
+
+            for migration in self.migrations.iter().rev() {
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let applied = tx.query_scalar_params(check_sql, &id_param).await?;
+                if applied.is_some() {
+                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                        PersistenceError::IrreversibleMigration(migration.id.clone())
+                    })?;
+                    tx.execute(down_sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                    tx.execute_params(delete_sql, &id_param).await?;
+                    tx.commit().await?;
+                    return Ok(Some(migration.id.clone()));
+                }
+            }
+            tx.commit().await?;
+            return Ok(None);
+        }
+
         backend.execute(ddl).await?;
 
         for migration in self.migrations.iter().rev() {
@@ -510,7 +686,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,

@@ -19,42 +19,59 @@ pub enum IdempotencyStatus {
 
 /// Storage interface for ensuring exactly-once or at-most-once job processing via idempotency keys.
 pub trait IdempotencyStore: Debug + Send + Sync + 'static {
-    /// Attempts to acquire an idempotency lock for `key` valid for `ttl`.
-    fn try_acquire(
-        &self,
-        key: &str,
-        ttl: Duration,
-    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>>;
-
-    /// Marks the execution as completed, saving an optional result payload.
-    fn complete(&self, key: &str, result: Option<Vec<u8>>) -> BoxFuture<'_, Result<(), JobError>>;
-
-    /// Releases an in-progress lock (e.g. after failure), permitting re-execution.
-    fn release(&self, key: &str) -> BoxFuture<'_, Result<(), JobError>>;
-
     /// Attempts to acquire an idempotency lock for `key` valid for `ttl` with owner token fencing.
     fn try_acquire_with_token(
         &self,
         key: &str,
-        _token: &str,
+        token: &str,
         ttl: Duration,
-    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
-        self.try_acquire(key, ttl)
-    }
+    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>>;
 
     /// Marks the execution as completed with owner token validation, saving an optional result payload.
     fn complete_with_token(
         &self,
         key: &str,
-        _token: &str,
+        token: &str,
         result: Option<Vec<u8>>,
-    ) -> BoxFuture<'_, Result<(), JobError>> {
-        self.complete(key, result)
-    }
+    ) -> BoxFuture<'_, Result<(), JobError>>;
 
     /// Releases an in-progress lock with owner token validation, permitting re-execution.
-    fn release_with_token(&self, key: &str, _token: &str) -> BoxFuture<'_, Result<(), JobError>> {
-        self.release(key)
+    fn release_with_token(&self, key: &str, token: &str) -> BoxFuture<'_, Result<(), JobError>>;
+
+    /// Attempts to acquire an idempotency lock for `key` valid for `ttl` without owner token fencing.
+    ///
+    /// Delegates to [`IdempotencyStore::try_acquire_with_token`] with an empty token.
+    fn try_acquire(
+        &self,
+        key: &str,
+        ttl: Duration,
+    ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+        self.try_acquire_with_token(key, "", ttl)
+    }
+
+    /// Marks the execution as completed, saving an optional result payload.
+    ///
+    /// Delegates to [`IdempotencyStore::complete_with_token`] with an empty token.
+    fn complete(&self, key: &str, result: Option<Vec<u8>>) -> BoxFuture<'_, Result<(), JobError>> {
+        self.complete_with_token(key, "", result)
+    }
+
+    /// Releases an in-progress lock (e.g. after failure), permitting re-execution.
+    ///
+    /// Delegates to [`IdempotencyStore::release_with_token`] with an empty token.
+    fn release(&self, key: &str) -> BoxFuture<'_, Result<(), JobError>> {
+        self.release_with_token(key, "")
+    }
+
+    /// Extends the lease/lock expiration for an in-progress idempotency key if the caller holds the matching token.
+    fn extend_lock_with_token(
+        &self,
+        key: &str,
+        token: &str,
+        extension: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let _ = (key, token, extension);
+        Box::pin(async move { Ok(()) })
     }
 }
 

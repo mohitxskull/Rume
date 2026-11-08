@@ -22,6 +22,10 @@ pub struct RateLimitConfig {
     pub max_requests: u32,
     /// Duration of the sliding time window.
     pub window: Duration,
+    /// Maximum active key entries per memory shard before inline eviction occurs (default: 10,000).
+    pub max_entries_per_shard: usize,
+    /// Trusted reverse proxy IP addresses. When non-empty and socket peer matches, X-Forwarded-For is honored.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for RateLimitConfig {
@@ -29,7 +33,41 @@ impl Default for RateLimitConfig {
         Self {
             max_requests: 100,
             window: Duration::from_secs(60),
+            max_entries_per_shard: 10_000,
+            trusted_proxies: Vec::new(),
         }
+    }
+}
+
+impl RateLimitConfig {
+    /// Sets the maximum allowed requests within the window.
+    pub fn with_max_requests(mut self, max: u32) -> Self {
+        self.max_requests = max;
+        self
+    }
+
+    /// Sets the sliding time window duration.
+    pub fn with_window(mut self, window: Duration) -> Self {
+        self.window = window;
+        self
+    }
+
+    /// Sets the maximum capacity of client keys tracked per memory shard.
+    pub fn with_max_entries_per_shard(mut self, max: usize) -> Self {
+        self.max_entries_per_shard = max.max(1);
+        self
+    }
+
+    /// Adds a trusted reverse proxy IP address for client IP resolution.
+    pub fn with_trusted_proxy(mut self, ip: std::net::IpAddr) -> Self {
+        self.trusted_proxies.push(ip);
+        self
+    }
+
+    /// Sets the list of trusted reverse proxy IP addresses.
+    pub fn with_trusted_proxies(mut self, ips: Vec<std::net::IpAddr>) -> Self {
+        self.trusted_proxies = ips;
+        self
     }
 }
 
@@ -110,6 +148,25 @@ impl RateLimiter {
         let mut clients = Self::shard_for(shards, key).write().unwrap();
         let now = Instant::now();
         let window_start = now.checked_sub(config.window).unwrap_or(now);
+
+        // Prune expired entries inline if shard is at capacity to prevent memory bloat
+        if clients.len() >= config.max_entries_per_shard {
+            clients.retain(|_, entry| {
+                entry.timestamps.retain(|&t| t > window_start);
+                !entry.timestamps.is_empty()
+            });
+
+            // If still at capacity, evict the entry with the oldest recorded timestamp to bound memory
+            if clients.len() >= config.max_entries_per_shard
+                && !clients.contains_key(key)
+                && let Some(oldest_key) = clients
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.timestamps.last().copied().unwrap_or(now))
+                    .map(|(k, _)| k.clone())
+            {
+                clients.remove(&oldest_key);
+            }
+        }
 
         let entry = clients.entry(key.to_string()).or_default();
         // Discard timestamps older than the sliding window
@@ -241,9 +298,11 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let limiter = self.limiter.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // Extract client key (prefer tenant context or header if present for multi-tenant isolation, otherwise trimmed client IP from X-Forwarded-For)
+        // Extract client key:
+        // 1. Authenticated tenant context from request extensions (if present)
         let tenant_key = req
             .extensions()
             .get::<crate::tenant::Tenant>()
@@ -252,20 +311,36 @@ where
                 req.extensions()
                     .get::<crate::tenant::TenantContext>()
                     .map(|tc| format!("tenant:{}", tc.id))
-            })
-            .or_else(|| {
-                req.headers()
-                    .get("x-tenant-id")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|t| format!("tenant:{}", t.trim()))
             });
 
+        // 2. Otherwise derive client identity from socket peer (ConnectInfo) or trusted proxy
         let client_key = tenant_key.unwrap_or_else(|| {
-            req.headers()
-                .get("x-forwarded-for")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|s| s.split(',').next())
-                .map(|ip| format!("ip:{}", ip.trim()))
+            let socket_ip = req
+                .extensions()
+                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+                .map(|ci| ci.0.ip());
+
+            let is_trusted_proxy = socket_ip
+                .map(|ip| {
+                    !limiter.config().trusted_proxies.is_empty()
+                        && limiter.config().trusted_proxies.contains(&ip)
+                })
+                .unwrap_or(false);
+
+            if is_trusted_proxy
+                && let Some(forwarded_ip) = req
+                    .headers()
+                    .get("x-forwarded-for")
+                    .and_then(|h| h.to_str().ok())
+                    .and_then(|s| s.split(',').next())
+                    .map(|ip| ip.trim())
+                    .filter(|ip| !ip.is_empty())
+            {
+                return format!("ip:{}", forwarded_ip);
+            }
+
+            socket_ip
+                .map(|ip| format!("ip:{}", ip))
                 .unwrap_or_else(|| "client_default".to_string())
         });
 

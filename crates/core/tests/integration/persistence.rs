@@ -452,6 +452,52 @@ async fn migration_checksum_mismatch_fails_closed_in_preflight_and_runner() {
 }
 
 #[tokio::test]
+async fn test_migration_empty_checksum_rejected_fails_closed() {
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+    let migration_id = "20261104_001_empty_checksum_test";
+    let migrator = Migrator::new().add_migration(
+        Migration::from_sql(
+            migration_id,
+            "Schema with dummy table",
+            "CREATE TABLE dummy_empty (id TEXT PRIMARY KEY);",
+        )
+        .with_down("DROP TABLE dummy_empty;"),
+    );
+
+    // Apply normally first
+    let summary = migrator.run_pending_backend(&backend).await.unwrap();
+    assert_eq!(summary.applied.len(), 1);
+
+    // Manually tamper the recorded checksum in rume_migrations to be empty string ""
+    backend
+        .execute("UPDATE rume_migrations SET checksum = '' WHERE id = '20261104_001_empty_checksum_test';")
+        .await
+        .unwrap();
+
+    // verify_no_pending_backend must fail closed rather than ignoring empty checksum
+    let verify_res = migrator.verify_no_pending_backend(&backend).await;
+    assert!(
+        matches!(
+            verify_res,
+            Err(PersistenceError::MigrationChecksumMismatch { ref migration, ref actual, .. })
+            if migration == migration_id && actual.is_empty()
+        ),
+        "verify_no_pending must reject empty stored checksum, got: {verify_res:?}"
+    );
+
+    // run_pending_backend must also fail closed
+    let run_res = migrator.run_pending_backend(&backend).await;
+    assert!(
+        matches!(
+            run_res,
+            Err(PersistenceError::MigrationChecksumMismatch { ref migration, ref actual, .. })
+            if migration == migration_id && actual.is_empty()
+        ),
+        "run_pending must reject empty stored checksum, got: {run_res:?}"
+    );
+}
+
+#[tokio::test]
 async fn migrator_with_rume_core_registers_and_applies_core_persistence() {
     let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
 

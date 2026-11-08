@@ -395,7 +395,8 @@ where
             span.record("route", route.as_str());
         }
 
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let req_id_str = request_id.0.clone();
         let trace_parent_str = trace_context.traceparent.clone();
         let span_clone = span.clone();
@@ -451,18 +452,22 @@ where
                         const MAX_PROBLEM_DETAILS_INSPECT: usize = 1024 * 1024; // 1 MiB
                         let (mut parts, body) = response.into_parts();
 
-                        let is_oversized = parts
+                        let should_inspect = match parts
                             .headers
                             .get(CONTENT_LENGTH)
                             .and_then(|val| val.to_str().ok())
                             .and_then(|val| val.parse::<usize>().ok())
-                            .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
-                            .unwrap_or_else(|| {
-                                body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64)
-                            });
+                        {
+                            Some(len) => len <= MAX_PROBLEM_DETAILS_INSPECT,
+                            None => body
+                                .size_hint()
+                                .upper()
+                                .map(|u| u <= MAX_PROBLEM_DETAILS_INSPECT as u64)
+                                .unwrap_or(false),
+                        };
 
-                        if is_oversized {
-                            // Never destroy or truncate oversized responses! Return untouched.
+                        if !should_inspect {
+                            // Never destroy or truncate oversized or streaming responses! Return untouched.
                             return Ok(Response::from_parts(parts, body));
                         }
 

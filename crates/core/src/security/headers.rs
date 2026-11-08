@@ -40,8 +40,10 @@ pub struct SecurityHeadersConfig {
     pub hsts_require_tls: bool,
     /// Whether native TLS is terminated in-process (default: `false`).
     pub native_tls: bool,
-    /// Whether to trust `x-forwarded-proto` and `Forwarded` headers from reverse proxies (default: `true`).
+    /// Whether to trust `x-forwarded-proto` and `Forwarded` headers from reverse proxies (default: `false`).
     pub trust_proxy_headers: bool,
+    /// Explicit opt-in to trust proxy headers from any client IP address (default: `false`).
+    pub trust_all_proxies: bool,
     /// Optional list of trusted proxy IP addresses. When non-empty, proxy headers are only honored if the client IP matches.
     pub trusted_proxies: Vec<std::net::IpAddr>,
 }
@@ -59,7 +61,8 @@ impl Default for SecurityHeadersConfig {
             custom_headers: BTreeMap::new(),
             hsts_require_tls: true,
             native_tls: false,
-            trust_proxy_headers: true,
+            trust_proxy_headers: false,
+            trust_all_proxies: false,
             trusted_proxies: Vec::new(),
         }
     }
@@ -107,14 +110,25 @@ impl SecurityHeadersConfig {
         self
     }
 
-    /// Adds a trusted reverse proxy IP address.
+    /// Explicitly opts in to trusting reverse proxy headers from any client IP address.
+    pub fn with_trust_all_proxies(mut self, trust: bool) -> Self {
+        self.trust_all_proxies = trust;
+        if trust {
+            self.trust_proxy_headers = true;
+        }
+        self
+    }
+
+    /// Adds a trusted reverse proxy IP address and enables proxy header evaluation.
     pub fn with_trusted_proxy(mut self, ip: std::net::IpAddr) -> Self {
+        self.trust_proxy_headers = true;
         self.trusted_proxies.push(ip);
         self
     }
 
-    /// Sets the full list of trusted reverse proxy IP addresses.
+    /// Sets the full list of trusted reverse proxy IP addresses and enables proxy header evaluation.
     pub fn with_trusted_proxies(mut self, ips: Vec<std::net::IpAddr>) -> Self {
+        self.trust_proxy_headers = true;
         self.trusted_proxies = ips;
         self
     }
@@ -184,17 +198,19 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let config = Arc::clone(&self.config);
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         let client_ip = req
             .extensions()
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
         let proxy_trusted = config.trust_proxy_headers
-            && (config.trusted_proxies.is_empty()
-                || client_ip
-                    .map(|ip| config.trusted_proxies.contains(&ip))
-                    .unwrap_or(false));
+            && (config.trust_all_proxies
+                || (!config.trusted_proxies.is_empty()
+                    && client_ip
+                        .map(|ip| config.trusted_proxies.contains(&ip))
+                        .unwrap_or(false)));
 
         let is_https = config.native_tls
             || req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)

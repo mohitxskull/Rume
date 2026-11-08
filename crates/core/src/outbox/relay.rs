@@ -536,21 +536,37 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             if count == 0 {
                 return Ok(true);
             }
-            if start.elapsed() >= timeout {
+            let elapsed = start.elapsed();
+            if elapsed >= timeout {
                 tracing::warn!(
                     remaining = count,
                     "Outbox relay drain timed out with messages remaining"
                 );
                 return Ok(false);
             }
-            let res = self.poll_and_dispatch(50).await?;
+            let remaining = timeout.saturating_sub(elapsed);
+            let res = match tokio::time::timeout(remaining, self.poll_and_dispatch(50)).await {
+                Ok(Ok(res)) => res,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    tracing::warn!(
+                        remaining = count,
+                        "Outbox relay drain timed out during message dispatch"
+                    );
+                    return Ok(false);
+                }
+            };
             if !res.is_success() {
                 return Err(OutboxError::Repository(format!(
                     "outbox relay encountered {} failed state transitions during drain",
                     res.failed_transitions
                 )));
             }
-            sleep(Duration::from_millis(20)).await;
+            let sleep_dur = Duration::from_millis(20).min(timeout.saturating_sub(start.elapsed()));
+            if sleep_dur.is_zero() {
+                return Ok(false);
+            }
+            sleep(sleep_dur).await;
         }
     }
 
