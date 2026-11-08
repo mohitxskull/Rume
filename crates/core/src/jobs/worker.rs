@@ -722,10 +722,25 @@ impl<Q: JobQueue> JobWorker<Q> {
                             hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                             break;
                         }
+                        // 2. Extend distributed idempotency lock heartbeat.
+                        // CRITICAL DISTRIBUTED INVARIANT:
+                        // If lock extension fails (e.g. Redis outage, network partition, or token mismatch where
+                        // another worker claimed the lease), this worker has LOST idempotency ownership.
+                        // Continuing to acknowledge the job upon completion would violate at-most-once/deduplication
+                        // guarantees. Therefore, we immediately set `hb_cancelled = true`, break the heartbeat loop,
+                        // and route the completed job to the dead letter queue (DLQ) without acking.
                         if let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
                             && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
-                            tracing::warn!(job_id = %hb_jid, key = %k, error = %e, "Failed to extend idempotency lock heartbeat");
+                            tracing::error!(
+                                job_id = %hb_jid,
+                                key = %k,
+                                error = %e,
+                                "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
+                            );
+                            hb_cancelled.store(true, Ordering::SeqCst);
+                            hb_lost_leases.fetch_add(1, Ordering::SeqCst);
+                            break;
                         }
                     }
                 }
@@ -1378,6 +1393,207 @@ mod tests {
             ack_count.load(Ordering::SeqCst),
             0,
             "handler must NOT execute or ack when idempotency acquisition fails"
+        );
+    }
+
+    #[derive(Debug)]
+    struct FailingRenewalIdempotencyStore;
+
+    impl IdempotencyStore for FailingRenewalIdempotencyStore {
+        fn try_acquire_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            Box::pin(async move { Ok(IdempotencyStatus::New) })
+        }
+
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn release_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn extend_lock_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move {
+                Err(JobError::Fatal(
+                    "failed to extend idempotency key: token mismatch or lease expired".into(),
+                ))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
+        let (enter_tx, _enter_rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let payload_bytes = serde_json::to_vec(&SlowTestJob).unwrap();
+        let job = QueuedJob {
+            id: "job-renew-fail".to_string(),
+            name: SlowTestJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("idemp-renew-key".into()),
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(SlowTestHandler);
+
+        let failing_store = Arc::new(FailingRenewalIdempotencyStore);
+
+        JobWorker::execute_job(
+            Arc::clone(&queue),
+            Arc::new(registry),
+            job,
+            Some(failing_store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            dlq_count.load(Ordering::SeqCst),
+            1,
+            "job must be routed to DLQ when idempotency renewal heartbeat fails"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "job must NOT be acked when idempotency renewal heartbeat fails"
+        );
+    }
+
+    #[derive(Debug)]
+    struct DefaultUnsupportedStore;
+
+    impl IdempotencyStore for DefaultUnsupportedStore {
+        fn try_acquire_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            Box::pin(async move { Ok(IdempotencyStatus::New) })
+        }
+
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn release_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
+        let (enter_tx, _enter_rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let payload_bytes = serde_json::to_vec(&SlowTestJob).unwrap();
+        let job = QueuedJob {
+            id: "job-unsupported-fail".to_string(),
+            name: SlowTestJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("idemp-unsupported-key".into()),
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(SlowTestHandler);
+
+        let unsupported_store = Arc::new(DefaultUnsupportedStore);
+
+        JobWorker::execute_job(
+            Arc::clone(&queue),
+            Arc::new(registry),
+            job,
+            Some(unsupported_store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            dlq_count.load(Ordering::SeqCst),
+            1,
+            "job must be routed to DLQ when store does not support heartbeat renewal"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "job must NOT be acked when store does not support heartbeat renewal"
         );
     }
 }

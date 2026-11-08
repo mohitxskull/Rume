@@ -64,6 +64,22 @@ pub trait IdempotencyStore: Debug + Send + Sync + 'static {
     }
 
     /// Extends the lease/lock expiration for an in-progress idempotency key if the caller holds the matching token.
+    ///
+    /// # Safety and Distributed Invariants (CRITICAL — DO NOT DEFAULT TO `Ok(())`)
+    /// This method **MUST fail closed** by returning [`JobError::Unsupported`] when unimplemented.
+    ///
+    /// ## Why a silent `Ok(())` default is dangerous:
+    /// In an asynchronous job processing system, long-running jobs depend on heartbeat renewal
+    /// of their idempotency lock. If an idempotency store silently returns `Ok(())` without actually
+    /// extending the TTL in the backend (e.g. Redis `PEXPIRE`), the lock on the remote store will
+    /// expire while the worker is still executing. A second worker or retrying queue will then
+    /// acquire the same idempotency key and execute the job concurrently, causing duplicate external
+    /// side effects (double billing, duplicate emails, etc.).
+    ///
+    /// By returning `Err(JobError::Unsupported)`, custom stores that do not implement heartbeat
+    /// lock extension cause the worker's heartbeat loop to immediately detect that renewal is not
+    /// supported, fail closed, mark the lease as lost, and route the job to DLQ rather than
+    /// falsely assuming idempotency protection.
     fn extend_lock_with_token(
         &self,
         key: &str,
@@ -71,7 +87,11 @@ pub trait IdempotencyStore: Debug + Send + Sync + 'static {
         extension: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let _ = (key, token, extension);
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            Err(JobError::Unsupported(
+                "idempotency lock extension is not supported by this store".into(),
+            ))
+        })
     }
 }
 

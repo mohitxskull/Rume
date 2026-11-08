@@ -523,6 +523,16 @@ impl<R: OutboxRepository> OutboxRelay<R> {
 
     /// Requests shutdown and drains remaining pending messages within `timeout`.
     ///
+    /// # Graceful Shutdown & Absolute Deadline Invariants:
+    /// This method guarantees that shutdown **never hangs** beyond `timeout`, even if the underlying
+    /// database repository experiences transient stalls, high connection latency, or deadlocks.
+    ///
+    /// An absolute deadline (`start + timeout`) is established upfront. Every asynchronous operation
+    /// inside the drain loop—including checking [`OutboxRepository::pending_count`], dispatching batches
+    /// via [`OutboxRelay::poll_and_dispatch`], and inter-batch sleep—is strictly bounded by the
+    /// remaining duration until `deadline`. If any operation exceeds the deadline, it aborts cleanly,
+    /// logs a warning, and returns `Ok(false)` rather than blocking process termination.
+    ///
     /// Returns `Ok(true)` if all messages were drained, `Ok(false)` if the drain
     /// timed out, or `Err(err)` if an unrecoverable repository error occurred while
     /// checking pending count or dispatching messages.
@@ -530,21 +540,40 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         self.is_stopping.store(true, Ordering::SeqCst);
         self.shutdown_notify.notify_waiters();
         let start = std::time::Instant::now();
+        let deadline = start + timeout;
 
         loop {
-            let count = self.repository.pending_count().await?;
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                tracing::warn!("Outbox relay drain timed out");
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+
+            let count = match tokio::time::timeout(remaining, self.repository.pending_count()).await
+            {
+                Ok(Ok(c)) => c,
+                Ok(Err(err)) => return Err(err),
+                Err(_) => {
+                    tracing::warn!("Outbox relay drain timed out while checking pending count");
+                    return Ok(false);
+                }
+            };
+
             if count == 0 {
                 return Ok(true);
             }
-            let elapsed = start.elapsed();
-            if elapsed >= timeout {
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
                 tracing::warn!(
                     remaining = count,
                     "Outbox relay drain timed out with messages remaining"
                 );
                 return Ok(false);
             }
-            let remaining = timeout.saturating_sub(elapsed);
+            let remaining = deadline.saturating_duration_since(now);
+
             let res = match tokio::time::timeout(remaining, self.poll_and_dispatch(50)).await {
                 Ok(Ok(res)) => res,
                 Ok(Err(err)) => return Err(err),
@@ -556,13 +585,20 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     return Ok(false);
                 }
             };
+
             if !res.is_success() {
                 return Err(OutboxError::Repository(format!(
                     "outbox relay encountered {} failed state transitions during drain",
                     res.failed_transitions
                 )));
             }
-            let sleep_dur = Duration::from_millis(20).min(timeout.saturating_sub(start.elapsed()));
+
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            let remaining = deadline.saturating_duration_since(now);
+            let sleep_dur = Duration::from_millis(20).min(remaining);
             if sleep_dur.is_zero() {
                 return Ok(false);
             }

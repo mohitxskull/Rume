@@ -1235,3 +1235,61 @@ async fn outbox_sweeper_purges_published_messages_and_prevents_bloat() {
     assert_eq!(repo.pending_count().await.unwrap(), 0);
     assert_eq!(relay.status().total_purged, 5);
 }
+
+#[derive(Debug)]
+struct StalledPendingCountRepo;
+
+impl OutboxRepository for StalledPendingCountRepo {
+    fn save(&self, _msg: OutboxMessage) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn fetch_pending(
+        &self,
+        _limit: usize,
+    ) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+    fn claim_pending_with_lease(
+        &self,
+        _limit: usize,
+        _secs: u64,
+    ) -> rume::outbox::BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move { Ok(vec![]) })
+    }
+    fn mark_published(
+        &self,
+        _id: &str,
+        _token: &str,
+    ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn pending_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(1)
+        })
+    }
+    fn published_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move { Ok(0) })
+    }
+}
+
+#[tokio::test]
+async fn test_outbox_relay_drain_times_out_when_pending_count_stalls() {
+    let repo = Arc::new(StalledPendingCountRepo);
+    let relay = OutboxRelay::new(repo, |_msg| async { Ok(()) });
+
+    let start = std::time::Instant::now();
+    let res = relay.try_drain(Duration::from_millis(50)).await;
+    let elapsed = start.elapsed();
+
+    assert!(res.is_ok(), "try_drain must return Ok(false) on timeout");
+    assert!(
+        !res.unwrap(),
+        "drain must return false when pending_count timed out"
+    );
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "drain must enforce deadline without blocking on stalled pending_count (took: {elapsed:?})"
+    );
+}

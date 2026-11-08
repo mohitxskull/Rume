@@ -429,9 +429,46 @@ impl Migrator {
                 Ok(())
             }
             .await;
-            let _ = tx.execute(MYSQL_MIGRATION_UNLOCK).await;
-            run_res?;
-            let _ = tx.commit().await;
+
+            if let Err(err) = run_res {
+                // If migration execution failed, rollback changes and release the named lock before returning
+                let _ = tx.execute("ROLLBACK").await;
+                let _ = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+
+            // CRITICAL MYSQL COORDINATION ORDERING (DO NOT REORDER):
+            // In MySQL, `GET_LOCK` and `RELEASE_LOCK` are bound to the specific server thread/connection (`CONNECTION_ID()`).
+            //
+            // 1. Durably commit the transaction:
+            //    We execute `COMMIT` directly on the active connection so that all migration schema and ledger updates
+            //    are 100% committed before another instance can acquire the lock.
+            //    (Releasing the lock before commit would allow a concurrent instance to acquire `rume_migrations_lock`
+            //    and read uncommitted ledger rows or attempt duplicate DDL execution).
+            tx.execute("COMMIT").await?;
+
+            // 2. Release the MySQL named lock on the EXACT SAME connection while it is still active:
+            //    If RELEASE_LOCK were called on a different pooled connection, MySQL would return 0 and refuse to release it.
+            let unlock_res = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+
+            // 3. Finalize the sqlx transaction handle and return connection to the pool:
+            let commit_res = tx.commit().await;
+
+            // 4. Propagate commit errors (never discard with `let _ = tx.commit().await`):
+            commit_res?;
+
+            // 5. Propagate unlock errors:
+            match unlock_res {
+                Ok(Some(s)) if s == "1" => {}
+                Ok(other) => {
+                    return Err(PersistenceError::TransactionError(format!(
+                        "failed to release MySQL migration lock: RELEASE_LOCK returned {other:?}"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+
             return Ok(MigrationSummary { applied });
         }
 
@@ -609,9 +646,39 @@ impl Migrator {
                 Ok(())
             }
             .await;
-            let _ = tx.execute(MYSQL_MIGRATION_UNLOCK).await;
-            run_res?;
-            let _ = tx.commit().await;
+
+            if let Err(err) = run_res {
+                // If rollback execution failed, rollback changes and release the named lock before returning
+                let _ = tx.execute("ROLLBACK").await;
+                let _ = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+
+            // CRITICAL MYSQL COORDINATION ORDERING (DO NOT REORDER):
+            // 1. Durably commit rollback changes on the active connection before releasing the lock:
+            tx.execute("COMMIT").await?;
+
+            // 2. Release the MySQL named lock on the EXACT SAME connection while it is still active:
+            let unlock_res = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+
+            // 3. Finalize the sqlx transaction handle and return connection to the pool:
+            let commit_res = tx.commit().await;
+
+            // 4. Propagate commit errors:
+            commit_res?;
+
+            // 5. Propagate unlock errors:
+            match unlock_res {
+                Ok(Some(s)) if s == "1" => {}
+                Ok(other) => {
+                    return Err(PersistenceError::TransactionError(format!(
+                        "failed to release MySQL migration lock: RELEASE_LOCK returned {other:?}"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+
             return Ok(rolled_back);
         }
 

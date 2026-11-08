@@ -101,6 +101,9 @@ pub struct RateLimiter {
 }
 
 impl RateLimiter {
+    /// Sentinel key used for unmapped identities when an in-memory shard reaches its maximum capacity.
+    pub const OVERFLOW_KEY: &'static str = "__overflow__";
+
     /// Creates a new in-memory rate limiter with the specified configuration.
     pub fn new(config: RateLimitConfig) -> Self {
         let mut shards = Vec::with_capacity(NUM_SHARDS);
@@ -149,26 +152,36 @@ impl RateLimiter {
         let now = Instant::now();
         let window_start = now.checked_sub(config.window).unwrap_or(now);
 
-        // Prune expired entries inline if shard is at capacity to prevent memory bloat
-        if clients.len() >= config.max_entries_per_shard {
-            clients.retain(|_, entry| {
-                entry.timestamps.retain(|&t| t > window_start);
-                !entry.timestamps.is_empty()
-            });
-
-            // If still at capacity, evict the entry with the oldest recorded timestamp to bound memory
-            if clients.len() >= config.max_entries_per_shard
-                && !clients.contains_key(key)
-                && let Some(oldest_key) = clients
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.timestamps.last().copied().unwrap_or(now))
-                    .map(|(k, _)| k.clone())
-            {
-                clients.remove(&oldest_key);
+        let target_key = if clients.contains_key(key) {
+            // Active known identity: always enforce its recorded history.
+            key
+        } else {
+            // 1. Prune expired entries inline if shard is at capacity to free up inactive slots.
+            if clients.len() >= config.max_entries_per_shard {
+                clients.retain(|_, entry| {
+                    entry.timestamps.retain(|&t| t > window_start);
+                    !entry.timestamps.is_empty()
+                });
             }
-        }
 
-        let entry = clients.entry(key.to_string()).or_default();
+            // 2. SECURITY INVARIANT (DO NOT EVICT ACTIVE ENTRIES):
+            // In naive rate-limit implementations, when a cache is full, the oldest entry is evicted
+            // to make room for new keys. Under high cardinality attacks (e.g. an attacker rotating forged
+            // client IPs or IDs), evicting the oldest entry wipes out that client's rate-limiting history!
+            // The attacker can then immediately reuse that client identity with a fresh quota, completely
+            // bypassing rate limits via cache-churn eviction.
+            //
+            // Fix: When the shard remains at capacity after pruning expired entries, any new unmapped identity
+            // is routed to the shared `__overflow__` bucket. This bounds memory strictly to `max_entries_per_shard + 1`,
+            // throttles excess unmapped traffic as a shared group, and NEVER resets the rate limits of active clients.
+            if clients.len() >= config.max_entries_per_shard && !clients.contains_key(key) {
+                Self::OVERFLOW_KEY
+            } else {
+                key
+            }
+        };
+
+        let entry = clients.entry(target_key.to_string()).or_default();
         // Discard timestamps older than the sliding window
         entry.timestamps.retain(|&t| t > window_start);
 
@@ -320,28 +333,16 @@ where
                 .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
                 .map(|ci| ci.0.ip());
 
-            let is_trusted_proxy = socket_ip
-                .map(|ip| {
-                    !limiter.config().trusted_proxies.is_empty()
-                        && limiter.config().trusted_proxies.contains(&ip)
-                })
-                .unwrap_or(false);
+            let forwarded_header = req
+                .headers()
+                .get("x-forwarded-for")
+                .and_then(|h| h.to_str().ok());
 
-            if is_trusted_proxy
-                && let Some(forwarded_ip) = req
-                    .headers()
-                    .get("x-forwarded-for")
-                    .and_then(|h| h.to_str().ok())
-                    .and_then(|s| s.split(',').next())
-                    .map(|ip| ip.trim())
-                    .filter(|ip| !ip.is_empty())
-            {
-                return format!("ip:{}", forwarded_ip);
-            }
-
-            socket_ip
-                .map(|ip| format!("ip:{}", ip))
-                .unwrap_or_else(|| "client_default".to_string())
+            resolve_forwarded_client_ip(
+                socket_ip,
+                forwarded_header,
+                &limiter.config().trusted_proxies,
+            )
         });
 
         Box::pin(async move {
@@ -375,4 +376,60 @@ where
             }
         })
     }
+}
+
+/// Resolves the genuine client IP address from the direct socket peer and optional `X-Forwarded-For` chain.
+///
+/// # Security and Proxy Invariants (CRITICAL — DO NOT USE `s.split(',').next()`)
+///
+/// ## The Spoofing Vulnerability in Naive Parsers:
+/// An HTTP client connects to an edge proxy (e.g., Cloudflare, ALB, Nginx). If the client sends an initial header
+/// `X-Forwarded-For: 1.1.1.1`, the proxy appends the client's actual IP (`203.0.113.195`), producing:
+/// `X-Forwarded-For: 1.1.1.1, 203.0.113.195`.
+///
+/// A naive parser that takes the first IP (`s.split(',').next()`) trusts the attacker-controlled `1.1.1.1`.
+/// The attacker can rotate this header on every request to obtain a fresh rate limit bucket, completely bypassing
+/// IP-based rate limiting, geofencing, and security auditing!
+///
+/// ## Secure Right-to-Left (RTL) Proxy Chain Evaluation:
+/// Intermediate reverse proxies append IPs to the **right** of `X-Forwarded-For`.
+/// 1. If the direct socket peer (`socket_ip`) is missing or not in `trusted_proxies`, `X-Forwarded-For` is completely ignored.
+///    The untrusted socket peer is used directly as the client identity.
+/// 2. If the direct socket peer is in `trusted_proxies`, `X-Forwarded-For` is parsed from right to left (`rsplit(',')`).
+/// 3. Any IP belonging to `trusted_proxies` is an internal proxy hop and is safely skipped.
+/// 4. The **first untrusted IP** encountered from the right is the genuine client IP that connected to our trusted proxy edge.
+/// 5. If all IPs in the chain belong to trusted proxies, the leftmost valid IP is used as the originator.
+pub fn resolve_forwarded_client_ip(
+    socket_ip: Option<std::net::IpAddr>,
+    forwarded_header: Option<&str>,
+    trusted_proxies: &[std::net::IpAddr],
+) -> String {
+    let Some(peer) = socket_ip else {
+        return "client_default".to_string();
+    };
+
+    if trusted_proxies.is_empty() || !trusted_proxies.contains(&peer) {
+        return format!("ip:{peer}");
+    }
+
+    if let Some(chain) = forwarded_header {
+        let mut last_valid_ip = None;
+        for hop in chain.rsplit(',') {
+            let trimmed = hop.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
+                if !trusted_proxies.contains(&ip) {
+                    return format!("ip:{ip}");
+                }
+                last_valid_ip = Some(ip);
+            }
+        }
+        if let Some(leftmost) = last_valid_ip {
+            return format!("ip:{leftmost}");
+        }
+    }
+
+    format!("ip:{peer}")
 }

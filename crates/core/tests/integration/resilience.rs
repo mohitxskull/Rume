@@ -358,7 +358,7 @@ async fn test_tenant_extension_rate_limiting() {
 }
 
 #[tokio::test]
-async fn test_rate_limiter_bounds_cardinality_with_inline_eviction() {
+async fn test_rate_limiter_overflow_bucket_preserves_active_clients() {
     use std::hash::{Hash, Hasher};
 
     fn key_for_shard(shard_target: usize, prefix: &str) -> String {
@@ -379,35 +379,88 @@ async fn test_rate_limiter_bounds_cardinality_with_inline_eviction() {
         .with_max_entries_per_shard(2);
     let limiter = RateLimiter::new(config);
 
-    // Pick 3 keys that are guaranteed to map to the exact same shard
+    // Pick 4 keys that are guaranteed to map to the exact same shard
     let key_a = key_for_shard(3, "client_a");
     let key_b = key_for_shard(3, "client_b");
     let key_c = key_for_shard(3, "client_c");
+    let key_d = key_for_shard(3, "client_d");
 
     // 1. client_A exhausts its rate limit quota
     assert!(limiter.check(&key_a).is_ok());
     assert!(
         limiter.check(&key_a).is_err(),
-        "second request must be rate limited"
+        "second request for client_A must be rate limited"
     );
-
-    // Brief sleep to ensure distinct timestamps for oldest-entry eviction
-    tokio::time::sleep(Duration::from_millis(10)).await;
 
     // 2. client_B exhausts its rate limit quota; shard now has 2 entries (full capacity)
     assert!(limiter.check(&key_b).is_ok());
-
-    tokio::time::sleep(Duration::from_millis(10)).await;
-
-    // 3. client_C comes in, exceeding max_entries_per_shard of 2.
-    // The rate limiter must evict the oldest key (client_A) inline to bound memory.
-    assert!(limiter.check(&key_c).is_ok());
-
-    // 4. client_A was evicted, so its rate limit history was cleared; it can make a request again!
     assert!(
-        limiter.check(&key_a).is_ok(),
-        "client_A should have been evicted when shard capacity was exceeded"
+        limiter.check(&key_b).is_err(),
+        "second request for client_B must be rate limited"
     );
+
+    // 3. client_C arrives when shard is at capacity.
+    // Rather than evicting client_A, client_C is routed to the shared __overflow__ bucket.
+    assert!(
+        limiter.check(&key_c).is_ok(),
+        "client_C uses first request of __overflow__ bucket"
+    );
+
+    // 4. client_D also arrives; since __overflow__ bucket already consumed its 1 request, client_D is limited.
+    assert!(
+        limiter.check(&key_d).is_err(),
+        "client_D must be rate limited by saturated __overflow__ bucket"
+    );
+
+    // 5. Critical security invariant: client_A was NOT evicted, so it CANNOT bypass rate limiting!
+    assert!(
+        limiter.check(&key_a).is_err(),
+        "client_A must remain rate limited; new keys cannot evict active clients"
+    );
+}
+
+#[test]
+fn test_resolve_forwarded_client_ip_chain_security() {
+    use rume::resilience::rate_limiter::resolve_forwarded_client_ip;
+    use std::net::IpAddr;
+
+    let trusted_proxy_1: IpAddr = "10.0.0.1".parse().unwrap();
+    let trusted_proxy_2: IpAddr = "10.0.0.2".parse().unwrap();
+    let trusted = vec![trusted_proxy_1, trusted_proxy_2];
+
+    let untrusted_peer: IpAddr = "198.51.100.5".parse().unwrap();
+    let real_client: IpAddr = "203.0.113.195".parse().unwrap();
+
+    // 1. Untrusted peer: ignores X-Forwarded-For completely
+    let spoofed = "1.1.1.1, 8.8.8.8";
+    let res = resolve_forwarded_client_ip(Some(untrusted_peer), Some(spoofed), &trusted);
+    assert_eq!(res, format!("ip:{untrusted_peer}"));
+
+    // 2. Missing socket peer
+    let res_none = resolve_forwarded_client_ip(None, Some(spoofed), &trusted);
+    assert_eq!(res_none, "client_default");
+
+    // 3. Trusted immediate proxy, single client in chain
+    let res_single =
+        resolve_forwarded_client_ip(Some(trusted_proxy_1), Some("203.0.113.195"), &trusted);
+    assert_eq!(res_single, format!("ip:{real_client}"));
+
+    // 4. Trusted immediate proxy, intermediate trusted proxy, untrusted client, spoofed prefix
+    // Header format: <spoofed_attacker_ip>, <real_client_ip>, <intermediate_trusted_proxy>
+    let complex_chain = "1.1.1.1, 203.0.113.195, 10.0.0.2";
+    let res_chain =
+        resolve_forwarded_client_ip(Some(trusted_proxy_1), Some(complex_chain), &trusted);
+    assert_eq!(
+        res_chain,
+        format!("ip:{real_client}"),
+        "must pick the first untrusted IP from the right, ignoring spoofed leftmost IP"
+    );
+
+    // 5. All hops in chain are trusted proxies
+    let all_trusted_chain = "10.0.0.2, 10.0.0.1";
+    let res_all_trusted =
+        resolve_forwarded_client_ip(Some(trusted_proxy_1), Some(all_trusted_chain), &trusted);
+    assert_eq!(res_all_trusted, "ip:10.0.0.2");
 }
 
 #[tokio::test]

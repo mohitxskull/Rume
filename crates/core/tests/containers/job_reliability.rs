@@ -90,6 +90,53 @@ async fn idempotency_store_lifecycle() {
 }
 
 #[tokio::test]
+async fn idempotency_store_extend_lock_token_validation() {
+    let (_node, pool) = start_redis_pool().await;
+    let store = RedisIdempotencyStore::new(pool);
+
+    let key = format!("req_ext_{}", uuid::Uuid::new_v4());
+    let token_a = "token-owner-a";
+    let token_b = "token-imposter-b";
+
+    // 1. Acquire with token A
+    let status = store
+        .try_acquire_with_token(&key, token_a, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(status, IdempotencyStatus::New);
+
+    // 2. Imposter cannot extend lock
+    let err_b = store
+        .extend_lock_with_token(&key, token_b, Duration::from_secs(10))
+        .await;
+    assert!(
+        err_b.is_err(),
+        "extending lock with mismatched token must fail"
+    );
+
+    // 3. Genuine owner can extend lock
+    store
+        .extend_lock_with_token(&key, token_a, Duration::from_secs(10))
+        .await
+        .expect("genuine owner must be able to extend lock");
+
+    // 4. Complete with token A
+    store
+        .complete_with_token(&key, token_a, Some(b"done".to_vec()))
+        .await
+        .expect("complete with token A");
+
+    // 5. Extending completed lock must fail
+    let err_completed = store
+        .extend_lock_with_token(&key, token_a, Duration::from_secs(10))
+        .await;
+    assert!(
+        err_completed.is_err(),
+        "extending completed idempotency key must fail"
+    );
+}
+
+#[tokio::test]
 async fn worker_heartbeat_tracking_and_reaping() {
     let (_node, pool) = start_redis_pool().await;
     let tracker = RedisHeartbeatRegistry::new(pool)

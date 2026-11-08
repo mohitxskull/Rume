@@ -6,7 +6,8 @@ use testcontainers_modules::mysql::Mysql;
 
 use rume::outbox::{OutboxMessage, OutboxRepository, OutboxStatus, TransactionalOutbox};
 use rume::persistence::{
-    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, MysqlBackend,
+    DatabaseBackend, DatabaseConfig, DatabasePool, DatabaseTransaction, Migration, Migrator,
+    MysqlBackend,
 };
 
 use crate::common;
@@ -400,4 +401,93 @@ async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
         .expect("count")
         .expect("count present");
     assert_eq!(count, "3");
+}
+
+#[tokio::test]
+async fn test_mysql_migration_lock_ordering_and_durability() {
+    let (_node, backend, _config) = start_mysql_node().await;
+
+    let migrator = Migrator::new().add_migration(
+        Migration::from_sql(
+            "20261108_01_init",
+            "create users table",
+            "CREATE TABLE test_users (id INT PRIMARY KEY, name VARCHAR(50));",
+        )
+        .with_down("DROP TABLE test_users;"),
+    );
+
+    // 1. Run pending migrations: must acquire named lock, commit transaction, and release named lock
+    let summary = migrator
+        .run_pending_backend(&backend)
+        .await
+        .expect("run_pending_backend should succeed");
+    assert_eq!(summary.applied, vec!["20261108_01_init".to_string()]);
+
+    // 2. Ledger must be durably committed
+    let count = backend
+        .query_scalar("SELECT count(*) FROM rume_migrations WHERE id = '20261108_01_init'")
+        .await
+        .expect("query ledger")
+        .expect("count present");
+    assert_eq!(count, "1", "migration row must be durably committed");
+
+    // 3. Named lock must be released so another connection can acquire it immediately.
+    // NOTE: In MySQL, GET_LOCK and RELEASE_LOCK are connection-bound. We execute both on the same
+    // transaction connection handle `tx_lock` so that RELEASE_LOCK releases the lock before returning to pool.
+    let tx_lock = backend
+        .begin_transaction()
+        .await
+        .expect("begin tx to probe lock");
+    let lock_res = tx_lock
+        .query_scalar("SELECT GET_LOCK('rume_migrations_lock', 0)")
+        .await
+        .expect("acquire named lock")
+        .expect("lock result present");
+    assert_eq!(
+        lock_res, "1",
+        "named lock must be released after run_pending"
+    );
+    tx_lock
+        .execute("SELECT RELEASE_LOCK('rume_migrations_lock')")
+        .await
+        .expect("release lock");
+    tx_lock.commit().await.expect("commit probe tx");
+
+    // 4. Rollback last migration
+    let rolled_back = migrator
+        .rollback_last_backend(&backend)
+        .await
+        .expect("rollback should succeed");
+    assert_eq!(rolled_back, Some("20261108_01_init".to_string()));
+
+    // 5. Ledger row must be removed
+    let count_after = backend
+        .query_scalar("SELECT count(*) FROM rume_migrations WHERE id = '20261108_01_init'")
+        .await
+        .expect("query ledger")
+        .expect("count present");
+    assert_eq!(
+        count_after, "0",
+        "migration row must be deleted on rollback"
+    );
+
+    // 6. Named lock must be released after rollback
+    let tx_lock2 = backend
+        .begin_transaction()
+        .await
+        .expect("begin tx to probe lock");
+    let lock_res2 = tx_lock2
+        .query_scalar("SELECT GET_LOCK('rume_migrations_lock', 0)")
+        .await
+        .expect("acquire named lock")
+        .expect("lock result present");
+    assert_eq!(
+        lock_res2, "1",
+        "named lock must be released after rollback_last"
+    );
+    tx_lock2
+        .execute("SELECT RELEASE_LOCK('rume_migrations_lock')")
+        .await
+        .expect("release lock");
+    tx_lock2.commit().await.expect("commit probe tx");
 }
