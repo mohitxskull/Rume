@@ -703,7 +703,7 @@ impl<Q: JobQueue> JobWorker<Q> {
         });
 
         let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            registry.dispatch_with_cancellation(&job, Some(job_cancelled))
+            registry.dispatch_with_cancellation(&job, Some(Arc::clone(&job_cancelled)))
         })) {
             Ok(fut) => match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
                 Ok(res) => res,
@@ -717,24 +717,53 @@ impl<Q: JobQueue> JobWorker<Q> {
 
         match dispatch_result {
             Ok(()) => {
-                if let Err(err) = queue.ack(&job_id, &token).await {
-                    tracing::error!(
+                if job_cancelled.load(Ordering::SeqCst) {
+                    tracing::warn!(
                         job_id = %job_id,
-                        error = %err,
-                        "Failed to ack job; lease may have expired or state mismatch"
+                        "Job execution completed after lease was lost; routing to dead letter queue"
                     );
-                    transition_errors.fetch_add(1, Ordering::SeqCst);
-                    lost_leases.fetch_add(1, Ordering::SeqCst);
-                }
-                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                    && let Err(err) = store.complete_with_token(key, &token, None).await
-                {
-                    tracing::error!(
-                        job_id = %job_id,
-                        key = %key,
-                        error = %err,
-                        "Failed to record idempotency completion"
-                    );
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                        && let Err(err) = store.release_with_token(key, &token).await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            key = %key,
+                            error = %err,
+                            "Failed to release idempotency token on lease loss"
+                        );
+                    }
+                    if let Err(err) = queue
+                        .dead_letter(job, &token, "lease lost during execution".into())
+                        .await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %err,
+                            "Failed to dead-letter job after lost lease"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
+                } else {
+                    if let Err(err) = queue.ack(&job_id, &token).await {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %err,
+                            "Failed to ack job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                        && let Err(err) = store.complete_with_token(key, &token, None).await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            key = %key,
+                            error = %err,
+                            "Failed to record idempotency completion"
+                        );
+                    }
                 }
             }
             Err(JobError::Fatal(msg))
@@ -874,6 +903,9 @@ mod tests {
         enter_tx: mpsc::Sender<()>,
         release_rx: Mutex<mpsc::Receiver<()>>,
         nack_count: Arc<AtomicUsize>,
+        ack_count: Arc<AtomicUsize>,
+        dlq_count: Arc<AtomicUsize>,
+        fail_renew: bool,
     }
 
     impl JobQueue for BlockingTestQueue {
@@ -916,6 +948,7 @@ mod tests {
         }
 
         fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            self.ack_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
         }
 
@@ -937,7 +970,25 @@ mod tests {
             _lease_token: &str,
             _reason: String,
         ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.dlq_count.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move { Ok(()) })
+        }
+
+        fn renew_lease(
+            &self,
+            _job_id: &str,
+            _lease_token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            if self.fail_renew {
+                Box::pin(async move { Err(JobError::Fatal("lease renewal failed".into())) })
+            } else {
+                Box::pin(async move { Ok(()) })
+            }
+        }
+
+        fn purge_completed(&self, _retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
+            Box::pin(async { Ok(5) })
         }
 
         fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
@@ -981,6 +1032,9 @@ mod tests {
             enter_tx,
             release_rx: Mutex::new(release_rx),
             nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::new(AtomicUsize::new(0)),
+            dlq_count: Arc::new(AtomicUsize::new(0)),
+            fail_renew: false,
         });
 
         let executions = Arc::new(AtomicUsize::new(0));
@@ -1053,6 +1107,108 @@ mod tests {
         assert!(
             !success,
             "WorkerHandle::shutdown must return false when a task panics"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_purge_completed_queue_api() {
+        let (enter_tx, _) = mpsc::channel(1);
+        let (_, release_rx) = mpsc::channel(1);
+        let queue = BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::new(AtomicUsize::new(0)),
+            ack_count: Arc::new(AtomicUsize::new(0)),
+            dlq_count: Arc::new(AtomicUsize::new(0)),
+            fail_renew: false,
+        };
+
+        let purged = queue
+            .purge_completed(Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert_eq!(purged, 5);
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SlowTestJob;
+    impl Job for SlowTestJob {
+        const NAME: &'static str = "SlowTestJob";
+    }
+
+    struct SlowTestHandler;
+    impl JobHandler<SlowTestJob> for SlowTestHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: SlowTestJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_heartbeat_loss_routes_to_dlq() {
+        let (enter_tx, _) = mpsc::channel(1);
+        let (_, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let payload_bytes = serde_json::to_vec(&SlowTestJob).unwrap();
+        let job = QueuedJob {
+            id: "job-dlq-test".to_string(),
+            name: SlowTestJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: true,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(SlowTestHandler);
+
+        JobWorker::execute_job(
+            Arc::clone(&queue),
+            Arc::new(registry),
+            job,
+            None,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            dlq_count.load(Ordering::SeqCst),
+            1,
+            "heartbeat lost job must route to DLQ"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "heartbeat lost job must not be acked"
         );
     }
 }

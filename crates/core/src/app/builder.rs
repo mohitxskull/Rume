@@ -1082,6 +1082,28 @@ where
         //   Response Exit: Handler -> Group (last -> first) -> Individual (last -> first)
         // we wrap the inner router with group members in reverse order, then wrap
         // with individual middleware in reverse order.
+        // Capture and record MatchedPath on the active tracing span if routes are present
+        let router = if !ctx.route_registry.is_empty() {
+            router.route_layer(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if let Some(mp) = req
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .cloned()
+                    {
+                        tracing::Span::current().record("route", mp.as_str());
+                        let mut resp = next.run(req).await;
+                        resp.extensions_mut().insert(mp);
+                        resp
+                    } else {
+                        next.run(req).await
+                    }
+                },
+            ))
+        } else {
+            router
+        };
+
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx);
 
         // 1. Apply group middleware (innermost middleware layers)

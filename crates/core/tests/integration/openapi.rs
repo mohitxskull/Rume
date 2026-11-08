@@ -83,6 +83,53 @@ async fn openapi_generation_from_route_registry() {
             }
           }
         }
+      },
+      "components": {
+        "schemas": {
+          "ProblemDetails": {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "instance": {
+                "format": "uri",
+                "type": "string"
+              },
+              "status": {
+                "type": "integer"
+              },
+              "title": {
+                "type": "string"
+              },
+              "type": {
+                "format": "uri",
+                "type": "string"
+              }
+            },
+            "required": [
+              "title",
+              "status"
+            ],
+            "type": "object"
+          }
+        },
+        "security_schemes": {
+          "apiKeyAuth": {
+            "in": "header",
+            "name": "X-API-Key",
+            "type": "apiKey"
+          },
+          "bearerAuth": {
+            "bearerFormat": "JWT",
+            "scheme": "bearer",
+            "type": "http"
+          },
+          "sessionCookie": {
+            "in": "cookie",
+            "name": "rume_session",
+            "type": "apiKey"
+          }
+        }
       }
     }
     "###);

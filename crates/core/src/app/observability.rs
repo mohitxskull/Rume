@@ -414,6 +414,9 @@ where
 
                     span_clone.record("status", status.as_u16());
                     span_clone.record("latency_ms", latency_ms);
+                    if let Some(mp) = response.extensions().get::<axum::extract::MatchedPath>() {
+                        span_clone.record("route", mp.as_str());
+                    }
 
                     if status.is_server_error() {
                         tracing::error!(status = status.as_u16(), latency_ms, "request failed");
@@ -608,6 +611,46 @@ mod tests {
                 .get("tracestate")
                 .and_then(|h| h.to_str().ok()),
             Some("vendor=val1,other=val2")
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_service_records_matched_path_from_response_extension() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/users/{id}", get(|| async { "user" }))
+            .route_layer(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if let Some(mp) = req
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .cloned()
+                    {
+                        tracing::Span::current().record("route", mp.as_str());
+                        let mut resp = next.run(req).await;
+                        resp.extensions_mut().insert(mp);
+                        resp
+                    } else {
+                        next.run(req).await
+                    }
+                },
+            ))
+            .layer(ObservabilityLayer::new());
+
+        let req = Request::builder()
+            .uri("/users/42")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.expect("service call succeeds");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.extensions()
+                .get::<axum::extract::MatchedPath>()
+                .map(|m| m.as_str()),
+            Some("/users/{id}")
         );
     }
 }

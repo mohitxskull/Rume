@@ -128,6 +128,17 @@ async fn sqlite_auto_migrate_applies_pending_migrations() {
     let pool2 = DatabasePool::new(backend2, config2);
     let res2 = pool2.apply_auto_migrations(&migrator).await.expect("no-op");
     assert!(res2.is_none());
+
+    // When auto_migrate_core is called:
+    let backend3 = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    let config3 = DatabaseConfig::default().with_auto_migrate(true);
+    let pool3 = DatabasePool::new(backend3, config3);
+    let res3 = pool3
+        .apply_auto_migrations_core()
+        .await
+        .expect("core auto migrate");
+    assert!(res3.is_some());
+    assert_eq!(res3.unwrap().applied.len(), 1);
 }
 
 #[tokio::test]

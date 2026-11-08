@@ -110,6 +110,19 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         Ok(Some(summary))
     }
 
+    /// Automatically applies pending core Rume migrations (outbox, jobs, locks, leader)
+    /// if `auto_migrate` is configured.
+    pub async fn apply_auto_migrations_core(
+        &self,
+    ) -> Result<Option<crate::persistence::migration::MigrationSummary>, PersistenceError> {
+        if !self.config.auto_migrate {
+            return Ok(None);
+        }
+        let migrator =
+            crate::persistence::migration::Migrator::new().with_rume_core(self.backend.dialect());
+        self.apply_auto_migrations(&migrator).await
+    }
+
     /// Returns the underlying database backend.
     pub fn backend(&self) -> &B {
         &self.backend

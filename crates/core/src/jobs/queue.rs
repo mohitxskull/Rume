@@ -116,6 +116,13 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         })
     }
 
+    /// Purges completed jobs that finished before the specified retention window, updating status to `'purged'`.
+    ///
+    /// The default implementation returns `Ok(0)`. Backends supporting retention sweeps override this method.
+    fn purge_completed(&self, _retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
+        Box::pin(async { Ok(0) })
+    }
+
     /// Replays a dead-lettered job by resetting its status back to `pending`.
     fn replay_dead_letter(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let id = job_id.to_string();

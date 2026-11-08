@@ -676,9 +676,16 @@ impl OutboxRepository for MysqlBackend {
                     .await
                     .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
+                let exp: i64 =
+                    sqlx::query_scalar("SELECT lease_expires_at FROM rume_outbox WHERE id = ?")
+                        .bind(&msg.id)
+                        .fetch_one(&mut *tx)
+                        .await
+                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);
-                msg.lease_expires_at = None;
+                msg.lease_expires_at = Some(exp as u64);
                 claimed.push(msg);
             }
 
