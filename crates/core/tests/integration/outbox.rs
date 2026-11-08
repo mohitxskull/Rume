@@ -1145,7 +1145,8 @@ async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_c
                     observed.store(true, Ordering::SeqCst);
                     break;
                 }
-                tokio::time::sleep(Duration::from_millis(20)).await;
+                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
             }
             Ok(())
         }

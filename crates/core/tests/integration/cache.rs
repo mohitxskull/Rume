@@ -152,19 +152,19 @@ async fn cache_expiration_and_refresh() {
 
     // Set with short TTL
     cache
-        .set_json("short_lived", &42, Some(Duration::from_millis(150)))
+        .set_json("short_lived", &42, Some(Duration::from_millis(30)))
         .await
         .unwrap();
 
     assert!(cache.exists("short_lived").await.unwrap());
 
-    // Wait for TTL expiration in Redis
+    // Wait for TTL expiration in cache
     let start = std::time::Instant::now();
     while cache.exists("short_lived").await.unwrap() {
-        if start.elapsed() > Duration::from_secs(2) {
+        if start.elapsed() > Duration::from_secs(1) {
             panic!("cache key did not expire in time");
         }
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
     assert!(!cache.exists("short_lived").await.unwrap());
@@ -207,7 +207,7 @@ async fn cache_remember_stampede_singleflight_protection() {
             cache_clone
                 .remember("stampede_key", None, || async move {
                     count_clone.fetch_add(1, Ordering::SeqCst);
-                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    tokio::task::yield_now().await;
                     Ok(Product {
                         id: "shared".into(),
                         title: "Singleflight Product".into(),

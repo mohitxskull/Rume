@@ -309,26 +309,23 @@ mod saml_tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_enterprise_idp_metadata_wiremock_integration() {
-        let mock_server = wiremock::MockServer::start().await;
-        let metadata_xml = r#"<EntityDescriptor entityID="https://mock-idp.example.com"><IDPSSODescriptor /></EntityDescriptor>"#;
-
-        wiremock::Mock::given(wiremock::matchers::method("GET"))
-            .and(wiremock::matchers::path("/saml/metadata"))
-            .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(metadata_xml))
-            .mount(&mock_server)
-            .await;
-
-        let target_url = format!("{}/saml/metadata", mock_server.uri());
-        let mut resp = ureq::get(&target_url)
-            .call()
-            .expect("fetch IdP metadata from mock server");
-        assert_eq!(resp.status(), 200);
-        let body = resp.body_mut().read_to_string().expect("read body");
-        // Verify Rume's SAML parser successfully parses the IdP metadata EntityDescriptor
-        let entity_id = SamlParser::parse_entity_id(&body).expect("parse entity id");
+    #[test]
+    fn test_enterprise_idp_metadata_entity_id_resolution() {
+        let valid_metadata = r#"<EntityDescriptor entityID="https://mock-idp.example.com"><IDPSSODescriptor /></EntityDescriptor>"#;
+        let entity_id = SamlParser::parse_entity_id(valid_metadata).expect("parse valid entity id");
         assert_eq!(entity_id, "https://mock-idp.example.com");
+
+        let missing_id = r#"<EntityDescriptor><IDPSSODescriptor /></EntityDescriptor>"#;
+        assert!(
+            SamlParser::parse_entity_id(missing_id).is_err(),
+            "missing entityID must fail"
+        );
+
+        let malformed = r#"<EntityDescriptor entityID="unclosed"#;
+        assert!(
+            SamlParser::parse_entity_id(malformed).is_err(),
+            "malformed XML must fail"
+        );
     }
 
     #[test]

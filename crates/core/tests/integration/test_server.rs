@@ -163,7 +163,7 @@ async fn test_client_disconnect_during_response_streaming() {
                         if step >= 20 {
                             return None;
                         }
-                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                         flag.store(true, Ordering::SeqCst);
                         Some((
                             Ok::<_, std::io::Error>(format!("data-{step}\n")),
@@ -193,7 +193,7 @@ async fn test_client_disconnect_during_response_streaming() {
     }
 
     // Give server a moment to observe disconnect and clean up task
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    tokio::time::sleep(Duration::from_millis(20)).await;
 
     // Server remains completely healthy and handles subsequent traffic
     let health = server.get("/health").await.expect("health succeeds");
@@ -206,11 +206,17 @@ async fn test_client_disconnect_during_response_streaming() {
 
 #[tokio::test]
 async fn test_graceful_shutdown_with_active_in_flight_requests() {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let entered_clone = Arc::clone(&entered);
     let app = Rume::new().route(
         "/slow-work",
-        get(|| async {
-            tokio::time::sleep(Duration::from_millis(150)).await;
-            "work-completed"
+        get(move || {
+            let entered = Arc::clone(&entered_clone);
+            async move {
+                entered.notify_one();
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                "work-completed"
+            }
         }),
     );
 
@@ -222,8 +228,8 @@ async fn test_graceful_shutdown_with_active_in_flight_requests() {
     // Start in-flight request
     let request_task = tokio::spawn(async move { client.get(&url).send().await });
 
-    // Wait 30ms to ensure the request has arrived and is executing
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Wait until the handler has actively started executing
+    entered.notified().await;
 
     // Trigger graceful shutdown while the request is still executing
     server.shutdown().await.expect("shutdown initiated");

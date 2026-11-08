@@ -41,7 +41,7 @@ async fn pool_lease_capacity_and_exhaustion_invariants_under_load() {
                     "invariant violated: active leases ({count}) exceeded max_connections (5)"
                 );
 
-                tokio::time::sleep(Duration::from_millis(10)).await;
+                tokio::task::yield_now().await;
                 curr.fetch_sub(1, Ordering::SeqCst);
             }
         }));
@@ -72,16 +72,18 @@ async fn pool_close_and_drain_interleaving_with_active_workers() {
     let pool = DatabasePool::new(backend, config);
 
     let started_barrier = Arc::new(tokio::sync::Barrier::new(4));
+    let release_notify = Arc::new(tokio::sync::Notify::new());
     let mut worker_handles = Vec::new();
 
-    // Spawn 3 workers holding leases for 50ms
+    // Spawn 3 workers holding leases until drain begins
     for _ in 0..3 {
         let pool = pool.clone();
         let barrier = Arc::clone(&started_barrier);
+        let release = Arc::clone(&release_notify);
         worker_handles.push(tokio::spawn(async move {
             let _lease = pool.acquire_lease().expect("lease succeeds before close");
             barrier.wait().await;
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            release.notified().await;
         }));
     }
 
@@ -98,6 +100,9 @@ async fn pool_close_and_drain_interleaving_with_active_workers() {
     while !pool.status().is_closed {
         tokio::task::yield_now().await;
     }
+
+    // Release workers so leases can drain
+    release_notify.notify_waiters();
 
     // Concurrently verify that new lease acquisitions are rejected immediately
     for _ in 0..5 {
@@ -138,7 +143,7 @@ async fn singleflight_stampede_protection_interleaving_executes_closure_once() {
                     Some(Duration::from_secs(60)),
                     || async {
                         runs.fetch_add(1, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        tokio::task::yield_now().await;
                         Ok::<_, rume::cache::CacheError>("computed_value".to_string())
                     },
                 )
@@ -184,15 +189,15 @@ fn lifecycle_monotonic_state_transition_under_concurrent_readers() {
     }
 
     // Step through the states monotonically
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::yield_now();
     lifecycle.set(LifecycleState::Booted);
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::yield_now();
     lifecycle.set(LifecycleState::Ready);
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::yield_now();
     lifecycle.set(LifecycleState::Terminating);
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::yield_now();
     lifecycle.set(LifecycleState::Terminated);
-    std::thread::sleep(Duration::from_millis(5));
+    std::thread::yield_now();
 
     stop.store(true, Ordering::Relaxed);
     for reader in readers {
