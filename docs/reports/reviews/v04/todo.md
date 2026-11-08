@@ -134,11 +134,11 @@ Ordered by execution priority `P0`–`P3` (what unblocks what), with shared root
 ### Group K — Test Determinism & Harness Upgrades (solve together)
 > Root cause: Hardcoded wall-clock sleeps and orphaned harness definitions create test flakes and compiler warnings.
 
-- [ ] **Testing M1 — 33 wall-clock `sleep()` calls in test suites** (`testing-feature-matrix.md` M1).
+- [x] **Testing M1 — 33 wall-clock `sleep()` calls in test suites** (`testing-feature-matrix.md` M1).
       `crates/core/tests/`: Adds >12s idle latency and causes timing flakes on loaded runners. Replace wall-clock sleeps with `tokio::sync::Notify`, virtual time, or polling conditions.
-- [ ] **Testing M2 — Orphaned `RumeTestHarness` with zero adoption & compiler warnings** (`testing-feature-matrix.md` M2).
+- [x] **Testing M2 — Orphaned `RumeTestHarness` with zero adoption & compiler warnings** (`testing-feature-matrix.md` M2).
       `crates/core/src/testing/harness.rs:12–65`: Unused in tests and emits warnings under non-sqlite features. Resolve feature gates and integrate into integration suites.
-- [ ] **Testing M3 — Tautological third-party mock test in enterprise integration** (`testing-feature-matrix.md` M3).
+- [x] **Testing M3 — Tautological third-party mock test in enterprise integration** (`testing-feature-matrix.md` M3).
       `crates/core/tests/integration/enterprise.rs:300–315`: Asserts `wiremock` against `ureq` with zero Rume code exercised. Test real Rume IdP metadata resolution client.
 - [x] **Testing M4 — Missing negative-path coverage for events, sagas, and worker fences** (`testing-feature-matrix.md` M4).
       `crates/core/tests/`: Untested error paths in new pipeline code. Add unit and integration assertions for listener panics, saga step compensation errors, and worker lease fences.
