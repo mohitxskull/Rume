@@ -37,7 +37,7 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 tower = "=0.5.3"
 # Request validation.
 garde = { workspace = true, features = ["derive", "email", "url"] }
-uuid = { version = "=1.29.0", features = ["v4"] }
+uuid = { version = "=1.29.2", features = ["v4"] }
 sha2 = "=0.11.1"
 hmac = "=0.13.0"
 sqlx = { workspace = true, optional = true }
