@@ -298,6 +298,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
         result: Option<Vec<u8>>,
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let redis_key = self.key(key);
+        let key = key.to_string();
         let token = token.to_string();
         Box::pin(async move {
             let mut conn = self
@@ -334,7 +335,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 "#,
             );
 
-            let _: i64 = script
+            let res: i64 = script
                 .key(&redis_key)
                 .arg(&val)
                 .arg(ttl_ms)
@@ -342,6 +343,12 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res == 0 {
+                return Err(JobError::Fatal(format!(
+                    "failed to complete idempotency key '{key}': token mismatch or lease expired"
+                )));
+            }
 
             Ok(())
         })
@@ -353,6 +360,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
 
     fn release_with_token(&self, key: &str, token: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let redis_key = self.key(key);
+        let key = key.to_string();
         let token = token.to_string();
         Box::pin(async move {
             let mut conn = self
@@ -385,12 +393,72 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 "#,
             );
 
-            let _: i64 = script
+            let res: i64 = script
                 .key(&redis_key)
                 .arg(&token)
                 .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res == 0 {
+                return Err(JobError::Fatal(format!(
+                    "failed to release idempotency key '{key}': token mismatch or lease expired"
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
+    fn extend_lock_with_token(
+        &self,
+        key: &str,
+        token: &str,
+        extension: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let redis_key = self.key(key);
+        let key = key.to_string();
+        let token = token.to_string();
+        let extension_ms = extension.as_millis().max(1) as u64;
+        Box::pin(async move {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let script = redis::Script::new(
+                r#"
+                local current = redis.call('GET', KEYS[1])
+                local matches = false
+                if current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
+                    matches = true
+                elseif current and ARGV[1] == '' and (current == 'IN_PROGRESS' or string.sub(current, 1, 12) == 'IN_PROGRESS:') then
+                    matches = true
+                end
+
+                if matches then
+                    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                    return 1
+                else
+                    return 0
+                end
+                "#,
+            );
+
+            let res: i64 = script
+                .key(&redis_key)
+                .arg(&token)
+                .arg(extension_ms)
+                .invoke_async(&mut *conn)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res == 0 {
+                return Err(JobError::Fatal(format!(
+                    "failed to extend idempotency key '{key}': token mismatch or lease expired"
+                )));
+            }
 
             Ok(())
         })

@@ -75,7 +75,8 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let resolver = Arc::clone(&self.resolver);
         let required = self.required;
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let (parts, body) = req.into_parts();
@@ -165,7 +166,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let require_tenant_id = self.require_tenant_id;
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let tenant = req.extensions().get::<crate::tenant::model::Tenant>();
@@ -351,7 +353,8 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let store = Arc::clone(&self.store);
         let policy = self.policy.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let tenant = req

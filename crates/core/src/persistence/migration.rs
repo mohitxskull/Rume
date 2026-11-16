@@ -49,12 +49,15 @@ const MYSQL_MIGRATION_INSERT: &str = include_str!("sql/mysql/migration_insert.sq
 const MYSQL_MIGRATION_DELETE: &str = include_str!("sql/mysql/migration_delete.sql");
 const MYSQL_MIGRATION_FIND_ID: &str = include_str!("sql/mysql/migration_find_id.sql");
 const MYSQL_CLOCK: &str = include_str!("sql/mysql/mysql_clock.sql");
+const MYSQL_MIGRATION_LOCK: &str = include_str!("sql/mysql/mysql_migration_lock.sql");
+const MYSQL_MIGRATION_UNLOCK: &str = include_str!("sql/mysql/mysql_migration_unlock.sql");
 
 const SQLITE_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/sqlite/migration_find_checksum.sql");
 const SQLITE_MIGRATION_INSERT: &str = include_str!("sql/sqlite/migration_insert.sql");
 const SQLITE_MIGRATION_DELETE: &str = include_str!("sql/sqlite/migration_delete.sql");
 const SQLITE_MIGRATION_FIND_ID: &str = include_str!("sql/sqlite/migration_find_id.sql");
 const SQLITE_CLOCK: &str = include_str!("sql/sqlite/sqlite_clock.sql");
+const SQLITE_BUSY_TIMEOUT: &str = include_str!("sql/sqlite/sqlite_busy_timeout.sql");
 
 fn find_checksum_query(dialect: &str) -> &'static str {
     match dialect {
@@ -136,20 +139,22 @@ impl Migration {
     }
 
     /// Computes the SHA-256 hexadecimal digest of the migration's `up_sql` statement.
+    ///
+    /// For no-SQL migrations (`up_sql == None`), returns a deterministic non-empty sentinel digest
+    /// so ledger verification never mistakes an intentional no-SQL migration for a corrupt empty checksum.
     pub fn checksum(&self) -> String {
-        match &self.up_sql {
-            Some(s) => {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(s.as_bytes());
-                let mut hex = String::with_capacity(digest.len() * 2);
-                for byte in digest {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{byte:02x}");
-                }
-                hex
-            }
-            None => String::new(),
+        use sha2::{Digest, Sha256};
+        let bytes = match &self.up_sql {
+            Some(s) => s.as_bytes(),
+            None => b"__rume_no_sql_migration__",
+        };
+        let digest = Sha256::digest(bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
         }
+        hex
     }
 }
 
@@ -226,7 +231,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -300,7 +305,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -333,7 +338,7 @@ impl Migrator {
                 let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
                 if let Some(actual) = stored_checksum {
                     let expected = migration.checksum();
-                    if !actual.is_empty() && actual != expected {
+                    if actual.is_empty() || actual != expected {
                         return Err(PersistenceError::MigrationChecksumMismatch {
                             migration: migration.id.clone(),
                             expected,
@@ -373,6 +378,159 @@ impl Migrator {
             return Ok(MigrationSummary { applied });
         }
 
+        if dialect == "mysql" {
+            let tx = backend.begin_transaction().await?;
+            let lock_res = tx.query_scalar(MYSQL_MIGRATION_LOCK).await?;
+            if lock_res.as_deref() != Some("1") {
+                return Err(PersistenceError::Timeout);
+            }
+            tx.release_mysql_lock_on_drop(true);
+            let mut applied = Vec::new();
+            let run_res: Result<(), PersistenceError> = async {
+                // `CREATE TABLE IF NOT EXISTS` triggers an implicit commit in MySQL, so run it
+                // under the named lock first and immediately start a fresh transaction for data
+                // migrations and ledger inserts.
+                tx.execute(ddl).await?;
+                tx.execute("START TRANSACTION").await?;
+                for migration in &self.migrations {
+                    let id_param = [DbValue::from(migration.id.as_str())];
+                    let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
+                    if let Some(actual) = stored_checksum {
+                        let expected = migration.checksum();
+                        if actual.is_empty() || actual != expected {
+                            return Err(PersistenceError::MigrationChecksumMismatch {
+                                migration: migration.id.clone(),
+                                expected,
+                                actual,
+                            });
+                        }
+                    } else {
+                        if let Some(sql) = &migration.up_sql {
+                            tx.execute(sql).await.map_err(|err| {
+                                PersistenceError::MigrationError {
+                                    migration: migration.id.clone(),
+                                    message: err.to_string(),
+                                }
+                            })?;
+                        }
+                        let now = if let Ok(Some(s)) = tx.query_scalar(MYSQL_CLOCK).await
+                            && let Ok(ts) = s.parse::<u64>()
+                        {
+                            ts
+                        } else {
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs()
+                        };
+                        let params = [
+                            DbValue::from(migration.id.as_str()),
+                            DbValue::from(migration.description.as_str()),
+                            DbValue::Int(now as i64),
+                            DbValue::from(migration.checksum().as_str()),
+                        ];
+                        tx.execute_params(insert_sql, &params).await?;
+                        applied.push(migration.id.clone());
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = run_res {
+                // If migration execution failed, rollback changes and release the named lock before returning
+                let _ = tx.execute("ROLLBACK").await;
+                let _ = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+
+            // CRITICAL MYSQL COORDINATION ORDERING (DO NOT REORDER):
+            // In MySQL, `GET_LOCK` and `RELEASE_LOCK` are bound to the specific server thread/connection (`CONNECTION_ID()`).
+            //
+            // 1. Durably commit the transaction:
+            //    We execute `COMMIT` directly on the active connection so that all migration schema and ledger updates
+            //    are 100% committed before another instance can acquire the lock.
+            //    (Releasing the lock before commit would allow a concurrent instance to acquire `rume_migrations_lock`
+            //    and read uncommitted ledger rows or attempt duplicate DDL execution).
+            tx.execute("COMMIT").await?;
+
+            // 2. Release the MySQL named lock on the EXACT SAME connection while it is still active:
+            //    If RELEASE_LOCK were called on a different pooled connection, MySQL would return 0 and refuse to release it.
+            let unlock_res = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+
+            // 3. Finalize the sqlx transaction handle and return connection to the pool:
+            let commit_res = tx.commit().await;
+
+            // 4. Propagate commit errors (never discard with `let _ = tx.commit().await`):
+            commit_res?;
+
+            // 5. Propagate unlock errors:
+            match unlock_res {
+                Ok(Some(s)) if s == "1" => {}
+                Ok(other) => {
+                    return Err(PersistenceError::TransactionError(format!(
+                        "failed to release MySQL migration lock: RELEASE_LOCK returned {other:?}"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+
+            return Ok(MigrationSummary { applied });
+        }
+
+        if dialect == "sqlite" {
+            let tx = backend.begin_transaction().await?;
+            // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
+            tx.execute(SQLITE_BUSY_TIMEOUT).await?;
+            tx.execute(ddl).await?;
+
+            let mut applied = Vec::new();
+            for migration in &self.migrations {
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
+                if let Some(actual) = stored_checksum {
+                    let expected = migration.checksum();
+                    if actual.is_empty() || actual != expected {
+                        return Err(PersistenceError::MigrationChecksumMismatch {
+                            migration: migration.id.clone(),
+                            expected,
+                            actual,
+                        });
+                    }
+                } else {
+                    if let Some(sql) = &migration.up_sql {
+                        tx.execute(sql)
+                            .await
+                            .map_err(|err| PersistenceError::MigrationError {
+                                migration: migration.id.clone(),
+                                message: err.to_string(),
+                            })?;
+                    }
+                    let now = if let Ok(Some(s)) = tx.query_scalar(SQLITE_CLOCK).await
+                        && let Ok(ts) = s.parse::<u64>()
+                    {
+                        ts
+                    } else {
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs()
+                    };
+                    let params = [
+                        DbValue::from(migration.id.as_str()),
+                        DbValue::from(migration.description.as_str()),
+                        DbValue::Int(now as i64),
+                        DbValue::from(migration.checksum().as_str()),
+                    ];
+                    tx.execute_params(insert_sql, &params).await?;
+                    applied.push(migration.id.clone());
+                }
+            }
+            tx.commit().await?;
+            return Ok(MigrationSummary { applied });
+        }
+
         backend.execute(ddl).await?;
 
         let mut applied = Vec::new();
@@ -381,7 +539,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,
@@ -466,6 +624,102 @@ impl Migrator {
             return Ok(None);
         }
 
+        if dialect == "mysql" {
+            let tx = backend.begin_transaction().await?;
+            let lock_res = tx.query_scalar(MYSQL_MIGRATION_LOCK).await?;
+            if lock_res.as_deref() != Some("1") {
+                return Err(PersistenceError::Timeout);
+            }
+            tx.release_mysql_lock_on_drop(true);
+            let mut rolled_back = None;
+            let run_res: Result<(), PersistenceError> = async {
+                tx.execute(ddl).await?;
+                tx.execute("START TRANSACTION").await?;
+                for migration in self.migrations.iter().rev() {
+                    let id_param = [DbValue::from(migration.id.as_str())];
+                    let applied = tx.query_scalar_params(check_sql, &id_param).await?;
+                    if applied.is_some() {
+                        let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                            PersistenceError::IrreversibleMigration(migration.id.clone())
+                        })?;
+                        tx.execute(down_sql).await.map_err(|err| {
+                            PersistenceError::MigrationError {
+                                migration: migration.id.clone(),
+                                message: err.to_string(),
+                            }
+                        })?;
+                        tx.execute_params(delete_sql, &id_param).await?;
+                        rolled_back = Some(migration.id.clone());
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+
+            if let Err(err) = run_res {
+                // If rollback execution failed, rollback changes and release the named lock before returning
+                let _ = tx.execute("ROLLBACK").await;
+                let _ = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
+
+            // CRITICAL MYSQL COORDINATION ORDERING (DO NOT REORDER):
+            // 1. Durably commit rollback changes on the active connection before releasing the lock:
+            tx.execute("COMMIT").await?;
+
+            // 2. Release the MySQL named lock on the EXACT SAME connection while it is still active:
+            let unlock_res = tx.query_scalar(MYSQL_MIGRATION_UNLOCK).await;
+
+            // 3. Finalize the sqlx transaction handle and return connection to the pool:
+            let commit_res = tx.commit().await;
+
+            // 4. Propagate commit errors:
+            commit_res?;
+
+            // 5. Propagate unlock errors:
+            match unlock_res {
+                Ok(Some(s)) if s == "1" => {}
+                Ok(other) => {
+                    return Err(PersistenceError::TransactionError(format!(
+                        "failed to release MySQL migration lock: RELEASE_LOCK returned {other:?}"
+                    )));
+                }
+                Err(err) => return Err(err),
+            }
+
+            return Ok(rolled_back);
+        }
+
+        if dialect == "sqlite" {
+            let tx = backend.begin_transaction().await?;
+            // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
+            tx.execute(SQLITE_BUSY_TIMEOUT).await?;
+            tx.execute(ddl).await?;
+
+            for migration in self.migrations.iter().rev() {
+                let id_param = [DbValue::from(migration.id.as_str())];
+                let applied = tx.query_scalar_params(check_sql, &id_param).await?;
+                if applied.is_some() {
+                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                        PersistenceError::IrreversibleMigration(migration.id.clone())
+                    })?;
+                    tx.execute(down_sql)
+                        .await
+                        .map_err(|err| PersistenceError::MigrationError {
+                            migration: migration.id.clone(),
+                            message: err.to_string(),
+                        })?;
+                    tx.execute_params(delete_sql, &id_param).await?;
+                    tx.commit().await?;
+                    return Ok(Some(migration.id.clone()));
+                }
+            }
+            tx.commit().await?;
+            return Ok(None);
+        }
+
         backend.execute(ddl).await?;
 
         for migration in self.migrations.iter().rev() {
@@ -510,7 +764,7 @@ impl Migrator {
             let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
             if let Some(actual) = stored_checksum {
                 let expected = migration.checksum();
-                if !actual.is_empty() && actual != expected {
+                if actual.is_empty() || actual != expected {
                     return Err(PersistenceError::MigrationChecksumMismatch {
                         migration: migration.id.clone(),
                         expected,

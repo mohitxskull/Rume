@@ -41,6 +41,47 @@ const PG_OUTBOX_REPROCESS_FAILED_SQL: &str =
     include_str!("sql/postgres/outbox_reprocess_failed.sql");
 const PG_OUTBOX_PURGE_PUBLISHED_SQL: &str = include_str!("sql/postgres/outbox_purge_published.sql");
 
+/// Untyped SQL `NULL` bind parameter for PostgreSQL.
+///
+/// Why: `None::<String>` sends PostgreSQL OID 25 (`TEXT`), causing `Parse` to fail
+/// with a type mismatch when bound to non-text columns (e.g. `BIGINT`) on a fresh
+/// connection whose statement cache has not yet inferred the parameter OID from an
+/// earlier non-null bind. OID 0 (`UNSPECIFIED`) instructs PostgreSQL to infer the
+/// column type from context.
+struct PgNull;
+
+impl sqlx::Type<sqlx::Postgres> for PgNull {
+    fn type_info() -> sqlx::postgres::PgTypeInfo {
+        sqlx::postgres::PgTypeInfo::with_oid(sqlx::postgres::types::Oid(0))
+    }
+}
+
+impl sqlx::Encode<'_, sqlx::Postgres> for PgNull {
+    fn encode_by_ref(
+        &self,
+        _buf: &mut sqlx::postgres::PgArgumentBuffer,
+    ) -> Result<sqlx::encode::IsNull, sqlx::error::BoxDynError> {
+        Ok(sqlx::encode::IsNull::Yes)
+    }
+}
+
+fn bind_pg_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
+    params: &'q [DbValue],
+) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+    for param in params {
+        query = match param {
+            DbValue::Null => query.bind(PgNull),
+            DbValue::Text(s) => query.bind(s.as_str()),
+            DbValue::Int(i) => query.bind(*i),
+            DbValue::Float(f) => query.bind(*f),
+            DbValue::Bool(b) => query.bind(*b),
+            DbValue::Bytes(b) => query.bind(b.as_slice()),
+        };
+    }
+    query
+}
+
 /// Production PostgreSQL database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]
 pub struct PostgresBackend {
@@ -165,17 +206,7 @@ impl DatabaseBackend for PostgresBackend {
                     .map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             } else {
-                let mut query = sqlx::query(AssertSqlSafe(statement));
-                for param in &params_vec {
-                    query = match param {
-                        DbValue::Null => query.bind(None as Option<String>),
-                        DbValue::Text(s) => query.bind(s.as_str()),
-                        DbValue::Int(i) => query.bind(*i),
-                        DbValue::Float(f) => query.bind(*f),
-                        DbValue::Bool(b) => query.bind(*b),
-                        DbValue::Bytes(b) => query.bind(b.as_slice()),
-                    };
-                }
+                let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
                 let res = query.execute(&self.pool).await.map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             }
@@ -190,17 +221,7 @@ impl DatabaseBackend for PostgresBackend {
         let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            let query_obj = bind_pg_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<PgRow> = query_obj
                 .fetch_optional(&self.pool)
                 .await
@@ -218,17 +239,7 @@ impl DatabaseBackend for PostgresBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<PgRow> = query.fetch_all(&self.pool).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
@@ -242,17 +253,7 @@ impl DatabaseBackend for PostgresBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<PgRow> = query
                 .fetch_optional(&self.pool)
                 .await
@@ -373,17 +374,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let res = query
                 .execute(&mut **tx)
                 .await
@@ -422,17 +413,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            let query_obj = bind_pg_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<PgRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
@@ -458,17 +439,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &p {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &p);
             let rows: Vec<PgRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_pg_row_to_db_row).collect()
         })
@@ -487,17 +458,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &p {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &p);
             let row: Option<PgRow> = query
                 .fetch_optional(&mut **tx)
                 .await

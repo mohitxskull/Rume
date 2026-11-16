@@ -20,6 +20,7 @@ use axum::http::Request;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE, HeaderName, HeaderValue};
 use axum::http::request::Parts;
 use axum::response::Response;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 
 /// Non-panicking initializer for the default global tracing subscriber.
@@ -395,7 +396,8 @@ where
             span.record("route", route.as_str());
         }
 
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
         let req_id_str = request_id.0.clone();
         let trace_parent_str = trace_context.traceparent.clone();
         let span_clone = span.clone();
@@ -414,6 +416,9 @@ where
 
                     span_clone.record("status", status.as_u16());
                     span_clone.record("latency_ms", latency_ms);
+                    if let Some(mp) = response.extensions().get::<axum::extract::MatchedPath>() {
+                        span_clone.record("route", mp.as_str());
+                    }
 
                     if status.is_server_error() {
                         tracing::error!(status = status.as_u16(), latency_ms, "request failed");
@@ -448,63 +453,111 @@ where
                         const MAX_PROBLEM_DETAILS_INSPECT: usize = 1024 * 1024; // 1 MiB
                         let (mut parts, body) = response.into_parts();
 
-                        let is_oversized = parts
+                        let should_inspect = match parts
                             .headers
                             .get(CONTENT_LENGTH)
                             .and_then(|val| val.to_str().ok())
                             .and_then(|val| val.parse::<usize>().ok())
-                            .map(|len| len > MAX_PROBLEM_DETAILS_INSPECT)
-                            .unwrap_or_else(|| {
-                                body.size_hint().lower() > (MAX_PROBLEM_DETAILS_INSPECT as u64)
-                            });
+                        {
+                            Some(len) => len <= MAX_PROBLEM_DETAILS_INSPECT,
+                            None => body
+                                .size_hint()
+                                .upper()
+                                .map(|u| u <= MAX_PROBLEM_DETAILS_INSPECT as u64)
+                                .unwrap_or(false),
+                        };
 
-                        if is_oversized {
-                            // Never destroy or truncate oversized responses! Return untouched.
+                        if !should_inspect {
+                            // Never destroy or truncate oversized or streaming responses! Return untouched.
                             return Ok(Response::from_parts(parts, body));
                         }
 
-                        match axum::body::to_bytes(body, MAX_PROBLEM_DETAILS_INSPECT).await {
-                            Ok(bytes) => {
-                                let mut final_bytes = bytes;
-                                let mut body_modified = false;
+                        // BODY INTEGRITY & OBSERVABILITY INVARIANT (CRITICAL — NEVER RETURN `Body::empty()`):
+                        // When inspecting `application/problem+json` to inject `request_id`, we must NEVER destroy
+                        // or truncate the response body if buffering fails or if the stream exceeds limits.
+                        //
+                        // Naive middleware implementations buffer with `to_bytes(body)` and, on error, return
+                        // `Response::from_parts(parts, Body::empty())`. This wipes out the error payload and returns
+                        // an empty HTTP response to the client with no debugging context.
+                        //
+                        // Instead, we collect chunks incrementally. If the stream exceeds `MAX_PROBLEM_DETAILS_INSPECT`
+                        // or encounters a stream error, we chain the collected chunks back together with the remaining
+                        // stream via `chain()`. This guarantees that the original response stream is preserved
+                        // byte-for-byte and delivered to the client completely intact.
+                        let mut stream = body.into_data_stream();
+                        let mut collected: Vec<axum::body::Bytes> = Vec::new();
+                        let mut total_len = 0;
+                        let mut stream_err: Option<axum::Error> = None;
+                        let mut limit_exceeded = false;
 
-                                if let Ok(mut json) =
-                                    serde_json::from_slice::<serde_json::Value>(&final_bytes)
-                                    && let Some(obj) = json.as_object_mut()
-                                {
-                                    let should_inject = matches!(
-                                        obj.get("request_id"),
-                                        None | Some(serde_json::Value::Null)
-                                    );
-                                    if should_inject {
-                                        obj.insert(
-                                            "request_id".to_string(),
-                                            serde_json::Value::String(req_id_str),
-                                        );
-                                        if let Ok(new_bytes) = serde_json::to_vec(&obj) {
-                                            final_bytes = axum::body::Bytes::from(new_bytes);
-                                            body_modified = true;
-                                        }
+                        while let Some(chunk_res) = stream.next().await {
+                            match chunk_res {
+                                Ok(chunk) => {
+                                    total_len += chunk.len();
+                                    collected.push(chunk);
+                                    if total_len > MAX_PROBLEM_DETAILS_INSPECT {
+                                        limit_exceeded = true;
+                                        break;
                                     }
                                 }
-
-                                if body_modified {
-                                    // If Content-Length was present, update it to match new body length
-                                    if parts.headers.contains_key(CONTENT_LENGTH)
-                                        && let Ok(len_val) =
-                                            HeaderValue::from_str(&final_bytes.len().to_string())
-                                    {
-                                        parts.headers.insert(CONTENT_LENGTH, len_val);
-                                    }
+                                Err(err) => {
+                                    stream_err = Some(err);
+                                    break;
                                 }
-
-                                return Ok(Response::from_parts(parts, Body::from(final_bytes)));
-                            }
-                            Err(_) => {
-                                parts.headers.remove(CONTENT_LENGTH);
-                                return Ok(Response::from_parts(parts, Body::empty()));
                             }
                         }
+
+                        if limit_exceeded || stream_err.is_some() {
+                            // If stream exceeded limit or failed, chain collected chunks, any consumed
+                            // stream error, and the remaining stream so neither bytes nor errors are lost.
+                            let collected_stream =
+                                futures_util::stream::iter(collected.into_iter().map(Ok));
+                            let err_stream =
+                                futures_util::stream::iter(stream_err.into_iter().map(Err));
+                            let chained = collected_stream.chain(err_stream).chain(stream);
+                            return Ok(Response::from_parts(parts, Body::from_stream(chained)));
+                        }
+
+                        let mut final_bytes = {
+                            let mut buf = Vec::with_capacity(total_len);
+                            for c in collected {
+                                buf.extend_from_slice(&c);
+                            }
+                            axum::body::Bytes::from(buf)
+                        };
+                        let mut body_modified = false;
+
+                        if let Ok(mut json) =
+                            serde_json::from_slice::<serde_json::Value>(&final_bytes)
+                            && let Some(obj) = json.as_object_mut()
+                        {
+                            let should_inject = matches!(
+                                obj.get("request_id"),
+                                None | Some(serde_json::Value::Null)
+                            );
+                            if should_inject {
+                                obj.insert(
+                                    "request_id".to_string(),
+                                    serde_json::Value::String(req_id_str),
+                                );
+                                if let Ok(new_bytes) = serde_json::to_vec(&obj) {
+                                    final_bytes = axum::body::Bytes::from(new_bytes);
+                                    body_modified = true;
+                                }
+                            }
+                        }
+
+                        if body_modified {
+                            // If Content-Length was present, update it to match new body length
+                            if parts.headers.contains_key(CONTENT_LENGTH)
+                                && let Ok(len_val) =
+                                    HeaderValue::from_str(&final_bytes.len().to_string())
+                            {
+                                parts.headers.insert(CONTENT_LENGTH, len_val);
+                            }
+                        }
+
+                        return Ok(Response::from_parts(parts, Body::from(final_bytes)));
                     }
 
                     Ok(response)
@@ -608,6 +661,190 @@ mod tests {
                 .get("tracestate")
                 .and_then(|h| h.to_str().ok()),
             Some("vendor=val1,other=val2")
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_service_records_matched_path_from_response_extension() {
+        use axum::routing::get;
+        use tower::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/users/{id}", get(|| async { "user" }))
+            .route_layer(axum::middleware::from_fn(
+                |req: axum::extract::Request, next: axum::middleware::Next| async move {
+                    if let Some(mp) = req
+                        .extensions()
+                        .get::<axum::extract::MatchedPath>()
+                        .cloned()
+                    {
+                        tracing::Span::current().record("route", mp.as_str());
+                        let mut resp = next.run(req).await;
+                        resp.extensions_mut().insert(mp);
+                        resp
+                    } else {
+                        next.run(req).await
+                    }
+                },
+            ))
+            .layer(ObservabilityLayer::new());
+
+        let req = Request::builder()
+            .uri("/users/42")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = router.oneshot(req).await.expect("service call succeeds");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+        assert_eq!(
+            resp.extensions()
+                .get::<axum::extract::MatchedPath>()
+                .map(|m| m.as_str()),
+            Some("/users/{id}")
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_service_preserves_body_on_invalid_problem_details_json() {
+        use tower::{Layer, Service};
+
+        let raw_payload = b"this is not valid json problem details";
+        let mut svc =
+            ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| async move {
+                let resp = Response::builder()
+                    .header(CONTENT_TYPE, "application/problem+json")
+                    .body(Body::from(raw_payload.as_slice()))
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            }));
+
+        let req = Request::builder()
+            .uri("/error")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.as_ref(),
+            raw_payload,
+            "original body must be preserved when JSON inspection cannot parse it"
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_service_preserves_body_on_oversized_stream() {
+        use tower::{Layer, Service};
+
+        // 1.5 MiB payload exceeding the 1 MiB MAX_PROBLEM_DETAILS_INSPECT limit
+        let chunk_size = 64 * 1024;
+        let num_chunks = 24; // 24 * 64KB = 1.5 MB
+        let chunks: Vec<axum::body::Bytes> = (0..num_chunks)
+            .map(|i| axum::body::Bytes::from(vec![(i % 256) as u8; chunk_size]))
+            .collect();
+        let expected_total = num_chunks * chunk_size;
+
+        let chunks_clone = chunks.clone();
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
+            let stream = futures_util::stream::iter(
+                chunks_clone
+                    .clone()
+                    .into_iter()
+                    .map(Ok::<_, std::io::Error>),
+            );
+            async move {
+                let resp = Response::builder()
+                    .header(CONTENT_TYPE, "application/problem+json")
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            }
+        }));
+
+        let req = Request::builder()
+            .uri("/oversized")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 4 * 1024 * 1024)
+            .await
+            .unwrap();
+        assert_eq!(
+            bytes.len(),
+            expected_total,
+            "oversized body must never be truncated or replaced with empty body"
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_service_injects_request_id_into_valid_problem_details() {
+        use tower::{Layer, Service};
+
+        let raw_problem = serde_json::json!({
+            "type": "https://example.com/probs/out-of-credit",
+            "title": "You do not have enough credit.",
+            "status": 403
+        });
+        let raw_bytes = serde_json::to_vec(&raw_problem).unwrap();
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
+            let bytes = raw_bytes.clone();
+            async move {
+                let resp = Response::builder()
+                    .header(CONTENT_TYPE, "application/problem+json")
+                    .body(Body::from(bytes))
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            }
+        }));
+
+        let req = Request::builder()
+            .uri("/credit-check")
+            .header("x-request-id", "test-req-id-777")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["request_id"], "test-req-id-777");
+        assert_eq!(parsed["title"], "You do not have enough credit.");
+    }
+
+    #[tokio::test]
+    async fn observability_service_preserves_stream_error_on_inspected_problem_details() {
+        use tower::{Layer, Service};
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(|_req: Request<Body>| {
+            let stream = futures_util::stream::iter(vec![
+                Ok(axum::body::Bytes::from_static(b"{\"title\":\"partial\"")),
+                Err(std::io::Error::other("simulated mid-stream failure")),
+            ]);
+            async move {
+                let resp = Response::builder()
+                    .header(CONTENT_TYPE, "application/problem+json")
+                    .header(CONTENT_LENGTH, "100")
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            }
+        }));
+
+        let req = Request::builder()
+            .uri("/stream-error")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let res = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        assert!(
+            res.is_err(),
+            "mid-stream error must be preserved and propagated to body consumer"
         );
     }
 }

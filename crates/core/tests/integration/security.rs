@@ -44,10 +44,26 @@ async fn test_default_security_headers() {
     );
     assert_eq!(headers.get("x-xss-protection").unwrap(), "0");
 
-    // 2. HTTPS / x-forwarded-proto: https request emits HSTS
-    let secure_req = Request::builder()
+    // 2. Untrusted proxy headers do not emit HSTS by default
+    let untrusted_proxy_req = Request::builder()
         .uri("/hello")
         .header("x-forwarded-proto", "https")
+        .body(axum::body::Body::empty())
+        .unwrap();
+
+    let res_untrusted = test_app.request(untrusted_proxy_req).await;
+    assert_eq!(res_untrusted.status(), StatusCode::OK);
+    assert!(
+        res_untrusted
+            .headers()
+            .get("strict-transport-security")
+            .is_none(),
+        "untrusted proxy headers must not emit HSTS"
+    );
+
+    // 3. Native HTTPS emits HSTS
+    let secure_req = Request::builder()
+        .uri("https://example.com/hello")
         .body(axum::body::Body::empty())
         .unwrap();
 
@@ -55,6 +71,32 @@ async fn test_default_security_headers() {
     assert_eq!(res_secure.status(), StatusCode::OK);
     assert_eq!(
         res_secure
+            .headers()
+            .get("strict-transport-security")
+            .unwrap(),
+        "max-age=31536000; includeSubDomains"
+    );
+
+    // 4. Configured trusted proxy emits HSTS
+    let trusted_layer = SecurityHeadersLayer::with_config(
+        SecurityHeadersConfig::new()
+            .with_trust_proxy_headers(true)
+            .with_trust_all_proxies(true),
+    );
+    let trusted_app = TestApp::new(
+        Router::new()
+            .route("/hello", get(|| async { "Hello World" }))
+            .layer(trusted_layer),
+    );
+    let proxy_req = Request::builder()
+        .uri("/hello")
+        .header("x-forwarded-proto", "https")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res_proxy = trusted_app.request(proxy_req).await;
+    assert_eq!(res_proxy.status(), StatusCode::OK);
+    assert_eq!(
+        res_proxy
             .headers()
             .get("strict-transport-security")
             .unwrap(),
@@ -364,4 +406,48 @@ async fn test_csrf_split_cookie_headers() {
     let res = test_app.request(post_req).await;
     assert_eq!(res.status(), StatusCode::OK);
     assert_eq!(TestApp::body_text(res).await, "updated");
+}
+
+#[tokio::test]
+async fn test_csrf_exemption_path_segment_boundary_matching() {
+    let csrf_config = CsrfConfig::new()
+        .allow_unauthenticated(true)
+        .exempt("/api/webhooks");
+
+    let app = Router::new()
+        .route("/api/webhooks", post(|| async { "webhook-ok" }))
+        .route("/api/webhooks/stripe", post(|| async { "stripe-ok" }))
+        .route("/api/webhooks-admin", post(|| async { "admin-ok" }))
+        .layer(CsrfLayer::with_config(csrf_config));
+
+    let test_app = TestApp::new(app);
+
+    // 1. Exact match /api/webhooks is exempt (no token needed)
+    let req1 = Request::builder()
+        .method(Method::POST)
+        .uri("/api/webhooks")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res1 = test_app.request(req1).await;
+    assert_eq!(res1.status(), StatusCode::OK);
+    assert_eq!(TestApp::body_text(res1).await, "webhook-ok");
+
+    // 2. Sub-path /api/webhooks/stripe is exempt
+    let req2 = Request::builder()
+        .method(Method::POST)
+        .uri("/api/webhooks/stripe")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res2 = test_app.request(req2).await;
+    assert_eq!(res2.status(), StatusCode::OK);
+    assert_eq!(TestApp::body_text(res2).await, "stripe-ok");
+
+    // 3. Sibling path /api/webhooks-admin is NOT exempt and must be rejected with 403 Forbidden
+    let req3 = Request::builder()
+        .method(Method::POST)
+        .uri("/api/webhooks-admin")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let res3 = test_app.request(req3).await;
+    assert_eq!(res3.status(), StatusCode::FORBIDDEN);
 }

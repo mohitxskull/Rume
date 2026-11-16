@@ -112,23 +112,12 @@ where
         .collect();
 
     for (key, value) in resolved.values {
-        let value = value.parse::<figment::value::Value>().map_err(|err| {
-            let redacted =
-                crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-            EnvError::Validation(redacted)
-        })?;
+        let Ok(value) = value.parse::<figment::value::Value>();
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
     for (key, secret) in &resolved.secrets {
-        let value = secret
-            .expose_secret()
-            .parse::<figment::value::Value>()
-            .map_err(|err| {
-                let redacted =
-                    crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-                EnvError::Validation(redacted)
-            })?;
+        let Ok(value) = secret.expose_secret().parse::<figment::value::Value>();
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key.clone(), value);
     }

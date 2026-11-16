@@ -40,6 +40,7 @@ const JOBS_LIST_DEAD_LETTERS_SQL: &str =
     include_str!("../persistence/sql/postgres/jobs_list_dead_letters.sql");
 const JOBS_REPLAY_DEAD_LETTER_SQL: &str =
     include_str!("../persistence/sql/postgres/jobs_replay_dead_letter.sql");
+const JOBS_PURGE_SQL: &str = include_str!("../persistence/sql/postgres/jobs_purge.sql");
 
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]
@@ -465,6 +466,19 @@ impl JobQueue for PostgresJobQueue {
                 )));
             }
             Ok(())
+        })
+    }
+
+    fn purge_completed(&self, retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
+        let retention_ms = retention.as_millis() as i64;
+        Box::pin(async move {
+            let res = sqlx::query(JOBS_PURGE_SQL)
+                .bind(retention_ms)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            Ok(res.rows_affected())
         })
     }
 }

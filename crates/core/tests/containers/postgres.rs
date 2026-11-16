@@ -31,7 +31,7 @@ use rume::persistence::error::PersistenceError;
 use rume::persistence::migration::{Migration, Migrator};
 use rume::persistence::pool::DatabasePool;
 use rume::persistence::postgres::PostgresBackend;
-use rume::persistence::{DatabaseBackend, DatabaseTransaction};
+use rume::persistence::{DatabaseBackend, DatabaseTransaction, DbValue};
 use rume::routing::health::{HealthCheck, HealthStatus};
 
 use testcontainers_modules::postgres::Postgres;
@@ -56,6 +56,52 @@ async fn test_postgres_unified_database_conformance_suite() {
     rume::testing::verify_database_conformance(&pool, "postgres")
         .await
         .expect("postgres database conformance suite must pass");
+    pool.close_async().await;
+}
+
+#[tokio::test]
+async fn test_postgres_null_bind_into_non_text_columns() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    pool.execute(
+        "CREATE TABLE IF NOT EXISTS null_bind_test (
+            id TEXT PRIMARY KEY,
+            counter BIGINT,
+            flag BOOLEAN,
+            ratio DOUBLE PRECISION,
+            raw BYTEA
+        )",
+    )
+    .await
+    .expect("create table");
+
+    // First prepared execution on a fresh connection binds DbValue::Null directly
+    // to non-TEXT columns (BIGINT, BOOLEAN, DOUBLE PRECISION, BYTEA).
+    pool.execute_params(
+        "INSERT INTO null_bind_test (id, counter, flag, ratio, raw) VALUES ($1, $2, $3, $4, $5)",
+        &[
+            DbValue::Text("row-1".to_string()),
+            DbValue::Null,
+            DbValue::Null,
+            DbValue::Null,
+            DbValue::Null,
+        ],
+    )
+    .await
+    .expect("inserting DbValue::Null into non-TEXT columns must succeed");
+
+    let row = pool
+        .fetch_optional(
+            "SELECT counter, flag, ratio, raw FROM null_bind_test WHERE id = $1",
+            &[DbValue::Text("row-1".to_string())],
+        )
+        .await
+        .expect("select row")
+        .expect("row-1 must exist");
+    assert_eq!(row.get_value("counter").unwrap(), &DbValue::Null);
+    assert_eq!(row.get_value("flag").unwrap(), &DbValue::Null);
+    assert_eq!(row.get_value("ratio").unwrap(), &DbValue::Null);
+    assert_eq!(row.get_value("raw").unwrap(), &DbValue::Null);
+
     pool.close_async().await;
 }
 

@@ -385,3 +385,169 @@ async fn test_tenant_cache_delimiter_isolation() {
     assert!(val1_after.is_none());
     assert_eq!(val2_after.as_deref(), Some("value_a_bc"));
 }
+
+#[tokio::test]
+async fn test_tenant_cache_quota_idempotent_key_updates() {
+    let scoped_cache = start_tenant_cache().with_max_keys_per_tenant(2);
+
+    // Repeated updates to the SAME key k1 do not consume additional quota
+    for i in 0..10 {
+        scoped_cache
+            .set("tenant_quota_test", "k1", &format!("val_{i}"), None)
+            .await
+            .expect("key update must succeed");
+    }
+
+    // Tenant can still write a distinct second key k2 (within quota of 2)
+    scoped_cache
+        .set("tenant_quota_test", "k2", &"val_k2", None)
+        .await
+        .expect("second distinct key within quota must succeed");
+
+    // Attempting a third distinct key k3 exceeds quota of 2
+    let err = scoped_cache
+        .set("tenant_quota_test", "k3", &"val_k3", None)
+        .await;
+    assert!(matches!(
+        err,
+        Err(rume::cache::CacheError::QuotaExceeded(_))
+    ));
+
+    // Updating existing key k2 still succeeds!
+    scoped_cache
+        .set("tenant_quota_test", "k2", &"val_k2_updated", None)
+        .await
+        .expect("updating existing key k2 must succeed even when quota is full");
+}
+
+#[tokio::test]
+async fn test_in_memory_tenant_quota_store_lease_churn_never_bypasses_limit() {
+    use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+
+    let store = InMemoryTenantQuotaStore::new();
+    let tenant_id = "tenant_churn_test";
+    let max_leases = 2;
+
+    // Acquire up to limit
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    // Third acquisition must fail
+    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+
+    // Release 1 lease and acquire again in rapid churn cycles
+    for _ in 0..10 {
+        store.release(tenant_id).await.unwrap();
+        // One slot opened up
+        assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+        // Capacity is full again; exceeding limit MUST fail
+        assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+    }
+
+    // Both leases released
+    store.release(tenant_id).await.unwrap();
+    store.release(tenant_id).await.unwrap();
+    // Releasing beyond 0 saturates cleanly at 0
+    store.release(tenant_id).await.unwrap();
+
+    // Now 2 fresh acquisitions succeed
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    // And 3rd still fails
+    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+}
+
+#[tokio::test]
+async fn test_in_memory_tenant_quota_ttl_expiration() {
+    use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+    use std::time::Duration;
+
+    tokio::time::pause();
+
+    let store = InMemoryTenantQuotaStore::new();
+    let tenant_id = "tenant_ttl_test";
+    let max_keys = 2;
+
+    // 1. Record k1 with 30ms TTL
+    assert!(
+        store
+            .record_key(tenant_id, "k1", Some(Duration::from_millis(30)), max_keys)
+            .await
+            .unwrap()
+    );
+
+    // 2. Record k2 with 2000ms TTL
+    assert!(
+        store
+            .record_key(tenant_id, "k2", Some(Duration::from_secs(2)), max_keys)
+            .await
+            .unwrap()
+    );
+
+    assert_eq!(store.count(tenant_id).await.unwrap(), 2);
+
+    // 3. While both active, k3 is rejected because max_keys (2) is reached
+    assert!(
+        !store
+            .record_key(tenant_id, "k3", None, max_keys)
+            .await
+            .unwrap()
+    );
+
+    // 4. Advance controlled clock past k1's 30ms TTL (while k2's 2s TTL remains valid)
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    // Active count must now reflect 1 (expired k1 is pruned/excluded)
+    assert_eq!(store.count(tenant_id).await.unwrap(), 1);
+
+    // 5. k3 can now be recorded successfully
+    assert!(
+        store
+            .record_key(tenant_id, "k3", None, max_keys)
+            .await
+            .unwrap()
+    );
+    assert_eq!(store.count(tenant_id).await.unwrap(), 2);
+
+    // 6. Refreshing k2 with new TTL succeeds even at max_keys
+    assert!(
+        store
+            .record_key(tenant_id, "k2", Some(Duration::from_secs(5)), max_keys)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn test_concurrent_same_key_quota_updates() {
+    use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+    use std::time::Duration;
+
+    let store = Arc::new(InMemoryTenantQuotaStore::new());
+    let tenant_id = "tenant_concurrent_test";
+    let max_keys = 1;
+
+    // Spawn 10 concurrent tasks all updating the SAME key
+    let mut handles = Vec::new();
+    for i in 0..10 {
+        let store = Arc::clone(&store);
+        handles.push(tokio::spawn(async move {
+            store
+                .record_key(
+                    tenant_id,
+                    "shared_key",
+                    Some(Duration::from_secs(10 + i)),
+                    max_keys,
+                )
+                .await
+                .unwrap()
+        }));
+    }
+
+    for handle in handles {
+        let ok = handle.await.unwrap();
+        assert!(ok, "all concurrent updates to the same key must succeed");
+    }
+
+    // Must still count as exactly 1 key, respecting max_keys = 1
+    assert_eq!(store.count(tenant_id).await.unwrap(), 1);
+}

@@ -76,13 +76,14 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+
         if req.uri().path() == self.bypass_path.as_str() {
-            let mut inner = self.inner.clone();
             return Box::pin(async move { inner.call(req).await });
         }
 
         let registry = self.registry.clone();
-        let mut inner = self.inner.clone();
         let method = req.method().to_string();
         let start = Instant::now();
 

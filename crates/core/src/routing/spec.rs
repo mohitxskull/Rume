@@ -293,7 +293,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let matchers = std::sync::Arc::clone(&self.matchers);
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let (mut parts, body) = req.into_parts();

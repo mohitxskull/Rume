@@ -334,7 +334,11 @@ pub struct OpenApiPathItem {
 pub struct OpenApiComponents {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub schemas: BTreeMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    #[serde(
+        rename = "securitySchemes",
+        skip_serializing_if = "BTreeMap::is_empty",
+        default
+    )]
     pub security_schemes: BTreeMap<String, serde_json::Value>,
 }
 
@@ -456,10 +460,57 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
         }
     }
 
+    let mut schemas = BTreeMap::new();
+    schemas.insert(
+        "ProblemDetails".to_string(),
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "type": { "type": "string", "format": "uri" },
+                "title": { "type": "string" },
+                "status": { "type": "integer" },
+                "detail": { "type": "string" },
+                "instance": { "type": "string", "format": "uri-reference" }
+            },
+            "required": ["title", "status"]
+        }),
+    );
+
+    let mut security_schemes = BTreeMap::new();
+    security_schemes.insert(
+        "bearerAuth".to_string(),
+        serde_json::json!({
+            "type": "http",
+            "scheme": "bearer",
+            "bearerFormat": "JWT"
+        }),
+    );
+    security_schemes.insert(
+        "sessionCookie".to_string(),
+        serde_json::json!({
+            "type": "apiKey",
+            "in": "cookie",
+            "name": "rume_session"
+        }),
+    );
+    security_schemes.insert(
+        "apiKeyAuth".to_string(),
+        serde_json::json!({
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key"
+        }),
+    );
+
+    let components = Some(OpenApiComponents {
+        schemas,
+        security_schemes,
+    });
+
     OpenApiSpec {
         openapi: "3.1.0".to_string(),
         info,
         paths,
-        components: None,
+        components,
     }
 }

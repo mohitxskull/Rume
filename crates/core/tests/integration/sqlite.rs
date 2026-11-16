@@ -32,9 +32,18 @@ async fn sqlite_pool_lifecycle_and_ping() {
     );
 
     pool.backend().ping().await.expect("ping should succeed");
-    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let mut status = pool.status();
+    while status.active_connections != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pool failed to return connection to idle within 2s (active_connections={})",
+            status.active_connections
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        status = pool.status();
+    }
 
-    let status = pool.status();
     assert_eq!(status.leased_connections, 0);
     assert_eq!(status.active_connections, 0);
     assert_eq!(status.max_connections, 5);
@@ -128,6 +137,17 @@ async fn sqlite_auto_migrate_applies_pending_migrations() {
     let pool2 = DatabasePool::new(backend2, config2);
     let res2 = pool2.apply_auto_migrations(&migrator).await.expect("no-op");
     assert!(res2.is_none());
+
+    // When auto_migrate_core is called:
+    let backend3 = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    let config3 = DatabaseConfig::default().with_auto_migrate(true);
+    let pool3 = DatabasePool::new(backend3, config3);
+    let res3 = pool3
+        .apply_auto_migrations_core()
+        .await
+        .expect("core auto migrate");
+    assert!(res3.is_some());
+    assert_eq!(res3.unwrap().applied.len(), 1);
 }
 
 #[tokio::test]
@@ -395,4 +415,41 @@ async fn sqlite_parameterized_transaction_and_safe_values() {
         .expect("count query")
         .expect("count present");
     assert_eq!(count_after_native, "3");
+}
+
+#[tokio::test]
+async fn sqlite_test_harness_integration() {
+    use rume::testing::RumeTestHarness;
+
+    let router = axum::Router::new().route(
+        "/status",
+        axum::routing::get(|| async { "all-systems-nominal" }),
+    );
+    let harness = RumeTestHarness::in_memory()
+        .await
+        .expect("in-memory harness init")
+        .with_router(router);
+
+    let resp = harness.get("/status").await;
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        rume::testing::TestApp::body_text(resp).await,
+        "all-systems-nominal"
+    );
+
+    harness
+        .execute("CREATE TABLE inventory (id INTEGER PRIMARY KEY, sku TEXT NOT NULL);")
+        .await
+        .expect("table creation succeeds");
+
+    harness
+        .execute("INSERT INTO inventory (id, sku) VALUES (1, 'SKU-001');")
+        .await
+        .expect("insert succeeds");
+
+    let sku = harness
+        .query_scalar("SELECT sku FROM inventory WHERE id = 1;")
+        .await
+        .expect("query succeeds");
+    assert_eq!(sku, Some("SKU-001".into()));
 }

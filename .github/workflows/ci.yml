@@ -6,6 +6,13 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -D warnings
@@ -29,16 +36,88 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-      - run: cargo clippy --workspace --all-targets
+      - uses: Swatinem/rust-cache@v2
+      # Clippy MUST check all targets across all features (postgres, mysql, sqlite, redis)
+      # to ensure no feature-gated code or platform integrations introduce warnings or unsafe code.
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  doc:
+    name: doc & doctests
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy]
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace doc-tests
+        run: cargo test --workspace --doc --all-features
+      - name: Build rume documentation
+        run: cargo doc -p rume --no-deps --all-features
+
+  audit:
+    name: security audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - run: cargo audit
+
+  msrv:
+    name: msrv (1.96)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: dtolnay/rust-toolchain@1.96
+      - uses: Swatinem/rust-cache@v2
+      - name: Check workspace against declared MSRV
+        run: cargo check --workspace --all-features
 
   test:
-    name: test (${{ matrix.crate }})
+    name: test (${{ matrix.name }})
     runs-on: ubuntu-latest
     needs: [fmt, clippy]
     strategy:
       fail-fast: false
       matrix:
-        crate: [crates/core, crates/cli, crates/macro, workbench/simple-api, workbench/modular-monolith]
+        # NOTE FOR REVIEWERS & MAINTAINERS:
+        # Cargo's `-p` flag requires exact workspace package names (`rume`, `rume-cli`, `workbench`),
+        # NOT filesystem paths (e.g. `crates/core`). Passing directory paths causes Cargo to fail.
+        # We explicitly matrix both all-features testing and individual backend isolated feature
+        # combinations (Postgres, MySQL, SQLite, Redis) to verify feature-flag isolation and prevent
+        # accidental implicit feature coupling.
+        include:
+          - package: rume
+            name: "rume (all features: postgres, mysql, sqlite, redis)"
+            features: "--all-features"
+          - package: rume
+            name: "rume (sqlite isolated)"
+            features: "--no-default-features --features sqlite,testing"
+          - package: rume
+            name: "rume (postgres isolated)"
+            features: "--no-default-features --features postgres,testing"
+          - package: rume
+            name: "rume (mysql isolated)"
+            features: "--no-default-features --features mysql,testing"
+          - package: rume
+            name: "rume (redis isolated)"
+            features: "--no-default-features --features redis,testing"
+          - package: rume-cli
+            name: "rume-cli"
+            features: ""
+          - package: rume-macros
+            name: "rume-macros"
+            features: ""
+          - package: workbench-simple-api
+            name: "workbench-simple-api"
+            features: ""
+          - package: workbench-modular-monolith
+            name: "workbench-modular-monolith"
+            features: ""
+          - package: workbench
+            name: "workbench (multi-instance cluster tests)"
+            features: ""
     services:
       postgres:
         image: postgres:16-alpine
@@ -62,14 +141,28 @@ jobs:
           --health-retries 25
         ports:
           - 6379:6379
+      mysql:
+        image: mysql:8.0
+        env:
+          MYSQL_ALLOW_EMPTY_PASSWORD: "yes"
+          MYSQL_DATABASE: workbench
+        options: >-
+          --health-cmd "mysqladmin ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 25
+        ports:
+          - 3306:3306
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build and test ${{ matrix.crate }}
-        run: cargo test -p ${{ matrix.crate }} --all-targets
+      - uses: Swatinem/rust-cache@v2
+      - name: Build and test ${{ matrix.name }}
+        run: cargo test -p ${{ matrix.package }} ${{ matrix.features }} --all-targets
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/workbench
           REDIS_URL: redis://localhost:6379
+          MYSQL_URL: mysql://root@localhost:3306/workbench
 
   compose-qualification:
     name: compose qualification (Phase 7.2)
@@ -101,10 +194,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Docker Compose
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y docker-compose-plugin
+      - uses: Swatinem/rust-cache@v2
+      - name: Set up Docker Compose v2
+        uses: docker/setup-compose-action@v2
+      - name: Verify Docker Compose version
+        run: docker compose version
       - name: Build release workbench binary
         run: cargo build --release -p workbench --bin workbench
       - name: Run Docker Compose multi-instance system test
@@ -112,3 +206,28 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/workbench
           REDIS_URL: redis://localhost:6379
+      - name: Tear down Docker Compose stack
+        if: always()
+        run: docker compose -f workbench/multi-instance/docker-compose.yml down --volumes --remove-orphans || true
+
+  ci-gate:
+    name: ci-gate
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, doc, audit, msrv, test, compose-qualification]
+    if: always()
+    steps:
+      - name: Verify all CI jobs succeeded
+        run: |
+          for result in \
+            "${{ needs.fmt.result }}" \
+            "${{ needs.clippy.result }}" \
+            "${{ needs.doc.result }}" \
+            "${{ needs.audit.result }}" \
+            "${{ needs.msrv.result }}" \
+            "${{ needs.test.result }}" \
+            "${{ needs.compose-qualification.result }}"; do
+            if [ "$result" != "success" ]; then
+              echo "CI gate failed: job result was '$result'"
+              exit 1
+            fi
+          done

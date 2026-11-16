@@ -40,8 +40,12 @@ pub struct SecurityHeadersConfig {
     pub hsts_require_tls: bool,
     /// Whether native TLS is terminated in-process (default: `false`).
     pub native_tls: bool,
-    /// Whether to trust `x-forwarded-proto` and `Forwarded` headers from reverse proxies (default: `true`).
+    /// Whether to trust `x-forwarded-proto` and `Forwarded` headers from reverse proxies (default: `false`).
     pub trust_proxy_headers: bool,
+    /// Explicit opt-in to trust proxy headers from any client IP address (default: `false`).
+    pub trust_all_proxies: bool,
+    /// Optional list of trusted proxy IP addresses. When non-empty, proxy headers are only honored if the client IP matches.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for SecurityHeadersConfig {
@@ -57,7 +61,9 @@ impl Default for SecurityHeadersConfig {
             custom_headers: BTreeMap::new(),
             hsts_require_tls: true,
             native_tls: false,
-            trust_proxy_headers: true,
+            trust_proxy_headers: false,
+            trust_all_proxies: false,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -101,6 +107,29 @@ impl SecurityHeadersConfig {
     /// Configures whether reverse proxy headers (`x-forwarded-proto`, `Forwarded`) are trusted.
     pub fn with_trust_proxy_headers(mut self, trust: bool) -> Self {
         self.trust_proxy_headers = trust;
+        self
+    }
+
+    /// Explicitly opts in to trusting reverse proxy headers from any client IP address.
+    pub fn with_trust_all_proxies(mut self, trust: bool) -> Self {
+        self.trust_all_proxies = trust;
+        if trust {
+            self.trust_proxy_headers = true;
+        }
+        self
+    }
+
+    /// Adds a trusted reverse proxy IP address and enables proxy header evaluation.
+    pub fn with_trusted_proxy(mut self, ip: std::net::IpAddr) -> Self {
+        self.trust_proxy_headers = true;
+        self.trusted_proxies.push(ip);
+        self
+    }
+
+    /// Sets the full list of trusted reverse proxy IP addresses and enables proxy header evaluation.
+    pub fn with_trusted_proxies(mut self, ips: Vec<std::net::IpAddr>) -> Self {
+        self.trust_proxy_headers = true;
+        self.trusted_proxies = ips;
         self
     }
 
@@ -169,24 +198,45 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let config = Arc::clone(&self.config);
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+
+        let client_ip = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
+        let proxy_trusted = config.trust_proxy_headers
+            && (config.trust_all_proxies
+                || (!config.trusted_proxies.is_empty()
+                    && client_ip
+                        .map(|ip| config.trusted_proxies.contains(&ip))
+                        .unwrap_or(false)));
 
         let is_https = config.native_tls
             || req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
-            || (config.trust_proxy_headers
+            || (proxy_trusted
                 && (req
                     .headers()
                     .get("x-forwarded-proto")
                     .and_then(|v| v.to_str().ok())
-                    .map(|v| v.eq_ignore_ascii_case("https"))
+                    .map(|v| v.trim().eq_ignore_ascii_case("https"))
                     .unwrap_or(false)
                     || req
                         .headers()
                         .get("forwarded")
                         .and_then(|v| v.to_str().ok())
                         .map(|v| {
-                            v.split([';', ','])
-                                .any(|part| part.trim().eq_ignore_ascii_case("proto=https"))
+                            v.split([';', ',']).any(|part| {
+                                if let Some((k, val)) = part.trim().split_once('=') {
+                                    k.trim().eq_ignore_ascii_case("proto")
+                                        && val
+                                            .trim()
+                                            .trim_matches('"')
+                                            .eq_ignore_ascii_case("https")
+                                } else {
+                                    false
+                                }
+                            })
                         })
                         .unwrap_or(false)));
 
@@ -241,5 +291,66 @@ where
 
             Ok(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tower::Service;
+
+    #[tokio::test]
+    async fn test_forwarded_parameter_parsing_and_proxy_trust() {
+        use std::net::SocketAddr;
+        use tower::Layer;
+
+        let config = SecurityHeadersConfig::new().with_trusted_proxy("10.0.0.1".parse().unwrap());
+        let mut service = SecurityHeadersLayer::with_config(config).layer(tower::service_fn(
+            |_req: Request<Body>| async {
+                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+            },
+        ));
+
+        // 1. Host with proto=https in host parameter must NOT trigger HSTS
+        let mut req1 = Request::builder()
+            .header("forwarded", "for=192.0.2.60;host=\"proto=https.evil.com\"")
+            .body(Body::empty())
+            .unwrap();
+        req1.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [10, 0, 0, 1],
+                1234,
+            ))));
+
+        let res1 = service.call(req1).await.unwrap();
+        assert!(!res1.headers().contains_key("strict-transport-security"));
+
+        // 2. Untrusted proxy socket IP must not trigger HSTS
+        let mut req2 = Request::builder()
+            .header("x-forwarded-proto", "https")
+            .body(Body::empty())
+            .unwrap();
+        req2.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [192, 168, 1, 1],
+                1234,
+            ))));
+
+        let res2 = service.call(req2).await.unwrap();
+        assert!(!res2.headers().contains_key("strict-transport-security"));
+
+        // 3. Trusted proxy socket IP with valid proto=https triggers HSTS
+        let mut req3 = Request::builder()
+            .header("forwarded", "for=192.0.2.60;proto=https")
+            .body(Body::empty())
+            .unwrap();
+        req3.extensions_mut()
+            .insert(axum::extract::ConnectInfo(SocketAddr::from((
+                [10, 0, 0, 1],
+                1234,
+            ))));
+
+        let res3 = service.call(req3).await.unwrap();
+        assert!(res3.headers().contains_key("strict-transport-security"));
     }
 }

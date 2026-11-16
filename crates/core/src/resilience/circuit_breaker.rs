@@ -218,7 +218,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let breaker = self.breaker.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             if !breaker.allow_request() {

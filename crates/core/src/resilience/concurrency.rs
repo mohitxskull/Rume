@@ -30,18 +30,27 @@ impl ConcurrencyLimiter {
 
     /// Attempts to acquire an execution permit.
     pub fn acquire(&self) -> Result<ConcurrencyPermit, ResilienceError> {
-        match self
-            .current
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |c| {
-                (c < self.max).then_some(c + 1)
-            }) {
-            Ok(_) => Ok(ConcurrencyPermit {
-                counter: Arc::clone(&self.current),
-            }),
-            Err(current) => Err(ResilienceError::LoadShed {
-                current,
-                max: self.max,
-            }),
+        let mut curr = self.current.load(Ordering::Acquire);
+        loop {
+            if curr >= self.max {
+                return Err(ResilienceError::LoadShed {
+                    current: curr,
+                    max: self.max,
+                });
+            }
+            match self.current.compare_exchange_weak(
+                curr,
+                curr + 1,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Ok(ConcurrencyPermit {
+                        counter: Arc::clone(&self.current),
+                    });
+                }
+                Err(actual) => curr = actual,
+            }
         }
     }
 
@@ -113,7 +122,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let limiter = self.limiter.clone();
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let _permit = match limiter.acquire() {

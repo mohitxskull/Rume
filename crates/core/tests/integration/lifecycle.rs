@@ -175,19 +175,19 @@ async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
 
     let builder = Rume::builder(ctx)
         .router(Router::new())
-        .shutdown_timeout(Duration::from_millis(80))
+        .shutdown_timeout(Duration::from_millis(40))
         .on_shutdown(move |_| {
             let flag = h1_flag.clone();
             async move {
-                tokio::time::sleep(Duration::from_millis(30)).await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
                 flag.store(true, Ordering::SeqCst);
             }
         })
         .on_shutdown(move |_| {
             let flag = h2_flag.clone();
             async move {
-                // This hook takes 250ms, exceeding the aggregate timeout
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                // This hook takes 100ms, exceeding the aggregate timeout
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 flag.store(true, Ordering::SeqCst);
             }
         });

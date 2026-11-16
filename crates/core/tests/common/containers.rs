@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 #![allow(dead_code)]
 
+#[cfg(any(feature = "postgres", feature = "mysql"))]
 use sqlx::AssertSqlSafe;
 #[cfg(any(feature = "postgres", feature = "redis"))]
 use testcontainers_modules::testcontainers::ImageExt;

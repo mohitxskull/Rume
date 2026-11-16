@@ -285,7 +285,8 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let config = Arc::clone(&self.config);
-        let mut inner = self.inner.clone();
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
             let method = req.method();
@@ -330,7 +331,15 @@ where
 
             let path = req.uri().path();
             for exempt in &config.exempt_prefixes {
-                if path.starts_with(exempt) {
+                let is_exempt = if exempt.ends_with('/') {
+                    path.starts_with(exempt)
+                } else {
+                    path == exempt
+                        || path
+                            .strip_prefix(exempt)
+                            .is_some_and(|rest| rest.starts_with('/'))
+                };
+                if is_exempt {
                     return inner.call(req).await;
                 }
             }

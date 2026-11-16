@@ -99,6 +99,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
+        let key_already_existed = self.cache.exists(&full_key).await.unwrap_or(false);
 
         if let Some(ref quota) = self.quota_store {
             let acquired = quota
@@ -125,7 +126,9 @@ impl<B: CacheBackend> TenantScopedCache<B> {
             .await;
 
         if res.is_err()
+            && !key_already_existed
             && let Some(ref quota) = self.quota_store
+            && matches!(self.cache.exists(&full_key).await, Ok(false))
         {
             let _ = quota.remove_key(tenant_id, key).await;
         }
