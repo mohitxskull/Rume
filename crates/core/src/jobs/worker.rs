@@ -229,18 +229,20 @@ impl WorkerHandle {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // 2. Await the worker execution loop (caching join outcome so retries never re-poll)
+        // 2. Await the worker execution loop (caching only an observed join outcome)
         let worker_ok = match self.worker_result {
             Some(ok) => ok,
             None => {
                 let remaining = timeout.saturating_sub(start.elapsed());
-                let ok =
-                    await_supervised_task(&mut self.worker_task, remaining, "worker_execution")
-                        .await;
-                if ok || self.worker_task.is_finished() {
-                    self.worker_result = Some(ok);
+                match await_supervised_task(&mut self.worker_task, remaining, "worker_execution")
+                    .await
+                {
+                    Some(ok) => {
+                        self.worker_result = Some(ok);
+                        ok
+                    }
+                    None => false,
                 }
-                ok
             }
         };
         if !worker_ok {
@@ -253,11 +255,13 @@ impl WorkerHandle {
                 Some(ok) => ok,
                 None => {
                     let remaining = timeout.saturating_sub(start.elapsed());
-                    let ok = await_supervised_task(hb, remaining, "worker_heartbeat").await;
-                    if ok || hb.is_finished() {
-                        self.heartbeat_result = Some(ok);
+                    match await_supervised_task(hb, remaining, "worker_heartbeat").await {
+                        Some(ok) => {
+                            self.heartbeat_result = Some(ok);
+                            ok
+                        }
+                        None => false,
                     }
-                    ok
                 }
             };
             if !hb_ok {
@@ -271,11 +275,13 @@ impl WorkerHandle {
                 Some(ok) => ok,
                 None => {
                     let remaining = timeout.saturating_sub(start.elapsed());
-                    let ok = await_supervised_task(rec, remaining, "worker_recovery").await;
-                    if ok || rec.is_finished() {
-                        self.recovery_result = Some(ok);
+                    match await_supervised_task(rec, remaining, "worker_recovery").await {
+                        Some(ok) => {
+                            self.recovery_result = Some(ok);
+                            ok
+                        }
+                        None => false,
                     }
-                    ok
                 }
             };
             if !rec_ok {
@@ -304,9 +310,9 @@ async fn await_supervised_task(
     task: &mut tokio::task::JoinHandle<()>,
     remaining: Duration,
     task_name: &'static str,
-) -> bool {
+) -> Option<bool> {
     match tokio::time::timeout(remaining, task).await {
-        Ok(Ok(())) => true,
+        Ok(Ok(())) => Some(true),
         Ok(Err(join_err)) => {
             if join_err.is_panic() {
                 tracing::error!(
@@ -321,14 +327,14 @@ async fn await_supervised_task(
                     "Worker background task failed: {join_err}"
                 );
             }
-            false
+            Some(false)
         }
         Err(_) => {
             tracing::warn!(
                 task = task_name,
                 "Worker background task shutdown timed out"
             );
-            false
+            None
         }
     }
 }

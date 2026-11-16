@@ -384,6 +384,7 @@ impl Migrator {
             if lock_res.as_deref() != Some("1") {
                 return Err(PersistenceError::Timeout);
             }
+            tx.release_mysql_lock_on_drop(true);
             let mut applied = Vec::new();
             let run_res: Result<(), PersistenceError> = async {
                 // `CREATE TABLE IF NOT EXISTS` triggers an implicit commit in MySQL, so run it
@@ -629,6 +630,7 @@ impl Migrator {
             if lock_res.as_deref() != Some("1") {
                 return Err(PersistenceError::Timeout);
             }
+            tx.release_mysql_lock_on_drop(true);
             let mut rolled_back = None;
             let run_res: Result<(), PersistenceError> = async {
                 tx.execute(ddl).await?;

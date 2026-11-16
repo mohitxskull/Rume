@@ -128,6 +128,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         if res.is_err()
             && !key_already_existed
             && let Some(ref quota) = self.quota_store
+            && matches!(self.cache.exists(&full_key).await, Ok(false))
         {
             let _ = quota.remove_key(tenant_id, key).await;
         }

@@ -12,11 +12,12 @@ use rume::testing::TestApp;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
-async fn handler_bad_request() -> Result<(), AppError> {
-    Err(AppError::BadRequest {
+async fn handler_bad_request() -> axum::response::Response {
+    AppError::BadRequest {
         code: "INVALID_INPUT",
         message: "something went wrong".to_string(),
-    })
+    }
+    .into_response_in_env(&rume::app::Environment::new("production"))
 }
 
 async fn handler_not_found() -> Result<(), AppError> {
