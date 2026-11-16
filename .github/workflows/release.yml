@@ -45,12 +45,17 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
-        run: cargo build --release -p rume-cli --bin rume --target ${{ matrix.target }}
+        env:
+          TARGET: ${{ matrix.target }}
+        run: cargo build --release -p rume-cli --bin rume --target "${TARGET}"
       - name: Package binary and checksum
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
         run: |
           mkdir -p dist
-          ARCHIVE="rume-${{ github.ref_name }}-${{ matrix.target }}.tar.gz"
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/${ARCHIVE}" rume
+          ARCHIVE="rume-${RELEASE_TAG}-${TARGET}.tar.gz"
+          tar -C "target/${TARGET}/release" -czf "dist/${ARCHIVE}" rume
           if command -v sha256sum >/dev/null 2>&1; then
             (cd dist && sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256")
           else

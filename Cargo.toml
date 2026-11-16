@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/cli",
     "crates/macro",
+    "crates/xtask",
     "workbench/simple-api",
     "workbench/modular-monolith",
     "workbench/multi-instance",

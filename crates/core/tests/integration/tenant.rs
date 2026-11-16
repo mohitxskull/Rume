@@ -461,6 +461,8 @@ async fn test_in_memory_tenant_quota_ttl_expiration() {
     use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
     use std::time::Duration;
 
+    tokio::time::pause();
+
     let store = InMemoryTenantQuotaStore::new();
     let tenant_id = "tenant_ttl_test";
     let max_keys = 2;
@@ -491,8 +493,8 @@ async fn test_in_memory_tenant_quota_ttl_expiration() {
             .unwrap()
     );
 
-    // 4. Wait for k1 to expire
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // 4. Advance controlled clock past k1's 30ms TTL (while k2's 2s TTL remains valid)
+    tokio::time::advance(Duration::from_millis(50)).await;
 
     // Active count must now reflect 1 (expired k1 is pruned/excluded)
     assert_eq!(store.count(tenant_id).await.unwrap(), 1);

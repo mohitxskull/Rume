@@ -1503,9 +1503,14 @@ where
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
         };
 
-        let result = axum::serve(listener, router.with_state(serve_ctx.clone()))
-            .with_graceful_shutdown(graceful_signal)
-            .await;
+        let result = axum::serve(
+            listener,
+            router
+                .with_state(serve_ctx.clone())
+                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(graceful_signal)
+        .await;
 
         // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
         let on_shutdown_fut = async {

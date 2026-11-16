@@ -97,8 +97,8 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     fn release<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let now = tokio::time::Instant::now();
             let mut map = self.keys.write().await;
+            let now = tokio::time::Instant::now();
             if let Some(tenant_map) = map.get_mut(&tid) {
                 Self::prune_expired_inline(tenant_map, now);
                 if let Some(first_key) = tenant_map.keys().next().cloned() {
@@ -119,9 +119,9 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
         let tid = tenant_id.to_string();
         let k = key.to_string();
         Box::pin(async move {
+            let mut map = self.keys.write().await;
             let now = tokio::time::Instant::now();
             let expires_at = ttl.map(|d| now + d);
-            let mut map = self.keys.write().await;
             let tenant_map = map.entry(tid).or_default();
             Self::prune_expired_inline(tenant_map, now);
 
@@ -146,8 +146,8 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
         let tid = tenant_id.to_string();
         let k = key.to_string();
         Box::pin(async move {
-            let now = tokio::time::Instant::now();
             let mut map = self.keys.write().await;
+            let now = tokio::time::Instant::now();
             if let Some(tenant_map) = map.get_mut(&tid) {
                 Self::prune_expired_inline(tenant_map, now);
                 tenant_map.remove(&k);
@@ -159,8 +159,8 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     fn count<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<usize, CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let now = tokio::time::Instant::now();
             let map = self.keys.read().await;
+            let now = tokio::time::Instant::now();
             if let Some(tenant_map) = map.get(&tid) {
                 let active = tenant_map
                     .values()

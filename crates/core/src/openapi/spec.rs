@@ -334,7 +334,11 @@ pub struct OpenApiPathItem {
 pub struct OpenApiComponents {
     #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
     pub schemas: BTreeMap<String, serde_json::Value>,
-    #[serde(skip_serializing_if = "BTreeMap::is_empty", default)]
+    #[serde(
+        rename = "securitySchemes",
+        skip_serializing_if = "BTreeMap::is_empty",
+        default
+    )]
     pub security_schemes: BTreeMap<String, serde_json::Value>,
 }
 
@@ -466,7 +470,7 @@ pub fn generate_openapi(registry: &RouteRegistry, info: OpenApiInfo) -> OpenApiS
                 "title": { "type": "string" },
                 "status": { "type": "integer" },
                 "detail": { "type": "string" },
-                "instance": { "type": "string", "format": "uri" }
+                "instance": { "type": "string", "format": "uri-reference" }
             },
             "required": ["title", "status"]
         }),

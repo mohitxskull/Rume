@@ -139,20 +139,22 @@ impl Migration {
     }
 
     /// Computes the SHA-256 hexadecimal digest of the migration's `up_sql` statement.
+    ///
+    /// For no-SQL migrations (`up_sql == None`), returns a deterministic non-empty sentinel digest
+    /// so ledger verification never mistakes an intentional no-SQL migration for a corrupt empty checksum.
     pub fn checksum(&self) -> String {
-        match &self.up_sql {
-            Some(s) => {
-                use sha2::{Digest, Sha256};
-                let digest = Sha256::digest(s.as_bytes());
-                let mut hex = String::with_capacity(digest.len() * 2);
-                for byte in digest {
-                    use std::fmt::Write;
-                    let _ = write!(hex, "{byte:02x}");
-                }
-                hex
-            }
-            None => String::new(),
+        use sha2::{Digest, Sha256};
+        let bytes = match &self.up_sql {
+            Some(s) => s.as_bytes(),
+            None => b"__rume_no_sql_migration__",
+        };
+        let digest = Sha256::digest(bytes);
+        let mut hex = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            use std::fmt::Write;
+            let _ = write!(hex, "{byte:02x}");
         }
+        hex
     }
 }
 
@@ -384,7 +386,11 @@ impl Migrator {
             }
             let mut applied = Vec::new();
             let run_res: Result<(), PersistenceError> = async {
+                // `CREATE TABLE IF NOT EXISTS` triggers an implicit commit in MySQL, so run it
+                // under the named lock first and immediately start a fresh transaction for data
+                // migrations and ledger inserts.
                 tx.execute(ddl).await?;
+                tx.execute("START TRANSACTION").await?;
                 for migration in &self.migrations {
                     let id_param = [DbValue::from(migration.id.as_str())];
                     let stored_checksum = tx.query_scalar_params(check_sql, &id_param).await?;
@@ -473,8 +479,9 @@ impl Migrator {
         }
 
         if dialect == "sqlite" {
-            backend.execute(SQLITE_BUSY_TIMEOUT).await?;
             let tx = backend.begin_transaction().await?;
+            // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
+            tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;
 
             let mut applied = Vec::new();
@@ -625,6 +632,7 @@ impl Migrator {
             let mut rolled_back = None;
             let run_res: Result<(), PersistenceError> = async {
                 tx.execute(ddl).await?;
+                tx.execute("START TRANSACTION").await?;
                 for migration in self.migrations.iter().rev() {
                     let id_param = [DbValue::from(migration.id.as_str())];
                     let applied = tx.query_scalar_params(check_sql, &id_param).await?;
@@ -683,8 +691,9 @@ impl Migrator {
         }
 
         if dialect == "sqlite" {
-            backend.execute(SQLITE_BUSY_TIMEOUT).await?;
             let tx = backend.begin_transaction().await?;
+            // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
+            tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;
 
             for migration in self.migrations.iter().rev() {

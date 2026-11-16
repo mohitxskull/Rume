@@ -487,7 +487,7 @@ where
                         let mut stream = body.into_data_stream();
                         let mut collected: Vec<axum::body::Bytes> = Vec::new();
                         let mut total_len = 0;
-                        let mut stream_failed = false;
+                        let mut stream_err: Option<axum::Error> = None;
                         let mut limit_exceeded = false;
 
                         while let Some(chunk_res) = stream.next().await {
@@ -500,19 +500,21 @@ where
                                         break;
                                     }
                                 }
-                                Err(_) => {
-                                    stream_failed = true;
+                                Err(err) => {
+                                    stream_err = Some(err);
                                     break;
                                 }
                             }
                         }
 
-                        if limit_exceeded || stream_failed {
-                            // If stream exceeded limit or failed, chain collected chunks with remaining stream
-                            // so the original body is never destroyed or replaced with empty body!
+                        if limit_exceeded || stream_err.is_some() {
+                            // If stream exceeded limit or failed, chain collected chunks, any consumed
+                            // stream error, and the remaining stream so neither bytes nor errors are lost.
                             let collected_stream =
                                 futures_util::stream::iter(collected.into_iter().map(Ok));
-                            let chained = collected_stream.chain(stream);
+                            let err_stream =
+                                futures_util::stream::iter(stream_err.into_iter().map(Err));
+                            let chained = collected_stream.chain(err_stream).chain(stream);
                             return Ok(Response::from_parts(parts, Body::from_stream(chained)));
                         }
 
@@ -812,5 +814,37 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["request_id"], "test-req-id-777");
         assert_eq!(parsed["title"], "You do not have enough credit.");
+    }
+
+    #[tokio::test]
+    async fn observability_service_preserves_stream_error_on_inspected_problem_details() {
+        use tower::{Layer, Service};
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(|_req: Request<Body>| {
+            let stream = futures_util::stream::iter(vec![
+                Ok(axum::body::Bytes::from_static(b"{\"title\":\"partial\"")),
+                Err(std::io::Error::other("simulated mid-stream failure")),
+            ]);
+            async move {
+                let resp = Response::builder()
+                    .header(CONTENT_TYPE, "application/problem+json")
+                    .header(CONTENT_LENGTH, "100")
+                    .body(Body::from_stream(stream))
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            }
+        }));
+
+        let req = Request::builder()
+            .uri("/stream-error")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let res = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await;
+        assert!(
+            res.is_err(),
+            "mid-stream error must be preserved and propagated to body consumer"
+        );
     }
 }
