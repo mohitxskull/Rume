@@ -168,19 +168,25 @@ impl Availability {
 
         // Monotonic transition guard: once in a drain or terminal state (RefusingTraffic or Broken),
         // reject transitions back to Live or Ready to prevent in-flight workers or handlers from bypassing drain.
-        let _ = self
-            .inner
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |curr| {
-                if (curr == AvailabilityState::RefusingTraffic as u8
-                    || curr == AvailabilityState::Broken as u8)
-                    && (new_val == AvailabilityState::Live as u8
-                        || new_val == AvailabilityState::Ready as u8)
-                {
-                    None
-                } else {
-                    Some(new_val)
-                }
-            });
+        let mut curr = self.inner.load(Ordering::SeqCst);
+        loop {
+            if (curr == AvailabilityState::RefusingTraffic as u8
+                || curr == AvailabilityState::Broken as u8)
+                && (new_val == AvailabilityState::Live as u8
+                    || new_val == AvailabilityState::Ready as u8)
+            {
+                break;
+            }
+            match self.inner.compare_exchange_weak(
+                curr,
+                new_val,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => break,
+                Err(actual) => curr = actual,
+            }
+        }
     }
 
     /// Sets the availability state unconditionally, bypassing monotonicity guards.

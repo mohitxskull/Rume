@@ -20,8 +20,6 @@ rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
-rume = { path = "crates/core", version = "0.1.0" }
-
 axum = "=0.8.9"
 tower = "=0.5.3"
 tokio = { version = "=1.54.1", features = ["full", "test-util"] }

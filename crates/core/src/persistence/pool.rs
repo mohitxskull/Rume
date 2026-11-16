@@ -379,14 +379,9 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         }
 
         let remaining = timeout.saturating_sub(start.elapsed());
-        if tokio::time::timeout(remaining, self.backend.close())
+        tokio::time::timeout(remaining, self.backend.close())
             .await
-            .is_err()
-        {
-            return false;
-        }
-
-        true
+            .is_ok()
     }
 
     /// Creates a Rume [`HealthCheck`] for this database pool.
