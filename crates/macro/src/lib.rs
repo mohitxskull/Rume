@@ -352,7 +352,7 @@ fn extract_migration_version(id: &str) -> &str {
     }
 }
 
-/// Discovers `.up.sql` and `.down.sql` migrations and embeds them into a [`Migrator`].
+/// Discovers `.up.sql` and `.down.sql` migrations and embeds them into a `Migrator`.
 ///
 /// # Usage
 /// ```ignore
