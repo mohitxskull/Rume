@@ -195,10 +195,13 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Install Docker Compose
+      - name: Verify Docker Compose availability
         run: |
-          sudo apt-get update
-          sudo apt-get install -y docker-compose-plugin
+          if ! docker compose version >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y docker-compose-v2 || sudo apt-get install -y docker-compose-plugin
+          fi
+          docker compose version
       - name: Build release workbench binary
         run: cargo build --release -p workbench --bin workbench
       - name: Run Docker Compose multi-instance system test
