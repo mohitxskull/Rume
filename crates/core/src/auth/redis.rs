@@ -14,6 +14,31 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
+/// Escape a string for safe use as a Lua *pattern* (not literal) in
+/// `string.match`/`string.gsub`. Lua pattern magic characters
+/// (`^ $ ( ) % . [ ] * + - ?`) are prefixed with `%` so they match
+/// literally. This prevents hyphenated UUIDs (e.g. session IDs) from
+/// being misinterpreted as pattern operators.
+fn escape_lua_pattern(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '^' | '$' | '(' | ')' | '%' | '.' | '[' | ']' | '*' | '+' | '-' | '?' => {
+                result.push('%');
+                result.push(c);
+            }
+            _ => result.push(c),
+        }
+    }
+    result
+}
+
+/// Escape `%` in a string used as a Lua *replacement* (in `string.gsub`),
+/// where `%` introduces capture references (`%0`..`%9`, `%1`..`%9`).
+fn escape_lua_replacement(s: &str) -> String {
+    s.replace('%', "%%")
+}
+
 /// Redis-backed implementation of [`SessionStore`].
 ///
 /// Stores JSON-serialized sessions with Redis TTL auto-expiration matching [`Session::expires_at`].
@@ -133,6 +158,11 @@ impl SessionStore for RedisSessionStore {
         let old_key = self.key(old_id);
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_key = self.key(&new_id);
+        // Escape old_id for use as a Lua pattern (UUID hyphens are pattern
+        // operators, not literals). Escape new_id for use as a replacement
+        // string (% introduces capture references).
+        let old_id_pat = escape_lua_pattern(old_id);
+        let new_id_rep = escape_lua_replacement(&new_id);
 
         Box::pin(async move {
             let mut conn = self
@@ -143,11 +173,12 @@ impl SessionStore for RedisSessionStore {
 
             let now = current_timestamp();
 
-            let script = r#"
+            let script = format!(
+                r#"
                 local old_key = KEYS[1]
                 local new_key = KEYS[2]
-                local old_id = ARGV[1]
-                local new_id = ARGV[2]
+                local old_id_pat = ARGV[1]
+                local new_id_rep = ARGV[2]
                 local now = tonumber(ARGV[3])
 
                 local data = redis.call('GET', old_key)
@@ -161,13 +192,20 @@ impl SessionStore for RedisSessionStore {
                     return redis.error_reply("EXPIRED")
                 end
 
-                local target = '"id":"' .. old_id .. '"'
-                local replacement = '"id":"' .. new_id .. '"'
-                local updated, count = string.gsub(data, target, replacement, 1)
-                if count == 0 then
-                    target = '"id":%s*"' .. old_id .. '"'
-                    replacement = '"id":"' .. new_id .. '"'
-                    updated = string.gsub(data, target, replacement, 1)
+                -- Replace "id":"<old_id>" with "id":"<new_id>" using plain
+                -- string search (not pattern matching) to avoid Lua pattern
+                -- magic characters in UUIDs (e.g. hyphens).
+                local start, stop = string.find(data, '"id":"' .. old_id_pat .. '"', 1, true)
+                local updated
+                if start then
+                    updated = string.sub(data, 1, start - 1)
+                        .. '"id":"' .. new_id_rep .. '"'
+                        .. string.sub(data, stop + 1)
+                else
+                    -- Fallback: try with optional whitespace after colon
+                    local target = '"id":%s*"' .. old_id_pat .. '"'
+                    local replacement = '"id":"' .. new_id_rep .. '"'
+                    updated, _ = string.gsub(data, target, replacement, 1)
                 end
 
                 local ttl = redis.call('PTTL', old_key)
@@ -178,13 +216,14 @@ impl SessionStore for RedisSessionStore {
                 end
                 redis.call('DEL', old_key)
                 return updated
-            "#;
+                "#,
+            );
 
-            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(script)
+            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(&script)
                 .key(&old_key)
                 .key(&new_key)
-                .arg(old_id)
-                .arg(&new_id)
+                .arg(&old_id_pat)
+                .arg(&new_id_rep)
                 .arg(now)
                 .invoke_async(&mut *conn)
                 .await;

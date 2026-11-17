@@ -195,6 +195,9 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
                                 let mut user = AuthUser::new(session.user_id)
                                     .with_roles(session.roles)
                                     .with_permissions(session.permissions);
+                                if let Some(tenant_id) = &session.tenant_id {
+                                    user = user.with_tenant_id(tenant_id.clone());
+                                }
                                 user.metadata = session.data;
                                 return Ok(Some(user));
                             }
