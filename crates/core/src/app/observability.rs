@@ -814,6 +814,7 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(parsed["request_id"], "test-req-id-777");
         assert_eq!(parsed["title"], "You do not have enough credit.");
+    }
 
     #[tokio::test]
     async fn observability_service_preserves_stream_error_on_inspected_problem_details() {

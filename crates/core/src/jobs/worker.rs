@@ -953,9 +953,23 @@ impl<Q: JobQueue> JobWorker<Q> {
             }
             Err(err) => {
                 // Retryable failure: check remaining attempts.
-                // Do not release the idempotency lock during retry backoff; ownership is retained
-                // until terminal transition (success via ack or terminal failure to dead_letter).
+                // Why: lock ownership is retained only until the terminal transition
+                // (success via ack or terminal failure dead-lettered). A retryable error is a
+                // non-terminal transition, so release the distributed idempotency lock *before*
+                // nacking so another worker can re-acquire the same scoped key and re-execute.
+                // The lock is keyed by `effective_key` (the tenant-scoped idempotency key),
+                // never by `job.id`.
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
+                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
+                        && let Err(rel_err) = store.release_with_token(key, &token).await
+                    {
+                        tracing::error!(
+                            job_id = %job_id,
+                            key = %key,
+                            error = %rel_err,
+                            "Failed to release idempotency token before retryable nack; proceeding with nack"
+                        );
+                    }
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -1746,6 +1760,225 @@ mod tests {
             ack_count.load(Ordering::SeqCst),
             0,
             "job must NOT be acked when store does not support heartbeat renewal"
+        );
+    }
+
+    /// A job whose handler always returns a retryable error, used to exercise the
+    /// retryable-failure branch of [`JobWorker::execute_job`].
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct RetryFailJob;
+
+    impl Job for RetryFailJob {
+        const NAME: &'static str = "retry_fail_job";
+    }
+
+    struct RetryFailHandler;
+
+    impl JobHandler<RetryFailJob> for RetryFailHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: RetryFailJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            Box::pin(async move { Err(JobError::Retryable("transient failure".into())) })
+        }
+    }
+
+    /// Fake idempotency store that records every call into a shared sequence log,
+    /// used to assert lock-release ordering relative to queue nack.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingIdempotencyStore {
+        seq_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl IdempotencyStore for RecordingIdempotencyStore {
+        fn try_acquire_with_token(
+            &self,
+            key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            let key = key.to_string();
+            let seq_log = Arc::clone(&self.seq_log);
+            Box::pin(async move {
+                seq_log.lock().await.push(format!("acquire:{key}"));
+                Ok(IdempotencyStatus::New)
+            })
+        }
+
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn release_with_token(
+            &self,
+            key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let key = key.to_string();
+            let seq_log = Arc::clone(&self.seq_log);
+            Box::pin(async move {
+                seq_log.lock().await.push(format!("release:{key}"));
+                Ok(())
+            })
+        }
+
+        fn extend_lock_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    /// Fake queue that records `nack` calls into a shared sequence log.
+    #[derive(Debug, Clone, Default)]
+    struct RecordingTestQueue {
+        seq_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl JobQueue for RecordingTestQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async move { Ok("test-id".to_string()) })
+        }
+
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async move { Ok(None) })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let id = job.id.clone();
+            let seq_log = Arc::clone(&self.seq_log);
+            Box::pin(async move {
+                seq_log.lock().await.push(format!("nack:{id}"));
+                Ok(())
+            })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn renew_lease(
+            &self,
+            _job_id: &str,
+            _lease_token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move { Ok(()) })
+        }
+
+        fn purge_completed(&self, _retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async move { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_retryable_failure_releases_idempotency_lock_before_nack() {
+        let seq_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let store = Arc::new(RecordingIdempotencyStore {
+            seq_log: Arc::clone(&seq_log),
+        });
+        let queue = Arc::new(RecordingTestQueue {
+            seq_log: Arc::clone(&seq_log),
+        });
+
+        let payload_bytes = serde_json::to_vec(&RetryFailJob).unwrap();
+        let job = QueuedJob {
+            id: "job-retry-lock".to_string(),
+            name: RetryFailJob::NAME.to_string(),
+            payload: payload_bytes,
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("idemp-key".into()),
+            tenant_id: Some("tenant-a".into()),
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(60),
+            trace_context: None,
+        };
+
+        let mut registry = JobRegistry::new();
+        registry.register(RetryFailHandler);
+
+        JobWorker::execute_job(
+            Arc::clone(&queue),
+            Arc::new(registry),
+            job,
+            Some(store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        let log = seq_log.lock().await;
+        let release_idx = log.iter().position(|e| e.starts_with("release:"));
+        let nack_idx = log.iter().position(|e| e.starts_with("nack:"));
+
+        assert!(
+            release_idx.is_some(),
+            "release_with_token must be called before nack on retryable failure; idempotency lock was leaked"
+        );
+        let release_idx = release_idx.expect("release present");
+        let nack_idx = nack_idx.expect("nack present");
+        assert!(
+            release_idx < nack_idx,
+            "release_with_token must precede queue.nack; log: {log:?}"
+        );
+
+        // The lock must be keyed by the scoped idempotency key (effective_key), not job.id.
+        let release_entry = &log[release_idx];
+        let expected_key = scoped_idempotency_key("tenant-a", "idemp-key");
+        assert!(
+            release_entry == &format!("release:{expected_key}"),
+            "lock must be released by effective_key, not job.id; got {release_entry:?}"
         );
     }
 }
