@@ -42,6 +42,8 @@ prometheus.workspace = true
 uuid = { version = "=1.29.2", features = ["v4"] }
 sha2 = "=0.11.1"
 hmac = "=0.13.0"
+# Constant-time comparison used by `helpers::safe_equal` (RC-14).
+subtle.workspace = true
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }

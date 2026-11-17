@@ -1,19 +1,18 @@
 //! Constant-time byte and string comparison.
 
-use sha2::{Digest, Sha256};
-use std::hint::black_box;
+use subtle::ConstantTimeEq;
 
 /// Constant-time comparison of two byte sequences or strings.
 ///
 /// Returns `true` only when `a` and `b` are identical in length and content.
 ///
-/// Both inputs are first hashed with SHA-256, producing fixed 32-byte
-/// digests, so the comparison loop always runs exactly 32 iterations
-/// regardless of input length. This eliminates timing side-channels that
-/// would leak input length from the loop bound or memory access pattern.
-///
-/// `std::hint::black_box` is applied to the accumulator to prevent compiler
-/// optimizations from short-circuiting or vectorizing the loop with early branches.
+/// The comparison delegates to [`subtle::ConstantTimeEq::ct_eq`], which is
+/// audited constant-time crypto code. Equal-length inputs are compared
+/// byte-by-byte without short-circuiting, so no data-dependent branch or
+/// memory-access pattern leaks byte content. When the lengths differ, the
+/// comparison returns `false` without iterating over the longer input, so the
+/// runtime reveals only that the lengths are unequal — never how much they
+/// differ.
 ///
 /// # Examples
 ///
@@ -29,22 +28,19 @@ where
     A: AsRef<[u8]>,
     B: AsRef<[u8]>,
 {
-    let a_hash = Sha256::digest(a.as_ref());
-    let b_hash = Sha256::digest(b.as_ref());
-
-    let mut diff = 0u64;
-    for i in 0..32 {
-        let x = a_hash[i];
-        let y = b_hash[i];
-        diff |= (x ^ y) as u64;
-    }
-    black_box(diff) == 0
+    // Why: `subtle::ConstantTimeEq` is audited, constant-time crypto code — no
+    // hand-rolled loop, no length-dependent timing side-channel from loop bounds
+    // or SHA-256 pre-hashing.
+    bool::from(a.as_ref().ct_eq(b.as_ref()))
 }
 
-/// Constant-time comparison of two byte sequences or strings after SHA-256 hashing.
+/// Constant-time comparison of two byte sequences or strings.
 ///
-/// Hashes both inputs using SHA-256 and compares the fixed 32-byte digests in constant time.
-/// This completely eliminates timing discrepancies from input length variance.
+/// `safe_equal_hashed` is preserved for API compatibility. It now delegates
+/// directly to [`safe_equal`]: because `subtle::ConstantTimeEq` compares
+/// fixed-length slices in constant time and handles unequal lengths without
+/// leaking their magnitude, the separate SHA-256 pre-hashing step the previous
+/// implementation used is no longer necessary.
 ///
 /// # Examples
 ///

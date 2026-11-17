@@ -1,35 +1,38 @@
 # 10-rc14-safe-equal.md
 
-## Goal
+## OVERRIDE — Dependency-based approach
+Do NOT hand-roll constant-time comparison. Instead:
+- Add the `subtle` crate to workspace dependencies and core Cargo.toml
+- Rewrite `crates/core/src/helpers/safe_equal.rs` to use `subtle::ConstantTimeEq`
+- `subtle::ConstantTimeEq` is audited crypto code — no length-dependent loop, no timing side-channel from loop bounds
 
-Fix RC-14: `helpers/safe_equal.rs` `safe_equal` has a length-dependent loop.
+## Task file
+Read the full task file: /home/skull/Projects/rume/docs/plans/001-fix-audit-findings/10-rc14-safe-equal.md
 
-The loop iterates `0..max_len` and reads `a_bytes.get(i).copied().unwrap_or(0)` / `b_bytes.get(i)`, folding `x ^ y` into `diff`. While it does not early-return on mismatch, the *number of iterations* depends on `max_len = max(a.len(), b.len())`, and the `unwrapped_or(0)` padding means comparisons of different lengths still run `max_len` iterations — but the observable timing can still leak length because the loop bound and memory access pattern scale with input length, and `black_box` only guards the accumulator, not the loop-bound leakage.
+## Your job
+Fix RC-14 `safe_equal` length-dependent timing leak using `subtle`:
 
-Fix root cause: make the comparison truly constant-time with respect to length — always iterate a fixed, length-independent bound (e.g. compare fixed 32-byte SHA-256 digests via `safe_equal_hashed`, or pad both inputs to a fixed block size before comparing). Prefer routing public secret comparisons through `safe_equal_hashed` (fixed 32-byte output) so timing is independent of input length.
+1. Add `subtle` crate to workspace `Cargo.toml` (`[workspace.dependencies]`) and `crates/core/Cargo.toml` (pin exact version, e.g. `=2.6.1`)
+2. Rewrite `crates/core/src/helpers/safe_equal.rs` to use `subtle::ConstantTimeEq::ct_eq()` instead of hand-rolled `max_len` loop with SHA-256 hashing
+3. Preserve public API: `safe_equal` and `safe_equal_hashed`
+4. `subtle::ConstantTimeEq` is audited, constant-time, length-independent
 
 ## Files touched
+- `Cargo.toml` (workspace deps)
+- `crates/core/Cargo.toml` (add subtle)
+- `crates/core/src/helpers/safe_equal.rs` — rewrite to use subtle::ConstantTimeEq
 
-- `crates/core/src/helpers/safe_equal.rs` — `safe_equal` (and document callers to use the hashed variant for secrets).
+## Constraints
+- Use `subtle::ConstantTimeEq` for constant-time comparison
+- No `unsafe`
+- Record `Why:` comments at decision sites
+- `safe_equal("a", "aaaaaaaaaa")` and `safe_equal("a", "a")` take constant time regardless of length difference
+- Existing API preserved (`safe_equal`, `safe_equal_hashed`)
 
-## Constraints honoured
+## Verification
+1. `cargo test -p rume helpers`
+2. `cargo clippy -p rume-core --all-targets`
+3. `cargo fmt --all --check`
 
-- Root cause, not symptom: timing must not vary with input length.
-- No new dependencies (sha2 already present), no `unsafe`.
-- Preserve the existing API (`safe_equal` still works for equality), but make the security-sensitive path length-independent.
-- Record a `Why:` comment explaining length-independent comparison.
-
-## Done when (checkable by a command)
-
-- `cargo test -p rume-core helpers` passes (safe_equal tests).
-- `cargo clippy -p rume-core --all-targets` and `cargo fmt --all --check` clean.
-- `safe_equal` no longer iterates a length-dependent bound for security-sensitive comparisons; secret comparisons use fixed-width digests.
-
-## Verification (fails-before test idea)
-
-A timing-sensitive assertion is hard to make deterministic in a unit test, so the fails-before test is structural:
-
-1. Before the fix, `safe_equal("a", "aaaaaaaaaa")` iterates 10 times while `safe_equal("a", "a")` iterates 1 — a length-dependent loop bound exists (demonstrate by inspecting source / a unit test that the loop bound is `max_len`).
-2. After the fix, security-sensitive comparison is performed on fixed-width (32-byte) hashes so the loop bound is constant regardless of input length (e.g. a test confirms `safe_equal_hashed` is used for token comparison, or `safe_equal` itself pads to a fixed width).
-
-Since true constant-time cannot be reliably asserted in a portable unit test, the test asserts the *construction* (fixed-width digest, no `max_len`-bounded loop over raw input) rather than measuring nanoseconds.
+## Handoff
+Write to `/home/skull/Projects/rume/docs/plans/001-fix-audit-findings/scratch/task-10-done.md`. Do not commit.
