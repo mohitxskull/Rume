@@ -1,13 +1,44 @@
-//! Prometheus metrics registry, counters, gauges, and histograms.
+//! Prometheus metrics collection, registry, and Tower middleware.
 
-use std::collections::BTreeMap;
-use std::fmt::Write;
+use std::sync::Arc;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 use std::time::Duration;
+
+use prometheus::{
+    Encoder, Gauge as PromGauge, GaugeVec, HistogramOpts, HistogramVec, IntCounterVec, Opts,
+    Registry, TextEncoder,
+};
 
 use crate::persistence::PoolStatus;
 use crate::routing::HealthStatus;
+
+// Histogram buckets for request latency (seconds), matching the legacy summary.
+const HISTOGRAM_BUCKETS: [f64; 11] = [
+    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+/// Map an HTTP method to a bounded label value.
+///
+/// Why: raw HTTP methods are unbounded client input. A fuzzed or extended
+/// method (e.g. `GET\x00CUSTOM`) would otherwise create a new Prometheus
+/// label series per distinct value. Known methods are tracked individually and
+/// everything else is collapsed to `OTHER`, keeping the label set bounded at
+/// the nine known methods plus `OTHER`.
+fn http_method_label(method: &str) -> &'static str {
+    match method.to_ascii_uppercase().as_str() {
+        "GET" => "GET",
+        "POST" => "POST",
+        "PUT" => "PUT",
+        "DELETE" => "DELETE",
+        "HEAD" => "HEAD",
+        "OPTIONS" => "OPTIONS",
+        "PATCH" => "PATCH",
+        "CONNECT" => "CONNECT",
+        "TRACE" => "TRACE",
+        _ => "OTHER",
+    }
+}
 
 /// Atomic counter metric.
 #[derive(Debug, Default)]
@@ -51,34 +82,6 @@ impl Gauge {
     pub fn get(&self) -> i64 {
         self.value.load(Ordering::Relaxed)
     }
-}
-
-const HISTOGRAM_BUCKETS: [f64; 11] = [
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
-];
-
-#[derive(Debug, Clone, Default)]
-struct LatencySummary {
-    count: u64,
-    sum: f64,
-    buckets: [u64; 11],
-}
-
-#[derive(Debug, Clone, Default)]
-struct DbPoolMetrics {
-    leased: u32,
-    active: u32,
-    idle: u32,
-    total: u32,
-    max: u32,
-    in_flight_tx: u32,
-    is_closed: bool,
-}
-
-#[derive(Debug, Clone)]
-struct HealthCheckMetric {
-    status: u8,
-    duration_secs: f64,
 }
 
 /// Trait for types that can export database connection pool metrics into [`MetricsRegistry`].
@@ -129,62 +132,215 @@ where
     }
 }
 
-/// Standard HTTP request metrics registry with Prometheus text-format exporter.
-#[derive(Debug, Clone, Default)]
+/// Standard HTTP request metrics registry backed by a [`prometheus::Registry`].
+///
+/// Metrics are gathered and rendered with [`prometheus::Encoder::encode`]
+/// (`TextEncoder`), so label values are escaped per the Prometheus text
+/// exposition specification automatically — no manual interpolation.
+#[derive(Clone)]
 pub struct MetricsRegistry {
-    requests_total: Arc<RwLock<BTreeMap<(String, u16), u64>>>,
-    request_latencies: Arc<RwLock<BTreeMap<String, LatencySummary>>>,
-    in_flight: Arc<AtomicI64>,
-    db_pools: Arc<RwLock<BTreeMap<String, DbPoolMetrics>>>,
+    inner: Arc<Inner>,
+}
+
+impl Default for MetricsRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl std::fmt::Debug for MetricsRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MetricsRegistry")
+            .field("in_flight", &self.in_flight())
+            .finish_non_exhaustive()
+    }
+}
+
+struct Inner {
+    registry: Registry,
+    requests_total: IntCounterVec,
+    request_duration: HistogramVec,
+    in_flight: PromGauge,
+    db_pool_connections: GaugeVec,
+    db_pool_in_flight_transactions: GaugeVec,
+    db_pool_is_closed: GaugeVec,
+    health_check_status: GaugeVec,
+    health_check_duration: GaugeVec,
+    health_checks_total: IntCounterVec,
+    health_check_failures_total: IntCounterVec,
     pool_exporters: Arc<RwLock<Vec<Arc<dyn PoolMetricsExporter>>>>,
-    health_checks: Arc<RwLock<BTreeMap<String, HealthCheckMetric>>>,
-    health_checks_total: Arc<RwLock<BTreeMap<String, u64>>>,
-    health_check_failures_total: Arc<RwLock<BTreeMap<String, u64>>>,
 }
 
 impl MetricsRegistry {
     /// Creates a new empty metrics registry.
     pub fn new() -> Self {
-        Self::default()
+        let registry = Registry::new();
+
+        let requests_total = IntCounterVec::new(
+            Opts::new(
+                "http_requests_total",
+                "Total number of HTTP requests partitioned by status code and method.",
+            ),
+            &["method", "status"],
+        )
+        .expect("http_requests_total metric definition is valid");
+
+        let request_duration = HistogramVec::new(
+            HistogramOpts::new(
+                "http_request_duration_seconds",
+                "Latency of HTTP requests in seconds.",
+            )
+            .buckets(HISTOGRAM_BUCKETS.to_vec()),
+            &["method"],
+        )
+        .expect("http_request_duration_seconds metric definition is valid");
+
+        let in_flight = PromGauge::new(
+            "http_requests_in_flight",
+            "Current number of HTTP requests being processed.",
+        )
+        .expect("http_requests_in_flight metric definition is valid");
+
+        let db_pool_connections = GaugeVec::new(
+            Opts::new(
+                "db_pool_connections",
+                "Current connection count of the database pool by state.",
+            ),
+            &["pool", "state"],
+        )
+        .expect("db_pool_connections metric definition is valid");
+
+        let db_pool_in_flight_transactions = GaugeVec::new(
+            Opts::new(
+                "db_pool_in_flight_transactions",
+                "In-flight database transactions.",
+            ),
+            &["pool"],
+        )
+        .expect("db_pool_in_flight_transactions metric definition is valid");
+
+        let db_pool_is_closed = GaugeVec::new(
+            Opts::new(
+                "db_pool_is_closed",
+                "Whether the database connection pool is closed.",
+            ),
+            &["pool"],
+        )
+        .expect("db_pool_is_closed metric definition is valid");
+
+        let health_check_status = GaugeVec::new(
+            Opts::new(
+                "health_check_status",
+                "Health check execution status (1 = healthy, 0 = unhealthy).",
+            ),
+            &["name"],
+        )
+        .expect("health_check_status metric definition is valid");
+
+        let health_check_duration = GaugeVec::new(
+            Opts::new(
+                "health_check_duration_seconds",
+                "Health check execution latency in seconds.",
+            ),
+            &["name"],
+        )
+        .expect("health_check_duration_seconds metric definition is valid");
+
+        let health_checks_total = IntCounterVec::new(
+            Opts::new(
+                "health_checks_total",
+                "Total number of health check executions partitioned by check name.",
+            ),
+            &["name"],
+        )
+        .expect("health_checks_total metric definition is valid");
+
+        let health_check_failures_total = IntCounterVec::new(
+            Opts::new(
+                "health_check_failures_total",
+                "Total number of failed health check executions partitioned by check name.",
+            ),
+            &["name"],
+        )
+        .expect("health_check_failures_total metric definition is valid");
+
+        // Register every collector with the registry while retaining the
+        // handles used to record observations.
+        let collectors: Vec<Box<dyn prometheus::core::Collector>> = vec![
+            Box::new(requests_total.clone()),
+            Box::new(request_duration.clone()),
+            Box::new(in_flight.clone()),
+            Box::new(db_pool_connections.clone()),
+            Box::new(db_pool_in_flight_transactions.clone()),
+            Box::new(db_pool_is_closed.clone()),
+            Box::new(health_check_status.clone()),
+            Box::new(health_check_duration.clone()),
+            Box::new(health_checks_total.clone()),
+            Box::new(health_check_failures_total.clone()),
+        ];
+        for collector in collectors {
+            registry
+                .register(collector)
+                .expect("metric registration is valid");
+        }
+
+        Self {
+            inner: Arc::new(Inner {
+                registry,
+                requests_total,
+                request_duration,
+                in_flight,
+                db_pool_connections,
+                db_pool_in_flight_transactions,
+                db_pool_is_closed,
+                health_check_status,
+                health_check_duration,
+                health_checks_total,
+                health_check_failures_total,
+                pool_exporters: Arc::new(RwLock::new(Vec::new())),
+            }),
+        }
     }
 
     /// Records an HTTP request completion with method, status, and duration.
+    ///
+    /// The method label is cardinality-bounded via [`http_method_label`]:
+    /// known methods are tracked individually and everything else is reported
+    /// under `OTHER`.
     pub fn record_http_request(&self, method: &str, status: u16, duration: Duration) {
-        if let Ok(mut total) = self.requests_total.write() {
-            *total.entry((method.to_uppercase(), status)).or_default() += 1;
-        }
+        let method = http_method_label(method);
+        let status = status.to_string();
+
+        self.inner
+            .requests_total
+            .with_label_values(&[method, status.as_str()])
+            .inc();
 
         let secs = duration.as_secs_f64();
-        if let Ok(mut latencies) = self.request_latencies.write() {
-            let summary = latencies.entry(method.to_uppercase()).or_default();
-            summary.count += 1;
-            summary.sum += secs;
-            for (idx, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
-                if secs <= boundary {
-                    summary.buckets[idx] += 1;
-                }
-            }
-        }
+        self.inner
+            .request_duration
+            .with_label_values(&[method])
+            .observe(secs);
     }
 
     /// Increments in-flight requests gauge.
     pub fn inc_in_flight(&self) {
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        self.inner.in_flight.inc();
     }
 
     /// Decrements in-flight requests gauge.
     pub fn dec_in_flight(&self) {
-        self.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.inner.in_flight.dec();
     }
 
     /// Returns current in-flight requests.
     pub fn in_flight(&self) -> i64 {
-        self.in_flight.load(Ordering::Relaxed)
+        self.inner.in_flight.get() as i64
     }
 
     /// Registers a custom pool metrics exporter.
     pub fn register_pool_exporter(&self, exporter: Arc<dyn PoolMetricsExporter>) {
-        if let Ok(mut exporters) = self.pool_exporters.write() {
+        if let Ok(mut exporters) = self.inner.pool_exporters.write() {
             exporters.push(exporter);
         }
     }
@@ -202,255 +358,90 @@ impl MetricsRegistry {
 
     /// Records connection pool metrics for a database pool.
     pub fn record_db_pool_status(&self, pool_name: &str, status: &PoolStatus) {
-        if let Ok(mut pools) = self.db_pools.write() {
-            pools.insert(
-                pool_name.to_string(),
-                DbPoolMetrics {
-                    leased: status.leased_connections,
-                    active: status.active_connections,
-                    idle: status.idle_connections,
-                    total: status.total_connections,
-                    max: status.max_connections,
-                    in_flight_tx: status.in_flight_transactions,
-                    is_closed: status.is_closed,
-                },
-            );
-        }
+        let pool = pool_name;
+        self.inner
+            .db_pool_connections
+            .with_label_values(&[pool, "active"])
+            .set(status.active_connections as f64);
+        self.inner
+            .db_pool_connections
+            .with_label_values(&[pool, "idle"])
+            .set(status.idle_connections as f64);
+        self.inner
+            .db_pool_connections
+            .with_label_values(&[pool, "leased"])
+            .set(status.leased_connections as f64);
+        self.inner
+            .db_pool_connections
+            .with_label_values(&[pool, "total"])
+            .set(status.total_connections as f64);
+        self.inner
+            .db_pool_connections
+            .with_label_values(&[pool, "max"])
+            .set(status.max_connections as f64);
+
+        self.inner
+            .db_pool_in_flight_transactions
+            .with_label_values(&[pool])
+            .set(status.in_flight_transactions as f64);
+
+        self.inner
+            .db_pool_is_closed
+            .with_label_values(&[pool])
+            .set(if status.is_closed { 1.0 } else { 0.0 });
     }
 
     /// Records the execution status and duration of a health check.
     pub fn record_health_check(&self, name: &str, status: HealthStatus, duration: Duration) {
-        if let Ok(mut checks) = self.health_checks.write() {
-            checks.insert(
-                name.to_string(),
-                HealthCheckMetric {
-                    status: if status == HealthStatus::Ok { 1 } else { 0 },
-                    duration_secs: duration.as_secs_f64(),
-                },
-            );
-        }
-        if let Ok(mut totals) = self.health_checks_total.write() {
-            *totals.entry(name.to_string()).or_default() += 1;
-        }
-        if status != HealthStatus::Ok
-            && let Ok(mut fails) = self.health_check_failures_total.write()
-        {
-            *fails.entry(name.to_string()).or_default() += 1;
+        let status_val = if status == HealthStatus::Ok { 1.0 } else { 0.0 };
+        self.inner
+            .health_check_status
+            .with_label_values(&[name])
+            .set(status_val);
+        self.inner
+            .health_check_duration
+            .with_label_values(&[name])
+            .set(duration.as_secs_f64());
+        self.inner
+            .health_checks_total
+            .with_label_values(&[name])
+            .inc();
+        if status != HealthStatus::Ok {
+            self.inner
+                .health_check_failures_total
+                .with_label_values(&[name])
+                .inc();
         }
     }
 
     /// Renders all registered metrics into the standard Prometheus exposition format.
+    ///
+    /// Label escaping is performed by [`prometheus::Encoder::encode`]
+    /// (`TextEncoder`) per the text exposition specification, so label values
+    /// containing backslashes, double quotes, or newlines cannot break the
+    /// output or inject labels.
     pub fn render_prometheus(&self) -> String {
-        // Refresh pool metrics via registered exporters before formatting
-        if let Ok(exporters) = self.pool_exporters.read() {
+        // Refresh pool metrics via registered exporters before gathering
+        if let Ok(exporters) = self.inner.pool_exporters.read() {
             for exp in exporters.iter() {
                 exp.export_metrics(self);
             }
         }
 
-        let mut out = String::new();
-
-        // 1. in_flight gauge
-        writeln!(
-            out,
-            "# HELP http_requests_in_flight Current number of HTTP requests being processed."
-        )
-        .unwrap();
-        writeln!(out, "# TYPE http_requests_in_flight gauge").unwrap();
-        writeln!(out, "http_requests_in_flight {}", self.in_flight()).unwrap();
-
-        // 2. requests_total counter
-        writeln!(
-            out,
-            "# HELP http_requests_total Total number of HTTP requests partitioned by status code and method."
-        )
-        .unwrap();
-        writeln!(out, "# TYPE http_requests_total counter").unwrap();
-        if let Ok(totals) = self.requests_total.read() {
-            for ((method, status), count) in totals.iter() {
-                writeln!(
-                    out,
-                    "http_requests_total{{method=\"{method}\",status=\"{status}\"}} {count}"
-                )
-                .unwrap();
-            }
-        }
-
-        // 3. request_duration_seconds summary & histogram
-        writeln!(
-            out,
-            "# HELP http_request_duration_seconds Latency of HTTP requests in seconds."
-        )
-        .unwrap();
-        writeln!(out, "# TYPE http_request_duration_seconds histogram").unwrap();
-        if let Ok(latencies) = self.request_latencies.read() {
-            for (method, summary) in latencies.iter() {
-                for (idx, &boundary) in HISTOGRAM_BUCKETS.iter().enumerate() {
-                    let bucket_count = summary.buckets[idx];
-                    writeln!(
-                        out,
-                        "http_request_duration_seconds_bucket{{method=\"{method}\",le=\"{boundary}\"}} {bucket_count}"
-                    )
-                    .unwrap();
-                }
-                writeln!(
-                    out,
-                    "http_request_duration_seconds_bucket{{method=\"{method}\",le=\"+Inf\"}} {}",
-                    summary.count
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "http_request_duration_seconds_count{{method=\"{method}\"}} {}",
-                    summary.count
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "http_request_duration_seconds_sum{{method=\"{method}\"}} {:.6}",
-                    summary.sum
-                )
-                .unwrap();
-            }
-        }
-
-        // 4. db_pool metrics
-        let pools_guard = self.db_pools.read().ok();
-        if let Some(pools) = pools_guard.as_ref().filter(|p| !p.is_empty()) {
-            writeln!(
-                out,
-                "# HELP db_pool_connections Current connection count of the database pool by state."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE db_pool_connections gauge").unwrap();
-            for (pool, m) in pools.iter() {
-                writeln!(
-                    out,
-                    "db_pool_connections{{pool=\"{pool}\",state=\"active\"}} {}",
-                    m.active
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "db_pool_connections{{pool=\"{pool}\",state=\"idle\"}} {}",
-                    m.idle
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "db_pool_connections{{pool=\"{pool}\",state=\"leased\"}} {}",
-                    m.leased
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "db_pool_connections{{pool=\"{pool}\",state=\"total\"}} {}",
-                    m.total
-                )
-                .unwrap();
-                writeln!(
-                    out,
-                    "db_pool_connections{{pool=\"{pool}\",state=\"max\"}} {}",
-                    m.max
-                )
-                .unwrap();
-            }
-
-            writeln!(
-                out,
-                "# HELP db_pool_in_flight_transactions In-flight database transactions."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE db_pool_in_flight_transactions gauge").unwrap();
-            for (pool, m) in pools.iter() {
-                writeln!(
-                    out,
-                    "db_pool_in_flight_transactions{{pool=\"{pool}\"}} {}",
-                    m.in_flight_tx
-                )
-                .unwrap();
-            }
-
-            writeln!(
-                out,
-                "# HELP db_pool_is_closed Whether the database connection pool is closed."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE db_pool_is_closed gauge").unwrap();
-            for (pool, m) in pools.iter() {
-                writeln!(
-                    out,
-                    "db_pool_is_closed{{pool=\"{pool}\"}} {}",
-                    if m.is_closed { 1 } else { 0 }
-                )
-                .unwrap();
-            }
-        }
-
-        // 5. health_check metrics
-        let checks_guard = self.health_checks.read().ok();
-        if let Some(checks) = checks_guard.as_ref().filter(|c| !c.is_empty()) {
-            writeln!(
-                out,
-                "# HELP health_check_status Health check execution status (1 = healthy, 0 = unhealthy)."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE health_check_status gauge").unwrap();
-            for (name, m) in checks.iter() {
-                writeln!(out, "health_check_status{{name=\"{name}\"}} {}", m.status).unwrap();
-            }
-
-            writeln!(
-                out,
-                "# HELP health_check_duration_seconds Health check execution latency in seconds."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE health_check_duration_seconds gauge").unwrap();
-            for (name, m) in checks.iter() {
-                writeln!(
-                    out,
-                    "health_check_duration_seconds{{name=\"{name}\"}} {:.6}",
-                    m.duration_secs
-                )
-                .unwrap();
-            }
-
-            writeln!(
-                out,
-                "# HELP health_checks_total Total number of health check executions partitioned by check name."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE health_checks_total counter").unwrap();
-            if let Ok(totals) = self.health_checks_total.read() {
-                for (name, count) in totals.iter() {
-                    writeln!(out, "health_checks_total{{name=\"{name}\"}} {count}").unwrap();
-                }
-            }
-
-            writeln!(
-                out,
-                "# HELP health_check_failures_total Total number of failed health check executions partitioned by check name."
-            )
-            .unwrap();
-            writeln!(out, "# TYPE health_check_failures_total counter").unwrap();
-            if let Ok(fails) = self.health_check_failures_total.read() {
-                for (name, count) in fails.iter() {
-                    writeln!(
-                        out,
-                        "health_check_failures_total{{name=\"{name}\"}} {count}"
-                    )
-                    .unwrap();
-                }
-            }
-        }
-
-        out
+        let encoder = TextEncoder::new();
+        let metric_families = self.inner.registry.gather();
+        let mut buffer = Vec::new();
+        encoder
+            .encode(&metric_families, &mut buffer)
+            .expect("failed to encode prometheus metrics");
+        String::from_utf8(buffer).expect("prometheus metrics are not valid utf-8")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_record_db_pool_status() {
@@ -485,12 +476,61 @@ mod tests {
         let rendered = registry.render_prometheus();
         assert!(rendered.contains("health_check_status{name=\"redis\"} 1"));
         assert!(rendered.contains("health_check_status{name=\"db\"} 0"));
-        assert!(rendered.contains("health_check_duration_seconds{name=\"redis\"} 0.015000"));
-        assert!(rendered.contains("health_check_duration_seconds{name=\"db\"} 0.120000"));
+        assert!(rendered.contains("health_check_duration_seconds{name=\"redis\"} 0.015"));
+        assert!(rendered.contains("health_check_duration_seconds{name=\"db\"} 0.12"));
         assert!(rendered.contains("health_checks_total{name=\"redis\"} 1"));
         assert!(rendered.contains("health_checks_total{name=\"db\"} 1"));
         assert!(rendered.contains("health_check_failures_total{name=\"db\"} 1"));
         assert!(!rendered.contains("health_check_failures_total{name=\"redis\"}"));
+    }
+
+    #[test]
+    fn test_http_method_cardinality_is_bounded() {
+        let registry = MetricsRegistry::new();
+
+        registry.record_http_request("GET", 200, Duration::from_millis(5));
+        registry.record_http_request("GET", 200, Duration::from_millis(5));
+        // Fuzzed / extended method: must not create an unbounded label series.
+        registry.record_http_request("GET\x00CUSTOM", 200, Duration::from_millis(5));
+        registry.record_http_request("DELETE", 204, Duration::from_millis(2));
+
+        let rendered = registry.render_prometheus();
+
+        // Known methods are tracked individually...
+        assert!(rendered.contains("http_requests_total{method=\"GET\",status=\"200\"} 2"));
+        assert!(rendered.contains("http_requests_total{method=\"DELETE\",status=\"204\"} 1"));
+        // ...and everything else collapses to a single `OTHER` bucket.
+        assert!(rendered.contains("http_requests_total{method=\"OTHER\",status=\"200\"} 1"));
+        // The raw fuzzed value must never appear verbatim in a label.
+        assert!(!rendered.contains("GET\x00CUSTOM"));
+    }
+
+    #[test]
+    fn test_prometheus_label_values_are_escaped() {
+        let registry = MetricsRegistry::new();
+        let status = PoolStatus {
+            leased_connections: 0,
+            active_connections: 1,
+            idle_connections: 0,
+            total_connections: 1,
+            max_connections: 10,
+            in_flight_transactions: 0,
+            is_closed: false,
+        };
+
+        // Label values containing a double-quote and a backslash.
+        registry.record_db_pool_status(r#"prim"ary"#, &status);
+        registry.record_health_check(r#"chk"ec"#, HealthStatus::Ok, Duration::ZERO);
+
+        let rendered = registry.render_prometheus();
+
+        // Encoder-escaped label values.
+        assert!(rendered.contains(r#"db_pool_connections{pool="prim\"ary",state="active"} 1"#));
+        assert!(rendered.contains(r#"health_check_status{name="chk\"ec"} 1"#));
+
+        // Raw, unescaped label values must not break out of the quoted string.
+        assert!(!rendered.contains(r#"db_pool_connections{pool="prim"ary""#));
+        assert!(!rendered.contains(r#"health_check_status{name="chk"ec""#));
     }
 
     #[test]
