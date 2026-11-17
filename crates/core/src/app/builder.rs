@@ -9,7 +9,6 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::net::TcpListener;
 use tokio::time::timeout;
@@ -1316,26 +1315,21 @@ where
     {
         let addr = listener.local_addr()?;
 
-        // Shutdown signal monitoring for boot hooks and server
-        let shutdown_flag = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        // Shutdown signal monitoring for boot hooks and server.
+        // Use a watch channel instead of AtomicBool+Notify so the shutdown
+        // signal latches: `rx.wait_for()` returns immediately if `send(true)`
+        // already happened before the waiter registered, preventing the
+        // lost-wakeup hang (RC-01).
+        let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-        let sf_task = Arc::clone(&shutdown_flag);
-        let sn_task = Arc::clone(&shutdown_notify);
+        let sf_task = shutdown_tx.clone();
         tokio::spawn(async move {
             signal.await;
-            sf_task.store(true, Ordering::SeqCst);
-            sn_task.notify_waiters();
+            let _ = sf_task.send(true);
         });
 
-        let wait_shutdown = |flag: &Arc<AtomicBool>, notify: &Arc<tokio::sync::Notify>| {
-            let f = Arc::clone(flag);
-            let n = Arc::clone(notify);
-            async move {
-                while !f.load(Ordering::SeqCst) {
-                    n.notified().await;
-                }
-            }
+        let wait_shutdown = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
+            let _ = rx.wait_for(|&shutting_down| shutting_down).await;
         };
 
         // --- Step 3: Booted & Live ---
@@ -1352,7 +1346,7 @@ where
                 serve_ctx.lifecycle.clone(),
             );
             tokio::select! {
-                _ = wait_shutdown(&shutdown_flag, &shutdown_notify) => {
+                _ = wait_shutdown(shutdown_rx.clone()) => {
                     tracing::warn!("shutdown signal received during module startup; aborting boot");
                     serve_ctx.lifecycle.set(LifecycleState::Terminating);
                     serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
@@ -1422,7 +1416,7 @@ where
         // --- Step 5: Application startup hooks with cleanup on failure ---
         for hook in on_ready {
             tokio::select! {
-                _ = wait_shutdown(&shutdown_flag, &shutdown_notify) => {
+                _ = wait_shutdown(shutdown_rx.clone()) => {
                     tracing::warn!("shutdown signal received during application startup hooks; aborting boot");
                     serve_ctx.lifecycle.set(LifecycleState::Terminating);
                     serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
@@ -1493,9 +1487,7 @@ where
         let shutdown_availability = serve_ctx.availability.clone();
 
         let graceful_signal = async move {
-            while !shutdown_flag.load(Ordering::SeqCst) {
-                shutdown_notify.notified().await;
-            }
+            let _ = shutdown_rx.wait_for(|&shutting_down| shutting_down).await;
             tracing::info!(
                 "shutdown signal received: transitioning to Terminating / RefusingTraffic"
             );
