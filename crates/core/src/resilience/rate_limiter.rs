@@ -214,15 +214,25 @@ impl RateLimiter {
     }
 
     /// Evaluates if a request from `key` is within limits, recording the request on success.
+    ///
+    /// Note: Redis backends are not supported by the synchronous `check` — the Redis client
+    /// is async, and blocking on it from within an async context panics on a `current_thread`
+    /// runtime. Use `RateLimiter::check_async` for Redis-backed limiters.
     pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
         match &self.backend {
             RateLimiterBackend::InMemory(shards) => {
                 Self::check_in_memory(&self.config, shards, key)
             }
             #[cfg(feature = "redis")]
-            RateLimiterBackend::Redis(r) => tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(r.check(key))
-            }),
+            // Why: `check` is synchronous but the Redis backend is async. The previous code used
+            // `tokio::task::block_in_place(|| Handle::current().block_on(r.check(key)))`, which
+            // panics on a `current_thread` runtime ("block_on cannot be invoked from within a
+            // runtime context"). `RateLimitService::call` already uses `check_async`, so `check`
+            // no longer supports Redis backends — callers must use `check_async` instead.
+            RateLimiterBackend::Redis(_) => Err(ResilienceError::Backend(
+                "RateLimiter::check is unavailable for Redis backends; use RateLimiter::check_async instead"
+                    .to_string(),
+            )),
         }
     }
 

@@ -537,3 +537,36 @@ async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
     let res3 = app.request(req3).await;
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// Regression test for RC-08: `RateLimiter::check` must not panic on a `current_thread`
+/// runtime when a Redis backend is configured. It must return a clear error directing
+/// callers to `check_async` instead of blocking on the async Redis client via
+/// `block_in_place` + `Handle::current().block_on`.
+///
+/// The pool is never actually used: `check` returns an error before touching Redis, and
+/// pool construction is lazy (no connection is opened).
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "redis")]
+async fn rate_limiter_check_redis_returns_backend_error_on_current_thread_runtime() {
+    use deadpool_redis::{Manager, Pool};
+
+    let pool = Pool::builder(Manager::new("redis://127.0.0.1:6379").unwrap())
+        .build()
+        .unwrap();
+
+    let config = RateLimitConfig {
+        max_requests: 10,
+        window: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let limiter = RateLimiter::redis(pool, config);
+
+    // Runs inside a `current_thread` runtime: before the RC-08 fix this panicked with
+    // "cannot block on a runtime from within a runtime".
+    let result = limiter.check("some-key");
+
+    assert!(
+        matches!(result, Err(ResilienceError::Backend(_))),
+        "expected Backend error directing callers to check_async, got: {result:?}"
+    );
+}
