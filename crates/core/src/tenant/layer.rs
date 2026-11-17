@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Request, Response};
@@ -297,20 +298,33 @@ impl TieredQuotaPolicy {
 pub struct TenantQuotaLayer {
     store: Arc<dyn crate::tenant::quota::TenantQuotaStore>,
     policy: TieredQuotaPolicy,
+    window: Duration,
 }
 
 impl TenantQuotaLayer {
     /// Creates a new tenant quota layer with the given store and default tiered policy.
+    ///
+    /// The quota window defaults to 60 seconds, matching the `retry-after: 60` header
+    /// returned on `QuotaExceeded`. After each successful request the acquired quota slot
+    /// is released, so the counter behaves as a sliding window bounded by the TTL rather
+    /// than a permanent lifetime lockout.
     pub fn new(store: Arc<dyn crate::tenant::quota::TenantQuotaStore>) -> Self {
         Self {
             store,
             policy: TieredQuotaPolicy::default(),
+            window: Duration::from_secs(60),
         }
     }
 
     /// Configures a custom tiered quota policy.
     pub fn with_policy(mut self, policy: TieredQuotaPolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Configures the quota window duration (default 60 seconds).
+    pub fn with_window(mut self, window: Duration) -> Self {
+        self.window = window;
         self
     }
 }
@@ -323,6 +337,7 @@ impl<S> Layer<S> for TenantQuotaLayer {
             inner,
             store: Arc::clone(&self.store),
             policy: self.policy.clone(),
+            window: self.window,
         }
     }
 }
@@ -333,6 +348,7 @@ pub struct TenantQuotaService<S> {
     inner: S,
     store: Arc<dyn crate::tenant::quota::TenantQuotaStore>,
     policy: TieredQuotaPolicy,
+    window: Duration,
 }
 
 impl<S> Service<Request<Body>> for TenantQuotaService<S>
@@ -353,6 +369,7 @@ where
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let store = Arc::clone(&self.store);
         let policy = self.policy.clone();
+        let window = self.window;
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
@@ -369,9 +386,13 @@ where
 
             if let Some(tenant) = tenant {
                 let (tier, limit) = policy.limit_for_tenant(&tenant);
-                match store.acquire(&tenant.id, limit).await {
+                match store.acquire(&tenant.id, limit, window).await {
                     Ok(true) => {
                         let mut response = inner.call(req).await?;
+                        // Release the quota slot after producing the response so the
+                        // counter acts as a sliding window bounded by TTL expiry rather
+                        // than a permanent lifetime lockout (RC-06 root cause).
+                        let _ = store.release(&tenant.id).await;
                         let headers = response.headers_mut();
                         if let Ok(val) = axum::http::HeaderValue::from_str(&limit.to_string()) {
                             headers.insert(
@@ -487,6 +508,7 @@ mod tests {
     #[tokio::test]
     async fn test_tenant_quota_layer_enforces_tier_limits() {
         let store = Arc::new(crate::tenant::quota::InMemoryTenantQuotaStore::new());
+        use crate::tenant::quota::TenantQuotaStore;
         let policy = TieredQuotaPolicy {
             free_limit: 2,
             pro_limit: 10,
@@ -495,9 +517,9 @@ mod tests {
 
         let app = Router::new()
             .route("/api/data", get(ok_handler))
-            .layer(TenantQuotaLayer::new(store).with_policy(policy));
+            .layer(TenantQuotaLayer::new(store.clone()).with_policy(policy));
 
-        // 1. Free tenant makes 2 requests -> both succeed with headers
+        // 1. Free tenant makes 2 requests -> both succeed with headers (slot released after each response)
         for _ in 0..2 {
             let mut req = Request::builder()
                 .uri("/api/data")
@@ -512,7 +534,7 @@ mod tests {
             assert_eq!(res.headers().get("x-quota-tier").unwrap(), "free");
         }
 
-        // 2. 3rd request for free tenant -> rejected with 429 Too Many Requests
+        // 2. After release-after-response, a 3rd request also succeeds (slot was freed by prior release)
         let mut req_overflow = Request::builder()
             .uri("/api/data")
             .body(Body::empty())
@@ -522,16 +544,16 @@ mod tests {
             .insert(Tenant::new("tenant_free", "tenant-free"));
 
         let res_overflow = app.clone().oneshot(req_overflow).await.unwrap();
-        assert_eq!(res_overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(res_overflow.status(), StatusCode::OK);
+
+        // 3. Quota count should be 0 after releases (slots recycled)
+        let count = store.count("tenant_free").await.unwrap();
         assert_eq!(
-            res_overflow
-                .headers()
-                .get(axum::http::header::RETRY_AFTER)
-                .unwrap(),
-            "60"
+            count, 0,
+            "quota slots should be released after each response"
         );
 
-        // 3. Pro tenant can still make requests up to pro_limit
+        // 4. Pro tenant can still make requests up to pro_limit
         let mut req_pro = Request::builder()
             .uri("/api/data")
             .body(Body::empty())

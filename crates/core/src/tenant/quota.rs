@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::cache::error::CacheError;
 
@@ -17,6 +18,7 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
         &'a self,
         tenant_id: &'a str,
         max_keys: usize,
+        window: Duration,
     ) -> BoxFuture<'a, Result<bool, CacheError>>;
 
     /// Decrements the active key count for `tenant_id`.
@@ -89,9 +91,13 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
         &'a self,
         tenant_id: &'a str,
         max_keys: usize,
+        window: Duration,
     ) -> BoxFuture<'a, Result<bool, CacheError>> {
         let unique_id = format!("lease-{}", uuid::Uuid::new_v4());
-        Box::pin(async move { self.record_key(tenant_id, &unique_id, None, max_keys).await })
+        Box::pin(async move {
+            self.record_key(tenant_id, &unique_id, Some(window), max_keys)
+                .await
+        })
     }
 
     fn release<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>> {
@@ -232,15 +238,15 @@ mod redis_store {
             &'a self,
             tenant_id: &'a str,
             max_keys: usize,
+            window: Duration,
         ) -> BoxFuture<'a, Result<bool, CacheError>> {
-            let unique_id = format!(
-                "lease-{}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_nanos()
-            );
-            Box::pin(async move { self.record_key(tenant_id, &unique_id, None, max_keys).await })
+            // Use UUID instead of SystemTime nanos to avoid lease-id collisions when concurrent
+            // requests share the same nanosecond across multi-instance nodes.
+            let unique_id = format!("lease-{}", uuid::Uuid::new_v4());
+            Box::pin(async move {
+                self.record_key(tenant_id, &unique_id, Some(window), max_keys)
+                    .await
+            })
         }
 
         fn record_key<'a>(
