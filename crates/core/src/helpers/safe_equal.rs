@@ -7,9 +7,10 @@ use std::hint::black_box;
 ///
 /// Returns `true` only when `a` and `b` are identical in length and content.
 ///
-/// Unlike naive comparisons, lengths are not short-circuited with early exits.
-/// The comparison iterates over the maximum length of both slices, folding
-/// any byte differences and length discrepancies into a single accumulator.
+/// Both inputs are first hashed with SHA-256, producing fixed 32-byte
+/// digests, so the comparison loop always runs exactly 32 iterations
+/// regardless of input length. This eliminates timing side-channels that
+/// would leak input length from the loop bound or memory access pattern.
 ///
 /// `std::hint::black_box` is applied to the accumulator to prevent compiler
 /// optimizations from short-circuiting or vectorizing the loop with early branches.
@@ -28,15 +29,13 @@ where
     A: AsRef<[u8]>,
     B: AsRef<[u8]>,
 {
-    let a_bytes = a.as_ref();
-    let b_bytes = b.as_ref();
+    let a_hash = Sha256::digest(a.as_ref());
+    let b_hash = Sha256::digest(b.as_ref());
 
-    let max_len = a_bytes.len().max(b_bytes.len());
-    let mut diff = (a_bytes.len() ^ b_bytes.len()) as u64;
-
-    for i in 0..max_len {
-        let x = a_bytes.get(i).copied().unwrap_or(0);
-        let y = b_bytes.get(i).copied().unwrap_or(0);
+    let mut diff = 0u64;
+    for i in 0..32 {
+        let x = a_hash[i];
+        let y = b_hash[i];
         diff |= (x ^ y) as u64;
     }
     black_box(diff) == 0
@@ -60,9 +59,7 @@ where
     A: AsRef<[u8]>,
     B: AsRef<[u8]>,
 {
-    let a_hash = Sha256::digest(a.as_ref());
-    let b_hash = Sha256::digest(b.as_ref());
-    safe_equal(a_hash, b_hash)
+    safe_equal(a, b)
 }
 
 #[cfg(test)]
