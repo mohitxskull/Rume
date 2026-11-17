@@ -307,6 +307,15 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     }
                 }
             });
+            // Ensure the heartbeat task (and its Arc<Repository> reference) is aborted immediately
+            // if poll_and_dispatch is dropped by an outer drain timeout.
+            struct AbortOnDrop(tokio::task::AbortHandle);
+            impl Drop for AbortOnDrop {
+                fn drop(&mut self) {
+                    self.0.abort();
+                }
+            }
+            let _hb_guard = AbortOnDrop(heartbeat_handle.abort_handle());
 
             let cancel_signal = Arc::clone(&lease_lost);
             let fut_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

@@ -32,12 +32,15 @@ async fn sqlite_pool_lifecycle_and_ping() {
     );
 
     pool.backend().ping().await.expect("ping should succeed");
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
     let mut status = pool.status();
-    for _ in 0..50 {
-        if status.active_connections == 0 {
-            break;
-        }
-        tokio::task::yield_now().await;
+    while status.active_connections != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "pool failed to return connection to idle within 2s (active_connections={})",
+            status.active_connections
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         status = pool.status();
     }
 

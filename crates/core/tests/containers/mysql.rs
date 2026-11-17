@@ -405,7 +405,7 @@ async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
 
 #[tokio::test]
 async fn test_mysql_migration_lock_ordering_and_durability() {
-    let (_node, backend, _config) = start_mysql_node().await;
+    let (_node, backend, config) = start_mysql_node().await;
 
     let migrator = Migrator::new().add_migration(
         Migration::from_sql(
@@ -431,13 +431,22 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
         .expect("count present");
     assert_eq!(count, "1", "migration row must be durably committed");
 
-    // 3. Named lock must be released so another connection can acquire it immediately.
-    // NOTE: In MySQL, GET_LOCK and RELEASE_LOCK are connection-bound. We execute both on the same
-    // transaction connection handle `tx_lock` so that RELEASE_LOCK releases the lock before returning to pool.
-    let tx_lock = backend
+    // 3. Named lock must be released so an independent session can acquire it immediately.
+    // Use an independent MysqlBackend pool so MySQL's same-session recursive GET_LOCK cannot mask a leaked lock.
+    let probe_backend = MysqlBackend::new(&config).expect("independent mysql probe backend");
+    let is_free = probe_backend
+        .query_scalar("SELECT IS_FREE_LOCK('rume_migrations_lock')")
+        .await
+        .expect("check IS_FREE_LOCK")
+        .expect("IS_FREE_LOCK present");
+    assert_eq!(
+        is_free, "1",
+        "named lock must be completely free after run_pending"
+    );
+    let tx_lock = probe_backend
         .begin_transaction()
         .await
-        .expect("begin tx to probe lock");
+        .expect("begin tx on independent session to probe lock");
     let lock_res = tx_lock
         .query_scalar("SELECT GET_LOCK('rume_migrations_lock', 0)")
         .await
@@ -445,7 +454,7 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
         .expect("lock result present");
     assert_eq!(
         lock_res, "1",
-        "named lock must be released after run_pending"
+        "independent session must be able to acquire named lock after run_pending"
     );
     tx_lock
         .execute("SELECT RELEASE_LOCK('rume_migrations_lock')")
@@ -471,11 +480,20 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
         "migration row must be deleted on rollback"
     );
 
-    // 6. Named lock must be released after rollback
-    let tx_lock2 = backend
+    // 6. Named lock must be released after rollback (verified from independent session)
+    let is_free2 = probe_backend
+        .query_scalar("SELECT IS_FREE_LOCK('rume_migrations_lock')")
+        .await
+        .expect("check IS_FREE_LOCK")
+        .expect("IS_FREE_LOCK present");
+    assert_eq!(
+        is_free2, "1",
+        "named lock must be completely free after rollback_last"
+    );
+    let tx_lock2 = probe_backend
         .begin_transaction()
         .await
-        .expect("begin tx to probe lock");
+        .expect("begin tx on independent session to probe lock");
     let lock_res2 = tx_lock2
         .query_scalar("SELECT GET_LOCK('rume_migrations_lock', 0)")
         .await
@@ -483,7 +501,7 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
         .expect("lock result present");
     assert_eq!(
         lock_res2, "1",
-        "named lock must be released after rollback_last"
+        "independent session must be able to acquire named lock after rollback_last"
     );
     tx_lock2
         .execute("SELECT RELEASE_LOCK('rume_migrations_lock')")

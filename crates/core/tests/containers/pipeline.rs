@@ -34,6 +34,7 @@ use rume::coordination::postgres::PostgresLeaderElector;
 use rume::error::AppError;
 use rume::events::Event;
 use rume::jobs::{Job, JobContext, JobError, JobQueue, JobRegistry, JobWorker, PostgresJobQueue};
+#[cfg(feature = "sqlite")]
 use rume::metrics::MetricsRegistry;
 use rume::outbox::OutboxStatus;
 use rume::outbox::{

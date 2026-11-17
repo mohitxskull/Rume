@@ -172,9 +172,15 @@ impl RateLimiter {
             // bypassing rate limits via cache-churn eviction.
             //
             // Fix: When the shard remains at capacity after pruning expired entries, any new unmapped identity
-            // is routed to the shared `__overflow__` bucket. This bounds memory strictly to `max_entries_per_shard + 1`,
-            // throttles excess unmapped traffic as a shared group, and NEVER resets the rate limits of active clients.
-            if clients.len() >= config.max_entries_per_shard && !clients.contains_key(key) {
+            // is routed to the shared `__overflow__` bucket. Furthermore, while `__overflow__` still holds
+            // active timestamps in the current window, new unmapped identities continue sharing `__overflow__`
+            // so a client cannot gain a fresh quota mid-window when older entries expire.
+            let overflow_active = clients
+                .get(Self::OVERFLOW_KEY)
+                .is_some_and(|e| e.timestamps.iter().any(|&t| t > window_start));
+            if (clients.len() >= config.max_entries_per_shard || overflow_active)
+                && !clients.contains_key(key)
+            {
                 Self::OVERFLOW_KEY
             } else {
                 key

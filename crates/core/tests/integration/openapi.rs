@@ -92,7 +92,7 @@ async fn openapi_generation_from_route_registry() {
                 "type": "string"
               },
               "instance": {
-                "format": "uri",
+                "format": "uri-reference",
                 "type": "string"
               },
               "status": {
@@ -113,7 +113,7 @@ async fn openapi_generation_from_route_registry() {
             "type": "object"
           }
         },
-        "security_schemes": {
+        "securitySchemes": {
           "apiKeyAuth": {
             "in": "header",
             "name": "X-API-Key",

@@ -380,4 +380,8 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
 
     /// Explicitly discards and rolls back all changes made within this transaction.
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>>;
+
+    /// Marks the transaction connection for cancellation-safe session cleanup if dropped
+    /// without explicit resolution (e.g. releasing a MySQL session-level named lock).
+    fn release_mysql_lock_on_drop(&self, _armed: bool) {}
 }
