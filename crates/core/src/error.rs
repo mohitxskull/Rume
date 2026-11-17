@@ -82,11 +82,10 @@ impl InternalSource {
     /// Creates a new internal diagnostic error source with backtrace and span context.
     pub fn new(source: impl Into<String>) -> Self {
         let span = tracing::Span::current();
-        let span_context = if span.is_none() {
-            None
-        } else {
-            Some(format!("{:?}", span.id()))
-        };
+        // Why: `Id`'s Debug is `Some(Id(1))`, which is not a stable identifier
+        // across runs or processes. Use the span's u64 id instead so the
+        // recorded span context is stable and parseable.
+        let span_context = span.id().map(|id| format!("/spans/{}", id.into_u64()));
         Self {
             message: source.into(),
             backtrace: Some(std::backtrace::Backtrace::capture()),
@@ -352,9 +351,10 @@ impl AppError {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        if crate::env::loading::is_running_in_test() {
-            return self.into_response_in_env(&crate::app::Environment::new("test"));
-        }
+        // Why: rendering must follow the resolved environment consistently,
+        // including under `#[cfg(test)]`. Forcing the test environment here
+        // hid development/production Problem Details behaviour; `from_env()`
+        // already resolves "test" while a test harness is active.
         let env = crate::app::Environment::from_env();
         self.into_response_in_env(&env)
     }
@@ -544,6 +544,20 @@ mod tests {
             Some("Internal Error: database socket timeout")
         );
         assert_eq!(value["instance"].as_str(), Some("span-456"));
+    }
+
+    #[tokio::test]
+    async fn into_response_matches_explicit_environment_rendering() {
+        // `IntoResponse` must not special-case the test harness: it must render
+        // identically to `into_response_in_env(&Environment::from_env())`.
+        let env = crate::app::Environment::from_env();
+        let make = || AppError::Internal {
+            source: InternalSource::new("boom").with_span_context("span-1"),
+            request_id: Some("req-1".into()),
+        };
+        let implicit = body_json(make().into_response()).await;
+        let explicit = body_json(make().into_response_in_env(&env)).await;
+        assert_eq!(implicit, explicit);
     }
 
     #[tokio::test]

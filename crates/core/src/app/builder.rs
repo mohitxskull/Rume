@@ -15,7 +15,7 @@ use tokio::time::timeout;
 
 use crate::app::context::AppContext;
 use crate::app::paths::ProjectPaths;
-use crate::app::state::{ApplicationMode, AvailabilityState, Environment, LifecycleState};
+use crate::app::state::{ApplicationMode, AvailabilityState, LifecycleState};
 use crate::routing::RouteRegistry;
 
 /// Errors that can occur when building the middleware stack.
@@ -263,7 +263,6 @@ where
     modules: Vec<Arc<dyn crate::module::Module>>,
     bind: String,
     mode: ApplicationMode,
-    environment: Environment,
     on_ready: Vec<ReadyHook<E, C, S>>,
     on_shutdown: Vec<ShutdownHook<E, C, S>>,
     /// Named middleware registered by alias. The closure wraps the router as a
@@ -313,7 +312,6 @@ where
             modules: Vec::new(),
             bind: "127.0.0.1:3000".to_string(),
             mode: ApplicationMode::Run,
-            environment: Environment::from_env(),
             on_ready: Vec::new(),
             on_shutdown: Vec::new(),
             middleware: BTreeMap::new(),
@@ -816,12 +814,6 @@ where
         self
     }
 
-    /// Override the detected environment.
-    pub fn environment(mut self, environment: Environment) -> Self {
-        self.environment = environment;
-        self
-    }
-
     /// Set the application state (db pool, redis, HTTP client, …).
     ///
     /// This is synced into the [`AppContext`] that Axum serves as state, so
@@ -873,11 +865,6 @@ where
     /// Access the availability handle.
     pub fn availability(&self) -> crate::app::state::Availability {
         self.ctx.availability.clone()
-    }
-
-    /// Access the detected environment.
-    pub fn environment_ref(&self) -> &Environment {
-        &self.environment
     }
 
     /// Access the project paths.
@@ -993,10 +980,11 @@ where
         let mut module_axum = axum::Router::new();
         let mut module_routes = crate::routing::RouteRegistry::new();
         let mut seen_routes: Vec<(String, String)> = Vec::new();
-        for r in route_registry.read().unwrap().routes() {
-            seen_routes.push((r.method.to_string(), r.path.clone()));
-        }
 
+        // Register module routes FIRST: they must occupy `seen_routes` before
+        // app routes are read from `route_registry`, so that module routes
+        // participate in duplicate-route detection (App M4) instead of being
+        // invisible to it.
         for m in &startup_modules {
             let single_mod_router = m.register_routes(crate::routing::Router::new());
             let (axum_r, routes) = single_mod_router.into_parts();
@@ -1004,8 +992,11 @@ where
                 let new_method = r.method.to_string();
                 let new_path = &r.path;
                 // App M4: Check ANY method overlap against existing routes to avoid Axum panics
-                if seen_routes.iter().any(|(m, p)| {
-                    p == new_path && (m == &new_method || m == "ANY" || new_method == "ANY")
+                if seen_routes.iter().any(|(existing_method, existing_path)| {
+                    existing_path == new_path
+                        && (existing_method == &new_method
+                            || existing_method == "ANY"
+                            || new_method == "ANY")
                 }) {
                     return Err(BuildError::DuplicateRoute {
                         method: new_method,
@@ -1017,6 +1008,26 @@ where
             module_axum = module_axum.merge(axum_r);
             module_routes.extend(routes);
             m.register_health_checks(&mut ctx.health_checks);
+        }
+
+        // Then read app routes into `seen_routes`. Module routes are already
+        // present, so app/module collisions are caught fail-closed; app routes
+        // are checked against each other as they are recorded.
+        for r in route_registry.read().unwrap().routes() {
+            let new_method = r.method.to_string();
+            let new_path = &r.path;
+            if seen_routes.iter().any(|(existing_method, existing_path)| {
+                existing_path == new_path
+                    && (existing_method == &new_method
+                        || existing_method == "ANY"
+                        || new_method == "ANY")
+            }) {
+                return Err(BuildError::DuplicateRoute {
+                    method: new_method,
+                    path: r.path.clone(),
+                });
+            }
+            seen_routes.push((new_method, r.path.clone()));
         }
 
         let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
@@ -1957,5 +1968,29 @@ mod tests {
             ],
             "individual middleware must wrap outside groups: global -> group -> handler -> group -> global"
         );
+    }
+
+    /// A test module that mounts a single GET route.
+    struct MountRouteModule;
+    impl crate::module::Module for MountRouteModule {
+        fn name(&self) -> &'static str {
+            "mount_route"
+        }
+        fn register_routes(&self, router: crate::routing::Router) -> crate::routing::Router {
+            router.get("/m/x", || async { "module" })
+        }
+    }
+
+    #[test]
+    fn module_route_conflicting_with_app_route_is_rejected() {
+        // Module routes must be registered before `route_registry` is read into
+        // `seen_routes`, so they participate in duplicate-route detection.
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .route("/m/x", axum::routing::get(|| async { "app" }))
+            .module(MountRouteModule);
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(err, BuildError::DuplicateRoute { path, .. } if path == "/m/x"));
     }
 }
