@@ -72,14 +72,21 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     }
 
     /// Marks a message as failed with a configurable maximum retry limit before marking as failed.
+    ///
+    /// Backends must override at least this method (or [`mark_failed`]); the default returns
+    /// [`OutboxError::Unsupported`] rather than recursing into [`mark_failed`].
     fn mark_failed_with_max_retries(
         &self,
-        id: &str,
-        lease_token: &str,
-        error: String,
+        _id: &str,
+        _lease_token: &str,
+        _error: String,
         _max_retries: u32,
     ) -> BoxFuture<'_, Result<(), OutboxError>> {
-        self.mark_failed(id, lease_token, error)
+        Box::pin(async move {
+            Err(OutboxError::Unsupported(
+                "mark_failed_with_max_retries not implemented by this repository backend".into(),
+            ))
+        })
     }
 
     /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
@@ -160,4 +167,69 @@ pub trait TransactionalOutbox<Tx: DatabaseTransaction>: OutboxRepository {
         tx: &'a Tx,
         message: OutboxMessage,
     ) -> BoxFuture<'a, Result<(), OutboxError>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Minimal stub that overrides none of `mark_failed` / `mark_failed_with_max_retries`,
+    /// exercising the trait defaults to prove they do not recurse infinitely.
+    #[derive(Debug)]
+    struct StubRepo;
+
+    impl OutboxRepository for StubRepo {
+        fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_pending(
+            &self,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn claim_pending_with_lease(
+            &self,
+            _limit: usize,
+            _lease_duration_secs: u64,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn mark_published(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn mark_failed_default_does_not_recurse() {
+        let repo = StubRepo;
+        // Must return an error (Unsupported) rather than stack-overflowing via mutual recursion.
+        let res = tokio::time::timeout(
+            Duration::from_secs(5),
+            repo.mark_failed("id", "token", "boom".into()),
+        )
+        .await
+        .expect("mark_failed default must complete within timeout");
+        assert!(
+            matches!(res, Err(OutboxError::Unsupported(_))),
+            "mark_failed default should return Unsupported, got {:?}",
+            res
+        );
+    }
 }

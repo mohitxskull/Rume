@@ -516,7 +516,8 @@ where
     fn save(&self, msg: OutboxMessage) -> OutboxFuture<'_, Result<(), OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().save(msg).await
         })
@@ -528,7 +529,8 @@ where
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().fetch_pending(limit).await
         })
@@ -540,7 +542,8 @@ where
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().claim_pending(limit).await
         })
@@ -553,7 +556,8 @@ where
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend()
                 .claim_pending_with_lease(limit, lease_duration_secs)
@@ -571,7 +575,8 @@ where
         let lease_token = lease_token.to_string();
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend()
                 .renew_outbox_lease(&id, &lease_token, extension_secs)
@@ -588,7 +593,8 @@ where
         let lease_token = lease_token.to_string();
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().mark_published(&id, &lease_token).await
         })
@@ -614,7 +620,8 @@ where
         let lease_token = lease_token.to_string();
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend()
                 .mark_failed_with_max_retries(&id, &lease_token, error, max_retries)
@@ -628,7 +635,8 @@ where
     ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend()
                 .recover_expired_claims(max_lease_age_secs)
@@ -639,7 +647,8 @@ where
     fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().pending_count().await
         })
@@ -648,7 +657,8 @@ where
     fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().published_count().await
         })
@@ -657,7 +667,8 @@ where
     fn failed_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().failed_count().await
         })
@@ -669,7 +680,8 @@ where
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().fetch_failed(limit).await
         })
@@ -679,7 +691,8 @@ where
         let id = id.to_string();
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().reprocess_failed(&id).await
         })
@@ -692,7 +705,8 @@ where
     ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move {
             let _lease = self
-                .acquire_lease()
+                .acquire_lease_timeout(self.config.connect_timeout())
+                .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend().purge_published(older_than_secs, limit).await
         })
