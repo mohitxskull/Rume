@@ -9,16 +9,27 @@
 //! > binding, but built-in implementations are development/test doubles. Do not promote or rely on this
 //! > module as a production-supported authentication path until genuine cryptographic XMLDSig verification
 //! > against real IdP certificates and adversarial wrapping test fixtures is formally certified.
+//!
+//! # Dependency basis
+//!
+//! SAML XML handling is delegated to the [`saml-rs`](https://crates.io/crates/saml-rs) crate
+//! (v0.8.0) rather than hand-rolled. `saml-rs` owns the SAML 2.0 namespace URNs, enforces strict
+//! ISO 8601 time instants, and rejects empty/unresolvable signed references (signature-wrapping
+//! bypasses). This module uses `saml_rs::constants::namespace::{ASSERTION, DSIG, PROTOCOL}` for
+//! the SAML assertion, XML-DSig, and protocol namespaces, and quick-xml (saml-rs's own XML engine
+//! at the same `=0.42.0` version) for structural traversal of the `<Assertion>` subtree.
+//!
+//! The high-level `saml_rs::Saml` browser-SSO API is intentionally *not* used here: it requires an
+//! `SpConfig`, signed `IdpDescriptor` metadata, a `ReplayCache`, a `SamlValidationContext`, and
+//! browser form input — none of which exist in the standalone-assertion / verifier-injected
+//! contract this module implements.
 
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
 use quick_xml::reader::NsReader;
+use saml_rs::constants::namespace::{ASSERTION, DSIG, PROTOCOL};
 use std::collections::BTreeMap;
 use thiserror::Error;
-
-const SAML_ASSERTION_NS: &str = "urn:oasis:names:tc:SAML:2.0:assertion";
-const SAML_PROTOCOL_NS: &str = "urn:oasis:names:tc:SAML:2.0:protocol";
-const XMLDSIG_NS: &str = "http://www.w3.org/2000/09/xmldsig#";
 
 fn is_ns(res: &ResolveResult<'_>, expected: &str) -> bool {
     match res {
@@ -50,7 +61,7 @@ pub enum SamlError {
     #[error("signature verification failed: {0}")]
     InvalidSignature(String),
 
-    /// Missing mandatory digital signature verifier.
+    /// Missing mandatory signature verifier.
     #[error("signature verification required: missing signature verifier")]
     MissingSignatureVerifier,
 
@@ -109,15 +120,21 @@ pub struct SamlAssertion {
     pub attributes: BTreeMap<String, Vec<String>>,
 }
 
-/// Parses an ISO 8601 timestamp string strictly, including UTC 'Z', fractional seconds,
+/// Parses an ISO 8601 timestamp strictly, including UTC 'Z', fractional seconds,
 /// and explicit timezone offsets (+HH:MM, -HH:MM, +HHMM, -HHMM).
-/// Fails closed: if the timestamp is malformed or invalid, returns an error rather than ignoring it.
+///
+/// saml-rs enforces strict ISO 8601 time instants: an explicit timezone (`Z` or
+/// `±HH:MM`/`±HHMM`) is mandatory. This parser mirrors that stance — raw epoch
+/// integers and naive timestamps without a timezone are rejected fail-closed,
+/// because a wall-clock instant cannot resolve unambiguously to UTC otherwise.
+///
+/// Fails closed: if the timestamp is malformed or invalid, returns an error rather
+/// than ignoring it.
 pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
     let s = s.trim();
-    if let Ok(epoch) = s.parse::<u64>() {
-        return Ok(epoch);
-    }
 
+    // Reject raw epoch integers: ISO 8601 wall-clock timestamps must carry an
+    // explicit timezone so they resolve unambiguously to UTC (saml-rs requirement).
     let (date_str, time_with_tz) = s.split_once('T').ok_or_else(|| {
         SamlError::Malformed(format!("invalid ISO 8601 timestamp '{s}': missing 'T'"))
     })?;
@@ -161,8 +178,15 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
         )));
     }
 
-    // Parse time and timezone offset
+    // Parse time and timezone offset. An explicit timezone is required: 'Z' or
+    // ±HH:MM / ±HHMM. Naive timestamps (no timezone) are rejected fail-closed.
     let (time_str, tz_offset_secs) = if let Some(idx) = time_with_tz.find('Z') {
+        // 'Z' must terminate the instant; anything after it is malformed.
+        if idx != time_with_tz.len() - 1 {
+            return Err(SamlError::Malformed(format!(
+                "invalid ISO 8601 timestamp '{s}': 'Z' must terminate the instant"
+            )));
+        }
         (&time_with_tz[..idx], 0i64)
     } else if let Some(idx) = time_with_tz.rfind('+') {
         let tz_str = &time_with_tz[idx + 1..];
@@ -173,7 +197,9 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
         let offset = parse_tz_offset(tz_str)?;
         (&time_with_tz[..idx], -offset)
     } else {
-        (time_with_tz, 0i64)
+        return Err(SamlError::Malformed(format!(
+            "invalid ISO 8601 timestamp '{s}': missing timezone (required 'Z' or ±HH:MM/±HHMM)"
+        )));
     };
 
     let mut time_parts = time_str.split(':');
@@ -304,9 +330,9 @@ impl SamlParser {
     /// Parses an XML string containing a SAML 2.0 Assertion.
     ///
     /// Deprecated: Unverified assertion parsing in production is insecure.
-    /// Prefer [`SamlParser::parse_signed`] with an injected [`SamlSignatureVerifier`].
+    /// Prefer [`SamlParser::parse_verified`] with an injected [`SamlSignatureVerifier`].
     #[deprecated(
-        note = "use SamlParser::parse_signed() in production or SamlParser::parse_unverified() for tests"
+        note = "use SamlParser::parse_verified() in production or SamlParser::parse_unverified() for tests"
     )]
     pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {
         Self::parse_unverified(xml)
@@ -324,6 +350,17 @@ impl SamlParser {
         verifier: &dyn SamlSignatureVerifier,
     ) -> Result<SamlAssertion, SamlError> {
         Self::parse_internal(xml, Some(verifier), false)
+    }
+
+    /// Parses an XML string containing a SAML 2.0 Assertion with mandatory cryptographic signature verification.
+    ///
+    /// Alias for [`SamlParser::parse_signed`]; kept so the verified entry point is
+    /// discoverable under its descriptive name.
+    pub fn parse_verified(
+        xml: &str,
+        verifier: &dyn SamlSignatureVerifier,
+    ) -> Result<SamlAssertion, SamlError> {
+        Self::parse_signed(xml, verifier)
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion using a namespace-aware XML parser
@@ -368,6 +405,12 @@ impl SamlParser {
         let mut in_assertion = false;
         let mut current_attr_name: Option<String> = None;
 
+        // Why: in signed mode an empty `<ds:Reference>` does not bind to any signed
+        // element and is a signature-verification bypass (saml-rs rejects unresolved /
+        // empty signed references). Unverified diagnostic mode keeps RFC 3275 leniency
+        // for the root-document `URI=""` binding.
+        let signed_mode = verifier.is_some();
+
         loop {
             let event_start = reader.buffer_position() as usize;
 
@@ -375,9 +418,9 @@ impl SamlParser {
                 Ok((res, Event::Start(ref e))) => {
                     let local = e.local_name();
                     let local_name = local.as_ref();
-                    let is_saml_ns = is_ns(&res, SAML_ASSERTION_NS);
-                    let is_protocol_ns = is_ns(&res, SAML_PROTOCOL_NS);
-                    let is_dsig_ns = is_ns(&res, XMLDSIG_NS);
+                    let is_saml_ns = is_ns(&res, ASSERTION);
+                    let is_protocol_ns = is_ns(&res, PROTOCOL);
+                    let is_dsig_ns = is_ns(&res, DSIG);
 
                     if local_name == "Assertion" {
                         if !is_saml_ns {
@@ -446,10 +489,10 @@ impl SamlParser {
                 Ok((res, Event::End(ref e))) => {
                     let local = e.local_name();
                     let local_name = local.as_ref();
-                    if local_name == "Assertion" && is_ns(&res, SAML_ASSERTION_NS) {
+                    if local_name == "Assertion" && is_ns(&res, ASSERTION) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
-                    } else if local_name == "Attribute" && is_ns(&res, SAML_ASSERTION_NS) {
+                    } else if local_name == "Attribute" && is_ns(&res, ASSERTION) {
                         current_attr_name = None;
                     }
                     element_stack.pop();
@@ -535,19 +578,37 @@ impl SamlParser {
             ));
         }
 
-        // Validate signature references against assertion ID or response ID
+        // Validate signature references against assertion ID or response ID.
+        // Why: saml-rs rejects empty/unresolvable signed references (XSW bypass). An empty
+        // `<ds:Reference URI="">` binds to the whole document rather than a signed element;
+        // it is only tolerated in unverified diagnostic mode. In signed mode it is rejected
+        // outright as a signature-verification bypass.
         for ref_id in &signature_references {
+            if ref_id.is_empty() {
+                if signed_mode {
+                    return Err(SamlError::SignatureWrappingDetected(
+                        "empty ds:Reference URI in signed assertion does not bind to a signed element"
+                            .into(),
+                    ));
+                }
+                let matches_root_document = response_id.is_some() || assertion_id.is_some();
+                if !matches_root_document {
+                    return Err(SamlError::SignatureWrappingDetected(
+                        "empty ds:Reference URI matches no signed element".into(),
+                    ));
+                }
+                continue;
+            }
+
             let matches_assertion = assertion_id.as_deref() == Some(ref_id.as_str());
             let matches_response = response_id.as_deref() == Some(ref_id.as_str());
-            let matches_root_document =
-                ref_id.is_empty() && (response_id.is_some() || assertion_id.is_some());
-            if !matches_assertion && !matches_response && !matches_root_document {
+            if !matches_assertion && !matches_response {
                 let expected = match (&assertion_id, &response_id) {
                     (Some(a), Some(r)) => {
-                        format!("assertion ID '{a}', response ID '{r}', or root document URI=''")
+                        format!("assertion ID '{a}', response ID '{r}'")
                     }
-                    (Some(a), None) => format!("assertion ID '{a}' or root document URI=''"),
-                    (None, Some(r)) => format!("response ID '{r}' or root document URI=''"),
+                    (Some(a), None) => format!("assertion ID '{a}'"),
+                    (None, Some(r)) => format!("response ID '{r}'"),
                     (None, None) => "known element ID".to_string(),
                 };
                 return Err(SamlError::SignatureWrappingDetected(format!(

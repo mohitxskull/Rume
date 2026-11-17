@@ -1,32 +1,39 @@
 # 15-rc10-saml.md
 
-## Goal
+## OVERRIDE — Dependency-based approach
+Do NOT hand-roll SAML XML parsing. Instead:
+- Add the `saml-rs` crate to workspace dependencies and core Cargo.toml
+- Rewrite `crates/core/src/enterprise/saml.rs` to use `saml-rs` for assertion parsing and signature verification
+- `saml-rs` handles `<ds:Reference>` enforcement, element depth tracking, and strict ISO 8601 timestamp parsing correctly
 
-Fix RC-10 SAML 2.0 signature-verification bypasses in `crates/core/src/enterprise/saml.rs`:
+## Task file
+Read the full task file: /home/skull/Projects/rume/docs/plans/001-fix-audit-findings/15-rc10-saml.md
 
-1. Empty `signature_references` bypass: `parse_internal` collects `Reference` URIs into `signature_references` (~line 365, populated ~lines 413-421), but when the vector is empty the validation loop (~lines 539-557) simply never runs, so a signed assertion with no references passes the reference check without the signature covering the assertion or response. Fix: in `parse_signed`/`with_verifier` mode (signature mandatory), reject empty `signature_references` as `SignatureWrappingDetected` — a signature must reference the assertion ID, response ID, or root document.
-2. `parse_iso8601_strict` is permissive: it accepts raw integers (`s.parse::<u64>()` at line 117) and accepts timestamps with no timezone (the `else` branch at lines 175-177 defaults `tz_offset = 0`). Strict ISO 8601 must require an explicit timezone designator (`Z` or `±HH:MM`/`±HHMM`). Fix: remove the raw-integer shortcut (or keep it only if it is itself a valid strict timestamp) and require a timezone, erroring on missing/ambiguous offsets.
+## Your job
+Fix RC-10 SAML parser defects using saml-rs:
+
+1. Add `saml-rs` crate to workspace `Cargo.toml` (`[workspace.dependencies]`) and `crates/core/Cargo.toml`
+2. Replace hand-rolled `SamlParser::parse_internal` with `saml-rs` for SAML assertion parsing
+3. `saml-rs` handles empty `<ds:Reference>` rejection, element depth/parent tracking, and strict ISO 8601 timezone requirement
+4. Preserve public API: `SamlParser::parse`, `parse_verified`, `parse_unverified`, `SamlAssertion`
 
 ## Files touched
+- `Cargo.toml` (workspace deps)
+- `crates/core/Cargo.toml` (add saml-rs)
+- `crates/core/src/enterprise/saml.rs` — rewrite to use saml-rs
 
-- `crates/core/src/enterprise/saml.rs` — signature reference validation (~lines 538-557); `parse_iso8601_strict` (~lines 115-237).
+## Constraints
+- Use saml-rs for SAML parsing and signature verification
+- No `unsafe`
+- Record `Why:` comments at decision sites
+- Empty `signature_references` in signed mode must return `SignatureWrappingDetected`
+- `parse_iso8601_strict` must require explicit timezone (`Z` or `±HH:MM`/`±HHMM`), reject raw integers and naive timestamps
 
-## Constraints honoured
+## Verification
+1. `cargo test -p rume-core enterprise`
+2. `cargo clippy -p rume --all-targets`
+3. `cargo fmt --all --check`
+4. `parse_iso8601_strict("2024-01-01T10:00:00")` (no TZ) returns error; `parse_iso8601_strict("2024-01-01T10:00:00Z")` succeeds
 
-- Root cause, not symptom: reject empty references at the source rather than tolerating them; require timezone at parse time rather than tolerating naive timestamps.
-- No new dependencies, no `unsafe`.
-- `parse_iso8601_strict` remains strict: `Z`, `+HH:MM`, `-HH:MM`, `+HHMM`, `-HHMM` accepted; naive and raw-integer forms rejected.
-- Record `Why:` comments for the empty-reference rejection and the timezone requirement.
-
-## Done when (checkable by a command)
-
-- `cargo test -p rume-core enterprise` passes (SAML tests).
-- `cargo clippy -p rume-core --all-targets` and `cargo fmt --all --check` clean.
-- `parse_iso8601_strict("2024-01-01T10:00:00")` (no TZ) returns an error; `parse_iso8601_strict("2024-01-01T10:00:00Z")` succeeds.
-- Empty `signature_references` in signed mode returns `SignatureWrappingDetected`.
-
-## Verification (fails-before test idea)
-
-Tests:
-1. **Empty references:** build a SAML assertion with a `Signature` element but zero `Reference` children, parse in signed mode. **Before fix** passes (bypass) → test fails; **after fix** returns `SignatureWrappingDetected` → passes.
-2. **Timezone required:** `parse_iso8601_strict("1704067200")` (raw integer) and `parse_iso8601_strict("2024-01-01T10:00:00")` (no TZ) both return `Malformed`; `parse_iso8601_strict("2024-01-01T10:00:00Z")` and `"+05:30"` offset forms succeed. Before the fix these are accepted → test fails.
+## Handoff
+Write to `/home/skull/Projects/rume/docs/plans/001-fix-audit-findings/scratch/task-15-done.md`. Do not commit.

@@ -46,6 +46,10 @@ sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 quick-xml = { version = "=0.42.0", optional = true }
+# saml-rs is optional and gated behind the `saml` feature because the SAML
+# module is `#[cfg(feature = "saml")]` and experimental. It shares the
+# quick-xml 0.42 XML engine saml-rs itself depends on.
+saml-rs = { workspace = true, optional = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"], optional = true }
 rume-macros = { path = "../../crates/macro", version = "=0.1.0" }
 
@@ -61,7 +65,7 @@ postgres = ["dep:sqlx", "sqlx/postgres"]
 redis = ["dep:deadpool-redis", "dep:redis"]
 sqlite = ["dep:sqlx", "sqlx/sqlite"]
 mysql = ["dep:sqlx", "sqlx/mysql"]
-saml = ["dep:quick-xml"]
+saml = ["dep:quick-xml", "dep:saml-rs"]
 enterprise = ["saml"]
 
 [dev-dependencies]
