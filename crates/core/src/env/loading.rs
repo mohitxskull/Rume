@@ -112,30 +112,37 @@ where
         .collect();
 
     for (key, value) in resolved.values {
-        let value = value.parse::<figment::value::Value>().map_err(|err| {
-            let redacted =
-                crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-            EnvError::Validation(redacted)
-        })?;
+        // Why: preserve the raw string as `Value::String` instead of calling
+        // `FromStr` (`parse::<Value>()`), which coerces "001234" -> 123
+        // (drops leading zeros), "true" -> Bool, and "8080" -> Num. A coerced
+        // Num/Bool cannot be deserialized into a `String`/`SecretString`
+        // field, so typed extraction would fail. Figment's serde extraction
+        // still coerces on demand when the target type requests it
+        // ("8080" -> u16, "true" -> bool), so coercion is not lost — only
+        // deferred to the consumption point.
+        let value = figment::value::Value::from(value.as_str());
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
     for (key, secret) in &resolved.secrets {
-        let value = secret
-            .expose_secret()
-            .parse::<figment::value::Value>()
-            .map_err(|err| {
-                let redacted =
-                    crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
-                EnvError::Validation(redacted)
-            })?;
+        // Why: same raw-string preservation as plain values above, so secret
+        // values extract into `SecretBox<String>` / `String` fields without
+        // spurious type errors, while still coercing to `u16`/`bool` when the
+        // target type requests it.
+        let value = figment::value::Value::from(secret.expose_secret().as_str());
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key.clone(), value);
     }
 
     let figment = Figment::from(Serialized::defaults(parsed));
+    // Why: `extract_lossy` uses figment's `LossyInterpreter`, which coerces a
+    // raw `Value::String` into `bool`/`u16`/`usize`/etc. at extraction time
+    // ("true" -> true, "8080" -> 8080) when the target type requests it, while
+    // leaving `String`/`SecretString` targets as the literal string ("001234"
+    // keeps its leading zeros). This defers coercion to the consumption point
+    // instead of forcing it at the boundary via `parse::<Value>()`.
     figment
-        .extract::<T>()
+        .extract_lossy::<T>()
         .map_err(|err| EnvError::from_figment_with_secrets(&err, &known_secrets))
 }
 
@@ -452,5 +459,43 @@ mod tests {
         assert!(!resolved.secrets.contains_key("HOST"));
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn raw_values_are_preserved_while_target_types_coerce() {
+        // RC-03: raw env strings must reach typed extraction as literal
+        // strings so `String`/`SecretString` fields succeed, while figment
+        // still coerces to `u16`/`bool` when the target type requests it.
+        //
+        // Why: `String::parse::<Value>()` uses `FromStr`, which coerces
+        // "001234" -> 123 (drops leading zeros), "true" -> Bool, "8080" ->
+        // Num. A coerced Num/Bool cannot be deserialized into a String field,
+        // so typed extraction would fail. Storing `Value::String` (raw) and
+        // letting figment coerce on demand keeps "001234" intact for String
+        // fields and still yields u16 8080 / bool true when requested.
+
+        let mut resolved = ResolvedEnv::default();
+        resolved
+            .values
+            .insert("PIN".to_string(), "001234".to_string());
+        resolved
+            .values
+            .insert("PORT".to_string(), "8080".to_string());
+        resolved
+            .values
+            .insert("FLAG".to_string(), "true".to_string());
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        struct Typed {
+            pin: String,
+            port: u16,
+            flag: bool,
+        }
+
+        let typed: Typed = load_from_resolved(resolved).unwrap();
+        assert_eq!(typed.pin, "001234");
+        assert_eq!(typed.port, 8080);
+        assert!(typed.flag);
     }
 }
