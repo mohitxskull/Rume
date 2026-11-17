@@ -222,14 +222,31 @@ impl CsrfConfig {
 }
 
 /// Tower Layer enforcing CSRF token validation on mutating requests.
-#[derive(Debug, Clone, Default)]
+///
+/// A secret is required to construct a layer; there is no `Default` because
+/// a secret-less layer would fail closed on every mutating request
+/// (RC-15 root cause: `Default()` vs `new()` contradiction).
+#[derive(Debug, Clone)]
 pub struct CsrfLayer {
     config: Arc<CsrfConfig>,
 }
 
 impl CsrfLayer {
-    /// Creates a CSRF protection layer with default configuration and auto-generated 32-byte HMAC secret.
-    pub fn new() -> Self {
+    /// Creates a CSRF protection layer with an explicit HMAC secret.
+    ///
+    /// The secret must be shared across all instances in a multi-instance
+    /// deployment, otherwise CSRF validation will fail ~50% of the time
+    /// behind a load balancer (each instance would generate its own secret
+    /// if `new()` auto-generated one).
+    pub fn new(secret: impl AsRef<[u8]>) -> Self {
+        Self::with_config(CsrfConfig::default().with_secret(secret.as_ref().to_vec()))
+    }
+
+    /// Creates a CSRF protection layer with an auto-generated 32-byte HMAC secret.
+    ///
+    /// This is an explicit opt-in. Prefer `CsrfLayer::new(secret)` with a
+    /// shared secret in multi-instance deployments.
+    pub fn with_random_secret() -> Self {
         Self::with_config(CsrfConfig::default().with_random_secret())
     }
 
@@ -301,18 +318,17 @@ where
                 if config.auto_inject_cookie {
                     let has_valid_cookie = req
                         .headers()
-                        .get(COOKIE)
-                        .and_then(|val| val.to_str().ok())
-                        .map(|cookies| {
-                            cookies.split(';').any(|pair| {
-                                if let Some((name, value)) = pair.trim().split_once('=') {
-                                    name == config.cookie_name && config.verify_token(value)
-                                } else {
-                                    false
-                                }
-                            })
-                        })
-                        .unwrap_or(false);
+                        .get_all(COOKIE)
+                        .iter()
+                        .filter_map(|val| val.to_str().ok())
+                        .flat_map(|cookies| cookies.split(';'))
+                        .any(|pair| {
+                            if let Some((name, value)) = pair.trim().split_once('=') {
+                                name == config.cookie_name && config.verify_token(value)
+                            } else {
+                                false
+                            }
+                        });
 
                     if !has_valid_cookie {
                         token_to_inject = Some(config.generate_token());
