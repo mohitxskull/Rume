@@ -85,40 +85,53 @@ impl CircuitBreaker {
     /// Returns the current state of the circuit breaker.
     pub fn state(&self) -> CircuitState {
         let mut inner = self.inner.write().unwrap();
-        if inner.state == CircuitState::Open
-            && let Some(opened) = inner.opened_at
-            && opened.elapsed() >= self.config.reset_timeout
-        {
-            inner.state = CircuitState::HalfOpen;
-            inner.consecutive_successes = 0;
-            inner.half_open_in_flight = false;
-        }
+        Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
         inner.state
     }
 
     /// Evaluates whether a new request is permitted to execute.
     pub fn allow_request(&self) -> bool {
         let mut inner = self.inner.write().unwrap();
-        if inner.state == CircuitState::Open
-            && let Some(opened) = inner.opened_at
-            && opened.elapsed() >= self.config.reset_timeout
-        {
-            inner.state = CircuitState::HalfOpen;
-            inner.consecutive_successes = 0;
-            inner.half_open_in_flight = false;
-        }
+        Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
 
         match inner.state {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => {
                 if inner.half_open_in_flight {
-                    false
+                    // A HalfOpen trial is in flight. If it has been open longer
+                    // than the reset timeout, the trial was abandoned (the
+                    // future was dropped before on_success/on_failure ran).
+                    // Release the slot so the circuit does not wedge HalfOpen.
+                    if let Some(opened) = inner.opened_at
+                        && opened.elapsed() >= self.config.reset_timeout
+                    {
+                        inner.half_open_in_flight = false;
+                        inner.half_open_in_flight = true;
+                        true
+                    } else {
+                        false
+                    }
                 } else {
                     inner.half_open_in_flight = true;
                     true
                 }
             }
             CircuitState::Open => false,
+        }
+    }
+
+    /// Transitions Open → HalfOpen when the reset timeout has elapsed.
+    /// Extracted into a helper so `state()` and `allow_request()` share one
+    /// code path instead of duplicating the transition logic.
+    fn try_transition_to_half_open(inner: &mut CircuitInner, reset_timeout: Duration) {
+        if inner.state == CircuitState::Open
+            && let Some(opened) = inner.opened_at
+            && opened.elapsed() >= reset_timeout
+        {
+            inner.state = CircuitState::HalfOpen;
+            inner.consecutive_successes = 0;
+            inner.opened_at = Some(Instant::now()); // mark HalfOpen entry time
+            inner.half_open_in_flight = false;
         }
     }
 

@@ -242,6 +242,40 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
 }
 
 #[tokio::test]
+async fn test_circuit_breaker_half_open_abandoned_trial_released() {
+    tokio::time::pause();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 2,
+        reset_timeout: Duration::from_millis(40),
+    };
+    let breaker = CircuitBreaker::new(config);
+
+    // Trip the breaker to Open
+    breaker.on_failure();
+    breaker.on_failure();
+    assert_eq!(breaker.state(), CircuitState::Open);
+
+    // Fast-forward past reset timeout -> HalfOpen
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+    // First request is allowed as trial probe
+    assert!(breaker.allow_request());
+
+    // Abandon the trial: do NOT call on_success/on_failure (simulates client
+    // disconnect or future cancellation). The half_open_in_flight slot should
+    // be released after the reset timeout elapses, not wedge the circuit.
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    // A subsequent trial must be permitted (not wedged HalfOpen)
+    assert!(
+        breaker.allow_request(),
+        "abandoned HalfOpen trial should release the slot, not wedge the circuit"
+    );
+}
+
+#[tokio::test]
 async fn test_rate_limiter_prune_expired_clients() {
     tokio::time::pause();
     let limiter = RateLimiter::new(RateLimitConfig {
