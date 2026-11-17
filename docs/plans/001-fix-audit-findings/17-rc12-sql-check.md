@@ -1,35 +1,40 @@
 # 17-rc12-sql-check.md
 
-## Goal
+## OVERRIDE — Dependency-based approach
+Do NOT hand-roll the SQL quote/comment scanner. Instead:
+- Add the `sqlparser-rs` crate to workspace dependencies and cli Cargo.toml
+- Rewrite `crates/cli/src/commands/sql_check.rs` to use `sqlparser-rs` for dialect-aware placeholder validation, comment-aware scanning, and EXPLAIN dry-run validation
+- `sqlparser-rs` handles block comments (`/* ... */`), line comments (`--`), `#` comments, and proper placeholder validation per dialect
 
-Fix RC-12 SQL validation defects in `crates/cli/src/commands/sql_check.rs`:
+## Task file
+Read the full task file: /home/skull/Projects/rume/docs/plans/001-fix-audit-findings/17-rc12-sql-check.md
 
-1. `$N` placeholder handling: the dialect check rejects `$N` for `"sqlite" | "mysql"` (line 321-324) — confirm intended semantics; per the audit the validator must not incorrectly reject valid placeholders or miss invalid ones per dialect (postgres uses `$N`, sqlite/mysql use `?`). Ensure each dialect only accepts its own placeholder style.
-2. `EXPLAIN` with zero params: dry-run builds `EXPLAIN {trimmed}` for DML and executes it; with certain statements this fails. Fix the EXPLAIN dry-run to handle zero-parameter statements correctly (or skip EXPLAIN when there are no bindable params / use a valid explain form per dialect).
-3. Comment-blind quote scanner: the quote/comment scanner (lines 210-272 and `contains_unquoted_char`/`contains_unquoted_dollar_param`) does not handle block comments (`/* ... */`) or `#` comments consistently, so a `?` or `$1` inside a comment is falsely flagged. Fix the scanner to skip block comments and line comments (`--`, `#`) when scanning for unquoted placeholders/quotes.
+## Your job
+Fix RC-12 sql_check defects using sqlparser-rs:
+
+1. Add `sqlparser-rs` crate to workspace `Cargo.toml` (`[workspace.dependencies]`) and `crates/cli/Cargo.toml`
+2. Replace hand-rolled `content.chars()` quote/comment scanner in `crates/cli/src/commands/sql_check.rs` with `sqlparser-rs` parsing
+3. Fix dialect placeholder validation: postgres uses `$N`, sqlite/mysql use `?` — sqlparser handles this natively
+4. Fix EXPLAIN dry-run to handle zero-parameter statements correctly via sqlparser validation
+5. Comments (`--`, `#`, `/* */`) are properly skipped so `?` or `$1` inside comments is not falsely flagged
 
 ## Files touched
+- `Cargo.toml` (workspace deps)
+- `crates/cli/Cargo.toml` (add sqlparser-rs)
+- `crates/cli/src/commands/sql_check.rs` — rewrite using sqlparser-rs
 
-- `crates/cli/src/commands/sql_check.rs` — `validate_sql_file` dialect placeholder check, EXPLAIN dry-run, and the comment/quote scanner helpers.
+## Constraints
+- Use sqlparser-rs for SQL parsing and validation
+- No `unsafe`
+- Record `Why:` comments at decision sites
+- postgres file using `$1` passes; sqlite/mysql file using `$1` rejected; sqlite/mysql file using `?` passes
+- `?` or `$1` inside `--`/`#`/`/* */` comment is not flagged
+- EXPLAIN dry-run succeeds on zero-param DML
 
-## Constraints honoured
+## Verification
+1. `cargo test -p rume-cli sql_check`
+2. `cargo clippy -p rume-cli --all-targets`
+3. `cargo fmt --all --check`
 
-- Root cause, not symptom: make placeholder validation dialect-correct, comment-aware, and EXPLAIN robust to zero-param statements.
-- No new dependencies, no `unsafe`.
-- Record `Why:` comments for each scanner/placeholder decision.
-
-## Done when (checkable by a command)
-
-- `cargo test -p rume-cli sql_check` passes.
-- `cargo clippy -p rume-cli --all-targets` and `cargo fmt --all --check` clean.
-- A postgres file using `$1` passes; a sqlite/mysql file using `$1` is rejected; a sqlite/mysql file using `?` passes.
-- `EXPLAIN` dry-run succeeds on a zero-param DML statement.
-- A `?` or `$1` inside `--`/`#`/`/* */` comment is not flagged.
-
-## Verification (fails-before test idea)
-
-Tests:
-1. **Comment-blind scanner:** `SELECT * FROM t -- ?` (postgres target) → **before fix** flagged as unquoted `?` → test fails; **after fix** passes (comment skipped).
-2. **Block comment:** `/* ? */ SELECT 1` → not flagged.
-3. **EXPLAIN zero-param:** a zero-param `SELECT 1` dry-run → **before fix** `EXPLAIN SELECT 1` may error → test fails; **after fix** handled → passes.
-4. **Dialect placeholders:** postgres `$1` ok / `?` error; sqlite `?` ok / `$1` error.
+## Handoff
+Write to `/home/skull/Projects/rume/docs/plans/001-fix-audit-findings/scratch/task-17-done.md`. Do not commit.

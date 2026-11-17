@@ -1,8 +1,16 @@
 //! Scans SQL files in a directory and validates syntax, non-emptiness, balanced delimiters, and placeholders.
+//!
+//! All SQL quoting, comment, and placeholder handling is delegated to `sqlparser-rs` instead of a
+//! hand-rolled character scanner (RC-12 audit finding). `sqlparser-rs` natively handles block
+//! comments (`/* ... */`), line comments (`--`), `#` comments, and dialect-aware placeholders
+//! (`$N` for PostgreSQL, `?` for SQLite/MySQL).
 
 use crate::ui::table::TableBuilder;
 use console::style;
 use serde::Serialize;
+use sqlparser::dialect::{Dialect, GenericDialect, MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -57,7 +65,10 @@ pub async fn run(
                 if let Some((handle, _dialect)) = &db_handle {
                     if let Ok(content) = fs::read_to_string(file_path) {
                         let trimmed = content.trim();
-                        // Dry-run with EXPLAIN if it's a DML statement
+                        // Dry-run with EXPLAIN if it's a DML statement.
+                        // Why: zero-parameter DML statements can be EXPLAINed against a live
+                        // connection to confirm they are executable; this is a best-effort
+                        // validation that never modifies data.
                         let first_word = trimmed
                             .split_whitespace()
                             .next()
@@ -203,130 +214,76 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Validate a single SQL file using `sqlparser-rs`.
+///
+/// Performs comment-aware syntax parsing, an emptiness check, and dialect-aware placeholder
+/// validation. Comments (`--`, `#`, `/* */`) are tokenized as [`Token::Whitespace`] variants by
+/// `sqlparser-rs`, so placeholders appearing inside comments are never flagged.
 fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), String> {
     let content = fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
 
-    // Filter out comments and whitespace to check if query body exists
-    let meaningful_sql: String = content
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim();
-            if trimmed.starts_with("--") || trimmed.starts_with('#') {
-                ""
-            } else if let Some(idx) = trimmed.find("--") {
-                &trimmed[..idx]
-            } else {
-                trimmed
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    // Resolve the effective dialect: an explicit `--dialect` flag wins, otherwise infer from the
+    // file path, falling back to GenericDialect when neither is available.
+    // Why: the dialect drives both syntax parsing and the per-dialect placeholder rules.
+    let effective_dialect = target_dialect.or_else(|| infer_dialect_from_path(path));
+    let dialect: Box<dyn Dialect> = match effective_dialect {
+        Some("postgres") => Box::new(PostgreSqlDialect {}),
+        Some("sqlite") => Box::new(SQLiteDialect {}),
+        Some("mysql") => Box::new(MySqlDialect {}),
+        _ => Box::new(GenericDialect {}), // Why: permissive fallback when the dialect is unknown
+    };
 
-    let trimmed = meaningful_sql.trim();
-    if trimmed.is_empty() {
+    // Dialect-aware placeholder validation. We tokenize with GenericDialect so that both `?` and
+    // `$N` surface as `Token::Placeholder` in every dialect (the dialect-specific lexers can map
+    // bare `?` to a non-placeholder token, e.g. PostgreSQL maps `?` to the jsonb `?` operator).
+    // Comments are emitted as `Token::Whitespace`, so `?`/`$1` inside `--`/`#`/`/* */` is never
+    // seen here and cannot be falsely flagged.
+    // Why: placeholder validation runs before parsing so a dialect-mismatched placeholder surfaces
+    // as a placeholder error rather than a parse error.
+    let tokens = Tokenizer::new(&GenericDialect {}, &content)
+        .tokenize()
+        .map_err(|e| format!("tokenizer error: {e}"))?;
+    validate_placeholders(&tokens, effective_dialect)?;
+
+    // Comment-aware scanning + syntax validation: `sqlparser-rs` tokenizes and parses the SQL.
+    // Comments (`--`, `#`, `/* */`) are emitted as `Token::Whitespace` variants, never as
+    // significant tokens, so they are inherently skipped during validation.
+    // Why: this replaces the old hand-rolled `content.chars()` quote/comment scanner with a
+    // battle-tested, dialect-aware lexer/parser.
+    let statements = Parser::parse_sql(dialect.as_ref(), &content)
+        .map_err(|e| format!("SQL syntax error: {e}"))?;
+
+    // A file that holds only comments (or nothing) yields no statements.
+    // Why: the old code stripped comments by hand to detect emptiness; sqlparser gives us this
+    // for free, comment-aware by construction.
+    if statements.is_empty() {
         return Err("SQL file is empty (contains no query statements)".to_string());
     }
 
-    // Check balanced delimiters: (), quotes
-    let mut paren_depth = 0i32;
-    let mut in_single_quote = false;
-    let mut in_double_quote = false;
-    let mut prev_char = '\0';
+    Ok(())
+}
 
-    for ch in content.chars() {
-        if in_single_quote {
-            if ch == '\'' && prev_char != '\\' {
-                in_single_quote = false;
-            }
-        } else if in_double_quote {
-            if ch == '"' && prev_char != '\\' {
-                in_double_quote = false;
-            }
-        } else {
-            match ch {
-                '\'' => in_single_quote = true,
-                '"' => in_double_quote = true,
-                '(' => paren_depth += 1,
-                ')' => {
-                    paren_depth -= 1;
-                    if paren_depth < 0 {
-                        return Err("unmatched closing parenthesis ')'".to_string());
-                    }
+/// Enforce the per-dialect placeholder rule over already-tokenized SQL.
+fn validate_placeholders(tokens: &[Token], dialect: Option<&str>) -> Result<(), String> {
+    for token in tokens {
+        if let Token::Placeholder(value) = token {
+            let is_dollar_style = value.starts_with('$');
+            match dialect {
+                Some("postgres") if !is_dollar_style => {
+                    return Err(
+                        "PostgreSQL query uses '?' parameter placeholder instead of '$1, $2, ...'"
+                            .to_string(),
+                    );
+                }
+                Some(dialect_name @ "sqlite") | Some(dialect_name @ "mysql") if is_dollar_style => {
+                    return Err(format!(
+                        "{dialect_name} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
+                    ));
                 }
                 _ => {}
             }
         }
-        prev_char = ch;
     }
-
-    if in_single_quote {
-        return Err("unclosed single quote (')".to_string());
-    }
-    if in_double_quote {
-        return Err("unclosed double quote (\")".to_string());
-    }
-    if paren_depth != 0 {
-        return Err(format!(
-            "unclosed parenthesis: {paren_depth} open parenthesis remain unmatched"
-        ));
-    }
-
-    // Validate that the SQL starts with a recognized SQL keyword
-    let first_word = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_ascii_uppercase();
-
-    const VALID_KEYWORDS: &[&str] = &[
-        "SELECT",
-        "INSERT",
-        "UPDATE",
-        "DELETE",
-        "CREATE",
-        "ALTER",
-        "DROP",
-        "TRUNCATE",
-        "WITH",
-        "BEGIN",
-        "COMMIT",
-        "ROLLBACK",
-        "SET",
-        "PRAGMA",
-        "SHOW",
-        "EXPLAIN",
-        "CALL",
-        "GRANT",
-        "REVOKE",
-        "MERGE",
-        "REPLACE",
-        "UPSERT",
-        "SAVEPOINT",
-        "RELEASE",
-    ];
-
-    if !VALID_KEYWORDS.contains(&first_word.as_str()) {
-        return Err(format!(
-            "query starts with unrecognized SQL statement keyword `{first_word}`"
-        ));
-    }
-
-    // Dialect placeholder checks
-    let effective_dialect = target_dialect.or_else(|| infer_dialect_from_path(path));
-    if let Some(dialect) = effective_dialect {
-        match dialect {
-            "postgres" if contains_unquoted_char(&content, '?') => {
-                return Err("PostgreSQL query uses unnumbered '?' parameter placeholder instead of '$1, $2, ...'".to_string());
-            }
-            "sqlite" | "mysql" if contains_unquoted_dollar_param(&content) => {
-                return Err(format!(
-                    "{dialect} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
-                ));
-            }
-            _ => {}
-        }
-    }
-
     Ok(())
 }
 
@@ -344,125 +301,101 @@ fn infer_dialect_from_path(path: &Path) -> Option<&'static str> {
     None
 }
 
-fn contains_unquoted_char(sql: &str, target: char) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut prev = '\0';
-
-    for ch in sql.chars() {
-        if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-        } else if in_single {
-            if ch == '\'' && prev != '\\' {
-                in_single = false;
-            }
-        } else if in_double {
-            if ch == '"' && prev != '\\' {
-                in_double = false;
-            }
-        } else if prev == '-' && ch == '-' {
-            in_line_comment = true;
-        } else {
-            match ch {
-                '\'' => in_single = true,
-                '"' => in_double = true,
-                c if c == target => return true,
-                _ => {}
-            }
-        }
-        prev = ch;
-    }
-    false
-}
-
-fn contains_unquoted_dollar_param(sql: &str) -> bool {
-    let mut in_single = false;
-    let mut in_double = false;
-    let mut in_line_comment = false;
-    let mut prev = '\0';
-    let mut saw_dollar = false;
-
-    for ch in sql.chars() {
-        if in_line_comment {
-            if ch == '\n' {
-                in_line_comment = false;
-            }
-        } else if in_single {
-            if ch == '\'' && prev != '\\' {
-                in_single = false;
-            }
-        } else if in_double {
-            if ch == '"' && prev != '\\' {
-                in_double = false;
-            }
-        } else if prev == '-' && ch == '-' {
-            in_line_comment = true;
-        } else if saw_dollar {
-            if ch.is_ascii_digit() {
-                return true;
-            }
-            saw_dollar = false;
-        } else {
-            match ch {
-                '\'' => in_single = true,
-                '"' => in_double = true,
-                '$' => saw_dollar = true,
-                _ => {}
-            }
-        }
-        prev = ch;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_validate_valid_sql() {
+    fn write_temp(content: &str) -> tempfile::NamedTempFile {
         let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "SELECT * FROM users WHERE id = $1;").unwrap();
+        fs::write(temp.path(), content).unwrap();
+        temp
+    }
+
+    #[test]
+    fn sql_check_accepts_postgres_dollar_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = $1;");
         assert!(validate_sql_file(temp.path(), Some("postgres")).is_ok());
     }
 
     #[test]
-    fn test_validate_dialect_mismatch_postgres_with_question_mark() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "SELECT * FROM users WHERE id = ?;").unwrap();
+    fn sql_check_accepts_sqlite_question_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = ?;");
+        assert!(validate_sql_file(temp.path(), Some("sqlite")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_accepts_mysql_question_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = ?;");
+        assert!(validate_sql_file(temp.path(), Some("mysql")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_rejects_postgres_question_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = ?;");
         let err = validate_sql_file(temp.path(), Some("postgres")).unwrap_err();
-        assert!(err.contains("PostgreSQL query uses unnumbered '?' parameter placeholder"));
+        assert!(
+            err.contains("PostgreSQL query uses '?' parameter placeholder"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn test_validate_dialect_mismatch_sqlite_with_dollar_param() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "SELECT * FROM users WHERE id = $1;").unwrap();
+    fn sql_check_rejects_sqlite_dollar_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = $1;");
         let err = validate_sql_file(temp.path(), Some("sqlite")).unwrap_err();
-        assert!(err.contains("sqlite query uses PostgreSQL-style '$N' parameter placeholder"));
+        assert!(
+            err.contains("sqlite query uses PostgreSQL-style '$N' parameter placeholder"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
-    fn test_validate_unmatched_paren() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "SELECT * FROM users WHERE id IN (1, 2;").unwrap();
+    fn sql_check_rejects_mysql_dollar_placeholder() {
+        let temp = write_temp("SELECT * FROM users WHERE id = $1;");
+        let err = validate_sql_file(temp.path(), Some("mysql")).unwrap_err();
+        assert!(
+            err.contains("mysql query uses PostgreSQL-style '$N' parameter placeholder"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn sql_check_ignores_placeholder_in_line_comment() {
+        // `?` inside a `--` comment must not be flagged for postgres (which expects `$N`).
+        let temp = write_temp("-- WHERE id = ?\nSELECT * FROM users;");
+        assert!(validate_sql_file(temp.path(), Some("postgres")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_ignores_placeholder_in_hash_comment() {
+        // `?` inside a `#` comment must not be flagged for mysql (which supports `#` comments and
+        // expects `?` placeholders).
+        let temp = write_temp("# WHERE id = ?\nSELECT * FROM users;");
+        assert!(validate_sql_file(temp.path(), Some("mysql")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_ignores_placeholder_in_block_comment() {
+        // `$1` inside a `/* */` comment must not be flagged for sqlite (which rejects `$1`).
+        let temp = write_temp("/* WHERE id = $1 */\nSELECT * FROM users;");
+        assert!(validate_sql_file(temp.path(), Some("sqlite")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_rejects_unmatched_paren() {
+        let temp = write_temp("SELECT * FROM users WHERE id IN (1, 2;");
         assert!(validate_sql_file(temp.path(), None).is_err());
     }
 
     #[test]
-    fn test_validate_empty_sql() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "-- Just a comment\n").unwrap();
+    fn sql_check_rejects_empty_sql() {
+        let temp = write_temp("-- Just a comment\n");
         assert!(validate_sql_file(temp.path(), None).is_err());
     }
 
     #[test]
-    fn test_validate_unrecognized_keyword() {
-        let temp = tempfile::NamedTempFile::new().unwrap();
-        fs::write(temp.path(), "FOOBAR something").unwrap();
+    fn sql_check_rejects_unrecognized_statement() {
+        let temp = write_temp("FOOBAR something");
         assert!(validate_sql_file(temp.path(), None).is_err());
     }
 }

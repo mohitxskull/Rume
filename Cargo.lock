@@ -3863,6 +3863,7 @@ dependencies = [
  "rume",
  "serde",
  "serde_json",
+ "sqlparser",
  "tempfile",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
@@ -4514,6 +4515,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 dependencies = [
  "zeroize",
+]
+
+[[package]]
+name = "sqlparser"
+version = "0.53.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05a528114c392209b3264855ad491fcce534b94a38771b0a0b97a79379275ce8"
+dependencies = [
+ "log",
 ]
 
 [[package]]
