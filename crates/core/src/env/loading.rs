@@ -15,7 +15,7 @@ use serde::de::DeserializeOwned;
 
 use crate::env::error::EnvError;
 use crate::env::interpolation::interpolate_value;
-use crate::env::secrets::is_secret_key;
+use crate::env::secrets::{is_secret_key, value_looks_sensitive};
 
 /// A resolved environment: the merged values plus where each one came from.
 ///
@@ -112,12 +112,23 @@ where
         .collect();
 
     for (key, value) in resolved.values {
-        let Ok(value) = value.parse::<figment::value::Value>();
+        let value = value.parse::<figment::value::Value>().map_err(|err| {
+            let redacted =
+                crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+            EnvError::Validation(redacted)
+        })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key, value);
     }
     for (key, secret) in &resolved.secrets {
-        let Ok(value) = secret.expose_secret().parse::<figment::value::Value>();
+        let value = secret
+            .expose_secret()
+            .parse::<figment::value::Value>()
+            .map_err(|err| {
+                let redacted =
+                    crate::env::secrets::redact_diagnostic_text(&err.to_string(), &known_secrets);
+                EnvError::Validation(redacted)
+            })?;
         parsed.insert(key.to_ascii_lowercase(), value.clone());
         parsed.insert(key.clone(), value);
     }
@@ -197,10 +208,13 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
     // Interpolate all values against the final merged map, then route to
-    // secrets vs plain values based on the key (not the interpolated value).
+    // secrets vs plain values based on the key OR the value content. A
+    // sensitive value under a non-secret key (e.g. DATABASE_URL with a
+    // credential URL) must be treated as a secret to avoid plaintext
+    // leakage in diagnostics (RC-03).
     for (key, (value, source)) in &merged {
         let interpolated = interpolate_value(value, &vars)?;
-        if is_secret_key(key) {
+        if is_secret_key(key) || value_looks_sensitive(&interpolated) {
             secrets.insert(key.clone(), SecretBox::new(Box::new(interpolated)));
         } else {
             values.insert(key.clone(), interpolated);
