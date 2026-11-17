@@ -326,7 +326,14 @@ impl HealthChecks {
                 };
 
                 if let Some(mut rx) = waiter {
-                    let _ = rx.wait_for(|val| val.is_some()).await;
+                    if rx.wait_for(|val| val.is_some()).await.is_err() {
+                        // Leader's channel closed without producing a report
+                        // (leader cancelled or panicked before publishing).
+                        // Clear the dead slot so a new leader can be elected.
+                        let mut sf = self.singleflight.lock().await;
+                        *sf = None;
+                        continue;
+                    }
                     if let Some(report) = self.get_cached_report(ttl) {
                         return report;
                     }
@@ -344,13 +351,17 @@ impl HealthChecks {
                     }
                 }
 
-                // Clear singleflight and notify waiters
+                // Publish to waiters BEFORE clearing the slot, so a follower
+                // that subscribes between the publish and the clear still
+                // observes the latest value via wait_for().
+                if let Some(tx) = leader_tx {
+                    let _ = tx.send(Some(report.clone()));
+                }
+
+                // Clear singleflight slot after publishing.
                 {
                     let mut sf = self.singleflight.lock().await;
                     *sf = None;
-                }
-                if let Some(tx) = leader_tx {
-                    let _ = tx.send(Some(report.clone()));
                 }
 
                 return report;
