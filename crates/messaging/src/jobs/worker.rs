@@ -732,11 +732,12 @@ impl<Q: JobQueue> JobWorker<Q> {
                     return;
                 }
                 Ok(IdempotencyStatus::InProgress) => {
-                    if let Err(err) = queue.nack(job, &token, Duration::from_secs(2)).await {
+                    // Why: the handler did not execute, so deferring must not consume a retry attempt.
+                    if let Err(err) = queue.defer(job, &token, Duration::from_secs(2)).await {
                         tracing::error!(
                             job_id = %job_id,
                             error = %err,
-                            "Failed to nack in-progress idempotent job; lease may have expired or state mismatch"
+                            "Failed to defer in-progress idempotent job; lease may have expired or state mismatch"
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
@@ -778,12 +779,14 @@ impl<Q: JobQueue> JobWorker<Q> {
         // its leases are still valid MUST be acked normally rather than dead-lettered.
         let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
         let lease_lost = Arc::new(AtomicBool::new(false));
+        let extend_idempotency = Arc::new(AtomicBool::new(true));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let hb_token = token.clone();
         let hb_queue = Arc::clone(&queue);
         let hb_jid = job_id.clone();
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_lease_lost = Arc::clone(&lease_lost);
+        let hb_extend_idempotency = Arc::clone(&extend_idempotency);
         let hb_stopping = Arc::clone(&stopping);
         let hb_lost_leases = Arc::clone(&lost_leases);
         let hb_idemp_store = idempotency_store.clone();
@@ -809,14 +812,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                             hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                             break;
                         }
-                        // 2. Extend distributed idempotency lock heartbeat.
+                        // 2. Extend distributed idempotency lock heartbeat while handler is running.
                         // CRITICAL DISTRIBUTED INVARIANT:
                         // If lock extension fails (e.g. Redis outage, network partition, or token mismatch where
                         // another worker claimed the lease), this worker has LOST idempotency ownership.
                         // Continuing to acknowledge the job upon completion would violate at-most-once/deduplication
                         // guarantees. Therefore, we immediately set `hb_lease_lost = true` and `hb_cancelled = true`,
                         // break the heartbeat loop, and route the completed job to the dead letter queue (DLQ) without acking.
-                        if let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
+                        if hb_extend_idempotency.load(Ordering::SeqCst)
+                            && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
                             && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
                             tracing::error!(
@@ -827,26 +831,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                             );
                             hb_cancelled.store(true, Ordering::SeqCst);
                             hb_lease_lost.store(true, Ordering::SeqCst);
-                            hb_lost_leases.fetch_add(1, Ordering::SeqCst);
-                            break;
-                        }
-                        // 2. Extend distributed idempotency lock heartbeat.
-                        // CRITICAL DISTRIBUTED INVARIANT:
-                        // If lock extension fails (e.g. Redis outage, network partition, or token mismatch where
-                        // another worker claimed the lease), this worker has LOST idempotency ownership.
-                        // Continuing to acknowledge the job upon completion would violate at-most-once/deduplication
-                        // guarantees. Therefore, we immediately set `hb_cancelled = true`, break the heartbeat loop,
-                        // and route the completed job to the dead letter queue (DLQ) without acking.
-                        if let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
-                            && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
-                        {
-                            tracing::error!(
-                                job_id = %hb_jid,
-                                key = %k,
-                                error = %e,
-                                "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
-                            );
-                            hb_cancelled.store(true, Ordering::SeqCst);
                             hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                             break;
                         }
@@ -872,9 +856,11 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(_) => Err(JobError::Fatal("handler panicked".into())),
         };
 
-        let _ = cancel_tx.send(());
-        heartbeat_handle.abort();
-
+        // Why: keep the queue lease heartbeat active until the post-dispatch state transition
+        // (ack / nack / dead_letter) completes, so a slow idempotency release cannot let the
+        // queue lease expire before `queue.nack` records the retry backoff. Stop extending the
+        // idempotency lock once we begin releasing/completing it so release does not trigger
+        // spurious `extend_lock_with_token` errors.
         match dispatch_result {
             Ok(()) => {
                 if lease_lost.load(Ordering::SeqCst) {
@@ -882,16 +868,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                         job_id = %job_id,
                         "Job execution completed after lease was lost; routing to dead letter queue"
                     );
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                        && let Err(err) = store.release_with_token(key, &token).await
-                    {
-                        tracing::error!(
-                            job_id = %job_id,
-                            key = %key,
-                            error = %err,
-                            "Failed to release idempotency token on lease loss"
-                        );
-                    }
                     if let Err(err) = queue
                         .dead_letter(job, &token, "lease lost during execution".into())
                         .await
@@ -903,6 +879,19 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        // Why: release the deduplication reservation only after `dead_letter`
+                        // commits; if dead-lettering fails, preserving the reservation blocks
+                        // another worker from re-executing a handler that already succeeded.
+                        extend_idempotency.store(false, Ordering::SeqCst);
+                        release_idempotency_token(
+                            &idempotency_store,
+                            &effective_key,
+                            &job_id,
+                            &token,
+                            "on lease loss",
+                        )
+                        .await;
                     }
                 } else {
                     if let Err(err) = queue.ack(&job_id, &token).await {
@@ -914,6 +903,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     }
+                    extend_idempotency.store(false, Ordering::SeqCst);
                     if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
                         && let Err(err) = store.complete_with_token(key, &token, None).await
                     {
@@ -929,16 +919,15 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(JobError::Fatal(msg))
             | Err(JobError::UnknownJob(msg))
             | Err(JobError::Serialization(msg)) => {
-                if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                    && let Err(err) = store.release_with_token(key, &token).await
-                {
-                    tracing::error!(
-                        job_id = %job_id,
-                        key = %key,
-                        error = %err,
-                        "Failed to release idempotency token on fatal failure"
-                    );
-                }
+                extend_idempotency.store(false, Ordering::SeqCst);
+                release_idempotency_token(
+                    &idempotency_store,
+                    &effective_key,
+                    &job_id,
+                    &token,
+                    "on fatal failure",
+                )
+                .await;
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
                         job_id = %job_id,
@@ -958,16 +947,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                 // The lock is keyed by `effective_key` (the tenant-scoped idempotency key),
                 // never by `job.id`.
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                        && let Err(rel_err) = store.release_with_token(key, &token).await
-                    {
-                        tracing::error!(
-                            job_id = %job_id,
-                            key = %key,
-                            error = %rel_err,
-                            "Failed to release idempotency token before retryable nack; proceeding with nack"
-                        );
-                    }
+                    extend_idempotency.store(false, Ordering::SeqCst);
+                    release_idempotency_token(
+                        &idempotency_store,
+                        &effective_key,
+                        &job_id,
+                        &token,
+                        "before retryable nack; proceeding with nack",
+                    )
+                    .await;
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -978,16 +966,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     }
                 } else {
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                        && let Err(rel_err) = store.release_with_token(key, &token).await
-                    {
-                        tracing::error!(
-                            job_id = %job_id,
-                            key = %key,
-                            error = %rel_err,
-                            "Failed to release idempotency token on dead letter"
-                        );
-                    }
+                    extend_idempotency.store(false, Ordering::SeqCst);
+                    release_idempotency_token(
+                        &idempotency_store,
+                        &effective_key,
+                        &job_id,
+                        &token,
+                        "on dead letter",
+                    )
+                    .await;
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
                         tracing::error!(
@@ -1001,6 +988,9 @@ impl<Q: JobQueue> JobWorker<Q> {
                 }
             }
         }
+
+        let _ = cancel_tx.send(());
+        heartbeat_handle.abort();
     }
 
     /// Gracefully requests worker shutdown and waits for in-flight jobs and background polling tasks to complete within `timeout`.
@@ -1031,6 +1021,38 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Returns the number of currently executing jobs.
     pub fn in_flight_count(&self) -> u32 {
         self.in_flight_count.load(Ordering::Relaxed)
+    }
+}
+
+/// Releases an idempotency token with a bounded wait so a stalled store cannot
+/// indefinitely block worker state transitions.
+async fn release_idempotency_token(
+    store: &Option<Arc<dyn IdempotencyStore>>,
+    key: &Option<String>,
+    job_id: &str,
+    token: &str,
+    context: &str,
+) {
+    const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
+    if let (Some(store), Some(key)) = (store, key) {
+        match tokio::time::timeout(RELEASE_TIMEOUT, store.release_with_token(key, token)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                tracing::error!(
+                    job_id = %job_id,
+                    key = %key,
+                    error = %err,
+                    "Failed to release idempotency token {context}"
+                );
+            }
+            Err(_) => {
+                tracing::error!(
+                    job_id = %job_id,
+                    key = %key,
+                    "Timed out releasing idempotency token {context}"
+                );
+            }
+        }
     }
 }
 
@@ -1977,6 +1999,547 @@ mod tests {
         assert!(
             release_entry == &format!("release:{expected_key}"),
             "lock must be released by effective_key, not job.id; got {release_entry:?}"
+        );
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    struct SlowOkJob;
+    impl Job for SlowOkJob {
+        const NAME: &'static str = "slow_ok_job";
+    }
+    struct SlowOkHandler(Duration);
+    impl JobHandler<SlowOkJob> for SlowOkHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: SlowOkJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let delay = self.0;
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct LeaseLossOrderQueue {
+        seq_log: Arc<Mutex<Vec<String>>>,
+        fail_dead_letter: bool,
+    }
+
+    impl JobQueue for LeaseLossOrderQueue {
+        fn enqueue_delayed<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn ack(&self, job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            let log = Arc::clone(&self.seq_log);
+            let id = job_id.to_string();
+            Box::pin(async move {
+                log.lock().await.push(format!("ack:{id}"));
+                Ok(())
+            })
+        }
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dead_letter(
+            &self,
+            job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let log = Arc::clone(&self.seq_log);
+            let fail = self.fail_dead_letter;
+            Box::pin(async move {
+                log.lock().await.push(format!("dead_letter:{}", job.id));
+                if fail {
+                    Err(JobError::Fatal("dlq failed".into()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+        fn renew_lease(
+            &self,
+            _job_id: &str,
+            _lease_token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Err(JobError::Fatal("lease lost".into())) })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
+        // Case A: dead_letter fails -> release_with_token must NOT be called
+        let seq_fail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let store_fail = Arc::new(RecordingIdempotencyStore {
+            seq_log: Arc::clone(&seq_fail),
+        });
+        let queue_fail = Arc::new(LeaseLossOrderQueue {
+            seq_log: Arc::clone(&seq_fail),
+            fail_dead_letter: true,
+        });
+        let job_a = QueuedJob {
+            id: "job-dlq-fail".to_string(),
+            name: SlowOkJob::NAME.to_string(),
+            payload: serde_json::to_vec(&SlowOkJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-fail".into()),
+            tenant_id: None,
+            assigned_worker: Some("w1".into()),
+            lease_token: Some("tok-1".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+        let mut reg_a = JobRegistry::new();
+        reg_a.register(SlowOkHandler(Duration::from_millis(60)));
+        let transition_errors = Arc::new(AtomicU64::new(0));
+        JobWorker::execute_job(
+            queue_fail,
+            Arc::new(reg_a),
+            job_a,
+            Some(store_fail),
+            Arc::new(AtomicBool::new(false)),
+            Arc::clone(&transition_errors),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let log_a = seq_fail.lock().await;
+        assert!(
+            log_a.iter().any(|e| e == "dead_letter:job-dlq-fail"),
+            "dead_letter must be attempted: {log_a:?}"
+        );
+        assert!(
+            !log_a.iter().any(|e| e.starts_with("release:")),
+            "release_with_token must NOT be called when dead_letter fails: {log_a:?}"
+        );
+        assert_eq!(transition_errors.load(Ordering::SeqCst), 1);
+
+        // Case B: dead_letter succeeds -> release_with_token must be called AFTER dead_letter
+        let seq_ok: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let store_ok = Arc::new(RecordingIdempotencyStore {
+            seq_log: Arc::clone(&seq_ok),
+        });
+        let queue_ok = Arc::new(LeaseLossOrderQueue {
+            seq_log: Arc::clone(&seq_ok),
+            fail_dead_letter: false,
+        });
+        let job_b = QueuedJob {
+            id: "job-dlq-ok".to_string(),
+            name: SlowOkJob::NAME.to_string(),
+            payload: serde_json::to_vec(&SlowOkJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-ok".into()),
+            tenant_id: None,
+            assigned_worker: Some("w1".into()),
+            lease_token: Some("tok-2".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(30),
+            trace_context: None,
+        };
+        let mut reg_b = JobRegistry::new();
+        reg_b.register(SlowOkHandler(Duration::from_millis(60)));
+        JobWorker::execute_job(
+            queue_ok,
+            Arc::new(reg_b),
+            job_b,
+            Some(store_ok),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+        let log_b = seq_ok.lock().await;
+        let dlq_idx = log_b
+            .iter()
+            .position(|e| e == "dead_letter:job-dlq-ok")
+            .expect("dead_letter recorded");
+        let rel_idx = log_b
+            .iter()
+            .position(|e| e.starts_with("release:"))
+            .expect("release recorded");
+        assert!(
+            dlq_idx < rel_idx,
+            "dead_letter must precede release_with_token on lease loss: {log_b:?}"
+        );
+    }
+
+    #[derive(Debug)]
+    struct SlowReleaseIdempotencyStore {
+        release_delay: Duration,
+        seq_log: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl IdempotencyStore for SlowReleaseIdempotencyStore {
+        fn try_acquire_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            Box::pin(async { Ok(IdempotencyStatus::New) })
+        }
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn release_with_token(
+            &self,
+            key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let delay = self.release_delay;
+            let log = Arc::clone(&self.seq_log);
+            let k = key.to_string();
+            Box::pin(async move {
+                tokio::time::sleep(delay).await;
+                log.lock().await.push(format!("release:{k}"));
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct LeaseTrackingQueue {
+        seq_log: Arc<Mutex<Vec<String>>>,
+        renew_count: Arc<AtomicUsize>,
+    }
+
+    impl JobQueue for LeaseTrackingQueue {
+        fn enqueue_delayed<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn nack(
+            &self,
+            job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let log = Arc::clone(&self.seq_log);
+            Box::pin(async move {
+                log.lock().await.push(format!("nack:{}", job.id));
+                Ok(())
+            })
+        }
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn renew_lease(
+            &self,
+            job_id: &str,
+            _lease_token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let count = Arc::clone(&self.renew_count);
+            let log = Arc::clone(&self.seq_log);
+            let id = job_id.to_string();
+            Box::pin(async move {
+                count.fetch_add(1, Ordering::SeqCst);
+                log.lock().await.push(format!("renew:{id}"));
+                Ok(())
+            })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_keeps_heartbeat_active_until_nack_completes_on_slow_release() {
+        let seq_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let renew_count = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(SlowReleaseIdempotencyStore {
+            release_delay: Duration::from_millis(120),
+            seq_log: Arc::clone(&seq_log),
+        });
+        let queue = Arc::new(LeaseTrackingQueue {
+            seq_log: Arc::clone(&seq_log),
+            renew_count: Arc::clone(&renew_count),
+        });
+        let job = QueuedJob {
+            id: "job-slow-rel".to_string(),
+            name: RetryFailJob::NAME.to_string(),
+            payload: serde_json::to_vec(&RetryFailJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-slow".into()),
+            tenant_id: None,
+            assigned_worker: Some("w1".into()),
+            lease_token: Some("tok-slow".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(45),
+            trace_context: None,
+        };
+        let mut registry = JobRegistry::new();
+        registry.register(RetryFailHandler);
+
+        JobWorker::execute_job(
+            queue,
+            Arc::new(registry),
+            job,
+            Some(store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        let log = seq_log.lock().await;
+        assert!(
+            renew_count.load(Ordering::SeqCst) >= 2,
+            "heartbeat must keep renewing lease while release_with_token is slow: {log:?}"
+        );
+        let rel_idx = log
+            .iter()
+            .position(|e| e.starts_with("release:"))
+            .expect("release");
+        let nack_idx = log
+            .iter()
+            .position(|e| e == "nack:job-slow-rel")
+            .expect("nack");
+        assert!(rel_idx < nack_idx, "release must precede nack: {log:?}");
+    }
+
+    #[derive(Debug)]
+    struct InProgressIdempotencyStore;
+    impl IdempotencyStore for InProgressIdempotencyStore {
+        fn try_acquire_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _ttl: Duration,
+        ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+            Box::pin(async { Ok(IdempotencyStatus::InProgress) })
+        }
+        fn complete_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+            _result: Option<Vec<u8>>,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn release_with_token(
+            &self,
+            _key: &str,
+            _token: &str,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Debug)]
+    struct DeferTrackingQueue {
+        nack_calls: Arc<AtomicUsize>,
+        defer_calls: Arc<AtomicUsize>,
+        attempt_counter: Arc<AtomicU32>,
+    }
+
+    impl JobQueue for DeferTrackingQueue {
+        fn enqueue_delayed<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.nack_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+        fn defer(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.defer_calls.fetch_add(1, Ordering::SeqCst);
+            let _ = self
+                .attempt_counter
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                    Some(v.saturating_sub(1))
+                });
+            Box::pin(async { Ok(()) })
+        }
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_worker_in_progress_idempotency_defers_without_burning_retry_budget() {
+        let nack_calls = Arc::new(AtomicUsize::new(0));
+        let defer_calls = Arc::new(AtomicUsize::new(0));
+        let attempt_counter = Arc::new(AtomicU32::new(2));
+        let queue = Arc::new(DeferTrackingQueue {
+            nack_calls: Arc::clone(&nack_calls),
+            defer_calls: Arc::clone(&defer_calls),
+            attempt_counter: Arc::clone(&attempt_counter),
+        });
+        let job = QueuedJob {
+            id: "job-defer".to_string(),
+            name: RetryFailJob::NAME.to_string(),
+            payload: serde_json::to_vec(&RetryFailJob).unwrap(),
+            attempt: 2,
+            retry_policy: RetryPolicy::new().with_max_attempts(3),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-inprog".into()),
+            tenant_id: None,
+            assigned_worker: Some("w1".into()),
+            lease_token: Some("tok-defer".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(60),
+            trace_context: None,
+        };
+        let mut registry = JobRegistry::new();
+        registry.register(RetryFailHandler);
+
+        JobWorker::execute_job(
+            queue,
+            Arc::new(registry),
+            job,
+            Some(Arc::new(InProgressIdempotencyStore)),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            defer_calls.load(Ordering::SeqCst),
+            1,
+            "InProgress must call queue.defer"
+        );
+        assert_eq!(
+            nack_calls.load(Ordering::SeqCst),
+            0,
+            "InProgress must not call queue.nack"
+        );
+        assert_eq!(
+            attempt_counter.load(Ordering::SeqCst),
+            1,
+            "defer must restore attempt count so next claim does not burn retry budget"
         );
     }
 }

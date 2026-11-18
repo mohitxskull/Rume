@@ -8,7 +8,9 @@ use uuid::Uuid;
 
 use crate::coordination::error::CoordinationError;
 use crate::coordination::leader::{LeaderElector, LeaderLease};
-use crate::coordination::lock::{CoordinationFuture, DistributedLock, LockGuard};
+use crate::coordination::lock::{
+    CoordinationFuture, DistributedLock, LockGuard, conservative_lease_deadline,
+};
 use crate::persistence::postgres::PostgresBackend;
 
 const LOCKS_SCHEMA: &str = include_str!("../persistence/sql/postgres/locks_schema.sql");
@@ -114,7 +116,12 @@ impl DistributedLock for PostgresDistributedLock {
 
     fn renew<'a>(&'a self, guard: &'a mut LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
         Box::pin(async move {
-            let ttl_ms = ttl.as_millis().max(1) as i64;
+            // Why: Compute the conservative deadline before dispatching `LOCK_RENEW_SQL` so
+            // network/scheduling delay counts against the local lease, and only advance
+            // `guard.expires_at` monotonically on confirmed extension (never shortening an
+            // existing longer deadline).
+            let (ttl_ms, candidate_deadline) = conservative_lease_deadline(ttl);
+            let ttl_ms = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
 
             let res = sqlx::query(LOCK_RENEW_SQL)
                 .bind(ttl_ms)
@@ -129,10 +136,7 @@ impl DistributedLock for PostgresDistributedLock {
                     resource: guard.resource.clone(),
                 })
             } else {
-                // Why: Refresh local `expires_at` only on confirmed DB extension so `is_expired()`
-                // and `time_remaining()` stay accurate; `fencing_token` stays unchanged because
-                // renewal extends the existing lease rather than issuing a new acquisition.
-                guard.expires_at = Some(std::time::Instant::now() + ttl);
+                guard.advance_expires_at(candidate_deadline);
                 Ok(())
             }
         })

@@ -52,6 +52,50 @@ struct CircuitInner {
     consecutive_successes: u32,
     opened_at: Option<Instant>,
     half_open_in_flight: bool,
+    half_open_generation: u64,
+    active_half_open_permit: Option<u64>,
+    permit_guarded: bool,
+}
+
+/// Drop-guarded permit for an in-flight request admitted by [`CircuitBreaker`].
+///
+/// For `HalfOpen` trials, carries the trial's generation ID and releases the
+/// `half_open_in_flight` slot on drop if the future is cancelled before
+/// reporting completion.
+struct TrialPermit {
+    breaker: CircuitBreaker,
+    generation: Option<u64>,
+    completed: bool,
+}
+
+impl TrialPermit {
+    fn complete_success(mut self) {
+        self.completed = true;
+        self.breaker.complete_with_permit(self.generation, true);
+    }
+
+    fn complete_failure(mut self) {
+        self.completed = true;
+        self.breaker.complete_with_permit(self.generation, false);
+    }
+}
+
+impl Drop for TrialPermit {
+    fn drop(&mut self) {
+        if self.completed {
+            return;
+        }
+        if let Some(generation) = self.generation {
+            let mut inner = self.breaker.inner.write().unwrap();
+            if inner.state == CircuitState::HalfOpen
+                && inner.active_half_open_permit == Some(generation)
+            {
+                inner.half_open_in_flight = false;
+                inner.active_half_open_permit = None;
+                inner.permit_guarded = false;
+            }
+        }
+    }
 }
 
 /// A circuit breaker tracking execution outcomes and preventing cascading failures.
@@ -78,6 +122,9 @@ impl CircuitBreaker {
                 consecutive_successes: 0,
                 opened_at: None,
                 half_open_in_flight: false,
+                half_open_generation: 0,
+                active_half_open_permit: None,
+                permit_guarded: false,
             })),
         }
     }
@@ -98,25 +145,123 @@ impl CircuitBreaker {
             CircuitState::Closed => true,
             CircuitState::HalfOpen => {
                 if inner.half_open_in_flight {
-                    // A HalfOpen trial is in flight. If it has been open longer
-                    // than the reset timeout, the trial was abandoned (the
-                    // future was dropped before on_success/on_failure ran).
-                    // Release the slot so the circuit does not wedge HalfOpen.
-                    if let Some(opened) = inner.opened_at
+                    // Only unguarded legacy `allow_request()` calls fall back to
+                    // timeout-based slot recovery; Drop-guarded service futures
+                    // keep the slot occupied until they complete or drop.
+                    if !inner.permit_guarded
+                        && let Some(opened) = inner.opened_at
                         && opened.elapsed() >= self.config.reset_timeout
                     {
-                        inner.half_open_in_flight = false;
+                        let generation = inner.half_open_generation.wrapping_add(1);
+                        inner.half_open_generation = generation;
+                        inner.active_half_open_permit = Some(generation);
                         inner.half_open_in_flight = true;
+                        inner.opened_at = Some(Instant::now());
                         true
                     } else {
                         false
                     }
                 } else {
+                    let generation = inner.half_open_generation.wrapping_add(1);
+                    inner.half_open_generation = generation;
+                    inner.active_half_open_permit = Some(generation);
                     inner.half_open_in_flight = true;
+                    inner.permit_guarded = false;
+                    inner.opened_at = Some(Instant::now());
                     true
                 }
             }
             CircuitState::Open => false,
+        }
+    }
+
+    fn acquire_permit(&self) -> Option<TrialPermit> {
+        let mut inner = self.inner.write().unwrap();
+        Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
+
+        match inner.state {
+            CircuitState::Closed => Some(TrialPermit {
+                breaker: self.clone(),
+                generation: None,
+                completed: false,
+            }),
+            CircuitState::HalfOpen => {
+                if inner.half_open_in_flight {
+                    if !inner.permit_guarded
+                        && let Some(opened) = inner.opened_at
+                        && opened.elapsed() >= self.config.reset_timeout
+                    {
+                        let generation = inner.half_open_generation.wrapping_add(1);
+                        inner.half_open_generation = generation;
+                        inner.active_half_open_permit = Some(generation);
+                        inner.half_open_in_flight = true;
+                        inner.permit_guarded = true;
+                        inner.opened_at = Some(Instant::now());
+                        Some(TrialPermit {
+                            breaker: self.clone(),
+                            generation: Some(generation),
+                            completed: false,
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    let generation = inner.half_open_generation.wrapping_add(1);
+                    inner.half_open_generation = generation;
+                    inner.active_half_open_permit = Some(generation);
+                    inner.half_open_in_flight = true;
+                    inner.permit_guarded = true;
+                    inner.opened_at = Some(Instant::now());
+                    Some(TrialPermit {
+                        breaker: self.clone(),
+                        generation: Some(generation),
+                        completed: false,
+                    })
+                }
+            }
+            CircuitState::Open => None,
+        }
+    }
+
+    fn complete_with_permit(&self, permit_generation: Option<u64>, success: bool) {
+        let mut inner = self.inner.write().unwrap();
+        match permit_generation {
+            Some(generation) => {
+                if inner.state != CircuitState::HalfOpen
+                    || inner.active_half_open_permit != Some(generation)
+                {
+                    return;
+                }
+                inner.half_open_in_flight = false;
+                inner.active_half_open_permit = None;
+                inner.permit_guarded = false;
+                if success {
+                    inner.consecutive_successes += 1;
+                    if inner.consecutive_successes >= self.config.success_threshold {
+                        inner.state = CircuitState::Closed;
+                        inner.consecutive_failures = 0;
+                        inner.consecutive_successes = 0;
+                        inner.opened_at = None;
+                    }
+                } else {
+                    inner.state = CircuitState::Open;
+                    inner.consecutive_successes = 0;
+                    inner.opened_at = Some(Instant::now());
+                }
+            }
+            None => {
+                if inner.state == CircuitState::Closed {
+                    if success {
+                        inner.consecutive_failures = 0;
+                    } else {
+                        inner.consecutive_failures += 1;
+                        if inner.consecutive_failures >= self.config.failure_threshold {
+                            inner.state = CircuitState::Open;
+                            inner.opened_at = Some(Instant::now());
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -132,6 +277,8 @@ impl CircuitBreaker {
             inner.consecutive_successes = 0;
             inner.opened_at = Some(Instant::now()); // mark HalfOpen entry time
             inner.half_open_in_flight = false;
+            inner.active_half_open_permit = None;
+            inner.permit_guarded = false;
         }
     }
 
@@ -139,6 +286,8 @@ impl CircuitBreaker {
     pub fn on_success(&self) {
         let mut inner = self.inner.write().unwrap();
         inner.half_open_in_flight = false;
+        inner.active_half_open_permit = None;
+        inner.permit_guarded = false;
         match inner.state {
             CircuitState::HalfOpen => {
                 inner.consecutive_successes += 1;
@@ -160,6 +309,8 @@ impl CircuitBreaker {
     pub fn on_failure(&self) {
         let mut inner = self.inner.write().unwrap();
         inner.half_open_in_flight = false;
+        inner.active_half_open_permit = None;
+        inner.permit_guarded = false;
         match inner.state {
             CircuitState::Closed => {
                 inner.consecutive_failures += 1;
@@ -170,6 +321,7 @@ impl CircuitBreaker {
             }
             CircuitState::HalfOpen => {
                 inner.state = CircuitState::Open;
+                inner.consecutive_successes = 0;
                 inner.opened_at = Some(Instant::now());
             }
             CircuitState::Open => {}
@@ -235,26 +387,153 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            if !breaker.allow_request() {
+            let Some(permit) = breaker.acquire_permit() else {
                 let err: AppError = ResilienceError::CircuitOpen.into();
                 return Ok(err.into_response());
-            }
+            };
 
             let response = match inner.call(req).await {
                 Ok(res) => res,
                 Err(err) => {
-                    breaker.on_failure();
+                    permit.complete_failure();
                     return Err(err);
                 }
             };
 
             if response.status().is_server_error() {
-                breaker.on_failure();
+                permit.complete_failure();
             } else {
-                breaker.on_success();
+                permit.complete_success();
             }
 
             Ok(response)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::StatusCode;
+    use std::future::Future;
+    use std::pin::Pin;
+    use tokio::sync::Notify;
+
+    #[derive(Clone)]
+    struct ControlledService {
+        gate: Arc<Notify>,
+    }
+
+    impl Service<Request<Body>> for ControlledService {
+        type Response = Response<Body>;
+        type Error = std::convert::Infallible;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: Request<Body>) -> Self::Future {
+            let gate = Arc::clone(&self.gate);
+            Box::pin(async move {
+                gate.notified().await;
+                Ok(Response::builder()
+                    .status(StatusCode::OK)
+                    .body(Body::empty())
+                    .unwrap())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn half_open_pending_trial_blocks_concurrent_requests_even_after_reset_timeout() {
+        tokio::time::pause();
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            reset_timeout: Duration::from_millis(40),
+        });
+
+        breaker.on_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        // Even after HalfOpen itself has lasted longer than reset_timeout,
+        // a pending trial must hold the slot until it completes or drops.
+        tokio::time::advance(Duration::from_millis(50)).await;
+
+        let gate = Arc::new(Notify::new());
+        let mut svc = CircuitBreakerService::new(
+            ControlledService {
+                gate: Arc::clone(&gate),
+            },
+            breaker.clone(),
+        );
+
+        let mut trial_fut = tokio::spawn({
+            let req = Request::builder().body(Body::empty()).unwrap();
+            svc.call(req)
+        });
+        // Poll once so the trial acquires its HalfOpen permit and awaits the gate.
+        tokio::task::yield_now().await;
+
+        // A second request arriving after another reset_timeout must still be rejected.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        let second_req = Request::builder().body(Body::empty()).unwrap();
+        let second_resp = svc.call(second_req).await.unwrap();
+        assert_eq!(second_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // Dropping/aborting the pending trial releases the slot immediately.
+        trial_fut.abort();
+        let _ = (&mut trial_fut).await;
+
+        // Now a new trial is admitted immediately without waiting for reset_timeout.
+        gate.notify_one();
+        let third_req = Request::builder().body(Body::empty()).unwrap();
+        let third_resp = svc.call(third_req).await.unwrap();
+        assert_eq!(third_resp.status(), StatusCode::OK);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn superseded_half_open_permit_completion_is_ignored() {
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            reset_timeout: Duration::from_millis(0),
+        });
+
+        // Trip to Open and immediately transition to HalfOpen.
+        breaker.on_failure();
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        // Trial A acquires generation 1.
+        let permit_a = breaker
+            .acquire_permit()
+            .expect("trial A should be admitted");
+        assert!(permit_a.generation.is_some());
+
+        // Simulate trial A being superseded by another cycle (e.g., failure -> Open -> HalfOpen -> trial B).
+        breaker.on_failure();
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        let permit_b = breaker
+            .acquire_permit()
+            .expect("trial B should be admitted");
+        assert_ne!(permit_a.generation, permit_b.generation);
+
+        // Late completion from superseded trial A must be ignored: it must NOT
+        // close the circuit or clear trial B's in-flight slot.
+        permit_a.complete_success();
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        assert!(
+            breaker.acquire_permit().is_none(),
+            "trial B's slot must remain occupied after superseded trial A completes"
+        );
+
+        // Trial B's own completion closes the circuit.
+        permit_b.complete_success();
+        assert_eq!(breaker.state(), CircuitState::Closed);
     }
 }

@@ -305,9 +305,8 @@ impl TenantQuotaLayer {
     /// Creates a new tenant quota layer with the given store and default tiered policy.
     ///
     /// The quota window defaults to 60 seconds, matching the `retry-after: 60` header
-    /// returned on `QuotaExceeded`. After each successful request the acquired quota slot
-    /// is released, so the counter behaves as a sliding window bounded by the TTL rather
-    /// than a permanent lifetime lockout.
+    /// returned on `QuotaExceeded`. Each admitted request retains its slot until the
+    /// window TTL expires, enforcing a sliding-window rate limit.
     pub fn new(store: Arc<dyn crate::tenant::quota::TenantQuotaStore>) -> Self {
         Self {
             store,
@@ -323,7 +322,12 @@ impl TenantQuotaLayer {
     }
 
     /// Configures the quota window duration (default 60 seconds).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `window` is zero.
     pub fn with_window(mut self, window: Duration) -> Self {
+        assert!(!window.is_zero(), "quota window must be greater than zero");
         self.window = window;
         self
     }
@@ -389,10 +393,9 @@ where
                 match store.acquire(&tenant.id, limit, window).await {
                     Ok(true) => {
                         let mut response = inner.call(req).await?;
-                        // Release the quota slot after producing the response so the
-                        // counter acts as a sliding window bounded by TTL expiry rather
-                        // than a permanent lifetime lockout (RC-06 root cause).
-                        let _ = store.release(&tenant.id).await;
+                        // Why: TenantQuotaLayer is a sliding-window rate limit (RC-06), not an
+                        // in-flight concurrency limiter; admitted slots must remain until `window`
+                        // expires rather than being released when the response completes.
                         let headers = response.headers_mut();
                         if let Ok(val) = axum::http::HeaderValue::from_str(&limit.to_string()) {
                             headers.insert(
@@ -420,10 +423,13 @@ where
                         }
                         .into();
                         let mut response = app_err.into_response();
-                        let val = axum::http::HeaderValue::from_static("60");
-                        response
-                            .headers_mut()
-                            .insert(axum::http::header::RETRY_AFTER, val);
+                        if let Ok(val) =
+                            axum::http::HeaderValue::from_str(&window.as_secs().max(1).to_string())
+                        {
+                            response
+                                .headers_mut()
+                                .insert(axum::http::header::RETRY_AFTER, val);
+                        }
                         Ok(response)
                     }
                     Err(err) => {
@@ -507,6 +513,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_tenant_quota_layer_enforces_tier_limits() {
+        tokio::time::pause();
+
         let store = Arc::new(crate::tenant::quota::InMemoryTenantQuotaStore::new());
         use crate::tenant::quota::TenantQuotaStore;
         let policy = TieredQuotaPolicy {
@@ -519,7 +527,7 @@ mod tests {
             .route("/api/data", get(ok_handler))
             .layer(TenantQuotaLayer::new(store.clone()).with_policy(policy));
 
-        // 1. Free tenant makes 2 requests -> both succeed with headers (slot released after each response)
+        // 1. Free tenant makes 2 requests -> both succeed with headers
         for _ in 0..2 {
             let mut req = Request::builder()
                 .uri("/api/data")
@@ -534,7 +542,7 @@ mod tests {
             assert_eq!(res.headers().get("x-quota-tier").unwrap(), "free");
         }
 
-        // 2. After release-after-response, a 3rd request also succeeds (slot was freed by prior release)
+        // 2. 3rd sequential request within the 60s window is rejected with 429
         let mut req_overflow = Request::builder()
             .uri("/api/data")
             .body(Body::empty())
@@ -544,13 +552,20 @@ mod tests {
             .insert(Tenant::new("tenant_free", "tenant-free"));
 
         let res_overflow = app.clone().oneshot(req_overflow).await.unwrap();
-        assert_eq!(res_overflow.status(), StatusCode::OK);
+        assert_eq!(res_overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            res_overflow
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .unwrap(),
+            "60"
+        );
 
-        // 3. Quota count should be 0 after releases (slots recycled)
+        // 3. Quota count remains 2 until window expires
         let count = store.count("tenant_free").await.unwrap();
         assert_eq!(
-            count, 0,
-            "quota slots should be released after each response"
+            count, 2,
+            "sliding-window admissions must be retained until window expiry"
         );
 
         // 4. Pro tenant can still make requests up to pro_limit
@@ -566,5 +581,18 @@ mod tests {
         assert_eq!(res_pro.status(), StatusCode::OK);
         assert_eq!(res_pro.headers().get("x-quota-limit").unwrap(), "10");
         assert_eq!(res_pro.headers().get("x-quota-tier").unwrap(), "pro");
+
+        // 5. After the 60s window elapses, free tenant can make requests again
+        tokio::time::advance(Duration::from_secs(61)).await;
+        let mut req_after_window = Request::builder()
+            .uri("/api/data")
+            .body(Body::empty())
+            .unwrap();
+        req_after_window
+            .extensions_mut()
+            .insert(Tenant::new("tenant_free", "tenant-free"));
+
+        let res_after = app.clone().oneshot(req_after_window).await.unwrap();
+        assert_eq!(res_after.status(), StatusCode::OK);
     }
 }

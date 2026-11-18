@@ -18,12 +18,36 @@ pub trait Step<Ctx: Send + Sync + 'static>: Send + Sync {
     /// Executes the forward action of this step, mutating the shared context.
     fn execute<'a>(&'a self, ctx: &'a mut Ctx) -> SagaFuture<'a>;
 
+    /// Executes the forward action with a stable per-saga/step idempotency key.
+    ///
+    /// Implementations that perform external side effects should use `idempotency_key` to
+    /// reconcile or deduplicate retries if a post-step persistence write fails.
+    fn execute_with_key<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        _idempotency_key: &'a str,
+    ) -> SagaFuture<'a> {
+        self.execute(ctx)
+    }
+
     /// Executes the compensating action to undo changes if a subsequent step fails.
     fn compensate<'a>(&'a self, ctx: &'a mut Ctx) -> SagaFuture<'a>;
+
+    /// Executes the compensating action with a stable per-saga/step idempotency key.
+    ///
+    /// Implementations that undo external side effects should use `idempotency_key` to
+    /// reconcile or deduplicate retries if a post-compensation persistence write fails.
+    fn compensate_with_key<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        _idempotency_key: &'a str,
+    ) -> SagaFuture<'a> {
+        self.compensate(ctx)
+    }
 }
 
-type ActionFn<Ctx> = Arc<dyn for<'a> Fn(&'a mut Ctx) -> SagaFuture<'a> + Send + Sync>;
-type CompensateFn<Ctx> = Arc<dyn for<'a> Fn(&'a mut Ctx) -> SagaFuture<'a> + Send + Sync>;
+type ActionFn<Ctx> = Arc<dyn for<'a> Fn(&'a mut Ctx, &'a str) -> SagaFuture<'a> + Send + Sync>;
+type CompensateFn<Ctx> = Arc<dyn for<'a> Fn(&'a mut Ctx, &'a str) -> SagaFuture<'a> + Send + Sync>;
 
 /// A functional step defined by async closures.
 pub struct FunctionalStep<Ctx> {
@@ -49,11 +73,26 @@ impl<Ctx: Send + Sync + 'static> FunctionalStep<Ctx> {
         FutA: Future<Output = Result<(), SagaError>> + Send + 'static,
         FutC: Future<Output = Result<(), SagaError>> + Send + 'static,
     {
-        let name_str = name.into();
+        Self::with_key(
+            name,
+            move |ctx, _key| action(ctx),
+            move |ctx, _key| compensation(ctx),
+        )
+    }
+
+    /// Creates a new functional step whose action and compensation receive a stable
+    /// per-saga/step idempotency key for deduplicating retries.
+    pub fn with_key<A, C, FutA, FutC>(name: impl Into<String>, action: A, compensation: C) -> Self
+    where
+        A: Fn(&mut Ctx, String) -> FutA + Send + Sync + 'static,
+        C: Fn(&mut Ctx, String) -> FutC + Send + Sync + 'static,
+        FutA: Future<Output = Result<(), SagaError>> + Send + 'static,
+        FutC: Future<Output = Result<(), SagaError>> + Send + 'static,
+    {
         Self {
-            name: name_str,
-            action: Arc::new(move |ctx| Box::pin(action(ctx))),
-            compensation: Arc::new(move |ctx| Box::pin(compensation(ctx))),
+            name: name.into(),
+            action: Arc::new(move |ctx, key| Box::pin(action(ctx, key.to_string()))),
+            compensation: Arc::new(move |ctx, key| Box::pin(compensation(ctx, key.to_string()))),
         }
     }
 }
@@ -64,10 +103,26 @@ impl<Ctx: Send + Sync + 'static> Step<Ctx> for FunctionalStep<Ctx> {
     }
 
     fn execute<'a>(&'a self, ctx: &'a mut Ctx) -> SagaFuture<'a> {
-        (self.action)(ctx)
+        (self.action)(ctx, "")
+    }
+
+    fn execute_with_key<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        idempotency_key: &'a str,
+    ) -> SagaFuture<'a> {
+        (self.action)(ctx, idempotency_key)
     }
 
     fn compensate<'a>(&'a self, ctx: &'a mut Ctx) -> SagaFuture<'a> {
-        (self.compensation)(ctx)
+        (self.compensation)(ctx, "")
+    }
+
+    fn compensate_with_key<'a>(
+        &'a self,
+        ctx: &'a mut Ctx,
+        idempotency_key: &'a str,
+    ) -> SagaFuture<'a> {
+        (self.compensation)(ctx, idempotency_key)
     }
 }

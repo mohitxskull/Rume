@@ -198,7 +198,23 @@ pub async fn run(format: &str) {
 }
 
 async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
-    let db_url = crate::commands::db::resolve_db_url();
+    let db_url = match crate::commands::db::resolve_db_url() {
+        Ok(url) => url,
+        Err(err) => {
+            return (
+                DoctorCheck {
+                    label: "database connectivity".to_string(),
+                    status: err,
+                    ok: false,
+                },
+                DoctorCheck {
+                    label: "pending migrations".to_string(),
+                    status: "skipped due to environment configuration error".to_string(),
+                    ok: false,
+                },
+            );
+        }
+    };
     let Some(url) = db_url else {
         return (
             DoctorCheck {
@@ -399,11 +415,12 @@ fn check_module_dag() -> (String, bool) {
             Ok(content) => content,
             Err(_) => continue,
         };
-        let decl = extract_module_info(&content);
-        let Some(name) = decl.name else {
-            continue;
-        };
-        deps_map.insert(name, decl.dependencies);
+        for decl in extract_module_info(&content) {
+            let Some(name) = decl.name else {
+                continue;
+            };
+            deps_map.insert(name, decl.dependencies);
+        }
     }
 
     if deps_map.is_empty() {
@@ -479,58 +496,93 @@ struct ModuleDecl {
     dependencies: Vec<String>,
 }
 
-/// Parse `content` with `syn::parse_file` and collect the `name()` and
-/// `dependencies()` methods declared in it.
+/// Parse `content` with `syn::parse_file` and collect one [`ModuleDecl`]
+/// per `impl Module for ...` block declared in it.
 ///
 /// Why: `syn::parse_file` tokenizes the whole file, so multi-line rustfmt
 /// formatting — a `fn` signature split across lines, a string literal split
 /// across lines, or a `vec![...]` spread over several lines — is parsed
 /// correctly without a fragile hand-rolled brace-depth scanner (RC-20).
-fn extract_module_info(content: &str) -> ModuleDecl {
+fn extract_module_info(content: &str) -> Vec<ModuleDecl> {
     let Ok(file) = parse_file(content) else {
-        return ModuleDecl::default();
+        return Vec::new();
     };
 
     let mut extractor = ModuleExtractor::default();
     extractor.visit_file(&file);
-    extractor.decl
+    extractor.decls
 }
 
 /// Walks a parsed syntax tree and records the `name` and `dependencies`
-/// methods of module declarations.
+/// methods strictly within `impl Module for ...` blocks.
 ///
 /// Why: syn's `Visit` trait recurses into expressions automatically, so we
-/// only need to intercept `fn name` / `fn dependencies` bodies and collect the
-/// string literals they contain — no manual brace tracking (RC-20).
+/// track the enclosing `impl Module` context and intercept `fn name` /
+/// `fn dependencies` bodies inside it while ignoring free functions and
+/// unrelated `impl` blocks (RC-20).
 #[derive(Default)]
 struct ModuleExtractor {
-    decl: ModuleDecl,
+    decls: Vec<ModuleDecl>,
+    current_decl: Option<ModuleDecl>,
     current_fn: Option<String>,
 }
 
+fn is_module_trait_impl(node: &syn::ItemImpl) -> bool {
+    node.trait_
+        .as_ref()
+        .is_some_and(|(path, _)| path.segments.last().is_some_and(|s| s.ident == "Module"))
+}
+
 impl<'ast> Visit<'ast> for ModuleExtractor {
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        let prev_decl = self.current_decl.take();
+        let prev_fn = self.current_fn.take();
+
+        if is_module_trait_impl(node) {
+            self.current_decl = Some(ModuleDecl::default());
+            visit::visit_item_impl(self, node);
+            if let Some(decl) = self.current_decl.take() {
+                self.decls.push(decl);
+            }
+        } else {
+            visit::visit_item_impl(self, node);
+        }
+
+        self.current_decl = prev_decl;
+        self.current_fn = prev_fn;
+    }
+
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        let prev = self.current_fn.replace(node.sig.ident.to_string());
+        // Free functions (and nested `fn` items inside methods) are never
+        // `Module` trait methods; clear `current_fn` for their body.
+        let prev = self.current_fn.take();
         visit::visit_item_fn(self, node);
         self.current_fn = prev;
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        let prev = self.current_fn.replace(node.sig.ident.to_string());
+        let prev = if self.current_decl.is_some() {
+            self.current_fn.replace(node.sig.ident.to_string())
+        } else {
+            self.current_fn.take()
+        };
         visit::visit_impl_item_fn(self, node);
         self.current_fn = prev;
     }
 
     fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
+        let Some(decl) = self.current_decl.as_mut() else {
+            return;
+        };
         if let syn::Lit::Str(s) = &node.lit {
             match self.current_fn.as_deref() {
                 Some("name") => {
-                    if self.decl.name.is_none() {
-                        self.decl.name = Some(s.value());
+                    if decl.name.is_none() {
+                        decl.name = Some(s.value());
                     }
                 }
                 Some("dependencies") => {
-                    self.decl.dependencies.push(s.value());
+                    decl.dependencies.push(s.value());
                 }
                 _ => {}
             }
@@ -545,18 +597,21 @@ impl<'ast> Visit<'ast> for ModuleExtractor {
         if self.current_fn.as_deref() != Some("dependencies") {
             return;
         }
+        let Some(decl) = self.current_decl.as_mut() else {
+            return;
+        };
         let mut current: Vec<proc_macro2::TokenTree> = Vec::new();
         for tt in node.tokens.clone() {
             if let proc_macro2::TokenTree::Punct(p) = &tt
                 && p.as_char() == ','
             {
-                push_dependency_literal(&current, &mut self.decl.dependencies);
+                push_dependency_literal(&current, &mut decl.dependencies);
                 current.clear();
                 continue;
             }
             current.push(tt);
         }
-        push_dependency_literal(&current, &mut self.decl.dependencies);
+        push_dependency_literal(&current, &mut decl.dependencies);
     }
 }
 
@@ -592,9 +647,10 @@ impl Module for CatalogModule {
     }
 }
 "#;
-        let decl = extract_module_info(content);
-        assert_eq!(decl.name.as_deref(), Some("catalog"));
-        assert!(decl.dependencies.is_empty());
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("catalog"));
+        assert!(decls[0].dependencies.is_empty());
     }
 
     #[test]
@@ -617,10 +673,11 @@ impl Module for OrdersModule {
     }
 }
 "#;
-        let decl = extract_module_info(content);
-        assert_eq!(decl.name.as_deref(), Some("orders"));
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("orders"));
         assert_eq!(
-            decl.dependencies,
+            decls[0].dependencies,
             vec!["catalog".to_string(), "inventory".to_string()]
         );
     }
@@ -640,9 +697,10 @@ impl Module for ShippingModule {
     }
 }
 "##;
-        let decl = extract_module_info(content);
-        assert_eq!(decl.name.as_deref(), Some("shipping"));
-        assert!(decl.dependencies.is_empty());
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("shipping"));
+        assert!(decls[0].dependencies.is_empty());
     }
 
     #[test]
@@ -662,22 +720,100 @@ impl Module for InventoryModule {
     }
 }
 "#;
-        let decl = extract_module_info(content);
-        assert_eq!(decl.name.as_deref(), Some("inventory"));
-        assert_eq!(decl.dependencies, vec!["catalog".to_string()]);
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("inventory"));
+        assert_eq!(decls[0].dependencies, vec!["catalog".to_string()]);
+    }
+
+    #[test]
+    fn extract_module_info_multiple_impls_in_one_file() {
+        let content = r#"
+impl Module for OrdersModule {
+    fn name(&self) -> &str {
+        "orders"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["inventory"]
+    }
+}
+
+impl rume::Module for InventoryModule {
+    fn name(&self) -> &str {
+        "inventory"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["orders"]
+    }
+}
+"#;
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 2);
+        assert_eq!(decls[0].name.as_deref(), Some("orders"));
+        assert_eq!(decls[0].dependencies, vec!["inventory".to_string()]);
+        assert_eq!(decls[1].name.as_deref(), Some("inventory"));
+        assert_eq!(decls[1].dependencies, vec!["orders".to_string()]);
+    }
+
+    #[test]
+    fn extract_module_info_ignores_free_fn_name_and_unrelated_impl_dependencies() {
+        let content = r#"
+fn name() -> &'static str {
+    "orders"
+}
+
+struct Helper;
+
+impl Helper {
+    fn name(&self) -> &str {
+        "orders"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["orders"]
+    }
+}
+
+impl SomeOtherTrait for Helper {
+    fn name(&self) -> &str {
+        "other"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["other"]
+    }
+}
+
+impl Module for BillingModule {
+    fn name(&self) -> &str {
+        fn name() -> &'static str {
+            "nested_fake"
+        }
+        "billing"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["orders"]
+    }
+}
+"#;
+        let decls = extract_module_info(content);
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("billing"));
+        assert_eq!(decls[0].dependencies, vec!["orders".to_string()]);
     }
 
     #[test]
     fn extract_module_info_empty_input() {
-        let decl = extract_module_info("");
-        assert!(decl.name.is_none());
-        assert!(decl.dependencies.is_empty());
+        let decls = extract_module_info("");
+        assert!(decls.is_empty());
     }
 
     #[test]
     fn extract_module_info_unparseable_input() {
-        let decl = extract_module_info("this is not rust {{{");
-        assert!(decl.name.is_none());
-        assert!(decl.dependencies.is_empty());
+        let decls = extract_module_info("this is not rust {{{");
+        assert!(decls.is_empty());
     }
 }

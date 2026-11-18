@@ -39,6 +39,51 @@ fn escape_lua_replacement(s: &str) -> String {
     s.replace('%', "%%")
 }
 
+const REGENERATE_ID_SCRIPT: &str = r#"
+    local old_key = KEYS[1]
+    local new_key = KEYS[2]
+    local old_id_pat = ARGV[1]
+    local new_id_rep = ARGV[2]
+    local now = tonumber(ARGV[3])
+
+    local data = redis.call('GET', old_key)
+    if not data then
+        return nil
+    end
+
+    local exp_str = string.match(data, '"expires_at":%s*(%d+)')
+    if exp_str and tonumber(exp_str) <= now then
+        redis.call('DEL', old_key)
+        return redis.error_reply("EXPIRED")
+    end
+
+    -- Replace "id":"<old_id>" with "id":"<new_id>" using plain
+    -- string search (not pattern matching) to avoid Lua pattern
+    -- magic characters in UUIDs (e.g. hyphens).
+    local start, stop = string.find(data, '"id":"' .. old_id_pat .. '"', 1, true)
+    local updated
+    if start then
+        updated = string.sub(data, 1, start - 1)
+            .. '"id":"' .. new_id_rep .. '"'
+            .. string.sub(data, stop + 1)
+    else
+        -- Fallback: try with optional whitespace after colon
+        local target = '"id":%s*"' .. old_id_pat .. '"'
+        local replacement = '"id":"' .. new_id_rep .. '"'
+        local _sub_count
+        updated, _sub_count = string.gsub(data, target, replacement, 1)
+    end
+
+    local ttl = redis.call('PTTL', old_key)
+    if ttl > 0 then
+        redis.call('SET', new_key, updated, 'PX', ttl)
+    else
+        redis.call('SET', new_key, updated)
+    end
+    redis.call('DEL', old_key)
+    return updated
+"#;
+
 /// Redis-backed implementation of [`SessionStore`].
 ///
 /// Stores JSON-serialized sessions with Redis TTL auto-expiration matching [`Session::expires_at`].
@@ -173,58 +218,15 @@ impl SessionStore for RedisSessionStore {
 
             let now = current_timestamp();
 
-            let script = r#"
-                local old_key = KEYS[1]
-                local new_key = KEYS[2]
-                local old_id_pat = ARGV[1]
-                local new_id_rep = ARGV[2]
-                local now = tonumber(ARGV[3])
-
-                local data = redis.call('GET', old_key)
-                if not data then
-                    return nil
-                end
-
-                local exp_str = string.match(data, '"expires_at":%s*(%d+)')
-                if exp_str and tonumber(exp_str) <= now then
-                    redis.call('DEL', old_key)
-                    return redis.error_reply("EXPIRED")
-                end
-
-                -- Replace "id":"<old_id>" with "id":"<new_id>" using plain
-                -- string search (not pattern matching) to avoid Lua pattern
-                -- magic characters in UUIDs (e.g. hyphens).
-                local start, stop = string.find(data, '"id":"' .. old_id_pat .. '"', 1, true)
-                local updated
-                if start then
-                    updated = string.sub(data, 1, start - 1)
-                        .. '"id":"' .. new_id_rep .. '"'
-                        .. string.sub(data, stop + 1)
-                else
-                    -- Fallback: try with optional whitespace after colon
-                    local target = '"id":%s*"' .. old_id_pat .. '"'
-                    local replacement = '"id":"' .. new_id_rep .. '"'
-                    updated, _ = string.gsub(data, target, replacement, 1)
-                end
-
-                local ttl = redis.call('PTTL', old_key)
-                if ttl > 0 then
-                    redis.call('SET', new_key, updated, 'PX', ttl)
-                else
-                    redis.call('SET', new_key, updated)
-                end
-                redis.call('DEL', old_key)
-                return updated
-                "#;
-
-            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(script)
-                .key(&old_key)
-                .key(&new_key)
-                .arg(&old_id_pat)
-                .arg(&new_id_rep)
-                .arg(now)
-                .invoke_async(&mut *conn)
-                .await;
+            let res: Result<Option<Vec<u8>>, redis::RedisError> =
+                redis::Script::new(REGENERATE_ID_SCRIPT)
+                    .key(&old_key)
+                    .key(&new_key)
+                    .arg(&old_id_pat)
+                    .arg(&new_id_rep)
+                    .arg(now)
+                    .invoke_async(&mut *conn)
+                    .await;
 
             let data = match res {
                 Ok(opt) => opt,
@@ -243,5 +245,32 @@ impl SessionStore for RedisSessionStore {
 
             Ok(session)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_regenerate_id_script_binds_gsub_count_locally() {
+        assert!(
+            !REGENERATE_ID_SCRIPT.contains("updated, _ ="),
+            "Lua script must not assign string.gsub count to global `_`"
+        );
+        assert!(
+            REGENERATE_ID_SCRIPT.contains("local _sub_count"),
+            "Lua script must declare local _sub_count before string.gsub"
+        );
+    }
+
+    #[test]
+    fn test_escape_lua_pattern_and_replacement_uuid() {
+        let uuid = "550e8400-e29b-41d4-a716-446655440000";
+        assert_eq!(
+            escape_lua_pattern(uuid),
+            "550e8400%-e29b%-41d4%-a716%-446655440000"
+        );
+        assert_eq!(escape_lua_replacement("abc%1def"), "abc%%1def");
     }
 }

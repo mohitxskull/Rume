@@ -90,8 +90,20 @@ impl CsrfConfig {
     }
 
     /// Sets an HMAC secret key for token signing and validation, preventing subdomain cookie tossing.
+    ///
+    /// Deployments must supply a high-entropy shared key; use [`CsrfConfig::with_random_secret`]
+    /// as an explicit alternative for single-instance setups.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `secret` is empty.
     pub fn with_secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
-        self.secret = Some(secret.into());
+        let secret = secret.into();
+        assert!(
+            !secret.is_empty(),
+            "CSRF HMAC secret must not be empty; supply a high-entropy shared key or use with_random_secret()"
+        );
+        self.secret = Some(secret);
         self
     }
 
@@ -173,6 +185,9 @@ impl CsrfConfig {
         let Some(secret) = &self.secret else {
             return self.allow_unauthenticated && !token.is_empty();
         };
+        if secret.is_empty() {
+            return false;
+        }
 
         let Some((raw, sig_hex)) = token.split_once('.') else {
             return false;
@@ -220,10 +235,14 @@ pub struct CsrfLayer {
 impl CsrfLayer {
     /// Creates a CSRF protection layer with an explicit HMAC secret.
     ///
-    /// The secret must be shared across all instances in a multi-instance
-    /// deployment, otherwise CSRF validation will fail ~50% of the time
-    /// behind a load balancer (each instance would generate its own secret
-    /// if `new()` auto-generated one).
+    /// Deployments must supply a high-entropy shared key across all instances
+    /// in a multi-instance deployment, otherwise CSRF validation will fail ~50%
+    /// of the time behind a load balancer. Use [`CsrfLayer::with_random_secret`]
+    /// as the explicit single-instance alternative.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `secret` is empty.
     pub fn new(secret: impl AsRef<[u8]>) -> Self {
         Self::with_config(CsrfConfig::default().with_secret(secret.as_ref().to_vec()))
     }
@@ -237,7 +256,15 @@ impl CsrfLayer {
     }
 
     /// Creates a CSRF protection layer with custom configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `config.secret` is `Some` with an empty byte slice.
     pub fn with_config(config: CsrfConfig) -> Self {
+        assert!(
+            !matches!(config.secret.as_deref(), Some([])),
+            "CSRF HMAC secret must not be empty; supply a high-entropy shared key or use CsrfLayer::with_random_secret()"
+        );
         if config.secret.is_none() && !config.allow_unauthenticated {
             tracing::warn!(
                 "CsrfLayer initialized without HMAC secret or allow_unauthenticated; CSRF token verification will fail closed"
@@ -419,5 +446,47 @@ where
 
             inner.call(req).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "CSRF HMAC secret must not be empty")]
+    fn test_csrf_layer_new_rejects_empty_secret() {
+        let _ = CsrfLayer::new(b"");
+    }
+
+    #[test]
+    #[should_panic(expected = "CSRF HMAC secret must not be empty")]
+    fn test_csrf_config_with_secret_rejects_empty_secret() {
+        let _ = CsrfConfig::default().with_secret(Vec::new());
+    }
+
+    #[test]
+    #[should_panic(expected = "CSRF HMAC secret must not be empty")]
+    fn test_csrf_layer_with_config_rejects_empty_secret() {
+        let config = CsrfConfig {
+            secret: Some(Vec::new()),
+            ..Default::default()
+        };
+        let _ = CsrfLayer::with_config(config);
+    }
+
+    #[test]
+    fn test_csrf_with_random_secret_and_explicit_secret_sign_and_verify() {
+        let config =
+            CsrfConfig::default().with_secret(b"high-entropy-shared-secret-key!!".to_vec());
+        let token = config.generate_token();
+        assert!(config.verify_token(&token));
+
+        let _layer = CsrfLayer::with_random_secret();
+        let empty_struct = CsrfConfig {
+            secret: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(!empty_struct.verify_token("anything.deadbeef"));
     }
 }

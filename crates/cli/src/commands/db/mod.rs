@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use comfy_table::Color;
 use console::style;
@@ -157,34 +157,215 @@ struct DatabaseSection {
     url: Option<String>,
 }
 
-pub(crate) fn resolve_db_url() -> Option<String> {
+pub(crate) fn resolve_db_url() -> Result<Option<String>, String> {
     resolve_db_url_in(Path::new("."))
 }
 
-pub(crate) fn resolve_db_url_in(dir: &Path) -> Option<String> {
-    // Why: route URL resolution through Rume's env/config engines instead of
-    // raw `dotenvy::dotenv()` + `toml::Value` parsing so `.env.{env}` layering,
-    // `${VAR}` interpolation, `file:` secrets, and `config/app.{env,local}.toml`
-    // overrides share a single source of truth with application boot.
-    let env_url = match rume::env::ResolvedEnv::load_in(dir) {
-        Ok(resolved) => resolved.get("DATABASE_URL").map(str::to_string),
-        Err(_) => std::env::var("DATABASE_URL").ok(),
-    };
-    if let Some(url) = env_url {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
+pub(crate) fn resolve_db_url_in(dir: &Path) -> Result<Option<String>, String> {
+    let env_name = rume::env::resolve_env_name();
+    resolve_db_url_for_env_in(dir, &env_name)
+}
+
+pub(crate) fn resolve_db_url_for_env_in(
+    dir: &Path,
+    env_name: &str,
+) -> Result<Option<String>, String> {
+    // Why: parse `.env` files raw (without `dotenvy`'s eager per-file `${VAR}`
+    // expansion) and run `rume::env::interpolate_value` only after all `.env*`
+    // layers and process env are merged, so overrides in `.env.{env}` /
+    // `.env.local` drive `${VAR}` expansion inside `DATABASE_URL`.
+    // Also fail closed on any `.env` load/parse/interpolation error instead of
+    // silently falling back to `config/app*.toml`.
+    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+
+    for path in dotenv_candidates(dir, env_name) {
+        if !path.is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(&path)
+            .map_err(|e| format!("failed to read environment file {}: {e}", path.display()))?;
+        for (key, raw_value) in parse_dotenv(&content, &path)? {
+            let value = resolve_file_value(raw_value, dir, &path)?;
+            merged.insert(key, value);
         }
     }
 
-    let cfg = rume::config::load_in::<DatabaseFileConfig>(dir).ok()?;
-    let url = cfg.database?.url?;
+    for (key, value) in std::env::vars() {
+        merged.insert(key, value);
+    }
+
+    if let Some(raw_url) = merged.get("DATABASE_URL") {
+        let resolved = rume::env::interpolate_value(raw_url, &merged)
+            .map_err(|e| format!("failed to resolve DATABASE_URL: {e}"))?;
+        let trimmed = resolved.trim();
+        if !trimmed.is_empty() {
+            return Ok(Some(trimmed.to_string()));
+        }
+    }
+
+    let Some(cfg) = rume::config::load_in::<DatabaseFileConfig>(dir).ok() else {
+        return Ok(None);
+    };
+    let Some(url) = cfg.database.and_then(|d| d.url) else {
+        return Ok(None);
+    };
     let trimmed = url.trim();
     if !trimmed.is_empty() {
-        Some(trimmed.to_string())
+        Ok(Some(trimmed.to_string()))
     } else {
-        None
+        Ok(None)
     }
+}
+
+fn dotenv_candidates(dir: &Path, env_name: &str) -> Vec<PathBuf> {
+    let is_test = env_name == "test" || env_name == "testing";
+    let mut candidates = vec![dir.join(".env"), dir.join(format!(".env.{env_name}"))];
+    if !is_test {
+        candidates.push(dir.join(".env.local"));
+    }
+    candidates.push(dir.join(format!(".env.{env_name}.local")));
+    candidates
+}
+
+fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>, String> {
+    let mut entries = Vec::new();
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let after_export = trimmed
+            .strip_prefix("export ")
+            .or_else(|| trimmed.strip_prefix("export\t"))
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+
+        let Some((raw_key, raw_val)) = after_export.split_once('=') else {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: missing '='",
+                path.display()
+            ));
+        };
+
+        let key = raw_key.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: invalid variable name",
+                path.display()
+            ));
+        }
+
+        let value = parse_dotenv_value(raw_val, path, line_no)?;
+        entries.push((key.to_string(), value));
+    }
+    Ok(entries)
+}
+
+fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<String, String> {
+    let val = raw_val.trim_start();
+    if let Some(rest) = val.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                '\\' => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => break,
+                },
+                other => out.push(other),
+            }
+        }
+        if !closed {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: unclosed double quote",
+                path.display()
+            ));
+        }
+        let trailing = chars.as_str().trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: unexpected trailing characters",
+                path.display()
+            ));
+        }
+        Ok(out)
+    } else if let Some(rest) = val.strip_prefix('\'') {
+        let Some((inner, trailing)) = rest.split_once('\'') else {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: unclosed single quote",
+                path.display()
+            ));
+        };
+        let trailing = trailing.trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(format!(
+                "failed to parse environment file {} at line {line_no}: unexpected trailing characters",
+                path.display()
+            ));
+        }
+        Ok(inner.to_string())
+    } else {
+        // Strip inline `# comment` only when preceded by whitespace.
+        let mut end = val.len();
+        let mut prev_ws = false;
+        for (i, ch) in val.char_indices() {
+            if ch == '#' && prev_ws {
+                end = i;
+                break;
+            }
+            prev_ws = ch.is_whitespace();
+        }
+        Ok(val[..end].trim_end().to_string())
+    }
+}
+
+fn resolve_file_value(value: String, dir: &Path, source_path: &Path) -> Result<String, String> {
+    if let Some(rest) = value.strip_prefix("file\\:") {
+        return Ok(format!("file:{rest}"));
+    }
+    let Some(rel_or_abs) = value.strip_prefix("file:") else {
+        return Ok(value);
+    };
+
+    let full = if Path::new(rel_or_abs).is_absolute() {
+        PathBuf::from(rel_or_abs)
+    } else {
+        dir.join(rel_or_abs)
+    };
+    let canonical_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let canonical_full = fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
+    if !canonical_full.starts_with(&canonical_dir) {
+        return Err(format!(
+            "failed to resolve file: reference in {}: path escapes workspace directory",
+            source_path.display()
+        ));
+    }
+
+    let contents = fs::read_to_string(&full).map_err(|e| {
+        format!(
+            "failed to read file: reference in {}: {e}",
+            source_path.display()
+        )
+    })?;
+    Ok(contents
+        .trim_end_matches('\n')
+        .trim_end_matches('\r')
+        .to_string())
 }
 
 pub(crate) enum BackendHandle {
@@ -215,7 +396,13 @@ pub(crate) async fn connect_backend(url: &str) -> Result<(BackendHandle, &'stati
 }
 
 pub async fn status() {
-    let db_url = resolve_db_url();
+    let db_url = match resolve_db_url() {
+        Ok(url) => url,
+        Err(err) => {
+            eprintln!("{}", style(format!("error: {err}")).red());
+            std::process::exit(1);
+        }
+    };
     let local_migrator = discover_local_migrations();
 
     let mut builder = TableBuilder::new();
@@ -305,9 +492,13 @@ pub async fn status() {
 
 pub async fn migrate() {
     let db_url = match resolve_db_url() {
-        Some(url) => url,
-        None => {
+        Ok(Some(url)) => url,
+        Ok(None) => {
             eprintln!("{}", style("error: DATABASE_URL is not set and database.url was not found in config/app.toml").red());
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("{}", style(format!("error: {err}")).red());
             std::process::exit(1);
         }
     };
@@ -359,9 +550,13 @@ pub async fn migrate() {
 
 pub async fn rollback() {
     let db_url = match resolve_db_url() {
-        Some(url) => url,
-        None => {
+        Ok(Some(url)) => url,
+        Ok(None) => {
             eprintln!("{}", style("error: DATABASE_URL is not set and database.url was not found in config/app.toml").red());
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("{}", style(format!("error: {err}")).red());
             std::process::exit(1);
         }
     };
@@ -398,7 +593,7 @@ pub async fn rollback() {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendHandle, connect_backend, resolve_db_url_in};
+    use super::{BackendHandle, connect_backend, resolve_db_url_for_env_in, resolve_db_url_in};
 
     #[tokio::test]
     async fn connect_backend_routes_mariadb_to_mysql() {
@@ -434,8 +629,8 @@ mod tests {
     fn resolve_db_url_uses_env_interpolation_and_config_layering() {
         let dir = tempfile::tempdir().unwrap();
 
-        // Neither .env nor config/app.toml present -> None
-        assert_eq!(resolve_db_url_in(dir.path()), None);
+        // Neither .env nor config/app.toml present -> Ok(None)
+        assert_eq!(resolve_db_url_in(dir.path()), Ok(None));
 
         // config/app.toml + config/app.local.toml override
         std::fs::create_dir_all(dir.path().join("config")).unwrap();
@@ -451,14 +646,14 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolve_db_url_in(dir.path()),
-            Some("mariadb://local:3306/app".to_string())
+            Ok(Some("mariadb://local:3306/app".to_string()))
         );
 
         // Empty DATABASE_URL in .env falls through to config/app*.toml
         std::fs::write(dir.path().join(".env"), "DATABASE_URL=   \n").unwrap();
         assert_eq!(
             resolve_db_url_in(dir.path()),
-            Some("mariadb://local:3306/app".to_string())
+            Ok(Some("mariadb://local:3306/app".to_string()))
         );
 
         // .env with ${VAR} interpolation takes precedence over config/app*.toml
@@ -469,7 +664,55 @@ mod tests {
         .unwrap();
         assert_eq!(
             resolve_db_url_in(dir.path()),
-            Some("postgres://app:secret@db.internal:5432/rume".to_string())
+            Ok(Some(
+                "postgres://app:secret@db.internal:5432/rume".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_db_url_expands_interpolation_after_merging_env_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "DB_HOST=dev.example\nDATABASE_URL=postgres://app:secret@${DB_HOST}:5432/rume\n",
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(".env.production"), "DB_HOST=prod.example\n").unwrap();
+
+        assert_eq!(
+            resolve_db_url_for_env_in(dir.path(), "production"),
+            Ok(Some(
+                "postgres://app:secret@prod.example:5432/rume".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_db_url_fails_closed_on_dotenv_error_without_toml_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/app.toml"),
+            "[database]\nurl = \"sqlite://dev.db\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "DATABASE_URL=postgres://prod:super-secret-pw@prod.example:5432/rume\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".env.production"),
+            "SECRET_TOKEN=\"unclosed-secret-value\n",
+        )
+        .unwrap();
+
+        let err = resolve_db_url_for_env_in(dir.path(), "production")
+            .expect_err("malformed .env.production must fail closed instead of falling back");
+        assert!(
+            !err.contains("unclosed-secret-value") && !err.contains("super-secret-pw"),
+            "error must not leak secret values: {err}"
         );
     }
 }

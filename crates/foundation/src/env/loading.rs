@@ -110,40 +110,95 @@ where
         .values()
         .map(|s| s.expose_secret().as_str())
         .collect();
+    let secret_keys: BTreeSet<String> = resolved.secrets.keys().cloned().collect();
 
-    for (key, value) in resolved.values {
-        // Why: preserve the raw string as `Value::String` instead of calling
-        // `FromStr` (`parse::<Value>()`), which coerces "001234" -> 123
-        // (drops leading zeros), "true" -> Bool, and "8080" -> Num. A coerced
-        // Num/Bool cannot be deserialized into a `String`/`SecretString`
-        // field, so typed extraction would fail. Figment's serde extraction
-        // still coerces on demand when the target type requests it
-        // ("8080" -> u16, "true" -> bool), so coercion is not lost — only
-        // deferred to the consumption point.
-        let value = figment::value::Value::from(value.as_str());
-        parsed.insert(key.to_ascii_lowercase(), value.clone());
-        parsed.insert(key, value);
+    // Why: insert all exact keys before any lowercase aliases so an uppercase
+    // key (e.g. `DATABASE_URL` in `secrets`) can never overwrite an explicit
+    // lowercase key (e.g. `database_url` in `values`).
+    for (key, value) in &resolved.values {
+        parsed.insert(key.clone(), figment::value::Value::from(value.as_str()));
     }
     for (key, secret) in &resolved.secrets {
-        // Why: same raw-string preservation as plain values above, so secret
-        // values extract into `SecretBox<String>` / `String` fields without
-        // spurious type errors, while still coercing to `u16`/`bool` when the
-        // target type requests it.
-        let value = figment::value::Value::from(secret.expose_secret().as_str());
-        parsed.insert(key.to_ascii_lowercase(), value.clone());
-        parsed.insert(key.clone(), value);
+        parsed.insert(
+            key.clone(),
+            figment::value::Value::from(secret.expose_secret().as_str()),
+        );
+    }
+    for (key, value) in &resolved.values {
+        parsed
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| figment::value::Value::from(value.as_str()));
+    }
+    for (key, secret) in &resolved.secrets {
+        parsed
+            .entry(key.to_ascii_lowercase())
+            .or_insert_with(|| figment::value::Value::from(secret.expose_secret().as_str()));
     }
 
-    let figment = Figment::from(Serialized::defaults(parsed));
     // Why: `extract_lossy` uses figment's `LossyInterpreter`, which coerces a
     // raw `Value::String` into `bool`/`u16`/`usize`/etc. at extraction time
-    // ("true" -> true, "8080" -> 8080) when the target type requests it, while
-    // leaving `String`/`SecretString` targets as the literal string ("001234"
-    // keeps its leading zeros). This defers coercion to the consumption point
-    // instead of forcing it at the boundary via `parse::<Value>()`.
+    // ("true" -> true, "8080" -> 8080) while keeping `String`/`SecretBox<String>`
+    // targets as the literal string ("001234" keeps its leading zeros).
+    //
+    // `LossyInterpreter` does not parse structured strings into sequences/maps,
+    // so if extraction fails because a target requested a sequence/map/struct/tuple
+    // for a `Value::String` key, parse just that key as a structured `Value`
+    // (`Array`/`Dict`) and retry. Keeping `Value::String` as the default
+    // ensures `String` fields still receive literal text (including "[a,b]").
+    let max_upgrades = parsed.len();
+    for _ in 0..=max_upgrades {
+        let figment = Figment::from(Serialized::defaults(&parsed));
+        match figment.extract_lossy::<T>() {
+            Ok(value) => return Ok(value),
+            Err(err) => {
+                if !upgrade_structured_fields(&err, &mut parsed) {
+                    return Err(EnvError::from_figment_with_secrets(
+                        err,
+                        &known_secrets,
+                        &secret_keys,
+                    ));
+                }
+            }
+        }
+    }
+
+    let figment = Figment::from(Serialized::defaults(&parsed));
     figment
         .extract_lossy::<T>()
-        .map_err(|err| EnvError::from_figment_with_secrets(&err, &known_secrets))
+        .map_err(|err| EnvError::from_figment_with_secrets(err, &known_secrets, &secret_keys))
+}
+
+fn expects_structured_target(expected: &str) -> bool {
+    expected == "a sequence"
+        || expected == "a map"
+        || expected.starts_with("a tuple")
+        || expected.starts_with("struct ")
+}
+
+fn upgrade_structured_fields(
+    err: &figment::Error,
+    parsed: &mut BTreeMap<String, figment::value::Value>,
+) -> bool {
+    use figment::error::{Actual, Kind};
+    use figment::value::Value;
+
+    let mut upgraded = false;
+    for sub_err in err.clone() {
+        let Kind::InvalidType(Actual::Str(_), ref expected) = sub_err.kind else {
+            continue;
+        };
+        if !expects_structured_target(expected) || sub_err.path.len() != 1 {
+            continue;
+        }
+        let key = &sub_err.path[0];
+        if let Some(Value::String(_, raw)) = parsed.get(key)
+            && let Ok(structured @ (Value::Array(..) | Value::Dict(..))) = raw.parse::<Value>()
+        {
+            parsed.insert(key.clone(), structured);
+            upgraded = true;
+        }
+    }
+    upgraded
 }
 
 /// Load the merged environment map for the current directory.
@@ -497,5 +552,119 @@ mod tests {
         assert_eq!(typed.pin, "001234");
         assert_eq!(typed.port, 8080);
         assert!(typed.flag);
+    }
+
+    #[test]
+    fn typed_collections_load_while_strings_stay_literal() {
+        let mut resolved = ResolvedEnv::default();
+        resolved
+            .values
+            .insert("PORTS".to_string(), "[8080,8081]".to_string());
+        resolved.values.insert(
+            "LABELS".to_string(),
+            "{env=\"prod\",tier=\"web\"}".to_string(),
+        );
+        resolved
+            .values
+            .insert("RAW_LIST".to_string(), "[8080,8081]".to_string());
+        resolved
+            .values
+            .insert("PIN".to_string(), "001234".to_string());
+
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        struct Typed {
+            ports: Vec<u16>,
+            labels: BTreeMap<String, String>,
+            raw_list: String,
+            pin: String,
+        }
+
+        let typed: Typed = load_from_resolved(resolved).unwrap();
+        assert_eq!(typed.ports, vec![8080, 8081]);
+        assert_eq!(typed.labels.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(typed.labels.get("tier").map(String::as_str), Some("web"));
+        assert_eq!(typed.raw_list, "[8080,8081]");
+        assert_eq!(typed.pin, "001234");
+    }
+
+    #[test]
+    fn secret_type_error_redacts_quoted_list_without_leaking() {
+        let mut resolved = ResolvedEnv::default();
+        resolved.secrets.insert(
+            "API_SECRET".to_string(),
+            SecretBox::new(Box::new(
+                "[\"top-secret-alpha\",\"top-secret-beta\"]".to_string(),
+            )),
+        );
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        struct BadSecret {
+            #[allow(dead_code)]
+            api_secret: u32,
+        }
+
+        let err = load_from_resolved::<BadSecret>(resolved).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("top-secret-alpha"),
+            "error leaked first secret element: {msg}"
+        );
+        assert!(
+            !msg.contains("top-secret-beta"),
+            "error leaked second secret element: {msg}"
+        );
+        assert!(
+            msg.contains("[redacted]"),
+            "error should contain [redacted]: {msg}"
+        );
+
+        // Non-secret diagnostic text must be preserved.
+        let mut non_secret_resolved = ResolvedEnv::default();
+        non_secret_resolved
+            .values
+            .insert("PORT".to_string(), "bad-port".to_string());
+
+        #[derive(Debug, serde::Deserialize)]
+        #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+        struct BadPort {
+            #[allow(dead_code)]
+            port: u16,
+        }
+
+        let err = load_from_resolved::<BadPort>(non_secret_resolved).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("bad-port"),
+            "non-secret diagnostic value should be preserved: {msg}"
+        );
+    }
+
+    #[test]
+    fn secret_alias_does_not_overwrite_exact_lowercase_key() {
+        let mut resolved = ResolvedEnv::default();
+        resolved.values.insert(
+            "database_url".to_string(),
+            "postgres://localhost/dev_db".to_string(),
+        );
+        resolved.secrets.insert(
+            "DATABASE_URL".to_string(),
+            SecretBox::new(Box::new("postgres://user:pass@prod/db".to_string())),
+        );
+        resolved.secrets.insert(
+            "API_TOKEN".to_string(),
+            SecretBox::new(Box::new("tok-123".to_string())),
+        );
+
+        #[derive(serde::Deserialize)]
+        struct Typed {
+            database_url: String,
+            api_token: SecretBox<String>,
+        }
+
+        let typed: Typed = load_from_resolved(resolved).unwrap();
+        assert_eq!(typed.database_url, "postgres://localhost/dev_db");
+        assert_eq!(typed.api_token.expose_secret(), "tok-123");
     }
 }

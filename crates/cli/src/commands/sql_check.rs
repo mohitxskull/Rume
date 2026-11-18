@@ -46,11 +46,19 @@ pub async fn run(
     files.sort();
 
     let mut db_handle = None;
-    if db_dry_run
-        && let Some(url) = crate::commands::db::resolve_db_url()
-        && let Ok((handle, dialect)) = crate::commands::db::connect_backend(&url).await
-    {
-        db_handle = Some((handle, dialect));
+    if db_dry_run {
+        match crate::commands::db::resolve_db_url() {
+            Ok(Some(url)) => {
+                if let Ok((handle, dialect)) = crate::commands::db::connect_backend(&url).await {
+                    db_handle = Some((handle, dialect));
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                eprintln!("{}", style(format!("error: {err}")).red());
+                std::process::exit(1);
+            }
+        }
     }
 
     let mut statuses = Vec::with_capacity(files.len());
@@ -233,25 +241,50 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
         _ => Box::new(GenericDialect {}), // Why: permissive fallback when the dialect is unknown
     };
 
-    // Dialect-aware placeholder validation. We tokenize with GenericDialect so that both `?` and
-    // `$N` surface as `Token::Placeholder` in every dialect (the dialect-specific lexers can map
-    // bare `?` to a non-placeholder token, e.g. PostgreSQL maps `?` to the jsonb `?` operator).
-    // Comments are emitted as `Token::Whitespace`, so `?`/`$1` inside `--`/`#`/`/* */` is never
-    // seen here and cannot be falsely flagged.
+    // Dialect-aware placeholder validation using the resolved dialect's lexer so
+    // dialect-specific quoting (e.g. MySQL `\'`) and comment syntax (e.g. MySQL `#`)
+    // are respected.
     // Why: placeholder validation runs before parsing so a dialect-mismatched placeholder surfaces
     // as a placeholder error rather than a parse error.
-    let tokens = Tokenizer::new(&GenericDialect {}, &content)
+    let tokens = Tokenizer::new(dialect.as_ref(), &content)
         .tokenize()
         .map_err(|e| format!("tokenizer error: {e}"))?;
     validate_placeholders(&tokens, effective_dialect)?;
 
     // Comment-aware scanning + syntax validation: `sqlparser-rs` tokenizes and parses the SQL.
-    // Comments (`--`, `#`, `/* */`) are emitted as `Token::Whitespace` variants, never as
-    // significant tokens, so they are inherently skipped during validation.
-    // Why: this replaces the old hand-rolled `content.chars()` quote/comment scanner with a
-    // battle-tested, dialect-aware lexer/parser.
-    let statements = Parser::parse_sql(dialect.as_ref(), &content)
-        .map_err(|e| format!("SQL syntax error: {e}"))?;
+    // Why: sqlparser 0.53.0's `MySqlDialect::parse_infix` calls `.unwrap()` on `parse_expr()` for
+    // `DIV` (e.g. `SELECT 1 DIV ;`), so we guard `Parser::parse_sql` with `catch_unwind` to turn
+    // any parser panic into a diagnostic error rather than aborting `sql:check`.
+    let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        Parser::parse_sql(dialect.as_ref(), &content)
+    }));
+    let statements = match parse_result {
+        Ok(Ok(stmts)) => stmts,
+        Ok(Err(e)) => {
+            let msg = e.to_string();
+            // Why: PostgreSqlDialect tokenizes bare `?` as `Token::Question` (the JSONB operator)
+            // rather than `Token::Placeholder`. When `parse_sql` succeeds, `?` was a valid infix
+            // JSONB operator; when it fails specifically at `found: ?`, it was a `?` placeholder.
+            if effective_dialect == Some("postgres")
+                && tokens.iter().any(|t| matches!(t, Token::Question))
+                && msg.contains("found: ?")
+            {
+                return Err(
+                    "PostgreSQL query uses '?' parameter placeholder instead of '$1, $2, ...'"
+                        .to_string(),
+                );
+            }
+            return Err(format!("SQL syntax error: {msg}"));
+        }
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<&str>()
+                .copied()
+                .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                .unwrap_or("internal parser panic on malformed SQL");
+            return Err(format!("SQL syntax error: {detail}"));
+        }
+    };
 
     // A file that holds only comments (or nothing) yields no statements.
     // Why: the old code stripped comments by hand to detect emptiness; sqlparser gives us this
@@ -266,22 +299,42 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
 /// Enforce the per-dialect placeholder rule over already-tokenized SQL.
 fn validate_placeholders(tokens: &[Token], dialect: Option<&str>) -> Result<(), String> {
     for token in tokens {
-        if let Token::Placeholder(value) = token {
-            let is_dollar_style = value.starts_with('$');
-            match dialect {
-                Some("postgres") if !is_dollar_style => {
-                    return Err(
-                        "PostgreSQL query uses '?' parameter placeholder instead of '$1, $2, ...'"
-                            .to_string(),
-                    );
+        match token {
+            Token::Placeholder(value) => {
+                let is_dollar_style = value.starts_with('$');
+                match dialect {
+                    Some("postgres") if !is_dollar_style => {
+                        return Err(
+                            "PostgreSQL query uses '?' parameter placeholder instead of '$1, $2, ...'"
+                                .to_string(),
+                        );
+                    }
+                    Some(dialect_name @ "sqlite") | Some(dialect_name @ "mysql")
+                        if is_dollar_style =>
+                    {
+                        return Err(format!(
+                            "{dialect_name} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
+                        ));
+                    }
+                    _ => {}
                 }
-                Some(dialect_name @ "sqlite") | Some(dialect_name @ "mysql") if is_dollar_style => {
-                    return Err(format!(
-                        "{dialect_name} query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
-                    ));
-                }
-                _ => {}
             }
+            // Why: MySqlDialect treats `$` as `is_identifier_start`, so `$1` tokenizes as an
+            // unquoted `Token::Word` rather than `Token::Placeholder`. Reject unquoted `$N`
+            // tokens in MySQL so PostgreSQL-style parameters are still caught.
+            Token::Word(word)
+                if dialect == Some("mysql")
+                    && word.quote_style.is_none()
+                    && word.value.starts_with('$')
+                    && word.value.len() > 1
+                    && word.value[1..].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                return Err(
+                    "mysql query uses PostgreSQL-style '$N' parameter placeholder instead of '?'"
+                        .to_string(),
+                );
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -368,10 +421,37 @@ mod tests {
 
     #[test]
     fn sql_check_ignores_placeholder_in_hash_comment() {
-        // `?` inside a `#` comment must not be flagged for mysql (which supports `#` comments and
-        // expects `?` placeholders).
-        let temp = write_temp("# WHERE id = ?\nSELECT * FROM users;");
+        // `$1` inside a `#` comment must not be flagged for mysql (which supports `#` comments and
+        // rejects `$1` placeholders).
+        let temp = write_temp("# WHERE id = $1\nSELECT * FROM users;");
         assert!(validate_sql_file(temp.path(), Some("mysql")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_accepts_mysql_escaped_single_quote() {
+        let temp = write_temp("SELECT 'it\\'s ready';");
+        assert!(validate_sql_file(temp.path(), Some("mysql")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_accepts_postgres_jsonb_question_operators() {
+        let q = write_temp("SELECT payload ? 'active' FROM events;");
+        assert!(validate_sql_file(q.path(), Some("postgres")).is_ok());
+
+        let q_pipe = write_temp("SELECT payload ?| array['a', 'b'] FROM events;");
+        assert!(validate_sql_file(q_pipe.path(), Some("postgres")).is_ok());
+
+        let q_and = write_temp("SELECT payload ?& array['a', 'b'] FROM events;");
+        assert!(validate_sql_file(q_and.path(), Some("postgres")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_rejects_malformed_mysql_div_without_panicking() {
+        let malformed = write_temp("SELECT 1 DIV ;");
+        assert!(validate_sql_file(malformed.path(), Some("mysql")).is_err());
+
+        let valid = write_temp("SELECT 10 DIV 2;");
+        assert!(validate_sql_file(valid.path(), Some("mysql")).is_ok());
     }
 
     #[test]

@@ -45,6 +45,16 @@ impl LockGuard {
         self
     }
 
+    /// Advances `expires_at` monotonically to at least `candidate`, never shortening
+    /// an existing longer deadline.
+    #[cfg(any(test, feature = "postgres", feature = "redis"))]
+    pub(crate) fn advance_expires_at(&mut self, candidate: std::time::Instant) {
+        self.expires_at = Some(match self.expires_at {
+            Some(prev) => prev.max(candidate),
+            None => candidate,
+        });
+    }
+
     /// Checks if this lock guard's lease has expired according to monotonic clock.
     pub fn is_expired(&self) -> bool {
         self.expires_at
@@ -59,6 +69,17 @@ impl LockGuard {
     }
 }
 
+/// Computes the effective millisecond TTL (`>= 1`) and a conservative local deadline
+/// captured before dispatching a backend lease operation.
+#[cfg(any(test, feature = "postgres", feature = "redis"))]
+pub(crate) fn conservative_lease_deadline(ttl: Duration) -> (u64, std::time::Instant) {
+    let ttl_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
+    let deadline = std::time::Instant::now()
+        .checked_add(Duration::from_millis(ttl_ms))
+        .unwrap_or_else(std::time::Instant::now);
+    (ttl_ms, deadline)
+}
+
 /// Interface for distributed locking.
 pub trait DistributedLock: Debug + Send + Sync + 'static {
     /// Attempts to acquire an exclusive lock on `resource` valid for `ttl`.
@@ -70,8 +91,14 @@ pub trait DistributedLock: Debug + Send + Sync + 'static {
         ttl: Duration,
     ) -> CoordinationFuture<'a, Option<LockGuard>>;
 
-    /// Renews an active lock lease for an additional `ttl`, updating `guard` with the
-    /// refreshed expiration (and any updated fencing token).
+    /// Extends an active lock lease so it remains valid for at least `ttl` from the
+    /// renewal time without shortening an existing longer deadline, updating `guard`
+    /// with the refreshed expiration (and any updated fencing token).
+    ///
+    /// Backends compute a conservative local deadline from the effective millisecond TTL
+    /// before dispatching the renewal and advance `guard.expires_at` monotonically only
+    /// on confirmed success, so a delayed reply cannot make an expired local guard
+    /// appear valid.
     // Why: Taking `&'a mut LockGuard` instead of `&'a LockGuard` lets backends write back the
     // extended `expires_at` and any bumped `fencing_token` so callers never hold stale lease
     // metadata after renewal (RC-17). Revisit if a future backend requires interior-mutable
@@ -113,9 +140,10 @@ mod tests {
             guard: &'a mut LockGuard,
             ttl: Duration,
         ) -> CoordinationFuture<'a, ()> {
+            let (_, deadline) = conservative_lease_deadline(ttl);
             Box::pin(async move {
                 guard.fencing_token = self.next_token.fetch_add(1, Ordering::SeqCst) + 1;
-                guard.expires_at = Some(std::time::Instant::now() + ttl);
+                guard.advance_expires_at(deadline);
                 Ok(())
             })
         }
@@ -153,6 +181,46 @@ mod tests {
         assert!(
             renewed_expires_at > initial_expires_at,
             "renew must extend expires_at on the guard"
+        );
+    }
+
+    #[tokio::test]
+    async fn renew_does_not_shorten_longer_existing_deadline() {
+        let lock = RenewingFakeLock::default();
+        let mut guard = lock
+            .acquire("res", Duration::from_secs(60))
+            .await
+            .expect("acquire succeeds")
+            .expect("guard acquired");
+
+        let initial_expires_at = guard.expires_at.expect("acquire sets expires_at");
+
+        lock.renew(&mut guard, Duration::from_millis(10))
+            .await
+            .expect("renew succeeds");
+
+        assert_eq!(
+            guard.expires_at,
+            Some(initial_expires_at),
+            "renew with a shorter ttl must not shorten the existing deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn precomputed_conservative_deadline_expires_if_reply_is_delayed() {
+        let (ttl_ms, candidate) =
+            conservative_lease_deadline(Duration::from_millis(10) + Duration::from_micros(900));
+        assert_eq!(ttl_ms, 10, "sub-millisecond fraction must truncate");
+
+        let mut guard = LockGuard::new("res", "lease-1", 1)
+            .with_expires_at(std::time::Instant::now() - Duration::from_millis(1));
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        guard.advance_expires_at(candidate);
+
+        assert!(
+            guard.is_expired(),
+            "delayed reply must leave guard locally expired when precomputed deadline passed"
         );
     }
 }

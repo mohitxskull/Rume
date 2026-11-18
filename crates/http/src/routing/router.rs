@@ -214,13 +214,14 @@ where
     /// Mount a standard Axum [`MethodRouter`].
     ///
     /// When using raw [`MethodRouter`], method information cannot be inspected
-    /// at runtime by Axum, so it is recorded as `ANY` in the registry.
+    /// at runtime by Axum, so it is recorded as `UNKNOWN` in the registry
+    /// (distinguishing it from explicit `.any()` / `.route_service()`).
     /// Prefer method-specific helpers (`.get()`, `.post()`, or `.route_spec()`)
     /// for exact metadata reflection.
     pub fn route(mut self, path: &str, method_router: MethodRouter<S>) -> Self {
         self.inner = self.inner.route(path, method_router);
         self.record_route(RouteInfo {
-            method: Method::from_bytes(b"ANY").unwrap_or(Method::GET),
+            method: RouteInfo::unknown_method(),
             path: path.to_string(),
             name: None,
             params: extract_path_params(path),

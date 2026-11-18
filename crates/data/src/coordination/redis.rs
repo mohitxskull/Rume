@@ -9,7 +9,9 @@ use uuid::Uuid;
 use crate::cache::redis::RedisCacheBackend;
 use crate::coordination::error::CoordinationError;
 use crate::coordination::leader::{LeaderElector, LeaderLease};
-use crate::coordination::lock::{CoordinationFuture, DistributedLock, LockGuard};
+use crate::coordination::lock::{
+    CoordinationFuture, DistributedLock, LockGuard, conservative_lease_deadline,
+};
 
 /// Redis-backed implementation of [`DistributedLock`].
 ///
@@ -120,6 +122,11 @@ impl DistributedLock for RedisDistributedLock {
 
     fn renew<'a>(&'a self, guard: &'a mut LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
         Box::pin(async move {
+            // Why: Compute the conservative deadline before pool acquisition / script dispatch
+            // so wait/network/scheduling delay counts against the local lease, and only advance
+            // `guard.expires_at` monotonically on confirmed extension.
+            let (ttl_ms, candidate_deadline) = conservative_lease_deadline(ttl);
+
             let mut conn = self
                 .pool
                 .get()
@@ -127,13 +134,16 @@ impl DistributedLock for RedisDistributedLock {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             let lock_key = self.lock_key(&guard.resource);
-            let ttl_ms = ttl.as_millis().max(1) as u64;
 
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 if current == ARGV[1] then
-                    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                    local requested_ttl = tonumber(ARGV[2])
+                    local remaining_ttl = redis.call('PTTL', KEYS[1])
+                    if remaining_ttl < 0 or remaining_ttl < requested_ttl then
+                        redis.call('PEXPIRE', KEYS[1], requested_ttl)
+                    end
                     return 1
                 else
                     return 0
@@ -150,10 +160,7 @@ impl DistributedLock for RedisDistributedLock {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if renewed == 1 {
-                // Why: Refresh local `expires_at` only on confirmed Redis PEXPIRE so `is_expired()`
-                // and `time_remaining()` stay accurate; `fencing_token` stays unchanged because
-                // renewal extends the existing lease rather than issuing a new acquisition.
-                guard.expires_at = Some(std::time::Instant::now() + ttl);
+                guard.advance_expires_at(candidate_deadline);
                 Ok(())
             } else {
                 Err(CoordinationError::LockExpired {

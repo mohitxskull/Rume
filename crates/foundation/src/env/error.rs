@@ -34,20 +34,87 @@ pub enum EnvError {
 }
 
 impl EnvError {
-    pub(crate) fn from_figment_with_secrets(err: &figment::Error, known_secrets: &[&str]) -> Self {
-        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), known_secrets);
-        Self::Validation(redacted)
+    pub(crate) fn from_figment_with_secrets(
+        err: figment::Error,
+        known_secrets: &[&str],
+        secret_keys: &std::collections::BTreeSet<String>,
+    ) -> Self {
+        let messages: Vec<String> = err
+            .into_iter()
+            .map(|mut sub_err| {
+                let is_secret_field = sub_err.path.iter().any(|segment| {
+                    crate::env::secrets::is_secret_key(segment)
+                        || secret_keys
+                            .iter()
+                            .any(|key| key.eq_ignore_ascii_case(segment))
+                });
+                redact_figment_kind(&mut sub_err.kind, is_secret_field, known_secrets);
+                crate::env::secrets::redact_diagnostic_text(&sub_err.to_string(), known_secrets)
+            })
+            .collect();
+        Self::Validation(messages.join("\n"))
     }
 
     #[allow(dead_code)]
     pub(crate) fn from_figment(err: figment::Error) -> Self {
-        Self::from_figment_with_secrets(&err, &[])
+        Self::from_figment_with_secrets(err, &[], &std::collections::BTreeSet::new())
     }
 }
 
 impl From<figment::Error> for EnvError {
     fn from(err: figment::Error) -> Self {
-        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &[]);
-        Self::Validation(redacted)
+        Self::from_figment_with_secrets(err, &[], &std::collections::BTreeSet::new())
+    }
+}
+
+fn redact_figment_kind(
+    kind: &mut figment::error::Kind,
+    is_secret_field: bool,
+    known_secrets: &[&str],
+) {
+    use figment::error::{Actual, Kind};
+
+    let contains_known_secret = |text: &str| {
+        known_secrets
+            .iter()
+            .any(|secret| !secret.trim().is_empty() && text.contains(secret))
+    };
+
+    match kind {
+        Kind::InvalidType(actual, _)
+        | Kind::InvalidValue(actual, _)
+        | Kind::Unsupported(actual)
+        | Kind::UnsupportedKey(actual, _) => {
+            if is_secret_field {
+                *actual = Actual::Other("[redacted]".to_string());
+            } else if let Actual::Str(text) = actual {
+                if contains_known_secret(text) {
+                    *actual = Actual::Other("[redacted]".to_string());
+                } else if crate::env::secrets::value_looks_sensitive(text) {
+                    *text = crate::env::secrets::redact_credential_urls_in_text(text);
+                }
+            }
+        }
+        Kind::UnknownVariant(variant, _) => {
+            if is_secret_field
+                || contains_known_secret(variant)
+                || crate::env::secrets::value_looks_sensitive(variant)
+            {
+                *variant = "[redacted]".to_string();
+            }
+        }
+        Kind::Message(msg) => {
+            if is_secret_field {
+                *msg = "[redacted]".to_string();
+            } else {
+                *msg = crate::env::secrets::redact_diagnostic_text(msg, known_secrets);
+            }
+        }
+        Kind::InvalidLength(..)
+        | Kind::UnknownField(..)
+        | Kind::MissingField(..)
+        | Kind::DuplicateField(..)
+        | Kind::ISizeOutOfRange(..)
+        | Kind::USizeOutOfRange(..) => {}
     }
 }

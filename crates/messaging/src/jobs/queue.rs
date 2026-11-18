@@ -76,6 +76,22 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         delay: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>>;
 
+    /// Re-queues a job that could not be executed (for example, deferred due to an
+    /// in-progress idempotency lock) without consuming a retry attempt, fenced by
+    /// worker lease token.
+    ///
+    /// Backends that increment `attempt` on claim should decrement `attempt` (clamped
+    /// at `0`) so the next claim restores the same attempt number. The default
+    /// implementation delegates to [`JobQueue::nack`].
+    fn defer(
+        &self,
+        job: QueuedJob,
+        lease_token: &str,
+        delay: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        self.nack(job, lease_token, delay)
+    }
+
     /// Moves a permanently failed job to the dead-letter queue (DLQ), fenced by worker lease token.
     fn dead_letter(
         &self,

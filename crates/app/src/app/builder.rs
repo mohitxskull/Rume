@@ -617,14 +617,14 @@ where
     /// Add a route to the application.
     ///
     /// The route is mounted on the router and registered into the route
-    /// registry with an `ANY` method filter (since [`MethodRouter`] does not
-    /// expose its specific HTTP methods). To register explicit HTTP methods
-    /// with typed metadata for OpenAPI or `rume list:routes`, use
-    /// [`RumeBuilder::route_spec`].
+    /// registry with an `UNKNOWN` method marker (since [`MethodRouter`] does
+    /// not expose its specific HTTP methods, distinguishing it from `.any()`).
+    /// To register explicit HTTP methods with typed metadata for OpenAPI or
+    /// `rume list:routes`, use [`RumeBuilder::route_spec`].
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
         self.record_route(rume_http::routing::RouteInfo {
-            method: axum::http::Method::from_bytes(b"ANY").unwrap(),
+            method: rume_http::routing::RouteInfo::unknown_method(),
             path: path.to_string(),
             name: None,
             params: rume_http::routing::registry::extract_path_params(path),
@@ -864,21 +864,7 @@ where
             let single_mod_router = m.register_routes(rume_http::routing::Router::new());
             let (axum_r, routes) = single_mod_router.into_parts();
             for r in routes.routes() {
-                let new_method = r.method.to_string();
-                let new_path = &r.path;
-                // App M4: Check ANY method overlap against existing routes to avoid Axum panics
-                if seen_routes.iter().any(|(existing_method, existing_path)| {
-                    existing_path == new_path
-                        && (existing_method == &new_method
-                            || existing_method == "ANY"
-                            || new_method == "ANY")
-                }) {
-                    return Err(BuildError::DuplicateRoute {
-                        method: new_method,
-                        path: r.path.clone(),
-                    });
-                }
-                seen_routes.push((new_method, r.path.clone()));
+                check_and_record_route(&mut seen_routes, r)?;
             }
             module_axum = module_axum.merge(axum_r);
             module_routes.extend(routes);
@@ -889,20 +875,7 @@ where
         // present, so app/module collisions are caught fail-closed; app routes
         // are checked against each other as they are recorded.
         for r in route_registry.read().unwrap().routes() {
-            let new_method = r.method.to_string();
-            let new_path = &r.path;
-            if seen_routes.iter().any(|(existing_method, existing_path)| {
-                existing_path == new_path
-                    && (existing_method == &new_method
-                        || existing_method == "ANY"
-                        || new_method == "ANY")
-            }) {
-                return Err(BuildError::DuplicateRoute {
-                    method: new_method,
-                    path: r.path.clone(),
-                });
-            }
-            seen_routes.push((new_method, r.path.clone()));
+            check_and_record_route(&mut seen_routes, r)?;
         }
 
         let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
@@ -1422,6 +1395,56 @@ where
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
         })
     }
+}
+
+/// Normalize route capture segments (e.g. `{id}`, `{user_id}`, `:id` -> `{}`,
+/// `{*rest}` -> `{*}`) so structurally equivalent route templates are detected
+/// as duplicates regardless of parameter names.
+fn normalize_route_template(path: &str) -> String {
+    path.split('/')
+        .map(|segment| {
+            if segment.starts_with("{*") && segment.ends_with('}') && segment.len() > 3 {
+                "{*}"
+            } else if (segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2)
+                || (segment.starts_with(':') && segment.len() > 1)
+            {
+                "{}"
+            } else {
+                segment
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn methods_conflict(existing: &str, new: &str) -> bool {
+    if existing == "ANY" || new == "ANY" {
+        return true;
+    }
+    if existing == rume_http::routing::RouteInfo::UNKNOWN_METHOD
+        || new == rume_http::routing::RouteInfo::UNKNOWN_METHOD
+    {
+        return false;
+    }
+    existing == new
+}
+
+fn check_and_record_route(
+    seen_routes: &mut Vec<(String, String)>,
+    route: &rume_http::routing::RouteInfo,
+) -> Result<(), BuildError> {
+    let new_method = route.method.to_string();
+    let normalized_path = normalize_route_template(&route.path);
+    if seen_routes.iter().any(|(existing_method, existing_path)| {
+        existing_path == &normalized_path && methods_conflict(existing_method, &new_method)
+    }) {
+        return Err(BuildError::DuplicateRoute {
+            method: new_method,
+            path: route.path.clone(),
+        });
+    }
+    seen_routes.push((new_method, normalized_path));
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1959,10 +1982,82 @@ mod tests {
         // `seen_routes`, so they participate in duplicate-route detection.
         let ctx = test_ctx();
         let builder = RumeBuilder::new(ctx)
-            .route("/m/x", axum::routing::get(|| async { "app" }))
+            .get("/m/x", || async { "app" })
             .module(MountRouteModule);
 
         let err = builder.build_router(test_ctx()).unwrap_err();
         assert!(matches!(err, BuildError::DuplicateRoute { path, .. } if path == "/m/x"));
+    }
+
+    #[test]
+    fn conflicting_capture_parameter_names_are_rejected_as_duplicate_route() {
+        struct CaptureRouteModule;
+        impl crate::module::Module for CaptureRouteModule {
+            fn name(&self) -> &'static str {
+                "capture_route"
+            }
+            fn register_routes(
+                &self,
+                router: rume_http::routing::Router,
+            ) -> rume_http::routing::Router {
+                router.get("/users/{id}", || async { "module" })
+            }
+        }
+
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .get("/users/{user_id}", || async { "app" })
+            .module(CaptureRouteModule);
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::DuplicateRoute { method, path }
+            if method == "GET" && path == "/users/{user_id}"
+        ));
+    }
+
+    #[test]
+    fn normalize_route_template_normalizes_captures_and_wildcards() {
+        assert_eq!(normalize_route_template("/users/{id}"), "/users/{}");
+        assert_eq!(normalize_route_template("/users/{user_id}"), "/users/{}");
+        assert_eq!(normalize_route_template("/users/:id"), "/users/{}");
+        assert_eq!(normalize_route_template("/files/{*rest}"), "/files/{*}");
+        assert_eq!(normalize_route_template("/users/list"), "/users/list");
+    }
+
+    #[test]
+    fn disjoint_methods_on_identical_template_are_allowed() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .get("/users/{id}", || async { "get" })
+            .post("/users/{id}", || async { "post" });
+
+        assert!(builder.build_router(test_ctx()).is_ok());
+    }
+
+    #[test]
+    fn opaque_method_router_with_disjoint_method_is_allowed() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .route("/items", axum::routing::get(|| async { "get" }))
+            .post("/items", || async { "post" });
+
+        assert!(builder.build_router(test_ctx()).is_ok());
+    }
+
+    #[test]
+    fn any_route_still_conflicts_with_specific_method_on_same_path() {
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .any("/items", || async { "any" })
+            .post("/items", || async { "post" });
+
+        let err = builder.build_router(test_ctx()).unwrap_err();
+        assert!(matches!(
+            err,
+            BuildError::DuplicateRoute { method, path }
+            if method == "POST" && path == "/items"
+        ));
     }
 }

@@ -546,6 +546,7 @@ mod rc16_tests {
             if should_fail {
                 return Box::pin(async {
                     Err(SagaError::Storage {
+                        saga_id: None,
                         message: "injected save_record failure".into(),
                     })
                 });

@@ -311,6 +311,47 @@ impl JobQueue for PostgresJobQueue {
         })
     }
 
+    fn defer(
+        &self,
+        job: QueuedJob,
+        lease_token: &str,
+        delay: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let delay_ms = delay.as_millis() as i64;
+
+            let res = sqlx::query(
+                "UPDATE rume_jobs \
+                 SET status = 'pending', \
+                     assigned_worker = NULL, \
+                     lease_expires_at = NULL, \
+                     lease_token = NULL, \
+                     attempt = GREATEST(attempt - 1, 0), \
+                     available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 \
+                 WHERE id = $2 \
+                   AND lease_token = $3 \
+                   AND status = 'in_flight' \
+                   AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
+            )
+            .bind(delay_ms)
+            .bind(&job.id)
+            .bind(&token)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot defer job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
+
+            Ok(())
+        })
+    }
+
     fn dead_letter(
         &self,
         job: QueuedJob,

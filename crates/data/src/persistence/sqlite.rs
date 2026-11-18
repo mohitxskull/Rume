@@ -380,8 +380,10 @@ impl DatabaseTransaction for SqliteTransaction {
             // Why: Match `SqliteBackend::execute_params` by routing empty-param
             // calls through `sqlx::raw_sql` for unprepared/multi-statement SQL
             // and mapping all sqlx errors via `map_sqlx_error` to preserve
-            // driver error classification.
+            // driver error classification. Reject unbound SQLite placeholders
+            // first so `raw_sql` cannot silently bind them as NULL.
             let res = if params_vec.is_empty() {
+                reject_unbound_sqlite_placeholders(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await
@@ -606,4 +608,146 @@ pub(crate) fn sqlx_sqlite_row_to_db_row(row: &SqliteRow) -> Result<DbRow, Persis
         values.push(val);
     }
     Ok(DbRow::new(columns, values))
+}
+
+fn is_sqlite_ident_start(b: u8, allow_digit: bool) -> bool {
+    b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() || (allow_digit && b.is_ascii_digit())
+}
+
+/// Rejects SQLite bind placeholders (`?`, `?NNN`, `:name`, `@name`, `$name`) outside
+/// string literals, quoted identifiers, and comments when executing with empty params.
+pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), PersistenceError> {
+    let bytes = statement.as_bytes();
+    let mut i = 0;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
+            i += 2;
+            while i < bytes.len() && bytes[i] != b'\n' {
+                i += 1;
+            }
+        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
+            i += 2;
+            while i < bytes.len() {
+                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                    i += 2;
+                    break;
+                }
+                i += 1;
+            }
+        } else if b == b'\'' || b == b'"' || b == b'`' {
+            let quote = b;
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == quote {
+                    if bytes.get(i + 1) == Some(&quote) {
+                        i += 2;
+                    } else {
+                        i += 1;
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+        } else if b == b'[' {
+            i += 1;
+            while i < bytes.len() {
+                if bytes[i] == b']' {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+        } else if b == b'?' {
+            return Err(PersistenceError::QueryFailed(
+                "statement contains unbound SQLite placeholder '?' with empty parameters".into(),
+            ));
+        } else if b == b':'
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&next| is_sqlite_ident_start(next, false))
+        {
+            return Err(PersistenceError::QueryFailed(
+                "statement contains unbound SQLite named placeholder ':' with empty parameters"
+                    .into(),
+            ));
+        } else if (b == b'@' || b == b'$')
+            && bytes
+                .get(i + 1)
+                .is_some_and(|&next| is_sqlite_ident_start(next, true))
+        {
+            return Err(PersistenceError::QueryFailed(format!(
+                "statement contains unbound SQLite named placeholder '{}' with empty parameters",
+                b as char
+            )));
+        } else {
+            i += 1;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_tx_rejects_unbound_placeholders_with_empty_params() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        let backend = SqliteBackend::from_pool(pool);
+
+        backend
+            .execute("CREATE TABLE notes (id INTEGER PRIMARY KEY, note TEXT)")
+            .await
+            .expect("create table");
+        backend
+            .execute("INSERT INTO notes (id, note) VALUES (1, 'original')")
+            .await
+            .expect("seed row");
+
+        let tx = backend.begin_transaction().await.expect("begin tx");
+
+        for stmt in [
+            "UPDATE notes SET note = :note WHERE id = 1",
+            "UPDATE notes SET note = ? WHERE id = 1",
+            "UPDATE notes SET note = ?1 WHERE id = 1",
+            "UPDATE notes SET note = @note WHERE id = 1",
+            "UPDATE notes SET note = $note WHERE id = 1",
+        ] {
+            let err = tx
+                .execute_params(stmt, &[])
+                .await
+                .expect_err(&format!("expected unbound placeholder error for: {stmt}"));
+            assert!(
+                matches!(err, PersistenceError::QueryFailed(_)),
+                "expected QueryFailed for {stmt}, got {err:?}"
+            );
+        }
+
+        // Quoted literals, quoted identifiers, and comments containing placeholder-like tokens must pass.
+        tx.execute_params(
+            "/* :note ? */ -- @note $note\nUPDATE notes SET note = 'kept :note ? @a $b' WHERE id = 1",
+            &[],
+        )
+        .await
+        .expect("quoted/commented placeholders should be allowed");
+
+        // Multi-statement raw execution without placeholders continues to work.
+        tx.execute("CREATE TABLE extra (id INTEGER); INSERT INTO extra (id) VALUES (42);")
+            .await
+            .expect("multi-statement batch without placeholders should succeed");
+
+        tx.commit().await.expect("commit tx");
+
+        let note = backend
+            .query_scalar("SELECT note FROM notes WHERE id = 1")
+            .await
+            .expect("query note");
+        assert_eq!(note.as_deref(), Some("kept :note ? @a $b"));
+    }
 }

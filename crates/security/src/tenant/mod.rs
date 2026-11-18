@@ -16,5 +16,5 @@ pub use layer::{
 pub use model::{OptionalTenant, Tenant, TenantContext};
 #[cfg(feature = "redis")]
 pub use quota::RedisTenantQuotaStore;
-pub use quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+pub use quota::{InMemoryTenantQuotaStore, LeaseId, TenantQuotaStore};
 pub use resolver::{HeaderTenantResolver, SubdomainTenantResolver, TenantResolver};

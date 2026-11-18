@@ -75,21 +75,19 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
 
     /// Marks a message as failed with a configurable maximum retry limit before marking as failed.
     ///
-    /// Backends must override at least this method (or [`mark_failed`]); the default returns
-    /// [`OutboxError::Unsupported`] rather than recursing into [`mark_failed`].
+    /// This is a required repository method so backends cannot silently fail with
+    /// [`OutboxError::Unsupported`] when [`mark_failed`](Self::mark_failed) delegates to it.
+    /// Implementations that previously only overrode [`mark_failed`](Self::mark_failed) should
+    /// move that logic into `mark_failed_with_max_retries` (honoring `max_retries`) and rely on
+    /// the default [`mark_failed`](Self::mark_failed) implementation, which delegates with a
+    /// limit of `5`.
     fn mark_failed_with_max_retries(
         &self,
-        _id: &str,
-        _lease_token: &str,
-        _error: String,
-        _max_retries: u32,
-    ) -> BoxFuture<'_, Result<(), OutboxError>> {
-        Box::pin(async move {
-            Err(OutboxError::Unsupported(
-                "mark_failed_with_max_retries not implemented by this repository backend".into(),
-            ))
-        })
-    }
+        id: &str,
+        lease_token: &str,
+        error: String,
+        max_retries: u32,
+    ) -> BoxFuture<'_, Result<(), OutboxError>>;
 
     /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
     /// resetting their status back to `Pending`.
@@ -388,12 +386,15 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
-    /// Minimal stub that overrides none of `mark_failed` / `mark_failed_with_max_retries`,
-    /// exercising the trait defaults to prove they do not recurse infinitely.
-    #[derive(Debug)]
-    struct StubRepo;
+    /// Minimal stub that relies on the default [`OutboxRepository::mark_failed`]
+    /// delegation to [`OutboxRepository::mark_failed_with_max_retries`].
+    #[derive(Debug, Default)]
+    struct StubRepo {
+        last_max_retries: AtomicU32,
+    }
 
     impl OutboxRepository for StubRepo {
         fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
@@ -423,6 +424,17 @@ mod tests {
             Box::pin(async { Ok(()) })
         }
 
+        fn mark_failed_with_max_retries(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+            _error: String,
+            max_retries: u32,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            self.last_max_retries.store(max_retries, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
         fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
             Box::pin(async { Ok(0) })
         }
@@ -433,19 +445,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mark_failed_default_does_not_recurse() {
-        let repo = StubRepo;
-        // Must return an error (Unsupported) rather than stack-overflowing via mutual recursion.
+    async fn mark_failed_default_delegates_with_default_limit_and_does_not_recurse() {
+        let repo = StubRepo::default();
         let res = tokio::time::timeout(
             Duration::from_secs(5),
             repo.mark_failed("id", "token", "boom".into()),
         )
         .await
         .expect("mark_failed default must complete within timeout");
-        assert!(
-            matches!(res, Err(OutboxError::Unsupported(_))),
-            "mark_failed default should return Unsupported, got {:?}",
-            res
-        );
+        assert!(res.is_ok(), "mark_failed should succeed, got {res:?}");
+        assert_eq!(repo.last_max_retries.load(Ordering::SeqCst), 5);
     }
 }

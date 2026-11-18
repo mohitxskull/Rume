@@ -43,6 +43,22 @@ pub struct RouteInfo {
 }
 
 impl RouteInfo {
+    /// Synthetic method token recorded for opaque [`axum::routing::MethodRouter`]
+    /// registrations (`Router::route()` / `RumeBuilder::route()`) whose specific
+    /// HTTP methods cannot be inspected at runtime.
+    pub const UNKNOWN_METHOD: &'static str = "UNKNOWN";
+
+    /// Returns the [`Method`] token used for opaque `MethodRouter` registrations.
+    pub fn unknown_method() -> Method {
+        Method::from_bytes(Self::UNKNOWN_METHOD.as_bytes()).unwrap_or(Method::GET)
+    }
+
+    /// Returns `true` if this route's HTTP method is opaque (registered via
+    /// `route()` rather than a method-specific helper, `.any()`, or `.route_service()`).
+    pub fn is_unknown_method(&self) -> bool {
+        self.method.as_str() == Self::UNKNOWN_METHOD
+    }
+
     /// Create a new `RouteInfo` without matchers.
     pub fn new(
         method: Method,

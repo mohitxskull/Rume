@@ -9,6 +9,42 @@ use rume_data::cache::error::CacheError;
 /// Pinned boxed future for quota operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// Opaque token identifying a single acquired quota lease.
+///
+/// Passing this token to [`TenantQuotaStore::release_lease`] ensures a late
+/// completion only releases its own lease and never evicts a replacement lease.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LeaseId(String);
+
+impl LeaseId {
+    /// Creates a new unique lease identifier.
+    pub fn new() -> Self {
+        Self(format!("lease-{}", uuid::Uuid::new_v4()))
+    }
+
+    /// Returns the underlying string representation of the lease identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for LeaseId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn validate_ttl(ttl: Option<Duration>) -> Result<(), CacheError> {
+    if let Some(d) = ttl
+        && d.is_zero()
+    {
+        return Err(CacheError::Backend(
+            "quota window/TTL must be greater than zero".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Trait for tracking and enforcing tenant cache quotas across single or multiple instances.
 pub trait TenantQuotaStore: Send + Sync + 'static {
     /// Attempts to record a new key for `tenant_id`.
@@ -23,6 +59,40 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
 
     /// Decrements the active key count for `tenant_id`.
     fn release<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<(), CacheError>>;
+
+    /// Attempts to acquire a tracked lease for `tenant_id` valid for `window`.
+    ///
+    /// Returns `Ok(Some(lease_id))` if acquired, or `Ok(None)` if `max_keys` would be exceeded.
+    fn acquire_lease<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        max_keys: usize,
+        window: Duration,
+    ) -> BoxFuture<'a, Result<Option<LeaseId>, CacheError>> {
+        let lease_id = LeaseId::new();
+        Box::pin(async move {
+            if self
+                .record_key(tenant_id, lease_id.as_str(), Some(window), max_keys)
+                .await?
+            {
+                Ok(Some(lease_id))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    /// Releases a specific `lease_id` previously returned by [`TenantQuotaStore::acquire_lease`].
+    ///
+    /// If the lease already expired or was evicted, this is a no-op and never affects
+    /// other active leases for `tenant_id`.
+    fn release_lease<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        lease_id: &'a LeaseId,
+    ) -> BoxFuture<'a, Result<(), CacheError>> {
+        self.remove_key(tenant_id, lease_id.as_str())
+    }
 
     /// Records a new key with optional TTL for `tenant_id`.
     ///
@@ -125,6 +195,7 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
         let tid = tenant_id.to_string();
         let k = key.to_string();
         Box::pin(async move {
+            validate_ttl(ttl)?;
             let mut map = self.keys.write().await;
             let now = tokio::time::Instant::now();
             let expires_at = ttl.map(|d| now + d);
@@ -205,6 +276,36 @@ mod redis_store {
         prefix: String,
     }
 
+    pub(super) const REDIS_RECORD_KEY_SCRIPT: &str = r#"
+        if redis.replicate_commands then redis.replicate_commands() end
+        local t = redis.call('TIME')
+        local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+        local count = redis.call('ZCARD', KEYS[1])
+        local exists = redis.call('ZSCORE', KEYS[1], ARGV[3])
+        if not exists and count >= tonumber(ARGV[2]) then
+            return 0
+        else
+            local ttl_ms = tonumber(ARGV[1])
+            local score
+            if ttl_ms < 0 then
+                score = '+inf'
+            else
+                score = now_ms + ttl_ms
+            end
+            redis.call('ZADD', KEYS[1], score, ARGV[3])
+            return 1
+        end
+    "#;
+
+    pub(super) const REDIS_COUNT_SCRIPT: &str = r#"
+        if redis.replicate_commands then redis.replicate_commands() end
+        local t = redis.call('TIME')
+        local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+        return redis.call('ZCARD', KEYS[1])
+    "#;
+
     impl Debug for RedisTenantQuotaStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("RedisTenantQuotaStore")
@@ -258,43 +359,26 @@ mod redis_store {
         ) -> BoxFuture<'a, Result<bool, CacheError>> {
             let k = self.key(tenant_id);
             let k_item = key.to_string();
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
-            let expires_at_ms = match ttl {
-                Some(t) => now_ms.saturating_add(t.as_millis() as i64),
-                None => i64::MAX,
-            };
 
             Box::pin(async move {
+                validate_ttl(ttl)?;
+                // Round positive sub-millisecond durations up to 1ms so Redis
+                // millisecond TTLs never truncate a positive window to 0ms.
+                let ttl_ms: i64 = match ttl {
+                    Some(t) => i64::try_from(t.as_millis().max(1)).unwrap_or(i64::MAX),
+                    None => -1,
+                };
+
                 let mut conn = self
                     .pool
                     .get()
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-                // 1. Prune expired keys from sorted set
-                // 2. Count active keys
-                // 3. If count >= max_keys, return 0
-                // 4. Otherwise add/update key with expiration score and return 1
-                let script = r#"
-                    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-                    local count = redis.call('ZCARD', KEYS[1])
-                    local exists = redis.call('ZSCORE', KEYS[1], ARGV[4])
-                    if not exists and count >= tonumber(ARGV[2]) then
-                        return 0
-                    else
-                        redis.call('ZADD', KEYS[1], ARGV[3], ARGV[4])
-                        return 1
-                    end
-                "#;
-
-                let res: i32 = redis::Script::new(script)
+                let res: i32 = redis::Script::new(REDIS_RECORD_KEY_SCRIPT)
                     .key(&k)
-                    .arg(now_ms)
+                    .arg(ttl_ms)
                     .arg(max_keys)
-                    .arg(expires_at_ms)
                     .arg(&k_item)
                     .invoke_async(&mut *conn)
                     .await
@@ -358,10 +442,6 @@ mod redis_store {
 
         fn count<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<usize, CacheError>> {
             let k = self.key(tenant_id);
-            let now_ms = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as i64;
             Box::pin(async move {
                 let mut conn = self
                     .pool
@@ -369,14 +449,8 @@ mod redis_store {
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-                let script = r#"
-                    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])
-                    return redis.call('ZCARD', KEYS[1])
-                "#;
-
-                let count: usize = redis::Script::new(script)
+                let count: usize = redis::Script::new(REDIS_COUNT_SCRIPT)
                     .key(&k)
-                    .arg(now_ms)
                     .invoke_async(&mut *conn)
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
@@ -403,5 +477,104 @@ mod redis_store {
                 Ok(())
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_acquire_lease_and_release_lease_never_evicts_replacement_lease() {
+        tokio::time::pause();
+
+        let store = InMemoryTenantQuotaStore::new();
+        let tenant = "tenant-lease-isolation";
+
+        // 1. Request A acquires lease_a with a short 20ms TTL at max_keys=1
+        let lease_a = store
+            .acquire_lease(tenant, 1, Duration::from_millis(20))
+            .await
+            .unwrap()
+            .expect("lease_a should be acquired");
+
+        // 2. Lease A expires while request A is still running
+        tokio::time::advance(Duration::from_millis(30)).await;
+
+        // 3. Request B acquires replacement lease_b with 60s TTL
+        let lease_b = store
+            .acquire_lease(tenant, 1, Duration::from_secs(60))
+            .await
+            .unwrap()
+            .expect("lease_b should be acquired after lease_a expired");
+
+        // 4. Late completion of request A releases lease_a -> must be a no-op
+        store.release_lease(tenant, &lease_a).await.unwrap();
+        assert_eq!(
+            store.count(tenant).await.unwrap(),
+            1,
+            "releasing expired lease_a must not evict active lease_b"
+        );
+
+        // 5. Third request is still blocked while lease_b is active
+        assert!(
+            store
+                .acquire_lease(tenant, 1, Duration::from_secs(60))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // 6. Releasing lease_b frees the slot
+        store.release_lease(tenant, &lease_b).await.unwrap();
+        assert_eq!(store.count(tenant).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_in_memory_quota_rejects_zero_window_and_allows_sub_ms() {
+        let store = InMemoryTenantQuotaStore::new();
+        let err = store
+            .acquire("t1", 1, Duration::ZERO)
+            .await
+            .expect_err("Duration::ZERO must be rejected");
+        assert!(err.to_string().contains("greater than zero"));
+
+        let err = store
+            .acquire_lease("t1", 1, Duration::ZERO)
+            .await
+            .expect_err("Duration::ZERO must be rejected");
+        assert!(err.to_string().contains("greater than zero"));
+
+        let err = store
+            .record_key("t1", "k1", Some(Duration::ZERO), 1)
+            .await
+            .expect_err("Duration::ZERO must be rejected");
+        assert!(err.to_string().contains("greater than zero"));
+
+        assert!(
+            store
+                .acquire("t1", 1, Duration::from_micros(500))
+                .await
+                .unwrap()
+        );
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn test_redis_quota_rejects_zero_window_and_uses_redis_time() {
+        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let pool = cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool config");
+        let store = RedisTenantQuotaStore::new(pool);
+
+        let err = store
+            .record_key("t1", "k1", Some(Duration::ZERO), 1)
+            .await
+            .expect_err("RedisTenantQuotaStore must reject Duration::ZERO");
+        assert!(err.to_string().contains("greater than zero"));
+
+        assert!(redis_store::REDIS_RECORD_KEY_SCRIPT.contains("redis.call('TIME')"));
+        assert!(redis_store::REDIS_COUNT_SCRIPT.contains("redis.call('TIME')"));
     }
 }
