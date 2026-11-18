@@ -33,7 +33,15 @@ pub enum SagaStatus {
     /// All steps succeeded without errors.
     Success,
     /// Currently executing a compensation action.
-    Compensating { current_step: String },
+    Compensating {
+        current_step: String,
+        /// Original forward error that triggered compensation, if known.
+        // Why: Persisting the trigger error inside `Compensating` (with `#[serde(default)]`
+        // for backward-compatible record deserialization) preserves the real forward failure
+        // across crashes so `resume_compensation` does not overwrite it with a generic string.
+        #[serde(default)]
+        error: Option<SagaError>,
+    },
     /// A step failed and all previously executed steps were successfully compensated.
     Compensated { error: SagaError },
     /// A step failed and at least one compensation action also failed.
@@ -180,27 +188,40 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     }
 
     /// Adds a step implementing [`Step`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if a step with the same name is already registered on this saga.
     pub fn add_step<S: Step<Ctx> + 'static>(mut self, step: S) -> Self {
+        // Why: Reject duplicate step names at registration (panicking like
+        // `HealthChecks::register` to preserve builder chaining) rather than allowing
+        // ambiguous names or returning `Result` on every `.step()` call. `SagaRecord`
+        // persists `completed_steps` and `compensated_steps` by name, so `resume_forward`
+        // and `resume_compensation` resolve indices via `.find(|s| s.name() == name)` —
+        // duplicate names would map to the wrong step index on recovery.
+        let name = step.name();
+        assert!(
+            !self.steps.iter().any(|existing| existing.name() == name),
+            "duplicate saga step name '{name}' in saga '{}'",
+            self.name
+        );
         self.steps.push(Arc::new(step));
         self
     }
 
     /// Adds a step from async closures.
-    pub fn step<A, C, FutA, FutC>(
-        mut self,
-        name: impl Into<String>,
-        action: A,
-        compensation: C,
-    ) -> Self
+    ///
+    /// # Panics
+    ///
+    /// Panics if a step with the same name is already registered on this saga.
+    pub fn step<A, C, FutA, FutC>(self, name: impl Into<String>, action: A, compensation: C) -> Self
     where
         A: Fn(&mut Ctx) -> FutA + Send + Sync + 'static,
         C: Fn(&mut Ctx) -> FutC + Send + Sync + 'static,
         FutA: std::future::Future<Output = Result<(), SagaError>> + Send + 'static,
         FutC: std::future::Future<Output = Result<(), SagaError>> + Send + 'static,
     {
-        let s = FunctionalStep::new(name, action, compensation);
-        self.steps.push(Arc::new(s));
-        self
+        self.add_step(FunctionalStep::new(name, action, compensation))
     }
 
     /// Returns the name of this saga.
@@ -214,7 +235,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         status: SagaStatus,
         completed_steps: &[String],
         compensated_steps: &[String],
-    ) {
+    ) -> Result<(), SagaError> {
         if let Some(store) = &self.store {
             let record = SagaRecord {
                 saga_id: saga_id.to_string(),
@@ -224,157 +245,35 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 compensated_steps: compensated_steps.to_vec(),
                 updated_at: current_timestamp(),
             };
-            if let Err(err) = store.save_record(&record).await {
-                tracing::warn!(saga_id = %saga_id, error = %err, "Failed to persist saga state transition");
-            }
+            // Why: Propagate `save_record` errors instead of logging and continuing, so a
+            // persistence failure aborts the transition rather than leaving the store stale
+            // while execution advances.
+            store.save_record(&record).await?;
         }
+        Ok(())
     }
 
     /// Executes the saga on the provided context with a randomly generated saga ID.
-    pub async fn run(&self, ctx: Ctx) -> SagaReport<Ctx> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SagaError`] if persisting state transitions to the attached [`SagaStore`] fails.
+    pub async fn run(&self, ctx: Ctx) -> Result<SagaReport<Ctx>, SagaError> {
         let saga_id = uuid::Uuid::new_v4().to_string();
         self.run_with_id(&saga_id, ctx).await
     }
 
     /// Executes the saga on the provided context using an explicit saga ID for persistence tracking.
-    pub async fn run_with_id(&self, saga_id: &str, mut ctx: Ctx) -> SagaReport<Ctx> {
-        let mut completed_indices = Vec::new();
-        let mut completed_names = Vec::new();
-        let mut compensated_names = Vec::new();
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`SagaError`] if persisting state transitions to the attached [`SagaStore`] fails.
+    pub async fn run_with_id(&self, saga_id: &str, ctx: Ctx) -> Result<SagaReport<Ctx>, SagaError> {
+        self.persist_state(saga_id, SagaStatus::Pending, &[], &[])
+            .await?;
 
-        self.persist_state(
-            saga_id,
-            SagaStatus::Pending,
-            &completed_names,
-            &compensated_names,
-        )
-        .await;
-
-        for (idx, step) in self.steps.iter().enumerate() {
-            self.persist_state(
-                saga_id,
-                SagaStatus::Running {
-                    current_step: step.name().to_string(),
-                },
-                &completed_names,
-                &compensated_names,
-            )
-            .await;
-
-            let res = AssertUnwindSafe(step.execute(&mut ctx))
-                .catch_unwind()
-                .await;
-            let step_result = match res {
-                Ok(r) => r,
-                Err(payload) => {
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("step execution panicked");
-                    Err(SagaError::Aborted {
-                        saga: self.name.clone(),
-                        reason: format!("panic in step '{}': {msg}", step.name()),
-                    })
-                }
-            };
-
-            match step_result {
-                Ok(()) => {
-                    completed_indices.push(idx);
-                    completed_names.push(step.name().to_string());
-                }
-                Err(err) => {
-                    // Forward execution failed. Run compensation in reverse order.
-                    let mut first_comp_error = None;
-                    for &prev_idx in completed_indices.iter().rev() {
-                        let prev_step = &self.steps[prev_idx];
-                        self.persist_state(
-                            saga_id,
-                            SagaStatus::Compensating {
-                                current_step: prev_step.name().to_string(),
-                            },
-                            &completed_names,
-                            &compensated_names,
-                        )
-                        .await;
-
-                        let comp_res = AssertUnwindSafe(prev_step.compensate(&mut ctx))
-                            .catch_unwind()
-                            .await;
-                        let comp_outcome = match comp_res {
-                            Ok(r) => r,
-                            Err(payload) => {
-                                let msg = payload
-                                    .downcast_ref::<&str>()
-                                    .copied()
-                                    .or_else(|| {
-                                        payload.downcast_ref::<String>().map(|s| s.as_str())
-                                    })
-                                    .unwrap_or("compensation panicked");
-                                Err(SagaError::Aborted {
-                                    saga: self.name.clone(),
-                                    reason: format!(
-                                        "panic in compensation for step '{}': {msg}",
-                                        prev_step.name()
-                                    ),
-                                })
-                            }
-                        };
-
-                        match comp_outcome {
-                            Ok(()) => {
-                                compensated_names.push(prev_step.name().to_string());
-                            }
-                            Err(comp_err) => {
-                                if first_comp_error.is_none() {
-                                    first_comp_error = Some(comp_err);
-                                }
-                            }
-                        }
-                    }
-
-                    let status = if let Some(compensation_error) = first_comp_error {
-                        SagaStatus::CompensationFailed {
-                            error: err,
-                            compensation_error,
-                        }
-                    } else {
-                        SagaStatus::Compensated { error: err }
-                    };
-
-                    self.persist_state(
-                        saga_id,
-                        status.clone(),
-                        &completed_names,
-                        &compensated_names,
-                    )
-                    .await;
-
-                    return SagaReport {
-                        context: ctx,
-                        status,
-                        completed_steps: completed_names,
-                        compensated_steps: compensated_names,
-                    };
-                }
-            }
-        }
-
-        self.persist_state(
-            saga_id,
-            SagaStatus::Success,
-            &completed_names,
-            &compensated_names,
-        )
-        .await;
-
-        SagaReport {
-            context: ctx,
-            status: SagaStatus::Success,
-            completed_steps: completed_names,
-            compensated_steps: compensated_names,
-        }
+        self.execute_forward_from(saga_id, ctx, 0, Vec::new(), Vec::new(), Vec::new())
+            .await
     }
 
     /// Resumes an incomplete or crashed saga from its persisted state record.
@@ -410,30 +309,30 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         }
     }
 
-    async fn resume_forward(
-        &self,
-        saga_id: &str,
-        record: SagaRecord,
-        mut ctx: Ctx,
-    ) -> Result<SagaReport<Ctx>, SagaError> {
-        let mut completed_indices = Vec::new();
-        let mut completed_names = record.completed_steps.clone();
-        let mut compensated_names = record.compensated_steps.clone();
-
-        // Map existing completed names to step indices
-        for name in &completed_names {
+    fn resolve_completed_indices(&self, completed_names: &[String]) -> Vec<usize> {
+        let mut indices = Vec::with_capacity(completed_names.len());
+        for name in completed_names {
             if let Some((idx, _)) = self
                 .steps
                 .iter()
                 .enumerate()
                 .find(|(_, s)| s.name() == name)
             {
-                completed_indices.push(idx);
+                indices.push(idx);
             }
         }
+        indices
+    }
 
-        let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
-
+    async fn execute_forward_from(
+        &self,
+        saga_id: &str,
+        mut ctx: Ctx,
+        start_idx: usize,
+        mut completed_indices: Vec<usize>,
+        mut completed_names: Vec<String>,
+        compensated_names: Vec<String>,
+    ) -> Result<SagaReport<Ctx>, SagaError> {
         for (idx, step) in self.steps.iter().enumerate().skip(start_idx) {
             self.persist_state(
                 saga_id,
@@ -443,7 +342,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 &completed_names,
                 &compensated_names,
             )
-            .await;
+            .await?;
 
             let res = AssertUnwindSafe(step.execute(&mut ctx))
                 .catch_unwind()
@@ -451,11 +350,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             let step_result = match res {
                 Ok(r) => r,
                 Err(payload) => {
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("step execution panicked");
+                    let msg = panic_message(&payload, "step execution panicked");
                     Err(SagaError::Aborted {
                         saga: self.name.clone(),
                         reason: format!("panic in step '{}': {msg}", step.name()),
@@ -467,84 +362,30 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 Ok(()) => {
                     completed_indices.push(idx);
                     completed_names.push(step.name().to_string());
-                }
-                Err(err) => {
-                    // Forward execution failed on resume. Compensate all completed steps.
-                    let mut first_comp_error = None;
-                    for &prev_idx in completed_indices.iter().rev() {
-                        let prev_step = &self.steps[prev_idx];
-                        if compensated_names.contains(&prev_step.name().to_string()) {
-                            continue;
-                        }
-
-                        self.persist_state(
-                            saga_id,
-                            SagaStatus::Compensating {
-                                current_step: prev_step.name().to_string(),
-                            },
-                            &completed_names,
-                            &compensated_names,
-                        )
-                        .await;
-
-                        let comp_res = AssertUnwindSafe(prev_step.compensate(&mut ctx))
-                            .catch_unwind()
-                            .await;
-                        let comp_outcome = match comp_res {
-                            Ok(r) => r,
-                            Err(payload) => {
-                                let msg = payload
-                                    .downcast_ref::<&str>()
-                                    .copied()
-                                    .or_else(|| {
-                                        payload.downcast_ref::<String>().map(|s| s.as_str())
-                                    })
-                                    .unwrap_or("compensation panicked");
-                                Err(SagaError::Aborted {
-                                    saga: self.name.clone(),
-                                    reason: format!(
-                                        "panic in compensation for step '{}': {msg}",
-                                        prev_step.name()
-                                    ),
-                                })
-                            }
-                        };
-
-                        match comp_outcome {
-                            Ok(()) => {
-                                compensated_names.push(prev_step.name().to_string());
-                            }
-                            Err(comp_err) => {
-                                if first_comp_error.is_none() {
-                                    first_comp_error = Some(comp_err);
-                                }
-                            }
-                        }
-                    }
-
-                    let status = if let Some(compensation_error) = first_comp_error {
-                        SagaStatus::CompensationFailed {
-                            error: err,
-                            compensation_error,
-                        }
-                    } else {
-                        SagaStatus::Compensated { error: err }
-                    };
-
+                    // Why: Persist completed step immediately after it succeeds rather than
+                    // waiting for the next step's `Running` write, so a crash or persist
+                    // failure between steps does not lose completion and re-run the step.
                     self.persist_state(
                         saga_id,
-                        status.clone(),
+                        SagaStatus::Running {
+                            current_step: step.name().to_string(),
+                        },
                         &completed_names,
                         &compensated_names,
                     )
-                    .await;
-
-                    return Ok(SagaReport {
-                        context: ctx,
-                        status,
-                        completed_steps: completed_names,
-                        compensated_steps: compensated_names,
-                    });
+                    .await?;
+                }
+                Err(err) => {
+                    return self
+                        .compensate_completed(
+                            saga_id,
+                            ctx,
+                            &completed_indices,
+                            &completed_names,
+                            compensated_names,
+                            Some(err),
+                        )
+                        .await;
                 }
             }
         }
@@ -555,7 +396,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             &completed_names,
             &compensated_names,
         )
-        .await;
+        .await?;
 
         Ok(SagaReport {
             context: ctx,
@@ -565,31 +406,19 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         })
     }
 
-    async fn resume_compensation(
+    async fn compensate_completed(
         &self,
         saga_id: &str,
-        record: SagaRecord,
         mut ctx: Ctx,
+        completed_indices: &[usize],
+        completed_names: &[String],
+        mut compensated_names: Vec<String>,
+        original_error: Option<SagaError>,
     ) -> Result<SagaReport<Ctx>, SagaError> {
-        let mut completed_indices = Vec::new();
-        let completed_names = record.completed_steps.clone();
-        let mut compensated_names = record.compensated_steps.clone();
-
-        for name in &completed_names {
-            if let Some((idx, _)) = self
-                .steps
-                .iter()
-                .enumerate()
-                .find(|(_, s)| s.name() == name)
-            {
-                completed_indices.push(idx);
-            }
-        }
-
         let mut first_comp_error = None;
         for &prev_idx in completed_indices.iter().rev() {
             let prev_step = &self.steps[prev_idx];
-            if compensated_names.contains(&prev_step.name().to_string()) {
+            if compensated_names.iter().any(|n| n == prev_step.name()) {
                 continue;
             }
 
@@ -597,11 +426,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 saga_id,
                 SagaStatus::Compensating {
                     current_step: prev_step.name().to_string(),
+                    error: original_error.clone(),
                 },
-                &completed_names,
+                completed_names,
                 &compensated_names,
             )
-            .await;
+            .await?;
 
             let comp_res = AssertUnwindSafe(prev_step.compensate(&mut ctx))
                 .catch_unwind()
@@ -609,11 +439,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             let comp_outcome = match comp_res {
                 Ok(r) => r,
                 Err(payload) => {
-                    let msg = payload
-                        .downcast_ref::<&str>()
-                        .copied()
-                        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
-                        .unwrap_or("compensation panicked");
+                    let msg = panic_message(&payload, "compensation panicked");
                     Err(SagaError::Aborted {
                         saga: self.name.clone(),
                         reason: format!(
@@ -627,6 +453,19 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             match comp_outcome {
                 Ok(()) => {
                     compensated_names.push(prev_step.name().to_string());
+                    // Why: Persist immediately after each compensation succeeds so a crash
+                    // before the next step's `Compensating` or terminal write does not
+                    // re-run an already-completed compensation on resume.
+                    self.persist_state(
+                        saga_id,
+                        SagaStatus::Compensating {
+                            current_step: prev_step.name().to_string(),
+                            error: original_error.clone(),
+                        },
+                        completed_names,
+                        &compensated_names,
+                    )
+                    .await?;
                 }
                 Err(comp_err) => {
                     if first_comp_error.is_none() {
@@ -636,37 +475,74 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             }
         }
 
-        let status = if let Some(compensation_error) = first_comp_error {
-            SagaStatus::CompensationFailed {
-                error: SagaError::Aborted {
+        let status = match first_comp_error {
+            Some(compensation_error) => SagaStatus::CompensationFailed {
+                error: original_error.unwrap_or_else(|| SagaError::Aborted {
                     saga: self.name.clone(),
                     reason: "resumed compensation encountered failure".into(),
-                },
+                }),
                 compensation_error,
-            }
-        } else {
-            SagaStatus::Compensated {
-                error: SagaError::Aborted {
+            },
+            None => SagaStatus::Compensated {
+                error: original_error.unwrap_or_else(|| SagaError::Aborted {
                     saga: self.name.clone(),
                     reason: "resumed compensation completed successfully".into(),
-                },
-            }
+                }),
+            },
         };
 
-        self.persist_state(
-            saga_id,
-            status.clone(),
-            &completed_names,
-            &compensated_names,
-        )
-        .await;
+        self.persist_state(saga_id, status.clone(), completed_names, &compensated_names)
+            .await?;
 
         Ok(SagaReport {
             context: ctx,
             status,
-            completed_steps: completed_names,
+            completed_steps: completed_names.to_vec(),
             compensated_steps: compensated_names,
         })
+    }
+
+    async fn resume_forward(
+        &self,
+        saga_id: &str,
+        record: SagaRecord,
+        ctx: Ctx,
+    ) -> Result<SagaReport<Ctx>, SagaError> {
+        let completed_indices = self.resolve_completed_indices(&record.completed_steps);
+        let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
+
+        self.execute_forward_from(
+            saga_id,
+            ctx,
+            start_idx,
+            completed_indices,
+            record.completed_steps,
+            record.compensated_steps,
+        )
+        .await
+    }
+
+    async fn resume_compensation(
+        &self,
+        saga_id: &str,
+        record: SagaRecord,
+        ctx: Ctx,
+    ) -> Result<SagaReport<Ctx>, SagaError> {
+        let completed_indices = self.resolve_completed_indices(&record.completed_steps);
+        let original_error = match record.status {
+            SagaStatus::Compensating { error, .. } => error,
+            _ => None,
+        };
+
+        self.compensate_completed(
+            saga_id,
+            ctx,
+            &completed_indices,
+            &record.completed_steps,
+            record.compensated_steps,
+            original_error,
+        )
+        .await
     }
 
     /// Forces rollback and compensation for all completed steps recorded under `saga_id`.
@@ -688,4 +564,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
 
         self.resume_compensation(saga_id, record, ctx).await
     }
+}
+
+fn panic_message<'a>(payload: &'a Box<dyn std::any::Any + Send>, fallback: &'a str) -> &'a str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
+        .unwrap_or(fallback)
 }
