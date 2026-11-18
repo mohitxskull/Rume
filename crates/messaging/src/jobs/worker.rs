@@ -2464,11 +2464,15 @@ mod tests {
             _delay: Duration,
         ) -> BoxFuture<'_, Result<(), JobError>> {
             self.defer_calls.fetch_add(1, Ordering::SeqCst);
-            let _ = self
-                .attempt_counter
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                    Some(v.saturating_sub(1))
-                });
+            let mut current = self.attempt_counter.load(Ordering::SeqCst);
+            while let Err(actual) = self.attempt_counter.compare_exchange(
+                current,
+                current.saturating_sub(1),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                current = actual;
+            }
             Box::pin(async { Ok(()) })
         }
         fn dead_letter(
