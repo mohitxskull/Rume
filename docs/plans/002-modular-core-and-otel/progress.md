@@ -37,3 +37,5 @@ Task 6: complete (345b4eb..5edd37e, per-task review skipped per user ruling)
 
 Whole-plan review (`5bee7ce..5edd37e`): PASS (0 Critical, 0 Major, 3 Minor).
 Minor fixes (`0703691..35ef99f`): resolved `[m-1]`, `[m-2]`, `[m-3]` (ephemeral `127.0.0.1:0` test port + `#[cfg(feature = "sqlite")]` test gating); `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -j 2 -- -D warnings`, `rume-app` (29+1), `rume-data` (4), and `rume-messaging` (13) tests pass with 0 warnings.
+
+Follow-up (`d0f7c6c..7699c35`): removed `prometheus` and `opentelemetry-prometheus` completely per user request; migrated `MetricsRegistry` to pure `SdkMeterProvider` + `InMemoryMetricExporter` (`snapshot()` / `export_metrics()`) + optional OTLP `MetricExporter` under `feature = "otel"`, and removed Prometheus `.metrics()` route helpers. Verified fmt, clippy (`-D warnings`), `rume --features otel`, `rume-observability` (14), `rume-data` (6), `rume --test integration` (229), `rume-cli` (32+2+3), and `workbench/*`.
