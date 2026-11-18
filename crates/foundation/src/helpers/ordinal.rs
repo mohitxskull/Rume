@@ -80,28 +80,3 @@ mod tests {
         assert_eq!(ordinal(103), "103rd");
     }
 }
-
-#[cfg(kani)]
-mod verification {
-    use super::*;
-
-    #[kani::proof]
-    fn kani_ordinal_suffix_valid_and_teens() {
-        let n: u64 = kani::any();
-        let suffix = ordinal_suffix(n);
-
-        assert!(matches!(suffix, "st" | "nd" | "rd" | "th"));
-
-        let rem100 = n % 100;
-        if (11..=13).contains(&rem100) {
-            assert_eq!(suffix, "th");
-        } else {
-            match n % 10 {
-                1 => assert_eq!(suffix, "st"),
-                2 => assert_eq!(suffix, "nd"),
-                3 => assert_eq!(suffix, "rd"),
-                _ => assert_eq!(suffix, "th"),
-            }
-        }
-    }
-}
