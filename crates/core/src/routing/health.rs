@@ -187,9 +187,15 @@ impl HealthChecks {
 
     /// Set the optional result cache TTL.
     ///
-    /// When `Some(ttl)`, check results are cached and subsequent [`run`](Self::run)
-    /// calls within the TTL return cached results (with `cached: true`) without
-    /// re-running the checks. When `None`, caching is disabled.
+    /// When `Some(ttl)`, per-check results are cached at completion time and
+    /// subsequent [`run`](Self::run) calls return cached results (`cached: true`)
+    /// when every registered check has an entry strictly younger than `ttl`
+    /// (`elapsed < ttl`, so `Duration::ZERO` or an empty registry never hits the
+    /// cache). Concurrent callers share a singleflight execution where the
+    /// leader returns `cached: false` and followers read the cached entries.
+    /// When `None`, caching and singleflight suppression are disabled.
+    // Why: Align doc comment with `get_cached_report` (`< ttl`, non-empty check)
+    // and `run` singleflight leader/follower behavior.
     pub fn cache_ttl(mut self, ttl: Option<Duration>) -> Self {
         self.cache_ttl = ttl;
         self
@@ -202,15 +208,13 @@ impl HealthChecks {
         self
     }
 
-    /// Run all registered checks concurrently and produce a report.
+    /// Retrieves a cached report if the registry is non-empty and every
+    /// registered check has a fresh result strictly within `ttl` (`elapsed < ttl`),
+    /// marking each returned check with `cached: true`.
     ///
-    /// Each check is spawned on a task and wrapped in a per-check timeout.
-    /// Results are aggregated: any [`HealthStatus::Failed`] → overall `Failed`
-    /// (503 on `/health/ready`); any [`HealthStatus::Warning`] with no
-    /// `Failed` → overall `Warning` (degraded, 503); all [`HealthStatus::Ok`]
-    /// → overall `Ok` (200).
-    /// Retrieves a cached report if all checks have fresh results within the TTL.
     /// Eliminates lock churn by holding the read lock once.
+    // Why: Removed the stale `run` doc-comment lines that were previously
+    // orphaned above this private helper.
     fn get_cached_report(&self, ttl: Duration) -> Option<HealthReport> {
         let now = Instant::now();
         let cache = self.cache.read().unwrap();
@@ -300,6 +304,11 @@ impl HealthChecks {
     /// Run all registered checks concurrently and produce a report.
     ///
     /// Each check is spawned on a task and wrapped in a per-check timeout.
+    /// Results are aggregated: any [`HealthStatus::Failed`] → overall `"error"`
+    /// (503 on `/health/ready`); any [`HealthStatus::Warning`] with no
+    /// `Failed` → overall `"warning"` (degraded, 503); all [`HealthStatus::Ok`]
+    /// → overall `"ok"` (200).
+    ///
     /// When `cache_ttl` is enabled, concurrent requests are protected by
     /// singleflight stampede suppression to prevent probe herds.
     pub async fn run(&self) -> HealthReport {
@@ -1196,5 +1205,54 @@ mod tests {
         let report = hc.run().await;
         assert_eq!(report.checks.len(), 1);
         assert!(report.checks[0].duration_ms.is_some());
+    }
+
+    #[tokio::test]
+    async fn health_check_cache_ttl_edge_cases_match_contract() {
+        // Empty registry never hits cache even when cache_ttl is set.
+        let empty = HealthChecks::new().cache_ttl(Some(Duration::from_secs(60)));
+        assert!(empty.get_cached_report(Duration::from_secs(60)).is_none());
+        let empty_report = empty.run().await;
+        assert!(empty_report.checks.is_empty());
+
+        // Duration::ZERO never returns a cached result because elapsed < ZERO is always false.
+        let zero_runs = Arc::new(AtomicUsize::new(0));
+        let zero_ttl = HealthChecks::new()
+            .cache_ttl(Some(Duration::ZERO))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&zero_runs),
+            });
+        let r1 = zero_ttl.run().await;
+        let r2 = zero_ttl.run().await;
+        assert_eq!(zero_runs.load(Ordering::SeqCst), 2);
+        assert!(!r1.checks[0].cached);
+        assert!(!r2.checks[0].cached);
+
+        // Positive TTL returns cached=true within TTL and re-runs once expired.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let short_ttl = HealthChecks::new()
+            .cache_ttl(Some(Duration::from_millis(40)))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&runs),
+            });
+        let first = short_ttl.run().await;
+        assert!(!first.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let cached = short_ttl.run().await;
+        assert!(cached.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Backdate the cached timestamp past TTL instead of sleeping so expiry is deterministic.
+        {
+            let mut cache = short_ttl.cache.write().unwrap();
+            let entry = cache.get_mut("db").expect("cached entry for db");
+            entry.0 = Instant::now() - Duration::from_secs(10);
+        }
+        let expired = short_ttl.run().await;
+        assert!(!expired.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 }

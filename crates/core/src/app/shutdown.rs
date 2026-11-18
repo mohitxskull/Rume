@@ -1,14 +1,9 @@
-//! Shutdown signal handling and operational shutdown helpers.
-
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
-use axum::routing::{Router, get};
-use serde_json::json;
-
-use crate::app::state::{Availability, AvailabilityState};
+//! Shutdown signal handling and operational tracing re-exports.
 
 pub use crate::app::observability::{init_tracing, try_init_tracing};
+
+// Why: `ops_router` was removed because `crate::routing::health_routes` is the
+// canonical liveness/readiness surface and `ops_router` had zero workspace callers.
 
 /// Wait for a shutdown signal (Ctrl+C or SIGTERM on Unix).
 pub(crate) async fn shutdown_signal() {
@@ -32,45 +27,4 @@ pub(crate) async fn shutdown_signal() {
         _ = ctrl_c => {}
         _ = terminate => {}
     }
-}
-
-/// Wrap a router with ops routes (liveness/readiness) keyed on availability.
-///
-/// # Deprecated
-///
-/// Use canonical [`rume::routing::health_routes`](crate::routing::health_routes) instead.
-#[deprecated(
-    since = "0.2.0",
-    note = "Use canonical `rume::routing::health_routes` instead"
-)]
-pub fn ops_router(router: Router<Availability>) -> Router<Availability> {
-    router
-        .route(
-            "/ops/live",
-            get(move |State(av): State<Availability>| async move {
-                if av.state() == AvailabilityState::Broken {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"status": "broken"})),
-                    )
-                        .into_response()
-                } else {
-                    (StatusCode::OK, Json(json!({"status": "alive"}))).into_response()
-                }
-            }),
-        )
-        .route(
-            "/ops/ready",
-            get(move |State(av): State<Availability>| async move {
-                if av.state() == AvailabilityState::Ready {
-                    (StatusCode::OK, Json(json!({"status": "ready"}))).into_response()
-                } else {
-                    (
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        Json(json!({"status": "not_ready"})),
-                    )
-                        .into_response()
-                }
-            }),
-        )
 }

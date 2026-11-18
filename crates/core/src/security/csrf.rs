@@ -22,22 +22,6 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
-/// Helper token representation holding an issued CSRF token.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CsrfToken(pub String);
-
-impl CsrfToken {
-    /// Creates a new `CsrfToken`.
-    pub fn new(token: impl Into<String>) -> Self {
-        Self(token.into())
-    }
-
-    /// Access the underlying token string.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 /// CSRF protection configuration.
 #[derive(Debug, Clone)]
 pub struct CsrfConfig {
@@ -164,6 +148,8 @@ impl CsrfConfig {
     }
 
     /// Generates a cryptographically strong CSRF token, signing it with HMAC if a secret is configured.
+    // Why: Tokens are represented as plain `String`/`&str` values (no `CsrfToken` wrapper struct)
+    // because `CsrfService` reads and compares raw header and cookie strings directly.
     pub fn generate_token(&self) -> String {
         let raw = uuid::Uuid::new_v4().simple().to_string();
         if let Some(secret) = &self.secret {

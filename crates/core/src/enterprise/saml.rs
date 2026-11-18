@@ -331,7 +331,10 @@ impl SamlParser {
     ///
     /// Deprecated: Unverified assertion parsing in production is insecure.
     /// Prefer [`SamlParser::parse_verified`] with an injected [`SamlSignatureVerifier`].
+    // Why: Zero workspace callers remain, but this `#[deprecated]` shim is retained
+    // until the next breaking release per the SAML parser public-API contract.
     #[deprecated(
+        since = "0.1.0",
         note = "use SamlParser::parse_verified() in production or SamlParser::parse_unverified() for tests"
     )]
     pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {

@@ -25,10 +25,15 @@ const INSERT_OUTBOX_SQL: &str = include_str!("sql/mysql/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/mysql/outbox_recover.sql");
 
 // Per-operation MySQL SQL, externalized from inline string literals.
+// Why: All MySQL queries (including lock cleanup and lease-expiry lookup) live in
+// `sql/mysql/*.sql` so this module contains no divergent inline SQL literals.
 const MYSQL_PING_SQL: &str = include_str!("sql/common/ping.sql");
+const MYSQL_MIGRATION_UNLOCK_SQL: &str = include_str!("sql/mysql/mysql_migration_unlock.sql");
 const MYSQL_AUDIT_INSERT_SQL: &str = include_str!("sql/mysql/audit_insert.sql");
 const MYSQL_SET_ISOLATION_LEVEL_SQL: &str = include_str!("sql/mysql/set_isolation_level.sql");
 const MYSQL_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/mysql/outbox_claim_lease.sql");
+const MYSQL_OUTBOX_SELECT_LEASE_EXPIRES_AT_SQL: &str =
+    include_str!("sql/mysql/outbox_select_lease_expires_at.sql");
 const MYSQL_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/mysql/outbox_renew_lease.sql");
 const MYSQL_OUTBOX_MARK_PUBLISHED_SQL: &str = include_str!("sql/mysql/outbox_mark_published.sql");
 const MYSQL_OUTBOX_SELECT_RETRY_COUNT_SQL: &str =
@@ -363,7 +368,7 @@ impl Drop for MysqlTransaction {
             // `rume_migrations_lock`, release the session-bound MySQL named lock before
             // returning the connection to the pool.
             handle.spawn(async move {
-                let _ = sqlx::query("SELECT RELEASE_LOCK('rume_migrations_lock')")
+                let _ = sqlx::query(MYSQL_MIGRATION_UNLOCK_SQL)
                     .execute(&mut *tx)
                     .await;
                 let _ = tx.rollback().await;
@@ -702,12 +707,11 @@ impl OutboxRepository for MysqlBackend {
                     .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
                 // NOTE: `lease_expires_at` is a MySQL `BIGINT UNSIGNED` column; decode into `u64` (not `i64`).
-                let exp: u64 =
-                    sqlx::query_scalar("SELECT lease_expires_at FROM rume_outbox WHERE id = ?")
-                        .bind(&msg.id)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+                let exp: u64 = sqlx::query_scalar(MYSQL_OUTBOX_SELECT_LEASE_EXPIRES_AT_SQL)
+                    .bind(&msg.id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
                 msg.status = OutboxStatus::InFlight;
                 msg.lease_token = Some(token);

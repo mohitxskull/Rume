@@ -131,14 +131,13 @@ impl<B: DatabaseBackend> SqlAuditLogger<B> {
     pub const SQLITE_SCHEMA: &'static str =
         include_str!("../persistence/sql/sqlite/audit_schema.sql");
 
-    /// Backward compatibility alias.
-    pub const SCHEMA: &'static str = Self::POSTGRES_SCHEMA;
-
     /// Count query for total recorded audit logs.
     pub const AUDIT_COUNT_SQL: &'static str =
         include_str!("../persistence/sql/common/audit_count.sql");
 
     /// Returns the schema DDL for the specified dialect.
+    // Why: Removed the unused generic `SCHEMA` alias because audit table DDL is
+    // dialect-specific and callers must resolve it via `schema_for_dialect`.
     pub fn schema_for_dialect(dialect: &str) -> &'static str {
         match dialect {
             "mysql" => Self::MYSQL_SCHEMA,

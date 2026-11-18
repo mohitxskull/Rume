@@ -15,8 +15,6 @@ pub use observability::{
     X_REQUEST_ID, init_tracing, try_init_tracing,
 };
 pub use paths::ProjectPaths;
-#[allow(deprecated)]
-pub use shutdown::ops_router;
 pub use state::{
     ApplicationMode, Availability, AvailabilityState, Environment, Lifecycle, LifecycleState,
 };

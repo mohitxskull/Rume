@@ -49,6 +49,9 @@ impl<S> Resource<S> {
     }
 
     /// Access the defined resource routes.
+    // Why: `Router::resource` and `RouteGroup::resource` consume `Resource` directly
+    // via `routes()` so HTTP method, route name, and param metadata stay intact
+    // (the legacy `into_routes` helper stripped metadata and had no callers).
     pub fn routes(&self) -> &[ResourceRoute<S>] {
         &self.routes
     }
@@ -102,6 +105,7 @@ impl<S> Resource<S> {
     }
 
     /// `PATCH /{name}/{id}` — partially update an existing resource.
+    // Why: `patch` is the single canonical method for PATCH routes (no `update_patch` alias).
     pub fn patch(mut self, router: MethodRouter<S>) -> Self {
         self.routes.push(ResourceRoute {
             method: Method::PATCH,
@@ -111,11 +115,6 @@ impl<S> Resource<S> {
             router,
         });
         self
-    }
-
-    /// Alias for `patch`: `PATCH /{name}/{id}`.
-    pub fn update_patch(self, router: MethodRouter<S>) -> Self {
-        self.patch(router)
     }
 
     /// `DELETE /{name}/{id}` — destroy a resource.
@@ -128,15 +127,6 @@ impl<S> Resource<S> {
             router,
         });
         self
-    }
-
-    /// Consume the builder and return the list of `(path, method_router)` pairs
-    /// for backward compatibility with plain Axum routers.
-    pub fn into_routes(self) -> Vec<(String, MethodRouter<S>)> {
-        self.routes
-            .into_iter()
-            .map(|r| (r.path, r.router))
-            .collect()
     }
 }
 
@@ -195,9 +185,14 @@ mod tests {
 
         async fn index() {}
 
-        let routes = Resource::<()>::new("posts").index(get(index)).into_routes();
+        let resource = Resource::<()>::new("posts").index(get(index));
 
-        let group = RouteGroup::<()>::new().prefix("/api").add_routes(routes);
-        let _router = group.build();
+        let group = RouteGroup::<()>::new().prefix("/api").resource(resource);
+        let router = group.build();
+        let routes = router.routes();
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].path, "/api/posts");
+        assert_eq!(routes[0].method, Method::GET);
+        assert_eq!(routes[0].name.as_deref(), Some("posts.index"));
     }
 }
