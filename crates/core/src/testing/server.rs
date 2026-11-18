@@ -189,7 +189,10 @@ impl TestServer {
                 axum::http::HeaderName::from_bytes(name.as_str().as_bytes()),
                 axum::http::HeaderValue::from_bytes(val.as_bytes()),
             ) {
-                headers.insert(hname, hval);
+                // Why: `HeaderMap::insert` replaces prior entries for the same header
+                // name, losing values on multi-value headers like repeated `Set-Cookie`;
+                // `append` preserves every value in wire order.
+                headers.append(hname, hval);
             }
         }
 
@@ -204,6 +207,9 @@ impl TestServer {
             let _ = tx.send(());
         }
         if let Some(task) = self.server_task.take() {
+            // Why: Bound graceful shutdown with an explicit 5s timeout rather than
+            // an unbounded join or fixed sleep so shutdown completes immediately on
+            // drain and fails deterministically if a handler hangs.
             tokio::time::timeout(Duration::from_secs(5), task)
                 .await
                 .map_err(|_| {
@@ -236,6 +242,7 @@ impl Drop for TestServer {
 mod tests {
     use super::*;
     use axum::Json;
+    use axum::response::AppendHeaders;
     use axum::routing::{get, post};
     use serde::{Deserialize, Serialize};
 
@@ -267,6 +274,21 @@ mod tests {
                 post(|Json(req): Json<EchoRequest>| async move {
                     Json(EchoResponse { echo: req.message })
                 }),
+            )
+            .route(
+                "/multi-headers",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        AppendHeaders([
+                            ("set-cookie", "a=1"),
+                            ("set-cookie", "b=2"),
+                            ("x-multi", "first"),
+                            ("x-multi", "second"),
+                        ]),
+                        "multi-ok",
+                    )
+                }),
             );
 
         let server = TestServer::start(router)
@@ -293,6 +315,29 @@ mod tests {
                 echo: "hello over real tcp".to_string(),
             }
         );
+
+        let multi_resp = server
+            .get("/multi-headers")
+            .await
+            .expect("multi-headers GET request succeeds")
+            .assert_status(StatusCode::OK)
+            .assert_text_equals("multi-ok");
+        let cookies: Vec<&str> = multi_resp
+            .headers()
+            .get_all("set-cookie")
+            .iter()
+            .map(|v| v.to_str().expect("valid utf-8 set-cookie header"))
+            .collect();
+        assert_eq!(cookies.len(), 2);
+        assert_eq!(cookies, vec!["a=1", "b=2"]);
+
+        let multi_values: Vec<&str> = multi_resp
+            .headers()
+            .get_all("x-multi")
+            .iter()
+            .map(|v| v.to_str().expect("valid utf-8 x-multi header"))
+            .collect();
+        assert_eq!(multi_values, vec!["first", "second"]);
 
         server.shutdown().await.expect("graceful shutdown succeeds");
     }
