@@ -172,3 +172,34 @@ mod tests {
         assert_eq!(truncate("hello", 2), "he");
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const MAX_LEN: usize = 8;
+
+    #[kani::proof]
+    #[kani::unwind(10)]
+    fn kani_truncate_panic_free_and_char_bound() {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+
+        let Ok(s) = std::str::from_utf8(&bytes[..len]) else {
+            return;
+        };
+
+        let limit: usize = kani::any();
+        let res = truncate(s, limit);
+
+        assert!(res.chars().count() <= limit);
+        if limit == 0 {
+            assert_eq!(res, "");
+            assert!(matches!(res, Cow::Borrowed(_)));
+        } else if s.chars().count() <= limit {
+            assert_eq!(res, s);
+            assert!(matches!(res, Cow::Borrowed(_)));
+        }
+    }
+}

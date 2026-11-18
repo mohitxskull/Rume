@@ -85,3 +85,29 @@ mod tests {
         assert_eq!(mask_email("not-an-email"), "******");
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    const MAX_LEN: usize = 10;
+
+    #[kani::proof]
+    #[kani::unwind(12)]
+    fn kani_mask_secret_panic_free_and_bounds() {
+        let bytes: [u8; MAX_LEN] = kani::any();
+        let len: usize = kani::any();
+        kani::assume(len <= MAX_LEN);
+
+        let Ok(s) = std::str::from_utf8(&bytes[..len]) else {
+            return;
+        };
+
+        let masked = mask_secret(s);
+        if s.chars().count() <= 6 {
+            assert_eq!(masked, "******");
+        } else {
+            assert!(masked.contains("..."));
+        }
+    }
+}
