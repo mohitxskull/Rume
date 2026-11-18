@@ -604,7 +604,10 @@ pub async fn rollback() {
 
 #[cfg(test)]
 mod tests {
-    use super::{BackendHandle, connect_backend, resolve_db_url_for_env_in, resolve_db_url_in};
+    use super::{
+        BackendHandle, connect_backend, resolve_db_url_for_env_in, resolve_db_url_for_env_with_vars,
+    };
+    use std::path::Path;
 
     #[tokio::test]
     async fn connect_backend_routes_mariadb_to_mysql() {
