@@ -144,26 +144,25 @@ impl EventBus {
                 event.type = E::TYPE,
                 traceparent = current_tc.as_ref().map(|tc| tc.traceparent.as_str()).unwrap_or(""),
             );
-            tokio::spawn(
-                crate::app::CURRENT_TRACE_CONTEXT
-                    .scope(current_tc, async move {
-                        for listener in listeners {
-                            let fut = listener(Arc::clone(&event_arc));
-                            match AssertUnwindSafe(fut).catch_unwind().await {
-                                Ok(Ok(())) => {}
-                                Ok(Err(err)) => {
-                                    tracing::error!("async event listener returned error: {err}");
-                                }
-                                Err(panic_payload) => {
-                                    tracing::error!(
-                                        "async event listener panicked: {panic_payload:?}"
-                                    );
-                                }
-                            }
+            let run_listeners = async move {
+                for listener in listeners {
+                    let fut = listener(Arc::clone(&event_arc));
+                    match AssertUnwindSafe(fut).catch_unwind().await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::error!("async event listener returned error: {err}");
                         }
-                    })
-                    .instrument(span),
-            );
+                        Err(panic_payload) => {
+                            tracing::error!("async event listener panicked: {panic_payload:?}");
+                        }
+                    }
+                }
+            };
+            if let Some(tc) = current_tc {
+                tokio::spawn(tc.scope_future(span, run_listeners));
+            } else {
+                tokio::spawn(run_listeners.instrument(span));
+            }
         }
 
         count

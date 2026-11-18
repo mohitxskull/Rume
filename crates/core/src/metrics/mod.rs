@@ -1,7 +1,6 @@
-//! Prometheus metrics collection, registry, and Tower middleware.
+//! Prometheus metrics collection, registry, and Tower middleware (re-exported from `rume-observability`).
 
-pub mod layer;
-pub mod registry;
-
-pub use layer::MetricsLayer;
-pub use registry::{Counter, Gauge, MetricsRegistry};
+pub use rume_observability::metrics::{
+    Counter, DynamicPoolExporter, Gauge, MetricsLayer, MetricsRegistry, MetricsService,
+    PoolMetricsExporter,
+};

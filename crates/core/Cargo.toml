@@ -9,6 +9,8 @@ description = "Explicit, typed, production-ready application shell for Axum."
 [dependencies]
 # Foundation primitives.
 rume-foundation.workspace = true
+# Observability (OTel traces, logs, W3C context, Prometheus metrics).
+rume-observability.workspace = true
 # Core HTTP substrate.
 axum.workspace = true
 # Async runtime.

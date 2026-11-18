@@ -336,13 +336,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 traceparent = %tc.traceparent,
                 tracestate = tc.tracestate.as_deref().unwrap_or(""),
             );
-            use tracing::Instrument;
 
-            let scope_tc = Some(tc);
             let dispatch_result = match fut_result {
                 Ok(fut) => {
-                    let scoped_fut = crate::app::CURRENT_TRACE_CONTEXT.scope(scope_tc, fut);
-                    match std::panic::AssertUnwindSafe(scoped_fut.instrument(span))
+                    let scoped_fut = tc.scope_future(span, fut);
+                    match std::panic::AssertUnwindSafe(scoped_fut)
                         .catch_unwind()
                         .await
                     {

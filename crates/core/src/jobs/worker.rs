@@ -101,23 +101,19 @@ impl JobRegistry {
             job.attempt = job.attempt,
             traceparent = %tc.traceparent,
         );
-        use tracing::Instrument;
 
-        let scope_tc = Some(tc);
-        crate::app::CURRENT_TRACE_CONTEXT
-            .scope(scope_tc, async move {
-                let fut = handler(&ctx, &job.payload);
-                if let Some(timeout) = job.timeout {
-                    match tokio::time::timeout(timeout, fut).await {
-                        Ok(res) => res,
-                        Err(_) => Err(JobError::Timeout),
-                    }
-                } else {
-                    fut.await
+        tc.scope_future(span, async move {
+            let fut = handler(&ctx, &job.payload);
+            if let Some(timeout) = job.timeout {
+                match tokio::time::timeout(timeout, fut).await {
+                    Ok(res) => res,
+                    Err(_) => Err(JobError::Timeout),
                 }
-            })
-            .instrument(span)
-            .await
+            } else {
+                fut.await
+            }
+        })
+        .await
     }
 }
 

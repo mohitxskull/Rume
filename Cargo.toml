@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/foundation",
+    "crates/observability",
     "crates/core",
     "crates/cli",
     "crates/macro",
@@ -23,11 +24,13 @@ license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 rume-foundation = { path = "crates/foundation", version = "=0.1.0" }
+rume-observability = { path = "crates/observability", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
 tokio = { version = "=1.54.1", features = ["full", "test-util"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 thiserror = "=2.0.21"
 secrecy = { version = "=0.10.3", features = ["serde"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
