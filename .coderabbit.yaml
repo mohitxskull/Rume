@@ -2,8 +2,10 @@
 reviews:
   profile: assertive
   path_filters:
-    - "!docs/**"
-    - "docs/specs/vision/**"
+    - "!docs/plans/**"
+    - "!docs/reports/**"
+    - "!docs/scratch/**"
+    - "!**/scratch/**"
   path_instructions:
     - path: crates/**/*.rs
       instructions: >-
