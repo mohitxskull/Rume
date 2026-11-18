@@ -219,12 +219,24 @@ impl<Ctx> Debug for SagaRecoveryHandle<Ctx> {
 }
 
 /// Error returned by recoverable saga execution methods, pairing the [`SagaError`]
-/// with a [`SagaRecoveryHandle`] containing the mutated context and recovery state.
+/// with a boxed [`SagaRecoveryHandle`] containing the mutated context and recovery state.
+// Why: Boxing `handle` keeps `Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>>` well below
+// Clippy's `result_large_err` threshold (128 bytes) regardless of `Ctx` size.
 pub struct SagaRecoveryError<Ctx> {
     /// Underlying saga error.
     pub error: SagaError,
     /// Recovery handle retaining `saga_id`, mutated `context`, and execution phase.
-    pub handle: SagaRecoveryHandle<Ctx>,
+    pub handle: Box<SagaRecoveryHandle<Ctx>>,
+}
+
+impl<Ctx> SagaRecoveryError<Ctx> {
+    /// Pairs a [`SagaError`] with a [`SagaRecoveryHandle`].
+    pub fn new(error: SagaError, handle: SagaRecoveryHandle<Ctx>) -> Self {
+        Self {
+            error,
+            handle: Box::new(handle),
+        }
+    }
 }
 
 impl<Ctx> Debug for SagaRecoveryError<Ctx> {
@@ -429,16 +441,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             .persist_state(saga_id, SagaStatus::Pending, &[], &[])
             .await
         {
-            return Err(SagaRecoveryError {
+            return Err(SagaRecoveryError::new(
                 error,
-                handle: SagaRecoveryHandle {
+                SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: Vec::new(),
                     compensated_steps: Vec::new(),
                 },
-            });
+            ));
         }
 
         self.execute_forward_from_recoverable(saga_id, ctx, 0, Vec::new(), Vec::new(), Vec::new())
@@ -475,50 +487,50 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let store = match self.store.as_ref() {
             Some(store) => store,
             None => {
-                return Err(SagaRecoveryError {
-                    error: SagaError::Storage {
+                return Err(SagaRecoveryError::new(
+                    SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
                         message: "cannot resume saga without a configured SagaStore".into(),
                     },
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
         };
 
         let record = match store.load_record(saga_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                return Err(SagaRecoveryError {
-                    error: SagaError::Storage {
+                return Err(SagaRecoveryError::new(
+                    SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
                         message: format!("saga record '{saga_id}' not found"),
                     },
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
             Err(err) => {
-                return Err(SagaRecoveryError {
-                    error: attach_saga_id(err, saga_id),
-                    handle: SagaRecoveryHandle {
+                return Err(SagaRecoveryError::new(
+                    attach_saga_id(err, saga_id),
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
         };
 
@@ -617,16 +629,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 )
                 .await
             {
-                return Err(SagaRecoveryError {
+                return Err(SagaRecoveryError::new(
                     error,
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: completed_names,
                         compensated_steps: compensated_names,
                     },
-                });
+                ));
             }
 
             let step_span = tracing::info_span!(
@@ -672,16 +684,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         )
                         .await
                     {
-                        return Err(SagaRecoveryError {
+                        return Err(SagaRecoveryError::new(
                             error,
-                            handle: SagaRecoveryHandle {
+                            SagaRecoveryHandle {
                                 saga_id: saga_id.to_string(),
                                 context: ctx,
                                 phase: SagaRecoveryPhase::Forward,
                                 completed_steps: completed_names,
                                 compensated_steps: compensated_names,
                             },
-                        });
+                        ));
                     }
                 }
                 Err(err) => {
@@ -709,16 +721,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             )
             .await
         {
-            return Err(SagaRecoveryError {
+            return Err(SagaRecoveryError::new(
                 error,
-                handle: SagaRecoveryHandle {
+                SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: completed_names,
                     compensated_steps: compensated_names,
                 },
-            });
+            ));
         }
 
         Ok(SagaReport {
@@ -760,9 +772,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 )
                 .await
             {
-                return Err(SagaRecoveryError {
+                return Err(SagaRecoveryError::new(
                     error,
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
@@ -772,7 +784,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         completed_steps: completed_names.to_vec(),
                         compensated_steps: compensated_names,
                     },
-                });
+                ));
             }
 
             let comp_span = tracing::info_span!(
@@ -821,9 +833,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         )
                         .await
                     {
-                        return Err(SagaRecoveryError {
+                        return Err(SagaRecoveryError::new(
                             error,
-                            handle: SagaRecoveryHandle {
+                            SagaRecoveryHandle {
                                 saga_id: saga_id.to_string(),
                                 context: ctx,
                                 phase: SagaRecoveryPhase::Compensating {
@@ -833,7 +845,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 completed_steps: completed_names.to_vec(),
                                 compensated_steps: compensated_names,
                             },
-                        });
+                        ));
                     }
                 }
                 Err(comp_err) => {
@@ -866,9 +878,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             .persist_state(saga_id, status.clone(), completed_names, &compensated_names)
             .await
         {
-            return Err(SagaRecoveryError {
+            return Err(SagaRecoveryError::new(
                 error,
-                handle: SagaRecoveryHandle {
+                SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Compensating {
@@ -878,7 +890,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     completed_steps: completed_names.to_vec(),
                     compensated_steps: compensated_names,
                 },
-            });
+            ));
         }
 
         Ok(SagaReport {
@@ -954,13 +966,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let store = match self.store.as_ref() {
             Some(store) => store,
             None => {
-                return Err(SagaRecoveryError {
-                    error: SagaError::Storage {
+                return Err(SagaRecoveryError::new(
+                    SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
                         message: "cannot compensate crashed saga without a configured SagaStore"
                             .into(),
                     },
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
@@ -970,19 +982,19 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
         };
 
         let record = match store.load_record(saga_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
-                return Err(SagaRecoveryError {
-                    error: SagaError::Storage {
+                return Err(SagaRecoveryError::new(
+                    SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
                         message: format!("saga record '{saga_id}' not found"),
                     },
-                    handle: SagaRecoveryHandle {
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
@@ -992,12 +1004,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
             Err(err) => {
-                return Err(SagaRecoveryError {
-                    error: attach_saga_id(err, saga_id),
-                    handle: SagaRecoveryHandle {
+                return Err(SagaRecoveryError::new(
+                    attach_saga_id(err, saga_id),
+                    SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
@@ -1007,7 +1019,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
                     },
-                });
+                ));
             }
         };
 
@@ -1176,7 +1188,7 @@ mod tests {
 
         store.clear_failure();
         let report = saga
-            .resume_from_handle(err.handle)
+            .resume_from_handle(*err.handle)
             .await
             .expect("resume_from_handle should succeed");
         assert!(report.status.is_success());
@@ -1297,7 +1309,7 @@ mod tests {
 
         store.clear_failure();
         let report = saga
-            .resume_from_handle(err.handle)
+            .resume_from_handle(*err.handle)
             .await
             .expect("resume_from_handle must complete rollback");
         assert_eq!(

@@ -43,11 +43,9 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
     };
 
     let is_secret = is_secret_key(key);
-    let display_value = if unredacted {
-        raw_value.clone()
-    } else {
-        redact_value(key, &raw_value)
-    };
+    // Why: Always redact via `redact_value` so `env explain` never writes raw secret values to
+    // stdout/logs, even when `--unredacted` is passed.
+    let display_value = redact_value(key, &raw_value);
 
     let source = resolved
         .sources
@@ -91,8 +89,14 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
     println!();
     println!("Precedence:");
     println!("  Highest priority wins.");
-    if is_secret && !unredacted {
+    if is_secret {
         println!();
-        println!("Note: this value is treated as a secret and is redacted in output.");
+        if unredacted {
+            println!(
+                "Note: this value is treated as a secret; secret values are always redacted by policy even with --unredacted."
+            );
+        } else {
+            println!("Note: this value is treated as a secret and is redacted in output.");
+        }
     }
 }
