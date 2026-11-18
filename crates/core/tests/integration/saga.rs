@@ -57,7 +57,7 @@ async fn test_saga_happy_path() {
         ..Default::default()
     };
 
-    let report = saga.run(initial).await;
+    let report = saga.run(initial).await.expect("saga run should succeed");
 
     assert!(report.status.is_success());
     assert_eq!(report.context.order_id, "ord-101");
@@ -127,7 +127,7 @@ async fn test_saga_compensation_on_failure() {
         ..Default::default()
     };
 
-    let report = saga.run(initial).await;
+    let report = saga.run(initial).await.expect("saga run should succeed");
 
     assert!(!report.status.is_success());
     match report.status {
@@ -196,7 +196,7 @@ async fn test_saga_compensation_failure() {
         );
 
     let initial = OrderContext::default();
-    let report = saga.run(initial).await;
+    let report = saga.run(initial).await.expect("saga run should succeed");
 
     match report.status {
         SagaStatus::CompensationFailed {
@@ -272,7 +272,7 @@ async fn test_saga_multi_step_partial_compensation_runs_all_steps() {
         );
 
     let initial = OrderContext::default();
-    let report = saga.run(initial).await;
+    let report = saga.run(initial).await.expect("saga run should succeed");
 
     // Even though step_2 compensation failed, step_3 AND step_1 compensations MUST run!
     assert!(matches!(
@@ -316,7 +316,7 @@ async fn test_saga_step_panic_isolation() {
         );
 
     let initial = OrderContext::default();
-    let report = saga.run(initial).await;
+    let report = saga.run(initial).await.expect("saga run should succeed");
 
     // Panic must not crash thread; must compensate step 1
     assert!(matches!(report.status, SagaStatus::Compensated { .. }));
@@ -458,6 +458,7 @@ async fn test_saga_persistence_and_crashed_compensation() {
         saga_name: "compensate_crashed_flow".into(),
         status: SagaStatus::Compensating {
             current_step: "step_1_reserve".into(),
+            error: None,
         },
         completed_steps: vec!["step_1_reserve".into(), "step_2_charge".into()],
         compensated_steps: vec!["step_2_charge".into()],
@@ -496,4 +497,360 @@ async fn test_saga_persistence_and_crashed_compensation() {
         .expect("load")
         .expect("exists");
     assert!(matches!(persisted.status, SagaStatus::Compensated { .. }));
+}
+
+mod rc16_tests {
+    use super::*;
+    use rume::saga::coordinator::BoxFuture;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    type FailPredicate = Arc<dyn Fn(&SagaRecord) -> bool + Send + Sync>;
+
+    #[derive(Clone, Default)]
+    struct RecordingSagaStore {
+        inner: InMemorySagaStore,
+        saved: Arc<Mutex<Vec<SagaRecord>>>,
+        fail_on: Arc<Mutex<Option<FailPredicate>>>,
+    }
+
+    impl RecordingSagaStore {
+        fn new() -> Self {
+            Self::default()
+        }
+
+        fn fail_when<F>(&self, pred: F)
+        where
+            F: Fn(&SagaRecord) -> bool + Send + Sync + 'static,
+        {
+            *self.fail_on.lock().expect("lock") = Some(Arc::new(pred));
+        }
+
+        fn clear_failure(&self) {
+            *self.fail_on.lock().expect("lock") = None;
+        }
+
+        fn recorded(&self) -> Vec<SagaRecord> {
+            self.saved.lock().expect("lock").clone()
+        }
+    }
+
+    impl SagaStore for RecordingSagaStore {
+        fn save_record(&self, record: &SagaRecord) -> BoxFuture<'_, Result<(), SagaError>> {
+            let should_fail = self
+                .fail_on
+                .lock()
+                .expect("lock")
+                .as_ref()
+                .is_some_and(|pred| pred(record));
+            if should_fail {
+                return Box::pin(async {
+                    Err(SagaError::Storage {
+                        saga_id: None,
+                        message: "injected save_record failure".into(),
+                    })
+                });
+            }
+            self.saved.lock().expect("lock").push(record.clone());
+            self.inner.save_record(record)
+        }
+
+        fn load_record(
+            &self,
+            saga_id: &str,
+        ) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>> {
+            self.inner.load_record(saga_id)
+        }
+
+        fn list_incomplete(&self) -> BoxFuture<'_, Result<Vec<SagaRecord>, SagaError>> {
+            self.inner.list_incomplete()
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn test_saga_rejects_duplicate_step_names_on_step() {
+        let _saga = Saga::<OrderContext>::new("dup_steps")
+            .step("same_name", |_| async { Ok(()) }, |_| async { Ok(()) })
+            .step("same_name", |_| async { Ok(()) }, |_| async { Ok(()) });
+    }
+
+    #[test]
+    #[should_panic(expected = "duplicate")]
+    fn test_saga_rejects_duplicate_step_names_on_add_step() {
+        let s1 =
+            FunctionalStep::<OrderContext>::new("dup", |_| async { Ok(()) }, |_| async { Ok(()) });
+        let s2 =
+            FunctionalStep::<OrderContext>::new("dup", |_| async { Ok(()) }, |_| async { Ok(()) });
+        let _saga = Saga::<OrderContext>::new("dup_add_step")
+            .add_step(s1)
+            .add_step(s2);
+    }
+
+    #[tokio::test]
+    async fn test_saga_post_step_persist_and_no_reexecution_on_resume() {
+        let store = Arc::new(RecordingSagaStore::new());
+        // Fail save_record when transitioning to step_2 (simulates crash/failure between step 1 and step 2).
+        store.fail_when(|r| {
+            matches!(&r.status, SagaStatus::Running { current_step } if current_step == "step_2")
+                || matches!(r.status, SagaStatus::Success)
+        });
+
+        let step_1_runs = Arc::new(AtomicUsize::new(0));
+        let step_2_runs = Arc::new(AtomicUsize::new(0));
+        let step_1_runs_c = Arc::clone(&step_1_runs);
+        let step_2_runs_c = Arc::clone(&step_2_runs);
+
+        let saga = Saga::new("post_step_persist_saga")
+            .with_store(store.clone())
+            .step(
+                "step_1",
+                move |ctx: &mut OrderContext| {
+                    step_1_runs_c.fetch_add(1, Ordering::SeqCst);
+                    ctx.events.push("step_1".into());
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            )
+            .step(
+                "step_2",
+                move |ctx: &mut OrderContext| {
+                    step_2_runs_c.fetch_add(1, Ordering::SeqCst);
+                    ctx.events.push("step_2".into());
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        let saga_id = "saga-post-step-1";
+        let run_err = saga
+            .run_with_id(saga_id, OrderContext::default())
+            .await
+            .err()
+            .expect("expected Storage error when step_2 Running persist fails");
+        assert!(matches!(run_err, SagaError::Storage { .. }));
+
+        // Post-step persist must have saved step_1 as completed BEFORE step_2's Running transition.
+        let recorded = store.recorded();
+        assert!(
+            recorded
+                .iter()
+                .any(|r| r.completed_steps == vec!["step_1".to_string()]),
+            "expected post-step persist recording step_1 as completed, got: {recorded:?}"
+        );
+
+        // Now clear the store failure and resume: step_1 must NOT re-execute.
+        store.clear_failure();
+        let before_resume_step_1 = step_1_runs.load(Ordering::SeqCst);
+        let report = saga
+            .resume(saga_id, OrderContext::default())
+            .await
+            .expect("resume should succeed");
+        assert!(report.status.is_success());
+        assert_eq!(
+            step_1_runs.load(Ordering::SeqCst),
+            before_resume_step_1,
+            "step_1 must not re-execute on resume"
+        );
+        assert_eq!(step_2_runs.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_saga_run_propagates_persist_state_error() {
+        let store = Arc::new(RecordingSagaStore::new());
+        store.fail_when(|_| true);
+
+        let saga = Saga::new("run_persist_error_saga").with_store(store).step(
+            "step_1",
+            |_| async { Ok(()) },
+            |_| async { Ok(()) },
+        );
+
+        let res = saga
+            .run_with_id("saga-run-err-1", OrderContext::default())
+            .await;
+        assert!(
+            matches!(res, Err(SagaError::Storage { .. })),
+            "expected Storage error from persist_state to propagate from run_with_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_saga_resume_propagates_persist_state_error() {
+        let store = Arc::new(RecordingSagaStore::new());
+        let saga = Saga::new("persist_error_saga")
+            .with_store(store.clone())
+            .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) });
+
+        let saga_id = "saga-persist-err-1";
+        store
+            .save_record(&SagaRecord {
+                saga_id: saga_id.into(),
+                saga_name: "persist_error_saga".into(),
+                status: SagaStatus::Pending,
+                completed_steps: Vec::new(),
+                compensated_steps: Vec::new(),
+                updated_at: 1000,
+            })
+            .await
+            .expect("seed record");
+
+        store.fail_when(|_| true);
+        let res = saga.resume(saga_id, OrderContext::default()).await;
+        assert!(
+            matches!(res, Err(SagaError::Storage { .. })),
+            "expected Storage error from persist_state to propagate, got: {:?}",
+            res.map(|r| r.status)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_saga_resume_compensation_preserves_failure_reason() {
+        let store = Arc::new(RecordingSagaStore::new());
+        // Fail save_record when starting compensation for step_1 (simulating crash mid-compensation
+        // after step_2 was compensated).
+        store.fail_when(|r| {
+            matches!(
+                &r.status,
+                SagaStatus::Compensating { current_step, .. } if current_step == "step_1"
+            )
+        });
+
+        let expected_err = SagaError::ActionFailed {
+            step: "step_3".into(),
+            message: "payment gateway rejected".into(),
+        };
+        let expected_err_c = expected_err.clone();
+
+        let saga = Saga::new("preserve_reason_saga")
+            .with_store(store.clone())
+            .step(
+                "step_1",
+                |ctx: &mut OrderContext| {
+                    ctx.events.push("s1_done".into());
+                    async { Ok(()) }
+                },
+                |ctx: &mut OrderContext| {
+                    ctx.events.push("s1_comp".into());
+                    async { Ok(()) }
+                },
+            )
+            .step(
+                "step_2",
+                |ctx: &mut OrderContext| {
+                    ctx.events.push("s2_done".into());
+                    async { Ok(()) }
+                },
+                |ctx: &mut OrderContext| {
+                    ctx.events.push("s2_comp".into());
+                    async { Ok(()) }
+                },
+            )
+            .step(
+                "step_3",
+                move |_| {
+                    let e = expected_err_c.clone();
+                    async move { Err(e) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        let saga_id = "saga-preserve-reason-1";
+        let run_err = saga
+            .run_with_id(saga_id, OrderContext::default())
+            .await
+            .err()
+            .expect("expected Storage error when step_1 Compensating persist fails");
+        assert!(matches!(run_err, SagaError::Storage { .. }));
+
+        let mid_crash = store
+            .load_record(saga_id)
+            .await
+            .expect("load")
+            .expect("exists");
+        assert!(
+            matches!(mid_crash.status, SagaStatus::Compensating { .. }),
+            "expected saga to remain in Compensating after persist failure, got: {:?}",
+            mid_crash.status
+        );
+
+        store.clear_failure();
+        let report = saga
+            .resume(saga_id, OrderContext::default())
+            .await
+            .expect("resume compensation should succeed");
+
+        assert_eq!(
+            report.status,
+            SagaStatus::Compensated {
+                error: expected_err
+            }
+        );
+        // step_2 was already persisted as compensated before crash, so resume only compensates step_1.
+        assert_eq!(report.context.events, vec!["s1_comp"]);
+        assert_eq!(report.compensated_steps, vec!["step_2", "step_1"]);
+    }
+
+    #[tokio::test]
+    async fn test_saga_resume_compensation_failed_preserves_failure_reason() {
+        let store = Arc::new(RecordingSagaStore::new());
+        store.fail_when(|r| {
+            matches!(
+                &r.status,
+                SagaStatus::Compensating { current_step, .. } if current_step == "step_1"
+            )
+        });
+
+        let expected_err = SagaError::ActionFailed {
+            step: "step_3".into(),
+            message: "inventory locked".into(),
+        };
+        let expected_comp_err = SagaError::CompensationFailed {
+            step: "step_1".into(),
+            message: "refund service down".into(),
+        };
+        let expected_err_c = expected_err.clone();
+        let expected_comp_err_c = expected_comp_err.clone();
+
+        let saga = Saga::new("preserve_reason_comp_failed_saga")
+            .with_store(store.clone())
+            .step(
+                "step_1",
+                |_| async { Ok(()) },
+                move |_| {
+                    let e = expected_comp_err_c.clone();
+                    async move { Err(e) }
+                },
+            )
+            .step("step_2", |_| async { Ok(()) }, |_| async { Ok(()) })
+            .step(
+                "step_3",
+                move |_| {
+                    let e = expected_err_c.clone();
+                    async move { Err(e) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        let saga_id = "saga-preserve-comp-failed-1";
+        let _ = saga
+            .run_with_id(saga_id, OrderContext::default())
+            .await
+            .err()
+            .expect("expected Storage error when step_1 Compensating persist fails");
+
+        store.clear_failure();
+        let report = saga
+            .resume(saga_id, OrderContext::default())
+            .await
+            .expect("resume compensation should return CompensationFailed report");
+
+        assert_eq!(
+            report.status,
+            SagaStatus::CompensationFailed {
+                error: expected_err,
+                compensation_error: expected_comp_err,
+            }
+        );
+    }
 }

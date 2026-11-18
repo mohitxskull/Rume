@@ -453,3 +453,88 @@ async fn sqlite_test_harness_integration() {
         .expect("query succeeds");
     assert_eq!(sku, Some("SKU-001".into()));
 }
+
+#[tokio::test]
+async fn sqlite_transaction_raw_no_param_execute_and_error_mapping() {
+    use rume::persistence::PersistenceError;
+
+    let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+    let tx = backend.begin_transaction().await.expect("begin tx");
+
+    // Multi-statement raw SQL via both `execute` and `execute_params(..., &[])`.
+    tx.execute("CREATE TABLE raw_e1 (id INTEGER PRIMARY KEY); INSERT INTO raw_e1 (id) VALUES (1);")
+        .await
+        .expect("tx.execute raw multi-statement must succeed");
+
+    tx.execute_params(
+        "CREATE TABLE raw_p1 (id INTEGER PRIMARY KEY); CREATE TABLE raw_p2 (id INTEGER PRIMARY KEY);",
+        &[],
+    )
+    .await
+    .expect("tx.execute_params with empty params must run raw multi-statement SQL");
+
+    let e1_count = tx
+        .query_scalar("SELECT count(*) FROM raw_e1;")
+        .await
+        .expect("query raw_e1")
+        .expect("count present");
+    assert_eq!(e1_count, "1");
+
+    // Both tables from the empty-params `execute_params` call must exist.
+    tx.execute_params(
+        "INSERT INTO raw_p2 (id) VALUES (?);",
+        &rume::params![42_i64],
+    )
+    .await
+    .expect("raw_p2 created by multi-statement execute_params(..., &[]) must exist");
+
+    // Trigger constraint violation via `execute` and `execute_params`.
+    let dup_raw = tx
+        .execute("INSERT INTO raw_e1 (id) VALUES (1);")
+        .await
+        .expect_err("duplicate PK via execute must fail");
+    assert!(
+        matches!(dup_raw, PersistenceError::QueryFailed(_)),
+        "expected QueryFailed on duplicate PK, got: {dup_raw:?}"
+    );
+
+    let dup_params = tx
+        .execute_params(
+            "INSERT INTO raw_p2 (id) VALUES (?);",
+            &rume::params![42_i64],
+        )
+        .await
+        .expect_err("duplicate PK via execute_params must fail");
+    assert!(
+        matches!(dup_params, PersistenceError::QueryFailed(_)),
+        "expected QueryFailed on duplicate PK, got: {dup_params:?}"
+    );
+
+    // Invalid SQL across query_scalar, fetch_all, fetch_optional maps to QueryFailed.
+    let qs_err = tx
+        .query_scalar("SELECT * FROM no_such_table;")
+        .await
+        .expect_err("query_scalar on missing table must fail");
+    assert!(matches!(qs_err, PersistenceError::QueryFailed(_)));
+
+    let fa_err = tx
+        .fetch_all("SELECT * FROM no_such_table;", &[])
+        .await
+        .expect_err("fetch_all on missing table must fail");
+    assert!(matches!(fa_err, PersistenceError::QueryFailed(_)));
+
+    let fo_err = tx
+        .fetch_optional("SELECT * FROM no_such_table;", &[])
+        .await
+        .expect_err("fetch_optional on missing table must fail");
+    assert!(matches!(fo_err, PersistenceError::QueryFailed(_)));
+
+    tx.rollback().await.expect("rollback");
+
+    // After resolution, transaction methods return TransactionError.
+    let after_err = tx
+        .execute("SELECT 1;")
+        .await
+        .expect_err("resolved tx must fail");
+    assert!(matches!(after_err, PersistenceError::TransactionError(_)));
+}

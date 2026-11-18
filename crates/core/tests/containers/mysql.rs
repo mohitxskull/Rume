@@ -509,3 +509,87 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
         .expect("release lock");
     tx_lock2.commit().await.expect("commit probe tx");
 }
+
+#[tokio::test]
+async fn test_mysql_transaction_raw_no_param_and_error_classification() {
+    use rume::persistence::PersistenceError;
+
+    let (_node, backend, _config) = start_mysql_node().await;
+
+    // 1. Raw no-param `execute` and `execute_params(..., &[])` on a transaction.
+    let tx = backend.begin_transaction().await.expect("begin tx");
+    tx.execute("CREATE TABLE mysql_raw_a (id INT PRIMARY KEY)")
+        .await
+        .expect("tx.execute raw DDL must succeed");
+    tx.execute_params("INSERT INTO mysql_raw_a (id) VALUES (1)", &[])
+        .await
+        .expect("tx.execute_params with empty params must succeed");
+
+    let count_a = tx
+        .query_scalar("SELECT count(*) FROM mysql_raw_a")
+        .await
+        .expect("query mysql_raw_a")
+        .expect("count present");
+    assert_eq!(count_a, "1");
+    tx.commit().await.expect("commit raw DDL tx");
+
+    // 2. Killing the transaction's MySQL connection causes subsequent transaction calls to hit
+    // an IO/EOF error, which must classify via `map_sqlx_error` as `ConnectionFailed` (not `QueryFailed`).
+    let tx_drop = backend.begin_transaction().await.expect("begin tx_drop");
+    let conn_id = tx_drop
+        .query_scalar("SELECT CONNECTION_ID()")
+        .await
+        .expect("read CONNECTION_ID()")
+        .expect("conn id present");
+    let conn_num: u64 = conn_id.parse().expect("numeric connection id");
+
+    backend
+        .execute(&format!("KILL {conn_num}"))
+        .await
+        .expect("kill connection");
+
+    let err_exec = tx_drop
+        .execute("SELECT 1")
+        .await
+        .expect_err("execute on killed tx must fail");
+    assert!(
+        matches!(err_exec, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed from map_sqlx_error on killed tx execute, got: {err_exec:?}"
+    );
+
+    let err_exec_params = tx_drop
+        .execute_params("SELECT ?", &rume::params![1_i64])
+        .await
+        .expect_err("execute_params on killed tx must fail");
+    assert!(
+        matches!(err_exec_params, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed from map_sqlx_error on killed tx execute_params, got: {err_exec_params:?}"
+    );
+
+    let err_qs = tx_drop
+        .query_scalar("SELECT 1")
+        .await
+        .expect_err("query_scalar on killed tx must fail");
+    assert!(
+        matches!(err_qs, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed from map_sqlx_error on killed tx query_scalar, got: {err_qs:?}"
+    );
+
+    let err_fa = tx_drop
+        .fetch_all("SELECT 1", &[])
+        .await
+        .expect_err("fetch_all on killed tx must fail");
+    assert!(
+        matches!(err_fa, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed from map_sqlx_error on killed tx fetch_all, got: {err_fa:?}"
+    );
+
+    let err_fo = tx_drop
+        .fetch_optional("SELECT 1", &[])
+        .await
+        .expect_err("fetch_optional on killed tx must fail");
+    assert!(
+        matches!(err_fo, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed from map_sqlx_error on killed tx fetch_optional, got: {err_fo:?}"
+    );
+}

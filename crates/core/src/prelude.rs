@@ -11,7 +11,7 @@ pub use crate::routing::{
     RouteRegistry, RouteSpec, Router,
 };
 #[cfg(feature = "testing")]
-pub use crate::testing::{TestApp, TestAppBuilder};
+pub use crate::testing::{RumeTestingExt, TestApp, TestAppBuilder};
 pub use crate::validation::{
     Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery,
 };

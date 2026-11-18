@@ -235,9 +235,14 @@ async fn realistic_enterprise_pipeline_end_to_end() {
     assert_eq!(queue.pending_count().await.unwrap(), 0);
 
     // Verify metrics recorded
-    let body = metrics.render_prometheus();
-    assert!(body.contains("http_requests_total"));
-    assert!(body.contains("POST"));
+    let snap = metrics.snapshot();
+    assert_eq!(
+        snap.counter_u64(
+            "http_requests_total",
+            &[("method", "POST"), ("status", "201")]
+        ),
+        Some(1)
+    );
 }
 
 #[tokio::test]

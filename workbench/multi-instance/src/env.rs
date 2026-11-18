@@ -1,5 +1,7 @@
 use serde::Deserialize;
 
+// Why: `rume::app::init_tracing()` configures log filtering directly from `RUST_LOG`,
+// so `Env` omits the unused `LogEnv` / `log` field.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub struct Env {
@@ -11,9 +13,6 @@ pub struct Env {
     pub database_url: String,
     #[serde(default = "default_redis_url")]
     pub redis_url: String,
-    #[serde(flatten)]
-    #[allow(dead_code)]
-    pub log: LogEnv,
 }
 
 fn default_host() -> std::net::IpAddr {
@@ -30,12 +29,4 @@ fn default_database_url() -> String {
 
 fn default_redis_url() -> String {
     "redis://localhost:6379".to_string()
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-#[allow(dead_code)]
-pub struct LogEnv {
-    #[serde(default)]
-    pub level: Option<String>,
 }

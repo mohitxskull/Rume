@@ -22,31 +22,26 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
         }
     };
 
-    // Look up the value (secrets are exposed internally via `get`).
-    let raw_value = match resolved.get(key) {
-        Some(v) => v.to_string(),
-        None => {
-            if json {
-                let err_json = serde_json::json!({
-                    "error": format!("environment variable '{key}' is not defined")
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&err_json).unwrap_or_default()
-                );
-            } else {
-                eprintln!("error: environment variable '{key}' is not defined");
-                eprintln!("hint: check your .env files or process environment");
-            }
-            std::process::exit(1);
-        }
-    };
-
-    let is_secret = is_secret_key(key);
-    let display_value = if unredacted {
-        raw_value.clone()
+    // Look up the value without calling `resolved.get(key)` / `expose_secret()` so raw
+    // secret values never flow into CLI stdout/JSON output.
+    let (display_value, is_secret) = if resolved.secrets.contains_key(key) {
+        ("[redacted]".to_string(), true)
+    } else if let Some(v) = resolved.values.get(key) {
+        (redact_value(key, v), is_secret_key(key))
     } else {
-        redact_value(key, &raw_value)
+        if json {
+            let err_json = serde_json::json!({
+                "error": format!("environment variable '{key}' is not defined")
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&err_json).unwrap_or_default()
+            );
+        } else {
+            eprintln!("error: environment variable '{key}' is not defined");
+            eprintln!("hint: check your .env files or process environment");
+        }
+        std::process::exit(1);
     };
 
     let source = resolved
@@ -91,8 +86,14 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
     println!();
     println!("Precedence:");
     println!("  Highest priority wins.");
-    if is_secret && !unredacted {
+    if is_secret {
         println!();
-        println!("Note: this value is treated as a secret and is redacted in output.");
+        if unredacted {
+            println!(
+                "Note: this value is treated as a secret; secret values are always redacted by policy even with --unredacted."
+            );
+        } else {
+            println!("Note: this value is treated as a secret and is redacted in output.");
+        }
     }
 }

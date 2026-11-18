@@ -118,6 +118,10 @@ jobs:
           - package: workbench
             name: "workbench (multi-instance cluster tests)"
             features: ""
+          - package: "rume-foundation -p rume-observability -p rume-data -p rume-messaging -p rume-security -p rume-http -p rume-enterprise -p rume-app -p rume-testing"
+            name: "workspace crates (unit tests, all features)"
+            features: "--all-features"
+            targets: "--lib"
     services:
       postgres:
         image: postgres:16-alpine
@@ -158,7 +162,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build and test ${{ matrix.name }}
-        run: cargo test -p ${{ matrix.package }} ${{ matrix.features }} --all-targets
+        run: cargo test -p ${{ matrix.package }} ${{ matrix.features }} ${{ matrix.targets || '--all-targets' }}
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/workbench
           REDIS_URL: redis://localhost:6379

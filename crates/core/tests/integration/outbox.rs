@@ -269,6 +269,15 @@ async fn outbox_relay_drain_fails_closed_when_pending_count_errors() {
         ) -> BoxFuture<'_, Result<(), OutboxError>> {
             Box::pin(async { Ok(()) })
         }
+        fn mark_failed_with_max_retries(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+            _reason: String,
+            _max_retries: u32,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
         fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
             Box::pin(async { Err(OutboxError::Repository("database offline".into())) })
         }
@@ -1068,6 +1077,15 @@ impl OutboxRepository for MockBareOutboxRepo {
     ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
         Box::pin(async move { Ok(()) })
     }
+    fn mark_failed_with_max_retries(
+        &self,
+        _id: &str,
+        _token: &str,
+        _reason: String,
+        _max_retries: u32,
+    ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
     fn pending_count(&self) -> rume::outbox::BoxFuture<'_, Result<usize, OutboxError>> {
         Box::pin(async move { Ok(0) })
     }
@@ -1260,6 +1278,15 @@ impl OutboxRepository for StalledPendingCountRepo {
         &self,
         _id: &str,
         _token: &str,
+    ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move { Ok(()) })
+    }
+    fn mark_failed_with_max_retries(
+        &self,
+        _id: &str,
+        _token: &str,
+        _reason: String,
+        _max_retries: u32,
     ) -> rume::outbox::BoxFuture<'_, Result<(), OutboxError>> {
         Box::pin(async move { Ok(()) })
     }

@@ -1,0 +1,17 @@
+[package]
+name = "rume-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Application builder, lifecycle management, and modular composition for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-observability.workspace = true
+rume-http.workspace = true
+axum.workspace = true
+tower.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
+tracing.workspace = true

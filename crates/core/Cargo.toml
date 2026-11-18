@@ -7,44 +7,34 @@ license.workspace = true
 description = "Explicit, typed, production-ready application shell for Axum."
 
 [dependencies]
-# Core HTTP substrate.
+# Foundation primitives.
+rume-foundation.workspace = true
+# Observability (OTel traces, logs, W3C context, Prometheus metrics).
+rume-observability.workspace = true
+# Persistence, caching, and distributed coordination.
+rume-data.workspace = true
+# Events, transactional outbox, and background jobs.
+rume-messaging.workspace = true
+# Authentication, security hardening, and multi-tenancy.
+rume-security.workspace = true
+# HTTP routing, OpenAPI, validation, and resilience.
+rume-http.workspace = true
+# Enterprise SAML/SCIM and Saga workflows.
+rume-enterprise.workspace = true
+# Application builder, lifecycle, and module composition.
+rume-app.workspace = true
+# Testing helpers, TestApp, TestServer, and declarative harnesses.
+rume-testing = { workspace = true, optional = true }
+# Core HTTP substrate (used by `rume::prelude`).
 axum.workspace = true
-# Async runtime.
+# Async runtime (used by `rume-crash-harness` and tests).
 tokio.workspace = true
-futures-util.workspace = true
-# Serialization.
+# Serialization (used by `rume::prelude`).
 serde.workspace = true
-# Tracing.
-tracing.workspace = true
-# Error derives.
-thiserror.workspace = true
-# Secret handling.
-secrecy.workspace = true
-# Layered configuration with provenance.
-figment.workspace = true
-# .env loading.
-dotenvy.workspace = true
-# URL/newtype validation helpers.
-url.workspace = true
-# TOML configuration files.
-toml.workspace = true
-# Optional JSON Schema generation.
-schemars = { version = "=1.2.3", optional = true, features = ["derive"] }
-serde_json = "=1.0.154"
-# Tracing/logging.
-tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
-# Tower utilities for testing and middleware.
-tower = "=0.5.3"
-# Request validation.
-garde = { workspace = true, features = ["derive", "email", "url"] }
-uuid = { version = "=1.29.2", features = ["v4"] }
-sha2 = "=0.11.1"
-hmac = "=0.13.0"
+# SQLx (optional, used by `rume-crash-harness` and container tests).
 sqlx = { workspace = true, optional = true }
-deadpool-redis = { workspace = true, optional = true }
-redis = { workspace = true, optional = true }
-quick-xml = { version = "=0.42.0", optional = true }
-reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"], optional = true }
+# UUID generation (used by `rume-crash-harness` and tests).
+uuid = { version = "=1.29.2", features = ["v4"] }
 rume-macros = { path = "../../crates/macro", version = "=0.1.0" }
 
 [[bin]]
@@ -54,15 +44,46 @@ required-features = ["postgres", "redis"]
 
 [features]
 default = ["sqlite", "testing"]
-testing = ["dep:reqwest"]
-postgres = ["dep:sqlx", "sqlx/postgres"]
-redis = ["dep:deadpool-redis", "dep:redis"]
-sqlite = ["dep:sqlx", "sqlx/sqlite"]
-mysql = ["dep:sqlx", "sqlx/mysql"]
-saml = ["dep:quick-xml"]
-enterprise = ["saml"]
+otel = ["rume-observability/otel"]
+testing = ["dep:rume-testing", "rume-testing/testing"]
+postgres = [
+    "dep:sqlx",
+    "sqlx/postgres",
+    "rume-data/postgres",
+    "rume-messaging/postgres",
+    "rume-testing?/postgres",
+]
+redis = [
+    "rume-data/redis",
+    "rume-messaging/redis",
+    "rume-security/redis",
+    "rume-http/redis",
+]
+sqlite = [
+    "dep:sqlx",
+    "sqlx/sqlite",
+    "rume-data/sqlite",
+    "rume-messaging/sqlite",
+    "rume-testing?/sqlite",
+]
+mysql = [
+    "dep:sqlx",
+    "sqlx/mysql",
+    "rume-data/mysql",
+    "rume-messaging/mysql",
+    "rume-testing?/mysql",
+]
+saml = ["rume-enterprise/saml"]
+enterprise = ["saml", "rume-enterprise/enterprise"]
+schemars = ["rume-foundation/schemars"]
 
 [dev-dependencies]
+deadpool-redis.workspace = true
+futures-util.workspace = true
+garde = { workspace = true, features = ["derive", "email", "url"] }
+redis.workspace = true
+serde_json = "=1.0.154"
+tower = "=0.5.3"
 tempfile = "=3.27.0"
 testcontainers-modules = { workspace = true }
 insta = { version = "=1.49.0", features = ["json"] }

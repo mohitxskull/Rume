@@ -423,24 +423,50 @@ async fn test_tenant_cache_quota_idempotent_key_updates() {
 #[tokio::test]
 async fn test_in_memory_tenant_quota_store_lease_churn_never_bypasses_limit() {
     use rume::tenant::quota::{InMemoryTenantQuotaStore, TenantQuotaStore};
+    use std::time::Duration;
 
     let store = InMemoryTenantQuotaStore::new();
     let tenant_id = "tenant_churn_test";
     let max_leases = 2;
 
     // Acquire up to limit
-    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
-    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(
+        store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
     // Third acquisition must fail
-    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(
+        !store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
 
     // Release 1 lease and acquire again in rapid churn cycles
     for _ in 0..10 {
         store.release(tenant_id).await.unwrap();
         // One slot opened up
-        assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+        assert!(
+            store
+                .acquire(tenant_id, max_leases, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
         // Capacity is full again; exceeding limit MUST fail
-        assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+        assert!(
+            !store
+                .acquire(tenant_id, max_leases, Duration::from_secs(60))
+                .await
+                .unwrap()
+        );
     }
 
     // Both leases released
@@ -450,10 +476,25 @@ async fn test_in_memory_tenant_quota_store_lease_churn_never_bypasses_limit() {
     store.release(tenant_id).await.unwrap();
 
     // Now 2 fresh acquisitions succeed
-    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
-    assert!(store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(
+        store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
     // And 3rd still fails
-    assert!(!store.acquire(tenant_id, max_leases).await.unwrap());
+    assert!(
+        !store
+            .acquire(tenant_id, max_leases, Duration::from_secs(60))
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]

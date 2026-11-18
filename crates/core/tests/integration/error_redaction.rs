@@ -43,11 +43,11 @@ fn typed_env_with_invalid_secret_field_does_not_disclose_secret() {
 
     assert!(
         !msg.contains(secret),
-        "secret was exposed in env validation error: {msg}"
+        "secret was exposed in env validation error"
     );
     assert!(
         msg.contains("[redacted]"),
-        "error message should indicate redaction: {msg}"
+        "error message should indicate redaction"
     );
 }
 
@@ -63,11 +63,11 @@ fn typed_env_with_invalid_credential_url_does_not_disclose_password() {
 
     assert!(
         !msg.contains(password),
-        "database password was exposed in env error: {msg}"
+        "database password was exposed in env error"
     );
     assert!(
         msg.contains("[redacted]"),
-        "error message should indicate redacted URL password: {msg}"
+        "error message should indicate redacted URL password"
     );
 }
 
@@ -89,11 +89,11 @@ fn typed_config_with_invalid_secret_field_does_not_disclose_secret() {
 
     assert!(
         !msg.contains(secret),
-        "secret token was exposed in config validation error: {msg}"
+        "secret token was exposed in config validation error"
     );
     assert!(
         msg.contains("[redacted]"),
-        "error message should indicate redaction: {msg}"
+        "error message should indicate redaction"
     );
 }
 
@@ -112,11 +112,11 @@ fn typed_config_with_credential_url_does_not_disclose_password() {
 
     assert!(
         !msg.contains(password),
-        "mysql password was exposed in config error: {msg}"
+        "mysql password was exposed in config error"
     );
     assert!(
         msg.contains("[redacted]"),
-        "error message should indicate redacted password: {msg}"
+        "error message should indicate redacted password"
     );
 }
 
@@ -130,10 +130,10 @@ fn non_secret_error_retains_diagnostic_clarity() {
 
     assert!(
         msg.contains("not_a_valid_number"),
-        "non-secret error should retain input diagnostic: {msg}"
+        "non-secret error should retain input diagnostic"
     );
     assert!(
         !msg.contains("[redacted]"),
-        "non-secret error should not be redacted: {msg}"
+        "non-secret error should not be redacted"
     );
 }

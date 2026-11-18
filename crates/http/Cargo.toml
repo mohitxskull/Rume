@@ -1,0 +1,27 @@
+[package]
+name = "rume-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "HTTP routing, OpenAPI generation, request validation, and resilience middleware for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-observability.workspace = true
+rume-security.workspace = true
+axum.workspace = true
+tower.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+garde.workspace = true
+uuid = { version = "=1.29.2", features = ["v4"] }
+deadpool-redis = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+
+[features]
+default = []
+redis = ["rume-security/redis", "dep:deadpool-redis", "dep:redis"]

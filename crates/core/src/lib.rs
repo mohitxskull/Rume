@@ -18,30 +18,52 @@
 
 #![forbid(unsafe_code)]
 
-pub mod app;
-pub mod auth;
-pub mod cache;
-pub mod config;
-pub mod coordination;
-pub mod enterprise;
-pub mod env;
-pub mod error;
-pub mod events;
-pub mod helpers;
-pub mod jobs;
-pub mod metrics;
-pub mod module;
-pub mod openapi;
-pub mod outbox;
-pub mod persistence;
+pub use rume_app::app;
+pub use rume_data::cache;
+pub use rume_data::coordination;
+pub use rume_data::persistence;
+pub use rume_enterprise::enterprise;
+pub use rume_enterprise::saga;
+pub use rume_foundation::config;
+pub use rume_foundation::env;
+pub use rume_foundation::error;
+pub use rume_foundation::helpers;
+pub use rume_http::openapi;
+pub use rume_http::resilience;
+pub use rume_http::validation;
+pub use rume_messaging::events;
+pub use rume_messaging::jobs;
+pub use rume_messaging::outbox;
+pub use rume_observability::metrics;
+pub use rume_security::auth;
+pub use rume_security::security;
+pub use rume_security::tenant;
+#[cfg(feature = "testing")]
+pub use rume_testing as testing;
+
 pub mod prelude;
-pub mod resilience;
-pub mod routing;
-pub mod saga;
-pub mod security;
-pub mod tenant;
-pub mod testing;
-pub mod validation;
+
+/// First-class application modules (re-exported from `rume-app` and `rume-testing`).
+pub mod module {
+    pub use rume_app::module::*;
+    #[cfg(feature = "testing")]
+    pub use rume_testing::{ModuleHarness, ModuleTestHarness};
+}
+
+/// Routing re-exports from `rume-http` with `AppContext`-typed `health_routes`.
+pub mod routing {
+    pub use rume_http::routing::*;
+
+    /// Routes for health checks (`/health/live` and `/health/ready`) bound to [`crate::app::AppContext`].
+    pub fn health_routes<E, C, S>() -> Router<crate::app::AppContext<E, C, S>>
+    where
+        E: Clone + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        rume_http::routing::health_routes::<crate::app::AppContext<E, C, S>>()
+    }
+}
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
@@ -52,4 +74,5 @@ pub use error::AppError;
 pub use events::{Event, EventBus};
 pub use module::{Module, ModuleContext};
 pub use routing::Router;
+pub use rume_data::{MetricsRegistryPoolExt, params};
 pub use rume_macros::{embed_migrations, sql_assets};

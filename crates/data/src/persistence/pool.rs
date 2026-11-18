@@ -1,0 +1,545 @@
+//! Connection pool lifecycle and management.
+
+use std::collections::BTreeMap;
+use std::fmt::Debug;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::time::Duration;
+
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+
+use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
+use rume_observability::{DynamicPoolExporter, MetricsRegistry};
+
+use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
+use crate::persistence::config::DatabaseConfig;
+use crate::persistence::error::PersistenceError;
+use crate::persistence::row::{DbRow, FromRow};
+
+pub use rume_foundation::telemetry::PoolStatus;
+
+/// A connection pool that manages database connection lifecycles, health checks, and transactions.
+pub struct DatabasePool<B: DatabaseBackend> {
+    backend: Arc<B>,
+    config: DatabaseConfig,
+    active_connections: Arc<AtomicU32>,
+    total_connections: Arc<AtomicU32>,
+    in_flight_transactions: Arc<AtomicU32>,
+    semaphore: Arc<Semaphore>,
+    is_closed: Arc<AtomicBool>,
+}
+
+impl<B: DatabaseBackend> Clone for DatabasePool<B> {
+    fn clone(&self) -> Self {
+        Self {
+            backend: Arc::clone(&self.backend),
+            config: self.config.clone(),
+            active_connections: Arc::clone(&self.active_connections),
+            total_connections: Arc::clone(&self.total_connections),
+            in_flight_transactions: Arc::clone(&self.in_flight_transactions),
+            semaphore: Arc::clone(&self.semaphore),
+            is_closed: Arc::clone(&self.is_closed),
+        }
+    }
+}
+
+impl<B: DatabaseBackend> Debug for DatabasePool<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabasePool")
+            .field("config", &self.config)
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+impl<B: DatabaseBackend> DatabasePool<B> {
+    /// Creates a new database pool with the given backend and configuration.
+    pub fn new(backend: B, config: DatabaseConfig) -> Self {
+        let initial_conns = config.min_connections;
+        let max_conns = config.max_connections.max(1) as usize;
+        Self {
+            backend: Arc::new(backend),
+            config,
+            active_connections: Arc::new(AtomicU32::new(0)),
+            total_connections: Arc::new(AtomicU32::new(initial_conns)),
+            in_flight_transactions: Arc::new(AtomicU32::new(0)),
+            semaphore: Arc::new(Semaphore::new(max_conns)),
+            is_closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Returns the pool's configuration.
+    pub fn config(&self) -> &DatabaseConfig {
+        &self.config
+    }
+
+    /// Returns whether `auto_migrate` is enabled in configuration.
+    pub fn auto_migrate(&self) -> bool {
+        self.config.auto_migrate
+    }
+
+    /// Automatically applies pending migrations on the backend if `auto_migrate` is configured.
+    /// Returns `Some(summary)` if migrations were executed, or `None` if `auto_migrate` was false.
+    pub async fn apply_auto_migrations(
+        &self,
+        migrator: &crate::persistence::migration::Migrator,
+    ) -> Result<Option<crate::persistence::migration::MigrationSummary>, PersistenceError> {
+        if !self.config.auto_migrate {
+            return Ok(None);
+        }
+        let summary = migrator.run_pending_backend(self.backend()).await?;
+        Ok(Some(summary))
+    }
+
+    /// Automatically applies pending core Rume migrations (outbox, jobs, locks, leader)
+    /// if `auto_migrate` is configured.
+    pub async fn apply_auto_migrations_core(
+        &self,
+    ) -> Result<Option<crate::persistence::migration::MigrationSummary>, PersistenceError> {
+        if !self.config.auto_migrate {
+            return Ok(None);
+        }
+        let migrator =
+            crate::persistence::migration::Migrator::new().with_rume_core(self.backend.dialect());
+        self.apply_auto_migrations(&migrator).await
+    }
+
+    /// Returns the underlying database backend.
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
+    /// Returns the current pool status and connection metrics derived from driver state.
+    pub fn status(&self) -> PoolStatus {
+        let is_closed = self.is_closed.load(Ordering::Relaxed) || self.backend.is_closed();
+        let total = self.backend.pool_size();
+        let idle = self.backend.pool_idle();
+        self.total_connections.store(total, Ordering::Relaxed);
+        let leased = self.active_connections.load(Ordering::Relaxed);
+        let active = total.saturating_sub(idle);
+        PoolStatus {
+            leased_connections: leased,
+            active_connections: active,
+            idle_connections: idle,
+            total_connections: total,
+            max_connections: self.config.max_connections,
+            in_flight_transactions: self.in_flight_transactions.load(Ordering::Relaxed),
+            is_closed,
+        }
+    }
+
+    /// Exports pool metrics to the provided [`MetricsRegistry`].
+    pub fn export_metrics(&self, registry: &MetricsRegistry, pool_name: &str) {
+        registry.record_db_pool_status(pool_name, &self.status());
+    }
+
+    /// Acquires a connection lease from the pool synchronously, checking capacity and closed state.
+    pub fn acquire_lease(&self) -> Result<ConnectionLease, PersistenceError> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Closed);
+        }
+
+        let permit = match self.semaphore.clone().try_acquire_owned() {
+            Ok(p) => p,
+            Err(_) => {
+                let active = self.active_connections.load(Ordering::SeqCst);
+                return Err(PersistenceError::PoolExhausted {
+                    active,
+                    max: self.config.max_connections,
+                });
+            }
+        };
+
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionLease {
+            counter: Arc::clone(&self.active_connections),
+            _permit: Some(permit),
+        })
+    }
+
+    /// Acquires a connection lease asynchronously, waiting up to `timeout` if pool capacity is exhausted.
+    pub async fn acquire_lease_timeout(
+        &self,
+        timeout: Duration,
+    ) -> Result<ConnectionLease, PersistenceError> {
+        if self.is_closed.load(Ordering::SeqCst) {
+            return Err(PersistenceError::Closed);
+        }
+
+        let permit =
+            match tokio::time::timeout(timeout, self.semaphore.clone().acquire_owned()).await {
+                Ok(Ok(p)) => p,
+                Ok(Err(_)) => return Err(PersistenceError::Closed),
+                Err(_) => return Err(PersistenceError::Timeout),
+            };
+
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+        Ok(ConnectionLease {
+            counter: Arc::clone(&self.active_connections),
+            _permit: Some(permit),
+        })
+    }
+
+    /// Executes an explicit transaction boundary.
+    ///
+    /// The transaction is automatically committed if the closure returns `Ok(res)`.
+    /// If the closure returns `Err(err)` or panics, the transaction is automatically rolled back.
+    pub async fn transaction<T, E, F, Fut>(&self, f: F) -> Result<T, PersistenceError>
+    where
+        F: FnOnce(B::Transaction) -> Fut,
+        Fut: std::future::Future<Output = Result<T, E>>,
+        PersistenceError: From<E>,
+    {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.in_flight_transactions.fetch_add(1, Ordering::SeqCst);
+
+        struct TxGuard(Arc<AtomicU32>);
+        impl Drop for TxGuard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let _guard = TxGuard(Arc::clone(&self.in_flight_transactions));
+
+        let tx = self.backend.begin_transaction().await?;
+        let tx_handle = tx.clone();
+
+        match f(tx).await {
+            Ok(value) => {
+                tx_handle.commit().await?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = tx_handle.rollback().await;
+                Err(PersistenceError::from(err))
+            }
+        }
+    }
+
+    /// Executes a SQL or DDL statement directly using the pool backend, returning the number of affected rows.
+    pub async fn execute(&self, statement: &str) -> Result<u64, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.execute(statement).await
+    }
+
+    /// Executes a parameterized SQL statement directly using the pool backend, returning the number of affected rows.
+    pub async fn execute_params(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<u64, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.execute_params(statement, params).await
+    }
+
+    /// Executes a scalar query directly using the pool backend, returning an optional string value.
+    pub async fn query_scalar(&self, query: &str) -> Result<Option<String>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.query_scalar(query).await
+    }
+
+    /// Executes a parameterized scalar query directly using the pool backend, returning an optional string value.
+    pub async fn query_scalar_params(
+        &self,
+        query: &str,
+        params: &[DbValue],
+    ) -> Result<Option<String>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.query_scalar_params(query, params).await
+    }
+
+    /// Fetches all matching rows as generic [`DbRow`] records.
+    pub async fn fetch_all(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<DbRow>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_all(statement, params).await
+    }
+
+    /// Fetches all matching rows and maps them into type `R` via [`FromRow`].
+    pub async fn fetch_all_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Vec<R>, PersistenceError> {
+        let rows = self.fetch_all(statement, params).await?;
+        rows.iter().map(R::from_row).collect()
+    }
+
+    /// Fetches an optional single row as [`DbRow`].
+    pub async fn fetch_optional(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Option<DbRow>, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_optional(statement, params).await
+    }
+
+    /// Fetches an optional single row and maps it into type `R` via [`FromRow`].
+    pub async fn fetch_optional_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<Option<R>, PersistenceError> {
+        match self.fetch_optional(statement, params).await? {
+            Some(row) => R::from_row(&row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Fetches exactly one row as [`DbRow`].
+    pub async fn fetch_one(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<DbRow, PersistenceError> {
+        let _lease = self
+            .acquire_lease_timeout(self.config.connect_timeout())
+            .await?;
+        self.backend.fetch_one(statement, params).await
+    }
+
+    /// Fetches exactly one row and maps it into type `R` via [`FromRow`].
+    pub async fn fetch_one_as<R: FromRow>(
+        &self,
+        statement: &str,
+        params: &[DbValue],
+    ) -> Result<R, PersistenceError> {
+        let row = self.fetch_one(statement, params).await?;
+        R::from_row(&row)
+    }
+
+    /// Gracefully closes the connection pool, refusing new leases and draining connections.
+    pub fn close(&self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.semaphore.close();
+        let backend = Arc::clone(&self.backend);
+        tokio::spawn(async move {
+            backend.close().await;
+        });
+    }
+
+    /// Asynchronously closes the connection pool, refusing new leases and awaiting backend driver connection teardown.
+    pub async fn close_async(&self) {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.semaphore.close();
+        self.backend.close().await;
+    }
+
+    /// Closes the pool and waits up to `timeout` for all active connections and in-flight transactions to drain.
+    ///
+    /// Returns `true` if cleanly drained within `timeout`, or `false` if active work remained.
+    pub async fn close_and_drain(&self, timeout: Duration) -> bool {
+        self.is_closed.store(true, Ordering::SeqCst);
+        self.semaphore.close();
+        let start = tokio::time::Instant::now();
+        while self.active_connections.load(Ordering::SeqCst) > 0
+            || self.in_flight_transactions.load(Ordering::SeqCst) > 0
+        {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let remaining = timeout.saturating_sub(start.elapsed());
+        tokio::time::timeout(remaining, self.backend.close())
+            .await
+            .is_ok()
+    }
+
+    /// Creates a Rume [`HealthCheck`] for this database pool.
+    pub fn health_check(&self, name: impl Into<String>) -> DatabaseHealthCheck<B> {
+        DatabaseHealthCheck {
+            name: name.into(),
+            pool: self.clone(),
+        }
+    }
+}
+
+/// An active connection lease that decrements the pool's active counter when dropped.
+#[derive(Debug)]
+pub struct ConnectionLease {
+    counter: Arc<AtomicU32>,
+    _permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Drop for ConnectionLease {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Health check implementation for database connection pools.
+pub struct DatabaseHealthCheck<B: DatabaseBackend> {
+    name: String,
+    pool: DatabasePool<B>,
+}
+
+impl<B: DatabaseBackend> Clone for DatabaseHealthCheck<B> {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            pool: self.pool.clone(),
+        }
+    }
+}
+
+impl<B: DatabaseBackend> Debug for DatabaseHealthCheck<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseHealthCheck")
+            .field("name", &self.name)
+            .field("status", &self.pool.status())
+            .finish()
+    }
+}
+
+impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn run(&self) -> Pin<Box<dyn std::future::Future<Output = HealthCheckResult> + Send>> {
+        let name = self.name.clone();
+        let pool = self.pool.clone();
+
+        Box::pin(async move {
+            let status = pool.status();
+            let mut meta = BTreeMap::new();
+            meta.insert(
+                "leased_connections".to_string(),
+                serde_json::json!(status.leased_connections),
+            );
+            meta.insert(
+                "active_connections".to_string(),
+                serde_json::json!(status.active_connections),
+            );
+            meta.insert(
+                "idle_connections".to_string(),
+                serde_json::json!(status.idle_connections),
+            );
+            meta.insert(
+                "total_connections".to_string(),
+                serde_json::json!(status.total_connections),
+            );
+            meta.insert(
+                "max_connections".to_string(),
+                serde_json::json!(status.max_connections),
+            );
+
+            if status.is_closed {
+                return HealthCheckResult {
+                    name,
+                    status: HealthStatus::Failed,
+                    message: "database pool is closed".to_string(),
+                    meta,
+                    cached: false,
+                    duration_ms: None,
+                };
+            }
+
+            let ping_timeout = pool.config().connect_timeout();
+            let ping_res = tokio::time::timeout(ping_timeout, pool.backend().ping()).await;
+            match ping_res {
+                Ok(Ok(())) => HealthCheckResult {
+                    name,
+                    status: HealthStatus::Ok,
+                    message: "database connection healthy".to_string(),
+                    meta,
+                    cached: false,
+                    duration_ms: None,
+                },
+                Ok(Err(err)) => HealthCheckResult {
+                    name,
+                    status: HealthStatus::Failed,
+                    message: format!("database connection check failed: {err}"),
+                    meta,
+                    cached: false,
+                    duration_ms: None,
+                },
+                Err(_) => HealthCheckResult {
+                    name,
+                    status: HealthStatus::Failed,
+                    message: format!(
+                        "database connection check timed out after {}s",
+                        ping_timeout.as_secs()
+                    ),
+                    meta,
+                    cached: false,
+                    duration_ms: None,
+                },
+            }
+        })
+    }
+}
+
+/// Extension trait on [`MetricsRegistry`] for registering live [`DatabasePool`] metrics exporters.
+pub trait MetricsRegistryPoolExt {
+    /// Registers a [`DatabasePool`] so its connection counts are exported on every metrics flush.
+    fn register_pool<B: DatabaseBackend + 'static>(
+        &self,
+        name: impl Into<String>,
+        pool: &DatabasePool<B>,
+    );
+}
+
+impl MetricsRegistryPoolExt for MetricsRegistry {
+    fn register_pool<B: DatabaseBackend + 'static>(
+        &self,
+        name: impl Into<String>,
+        pool: &DatabasePool<B>,
+    ) {
+        let pool = pool.clone();
+        self.register_pool_exporter(Arc::new(DynamicPoolExporter::new(name, move || {
+            pool.status()
+        })));
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn data_persistence_compiles_without_outbox_dependency() {
+        let backend = crate::persistence::SqliteBackend::in_memory()
+            .await
+            .expect("sqlite in-memory");
+        let pool = DatabasePool::new(backend, DatabaseConfig::new("sqlite::memory:"));
+        let status = pool.status();
+        assert!(!status.is_closed);
+
+        let registry = MetricsRegistry::new();
+        registry.register_pool("primary", &pool);
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "active")]
+            ),
+            Some(0.0)
+        );
+
+        let hc = pool.health_check("db");
+        let res = hc.run().await;
+        assert_eq!(res.status, HealthStatus::Ok);
+    }
+}

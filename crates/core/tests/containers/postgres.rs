@@ -580,7 +580,7 @@ async fn test_postgres_distributed_lock_mutual_exclusion_and_fencing() {
         .expect("init lock schema failed");
 
     // Worker 1 acquires lock
-    let guard1 = lock_svc
+    let mut guard1 = lock_svc
         .acquire("billing-reconciliation", Duration::from_secs(3))
         .await
         .expect("acquire call failed")
@@ -604,7 +604,7 @@ async fn test_postgres_distributed_lock_mutual_exclusion_and_fencing() {
 
     // Worker 1 renews lease
     lock_svc
-        .renew(&guard1, Duration::from_secs(3))
+        .renew(&mut guard1, Duration::from_secs(3))
         .await
         .expect("renewal should succeed");
 
@@ -642,7 +642,7 @@ async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
         .expect("init lock schema failed");
 
     // Acquire with short 100ms TTL
-    let guard1 = lock_svc
+    let mut guard1 = lock_svc
         .acquire("ephemeral-job", Duration::from_millis(100))
         .await
         .expect("acquire failed")
@@ -674,7 +674,7 @@ async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
     );
 
     // Original worker tries to renew expired guard -> fails with LockExpired
-    let renew_attempt = lock_svc.renew(&guard1, Duration::from_secs(2)).await;
+    let renew_attempt = lock_svc.renew(&mut guard1, Duration::from_secs(2)).await;
     match renew_attempt {
         Err(CoordinationError::LockExpired { resource }) => {
             assert_eq!(resource, "ephemeral-job");
@@ -1691,4 +1691,80 @@ async fn test_postgres_parameterized_transaction_and_native_escape_hatch() {
         .expect("count")
         .expect("count present");
     assert_eq!(count, "3");
+}
+
+#[tokio::test]
+async fn test_postgres_transaction_raw_no_param_and_error_classification() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = pool.backend();
+
+    // 1. Multi-statement raw SQL via both `execute` and `execute_params(..., &[])` on a transaction.
+    let tx = backend.begin_transaction().await.expect("begin tx");
+    tx.execute("CREATE TABLE pg_raw_a (id INT PRIMARY KEY); INSERT INTO pg_raw_a (id) VALUES (1);")
+        .await
+        .expect("tx.execute raw multi-statement must succeed");
+
+    tx.execute_params(
+        "CREATE TABLE pg_raw_b (id INT PRIMARY KEY); CREATE TABLE pg_raw_c (id INT PRIMARY KEY);",
+        &[],
+    )
+    .await
+    .expect("tx.execute_params with empty params must run raw multi-statement SQL");
+
+    let count_a = tx
+        .query_scalar("SELECT count(*) FROM pg_raw_a")
+        .await
+        .expect("query pg_raw_a")
+        .expect("count present");
+    assert_eq!(count_a, "1");
+    tx.commit().await.expect("commit raw DDL tx");
+
+    // 2. Terminating the transaction's backend socket causes subsequent transaction calls to hit
+    // an IO/EOF error, which must classify via `map_sqlx_error` as `ConnectionFailed` (not `QueryFailed`).
+    let tx_drop = backend.begin_transaction().await.expect("begin tx_drop");
+    let pid = tx_drop
+        .query_scalar("SELECT pg_backend_pid()::text")
+        .await
+        .expect("read pg_backend_pid")
+        .expect("pid present");
+    let pid_num: i32 = pid.parse().expect("numeric pid");
+
+    backend
+        .query_scalar_params(
+            "SELECT pg_terminate_backend($1::int4)::text",
+            &[DbValue::Int(pid_num as i64)],
+        )
+        .await
+        .expect("terminate backend");
+
+    // First call after termination typically receives FATAL 57P01 or EOF; the subsequent call
+    // on the dead connection hits an IO error that must map to ConnectionFailed.
+    let first_err = tx_drop
+        .execute("SELECT 1")
+        .await
+        .expect_err("first call after terminate must fail");
+    if matches!(first_err, PersistenceError::QueryFailed(_)) {
+        let second_err = tx_drop
+            .execute_params("SELECT $1::int4", &[DbValue::Int(1)])
+            .await
+            .expect_err("second call on terminated tx must fail");
+        assert!(
+            matches!(second_err, PersistenceError::ConnectionFailed(_)),
+            "expected ConnectionFailed from map_sqlx_error on dead tx connection, got: {second_err:?}"
+        );
+    } else {
+        assert!(
+            matches!(first_err, PersistenceError::ConnectionFailed(_)),
+            "expected ConnectionFailed from map_sqlx_error on dead tx connection, got: {first_err:?}"
+        );
+    }
+
+    let qs_err = tx_drop
+        .query_scalar("SELECT 1")
+        .await
+        .expect_err("query_scalar on dead tx must fail");
+    assert!(
+        matches!(qs_err, PersistenceError::ConnectionFailed(_)),
+        "expected ConnectionFailed on dead tx query_scalar, got: {qs_err:?}"
+    );
 }

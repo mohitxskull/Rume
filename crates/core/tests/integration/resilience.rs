@@ -242,6 +242,40 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
 }
 
 #[tokio::test]
+async fn test_circuit_breaker_half_open_abandoned_trial_released() {
+    tokio::time::pause();
+    let config = CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 2,
+        reset_timeout: Duration::from_millis(40),
+    };
+    let breaker = CircuitBreaker::new(config);
+
+    // Trip the breaker to Open
+    breaker.on_failure();
+    breaker.on_failure();
+    assert_eq!(breaker.state(), CircuitState::Open);
+
+    // Fast-forward past reset timeout -> HalfOpen
+    tokio::time::advance(Duration::from_millis(50)).await;
+    assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+    // First request is allowed as trial probe
+    assert!(breaker.allow_request());
+
+    // Abandon the trial: do NOT call on_success/on_failure (simulates client
+    // disconnect or future cancellation). The half_open_in_flight slot should
+    // be released after the reset timeout elapses, not wedge the circuit.
+    tokio::time::advance(Duration::from_millis(50)).await;
+
+    // A subsequent trial must be permitted (not wedged HalfOpen)
+    assert!(
+        breaker.allow_request(),
+        "abandoned HalfOpen trial should release the slot, not wedge the circuit"
+    );
+}
+
+#[tokio::test]
 async fn test_rate_limiter_prune_expired_clients() {
     tokio::time::pause();
     let limiter = RateLimiter::new(RateLimitConfig {
@@ -502,4 +536,37 @@ async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
         .unwrap();
     let res3 = app.request(req3).await;
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Regression test for RC-08: `RateLimiter::check` must not panic on a `current_thread`
+/// runtime when a Redis backend is configured. It must return a clear error directing
+/// callers to `check_async` instead of blocking on the async Redis client via
+/// `block_in_place` + `Handle::current().block_on`.
+///
+/// The pool is never actually used: `check` returns an error before touching Redis, and
+/// pool construction is lazy (no connection is opened).
+#[tokio::test(flavor = "current_thread")]
+#[cfg(feature = "redis")]
+async fn rate_limiter_check_redis_returns_backend_error_on_current_thread_runtime() {
+    use deadpool_redis::{Manager, Pool};
+
+    let pool = Pool::builder(Manager::new("redis://127.0.0.1:6379").unwrap())
+        .build()
+        .unwrap();
+
+    let config = RateLimitConfig {
+        max_requests: 10,
+        window: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let limiter = RateLimiter::redis(pool, config);
+
+    // Runs inside a `current_thread` runtime: before the RC-08 fix this panicked with
+    // "cannot block on a runtime from within a runtime".
+    let result = limiter.check("some-key");
+
+    assert!(
+        matches!(result, Err(ResilienceError::Backend(_))),
+        "expected Backend error directing callers to check_async, got: {result:?}"
+    );
 }

@@ -23,10 +23,13 @@ toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+sqlparser.workspace = true
 unicode-width = "=0.2.3"
+proc-macro2.workspace = true
 chrono = "=0.4.45"
 dotenvy.workspace = true
 redis.workspace = true
+syn.workspace = true
 
 [dev-dependencies]
 cargo_metadata = "0.23.1"

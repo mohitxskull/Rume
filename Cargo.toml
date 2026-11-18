@@ -1,6 +1,15 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/foundation",
+    "crates/observability",
+    "crates/data",
+    "crates/messaging",
+    "crates/security",
+    "crates/http",
+    "crates/enterprise",
+    "crates/app",
+    "crates/testing",
     "crates/core",
     "crates/cli",
     "crates/macro",
@@ -21,11 +30,21 @@ rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rume-foundation = { path = "crates/foundation", version = "=0.1.0" }
+rume-observability = { path = "crates/observability", version = "=0.1.0" }
+rume-data = { path = "crates/data", version = "=0.1.0" }
+rume-messaging = { path = "crates/messaging", version = "=0.1.0" }
+rume-security = { path = "crates/security", version = "=0.1.0" }
+rume-http = { path = "crates/http", version = "=0.1.0" }
+rume-enterprise = { path = "crates/enterprise", version = "=0.1.0" }
+rume-app = { path = "crates/app", version = "=0.1.0" }
+rume-testing = { path = "crates/testing", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
 tokio = { version = "=1.54.1", features = ["full", "test-util"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tracing = "=0.1.44"
+tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 thiserror = "=2.0.21"
 secrecy = { version = "=0.10.3", features = ["serde"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
@@ -37,11 +56,35 @@ serde_json = "1.0.154"
 clap = { version = "=4.6.7", features = ["derive"] }
 tempfile = "3.27.0"
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
+# SQL parsing and validation used by `rume sql:check`. Pinned to an exact version so the
+# dialect-aware placeholder and comment handling is deterministic across builds.
+sqlparser = "=0.53.0"
 deadpool-redis = "=0.23.1"
 redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
+# SAML 2.0 assertion parsing and signature verification (used by the `saml`
+# feature of `rume`; see crates/core/src/enterprise/saml.rs). saml-rs owns the
+# SAML namespace constants, strict ISO 8601 time validation, and signed-reference
+# / anti-wrapping rules we delegate to.
+saml-rs = "=0.8.0"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
 garde = { version = "=0.23.0", features = ["derive", "email", "url"] }
+# Constant-time comparison for security-sensitive equality checks (RC-14).
+subtle = "=2.6.1"
+
+# Rust source parsing used by `rume doctor` to validate module DAG acyclicity
+# (RC-20). Pinned to match crates/macro. syn::parse_file tokenizes the whole
+# file so multi-line rustfmt formatting is handled natively instead of by a
+# fragile hand-rolled brace-depth scanner.
+syn = { version = "=3.0.10", features = ["full", "visit"] }
+proc-macro2 = "=1.0.107"
+
+# OpenTelemetry backbone & tracing bridge (Plan 002).
+opentelemetry = "=0.33.1"
+opentelemetry_sdk = "=0.33.1"
+opentelemetry-otlp = "=0.33.1"
+opentelemetry-appender-tracing = "=0.33.1"
+tracing-opentelemetry = "=0.34.0"
 
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,
