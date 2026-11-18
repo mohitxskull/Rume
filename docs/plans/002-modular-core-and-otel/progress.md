@@ -36,4 +36,4 @@ Ruling: Kept `ModuleHarness` struct name in `rume-testing::module_harness` and a
 Task 6: complete (345b4eb..5edd37e, per-task review skipped per user ruling)
 
 Whole-plan review (`5bee7ce..5edd37e`): PASS (0 Critical, 0 Major, 3 Minor).
-Minor fixes (`5edd37e..844e392`): resolved `[m-1]`, `[m-2]`, `[m-3]` (ephemeral `127.0.0.1:0` test port + `#[cfg(feature = "sqlite")]` test gating); `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -j 2 -- -D warnings`, `rume-app`, `rume-data`, and `rume-messaging` tests pass with 0 warnings.
+Minor fixes (`0703691..35ef99f`): resolved `[m-1]`, `[m-2]`, `[m-3]` (ephemeral `127.0.0.1:0` test port + `#[cfg(feature = "sqlite")]` test gating); `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -j 2 -- -D warnings`, `rume-app` (29+1), `rume-data` (4), and `rume-messaging` (13) tests pass with 0 warnings.
