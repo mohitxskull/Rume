@@ -400,40 +400,35 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
-            let res = query
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            // Why: Match `SqliteBackend::execute_params` by routing empty-param
+            // calls through `sqlx::raw_sql` for unprepared/multi-statement SQL
+            // and mapping all sqlx errors via `map_sqlx_error` to preserve
+            // driver error classification.
+            let res = if params_vec.is_empty() {
+                sqlx::raw_sql(AssertSqlSafe(statement))
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(map_sqlx_error)?
+            } else {
+                let mut query = sqlx::query(AssertSqlSafe(statement));
+                for param in &params_vec {
+                    query = match param {
+                        DbValue::Null => query.bind(None as Option<String>),
+                        DbValue::Text(s) => query.bind(s.as_str()),
+                        DbValue::Int(i) => query.bind(*i),
+                        DbValue::Float(f) => query.bind(*f),
+                        DbValue::Bool(b) => query.bind(*b),
+                        DbValue::Bytes(b) => query.bind(b.as_slice()),
+                    };
+                }
+                query.execute(&mut **tx).await.map_err(map_sqlx_error)?
+            };
             Ok(res.rows_affected())
         })
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let statement = statement.to_string();
-        let tx_arc = Arc::clone(&self.tx);
-        Box::pin(async move {
-            let mut guard = tx_arc.lock().await;
-            let tx = guard.as_mut().ok_or_else(|| {
-                PersistenceError::TransactionError("transaction already resolved".into())
-            })?;
-            use sqlx::Executor;
-            let res = (&mut **tx)
-                .execute(AssertSqlSafe(statement))
-                .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-            Ok(res.rows_affected())
-        })
+        self.execute_params(statement, &[])
     }
 
     fn query_scalar_params(
@@ -463,7 +458,7 @@ impl DatabaseTransaction for SqliteTransaction {
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             Ok(row.and_then(|r| extract_sqlite_scalar(&r)))
         })
     }
@@ -492,10 +487,7 @@ impl DatabaseTransaction for SqliteTransaction {
                     DbValue::Bytes(b) => query.bind(b.as_slice()),
                 };
             }
-            let rows: Vec<SqliteRow> = query
-                .fetch_all(&mut **tx)
-                .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            let rows: Vec<SqliteRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
         })
     }
@@ -527,7 +519,7 @@ impl DatabaseTransaction for SqliteTransaction {
             let row: Option<SqliteRow> = query
                 .fetch_optional(&mut **tx)
                 .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             row.as_ref().map(sqlx_sqlite_row_to_db_row).transpose()
         })
     }

@@ -385,3 +385,32 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
     /// without explicit resolution (e.g. releasing a MySQL session-level named lock).
     fn release_mysql_lock_on_drop(&self, _armed: bool) {}
 }
+
+#[cfg(all(test, any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn map_sqlx_error_preserves_driver_classifications() {
+        assert!(matches!(
+            map_sqlx_error(sqlx::Error::PoolTimedOut),
+            PersistenceError::Timeout
+        ));
+        assert!(matches!(
+            map_sqlx_error(sqlx::Error::PoolClosed),
+            PersistenceError::Closed
+        ));
+        let io_err = sqlx::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "peer reset",
+        ));
+        assert!(matches!(
+            map_sqlx_error(io_err),
+            PersistenceError::ConnectionFailed(msg) if msg.contains("peer reset")
+        ));
+        assert!(matches!(
+            map_sqlx_error(sqlx::Error::RowNotFound),
+            PersistenceError::QueryFailed(_)
+        ));
+    }
+}

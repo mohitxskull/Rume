@@ -374,30 +374,25 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
-            let res = query
-                .execute(&mut **tx)
-                .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+            // Why: Match `PostgresBackend::execute_params` by routing empty-param
+            // calls through `sqlx::raw_sql` so unprepared/multi-statement SQL works,
+            // and map all sqlx errors via `map_sqlx_error` so driver classifications
+            // (`Timeout`, `Closed`, `ConnectionFailed`, `QueryFailed`) are preserved.
+            let res = if params_vec.is_empty() {
+                sqlx::raw_sql(AssertSqlSafe(statement))
+                    .execute(&mut **tx)
+                    .await
+                    .map_err(map_sqlx_error)?
+            } else {
+                let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
+                query.execute(&mut **tx).await.map_err(map_sqlx_error)?
+            };
             Ok(res.rows_affected())
         })
     }
 
     fn execute(&self, statement: &str) -> BoxFuture<'_, Result<u64, PersistenceError>> {
-        let statement = statement.to_string();
-        let tx_arc = Arc::clone(&self.tx);
-        Box::pin(async move {
-            let mut guard = tx_arc.lock().await;
-            let tx = guard.as_mut().ok_or_else(|| {
-                PersistenceError::TransactionError("transaction already resolved".into())
-            })?;
-            use sqlx::Executor;
-            let res = (&mut **tx)
-                .execute(AssertSqlSafe(statement))
-                .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
-            Ok(res.rows_affected())
-        })
+        self.execute_params(statement, &[])
     }
 
     fn query_scalar_params(
@@ -417,7 +412,7 @@ impl DatabaseTransaction for PostgresTransaction {
             let row: Option<PgRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
-                .map_err(|e| PersistenceError::QueryFailed(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             Ok(row.and_then(|r| extract_postgres_scalar(&r)))
         })
     }
