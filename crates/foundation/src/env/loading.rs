@@ -609,15 +609,15 @@ mod tests {
         let msg = err.to_string();
         assert!(
             !msg.contains("top-secret-alpha"),
-            "error leaked first secret element: {msg}"
+            "error leaked first secret element"
         );
         assert!(
             !msg.contains("top-secret-beta"),
-            "error leaked second secret element: {msg}"
+            "error leaked second secret element"
         );
         assert!(
             msg.contains("[redacted]"),
-            "error should contain [redacted]: {msg}"
+            "error should contain [redacted]"
         );
 
         // Non-secret diagnostic text must be preserved.
@@ -637,7 +637,7 @@ mod tests {
         let msg = err.to_string();
         assert!(
             msg.contains("bad-port"),
-            "non-secret diagnostic value should be preserved: {msg}"
+            "non-secret diagnostic value should be preserved"
         );
     }
 

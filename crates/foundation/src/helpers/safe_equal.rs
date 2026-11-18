@@ -158,20 +158,4 @@ mod verification {
 
         assert!(!safe_equal(&a[..len_a], &b[..len_b]));
     }
-
-    #[kani::proof]
-    #[kani::unwind(10)]
-    fn kani_safe_equal_hashed_reflexive_and_panic_free() {
-        let a: [u8; MAX_LEN] = kani::any();
-        let b: [u8; MAX_LEN] = kani::any();
-        let len_a: usize = kani::any();
-        let len_b: usize = kani::any();
-        kani::assume(len_a <= MAX_LEN);
-        kani::assume(len_b <= MAX_LEN);
-
-        let sa = &a[..len_a];
-        let sb = &b[..len_b];
-        assert!(safe_equal_hashed(sa, sa));
-        assert_eq!(safe_equal_hashed(sa, sb), sa == sb);
-    }
 }

@@ -18,6 +18,7 @@ jobs:
   kani:
     name: Kani proofs (rume-foundation)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7.0.1
       - name: Run Kani

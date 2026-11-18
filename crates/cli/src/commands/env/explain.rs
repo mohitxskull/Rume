@@ -22,30 +22,27 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
         }
     };
 
-    // Look up the value (secrets are exposed internally via `get`).
-    let raw_value = match resolved.get(key) {
-        Some(v) => v.to_string(),
-        None => {
-            if json {
-                let err_json = serde_json::json!({
-                    "error": format!("environment variable '{key}' is not defined")
-                });
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&err_json).unwrap_or_default()
-                );
-            } else {
-                eprintln!("error: environment variable '{key}' is not defined");
-                eprintln!("hint: check your .env files or process environment");
-            }
-            std::process::exit(1);
+    // Look up the value without calling `resolved.get(key)` / `expose_secret()` so raw
+    // secret values never flow into CLI stdout/JSON output.
+    let (display_value, is_secret) = if resolved.secrets.contains_key(key) {
+        ("[redacted]".to_string(), true)
+    } else if let Some(v) = resolved.values.get(key) {
+        (redact_value(key, v), is_secret_key(key))
+    } else {
+        if json {
+            let err_json = serde_json::json!({
+                "error": format!("environment variable '{key}' is not defined")
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&err_json).unwrap_or_default()
+            );
+        } else {
+            eprintln!("error: environment variable '{key}' is not defined");
+            eprintln!("hint: check your .env files or process environment");
         }
+        std::process::exit(1);
     };
-
-    let is_secret = is_secret_key(key);
-    // Why: Always redact via `redact_value` so `env explain` never writes raw secret values to
-    // stdout/logs, even when `--unredacted` is passed.
-    let display_value = redact_value(key, &raw_value);
 
     let source = resolved
         .sources

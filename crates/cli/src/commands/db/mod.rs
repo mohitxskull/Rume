@@ -170,6 +170,17 @@ pub(crate) fn resolve_db_url_for_env_in(
     dir: &Path,
     env_name: &str,
 ) -> Result<Option<String>, String> {
+    resolve_db_url_for_env_with_vars(dir, env_name, std::env::vars())
+}
+
+pub(crate) fn resolve_db_url_for_env_with_vars<I>(
+    dir: &Path,
+    env_name: &str,
+    process_vars: I,
+) -> Result<Option<String>, String>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     // Why: parse `.env` files raw (without `dotenvy`'s eager per-file `${VAR}`
     // expansion) and run `rume::env::interpolate_value` only after all `.env*`
     // layers and process env are merged, so overrides in `.env.{env}` /
@@ -190,7 +201,7 @@ pub(crate) fn resolve_db_url_for_env_in(
         }
     }
 
-    for (key, value) in std::env::vars() {
+    for (key, value) in process_vars {
         merged.insert(key, value);
     }
 
@@ -628,9 +639,11 @@ mod tests {
     #[test]
     fn resolve_db_url_uses_env_interpolation_and_config_layering() {
         let dir = tempfile::tempdir().unwrap();
+        let resolve_isolated =
+            |path: &Path| resolve_db_url_for_env_with_vars(path, "development", std::iter::empty());
 
         // Neither .env nor config/app.toml present -> Ok(None)
-        assert_eq!(resolve_db_url_in(dir.path()), Ok(None));
+        assert_eq!(resolve_isolated(dir.path()), Ok(None));
 
         // config/app.toml + config/app.local.toml override
         std::fs::create_dir_all(dir.path().join("config")).unwrap();
@@ -645,14 +658,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_db_url_in(dir.path()),
+            resolve_isolated(dir.path()),
             Ok(Some("mariadb://local:3306/app".to_string()))
         );
 
         // Empty DATABASE_URL in .env falls through to config/app*.toml
         std::fs::write(dir.path().join(".env"), "DATABASE_URL=   \n").unwrap();
         assert_eq!(
-            resolve_db_url_in(dir.path()),
+            resolve_isolated(dir.path()),
             Ok(Some("mariadb://local:3306/app".to_string()))
         );
 
@@ -663,7 +676,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            resolve_db_url_in(dir.path()),
+            resolve_isolated(dir.path()),
             Ok(Some(
                 "postgres://app:secret@db.internal:5432/rume".to_string()
             ))
@@ -681,7 +694,7 @@ mod tests {
         std::fs::write(dir.path().join(".env.production"), "DB_HOST=prod.example\n").unwrap();
 
         assert_eq!(
-            resolve_db_url_for_env_in(dir.path(), "production"),
+            resolve_db_url_for_env_with_vars(dir.path(), "production", std::iter::empty()),
             Ok(Some(
                 "postgres://app:secret@prod.example:5432/rume".to_string()
             ))
