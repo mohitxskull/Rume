@@ -514,11 +514,10 @@ impl MetricsRegistryPoolExt for MetricsRegistry {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "sqlite"))]
 mod tests {
     use super::*;
 
-    #[cfg(feature = "sqlite")]
     #[tokio::test]
     async fn data_persistence_compiles_without_outbox_dependency() {
         let backend = crate::persistence::SqliteBackend::in_memory()

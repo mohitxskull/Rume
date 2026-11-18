@@ -1926,6 +1926,7 @@ mod tests {
         let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = test_ctx();
         let builder = RumeBuilder::new(ctx)
+            .bind("127.0.0.1:0")
             .module(RecordingModule {
                 name: "c",
                 deps: vec!["b"],

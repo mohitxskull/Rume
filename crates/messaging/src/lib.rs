@@ -14,7 +14,9 @@ mod tests {
     use tokio::sync::oneshot;
 
     use crate::events::{Event, EventBus};
+    #[cfg(feature = "sqlite")]
     use crate::jobs::{Job, JobContext, JobError, JobHandler, JobRegistry, QueuedJob, RetryPolicy};
+    #[cfg(feature = "sqlite")]
     use crate::outbox::{OutboxMessage, OutboxRelay, OutboxRepository};
     use rume_observability::TraceContext;
 
@@ -27,19 +29,23 @@ mod tests {
         const TYPE: &'static str = "test.event";
     }
 
+    #[cfg(feature = "sqlite")]
     #[derive(Debug, Clone, Serialize, Deserialize)]
     struct TestJob {
         id: String,
     }
 
+    #[cfg(feature = "sqlite")]
     impl Job for TestJob {
         const NAME: &'static str = "test_job";
     }
 
+    #[cfg(feature = "sqlite")]
     struct CapturingHandler {
         tx: tokio::sync::Mutex<Option<oneshot::Sender<Option<TraceContext>>>>,
     }
 
+    #[cfg(feature = "sqlite")]
     impl JobHandler<TestJob> for CapturingHandler {
         fn handle<'a>(
             &'a self,
