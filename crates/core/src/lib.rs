@@ -19,29 +19,29 @@
 #![forbid(unsafe_code)]
 
 pub mod app;
-pub mod auth;
 pub use rume_data::cache;
 pub use rume_data::coordination;
+pub use rume_enterprise::enterprise;
 pub use rume_foundation::config;
-pub mod enterprise;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::helpers;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
+pub use rume_security::auth;
 pub mod metrics;
 pub mod module;
-pub mod openapi;
 pub use rume_data::persistence;
+pub use rume_http::openapi;
 pub use rume_messaging::outbox;
 pub mod prelude;
-pub mod resilience;
+pub use rume_http::resilience;
 pub mod routing;
-pub mod saga;
-pub mod security;
-pub mod tenant;
+pub use rume_enterprise::saga;
+pub use rume_security::security;
+pub use rume_security::tenant;
 pub mod testing;
-pub mod validation;
+pub use rume_http::validation;
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,

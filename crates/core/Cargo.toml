@@ -15,6 +15,12 @@ rume-observability.workspace = true
 rume-data.workspace = true
 # Events, transactional outbox, and background jobs.
 rume-messaging.workspace = true
+# Authentication, security hardening, and multi-tenancy.
+rume-security.workspace = true
+# HTTP routing, OpenAPI, validation, and resilience.
+rume-http.workspace = true
+# Enterprise SAML/SCIM and Saga workflows.
+rume-enterprise.workspace = true
 # Core HTTP substrate.
 axum.workspace = true
 # Async runtime.
@@ -70,11 +76,18 @@ required-features = ["postgres", "redis"]
 default = ["sqlite", "testing"]
 testing = ["dep:reqwest"]
 postgres = ["dep:sqlx", "sqlx/postgres", "rume-data/postgres", "rume-messaging/postgres"]
-redis = ["dep:deadpool-redis", "dep:redis", "rume-data/redis", "rume-messaging/redis"]
+redis = [
+    "dep:deadpool-redis",
+    "dep:redis",
+    "rume-data/redis",
+    "rume-messaging/redis",
+    "rume-security/redis",
+    "rume-http/redis",
+]
 sqlite = ["dep:sqlx", "sqlx/sqlite", "rume-data/sqlite", "rume-messaging/sqlite"]
 mysql = ["dep:sqlx", "sqlx/mysql", "rume-data/mysql", "rume-messaging/mysql"]
-saml = ["dep:quick-xml", "dep:saml-rs"]
-enterprise = ["saml"]
+saml = ["dep:quick-xml", "dep:saml-rs", "rume-enterprise/saml"]
+enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]
 
 [dev-dependencies]

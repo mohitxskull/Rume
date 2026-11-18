@@ -501,4 +501,83 @@ mod tests {
         assert!(!report.is_healthy);
         assert_eq!(report.status, "error");
     }
+
+    #[tokio::test]
+    async fn health_check_cache_ttl_edge_cases_match_contract() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Debug)]
+        struct CountingCheck {
+            name: &'static str,
+            runs: Arc<AtomicUsize>,
+        }
+
+        impl HealthCheck for CountingCheck {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                let name = self.name.to_string();
+                let runs = Arc::clone(&self.runs);
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    HealthCheckResult {
+                        name,
+                        status: HealthStatus::Ok,
+                        message: "ok".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                        duration_ms: None,
+                    }
+                })
+            }
+        }
+
+        // Empty registry never hits cache even when cache_ttl is set.
+        let empty = HealthChecks::new().cache_ttl(Some(Duration::from_secs(60)));
+        assert!(empty.get_cached_report(Duration::from_secs(60)).is_none());
+        let empty_report = empty.run().await;
+        assert!(empty_report.checks.is_empty());
+
+        // Duration::ZERO never returns a cached result because elapsed < ZERO is always false.
+        let zero_runs = Arc::new(AtomicUsize::new(0));
+        let zero_ttl = HealthChecks::new()
+            .cache_ttl(Some(Duration::ZERO))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&zero_runs),
+            });
+        let r1 = zero_ttl.run().await;
+        let r2 = zero_ttl.run().await;
+        assert_eq!(zero_runs.load(Ordering::SeqCst), 2);
+        assert!(!r1.checks[0].cached);
+        assert!(!r2.checks[0].cached);
+
+        // Positive TTL returns cached=true within TTL and re-runs once expired.
+        let runs = Arc::new(AtomicUsize::new(0));
+        let short_ttl = HealthChecks::new()
+            .cache_ttl(Some(Duration::from_millis(40)))
+            .register(CountingCheck {
+                name: "db",
+                runs: Arc::clone(&runs),
+            });
+        let first = short_ttl.run().await;
+        assert!(!first.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let cached = short_ttl.run().await;
+        assert!(cached.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        // Backdate the cached timestamp past TTL instead of sleeping so expiry is deterministic.
+        {
+            let mut cache = short_ttl.cache.write().unwrap();
+            let entry = cache.get_mut("db").expect("cached entry for db");
+            entry.0 = Instant::now() - Duration::from_secs(10);
+        }
+        let expired = short_ttl.run().await;
+        assert!(!expired.checks[0].cached);
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
 }

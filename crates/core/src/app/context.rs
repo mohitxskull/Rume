@@ -51,6 +51,28 @@ where
     pub state: S,
 }
 
+impl<E, C, S> axum::extract::FromRef<AppContext<E, C, S>> for Availability
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn from_ref(ctx: &AppContext<E, C, S>) -> Self {
+        ctx.availability.clone()
+    }
+}
+
+impl<E, C, S> axum::extract::FromRef<AppContext<E, C, S>> for HealthChecks
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    fn from_ref(ctx: &AppContext<E, C, S>) -> Self {
+        ctx.health_checks.clone()
+    }
+}
+
 impl<E, C, S> AppContext<E, C, S>
 where
     E: Clone + Send + Sync + 'static,

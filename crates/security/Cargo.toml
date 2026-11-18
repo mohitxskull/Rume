@@ -1,0 +1,27 @@
+[package]
+name = "rume-security"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Authentication, authorization, security hardening, and multi-tenancy primitives for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-data.workspace = true
+axum.workspace = true
+tower.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid = { version = "=1.29.2", features = ["v4"] }
+sha2 = "=0.11.1"
+hmac = "=0.13.0"
+deadpool-redis = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+
+[features]
+default = []
+redis = ["rume-data/redis", "dep:deadpool-redis", "dep:redis"]

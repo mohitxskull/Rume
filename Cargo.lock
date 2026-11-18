@@ -3922,10 +3922,13 @@ dependencies = [
  "reqwest",
  "rstest",
  "rume-data",
+ "rume-enterprise",
  "rume-foundation",
+ "rume-http",
  "rume-macros",
  "rume-messaging",
  "rume-observability",
+ "rume-security",
  "saml-rs",
  "secrecy",
  "serde",
@@ -3992,6 +3995,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "rume-enterprise"
+version = "0.1.0"
+dependencies = [
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "quick-xml",
+ "rume-foundation",
+ "rume-observability",
+ "saml-rs",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "rume-foundation"
 version = "0.1.0"
 dependencies = [
@@ -4007,6 +4031,26 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rume-http"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "deadpool-redis",
+ "garde",
+ "redis",
+ "rume-foundation",
+ "rume-observability",
+ "rume-security",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
  "tracing",
  "uuid",
 ]
@@ -4064,6 +4108,26 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "rume-security"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "deadpool-redis",
+ "hmac 0.13.0",
+ "redis",
+ "rume-data",
+ "rume-foundation",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
  "uuid",
 ]
 
