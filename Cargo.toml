@@ -55,6 +55,13 @@ prometheus = "=0.14.0"
 # Constant-time comparison for security-sensitive equality checks (RC-14).
 subtle = "=2.6.1"
 
+# Rust source parsing used by `rume doctor` to validate module DAG acyclicity
+# (RC-20). Pinned to match crates/macro. syn::parse_file tokenizes the whole
+# file so multi-line rustfmt formatting is handled natively instead of by a
+# fragile hand-rolled brace-depth scanner.
+syn = { version = "=3.0.10", features = ["full", "visit"] }
+proc-macro2 = "=1.0.107"
+
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,
 # testcontainers, tonic, ...), and the default `dev` profile embeds full

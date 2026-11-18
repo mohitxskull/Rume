@@ -3,6 +3,8 @@ use rume::env;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use syn::parse_file;
+use syn::visit::{self, Visit};
 
 #[derive(Serialize)]
 struct DoctorOutput {
@@ -393,14 +395,15 @@ fn check_module_dag() -> (String, bool) {
     let mut deps_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
     for file_path in files {
-        let content_opt = std::fs::read_to_string(&file_path).ok();
-        if let Some(name) = content_opt.as_deref().and_then(extract_module_name) {
-            let deps = content_opt
-                .as_deref()
-                .map(extract_module_dependencies)
-                .unwrap_or_default();
-            deps_map.insert(name, deps);
-        }
+        let content = match std::fs::read_to_string(&file_path) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+        let decl = extract_module_info(&content);
+        let Some(name) = decl.name else {
+            continue;
+        };
+        deps_map.insert(name, decl.dependencies);
     }
 
     if deps_map.is_empty() {
@@ -468,45 +471,213 @@ fn check_module_dag() -> (String, bool) {
     (format!("{count} module(s) verified acyclic"), true)
 }
 
-fn extract_module_name(content: &str) -> Option<String> {
-    content.lines().find_map(|line| {
-        let trimmed = line.trim();
-        let is_name_def = (trimmed.contains("fn name(") || trimmed.contains("name(&self)"))
-            && trimmed.contains('"');
-        if is_name_def {
-            trimmed
-                .split('"')
-                .nth(1)
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-        } else {
-            None
-        }
-    })
+/// The module name and its declared dependencies extracted from one Rust
+/// source file.
+#[derive(Default)]
+struct ModuleDecl {
+    name: Option<String>,
+    dependencies: Vec<String>,
 }
 
-fn extract_module_dependencies(content: &str) -> Vec<String> {
-    let mut deps = Vec::new();
-    let mut in_deps_fn = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.contains("fn dependencies(") || trimmed.contains("dependencies(&self)") {
-            in_deps_fn = true;
-        }
-        if in_deps_fn {
-            let mut remaining = trimmed;
-            while let Some(start) = remaining.find('"') {
-                if let Some(end) = remaining[start + 1..].find('"') {
-                    deps.push(remaining[start + 1..start + 1 + end].to_string());
-                    remaining = &remaining[start + 1 + end + 1..];
-                } else {
-                    break;
+/// Parse `content` with `syn::parse_file` and collect the `name()` and
+/// `dependencies()` methods declared in it.
+///
+/// Why: `syn::parse_file` tokenizes the whole file, so multi-line rustfmt
+/// formatting — a `fn` signature split across lines, a string literal split
+/// across lines, or a `vec![...]` spread over several lines — is parsed
+/// correctly without a fragile hand-rolled brace-depth scanner (RC-20).
+fn extract_module_info(content: &str) -> ModuleDecl {
+    let Ok(file) = parse_file(content) else {
+        return ModuleDecl::default();
+    };
+
+    let mut extractor = ModuleExtractor::default();
+    extractor.visit_file(&file);
+    extractor.decl
+}
+
+/// Walks a parsed syntax tree and records the `name` and `dependencies`
+/// methods of module declarations.
+///
+/// Why: syn's `Visit` trait recurses into expressions automatically, so we
+/// only need to intercept `fn name` / `fn dependencies` bodies and collect the
+/// string literals they contain — no manual brace tracking (RC-20).
+#[derive(Default)]
+struct ModuleExtractor {
+    decl: ModuleDecl,
+    current_fn: Option<String>,
+}
+
+impl<'ast> Visit<'ast> for ModuleExtractor {
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        let prev = self.current_fn.replace(node.sig.ident.to_string());
+        visit::visit_item_fn(self, node);
+        self.current_fn = prev;
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        let prev = self.current_fn.replace(node.sig.ident.to_string());
+        visit::visit_impl_item_fn(self, node);
+        self.current_fn = prev;
+    }
+
+    fn visit_expr_lit(&mut self, node: &'ast syn::ExprLit) {
+        if let syn::Lit::Str(s) = &node.lit {
+            match self.current_fn.as_deref() {
+                Some("name") => {
+                    if self.decl.name.is_none() {
+                        self.decl.name = Some(s.value());
+                    }
                 }
-            }
-            if trimmed.contains('}') {
-                break;
+                Some("dependencies") => {
+                    self.decl.dependencies.push(s.value());
+                }
+                _ => {}
             }
         }
     }
-    deps
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // syn's default visitor does not descend into macro bodies, so a
+        // `dependencies()` body like `vec!["catalog", "inventory"]` would
+        // otherwise yield no string literals. Re-parse the macro token stream
+        // to collect them (RC-20).
+        if self.current_fn.as_deref() != Some("dependencies") {
+            return;
+        }
+        let mut current: Vec<proc_macro2::TokenTree> = Vec::new();
+        for tt in node.tokens.clone() {
+            if let proc_macro2::TokenTree::Punct(p) = &tt
+                && p.as_char() == ','
+            {
+                push_dependency_literal(&current, &mut self.decl.dependencies);
+                current.clear();
+                continue;
+            }
+            current.push(tt);
+        }
+        push_dependency_literal(&current, &mut self.decl.dependencies);
+    }
+}
+
+/// Parse one comma-separated segment of a `vec![...]` macro body and, if it is
+/// a string literal, append its value to `deps`.
+fn push_dependency_literal(tokens: &[proc_macro2::TokenTree], deps: &mut Vec<String>) {
+    if tokens.is_empty() {
+        return;
+    }
+    let stream: proc_macro2::TokenStream = tokens.iter().cloned().collect();
+    if let Ok(expr) = syn::parse2::<syn::Expr>(stream)
+        && let syn::Expr::Lit(lit) = &expr
+        && let syn::Lit::Str(s) = &lit.lit
+    {
+        deps.push(s.value());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_module_info_single_line() {
+        let content = r#"
+impl Module for CatalogModule {
+    fn name(&self) -> &str {
+        "catalog"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+"#;
+        let decl = extract_module_info(content);
+        assert_eq!(decl.name.as_deref(), Some("catalog"));
+        assert!(decl.dependencies.is_empty());
+    }
+
+    #[test]
+    fn extract_module_info_multi_line_name_and_dependencies() {
+        let content = r#"
+impl Module for OrdersModule {
+    fn name(
+        &self,
+    ) -> &str {
+        "orders"
+    }
+
+    fn dependencies(
+        &self,
+    ) -> Vec<&str> {
+        vec![
+            "catalog",
+            "inventory",
+        ]
+    }
+}
+"#;
+        let decl = extract_module_info(content);
+        assert_eq!(decl.name.as_deref(), Some("orders"));
+        assert_eq!(
+            decl.dependencies,
+            vec!["catalog".to_string(), "inventory".to_string()]
+        );
+    }
+
+    #[test]
+    fn extract_module_info_multi_line_string_literal() {
+        let content = r##"
+impl Module for ShippingModule {
+    fn name(
+        &self,
+    ) -> &str {
+        r#"shipping"#
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        Vec::new()
+    }
+}
+"##;
+        let decl = extract_module_info(content);
+        assert_eq!(decl.name.as_deref(), Some("shipping"));
+        assert!(decl.dependencies.is_empty());
+    }
+
+    #[test]
+    fn extract_module_info_ignores_non_module_literals() {
+        let content = r#"
+fn helper() -> &str {
+    "not a module name"
+}
+
+impl Module for InventoryModule {
+    fn name(&self) -> &str {
+        "inventory"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        vec!["catalog"]
+    }
+}
+"#;
+        let decl = extract_module_info(content);
+        assert_eq!(decl.name.as_deref(), Some("inventory"));
+        assert_eq!(decl.dependencies, vec!["catalog".to_string()]);
+    }
+
+    #[test]
+    fn extract_module_info_empty_input() {
+        let decl = extract_module_info("");
+        assert!(decl.name.is_none());
+        assert!(decl.dependencies.is_empty());
+    }
+
+    #[test]
+    fn extract_module_info_unparseable_input() {
+        let decl = extract_module_info("this is not rust {{{");
+        assert!(decl.name.is_none());
+        assert!(decl.dependencies.is_empty());
+    }
 }
