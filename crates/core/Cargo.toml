@@ -7,6 +7,8 @@ license.workspace = true
 description = "Explicit, typed, production-ready application shell for Axum."
 
 [dependencies]
+# Foundation primitives.
+rume-foundation.workspace = true
 # Core HTTP substrate.
 axum.workspace = true
 # Async runtime.
@@ -28,8 +30,6 @@ dotenvy.workspace = true
 url.workspace = true
 # TOML configuration files.
 toml.workspace = true
-# Optional JSON Schema generation.
-schemars = { version = "=1.2.3", optional = true, features = ["derive"] }
 serde_json = "=1.0.154"
 # Tracing/logging.
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
@@ -69,6 +69,7 @@ sqlite = ["dep:sqlx", "sqlx/sqlite"]
 mysql = ["dep:sqlx", "sqlx/mysql"]
 saml = ["dep:quick-xml", "dep:saml-rs"]
 enterprise = ["saml"]
+schemars = ["rume-foundation/schemars"]
 
 [dev-dependencies]
 tempfile = "=3.27.0"

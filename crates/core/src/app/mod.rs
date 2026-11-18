@@ -3,9 +3,9 @@
 pub mod builder;
 pub mod context;
 pub mod observability;
-pub mod paths;
+pub use rume_foundation::paths;
 pub mod shutdown;
-pub mod state;
+pub use rume_foundation::state;
 
 // Re-export the public app surface at the module root for convenience.
 pub use builder::{BuildError, IntoBindAddr, MiddlewareConfigError, Rume, RumeBuilder};

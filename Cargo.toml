@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/foundation",
     "crates/core",
     "crates/cli",
     "crates/macro",
@@ -21,6 +22,7 @@ rust-version = "1.96"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
+rume-foundation = { path = "crates/foundation", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
 tokio = { version = "=1.54.1", features = ["full", "test-util"] }
@@ -61,6 +63,14 @@ subtle = "=2.6.1"
 # fragile hand-rolled brace-depth scanner.
 syn = { version = "=3.0.10", features = ["full", "visit"] }
 proc-macro2 = "=1.0.107"
+
+# OpenTelemetry backbone & tracing bridge (Plan 002).
+opentelemetry = "=0.33.1"
+opentelemetry_sdk = "=0.33.1"
+opentelemetry-otlp = "=0.33.1"
+opentelemetry-prometheus = "=0.33.0"
+opentelemetry-appender-tracing = "=0.33.1"
+tracing-opentelemetry = "=0.34.0"
 
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,

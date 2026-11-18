@@ -29,7 +29,7 @@ pub enum ParseDurationError {
 ///
 /// ```
 /// use std::time::Duration;
-/// use rume::helpers::format_duration;
+/// use rume_foundation::helpers::format_duration;
 ///
 /// assert_eq!(format_duration(Duration::from_millis(150)), "150ms");
 /// assert_eq!(format_duration(Duration::from_secs(45)), "45s");
@@ -95,7 +95,7 @@ pub fn format_duration(d: Duration) -> String {
 ///
 /// ```
 /// use std::time::Duration;
-/// use rume::helpers::parse_duration;
+/// use rume_foundation::helpers::parse_duration;
 ///
 /// assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
 /// assert_eq!(parse_duration("15s").unwrap(), Duration::from_secs(15));

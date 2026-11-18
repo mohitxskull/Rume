@@ -29,7 +29,7 @@ impl Default for TruncateOptions<'_> {
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::truncate;
+/// use rume_foundation::helpers::truncate;
 ///
 /// assert_eq!(truncate("hello world", 20), "hello world");
 /// assert_eq!(truncate("hello world", 8), "hello...");
@@ -44,7 +44,7 @@ pub fn truncate(input: &str, limit: usize) -> Cow<'_, str> {
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::{truncate_with, TruncateOptions};
+/// use rume_foundation::helpers::{truncate_with, TruncateOptions};
 ///
 /// let opts = TruncateOptions {
 ///     suffix: " [more]",

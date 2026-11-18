@@ -14,7 +14,7 @@
 //! }
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let env: Env = rume::env::load()?;
+//! let env: Env = rume_foundation::env::load()?;
 //! # Ok(())
 //! # }
 //! ```

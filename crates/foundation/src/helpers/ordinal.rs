@@ -5,7 +5,7 @@
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::ordinal_suffix;
+/// use rume_foundation::helpers::ordinal_suffix;
 ///
 /// assert_eq!(ordinal_suffix(1), "st");
 /// assert_eq!(ordinal_suffix(2), "nd");
@@ -33,7 +33,7 @@ pub fn ordinal_suffix(n: u64) -> &'static str {
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::ordinal;
+/// use rume_foundation::helpers::ordinal;
 ///
 /// assert_eq!(ordinal(1), "1st");
 /// assert_eq!(ordinal(2), "2nd");

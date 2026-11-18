@@ -18,24 +18,7 @@ use crate::persistence::error::PersistenceError;
 use crate::persistence::row::{DbRow, FromRow};
 use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 
-/// Metrics and status information for a database connection pool.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct PoolStatus {
-    /// Logical connection leases currently held by application callers via `acquire_lease`.
-    pub leased_connections: u32,
-    /// Physical active (busy) connections in the underlying driver pool (`total - idle`).
-    pub active_connections: u32,
-    /// Physical idle connections available in the underlying driver pool.
-    pub idle_connections: u32,
-    /// Physical total opened connections in the underlying driver pool.
-    pub total_connections: u32,
-    /// Configured maximum connection capacity.
-    pub max_connections: u32,
-    /// In-flight transaction handles.
-    pub in_flight_transactions: u32,
-    /// Whether the pool is closed.
-    pub is_closed: bool,
-}
+pub use rume_foundation::telemetry::PoolStatus;
 
 /// A connection pool that manages database connection lifecycles, health checks, and transactions.
 pub struct DatabasePool<B: DatabaseBackend> {

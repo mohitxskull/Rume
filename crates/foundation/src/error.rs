@@ -239,7 +239,7 @@ fn title_for(status: StatusCode) -> &'static str {
 
 impl AppError {
     /// Converts this error into an HTTP response using explicit environment configuration.
-    pub fn into_response_in_env(self, env: &crate::app::Environment) -> Response {
+    pub fn into_response_in_env(self, env: &crate::state::Environment) -> Response {
         let status = self.status_code();
 
         match self {
@@ -355,7 +355,7 @@ impl IntoResponse for AppError {
         // including under `#[cfg(test)]`. Forcing the test environment here
         // hid development/production Problem Details behaviour; `from_env()`
         // already resolves "test" while a test harness is active.
-        let env = crate::app::Environment::from_env();
+        let env = crate::state::Environment::from_env();
         self.into_response_in_env(&env)
     }
 }
@@ -512,7 +512,7 @@ mod tests {
 
     #[tokio::test]
     async fn bad_request_surfaces_message_in_development() {
-        let dev_env = crate::app::Environment::new("development");
+        let dev_env = crate::state::Environment::new("development");
         let resp = AppError::BadRequest {
             code: "MISSING_PARAM",
             message: "missing parameter: project_id".into(),
@@ -530,7 +530,7 @@ mod tests {
 
     #[tokio::test]
     async fn internal_surfaces_diagnostics_in_development() {
-        let dev_env = crate::app::Environment::new("development");
+        let dev_env = crate::state::Environment::new("development");
         let resp = AppError::Internal {
             source: InternalSource::new("database socket timeout").with_span_context("span-456"),
             request_id: Some("req-dev-1".into()),
@@ -550,7 +550,7 @@ mod tests {
     async fn into_response_matches_explicit_environment_rendering() {
         // `IntoResponse` must not special-case the test harness: it must render
         // identically to `into_response_in_env(&Environment::from_env())`.
-        let env = crate::app::Environment::from_env();
+        let env = crate::state::Environment::from_env();
         let make = || AppError::Internal {
             source: InternalSource::new("boom").with_span_context("span-1"),
             request_id: Some("req-1".into()),
@@ -597,5 +597,47 @@ mod tests {
         assert_eq!(value["type"].as_str(), Some("about:blank"));
         assert!(value["instance"].is_null());
         assert!(value["request_id"].is_null());
+    }
+
+    #[tokio::test]
+    async fn foundation_error_renders_rfc9457_problem_details_and_redacts_internal_in_prod() {
+        let prod_env = crate::state::Environment::new("production");
+        let dev_env = crate::state::Environment::new("development");
+
+        let prod_resp = AppError::internal("db password leaked").into_response_in_env(&prod_env);
+        assert_eq!(prod_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            prod_resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+        let prod_bytes = axum::body::to_bytes(prod_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let prod_json: serde_json::Value = serde_json::from_slice(&prod_bytes).unwrap();
+        assert_eq!(prod_json["type"].as_str(), Some("about:blank"));
+        assert_eq!(prod_json["status"].as_u64(), Some(500));
+        assert_eq!(prod_json["code"].as_str(), Some("INTERNAL_ERROR"));
+        assert!(
+            !prod_json["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("db password leaked")
+        );
+
+        let dev_resp = AppError::internal("db password leaked").into_response_in_env(&dev_env);
+        assert_eq!(dev_resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let dev_bytes = axum::body::to_bytes(dev_resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let dev_json: serde_json::Value = serde_json::from_slice(&dev_bytes).unwrap();
+        assert!(
+            dev_json["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("db password leaked")
+        );
     }
 }

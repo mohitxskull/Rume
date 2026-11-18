@@ -3824,9 +3824,9 @@ dependencies = [
  "redis",
  "reqwest",
  "rstest",
+ "rume-foundation",
  "rume-macros",
  "saml-rs",
- "schemars 1.2.3",
  "secrecy",
  "serde",
  "serde_json",
@@ -3871,6 +3871,26 @@ dependencies = [
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "unicode-width",
+]
+
+[[package]]
+name = "rume-foundation"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "dotenvy",
+ "figment",
+ "schemars 1.2.3",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "subtle",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 1.2.1+spec-1.1.0",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

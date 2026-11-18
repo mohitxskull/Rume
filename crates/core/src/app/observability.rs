@@ -9,7 +9,6 @@
 
 use std::fmt::{self, Display};
 use std::future::Future;
-use std::ops::Deref;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Instant;
@@ -22,6 +21,8 @@ use axum::http::request::Parts;
 use axum::response::Response;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+
+pub use rume_foundation::telemetry::{RequestId, X_REQUEST_ID, is_valid_request_id};
 
 /// Non-panicking initializer for the default global tracing subscriber.
 ///
@@ -55,9 +56,6 @@ pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>
 pub fn init_tracing() {
     let _ = try_init_tracing();
 }
-
-/// The standard HTTP header name for request identity: `x-request-id`.
-pub static X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 
 /// Standard W3C TraceContext header name: `traceparent`.
 pub static TRACEPARENT: HeaderName = HeaderName::from_static("traceparent");
@@ -212,96 +210,6 @@ where
             Ok(TraceContext::generate())
         }
     }
-}
-
-/// A unique identifier for an HTTP request.
-///
-/// Propagated through request extensions and extractable in Axum handlers via
-/// [`FromRequestParts`].
-///
-/// # Example
-///
-/// ```
-/// use rume::app::RequestId;
-///
-/// async fn my_handler(request_id: RequestId) -> String {
-///     format!("processing request {}", request_id.0)
-/// }
-/// ```
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct RequestId(pub String);
-
-impl RequestId {
-    /// Generate a new, unique UUID v4 formatted request ID backed by the OS CSPRNG.
-    pub fn generate() -> Self {
-        RequestId(uuid::Uuid::new_v4().to_string())
-    }
-
-    /// Access the underlying string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Deref for RequestId {
-    type Target = str;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl AsRef<str> for RequestId {
-    fn as_ref(&self) -> &str {
-        &self.0
-    }
-}
-
-impl Display for RequestId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl From<String> for RequestId {
-    fn from(s: String) -> Self {
-        Self(s)
-    }
-}
-
-impl From<&str> for RequestId {
-    fn from(s: &str) -> Self {
-        Self(s.to_string())
-    }
-}
-
-impl<S> FromRequestParts<S> for RequestId
-where
-    S: Send + Sync,
-{
-    type Rejection = std::convert::Infallible;
-
-    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
-        if let Some(id) = parts.extensions.get::<RequestId>() {
-            Ok(id.clone())
-        } else {
-            Ok(RequestId::generate())
-        }
-    }
-}
-
-/// Validate an incoming `X-Request-ID` value.
-///
-/// Ensures the value is non-empty, at most 128 characters, and contains only
-/// safe ASCII characters (alphanumeric, `-`, `_`, `.`, `/`).
-fn is_valid_request_id(value: &str) -> bool {
-    let len = value.len();
-    if !(1..=128).contains(&len) {
-        return false;
-    }
-    value
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '/')
 }
 
 /// A Tower layer that attaches request IDs, records tracing spans, and includes

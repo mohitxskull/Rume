@@ -438,6 +438,12 @@ impl MetricsRegistry {
     }
 }
 
+impl rume_foundation::health::HealthCheckObserver for MetricsRegistry {
+    fn record_health_check(&self, name: &str, status: HealthStatus, duration: Duration) {
+        self.record_health_check(name, status, duration);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

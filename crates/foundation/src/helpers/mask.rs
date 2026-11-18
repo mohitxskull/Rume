@@ -8,7 +8,7 @@
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::mask_secret;
+/// use rume_foundation::helpers::mask_secret;
 ///
 /// assert_eq!(mask_secret("sk_live_1234567890abcdef"), "sk_l...cdef");
 /// assert_eq!(mask_secret("short"), "******");
@@ -43,7 +43,7 @@ pub fn mask_secret(secret: &str) -> String {
 /// # Examples
 ///
 /// ```
-/// use rume::helpers::mask_email;
+/// use rume_foundation::helpers::mask_email;
 ///
 /// assert_eq!(mask_email("john.doe@example.com"), "j***e@example.com");
 /// assert_eq!(mask_email("me@example.com"), "m***@example.com");

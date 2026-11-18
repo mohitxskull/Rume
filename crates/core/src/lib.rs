@@ -21,13 +21,13 @@
 pub mod app;
 pub mod auth;
 pub mod cache;
-pub mod config;
+pub use rume_foundation::config;
 pub mod coordination;
 pub mod enterprise;
-pub mod env;
-pub mod error;
+pub use rume_foundation::env;
+pub use rume_foundation::error;
 pub mod events;
-pub mod helpers;
+pub use rume_foundation::helpers;
 pub mod jobs;
 pub mod metrics;
 pub mod module;
