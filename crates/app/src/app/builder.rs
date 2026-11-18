@@ -663,24 +663,6 @@ where
         })
     }
 
-    /// Mounts a Prometheus text metrics scraping route at the specified path (e.g. `/metrics`).
-    pub fn metrics(
-        self,
-        path: &str,
-        registry: rume_observability::metrics::MetricsRegistry,
-    ) -> Self {
-        self.get(path, move || {
-            let reg = registry.clone();
-            async move {
-                let body = reg.render_prometheus();
-                axum::response::Response::builder()
-                    .header("content-type", "text/plain; version=0.0.4; charset=utf-8")
-                    .body(axum::body::Body::from(body))
-                    .unwrap()
-            }
-        })
-    }
-
     /// Replace the application router.
     ///
     /// Accepts a [`rume_http::routing::Router`] (carrying both the Axum router and

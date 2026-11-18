@@ -1,7 +1,7 @@
-//! OpenTelemetry-backed Prometheus metrics collection, registry, and Tower middleware.
+//! OpenTelemetry metrics collection, registry, and Tower middleware.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -12,8 +12,10 @@ use opentelemetry::metrics::{
     Counter as OtelCounter, Gauge as OtelGauge, Histogram as OtelHistogram, MeterProvider as _,
     ObservableGauge,
 };
-use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
-use prometheus::{Encoder, Registry, TextEncoder};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::{
+    Aggregation, InMemoryMetricExporter, Instrument, PeriodicReader, SdkMeterProvider, Stream,
+};
 use rume_foundation::health::{HealthCheckObserver, HealthStatus};
 use rume_foundation::telemetry::PoolStatus;
 use tower::{Layer, Service};
@@ -26,8 +28,8 @@ const HISTOGRAM_BUCKETS: [f64; 11] = [
 /// Map an HTTP method to a bounded label value.
 ///
 /// Why: raw HTTP methods are unbounded client input. A fuzzed or extended
-/// method (e.g. `GET\x00CUSTOM`) would otherwise create a new Prometheus
-/// label series per distinct value. Known methods are tracked individually and
+/// method (e.g. `GET\x00CUSTOM`) would otherwise create a new metric
+/// attribute series per distinct value. Known methods are tracked individually and
 /// everything else is collapsed to `OTHER`, keeping the label set bounded at
 /// the nine known methods plus `OTHER`.
 fn http_method_label(method: &str) -> &'static str {
@@ -138,11 +140,12 @@ where
 }
 
 /// Standard HTTP, database pool, and health check metrics registry backed by
-/// [`opentelemetry_sdk::metrics::SdkMeterProvider`] and [`opentelemetry_prometheus`].
+/// [`opentelemetry_sdk::metrics::SdkMeterProvider`].
 ///
-/// Metrics are gathered from the underlying [`prometheus::Registry`] and rendered
-/// with [`prometheus::TextEncoder`], so label values are escaped per the Prometheus
-/// text exposition specification automatically.
+/// Metrics are collected in-process via [`InMemoryMetricExporter`] for inspection
+/// via [`MetricsRegistry::export_metrics`] and [`MetricsRegistry::snapshot`], and
+/// optionally exported over OTLP when `feature = "otel"` is enabled and
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is configured.
 #[derive(Clone)]
 pub struct MetricsRegistry {
     inner: Arc<Inner>,
@@ -163,8 +166,9 @@ impl std::fmt::Debug for MetricsRegistry {
 }
 
 struct Inner {
-    prom_registry: Registry,
-    _meter_provider: SdkMeterProvider,
+    in_memory_exporter: InMemoryMetricExporter,
+    meter_provider: SdkMeterProvider,
+    export_lock: Mutex<()>,
     requests_total: OtelCounter<u64>,
     request_duration: OtelHistogram<f64>,
     in_flight_count: Arc<AtomicI64>,
@@ -181,18 +185,12 @@ struct Inner {
 
 impl MetricsRegistry {
     /// Creates a new metrics registry backed by an OpenTelemetry `SdkMeterProvider`
-    /// and `opentelemetry-prometheus` exporter.
+    /// with an in-memory exporter (and OTLP periodic exporter when `feature = "otel"`
+    /// is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
     pub fn new() -> Self {
-        let prom_registry = Registry::new();
-        let exporter = opentelemetry_prometheus::exporter()
-            .with_registry(prom_registry.clone())
-            .scope_info_enabled(false)
-            .without_target_info()
-            .build()
-            .expect("prometheus exporter configuration is valid");
-
-        let meter_provider = SdkMeterProvider::builder()
-            .with_reader(exporter)
+        let in_memory_exporter = InMemoryMetricExporter::default();
+        let builder = SdkMeterProvider::builder()
+            .with_reader(PeriodicReader::builder(in_memory_exporter.clone()).build())
             .with_view(|instrument: &Instrument| {
                 if instrument.name() == "http_request_duration_seconds" {
                     Stream::builder()
@@ -205,16 +203,30 @@ impl MetricsRegistry {
                 } else {
                     None
                 }
-            })
-            .build();
+            });
 
+        #[cfg(feature = "otel")]
+        let builder = {
+            use opentelemetry_otlp::{Protocol, WithExportConfig};
+            let mut builder = builder;
+            if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                && !endpoint.trim().is_empty()
+                && let Ok(otlp_exporter) = opentelemetry_otlp::MetricExporter::builder()
+                    .with_http()
+                    .with_protocol(Protocol::HttpBinary)
+                    .with_endpoint(endpoint)
+                    .build()
+            {
+                builder = builder.with_periodic_exporter(otlp_exporter);
+            }
+            builder
+        };
+
+        let meter_provider = builder.build();
         let meter = meter_provider.meter("rume");
 
-        // Why: `opentelemetry-prometheus` appends `_total` to monotonic counters
-        // automatically, so OTel counter names omit `_total` to produce
-        // `http_requests_total`, `health_checks_total`, and `health_check_failures_total`.
         let requests_total = meter
-            .u64_counter("http_requests")
+            .u64_counter("http_requests_total")
             .with_description(
                 "Total number of HTTP requests partitioned by status code and method.",
             )
@@ -261,12 +273,12 @@ impl MetricsRegistry {
             .build();
 
         let health_checks_total = meter
-            .u64_counter("health_checks")
+            .u64_counter("health_checks_total")
             .with_description("Total number of health check executions partitioned by check name.")
             .build();
 
         let health_check_failures_total = meter
-            .u64_counter("health_check_failures")
+            .u64_counter("health_check_failures_total")
             .with_description(
                 "Total number of failed health check executions partitioned by check name.",
             )
@@ -274,8 +286,9 @@ impl MetricsRegistry {
 
         Self {
             inner: Arc::new(Inner {
-                prom_registry,
-                _meter_provider: meter_provider,
+                in_memory_exporter,
+                meter_provider,
+                export_lock: Mutex::new(()),
                 requests_total,
                 request_duration,
                 in_flight_count,
@@ -382,23 +395,142 @@ impl MetricsRegistry {
         }
     }
 
-    /// Renders all registered metrics into the standard Prometheus exposition format.
-    pub fn render_prometheus(&self) -> String {
-        // Refresh pool metrics via registered exporters before gathering.
+    /// Flushes and returns a snapshot of all OpenTelemetry [`ResourceMetrics`]
+    /// collected by the in-memory exporter.
+    pub fn export_metrics(&self) -> Vec<ResourceMetrics> {
+        let _guard = self
+            .inner
+            .export_lock
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // Refresh pool metrics via registered exporters before flushing.
         if let Ok(exporters) = self.inner.pool_exporters.read() {
             for exp in exporters.iter() {
                 exp.export_metrics(self);
             }
         }
 
-        let encoder = TextEncoder::new();
-        let metric_families = self.inner.prom_registry.gather();
-        let mut buffer = Vec::new();
-        encoder
-            .encode(&metric_families, &mut buffer)
-            .expect("failed to encode prometheus metrics");
-        String::from_utf8(buffer).expect("prometheus metrics are not valid utf-8")
+        self.inner.in_memory_exporter.reset();
+        let _ = self.inner.meter_provider.force_flush();
+        self.inner
+            .in_memory_exporter
+            .get_finished_metrics()
+            .unwrap_or_default()
     }
+
+    /// Returns a queryable [`MetricsSnapshot`] of all current OpenTelemetry metrics.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            resource_metrics: self.export_metrics(),
+        }
+    }
+}
+
+/// Snapshot of exported OpenTelemetry [`ResourceMetrics`] with lookup helpers.
+#[derive(Debug, Default)]
+pub struct MetricsSnapshot {
+    resource_metrics: Vec<ResourceMetrics>,
+}
+
+impl MetricsSnapshot {
+    /// Returns the underlying OpenTelemetry [`ResourceMetrics`].
+    pub fn resource_metrics(&self) -> &[ResourceMetrics] {
+        &self.resource_metrics
+    }
+
+    /// Returns `true` if any exported metric has the given instrument `name`.
+    pub fn has_metric(&self, name: &str) -> bool {
+        self.find_metrics(name).next().is_some()
+    }
+
+    /// Returns the value of a `u64` counter/sum data point matching `name` and `attrs`.
+    pub fn counter_u64(&self, name: &str, attrs: &[(&str, &str)]) -> Option<u64> {
+        self.find_metrics(name).find_map(|metric| {
+            let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() else {
+                return None;
+            };
+            sum.data_points()
+                .find(|dp| attrs_match(dp.attributes(), attrs))
+                .map(|dp| dp.value())
+        })
+    }
+
+    /// Returns the value of an `f64` gauge data point matching `name` and `attrs`.
+    pub fn gauge_f64(&self, name: &str, attrs: &[(&str, &str)]) -> Option<f64> {
+        self.find_metrics(name).find_map(|metric| {
+            let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
+                return None;
+            };
+            gauge
+                .data_points()
+                .find(|dp| attrs_match(dp.attributes(), attrs))
+                .map(|dp| dp.value())
+        })
+    }
+
+    /// Returns the value of an `i64` gauge data point matching `name` and `attrs`.
+    pub fn gauge_i64(&self, name: &str, attrs: &[(&str, &str)]) -> Option<i64> {
+        self.find_metrics(name).find_map(|metric| {
+            let AggregatedMetrics::I64(MetricData::Gauge(gauge)) = metric.data() else {
+                return None;
+            };
+            gauge
+                .data_points()
+                .find(|dp| attrs_match(dp.attributes(), attrs))
+                .map(|dp| dp.value())
+        })
+    }
+
+    /// Returns `(count, sum, bounds, bucket_counts)` for an `f64` histogram data point
+    /// matching `name` and `attrs`.
+    pub fn histogram_f64(
+        &self,
+        name: &str,
+        attrs: &[(&str, &str)],
+    ) -> Option<(u64, f64, Vec<f64>, Vec<u64>)> {
+        self.find_metrics(name).find_map(|metric| {
+            let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() else {
+                return None;
+            };
+            hist.data_points()
+                .find(|dp| attrs_match(dp.attributes(), attrs))
+                .map(|dp| {
+                    (
+                        dp.count(),
+                        dp.sum(),
+                        dp.bounds().collect(),
+                        dp.bucket_counts().collect(),
+                    )
+                })
+        })
+    }
+
+    fn find_metrics<'a>(
+        &'a self,
+        name: &'a str,
+    ) -> impl Iterator<Item = &'a opentelemetry_sdk::metrics::data::Metric> {
+        self.resource_metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .filter(move |m| m.name() == name)
+    }
+}
+
+fn attrs_match<'a>(
+    mut dp_attrs: impl Iterator<Item = &'a KeyValue>,
+    expected: &[(&str, &str)],
+) -> bool {
+    let collected: Vec<(&str, String)> = dp_attrs
+        .by_ref()
+        .map(|kv| (kv.key.as_str(), kv.value.as_str().into_owned()))
+        .collect();
+    expected.iter().all(|(k, v)| {
+        collected
+            .iter()
+            .any(|(ck, cv)| ck == k && cv.as_str() == *v)
+    }) && collected.len() == expected.len()
 }
 
 impl HealthCheckObserver for MetricsRegistry {
@@ -513,13 +645,11 @@ mod tests {
     use tower::service_fn;
 
     #[test]
-    fn observability_metrics_registry_records_http_and_pool_metrics_in_prometheus_format() {
+    fn observability_metrics_registry_records_http_and_pool_metrics() {
         let registry = MetricsRegistry::new();
 
-        let initial = registry.render_prometheus();
-        assert!(initial.contains("http_requests_in_flight 0"));
-        assert!(!initial.contains("otel_scope_"));
-        assert!(!initial.contains("target_info"));
+        let initial = registry.snapshot();
+        assert_eq!(initial.gauge_i64("http_requests_in_flight", &[]), Some(0));
 
         registry.record_http_request("GET", 200, Duration::from_millis(12));
         registry.record_http_request("POST", 201, Duration::from_millis(30));
@@ -535,17 +665,37 @@ mod tests {
         }));
         registry.register_pool_exporter(exporter);
 
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains("http_requests_total{method=\"GET\",status=\"200\"} 1"));
-        assert!(rendered.contains("http_requests_total{method=\"POST\",status=\"201\"} 1"));
-        assert!(rendered.contains("http_request_duration_seconds_count{method=\"GET\"} 1"));
-        assert!(
-            rendered
-                .contains("http_request_duration_seconds_bucket{method=\"GET\",le=\"0.025\"} 1")
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "GET"), ("status", "200")]
+            ),
+            Some(1)
         );
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"active\"} 3"));
-        assert!(!rendered.contains("otel_scope_"));
-        assert!(!rendered.contains("target_info"));
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "POST"), ("status", "201")]
+            ),
+            Some(1)
+        );
+
+        let (count, _sum, bounds, buckets) = snap
+            .histogram_f64("http_request_duration_seconds", &[("method", "GET")])
+            .expect("histogram recorded for GET");
+        assert_eq!(count, 1);
+        assert_eq!(bounds, HISTOGRAM_BUCKETS.to_vec());
+        // 12ms = 0.012s falls into the (0.01, 0.025] bucket (index 2).
+        assert_eq!(buckets[2], 1);
+
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "active")]
+            ),
+            Some(3.0)
+        );
     }
 
     #[test]
@@ -562,14 +712,50 @@ mod tests {
         };
         registry.record_db_pool_status("primary", &status);
 
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"active\"} 3"));
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"idle\"} 7"));
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"leased\"} 2"));
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"total\"} 10"));
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"max\"} 20"));
-        assert!(rendered.contains("db_pool_in_flight_transactions{pool=\"primary\"} 1"));
-        assert!(rendered.contains("db_pool_is_closed{pool=\"primary\"} 0"));
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "active")]
+            ),
+            Some(3.0)
+        );
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "idle")]
+            ),
+            Some(7.0)
+        );
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "leased")]
+            ),
+            Some(2.0)
+        );
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "total")]
+            ),
+            Some(10.0)
+        );
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "max")]
+            ),
+            Some(20.0)
+        );
+        assert_eq!(
+            snap.gauge_f64("db_pool_in_flight_transactions", &[("pool", "primary")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            snap.gauge_f64("db_pool_is_closed", &[("pool", "primary")]),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -578,15 +764,39 @@ mod tests {
         registry.record_health_check("redis", HealthStatus::Ok, Duration::from_millis(15));
         registry.record_health_check("db", HealthStatus::Failed, Duration::from_millis(120));
 
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains("health_check_status{name=\"redis\"} 1"));
-        assert!(rendered.contains("health_check_status{name=\"db\"} 0"));
-        assert!(rendered.contains("health_check_duration_seconds{name=\"redis\"} 0.015"));
-        assert!(rendered.contains("health_check_duration_seconds{name=\"db\"} 0.12"));
-        assert!(rendered.contains("health_checks_total{name=\"redis\"} 1"));
-        assert!(rendered.contains("health_checks_total{name=\"db\"} 1"));
-        assert!(rendered.contains("health_check_failures_total{name=\"db\"} 1"));
-        assert!(!rendered.contains("health_check_failures_total{name=\"redis\"}"));
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.gauge_f64("health_check_status", &[("name", "redis")]),
+            Some(1.0)
+        );
+        assert_eq!(
+            snap.gauge_f64("health_check_status", &[("name", "db")]),
+            Some(0.0)
+        );
+        assert_eq!(
+            snap.gauge_f64("health_check_duration_seconds", &[("name", "redis")]),
+            Some(0.015)
+        );
+        assert_eq!(
+            snap.gauge_f64("health_check_duration_seconds", &[("name", "db")]),
+            Some(0.12)
+        );
+        assert_eq!(
+            snap.counter_u64("health_checks_total", &[("name", "redis")]),
+            Some(1)
+        );
+        assert_eq!(
+            snap.counter_u64("health_checks_total", &[("name", "db")]),
+            Some(1)
+        );
+        assert_eq!(
+            snap.counter_u64("health_check_failures_total", &[("name", "db")]),
+            Some(1)
+        );
+        assert_eq!(
+            snap.counter_u64("health_check_failures_total", &[("name", "redis")]),
+            None
+        );
     }
 
     #[test]
@@ -598,34 +808,35 @@ mod tests {
         registry.record_http_request("GET\x00CUSTOM", 200, Duration::from_millis(5));
         registry.record_http_request("DELETE", 204, Duration::from_millis(2));
 
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains("http_requests_total{method=\"GET\",status=\"200\"} 2"));
-        assert!(rendered.contains("http_requests_total{method=\"DELETE\",status=\"204\"} 1"));
-        assert!(rendered.contains("http_requests_total{method=\"OTHER\",status=\"200\"} 1"));
-        assert!(!rendered.contains("GET\x00CUSTOM"));
-    }
-
-    #[test]
-    fn test_prometheus_label_values_are_escaped() {
-        let registry = MetricsRegistry::new();
-        let status = PoolStatus {
-            leased_connections: 0,
-            active_connections: 1,
-            idle_connections: 0,
-            total_connections: 1,
-            max_connections: 10,
-            in_flight_transactions: 0,
-            is_closed: false,
-        };
-
-        registry.record_db_pool_status(r#"prim"ary"#, &status);
-        registry.record_health_check(r#"chk"ec"#, HealthStatus::Ok, Duration::ZERO);
-
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains(r#"db_pool_connections{pool="prim\"ary",state="active"} 1"#));
-        assert!(rendered.contains(r#"health_check_status{name="chk\"ec"} 1"#));
-        assert!(!rendered.contains(r#"db_pool_connections{pool="prim"ary""#));
-        assert!(!rendered.contains(r#"health_check_status{name="chk"ec""#));
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "GET"), ("status", "200")]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "DELETE"), ("status", "204")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "OTHER"), ("status", "200")]
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "GET\x00CUSTOM"), ("status", "200")]
+            ),
+            None
+        );
     }
 
     #[test]
@@ -649,12 +860,24 @@ mod tests {
 
         registry.register_pool_exporter(exporter);
 
-        let rendered1 = registry.render_prometheus();
-        assert!(rendered1.contains("db_pool_connections{pool=\"test_pool\",state=\"active\"} 1"));
+        let snap1 = registry.snapshot();
+        assert_eq!(
+            snap1.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "test_pool"), ("state", "active")]
+            ),
+            Some(1.0)
+        );
 
         counter.store(4, Ordering::Relaxed);
-        let rendered2 = registry.render_prometheus();
-        assert!(rendered2.contains("db_pool_connections{pool=\"test_pool\",state=\"active\"} 4"));
+        let snap2 = registry.snapshot();
+        assert_eq!(
+            snap2.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "test_pool"), ("state", "active")]
+            ),
+            Some(4.0)
+        );
     }
 
     #[tokio::test]

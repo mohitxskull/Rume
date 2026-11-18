@@ -40,7 +40,7 @@ async fn minimal_stateless_application() {
 }
 
 #[tokio::test]
-async fn builder_mounts_openapi_and_metrics_endpoints() {
+async fn builder_mounts_openapi_and_records_metrics() {
     let registry = rume::metrics::MetricsRegistry::new();
     registry.record_http_request("GET", 200, std::time::Duration::from_millis(5));
 
@@ -49,7 +49,6 @@ async fn builder_mounts_openapi_and_metrics_endpoints() {
     let app = Rume::new()
         .get("/hello", || async { "world" })
         .openapi("/openapi.json", openapi_info)
-        .metrics("/metrics", registry)
         .test_app()
         .expect("build app");
 
@@ -59,10 +58,14 @@ async fn builder_mounts_openapi_and_metrics_endpoints() {
     assert_eq!(doc["info"]["title"], "App API");
     assert!(doc["paths"]["/hello"].is_object());
 
-    let res = app.get("/metrics").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    let metrics_text = body_string(res).await;
-    assert!(metrics_text.contains("http_requests_total"));
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.counter_u64(
+            "http_requests_total",
+            &[("method", "GET"), ("status", "200")]
+        ),
+        Some(1)
+    );
 }
 
 // ============================================================================

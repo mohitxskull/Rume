@@ -22,7 +22,7 @@ async fn counter_and_gauge_primitives() {
 }
 
 #[tokio::test]
-async fn metrics_middleware_and_prometheus_exporter() {
+async fn metrics_middleware_and_otel_registry() {
     let registry = MetricsRegistry::new();
 
     let router = rume::routing::Router::new()
@@ -31,16 +31,13 @@ async fn metrics_middleware_and_prometheus_exporter() {
             "/users",
             post(|| async { (StatusCode::CREATED, "user created") }),
         )
-        .metrics("/metrics", registry.clone())
         .layer(MetricsLayer::new(registry.clone()));
 
     let app = TestApp::new(router);
 
-    // Initial metrics scrape: in_flight = 0
-    let res0 = app.get("/metrics").await;
-    assert_eq!(res0.status(), StatusCode::OK);
-    let body0 = TestApp::body_text(res0).await;
-    assert!(body0.contains("http_requests_in_flight 0"));
+    // Initial snapshot: in_flight = 0
+    let snap0 = registry.snapshot();
+    assert_eq!(snap0.gauge_i64("http_requests_in_flight", &[]), Some(0));
     assert_eq!(registry.in_flight(), 0);
 
     // Send 2 GET /users requests
@@ -55,14 +52,28 @@ async fn metrics_middleware_and_prometheus_exporter() {
         .unwrap();
     let _ = app.request(req).await;
 
-    // Scrape /metrics again
-    let res = app.get("/metrics").await;
-    assert_eq!(res.status(), StatusCode::OK);
-    let body = TestApp::body_text(res).await;
-
-    // Check Prometheus text output
-    assert!(body.contains("http_requests_total{method=\"GET\",status=\"200\"} 2"));
-    assert!(body.contains("http_requests_total{method=\"POST\",status=\"201\"} 1"));
-    assert!(body.contains("http_request_duration_seconds_count{method=\"GET\"} 2"));
-    assert!(body.contains("http_request_duration_seconds_count{method=\"POST\"} 1"));
+    // Export OTel snapshot and verify counters & histograms
+    let snap = registry.snapshot();
+    assert_eq!(
+        snap.counter_u64(
+            "http_requests_total",
+            &[("method", "GET"), ("status", "200")]
+        ),
+        Some(2)
+    );
+    assert_eq!(
+        snap.counter_u64(
+            "http_requests_total",
+            &[("method", "POST"), ("status", "201")]
+        ),
+        Some(1)
+    );
+    let (get_count, _, _, _) = snap
+        .histogram_f64("http_request_duration_seconds", &[("method", "GET")])
+        .expect("GET duration histogram recorded");
+    assert_eq!(get_count, 2);
+    let (post_count, _, _, _) = snap
+        .histogram_f64("http_request_duration_seconds", &[("method", "POST")])
+        .expect("POST duration histogram recorded");
+    assert_eq!(post_count, 1);
 }

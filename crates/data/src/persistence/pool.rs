@@ -493,7 +493,7 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
 
 /// Extension trait on [`MetricsRegistry`] for registering live [`DatabasePool`] metrics exporters.
 pub trait MetricsRegistryPoolExt {
-    /// Registers a [`DatabasePool`] so its connection counts are exported on every `/metrics` scrape.
+    /// Registers a [`DatabasePool`] so its connection counts are exported on every metrics flush.
     fn register_pool<B: DatabaseBackend + 'static>(
         &self,
         name: impl Into<String>,
@@ -529,8 +529,14 @@ mod tests {
 
         let registry = MetricsRegistry::new();
         registry.register_pool("primary", &pool);
-        let rendered = registry.render_prometheus();
-        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"active\"}"));
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "primary"), ("state", "active")]
+            ),
+            Some(0.0)
+        );
 
         let hc = pool.health_check("db");
         let res = hc.run().await;

@@ -364,7 +364,7 @@ version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "83646137297e3ae2c0a79905f9173153b867aad75cd8e00cd8bcd963a448b245"
 dependencies = [
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -603,7 +603,7 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "serde_urlencoded",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
  "tokio",
  "tokio-stream",
@@ -756,7 +756,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -1353,7 +1353,7 @@ version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "71958f69fb2de856c5dd51ac9377e986ca1aa5919f931bf5395a807277f889a0"
 dependencies = [
- "thiserror 2.0.21",
+ "thiserror",
 ]
 
 [[package]]
@@ -2700,7 +2700,7 @@ dependencies = [
  "sha3 0.11.0",
  "signature 3.0.0",
  "slh-dsa",
- "thiserror 2.0.21",
+ "thiserror",
  "x25519-dalek 3.0.0",
  "x448",
  "zeroize",
@@ -3043,7 +3043,7 @@ dependencies = [
  "futures-sink",
  "js-sys",
  "pin-project-lite",
- "thiserror 2.0.21",
+ "thiserror",
  "tracing",
 ]
 
@@ -3086,20 +3086,7 @@ dependencies = [
  "opentelemetry_sdk",
  "prost",
  "reqwest",
- "thiserror 2.0.21",
-]
-
-[[package]]
-name = "opentelemetry-prometheus"
-version = "0.33.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "274c2e3a2ad55524484500d5a78dffbfee23e4a1e4c3d3fcbd881b61b033e6df"
-dependencies = [
- "once_cell",
- "opentelemetry",
- "opentelemetry_sdk",
- "prometheus",
- "tracing",
+ "thiserror",
 ]
 
 [[package]]
@@ -3126,7 +3113,8 @@ dependencies = [
  "percent-encoding",
  "portable-atomic",
  "rand 0.9.5",
- "thiserror 2.0.21",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -3481,21 +3469,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prometheus"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3ca5326d8d0b950a9acd87e6a3f94745394f62e4dae1b1ee22b2bc0c394af43a"
-dependencies = [
- "cfg-if",
- "fnv",
- "lazy_static",
- "memchr",
- "parking_lot",
- "protobuf",
- "thiserror 2.0.21",
-]
-
-[[package]]
 name = "proptest"
 version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3545,26 +3518,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
-]
-
-[[package]]
-name = "protobuf"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d65a1d4ddae7d8b5de68153b48f6aa3bba8cb002b243dbdbc55a5afbc98f99f4"
-dependencies = [
- "once_cell",
- "protobuf-support",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "protobuf-support"
-version = "3.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3e36c2f31e0a47f9280fb347ef5e461ffcd2c52dd520d8e216b52f93b0b0d7d6"
-dependencies = [
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -3989,7 +3942,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.1",
  "sqlx",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tracing",
  "uuid",
@@ -4008,7 +3961,7 @@ dependencies = [
  "saml-rs",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
@@ -4029,7 +3982,7 @@ dependencies = [
  "serde_json",
  "subtle",
  "tempfile",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "tracing",
@@ -4049,7 +4002,7 @@ dependencies = [
  "rume-security",
  "serde",
  "serde_json",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -4081,7 +4034,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-opentelemetry",
@@ -4098,9 +4051,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
- "opentelemetry-prometheus",
  "opentelemetry_sdk",
- "prometheus",
  "rume-foundation",
  "serde",
  "serde_json",
@@ -4125,7 +4076,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tower",
  "tracing",
@@ -4270,7 +4221,7 @@ dependencies = [
  "flate2",
  "quick-xml",
  "sha1 0.11.0",
- "thiserror 2.0.21",
+ "thiserror",
  "time",
  "url",
  "uuid",
@@ -4838,7 +4789,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smallvec",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tracing",
@@ -4906,7 +4857,7 @@ dependencies = [
  "sha1 0.11.0",
  "sha2 0.11.1",
  "sqlx-core",
- "thiserror 2.0.21",
+ "thiserror",
  "tracing",
 ]
 
@@ -4940,7 +4891,7 @@ dependencies = [
  "smallvec",
  "sqlx-core",
  "stringprep",
- "thiserror 2.0.21",
+ "thiserror",
  "tracing",
  "whoami",
 ]
@@ -4964,7 +4915,7 @@ dependencies = [
  "percent-encoding",
  "serde",
  "sqlx-core",
- "thiserror 2.0.21",
+ "thiserror",
  "tracing",
  "url",
 ]
@@ -5121,7 +5072,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
- "thiserror 2.0.21",
+ "thiserror",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -5139,31 +5090,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b6aaf5339b578ea85b50e080feb250a3e8ae8cfcdff9a461c9ec2904bc923f52"
-dependencies = [
- "thiserror-impl 1.0.69",
-]
-
-[[package]]
-name = "thiserror"
 version = "2.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09e52cb86a36cede5cb101bf8908837b3e4c6e5e59fe7fd85c23fb56200d189e"
 dependencies = [
- "thiserror-impl 2.0.21",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.69"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4fee6c4efc90059e10f81e6d42c60a18f76588c3d74cb83a0b242a2b6c7504c1"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.119",
+ "thiserror-impl",
 ]
 
 [[package]]
@@ -5613,7 +5544,7 @@ dependencies = [
  "log",
  "pem-rfc7468 0.7.0",
  "spki 0.7.3",
- "thiserror 2.0.21",
+ "thiserror",
  "x509-cert",
 ]
 
