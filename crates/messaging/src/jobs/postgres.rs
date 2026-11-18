@@ -11,7 +11,7 @@ use crate::jobs::error::JobError;
 use crate::jobs::job::{BoxFuture, Job, QueuedJob};
 use crate::jobs::queue::JobQueue;
 use crate::jobs::retry::RetryPolicy;
-use crate::persistence::postgres::PostgresBackend;
+use rume_data::persistence::postgres::PostgresBackend;
 
 fn current_epoch_millis() -> i64 {
     std::time::SystemTime::now()
@@ -20,27 +20,35 @@ fn current_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
-const JOBS_SCHEMA: &str = include_str!("../persistence/sql/postgres/jobs_schema.sql");
-const JOBS_CLAIM_SQL: &str = include_str!("../persistence/sql/postgres/jobs_claim.sql");
-const INSERT_JOB_SQL: &str = include_str!("../persistence/sql/postgres/jobs_insert.sql");
-const JOBS_REAP_SQL: &str = include_str!("../persistence/sql/postgres/jobs_reap.sql");
+const JOBS_SCHEMA: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_schema.sql");
+const JOBS_CLAIM_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_claim.sql");
+const INSERT_JOB_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_insert.sql");
+const JOBS_REAP_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_reap.sql");
 
 // Per-operation jobs SQL, externalized from inline string literals.
 const JOBS_PENDING_COUNT_SQL: &str =
-    include_str!("../persistence/sql/postgres/jobs_pending_count.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_pending_count.sql");
 const JOBS_DEAD_LETTER_COUNT_SQL: &str =
-    include_str!("../persistence/sql/postgres/jobs_dead_letter_count.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_dead_letter_count.sql");
 const JOBS_IDEMPOTENCY_CHECK_SQL: &str =
-    include_str!("../persistence/sql/postgres/jobs_idempotency_check.sql");
-const JOBS_ACK_SQL: &str = include_str!("../persistence/sql/postgres/jobs_ack.sql");
-const JOBS_NACK_SQL: &str = include_str!("../persistence/sql/postgres/jobs_nack.sql");
-const JOBS_DEAD_LETTER_SQL: &str = include_str!("../persistence/sql/postgres/jobs_dead_letter.sql");
-const JOBS_RENEW_LEASE_SQL: &str = include_str!("../persistence/sql/postgres/jobs_renew_lease.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_idempotency_check.sql");
+const JOBS_ACK_SQL: &str = include_str!("../../../data/src/persistence/sql/postgres/jobs_ack.sql");
+const JOBS_NACK_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_nack.sql");
+const JOBS_DEAD_LETTER_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_dead_letter.sql");
+const JOBS_RENEW_LEASE_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_renew_lease.sql");
 const JOBS_LIST_DEAD_LETTERS_SQL: &str =
-    include_str!("../persistence/sql/postgres/jobs_list_dead_letters.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_list_dead_letters.sql");
 const JOBS_REPLAY_DEAD_LETTER_SQL: &str =
-    include_str!("../persistence/sql/postgres/jobs_replay_dead_letter.sql");
-const JOBS_PURGE_SQL: &str = include_str!("../persistence/sql/postgres/jobs_purge.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_replay_dead_letter.sql");
+const JOBS_PURGE_SQL: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/jobs_purge.sql");
 
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]
@@ -103,7 +111,7 @@ impl JobQueue for PostgresJobQueue {
     ) -> BoxFuture<'_, Result<String, JobError>> {
         let trace = job
             .trace_context()
-            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
+            .or_else(|| rume_observability::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 

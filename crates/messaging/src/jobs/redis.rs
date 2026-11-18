@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use deadpool_redis::Pool;
 
-use crate::cache::redis::RedisCacheBackend;
 use crate::jobs::error::JobError;
 use crate::jobs::job::BoxFuture;
 use crate::jobs::reliability::{HeartbeatRegistry, IdempotencyStatus, IdempotencyStore};
+use rume_data::cache::redis::RedisCacheBackend;
 
 /// Redis-backed implementation of [`HeartbeatRegistry`].
 ///

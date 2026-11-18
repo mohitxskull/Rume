@@ -91,8 +91,10 @@ impl JobRegistry {
         let tc = job
             .trace_context
             .as_deref()
-            .and_then(|s| crate::app::TraceContext::parse_serialized(s).map(|c| c.new_child()))
-            .unwrap_or_else(crate::app::TraceContext::generate);
+            .and_then(|s| {
+                rume_observability::TraceContext::parse_serialized(s).map(|c| c.new_child())
+            })
+            .unwrap_or_else(rume_observability::TraceContext::generate);
 
         let span = tracing::info_span!(
             "job.dispatch",

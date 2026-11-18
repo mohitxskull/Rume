@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use crate::outbox::error::OutboxError;
 use crate::outbox::message::OutboxMessage;
 use crate::outbox::repository::{BoxFuture, OutboxRepository};
-use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
+use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
 
 /// Type alias for the message dispatch callback.
 pub type MessageDispatcher = Arc<
@@ -325,9 +325,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let tc = message
                 .trace_context
                 .as_deref()
-                .and_then(crate::app::TraceContext::parse_serialized)
+                .and_then(rume_observability::TraceContext::parse_serialized)
                 .map(|ctx| ctx.new_child())
-                .unwrap_or_else(crate::app::TraceContext::generate);
+                .unwrap_or_else(rume_observability::TraceContext::generate);
 
             let span = tracing::info_span!(
                 "outbox.dispatch",

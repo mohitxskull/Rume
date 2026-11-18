@@ -13,7 +13,7 @@ use serde::de::DeserializeOwned;
 use crate::cache::backend::CacheBackend;
 use crate::cache::config::CacheConfig;
 use crate::cache::error::CacheError;
-use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
+use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
 
 /// High-level typed cache interface providing JSON serialization, cache-aside patterns, and tag invalidation.
 pub struct Cache<B: CacheBackend> {

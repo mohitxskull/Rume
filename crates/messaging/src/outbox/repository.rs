@@ -4,9 +4,11 @@ use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
 
+use rume_data::persistence::backend::{DatabaseBackend, DatabaseTransaction};
+use rume_data::persistence::pool::DatabasePool;
+
 use crate::outbox::error::OutboxError;
 use crate::outbox::message::OutboxMessage;
-use crate::persistence::backend::DatabaseTransaction;
 
 /// Pinned boxed future type alias for async outbox repository operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -167,6 +169,220 @@ pub trait TransactionalOutbox<Tx: DatabaseTransaction>: OutboxRepository {
         tx: &'a Tx,
         message: OutboxMessage,
     ) -> BoxFuture<'a, Result<(), OutboxError>>;
+}
+
+impl<B> OutboxRepository for DatabasePool<B>
+where
+    B: DatabaseBackend + OutboxRepository,
+{
+    fn save(&self, msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().save(msg).await
+        })
+    }
+
+    fn fetch_pending(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().fetch_pending(limit).await
+        })
+    }
+
+    fn claim_pending(
+        &self,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().claim_pending(limit).await
+        })
+    }
+
+    fn claim_pending_with_lease(
+        &self,
+        limit: usize,
+        lease_duration_secs: u64,
+    ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .claim_pending_with_lease(limit, lease_duration_secs)
+                .await
+        })
+    }
+
+    fn renew_outbox_lease(
+        &self,
+        id: &str,
+        lease_token: &str,
+        extension_secs: u64,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id = id.to_string();
+        let lease_token = lease_token.to_string();
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .renew_outbox_lease(&id, &lease_token, extension_secs)
+                .await
+        })
+    }
+
+    fn mark_published(
+        &self,
+        id: &str,
+        lease_token: &str,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id = id.to_string();
+        let lease_token = lease_token.to_string();
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().mark_published(&id, &lease_token).await
+        })
+    }
+
+    fn mark_failed(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        self.mark_failed_with_max_retries(id, lease_token, error, 5)
+    }
+
+    fn mark_failed_with_max_retries(
+        &self,
+        id: &str,
+        lease_token: &str,
+        error: String,
+        max_retries: u32,
+    ) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id = id.to_string();
+        let lease_token = lease_token.to_string();
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .mark_failed_with_max_retries(&id, &lease_token, error, max_retries)
+                .await
+        })
+    }
+
+    fn recover_expired_claims(
+        &self,
+        max_lease_age_secs: u64,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .recover_expired_claims(max_lease_age_secs)
+                .await
+        })
+    }
+
+    fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().pending_count().await
+        })
+    }
+
+    fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().published_count().await
+        })
+    }
+
+    fn failed_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().failed_count().await
+        })
+    }
+
+    fn fetch_failed(&self, limit: usize) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().fetch_failed(limit).await
+        })
+    }
+
+    fn reprocess_failed(&self, id: &str) -> BoxFuture<'_, Result<(), OutboxError>> {
+        let id = id.to_string();
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().reprocess_failed(&id).await
+        })
+    }
+
+    fn purge_published(
+        &self,
+        older_than_secs: u64,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend().purge_published(older_than_secs, limit).await
+        })
+    }
+}
+
+impl<B> TransactionalOutbox<B::Transaction> for DatabasePool<B>
+where
+    B: DatabaseBackend + TransactionalOutbox<B::Transaction>,
+{
+    fn save_tx<'a>(
+        &'a self,
+        tx: &'a B::Transaction,
+        message: OutboxMessage,
+    ) -> BoxFuture<'a, Result<(), OutboxError>> {
+        self.backend().save_tx(tx, message)
+    }
 }
 
 #[cfg(test)]

@@ -9,14 +9,13 @@ use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::outbox::{
-    BoxFuture as OutboxFuture, OutboxError, OutboxMessage, OutboxRepository, TransactionalOutbox,
-};
+use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
+use rume_observability::{DynamicPoolExporter, MetricsRegistry};
+
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 use crate::persistence::row::{DbRow, FromRow};
-use crate::routing::{HealthCheck, HealthCheckResult, HealthStatus};
 
 pub use rume_foundation::telemetry::PoolStatus;
 
@@ -131,7 +130,7 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     }
 
     /// Exports pool metrics to the provided [`MetricsRegistry`].
-    pub fn export_metrics(&self, registry: &crate::metrics::MetricsRegistry, pool_name: &str) {
+    pub fn export_metrics(&self, registry: &MetricsRegistry, pool_name: &str) {
         registry.record_db_pool_status(pool_name, &self.status());
     }
 
@@ -492,219 +491,50 @@ impl<B: DatabaseBackend> HealthCheck for DatabaseHealthCheck<B> {
     }
 }
 
-impl<B> OutboxRepository for DatabasePool<B>
-where
-    B: DatabaseBackend + OutboxRepository,
-{
-    fn save(&self, msg: OutboxMessage) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().save(msg).await
-        })
-    }
-
-    fn fetch_pending(
+/// Extension trait on [`MetricsRegistry`] for registering live [`DatabasePool`] metrics exporters.
+pub trait MetricsRegistryPoolExt {
+    /// Registers a [`DatabasePool`] so its connection counts are exported on every `/metrics` scrape.
+    fn register_pool<B: DatabaseBackend + 'static>(
         &self,
-        limit: usize,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().fetch_pending(limit).await
-        })
-    }
+        name: impl Into<String>,
+        pool: &DatabasePool<B>,
+    );
+}
 
-    fn claim_pending(
+impl MetricsRegistryPoolExt for MetricsRegistry {
+    fn register_pool<B: DatabaseBackend + 'static>(
         &self,
-        limit: usize,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().claim_pending(limit).await
-        })
-    }
-
-    fn claim_pending_with_lease(
-        &self,
-        limit: usize,
-        lease_duration_secs: u64,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend()
-                .claim_pending_with_lease(limit, lease_duration_secs)
-                .await
-        })
-    }
-
-    fn renew_outbox_lease(
-        &self,
-        id: &str,
-        lease_token: &str,
-        extension_secs: u64,
-    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let id = id.to_string();
-        let lease_token = lease_token.to_string();
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend()
-                .renew_outbox_lease(&id, &lease_token, extension_secs)
-                .await
-        })
-    }
-
-    fn mark_published(
-        &self,
-        id: &str,
-        lease_token: &str,
-    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let id = id.to_string();
-        let lease_token = lease_token.to_string();
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().mark_published(&id, &lease_token).await
-        })
-    }
-
-    fn mark_failed(
-        &self,
-        id: &str,
-        lease_token: &str,
-        error: String,
-    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        self.mark_failed_with_max_retries(id, lease_token, error, 5)
-    }
-
-    fn mark_failed_with_max_retries(
-        &self,
-        id: &str,
-        lease_token: &str,
-        error: String,
-        max_retries: u32,
-    ) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let id = id.to_string();
-        let lease_token = lease_token.to_string();
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend()
-                .mark_failed_with_max_retries(&id, &lease_token, error, max_retries)
-                .await
-        })
-    }
-
-    fn recover_expired_claims(
-        &self,
-        max_lease_age_secs: u64,
-    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend()
-                .recover_expired_claims(max_lease_age_secs)
-                .await
-        })
-    }
-
-    fn pending_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().pending_count().await
-        })
-    }
-
-    fn published_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().published_count().await
-        })
-    }
-
-    fn failed_count(&self) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().failed_count().await
-        })
-    }
-
-    fn fetch_failed(
-        &self,
-        limit: usize,
-    ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().fetch_failed(limit).await
-        })
-    }
-
-    fn reprocess_failed(&self, id: &str) -> OutboxFuture<'_, Result<(), OutboxError>> {
-        let id = id.to_string();
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().reprocess_failed(&id).await
-        })
-    }
-
-    fn purge_published(
-        &self,
-        older_than_secs: u64,
-        limit: usize,
-    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
-        Box::pin(async move {
-            let _lease = self
-                .acquire_lease_timeout(self.config.connect_timeout())
-                .await
-                .map_err(|e| OutboxError::Repository(e.to_string()))?;
-            self.backend().purge_published(older_than_secs, limit).await
-        })
+        name: impl Into<String>,
+        pool: &DatabasePool<B>,
+    ) {
+        let pool = pool.clone();
+        self.register_pool_exporter(Arc::new(DynamicPoolExporter::new(name, move || {
+            pool.status()
+        })));
     }
 }
 
-impl<B> TransactionalOutbox<B::Transaction> for DatabasePool<B>
-where
-    B: DatabaseBackend + TransactionalOutbox<B::Transaction>,
-{
-    fn save_tx<'a>(
-        &'a self,
-        tx: &'a B::Transaction,
-        message: OutboxMessage,
-    ) -> OutboxFuture<'a, Result<(), OutboxError>> {
-        self.backend().save_tx(tx, message)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn data_persistence_compiles_without_outbox_dependency() {
+        let backend = crate::persistence::SqliteBackend::in_memory()
+            .await
+            .expect("sqlite in-memory");
+        let pool = DatabasePool::new(backend, DatabaseConfig::new("sqlite::memory:"));
+        let status = pool.status();
+        assert!(!status.is_closed);
+
+        let registry = MetricsRegistry::new();
+        registry.register_pool("primary", &pool);
+        let rendered = registry.render_prometheus();
+        assert!(rendered.contains("db_pool_connections{pool=\"primary\",state=\"active\"}"));
+
+        let hc = pool.health_check("db");
+        let res = hc.run().await;
+        assert_eq!(res.status, HealthStatus::Ok);
     }
 }

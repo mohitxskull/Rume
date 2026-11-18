@@ -12,7 +12,7 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     fn enqueue<J: Job>(&self, job: J) -> BoxFuture<'_, Result<String, JobError>> {
         let trace = job
             .trace_context()
-            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
+            .or_else(|| rume_observability::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, Duration::ZERO, trace)
     }
 
@@ -24,7 +24,7 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<String, JobError>> {
         let trace = job
             .trace_context()
-            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
+            .or_else(|| rume_observability::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 

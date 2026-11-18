@@ -23,7 +23,9 @@ pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator};
 #[cfg(feature = "mysql")]
 pub use mysql::{MariadbBackend, MariadbTransaction, MysqlBackend, MysqlTransaction};
-pub use pool::{ConnectionLease, DatabaseHealthCheck, DatabasePool, PoolStatus};
+pub use pool::{
+    ConnectionLease, DatabaseHealthCheck, DatabasePool, MetricsRegistryPoolExt, PoolStatus,
+};
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresBackend, PostgresTransaction};
 pub use query::SqlQuery;

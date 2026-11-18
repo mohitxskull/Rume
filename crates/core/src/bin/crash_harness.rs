@@ -20,10 +20,11 @@ use sqlx::postgres::PgPoolOptions;
 
 // Crash test SQL, externalized from inline string literals.
 const CRASH_SIDE_EFFECTS_TABLE: &str =
-    include_str!("../persistence/sql/postgres/crash_side_effects_table.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/crash_side_effects_table.sql");
 const CRASH_SIDE_EFFECTS_INSERT: &str =
-    include_str!("../persistence/sql/postgres/crash_side_effects_insert.sql");
-const CRASH_ORDERS_TABLE: &str = include_str!("../persistence/sql/postgres/crash_orders_table.sql");
+    include_str!("../../../data/src/persistence/sql/postgres/crash_side_effects_insert.sql");
+const CRASH_ORDERS_TABLE: &str =
+    include_str!("../../../data/src/persistence/sql/postgres/crash_orders_table.sql");
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

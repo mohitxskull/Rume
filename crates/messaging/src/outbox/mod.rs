@@ -17,8 +17,14 @@
 
 pub mod error;
 pub mod message;
+#[cfg(feature = "mysql")]
+mod mysql;
+#[cfg(feature = "postgres")]
+mod postgres;
 pub mod relay;
 pub mod repository;
+#[cfg(feature = "sqlite")]
+mod sqlite;
 
 pub use error::OutboxError;
 pub use message::{OutboxMessage, OutboxStatus};

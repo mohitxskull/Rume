@@ -138,7 +138,7 @@ impl EventBus {
         let count = listeners.len();
         if count > 0 {
             let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event);
-            let current_tc = crate::app::TraceContext::current();
+            let current_tc = rume_observability::TraceContext::current();
             let span = tracing::info_span!(
                 "event.publish_async",
                 event.type = E::TYPE,

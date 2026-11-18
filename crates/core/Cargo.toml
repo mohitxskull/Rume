@@ -11,6 +11,10 @@ description = "Explicit, typed, production-ready application shell for Axum."
 rume-foundation.workspace = true
 # Observability (OTel traces, logs, W3C context, Prometheus metrics).
 rume-observability.workspace = true
+# Persistence, caching, and distributed coordination.
+rume-data.workspace = true
+# Events, transactional outbox, and background jobs.
+rume-messaging.workspace = true
 # Core HTTP substrate.
 axum.workspace = true
 # Async runtime.
@@ -65,10 +69,10 @@ required-features = ["postgres", "redis"]
 [features]
 default = ["sqlite", "testing"]
 testing = ["dep:reqwest"]
-postgres = ["dep:sqlx", "sqlx/postgres"]
-redis = ["dep:deadpool-redis", "dep:redis"]
-sqlite = ["dep:sqlx", "sqlx/sqlite"]
-mysql = ["dep:sqlx", "sqlx/mysql"]
+postgres = ["dep:sqlx", "sqlx/postgres", "rume-data/postgres", "rume-messaging/postgres"]
+redis = ["dep:deadpool-redis", "dep:redis", "rume-data/redis", "rume-messaging/redis"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "rume-data/sqlite", "rume-messaging/sqlite"]
+mysql = ["dep:sqlx", "sqlx/mysql", "rume-data/mysql", "rume-messaging/mysql"]
 saml = ["dep:quick-xml", "dep:saml-rs"]
 enterprise = ["saml"]
 schemars = ["rume-foundation/schemars"]

@@ -1,0 +1,28 @@
+[package]
+name = "rume-data"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Database persistence, caching, and distributed coordination primitives for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-observability.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+uuid = { version = "=1.29.2", features = ["v4"] }
+sha2 = "=0.11.1"
+sqlx = { workspace = true, optional = true }
+deadpool-redis = { workspace = true, optional = true }
+redis = { workspace = true, optional = true }
+
+[features]
+default = []
+sqlite = ["dep:sqlx", "sqlx/sqlite"]
+postgres = ["dep:sqlx", "sqlx/postgres"]
+mysql = ["dep:sqlx", "sqlx/mysql"]
+redis = ["dep:deadpool-redis", "dep:redis"]
