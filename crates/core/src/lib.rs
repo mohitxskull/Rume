@@ -21,27 +21,49 @@
 pub use rume_app::app;
 pub use rume_data::cache;
 pub use rume_data::coordination;
+pub use rume_data::persistence;
 pub use rume_enterprise::enterprise;
+pub use rume_enterprise::saga;
 pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::helpers;
+pub use rume_http::openapi;
+pub use rume_http::resilience;
+pub use rume_http::validation;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
-pub use rume_security::auth;
-pub mod metrics;
-pub mod module;
-pub use rume_data::persistence;
-pub use rume_http::openapi;
 pub use rume_messaging::outbox;
-pub mod prelude;
-pub use rume_http::resilience;
-pub mod routing;
-pub use rume_enterprise::saga;
-pub use rume_http::validation;
+pub use rume_observability::metrics;
+pub use rume_security::auth;
 pub use rume_security::security;
 pub use rume_security::tenant;
+#[cfg(feature = "testing")]
 pub use rume_testing as testing;
+
+pub mod prelude;
+
+/// First-class application modules (re-exported from `rume-app` and `rume-testing`).
+pub mod module {
+    pub use rume_app::module::*;
+    #[cfg(feature = "testing")]
+    pub use rume_testing::{ModuleHarness, ModuleTestHarness};
+}
+
+/// Routing re-exports from `rume-http` with `AppContext`-typed `health_routes`.
+pub mod routing {
+    pub use rume_http::routing::*;
+
+    /// Routes for health checks (`/health/live` and `/health/ready`) bound to [`crate::app::AppContext`].
+    pub fn health_routes<E, C, S>() -> Router<crate::app::AppContext<E, C, S>>
+    where
+        E: Clone + Send + Sync + 'static,
+        C: Clone + Send + Sync + 'static,
+        S: Clone + Send + Sync + 'static,
+    {
+        rume_http::routing::health_routes::<crate::app::AppContext<E, C, S>>()
+    }
+}
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,

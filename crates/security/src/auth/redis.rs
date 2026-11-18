@@ -173,8 +173,7 @@ impl SessionStore for RedisSessionStore {
 
             let now = current_timestamp();
 
-            let script = format!(
-                r#"
+            let script = r#"
                 local old_key = KEYS[1]
                 local new_key = KEYS[2]
                 local old_id_pat = ARGV[1]
@@ -216,10 +215,9 @@ impl SessionStore for RedisSessionStore {
                 end
                 redis.call('DEL', old_key)
                 return updated
-                "#,
-            );
+                "#;
 
-            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(&script)
+            let res: Result<Option<Vec<u8>>, redis::RedisError> = redis::Script::new(script)
                 .key(&old_key)
                 .key(&new_key)
                 .arg(&old_id_pat)
