@@ -147,24 +147,38 @@ pub(crate) fn discover_local_migrations() -> Migrator {
     migrator
 }
 
+#[derive(serde::Deserialize)]
+struct DatabaseFileConfig {
+    database: Option<DatabaseSection>,
+}
+
+#[derive(serde::Deserialize)]
+struct DatabaseSection {
+    url: Option<String>,
+}
+
 pub(crate) fn resolve_db_url() -> Option<String> {
-    if let Ok(url) = std::env::var("DATABASE_URL") {
+    resolve_db_url_in(Path::new("."))
+}
+
+pub(crate) fn resolve_db_url_in(dir: &Path) -> Option<String> {
+    // Why: route URL resolution through Rume's env/config engines instead of
+    // raw `dotenvy::dotenv()` + `toml::Value` parsing so `.env.{env}` layering,
+    // `${VAR}` interpolation, `file:` secrets, and `config/app.{env,local}.toml`
+    // overrides share a single source of truth with application boot.
+    let env_url = match rume::env::ResolvedEnv::load_in(dir) {
+        Ok(resolved) => resolved.get("DATABASE_URL").map(str::to_string),
+        Err(_) => std::env::var("DATABASE_URL").ok(),
+    };
+    if let Some(url) = env_url {
         let trimmed = url.trim();
         if !trimmed.is_empty() {
             return Some(trimmed.to_string());
         }
     }
-    let _ = dotenvy::dotenv();
-    if let Ok(url) = std::env::var("DATABASE_URL") {
-        let trimmed = url.trim();
-        if !trimmed.is_empty() {
-            return Some(trimmed.to_string());
-        }
-    }
-    let app_toml = Path::new("config/app.toml");
-    let content = fs::read_to_string(app_toml).ok()?;
-    let val: toml::Value = content.parse().ok()?;
-    let url = val.get("database")?.get("url")?.as_str()?;
+
+    let cfg = rume::config::load_in::<DatabaseFileConfig>(dir).ok()?;
+    let url = cfg.database?.url?;
     let trimmed = url.trim();
     if !trimmed.is_empty() {
         Some(trimmed.to_string())
@@ -185,7 +199,10 @@ pub(crate) async fn connect_backend(url: &str) -> Result<(BackendHandle, &'stati
         let backend = PostgresBackend::new(&config)
             .map_err(|e| format!("failed to initialize PostgreSQL backend: {e}"))?;
         Ok((BackendHandle::Postgres(backend), "postgres"))
-    } else if url.starts_with("mysql://") {
+    } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+        // Why: MariaDB speaks the MySQL wire protocol and sqlx-mysql natively
+        // accepts `mariadb://` URLs, so routing `mariadb://` to `MysqlBackend`
+        // shares the MySQL pool/migrator without duplicating the backend.
         let backend = MysqlBackend::new(&config)
             .map_err(|e| format!("failed to initialize MySQL backend: {e}"))?;
         Ok((BackendHandle::Mysql(backend), "mysql"))
@@ -376,5 +393,83 @@ pub async fn rollback() {
             eprintln!("{}", style(format!("error: rollback failed: {e}")).red());
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{BackendHandle, connect_backend, resolve_db_url_in};
+
+    #[tokio::test]
+    async fn connect_backend_routes_mariadb_to_mysql() {
+        let (handle, dialect) = connect_backend("mariadb://user:pass@localhost:3306/app")
+            .await
+            .expect("mariadb:// URL should initialize MySQL-compatible backend");
+        assert_eq!(dialect, "mysql");
+        assert!(matches!(handle, BackendHandle::Mysql(_)));
+    }
+
+    #[tokio::test]
+    async fn connect_backend_routes_mysql_postgres_and_sqlite() {
+        let (mysql_handle, mysql_dialect) = connect_backend("mysql://user:pass@localhost:3306/app")
+            .await
+            .expect("mysql:// URL should initialize MySQL backend");
+        assert_eq!(mysql_dialect, "mysql");
+        assert!(matches!(mysql_handle, BackendHandle::Mysql(_)));
+
+        let (pg_handle, pg_dialect) = connect_backend("postgres://user:pass@localhost:5432/app")
+            .await
+            .expect("postgres:// URL should initialize PostgreSQL backend");
+        assert_eq!(pg_dialect, "postgres");
+        assert!(matches!(pg_handle, BackendHandle::Postgres(_)));
+
+        let (sqlite_handle, sqlite_dialect) = connect_backend("sqlite::memory:")
+            .await
+            .expect("sqlite::memory: should initialize SQLite backend");
+        assert_eq!(sqlite_dialect, "sqlite");
+        assert!(matches!(sqlite_handle, BackendHandle::Sqlite(_)));
+    }
+
+    #[test]
+    fn resolve_db_url_uses_env_interpolation_and_config_layering() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Neither .env nor config/app.toml present -> None
+        assert_eq!(resolve_db_url_in(dir.path()), None);
+
+        // config/app.toml + config/app.local.toml override
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/app.toml"),
+            "[database]\nurl = \"sqlite://base.db\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config/app.local.toml"),
+            "[database]\nurl = \"mariadb://local:3306/app\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_db_url_in(dir.path()),
+            Some("mariadb://local:3306/app".to_string())
+        );
+
+        // Empty DATABASE_URL in .env falls through to config/app*.toml
+        std::fs::write(dir.path().join(".env"), "DATABASE_URL=   \n").unwrap();
+        assert_eq!(
+            resolve_db_url_in(dir.path()),
+            Some("mariadb://local:3306/app".to_string())
+        );
+
+        // .env with ${VAR} interpolation takes precedence over config/app*.toml
+        std::fs::write(
+            dir.path().join(".env"),
+            "DB_HOST=db.internal\nDATABASE_URL=postgres://app:secret@${DB_HOST}:5432/rume\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_db_url_in(dir.path()),
+            Some("postgres://app:secret@db.internal:5432/rume".to_string())
+        );
     }
 }

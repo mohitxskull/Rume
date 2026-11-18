@@ -334,13 +334,19 @@ fn extract_migration_version(id: &str) -> &str {
     let parts: Vec<&str> = id.split('_').collect();
     let mut version_parts_len = 0;
     for part in &parts {
-        if part.chars().any(|c| c.is_ascii_digit()) {
+        // Why: only purely-numeric underscore-separated parts count as version
+        // segments. `.any(|c| c.is_ascii_digit())` treated mixed segments like
+        // "001a" or "v2" as version parts because they contain a digit. `.all()`
+        // requires every character in the segment to be an ASCII digit, and
+        // returning "" when no leading segment is purely numeric ensures
+        // "001a_add_users" is never treated as version "001a".
+        if !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()) {
             version_parts_len += 1;
         } else {
             break;
         }
     }
-    if version_parts_len > 0 && version_parts_len < parts.len() {
+    if version_parts_len > 0 {
         let end_idx = parts[..version_parts_len]
             .iter()
             .map(|p| p.len())
@@ -348,7 +354,7 @@ fn extract_migration_version(id: &str) -> &str {
             + (version_parts_len - 1);
         &id[..end_idx]
     } else {
-        id.split_once('_').map(|(v, _)| v).unwrap_or(id)
+        ""
     }
 }
 
@@ -478,8 +484,9 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 
             if is_up {
                 let ver_prefix = extract_migration_version(id);
-                if let Some(existing_file) =
-                    seen_versions.insert(ver_prefix.to_string(), file_name.to_string())
+                if !ver_prefix.is_empty()
+                    && let Some(existing_file) =
+                        seen_versions.insert(ver_prefix.to_string(), file_name.to_string())
                 {
                     return syn::Error::new(
                         dir_lit.span(),
@@ -534,4 +541,23 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extract_migration_version;
+
+    #[test]
+    fn extract_migration_version_requires_all_digit_segments() {
+        assert_eq!(extract_migration_version("001_add_users"), "001");
+        assert_eq!(
+            extract_migration_version("20261118_114500_create_users"),
+            "20261118_114500"
+        );
+        assert_eq!(extract_migration_version("001_oauth2_tokens"), "001");
+        assert_eq!(extract_migration_version("001_v2_add_users"), "001");
+        assert_ne!(extract_migration_version("001a_add_users"), "001a");
+        assert_eq!(extract_migration_version("001a_add_users"), "");
+        assert_eq!(extract_migration_version("_add_users"), "");
+    }
 }
