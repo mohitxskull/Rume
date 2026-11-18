@@ -1,10 +1,10 @@
 //! Isolated database and transaction fixtures for test isolation.
 
 #[cfg(feature = "sqlite")]
-use crate::persistence::DatabaseConfig;
+use rume_data::persistence::DatabaseConfig;
 #[cfg(any(feature = "sqlite", feature = "postgres"))]
-use crate::persistence::{DatabaseBackend, DatabasePool};
-use crate::persistence::{DatabaseTransaction, PersistenceError};
+use rume_data::persistence::{DatabaseBackend, DatabasePool};
+use rume_data::persistence::{DatabaseTransaction, PersistenceError};
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
 
@@ -84,7 +84,7 @@ impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
 #[cfg(feature = "sqlite")]
 pub struct SqliteTestFixture {
     path: PathBuf,
-    pool: DatabasePool<crate::persistence::SqliteBackend>,
+    pool: DatabasePool<rume_data::persistence::SqliteBackend>,
     closed: bool,
 }
 
@@ -97,7 +97,7 @@ impl SqliteTestFixture {
         let path = temp_dir.join(db_name);
         let path_str = path.to_string_lossy().to_string();
 
-        let backend = crate::persistence::SqliteBackend::open(&path_str).await?;
+        let backend = rume_data::persistence::SqliteBackend::open(&path_str).await?;
         let config = DatabaseConfig::new(format!("sqlite://{path_str}"));
         let pool = DatabasePool::new(backend, config);
 
@@ -109,7 +109,7 @@ impl SqliteTestFixture {
     }
 
     /// Returns a reference to the database pool.
-    pub fn pool(&self) -> &DatabasePool<crate::persistence::SqliteBackend> {
+    pub fn pool(&self) -> &DatabasePool<rume_data::persistence::SqliteBackend> {
         &self.pool
     }
 
@@ -121,7 +121,7 @@ impl SqliteTestFixture {
     /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
     pub async fn begin_test_tx(
         &self,
-    ) -> Result<TestTransactionFixture<crate::persistence::SqliteTransaction>, PersistenceError>
+    ) -> Result<TestTransactionFixture<rume_data::persistence::SqliteTransaction>, PersistenceError>
     {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
@@ -152,7 +152,7 @@ impl SqliteTestFixture {
 
 #[cfg(feature = "sqlite")]
 impl std::ops::Deref for SqliteTestFixture {
-    type Target = DatabasePool<crate::persistence::SqliteBackend>;
+    type Target = DatabasePool<rume_data::persistence::SqliteBackend>;
     fn deref(&self) -> &Self::Target {
         &self.pool
     }
@@ -184,8 +184,8 @@ impl Drop for SqliteTestFixture {
 #[cfg(feature = "postgres")]
 pub struct PostgresSchemaFixture {
     schema_name: String,
-    pool: DatabasePool<crate::persistence::PostgresBackend>,
-    admin_pool: Option<DatabasePool<crate::persistence::PostgresBackend>>,
+    pool: DatabasePool<rume_data::persistence::PostgresBackend>,
+    admin_pool: Option<DatabasePool<rume_data::persistence::PostgresBackend>>,
     closed: bool,
 }
 
@@ -193,7 +193,7 @@ pub struct PostgresSchemaFixture {
 impl PostgresSchemaFixture {
     /// Creates a unique schema in the target PostgreSQL instance and returns a pool scoped to that schema.
     pub async fn create(
-        admin_pool: &DatabasePool<crate::persistence::PostgresBackend>,
+        admin_pool: &DatabasePool<rume_data::persistence::PostgresBackend>,
     ) -> Result<Self, PersistenceError> {
         let schema_name = format!("test_{}", uuid::Uuid::new_v4().simple());
 
@@ -211,7 +211,7 @@ impl PostgresSchemaFixture {
 
         let mut config = admin_pool.config().clone();
         config.url = scoped_url;
-        let backend = crate::persistence::PostgresBackend::connect(&config).await?;
+        let backend = rume_data::persistence::PostgresBackend::connect(&config).await?;
         let pool = DatabasePool::new(backend, config);
 
         Ok(Self {
@@ -228,14 +228,14 @@ impl PostgresSchemaFixture {
     }
 
     /// Returns a reference to the pool scoped to this test's isolated schema.
-    pub fn pool(&self) -> &DatabasePool<crate::persistence::PostgresBackend> {
+    pub fn pool(&self) -> &DatabasePool<rume_data::persistence::PostgresBackend> {
         &self.pool
     }
 
     /// Begins an isolated transaction wrapped in a [`TestTransactionFixture`].
     pub async fn begin_test_tx(
         &self,
-    ) -> Result<TestTransactionFixture<crate::persistence::PostgresTransaction>, PersistenceError>
+    ) -> Result<TestTransactionFixture<rume_data::persistence::PostgresTransaction>, PersistenceError>
     {
         let tx = self.pool.backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
@@ -260,7 +260,7 @@ impl PostgresSchemaFixture {
 
 #[cfg(feature = "postgres")]
 impl std::ops::Deref for PostgresSchemaFixture {
-    type Target = DatabasePool<crate::persistence::PostgresBackend>;
+    type Target = DatabasePool<rume_data::persistence::PostgresBackend>;
     fn deref(&self) -> &Self::Target {
         &self.pool
     }

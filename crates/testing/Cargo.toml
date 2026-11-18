@@ -1,0 +1,29 @@
+[package]
+name = "rume-testing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Testing helpers, in-memory test app, TCP test server, and declarative test harness for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-observability.workspace = true
+rume-data.workspace = true
+rume-messaging.workspace = true
+rume-http.workspace = true
+rume-app.workspace = true
+axum.workspace = true
+tower.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid = { version = "=1.29.2", features = ["v4"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "stream"], optional = true }
+
+[features]
+default = []
+testing = ["dep:reqwest"]
+sqlite = ["rume-data/sqlite", "rume-messaging/sqlite"]
+postgres = ["rume-data/postgres", "rume-messaging/postgres"]
+mysql = ["rume-data/mysql", "rume-messaging/mysql"]

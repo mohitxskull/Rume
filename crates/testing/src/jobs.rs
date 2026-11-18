@@ -6,9 +6,9 @@ use std::time::{Duration, Instant};
 
 use uuid::Uuid;
 
-use crate::jobs::error::JobError;
-use crate::jobs::job::{BoxFuture, Job, QueuedJob};
-use crate::jobs::queue::JobQueue;
+use rume_messaging::jobs::error::JobError;
+use rume_messaging::jobs::job::{BoxFuture, Job, QueuedJob};
+use rume_messaging::jobs::queue::JobQueue;
 
 /// An in-memory test double for [`JobQueue`] recording all enqueued jobs for assertions.
 #[derive(Clone, Default)]
@@ -101,7 +101,7 @@ impl JobQueue for TestJobQueue {
     ) -> BoxFuture<'_, Result<String, JobError>> {
         let trace = job
             .trace_context()
-            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
+            .or_else(|| rume_observability::TraceContext::current().map(|tc| tc.to_string()));
         self.enqueue_delayed_with_trace(job, delay, trace)
     }
 
@@ -118,7 +118,7 @@ impl JobQueue for TestJobQueue {
         };
         let effective_tc = trace_context
             .or_else(|| job.trace_context())
-            .or_else(|| crate::app::TraceContext::current().map(|tc| tc.to_string()));
+            .or_else(|| rume_observability::TraceContext::current().map(|tc| tc.to_string()));
         let queued = QueuedJob {
             id: id.clone(),
             name: J::NAME.to_string(),

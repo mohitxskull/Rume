@@ -9,8 +9,9 @@ use axum::http::{Request, StatusCode};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 
-use crate::app::builder::{BuildError, RumeBuilder};
-use crate::testing::app::{TestApp, TestResponse};
+use crate::app::{TestApp, TestResponse};
+use crate::ext::RumeTestingExt;
+use rume_app::app::builder::{BuildError, RumeBuilder};
 
 /// A running HTTP server bound to an ephemeral TCP port on `127.0.0.1`.
 ///

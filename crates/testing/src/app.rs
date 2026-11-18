@@ -36,15 +36,16 @@ impl TestApp {
         }
     }
 
-    /// Builds a test app from a [`crate::app::builder::RumeBuilder`], executing module startup hooks and attaching lifecycle teardown.
+    /// Builds a test app from a [`rume_app::app::builder::RumeBuilder`], executing module startup hooks and attaching lifecycle teardown.
     pub async fn from_builder<E, C, S>(
-        builder: crate::app::builder::RumeBuilder<E, C, S>,
-    ) -> Result<Self, crate::app::builder::BuildError>
+        builder: rume_app::app::builder::RumeBuilder<E, C, S>,
+    ) -> Result<Self, rume_app::app::builder::BuildError>
     where
         E: Clone + Send + Sync + 'static,
         C: Clone + Send + Sync + 'static,
         S: Clone + Send + Sync + 'static,
     {
+        use crate::ext::RumeTestingExt;
         builder.build_test_app().await
     }
 

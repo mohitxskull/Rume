@@ -7,12 +7,16 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::app::{Availability, Lifecycle, ProjectPaths};
-use crate::module::Module;
-use crate::module::context::ModuleContext;
-use crate::module::error::ModuleError;
-use crate::routing::Router;
-use crate::testing::TestApp;
+use rume_app::app::{Availability, Lifecycle, ProjectPaths};
+use rume_app::module::Module;
+use rume_app::module::context::ModuleContext;
+use rume_app::module::error::ModuleError;
+use rume_http::routing::Router;
+
+use crate::app::TestApp;
+
+/// Convenience alias for [`ModuleHarness`].
+pub type ModuleTestHarness<M> = ModuleHarness<M>;
 
 /// An isolated test harness for verifying a single application module.
 pub struct ModuleHarness<M: Module> {
@@ -74,14 +78,14 @@ impl<M: Module> ModuleHarness<M> {
     }
 
     /// Collects all health checks registered by this module.
-    pub fn health_checks(&self) -> crate::routing::HealthChecks {
-        let mut checks = crate::routing::HealthChecks::new();
+    pub fn health_checks(&self) -> rume_http::routing::HealthChecks {
+        let mut checks = rume_http::routing::HealthChecks::new();
         self.module.register_health_checks(&mut checks);
         checks
     }
 
     /// Runs all health checks registered by this module and returns their report.
-    pub async fn run_health_checks(&self) -> crate::routing::HealthReport {
+    pub async fn run_health_checks(&self) -> rume_http::routing::HealthReport {
         let checks = self.health_checks();
         checks.run().await
     }

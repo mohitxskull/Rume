@@ -1,21 +1,27 @@
 //! Testing helpers and declarative test harness for Rume applications.
 
+#![forbid(unsafe_code)]
+
 pub mod app;
 pub mod events;
+pub mod ext;
 pub mod fixtures;
 pub mod harness;
 pub mod jobs;
+pub mod module_harness;
 #[cfg(feature = "testing")]
 pub mod server;
 
 pub use app::{TestApp, TestAppBuilder, TestResponse, status};
 pub use events::TestEventBus;
+pub use ext::RumeTestingExt;
 #[cfg(feature = "postgres")]
 pub use fixtures::PostgresSchemaFixture;
 #[cfg(feature = "sqlite")]
 pub use fixtures::SqliteTestFixture;
 pub use fixtures::TestTransactionFixture;
 pub use jobs::TestJobQueue;
+pub use module_harness::{ModuleHarness, ModuleTestHarness};
 #[cfg(feature = "testing")]
 pub use server::TestServer;
 

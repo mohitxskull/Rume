@@ -14,18 +14,16 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use crate::routing::{HealthChecks, Router};
+use rume_http::routing::{HealthChecks, Router};
 
 pub mod architecture;
 pub mod context;
 pub mod error;
-pub mod harness;
 pub mod registry;
 
 pub use architecture::{ArchitectureRules, ArchitectureViolation};
 pub use context::ModuleContext;
 pub use error::ModuleError;
-pub use harness::ModuleHarness;
 pub use registry::ModuleRegistry;
 
 /// Result type returned by fallible module startup hooks.

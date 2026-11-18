@@ -3921,6 +3921,7 @@ dependencies = [
  "redis",
  "reqwest",
  "rstest",
+ "rume-app",
  "rume-data",
  "rume-enterprise",
  "rume-foundation",
@@ -3929,6 +3930,7 @@ dependencies = [
  "rume-messaging",
  "rume-observability",
  "rume-security",
+ "rume-testing",
  "saml-rs",
  "secrecy",
  "serde",
@@ -3948,6 +3950,20 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
+]
+
+[[package]]
+name = "rume-app"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "rume-foundation",
+ "rume-http",
+ "rume-observability",
+ "serde_json",
+ "tokio",
+ "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -4128,6 +4144,25 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "rume-testing"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "reqwest",
+ "rume-app",
+ "rume-data",
+ "rume-foundation",
+ "rume-http",
+ "rume-messaging",
+ "rume-observability",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tower",
  "uuid",
 ]
 

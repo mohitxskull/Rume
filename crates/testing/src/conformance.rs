@@ -1,12 +1,12 @@
 //! Unified database conformance suite verifying behavioral parity across SQLite, PostgreSQL, and MySQL.
 
-use crate::persistence::backend::DbValue;
-use crate::persistence::error::PersistenceError;
-use crate::persistence::migration::{Migration, Migrator};
-use crate::persistence::pool::DatabasePool;
-use crate::persistence::row::{DbRow, FromRow};
-use crate::persistence::{DatabaseBackend, DatabaseTransaction};
-use crate::routing::health::{HealthCheck, HealthStatus};
+use rume_data::persistence::backend::DbValue;
+use rume_data::persistence::error::PersistenceError;
+use rume_data::persistence::migration::{Migration, Migrator};
+use rume_data::persistence::pool::DatabasePool;
+use rume_data::persistence::row::{DbRow, FromRow};
+use rume_data::persistence::{DatabaseBackend, DatabaseTransaction};
+use rume_http::routing::health::{HealthCheck, HealthStatus};
 
 /// Typed row representation used in database conformance verification.
 #[derive(Debug, Clone, PartialEq)]

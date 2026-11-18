@@ -7,7 +7,7 @@
 
 use crate::app::paths::ProjectPaths;
 use crate::app::state::Availability;
-use crate::routing::{HealthChecks, RouteRegistry};
+use rume_http::routing::{HealthChecks, RouteRegistry};
 
 /// Application context holding env, config, paths, availability, lifecycle,
 /// health checks, and application state.
@@ -15,8 +15,8 @@ use crate::routing::{HealthChecks, RouteRegistry};
 /// # Example
 ///
 /// ```no_run
-/// use rume::app::{AppContext, Availability, ProjectPaths, Rume};
-/// use rume::routing::{HealthChecks, Router};
+/// use rume_app::app::{AppContext, Availability, ProjectPaths, Rume};
+/// use rume_http::routing::{HealthChecks, Router};
 ///
 /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
 /// let ctx = AppContext::new((), (), ProjectPaths::from_current_dir(), Availability::new(), HealthChecks::new(), ());

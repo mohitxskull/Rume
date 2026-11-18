@@ -18,7 +18,7 @@
 
 #![forbid(unsafe_code)]
 
-pub mod app;
+pub use rume_app::app;
 pub use rume_data::cache;
 pub use rume_data::coordination;
 pub use rume_enterprise::enterprise;
@@ -38,10 +38,10 @@ pub mod prelude;
 pub use rume_http::resilience;
 pub mod routing;
 pub use rume_enterprise::saga;
+pub use rume_http::validation;
 pub use rume_security::security;
 pub use rume_security::tenant;
-pub mod testing;
-pub use rume_http::validation;
+pub use rume_testing as testing;
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,

@@ -16,7 +16,7 @@ use tokio::time::timeout;
 use crate::app::context::AppContext;
 use crate::app::paths::ProjectPaths;
 use crate::app::state::{ApplicationMode, AvailabilityState, LifecycleState};
-use crate::routing::RouteRegistry;
+use rume_http::routing::RouteRegistry;
 
 /// Errors that can occur when building the middleware stack.
 ///
@@ -213,7 +213,7 @@ impl Rume<(), (), ()> {
     pub fn new() -> RumeBuilder<(), (), ()> {
         let paths = ProjectPaths::from_current_dir();
         let availability = crate::app::state::Availability::new();
-        let health_checks = crate::routing::HealthChecks::new();
+        let health_checks = rume_http::routing::HealthChecks::new();
         let ctx = AppContext::new((), (), paths, availability, health_checks, ());
         RumeBuilder::new(ctx)
     }
@@ -234,7 +234,10 @@ where
     }
 }
 
-type ReadyHook<E, C, S> = Box<
+/// Type alias for an application `on_ready` startup hook.
+///
+/// Exposed for `rume-testing`'s `RumeTestingExt` lifecycle runner.
+pub type ReadyHook<E, C, S> = Box<
     dyn FnOnce(
             AppContext<E, C, S>,
         ) -> Pin<
@@ -242,8 +245,30 @@ type ReadyHook<E, C, S> = Box<
         > + Send,
 >;
 
-type ShutdownHook<E, C, S> =
+/// Type alias for an application `on_shutdown` teardown hook.
+///
+/// Exposed for `rume-testing`'s `RumeTestingExt` lifecycle runner.
+pub type ShutdownHook<E, C, S> =
     Box<dyn FnOnce(AppContext<E, C, S>) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>;
+
+/// Decomposed parts of a [`RumeBuilder`] needed to construct and manage a test application.
+///
+/// Exists to support `rume-testing`'s `RumeTestingExt` without creating a circular dependency
+/// between `rume-app` and `rume-testing`.
+pub struct TestAppParts<E, C, S>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    pub ctx: AppContext<E, C, S>,
+    pub router: axum::Router<()>,
+    pub modules: Vec<Arc<dyn crate::module::Module>>,
+    pub mode: ApplicationMode,
+    pub on_ready: Vec<ReadyHook<E, C, S>>,
+    pub on_shutdown: Vec<ShutdownHook<E, C, S>>,
+    pub shutdown_timeout: Duration,
+}
 
 /// Builder for a [`Rume`] application.
 #[allow(clippy::type_complexity)]
@@ -324,7 +349,7 @@ where
         }
     }
 
-    fn record_route(&self, info: crate::routing::RouteInfo) {
+    fn record_route(&self, info: rume_http::routing::RouteInfo) {
         self.route_registry.write().unwrap().register(info);
     }
 
@@ -352,11 +377,11 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::get(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::GET,
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
@@ -370,11 +395,11 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::post(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::POST,
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
@@ -388,11 +413,11 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::put(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::PUT,
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
@@ -406,11 +431,11 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::patch(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::PATCH,
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
@@ -424,11 +449,11 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::delete(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::DELETE,
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
@@ -442,22 +467,22 @@ where
         T: 'static,
     {
         self.router = self.router.route(path, axum::routing::any(handler));
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
         self
     }
 
-    /// Mount a RESTful [`crate::routing::Resource`].
-    pub fn resource(mut self, resource: crate::routing::Resource<AppContext<E, C, S>>) -> Self {
+    /// Mount a RESTful [`rume_http::routing::Resource`].
+    pub fn resource(mut self, resource: rume_http::routing::Resource<AppContext<E, C, S>>) -> Self {
         for r in resource.routes() {
             self.router = self.router.route(&r.path, r.router.clone());
-            self.record_route(crate::routing::RouteInfo {
+            self.record_route(rume_http::routing::RouteInfo {
                 method: r.method.clone(),
                 path: r.path.clone(),
                 name: Some(r.name.clone()),
@@ -469,18 +494,18 @@ where
         self
     }
 
-    /// Nest a child [`crate::routing::Router`] under a path prefix.
+    /// Nest a child [`rume_http::routing::Router`] under a path prefix.
     pub fn nest(
         mut self,
         path: &str,
-        router: impl Into<crate::routing::Router<AppContext<E, C, S>>>,
+        router: impl Into<rume_http::routing::Router<AppContext<E, C, S>>>,
     ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.nest(path, axum_router);
         for r in registry.routes() {
-            self.record_route(crate::routing::RouteInfo {
+            self.record_route(rume_http::routing::RouteInfo {
                 method: r.method.clone(),
-                path: crate::routing::registry::join_path(path, &r.path),
+                path: rume_http::routing::registry::join_path(path, &r.path),
                 name: r.name.clone(),
                 params: r.params.clone(),
                 matchers: r.matchers.clone(),
@@ -490,8 +515,11 @@ where
         self
     }
 
-    /// Merge another [`crate::routing::Router`] into this application.
-    pub fn merge(mut self, router: impl Into<crate::routing::Router<AppContext<E, C, S>>>) -> Self {
+    /// Merge another [`rume_http::routing::Router`] into this application.
+    pub fn merge(
+        mut self,
+        router: impl Into<rume_http::routing::Router<AppContext<E, C, S>>>,
+    ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.merge(axum_router);
         self.route_registry.write().unwrap().extend(registry);
@@ -550,42 +578,24 @@ where
         T::Future: Send + 'static,
     {
         self.router = self.router.route_service(path, service);
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap_or(axum::http::Method::GET),
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
         self
     }
 
-    /// Build the application router and return a lightweight [`crate::testing::TestApp`]
-    /// for integration and unit testing without binding a network port.
-    pub fn test_app(self) -> Result<crate::testing::TestApp, std::io::Error> {
-        let ctx = self.ctx.clone();
-        ctx.lifecycle.set(crate::app::state::LifecycleState::Ready);
-        ctx.availability
-            .set(crate::app::state::AvailabilityState::Ready);
-        let app_router = self.build_router(ctx.clone())?;
-        Ok(crate::testing::TestApp::new(app_router.with_state(ctx)))
-    }
-
-    /// Asynchronously builds the application and returns a [`crate::testing::TestApp`]
-    /// after executing all module `on_start` lifecycle hooks and `on_ready` hooks in topological order.
+    /// Decompose this builder into its compiled router, context, modules, and lifecycle hooks.
     ///
-    /// Automatically attaches an explicit teardown hook to [`crate::testing::TestApp`] that executes
-    /// module `on_shutdown` hooks in reverse topological order upon teardown or drop.
-    pub async fn build_test_app(mut self) -> Result<crate::testing::TestApp, BuildError> {
-        let mut module_registry = crate::module::ModuleRegistry::new();
-        for m in &self.modules {
-            module_registry.register(Arc::clone(m))?;
-        }
-        let startup_modules = module_registry.resolve_startup_modules()?;
-        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
-
-        let mut on_shutdown = std::mem::take(&mut self.on_shutdown);
+    /// Exists to support `rume-testing`'s `RumeTestingExt` (`.test_app()` and `.build_test_app()`)
+    /// without creating a circular dependency between `rume-app` and `rume-testing`.
+    pub fn into_test_parts(mut self) -> Result<TestAppParts<E, C, S>, BuildError> {
+        let modules = self.modules.clone();
+        let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
@@ -593,136 +603,15 @@ where
 
         let app_router = self.build_router(ctx.clone())?;
 
-        // In Inspect mode, align with run(): boot context to Booted/Live and return without running hooks.
-        if mode == ApplicationMode::Inspect {
-            ctx.lifecycle.set(crate::app::state::LifecycleState::Booted);
-            ctx.availability
-                .set(crate::app::state::AvailabilityState::Live);
-            let test_app = crate::testing::TestApp::new(app_router.with_state(ctx.clone()));
-            return Ok(test_app);
-        }
-
-        // 1. Booted & Live
-        ctx.lifecycle.set(crate::app::state::LifecycleState::Booted);
-        ctx.availability
-            .set(crate::app::state::AvailabilityState::Live);
-
-        // 2. Run module on_start hooks in topological order with rollback
-        let mut started_modules: Vec<Arc<dyn crate::module::Module>> = Vec::new();
-        for m in startup_modules {
-            let mod_ctx = crate::module::ModuleContext::new(
-                m.name(),
-                ctx.paths.clone(),
-                ctx.availability.clone(),
-                ctx.lifecycle.clone(),
-            );
-            if let Err(err) = m.on_start(&mod_ctx).await {
-                ctx.lifecycle
-                    .set(crate::app::state::LifecycleState::Terminating);
-                ctx.availability
-                    .set(crate::app::state::AvailabilityState::Broken);
-
-                started_modules.reverse();
-                let cleanup_ctx = ctx.clone();
-                for hook in std::mem::take(&mut on_shutdown) {
-                    let _ = hook(cleanup_ctx.clone()).await;
-                }
-                for sm in started_modules {
-                    let sm_ctx = crate::module::ModuleContext::new(
-                        sm.name(),
-                        cleanup_ctx.paths.clone(),
-                        cleanup_ctx.availability.clone(),
-                        cleanup_ctx.lifecycle.clone(),
-                    );
-                    sm.on_shutdown(&sm_ctx).await;
-                }
-                ctx.lifecycle
-                    .set(crate::app::state::LifecycleState::Terminated);
-                return Err(BuildError::Startup(format!(
-                    "module '{}' failed to start: {err}",
-                    m.name()
-                )));
-            }
-            started_modules.push(m);
-        }
-
-        // 3. Application on_ready hooks
-        for hook in on_ready {
-            if let Err(err) = hook(ctx.clone()).await {
-                ctx.lifecycle
-                    .set(crate::app::state::LifecycleState::Terminating);
-                ctx.availability
-                    .set(crate::app::state::AvailabilityState::Broken);
-
-                started_modules.reverse();
-                let cleanup_ctx = ctx.clone();
-                for hook in std::mem::take(&mut on_shutdown) {
-                    let _ = hook(cleanup_ctx.clone()).await;
-                }
-                for sm in started_modules {
-                    let sm_ctx = crate::module::ModuleContext::new(
-                        sm.name(),
-                        cleanup_ctx.paths.clone(),
-                        cleanup_ctx.availability.clone(),
-                        cleanup_ctx.lifecycle.clone(),
-                    );
-                    sm.on_shutdown(&sm_ctx).await;
-                }
-                ctx.lifecycle
-                    .set(crate::app::state::LifecycleState::Terminated);
-                return Err(BuildError::Startup(format!("startup hook failed: {err}")));
-            }
-        }
-
-        ctx.lifecycle.set(crate::app::state::LifecycleState::Ready);
-        ctx.availability
-            .set(crate::app::state::AvailabilityState::Ready);
-
-        // 4. Attach teardown closure
-        let cleanup_ctx = ctx.clone();
-        let cleanup = Box::new(move || {
-            let shutdown_future = async move {
-                cleanup_ctx
-                    .lifecycle
-                    .set(crate::app::state::LifecycleState::Terminating);
-                cleanup_ctx
-                    .availability
-                    .set(crate::app::state::AvailabilityState::RefusingTraffic);
-
-                for hook in on_shutdown {
-                    let _ = hook(cleanup_ctx.clone()).await;
-                }
-                for m in shutdown_modules {
-                    let sm_ctx = crate::module::ModuleContext::new(
-                        m.name(),
-                        cleanup_ctx.paths.clone(),
-                        cleanup_ctx.availability.clone(),
-                        cleanup_ctx.lifecycle.clone(),
-                    );
-                    m.on_shutdown(&sm_ctx).await;
-                }
-                cleanup_ctx
-                    .lifecycle
-                    .set(crate::app::state::LifecycleState::Terminated);
-            };
-
-            let _ = std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    rt.block_on(async {
-                        let _ = tokio::time::timeout(shutdown_timeout, shutdown_future).await;
-                    });
-                }
-            })
-            .join();
-        });
-
-        Ok(crate::testing::TestApp::with_cleanup(
-            app_router.with_state(ctx),
-            cleanup,
-        ))
+        Ok(TestAppParts {
+            router: app_router.with_state(ctx.clone()),
+            ctx,
+            modules,
+            mode,
+            on_ready,
+            on_shutdown,
+            shutdown_timeout,
+        })
     }
 
     /// Add a route to the application.
@@ -734,24 +623,24 @@ where
     /// [`RumeBuilder::route_spec`].
     pub fn route(mut self, path: &str, method_router: MethodRouter<AppContext<E, C, S>>) -> Self {
         self.router = self.router.route(path, method_router);
-        self.record_route(crate::routing::RouteInfo {
+        self.record_route(rume_http::routing::RouteInfo {
             method: axum::http::Method::from_bytes(b"ANY").unwrap(),
             path: path.to_string(),
             name: None,
-            params: crate::routing::registry::extract_path_params(path),
+            params: rume_http::routing::registry::extract_path_params(path),
             matchers: Vec::new(),
             request_schema: None,
         });
         self
     }
 
-    /// Mount a [`crate::routing::RouteSpec`] with its parameter validation layer and metadata.
-    pub fn route_spec<H, T>(mut self, spec: crate::routing::RouteSpec, handler: H) -> Self
+    /// Mount a [`rume_http::routing::RouteSpec`] with its parameter validation layer and metadata.
+    pub fn route_spec<H, T>(mut self, spec: rume_http::routing::RouteSpec, handler: H) -> Self
     where
         H: axum::handler::Handler<T, AppContext<E, C, S>>,
         T: 'static,
     {
-        let rume_router = crate::routing::Router::new().route_spec(spec, handler);
+        let rume_router = rume_http::routing::Router::new().route_spec(spec, handler);
         let (axum_router, registry) = rume_router.into_parts();
         self.router = self.router.merge(axum_router);
         self.route_registry.write().unwrap().extend(registry);
@@ -762,7 +651,7 @@ where
     ///
     /// The specification is generated lazily when requested from the shared route registry,
     /// guaranteeing that routes registered after `.openapi()` and module routes are included.
-    pub fn openapi(self, path: &str, info: crate::openapi::OpenApiInfo) -> Self {
+    pub fn openapi(self, path: &str, info: rume_http::openapi::OpenApiInfo) -> Self {
         let registry = Arc::clone(&self.route_registry);
         self.get(path, move || {
             let reg = Arc::clone(&registry);
@@ -775,7 +664,11 @@ where
     }
 
     /// Mounts a Prometheus text metrics scraping route at the specified path (e.g. `/metrics`).
-    pub fn metrics(self, path: &str, registry: crate::metrics::MetricsRegistry) -> Self {
+    pub fn metrics(
+        self,
+        path: &str,
+        registry: rume_observability::metrics::MetricsRegistry,
+    ) -> Self {
         self.get(path, move || {
             let reg = registry.clone();
             async move {
@@ -790,11 +683,11 @@ where
 
     /// Replace the application router.
     ///
-    /// Accepts a [`crate::routing::Router`] (carrying both the Axum router and
+    /// Accepts a [`rume_http::routing::Router`] (carrying both the Axum router and
     /// route registry) or an [`axum::Router`] via [`From`].
     pub fn router(
         mut self,
-        router: impl Into<crate::routing::Router<AppContext<E, C, S>>>,
+        router: impl Into<rume_http::routing::Router<AppContext<E, C, S>>>,
     ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = axum_router;
@@ -873,7 +766,7 @@ where
     }
 
     /// Access the health checks registry.
-    pub fn health_checks(&self) -> crate::routing::HealthChecks {
+    pub fn health_checks(&self) -> rume_http::routing::HealthChecks {
         self.ctx.health_checks.clone()
     }
 
@@ -978,7 +871,7 @@ where
         let startup_modules = module_registry.resolve_startup_modules()?;
 
         let mut module_axum = axum::Router::new();
-        let mut module_routes = crate::routing::RouteRegistry::new();
+        let mut module_routes = rume_http::routing::RouteRegistry::new();
         let mut seen_routes: Vec<(String, String)> = Vec::new();
 
         // Register module routes FIRST: they must occupy `seen_routes` before
@@ -986,7 +879,7 @@ where
         // participate in duplicate-route detection (App M4) instead of being
         // invisible to it.
         for m in &startup_modules {
-            let single_mod_router = m.register_routes(crate::routing::Router::new());
+            let single_mod_router = m.register_routes(rume_http::routing::Router::new());
             let (axum_r, routes) = single_mod_router.into_parts();
             for r in routes.routes() {
                 let new_method = r.method.to_string();
@@ -1178,7 +1071,7 @@ where
             if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
                 || std::env::args().any(|a| a == "--rume-inspect-routes")
             {
-                let mut module_router = crate::routing::Router::new();
+                let mut module_router = rume_http::routing::Router::new();
                 for m in &self.modules {
                     module_router = m.register_routes(module_router);
                 }
@@ -1262,7 +1155,7 @@ where
             if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
                 || std::env::args().any(|a| a == "--rume-inspect-routes")
             {
-                let mut module_router = crate::routing::Router::new();
+                let mut module_router = rume_http::routing::Router::new();
                 for m in &self.modules {
                     module_router = m.register_routes(module_router);
                 }
@@ -1555,7 +1448,7 @@ mod tests {
     use crate::app::context::AppContext;
     use crate::app::paths::ProjectPaths;
     use crate::app::state::{ApplicationMode, Availability, AvailabilityState, LifecycleState};
-    use crate::routing::HealthChecks;
+    use rume_http::routing::HealthChecks;
 
     fn test_ctx() -> AppContext<(), (), ()> {
         AppContext::new(
@@ -1870,7 +1763,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_individual_execution_order_during_request() {
-        use crate::testing::TestApp;
+        use tower::ServiceExt;
 
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = test_ctx();
@@ -1886,9 +1779,13 @@ mod tests {
             .use_middleware("second");
 
         let app_router = builder.build_router(test_ctx()).unwrap();
-        let app = TestApp::new(app_router.with_state(test_ctx()));
+        let app = app_router.with_state(test_ctx());
 
-        let res = app.get("/hello").await;
+        let req = axum::http::Request::builder()
+            .uri("/hello")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
 
         let events = log.lock().unwrap().clone();
@@ -1901,7 +1798,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_group_execution_order_during_request() {
-        use crate::testing::TestApp;
+        use tower::ServiceExt;
 
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = test_ctx();
@@ -1915,9 +1812,13 @@ mod tests {
             .use_group("stack");
 
         let app_router = builder.build_router(test_ctx()).unwrap();
-        let app = TestApp::new(app_router.with_state(test_ctx()));
+        let app = app_router.with_state(test_ctx());
 
-        let res = app.get("/hello").await;
+        let req = axum::http::Request::builder()
+            .uri("/hello")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
 
         let events = log.lock().unwrap().clone();
@@ -1932,7 +1833,7 @@ mod tests {
 
     #[tokio::test]
     async fn middleware_combined_individual_and_groups_execution_order() {
-        use crate::testing::TestApp;
+        use tower::ServiceExt;
 
         let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let ctx = test_ctx();
@@ -1950,9 +1851,13 @@ mod tests {
             .use_group("api");
 
         let app_router = builder.build_router(test_ctx()).unwrap();
-        let app = TestApp::new(app_router.with_state(test_ctx()));
+        let app = app_router.with_state(test_ctx());
 
-        let res = app.get("/hello").await;
+        let req = axum::http::Request::builder()
+            .uri("/hello")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), axum::http::StatusCode::OK);
 
         let events = log.lock().unwrap().clone();
@@ -1970,13 +1875,97 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn app_builder_topological_startup_and_reverse_shutdown_on_failure() {
+        struct RecordingModule {
+            name: &'static str,
+            deps: Vec<&'static str>,
+            fail_start: bool,
+            events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        impl crate::module::Module for RecordingModule {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn dependencies(&self) -> Vec<&str> {
+                self.deps.clone()
+            }
+
+            fn on_start<'a>(
+                &'a self,
+                _ctx: &'a crate::module::ModuleContext,
+            ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+                Box::pin(async move {
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(format!("start:{}", self.name));
+                    if self.fail_start {
+                        Err("boom".into())
+                    } else {
+                        Ok(())
+                    }
+                })
+            }
+
+            fn on_shutdown<'a>(
+                &'a self,
+                _ctx: &'a crate::module::ModuleContext,
+            ) -> crate::module::BoxFuture<'a, ()> {
+                Box::pin(async move {
+                    self.events
+                        .lock()
+                        .unwrap()
+                        .push(format!("shutdown:{}", self.name));
+                })
+            }
+        }
+
+        let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ctx = test_ctx();
+        let builder = RumeBuilder::new(ctx)
+            .module(RecordingModule {
+                name: "c",
+                deps: vec!["b"],
+                fail_start: true,
+                events: std::sync::Arc::clone(&events),
+            })
+            .module(RecordingModule {
+                name: "b",
+                deps: vec!["a"],
+                fail_start: false,
+                events: std::sync::Arc::clone(&events),
+            })
+            .module(RecordingModule {
+                name: "a",
+                deps: vec![],
+                fail_start: false,
+                events: std::sync::Arc::clone(&events),
+            });
+
+        let err = builder
+            .run_with_signal(std::future::pending())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("c"));
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec!["start:a", "start:b", "start:c", "shutdown:b", "shutdown:a",]
+        );
+    }
+
     /// A test module that mounts a single GET route.
     struct MountRouteModule;
     impl crate::module::Module for MountRouteModule {
         fn name(&self) -> &'static str {
             "mount_route"
         }
-        fn register_routes(&self, router: crate::routing::Router) -> crate::routing::Router {
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router,
+        ) -> rume_http::routing::Router {
             router.get("/m/x", || async { "module" })
         }
     }

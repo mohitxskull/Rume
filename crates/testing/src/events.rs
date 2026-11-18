@@ -4,7 +4,7 @@ use std::any::{Any, TypeId};
 use std::fmt::Debug;
 use std::sync::{Arc, RwLock};
 
-use crate::events::{Event, EventBus, EventHandler};
+use rume_messaging::events::{Event, EventBus, EventHandler};
 
 /// Representation of a captured event recorded by [`TestEventBus`].
 pub type RecordedEvent = (TypeId, &'static str, Arc<dyn Any + Send + Sync>);
@@ -45,7 +45,7 @@ impl TestEventBus {
     pub async fn publish_sync<E: Event>(
         &self,
         event: &E,
-    ) -> Result<usize, crate::events::EventError> {
+    ) -> Result<usize, rume_messaging::events::EventError> {
         let count = self.inner.publish_sync(event).await?;
         if let Ok(mut recorded) = self.recorded.write() {
             recorded.push((TypeId::of::<E>(), E::TYPE, Arc::new(event.clone())));

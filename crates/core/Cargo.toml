@@ -21,6 +21,10 @@ rume-security.workspace = true
 rume-http.workspace = true
 # Enterprise SAML/SCIM and Saga workflows.
 rume-enterprise.workspace = true
+# Application builder, lifecycle, and module composition.
+rume-app.workspace = true
+# Testing helpers, TestApp, TestServer, and declarative harnesses.
+rume-testing.workspace = true
 # Core HTTP substrate.
 axum.workspace = true
 # Async runtime.
@@ -74,8 +78,14 @@ required-features = ["postgres", "redis"]
 
 [features]
 default = ["sqlite", "testing"]
-testing = ["dep:reqwest"]
-postgres = ["dep:sqlx", "sqlx/postgres", "rume-data/postgres", "rume-messaging/postgres"]
+testing = ["dep:reqwest", "rume-testing/testing"]
+postgres = [
+    "dep:sqlx",
+    "sqlx/postgres",
+    "rume-data/postgres",
+    "rume-messaging/postgres",
+    "rume-testing/postgres",
+]
 redis = [
     "dep:deadpool-redis",
     "dep:redis",
@@ -84,8 +94,20 @@ redis = [
     "rume-security/redis",
     "rume-http/redis",
 ]
-sqlite = ["dep:sqlx", "sqlx/sqlite", "rume-data/sqlite", "rume-messaging/sqlite"]
-mysql = ["dep:sqlx", "sqlx/mysql", "rume-data/mysql", "rume-messaging/mysql"]
+sqlite = [
+    "dep:sqlx",
+    "sqlx/sqlite",
+    "rume-data/sqlite",
+    "rume-messaging/sqlite",
+    "rume-testing/sqlite",
+]
+mysql = [
+    "dep:sqlx",
+    "sqlx/mysql",
+    "rume-data/mysql",
+    "rume-messaging/mysql",
+    "rume-testing/mysql",
+]
 saml = ["dep:quick-xml", "dep:saml-rs", "rume-enterprise/saml"]
 enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]

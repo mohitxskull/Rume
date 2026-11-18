@@ -8,6 +8,8 @@ members = [
     "crates/security",
     "crates/http",
     "crates/enterprise",
+    "crates/app",
+    "crates/testing",
     "crates/core",
     "crates/cli",
     "crates/macro",
@@ -35,6 +37,8 @@ rume-messaging = { path = "crates/messaging", version = "=0.1.0" }
 rume-security = { path = "crates/security", version = "=0.1.0" }
 rume-http = { path = "crates/http", version = "=0.1.0" }
 rume-enterprise = { path = "crates/enterprise", version = "=0.1.0" }
+rume-app = { path = "crates/app", version = "=0.1.0" }
+rume-testing = { path = "crates/testing", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
 tokio = { version = "=1.54.1", features = ["full", "test-util"] }
