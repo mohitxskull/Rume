@@ -357,7 +357,7 @@ async fn test_redis_distributed_lock_mutual_exclusion_and_fencing() {
     let node_b = RedisDistributedLock::new(pool.clone());
 
     // 1. Node A acquires lock on "report-generator"
-    let guard_a = node_a
+    let mut guard_a = node_a
         .acquire("report-generator", Duration::from_secs(5))
         .await
         .expect("acquire node_a")
@@ -375,7 +375,7 @@ async fn test_redis_distributed_lock_mutual_exclusion_and_fencing() {
 
     // 3. Node A renews active lock
     node_a
-        .renew(&guard_a, Duration::from_secs(5))
+        .renew(&mut guard_a, Duration::from_secs(5))
         .await
         .expect("renewal should succeed");
 

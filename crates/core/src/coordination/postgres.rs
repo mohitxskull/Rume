@@ -112,7 +112,7 @@ impl DistributedLock for PostgresDistributedLock {
         })
     }
 
-    fn renew<'a>(&'a self, guard: &'a LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
+    fn renew<'a>(&'a self, guard: &'a mut LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
         Box::pin(async move {
             let ttl_ms = ttl.as_millis().max(1) as i64;
 
@@ -129,6 +129,10 @@ impl DistributedLock for PostgresDistributedLock {
                     resource: guard.resource.clone(),
                 })
             } else {
+                // Why: Refresh local `expires_at` only on confirmed DB extension so `is_expired()`
+                // and `time_remaining()` stay accurate; `fencing_token` stays unchanged because
+                // renewal extends the existing lease rather than issuing a new acquisition.
+                guard.expires_at = Some(std::time::Instant::now() + ttl);
                 Ok(())
             }
         })

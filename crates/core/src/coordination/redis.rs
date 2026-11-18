@@ -118,7 +118,7 @@ impl DistributedLock for RedisDistributedLock {
         })
     }
 
-    fn renew<'a>(&'a self, guard: &'a LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
+    fn renew<'a>(&'a self, guard: &'a mut LockGuard, ttl: Duration) -> CoordinationFuture<'a, ()> {
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -150,6 +150,10 @@ impl DistributedLock for RedisDistributedLock {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             if renewed == 1 {
+                // Why: Refresh local `expires_at` only on confirmed Redis PEXPIRE so `is_expired()`
+                // and `time_remaining()` stay accurate; `fencing_token` stays unchanged because
+                // renewal extends the existing lease rather than issuing a new acquisition.
+                guard.expires_at = Some(std::time::Instant::now() + ttl);
                 Ok(())
             } else {
                 Err(CoordinationError::LockExpired {

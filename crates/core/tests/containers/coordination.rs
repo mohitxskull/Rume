@@ -26,7 +26,7 @@ async fn test_distributed_lock_exclusive_and_fencing() {
     // 1. Client A acquires lock
     let guard_a = lock_service.acquire("db-export", ttl).await.unwrap();
     assert!(guard_a.is_some());
-    let guard_a = guard_a.unwrap();
+    let mut guard_a = guard_a.unwrap();
     assert_eq!(guard_a.resource, "db-export");
     assert_eq!(guard_a.fencing_token, 1);
 
@@ -35,7 +35,7 @@ async fn test_distributed_lock_exclusive_and_fencing() {
     assert!(guard_b.is_none());
 
     // 3. Client A renews lock
-    lock_service.renew(&guard_a, ttl).await.unwrap();
+    lock_service.renew(&mut guard_a, ttl).await.unwrap();
 
     // 4. Client A releases lock
     let released = lock_service.release(guard_a).await.unwrap();

@@ -580,7 +580,7 @@ async fn test_postgres_distributed_lock_mutual_exclusion_and_fencing() {
         .expect("init lock schema failed");
 
     // Worker 1 acquires lock
-    let guard1 = lock_svc
+    let mut guard1 = lock_svc
         .acquire("billing-reconciliation", Duration::from_secs(3))
         .await
         .expect("acquire call failed")
@@ -604,7 +604,7 @@ async fn test_postgres_distributed_lock_mutual_exclusion_and_fencing() {
 
     // Worker 1 renews lease
     lock_svc
-        .renew(&guard1, Duration::from_secs(3))
+        .renew(&mut guard1, Duration::from_secs(3))
         .await
         .expect("renewal should succeed");
 
@@ -642,7 +642,7 @@ async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
         .expect("init lock schema failed");
 
     // Acquire with short 100ms TTL
-    let guard1 = lock_svc
+    let mut guard1 = lock_svc
         .acquire("ephemeral-job", Duration::from_millis(100))
         .await
         .expect("acquire failed")
@@ -674,7 +674,7 @@ async fn test_postgres_distributed_lock_ttl_expiration_recovery() {
     );
 
     // Original worker tries to renew expired guard -> fails with LockExpired
-    let renew_attempt = lock_svc.renew(&guard1, Duration::from_secs(2)).await;
+    let renew_attempt = lock_svc.renew(&mut guard1, Duration::from_secs(2)).await;
     match renew_attempt {
         Err(CoordinationError::LockExpired { resource }) => {
             assert_eq!(resource, "ephemeral-job");
