@@ -1,0 +1,16 @@
+# yaml-language-server: $schema=https://www.coderabbit.ai/integrations/schema.v2.json
+reviews:
+  profile: assertive
+  path_filters:
+    - "!docs/**"
+    - "docs/specs/vision/**"
+  path_instructions:
+    - path: crates/**/*.rs
+      instructions: >-
+        Enforce #![forbid(unsafe_code)], avoid unwrap()/expect() in non-test production code,
+        and preserve W3C TraceContext propagation and OpenTelemetry span bridging across async boundaries.
+    - path: workbench/**/*.rs
+      instructions: >-
+        Reference application scenarios (simple-api, modular-monolith, multi-instance) must use the
+        public rume umbrella API and prelude, avoid bypassing framework module/persistence boundaries,
+        and keep test/SLA assertions deterministic.
