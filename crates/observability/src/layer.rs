@@ -116,31 +116,34 @@ where
         };
 
         // Why: `parent: None` makes every HTTP server request span a root in the `tracing`
-        // hierarchy instead of inheriting an ambient caller span on the current thread/task.
-        // Without `parent: None`, an unheadered request invoked under an active tracing span
-        // inherits that ambient span's OTel trace_id when `OpenTelemetryLayer` builds the span
-        // (and `span.set_parent(Context::new())` cannot override an already-resolved tracing
-        // parent if another subscriber/layer is active). Incoming W3C trace parents are attached
-        // explicitly via `span.set_parent(parent_cx)` immediately below.
-        let span = tracing::info_span!(
-            parent: None,
-            "http_request",
-            request_id = %request_id,
-            traceparent = tracing::field::Empty,
-            tracestate = tracing::field::Empty,
-            method = %req.method(),
-            route = tracing::field::Empty,
-            status = tracing::field::Empty,
-            latency_ms = tracing::field::Empty,
-        );
+        // hierarchy, and detaching the ambient thread-local OTel context around `info_span!`
+        // ensures `OpenTelemetryLayer::on_new_span` never captures an ambient `OtelContext::current()`.
+        // Incoming W3C trace parents are attached explicitly via `span.set_parent(parent_cx)`
+        // immediately below.
+        let span = {
+            let _isolated = opentelemetry::Context::new().attach();
+            tracing::info_span!(
+                parent: None,
+                "http_request",
+                request_id = %request_id,
+                traceparent = tracing::field::Empty,
+                tracestate = tracing::field::Empty,
+                method = %req.method(),
+                route = tracing::field::Empty,
+                status = tracing::field::Empty,
+                latency_ms = tracing::field::Empty,
+            )
+        };
 
-        // Why: unconditionally call `set_parent(parent_cx)` BEFORE `span.context()`. When an
-        // `OpenTelemetryLayer` is installed, `on_new_span` captures ambient `OtelContext::current()`
-        // on the span builder, so passing `Context::new()` for unheadered requests clears any
-        // ambient parent while headered requests bind the extracted parent; calling `span.context()`
-        // first would start the span (`AlreadyStarted`) and silently reject `set_parent`.
-        let _ = span.set_parent(parent_cx.clone());
-        let span_cx = span.context();
+        // Why: call `set_parent(parent_cx)` BEFORE `span.context()` so an incoming W3C parent is
+        // bound before `span.context()` starts the OTel span builder.
+        if parent_cx.span().span_context().is_valid() {
+            let _ = span.set_parent(parent_cx.clone());
+        }
+        let span_cx = {
+            let _isolated = opentelemetry::Context::new().attach();
+            span.context()
+        };
 
         let (server_tc, exec_cx) = if let Some(tc) = TraceContext::from_otel_context(&span_cx) {
             (tc, span_cx)
@@ -390,7 +393,16 @@ mod tests {
         let incoming_span_id = "00f067aa0ba902b7";
         let incoming_tp = format!("00-{incoming_trace_id}-{incoming_span_id}-01");
 
+        // Why: `observability_try_init_tracing_is_idempotent_and_non_panicking` installs a global
+        // tracing subscriber, and `#[tokio::test]` defaults to `current_thread` so `.set_default()`
+        // stays bound to this thread; serialize with `OTEL_TEST_LOCK` so concurrent tests don't
+        // swap the global propagator/subscriber mid-assertion.
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+
         // (a) Incoming traceparent without OpenTelemetryLayer
+        // Install an explicit no-OTel subscriber on this thread so a previously initialized
+        // global OTel subscriber from another test cannot intercept part (a).
+        let _no_otel_guard = tracing::subscriber::set_default(tracing_subscriber::registry());
         let no_otel_captured = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
         let no_otel_captured_clone = std::sync::Arc::clone(&no_otel_captured);
         let mut no_otel_svc =
@@ -686,6 +698,10 @@ mod tests {
         use opentelemetry::baggage::BaggageExt as _;
         use opentelemetry::propagation::TextMapCompositePropagator;
         use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+        // Ensure no global OTel tracing layer intercepts this fallback test.
+        let _no_otel_guard = tracing::subscriber::set_default(tracing_subscriber::registry());
 
         // Install a composite propagator (trace + baggage) without any OpenTelemetryLayer.
         let composite = TextMapCompositePropagator::new(vec![

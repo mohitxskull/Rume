@@ -219,11 +219,18 @@ pub fn init_tracing() {
 }
 
 #[cfg(test)]
+pub(crate) fn test_global_otel_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn observability_try_init_tracing_is_idempotent_and_non_panicking() {
+        let _global_guard = test_global_otel_lock().blocking_lock();
         init_tracing();
         init_tracing();
         let second_try = try_init_tracing();
