@@ -10,12 +10,10 @@ use crate::models::{CreateUserRequest, User};
 use crate::repositories::UserRepository;
 use crate::state::WorkbenchState;
 
-pub async fn create_user(
-    Authenticated(caller): Authenticated<AuthUser>,
-    TenantContext(tenant): TenantContext,
-    State(state): State<WorkbenchState>,
-    Json(payload): Json<CreateUserRequest>,
-) -> Result<(StatusCode, Json<User>), AppError> {
+pub(crate) fn validate_create_user_request<'a>(
+    caller: &AuthUser,
+    payload: &'a CreateUserRequest,
+) -> Result<(&'a str, &'a str, &'a str, &'a str, &'a str), AppError> {
     // Why: only organization administrators may provision new users and assign roles/API tokens;
     // allowing ordinary `member` accounts to call `POST /api/v1/users` would let any member mint
     // an `admin` account with a caller-chosen token and escalate privileges within the tenant.
@@ -38,6 +36,17 @@ pub async fn create_user(
             "Role must be one of: admin, member, viewer",
         ));
     }
+
+    Ok((id, email, name, role, token))
+}
+
+pub async fn create_user(
+    Authenticated(caller): Authenticated<AuthUser>,
+    TenantContext(tenant): TenantContext,
+    State(state): State<WorkbenchState>,
+    Json(payload): Json<CreateUserRequest>,
+) -> Result<(StatusCode, Json<User>), AppError> {
+    let (id, email, name, role, token) = validate_create_user_request(&caller, &payload)?;
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -98,7 +107,7 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::routing::post;
-    use rume::auth::policy::RequireRole;
+    use rume::auth::policy::RequireAnyRole;
     use rume::auth::{AuthLayer, BearerTokenScheme, PolicyLayer};
     use rume::tenant::Tenant;
     use tower::ServiceExt;
@@ -121,27 +130,23 @@ mod tests {
             }
         });
 
-        async fn guarded_create_user_check(
+        async fn production_validation_endpoint(
             Authenticated(caller): Authenticated<AuthUser>,
             TenantContext(_tenant): TenantContext,
             Json(payload): Json<CreateUserRequest>,
         ) -> Result<StatusCode, AppError> {
-            if !caller.has_role("admin") {
-                return Err(AppError::Forbidden);
-            }
-            let role = payload.role.trim();
-            if !matches!(role, "admin" | "member" | "viewer") {
-                return Err(AppError::bad_request(
-                    "Role must be one of: admin, member, viewer",
-                ));
-            }
+            validate_create_user_request(&caller, &payload)?;
             Ok(StatusCode::CREATED)
         }
 
+        // Mirrors the route-level `RequireAnyRole(&["admin", "member"])` policy from `routes.rs`
+        // so that authorization and role-whitelist enforcement are exercised through the shared
+        // production `validate_create_user_request` helper used by `create_user`.
         let app = Router::new()
             .route(
                 "/users",
-                post(guarded_create_user_check).layer(PolicyLayer::new(RequireRole("admin"))),
+                post(production_validation_endpoint)
+                    .layer(PolicyLayer::new(RequireAnyRole(&["admin", "member"]))),
             )
             .layer(AuthLayer::required().scheme(auth_scheme));
 

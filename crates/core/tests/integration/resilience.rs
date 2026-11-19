@@ -546,7 +546,10 @@ async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
 
 #[tokio::test]
 async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client_ip() {
+    tokio::time::pause();
+
     use axum::extract::ConnectInfo;
+    use rume::auth::identity::AuthUser;
     use rume::tenant::TenantLayer;
     use rume::tenant::resolver::HeaderTenantResolver;
     use std::net::SocketAddr;
@@ -558,10 +561,19 @@ async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client
     };
     let limiter = RateLimiter::new(config);
 
-    // Stack TenantLayer::optional(HeaderTenantResolver) outside RateLimitLayer
+    // Stack TenantLayer::optional(HeaderTenantResolver) outside RateLimitLayer.
+    // Also register a second tenant whose ID ends with IP A's client key suffix
+    // (`acme:198.51.100.10`) to prove anonymous traffic to `acme` from IP A cannot
+    // collide with the authenticated bucket of tenant `acme:198.51.100.10`.
     let resolver = HeaderTenantResolver::default();
     resolver
         .try_add_tenant(rume::tenant::Tenant::new("acme", "acme"))
+        .unwrap();
+    resolver
+        .try_add_tenant(rume::tenant::Tenant::new(
+            "acme:198.51.100.10",
+            "acme-ip-suffix",
+        ))
         .unwrap();
     let router = rume::routing::Router::new()
         .get("/api/tenant-scoped", || async { "ok" })
@@ -606,6 +618,23 @@ async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client
         res_b.status(),
         StatusCode::OK,
         "anonymous client IP A must not drain tenant 'acme' rate-limit bucket for IP B"
+    );
+
+    // Authenticated member of tenant `acme:198.51.100.10` must NOT share a bucket with
+    // anonymous requests to `acme` from `198.51.100.10`.
+    let mut req_auth_suffix = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme:198.51.100.10")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_auth_suffix
+        .extensions_mut()
+        .insert(AuthUser::new("member-1").with_tenant_id("acme:198.51.100.10"));
+    let res_auth_suffix = app.request(req_auth_suffix).await;
+    assert_eq!(
+        res_auth_suffix.status(),
+        StatusCode::OK,
+        "anonymous traffic to 'acme' from 198.51.100.10 must not collide with authenticated tenant 'acme:198.51.100.10'"
     );
 }
 

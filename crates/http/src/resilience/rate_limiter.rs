@@ -365,11 +365,11 @@ where
         // verifying that an authenticated `AuthUser` is bound to that tenant would let an
         // unauthenticated caller exhaust a victim tenant's shared bucket (DoS) or rotate
         // `X-Tenant-ID` across tenants to bypass their own IP rate limit. Only use the shared
-        // `tenant:<id>` key when an authenticated `AuthUser` matches the resolved tenant; when an
-        // unauthenticated request carries a resolved tenant without `ConnectInfo` (e.g. unit/test
-        // harness requests), scope the tenant key to `ip_key`, and when `ConnectInfo` is present on
-        // an unauthenticated request, key by `ip_key` (`tenant:<id>:{ip_key}`) so one anonymous IP
-        // cannot drain another IP's or an authenticated member's tenant quota.
+        // `tenant_auth:<len>:<id>` bucket when an authenticated `AuthUser` matches the resolved
+        // tenant; otherwise encode the anonymous tenant+client key with a disjoint prefix and
+        // length-prefixed tenant ID (`tenant_anon:<len>:<id>:<ip_key>`) so no two distinct
+        // `(tenant, client)` pairs or authenticated tenant buckets can ever collide, even when a
+        // tenant ID contains colons or ends with an IP key suffix.
         let authenticated_for_tenant = resolved_tenant_id.is_some_and(|tid| {
             req.extensions()
                 .get::<rume_security::auth::identity::AuthUser>()
@@ -383,9 +383,9 @@ where
         });
 
         let client_key = match (resolved_tenant_id, authenticated_for_tenant) {
-            (Some(tid), true) => format!("tenant:{tid}"),
-            (Some(tid), false) => format!("tenant:{tid}:{ip_key}"),
-            (None, _) => ip_key,
+            (Some(tid), true) => format!("tenant_auth:{}:{tid}", tid.len()),
+            (Some(tid), false) => format!("tenant_anon:{}:{tid}:{ip_key}", tid.len()),
+            (None, _) => format!("ip_anon:{ip_key}"),
         };
 
         Box::pin(async move {

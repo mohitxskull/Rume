@@ -327,6 +327,11 @@ impl SamlParser {
                         .checked_sub(2)
                         .and_then(|idx| element_stack.get(idx))
                         .map(|(n, pns)| (n.as_str(), *pns));
+                    let great_grandparent = element_stack
+                        .len()
+                        .checked_sub(3)
+                        .and_then(|idx| element_stack.get(idx))
+                        .map(|(n, pns)| (n.as_str(), *pns));
                     // Why: XML-DSig enveloped-signature transforms strip the entire `<ds:Signature>`
                     // subtree before computing the digest. An attacker who holds any validly signed
                     // assertion can inject `<saml:Subject>`, `<saml:Conditions>`, `<saml:Audience>`,
@@ -469,11 +474,22 @@ impl SamlParser {
                                 });
                             } else if local_name == "Audience"
                                 && fields.audience.is_none()
-                                && (matches!(
+                                && ((matches!(
                                     parent,
                                     Some(("AudienceRestriction", XmlNs::Assertion))
-                                        | Some(("Conditions", XmlNs::Assertion))
-                                ))
+                                ) && matches!(
+                                    grandparent,
+                                    Some(("Conditions", XmlNs::Assertion))
+                                ) && matches!(
+                                    great_grandparent,
+                                    Some(("Assertion", XmlNs::Assertion))
+                                )) || (matches!(
+                                    parent,
+                                    Some(("Conditions", XmlNs::Assertion))
+                                ) && matches!(
+                                    grandparent,
+                                    Some(("Assertion", XmlNs::Assertion))
+                                )))
                             {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::Audience,
@@ -1109,5 +1125,35 @@ mod saml_parser_and_iso8601_proptests {
         let err = SamlParser::parse_signed(xml, &AcceptVerifier)
             .expect_err("signed assertion missing its own <Issuer> must not fall back to unsigned Response <Issuer>");
         assert!(matches!(err, SamlError::Malformed(_)));
+    }
+
+    #[test]
+    fn advice_extension_audience_cannot_override_assertion_conditions_audience() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ext="urn:example:ext" ID="_a_adv_aud">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@acme.example</saml:NameID>
+            </saml:Subject>
+            <saml:Advice>
+                <ext:Payload>
+                    <saml:AudienceRestriction>
+                        <saml:Audience>https://forged-advice-sp.example.com</saml:Audience>
+                    </saml:AudienceRestriction>
+                </ext:Payload>
+            </saml:Advice>
+            <saml:Conditions NotBefore="2026-11-02T11:00:00Z" NotOnOrAfter="2026-11-02T13:00:00Z">
+                <saml:AudienceRestriction>
+                    <saml:Audience>https://real-sp.example.com</saml:Audience>
+                </saml:AudienceRestriction>
+            </saml:Conditions>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml)
+            .expect("valid assertion with Advice extension must parse");
+        assert_eq!(
+            assertion.audience.as_deref(),
+            Some("https://real-sp.example.com"),
+            "Audience nested under Advice/ext:Payload must not override Assertion/Conditions/AudienceRestriction/Audience"
+        );
     }
 }
