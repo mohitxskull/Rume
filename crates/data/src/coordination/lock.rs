@@ -206,17 +206,24 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn precomputed_conservative_deadline_expires_if_reply_is_delayed() {
+    #[test]
+    fn precomputed_conservative_deadline_expires_if_reply_is_delayed() {
+        let before = std::time::Instant::now();
         let (ttl_ms, candidate) =
             conservative_lease_deadline(Duration::from_millis(10) + Duration::from_micros(900));
+        let after = std::time::Instant::now();
         assert_eq!(ttl_ms, 10, "sub-millisecond fraction must truncate");
+        assert!(
+            candidate >= before + Duration::from_millis(ttl_ms)
+                && candidate <= after + Duration::from_millis(ttl_ms),
+            "candidate must lie between before+ttl_ms and after+ttl_ms"
+        );
 
-        let mut guard = LockGuard::new("res", "lease-1", 1)
-            .with_expires_at(std::time::Instant::now() - Duration::from_millis(1));
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        guard.advance_expires_at(candidate);
+        // Simulate a pre-RTT deadline captured 25ms before the remote reply arrives.
+        let delayed_pre_rtt_candidate = before - Duration::from_millis(15);
+        let mut guard =
+            LockGuard::new("res", "lease-1", 1).with_expires_at(before - Duration::from_millis(30));
+        guard.advance_expires_at(delayed_pre_rtt_candidate);
 
         assert!(
             guard.is_expired(),

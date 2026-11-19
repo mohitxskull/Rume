@@ -1347,8 +1347,10 @@ mod tests {
         let drain_task =
             tokio::spawn(async move { drain_worker.drain(Duration::from_secs(2)).await });
 
-        // Small yield so drain sets is_stopping
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Wait deterministically until `drain` sets `is_stopping`
+        while !worker.is_stopping.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+        }
 
         // 3. Release dequeue_for so it returns the job
         release_tx.send(()).await.expect("released dequeue");
@@ -1408,16 +1410,16 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_handle_timeout_aborts_tasks() {
         let is_stopping = Arc::new(AtomicBool::new(false));
         let shutdown_notify = Arc::new(tokio::sync::Notify::new());
         let in_flight_count = Arc::new(AtomicU32::new(0));
         let active_tasks = Arc::new(AtomicU32::new(1));
 
-        // Long-running task that would sleep forever unless aborted
+        // Long-running task that would suspend forever unless aborted
         let long_task = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_secs(60)).await;
+            std::future::pending::<()>().await;
         });
         let abort_handle = long_task.abort_handle();
 
@@ -1457,7 +1459,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_handle_try_shutdown_retry_after_heartbeat_timeout() {
         let worker_task = tokio::spawn(async {});
         let heartbeat_task = tokio::spawn(async {
@@ -1526,7 +1528,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_heartbeat_loss_routes_to_dlq() {
         let (enter_tx, _) = mpsc::channel(1);
         let (_, release_rx) = mpsc::channel(1);
@@ -2204,7 +2206,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
         // Case A: dead_letter fails -> release_with_token must NOT be called
         let seq_fail: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -2424,7 +2426,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_worker_keeps_heartbeat_active_until_nack_completes_on_slow_release() {
         let seq_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let renew_count = Arc::new(AtomicUsize::new(0));
@@ -2836,7 +2838,7 @@ mod tests {
                 worker.in_flight_count(),
                 worker.join_set_len.load(Ordering::SeqCst),
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
 
         assert_eq!(fast_completed.load(Ordering::SeqCst), 1000);

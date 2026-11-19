@@ -927,7 +927,7 @@ mod tests {
         assert_eq!(registry.in_flight(), 0);
 
         let service = service_fn(|_req: Request<Body>| async {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            std::future::pending::<()>().await;
             Ok::<_, std::convert::Infallible>(Response::new(Body::empty()))
         });
 

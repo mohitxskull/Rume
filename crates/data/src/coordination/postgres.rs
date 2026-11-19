@@ -87,7 +87,10 @@ impl DistributedLock for PostgresDistributedLock {
     ) -> CoordinationFuture<'a, Option<LockGuard>> {
         let res = resource.to_string();
         Box::pin(async move {
-            let ttl_ms = ttl.as_millis().max(1) as i64;
+            // Why: Compute the conservative deadline before dispatching `LOCK_ACQUIRE_SQL`
+            // so pool checkout and query RTT count against the local lease deadline (`RC-01`).
+            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+            let ttl_ms = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
             let lease_id = Uuid::new_v4().to_string();
 
             let row = sqlx::query(LOCK_ACQUIRE_SQL)
@@ -106,7 +109,7 @@ impl DistributedLock for PostgresDistributedLock {
                     resource: res,
                     lease_id,
                     fencing_token: fencing_token as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)
@@ -214,7 +217,10 @@ impl LeaderElector for PostgresLeaderElector {
         let r = role.to_string();
         let cid = candidate_id.to_string();
         Box::pin(async move {
-            let ttl_ms = ttl.as_millis().max(1) as i64;
+            // Why: Compute the conservative deadline before dispatching `LEADER_ACQUIRE_SQL`
+            // so pool checkout and query RTT count against the local leader lease (`RC-01`).
+            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+            let ttl_ms = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
 
             let row = sqlx::query(LEADER_ACQUIRE_SQL)
                 .bind(&r)
@@ -232,7 +238,7 @@ impl LeaderElector for PostgresLeaderElector {
                     role: r,
                     candidate_id: cid,
                     term: term as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)
@@ -249,7 +255,12 @@ impl LeaderElector for PostgresLeaderElector {
         let r = role.to_string();
         let cid = candidate_id.to_string();
         Box::pin(async move {
-            let ttl_ms = ttl.as_millis().max(1) as i64;
+            // Why: Capture `pre_rtt` before dispatching `LEADER_RENEW_SQL` (`RC-01`) and read the
+            // retained `remaining_ms` from `RETURNING term, remaining_ms` so `expires_at` reflects
+            // the monotonic `GREATEST(expires_at, now + $1)` lease without post-RTT inflation.
+            let pre_rtt = std::time::Instant::now();
+            let (ttl_ms, _) = conservative_lease_deadline(ttl);
+            let ttl_ms = i64::try_from(ttl_ms).unwrap_or(i64::MAX);
 
             let row = sqlx::query(LEADER_RENEW_SQL)
                 .bind(ttl_ms)
@@ -263,11 +274,15 @@ impl LeaderElector for PostgresLeaderElector {
                 let term: i64 = row_data
                     .try_get(0)
                     .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let remaining_ms: i64 = row_data
+                    .try_get(1)
+                    .map_err(|e| CoordinationError::Backend(e.to_string()))?;
+                let effective_ms = u64::try_from(remaining_ms.max(1)).unwrap_or(u64::MAX);
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: cid,
                     term: term as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(pre_rtt + Duration::from_millis(effective_ms)),
                 }))
             } else {
                 Ok(None)

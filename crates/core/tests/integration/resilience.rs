@@ -227,15 +227,19 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
     // First request is allowed as trial probe
-    assert!(breaker.allow_request());
+    let permit1 = breaker
+        .try_acquire()
+        .expect("first request allowed as trial probe");
 
     // Concurrent second request during probe must be rejected!
-    assert!(!breaker.allow_request());
+    assert!(breaker.try_acquire().is_none());
 
     // Once probe succeeds, subsequent trial can proceed
-    breaker.on_success();
-    assert!(breaker.allow_request());
-    breaker.on_success();
+    permit1.complete_success();
+    let permit2 = breaker
+        .try_acquire()
+        .expect("second trial allowed after first succeeds");
+    permit2.complete_success();
 
     // Closed after 2 successes
     assert_eq!(breaker.state(), CircuitState::Closed);
@@ -261,16 +265,18 @@ async fn test_circuit_breaker_half_open_abandoned_trial_released() {
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
     // First request is allowed as trial probe
-    assert!(breaker.allow_request());
+    let permit = breaker
+        .try_acquire()
+        .expect("first request allowed as trial probe");
 
-    // Abandon the trial: do NOT call on_success/on_failure (simulates client
-    // disconnect or future cancellation). The half_open_in_flight slot should
-    // be released after the reset timeout elapses, not wedge the circuit.
-    tokio::time::advance(Duration::from_millis(50)).await;
+    // Abandon the trial: drop the permit without calling complete_success/complete_failure
+    // (simulates client disconnect or future cancellation). The half_open_in_flight slot
+    // is released immediately by TrialPermit::drop, never wedging the circuit.
+    drop(permit);
 
     // A subsequent trial must be permitted (not wedged HalfOpen)
     assert!(
-        breaker.allow_request(),
+        breaker.try_acquire().is_some(),
         "abandoned HalfOpen trial should release the slot, not wedge the circuit"
     );
 }

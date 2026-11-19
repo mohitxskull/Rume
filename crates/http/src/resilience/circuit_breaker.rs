@@ -1,6 +1,7 @@
 //! Circuit breaker pattern implementation and Tower middleware.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -54,7 +55,6 @@ struct CircuitInner {
     half_open_in_flight: bool,
     half_open_generation: u64,
     active_half_open_permit: Option<u64>,
-    permit_guarded: bool,
 }
 
 /// Drop-guarded permit for an in-flight request admitted by [`CircuitBreaker`].
@@ -62,19 +62,22 @@ struct CircuitInner {
 /// For `HalfOpen` trials, carries the trial's generation ID and releases the
 /// `half_open_in_flight` slot on drop if the future is cancelled before
 /// reporting completion.
-struct TrialPermit {
+#[derive(Debug)]
+pub struct TrialPermit {
     breaker: CircuitBreaker,
     generation: Option<u64>,
     completed: bool,
 }
 
 impl TrialPermit {
-    fn complete_success(mut self) {
+    /// Marks the permitted execution as successful, updating the circuit breaker state.
+    pub fn complete_success(mut self) {
         self.completed = true;
         self.breaker.complete_with_permit(self.generation, true);
     }
 
-    fn complete_failure(mut self) {
+    /// Marks the permitted execution as failed, updating the circuit breaker state.
+    pub fn complete_failure(mut self) {
         self.completed = true;
         self.breaker.complete_with_permit(self.generation, false);
     }
@@ -86,13 +89,14 @@ impl Drop for TrialPermit {
             return;
         }
         if let Some(generation) = self.generation {
-            let mut inner = self.breaker.inner.write().unwrap();
+            // Why: `parking_lot::RwLock` does not poison, so `TrialPermit::drop` can never
+            // double-panic and abort the process if dropped during stack unwinding (`RC-03`).
+            let mut inner = self.breaker.inner.write();
             if inner.state == CircuitState::HalfOpen
                 && inner.active_half_open_permit == Some(generation)
             {
                 inner.half_open_in_flight = false;
                 inner.active_half_open_permit = None;
-                inner.permit_guarded = false;
             }
         }
     }
@@ -124,59 +128,25 @@ impl CircuitBreaker {
                 half_open_in_flight: false,
                 half_open_generation: 0,
                 active_half_open_permit: None,
-                permit_guarded: false,
             })),
         }
     }
 
     /// Returns the current state of the circuit breaker.
     pub fn state(&self) -> CircuitState {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
         inner.state
     }
 
-    /// Evaluates whether a new request is permitted to execute.
-    pub fn allow_request(&self) -> bool {
-        let mut inner = self.inner.write().unwrap();
-        Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
-
-        match inner.state {
-            CircuitState::Closed => true,
-            CircuitState::HalfOpen => {
-                if inner.half_open_in_flight {
-                    // Only unguarded legacy `allow_request()` calls fall back to
-                    // timeout-based slot recovery; Drop-guarded service futures
-                    // keep the slot occupied until they complete or drop.
-                    if !inner.permit_guarded
-                        && let Some(opened) = inner.opened_at
-                        && opened.elapsed() >= self.config.reset_timeout
-                    {
-                        let generation = inner.half_open_generation.wrapping_add(1);
-                        inner.half_open_generation = generation;
-                        inner.active_half_open_permit = Some(generation);
-                        inner.half_open_in_flight = true;
-                        inner.opened_at = Some(Instant::now());
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    let generation = inner.half_open_generation.wrapping_add(1);
-                    inner.half_open_generation = generation;
-                    inner.active_half_open_permit = Some(generation);
-                    inner.half_open_in_flight = true;
-                    inner.permit_guarded = false;
-                    inner.opened_at = Some(Instant::now());
-                    true
-                }
-            }
-            CircuitState::Open => false,
-        }
-    }
-
-    fn acquire_permit(&self) -> Option<TrialPermit> {
-        let mut inner = self.inner.write().unwrap();
+    /// Attempts to acquire a Drop-guarded [`TrialPermit`] for executing a request.
+    ///
+    /// Returns `None` when the circuit is `Open` or when a `HalfOpen` trial probe is already
+    /// in flight. Dropping the returned [`TrialPermit`] without calling
+    /// [`TrialPermit::complete_success`] or [`TrialPermit::complete_failure`] automatically
+    /// releases the `HalfOpen` trial slot so cancelled futures cannot wedge the circuit.
+    pub fn try_acquire(&self) -> Option<TrialPermit> {
+        let mut inner = self.inner.write();
         Self::try_transition_to_half_open(&mut inner, self.config.reset_timeout);
 
         match inner.state {
@@ -187,30 +157,12 @@ impl CircuitBreaker {
             }),
             CircuitState::HalfOpen => {
                 if inner.half_open_in_flight {
-                    if !inner.permit_guarded
-                        && let Some(opened) = inner.opened_at
-                        && opened.elapsed() >= self.config.reset_timeout
-                    {
-                        let generation = inner.half_open_generation.wrapping_add(1);
-                        inner.half_open_generation = generation;
-                        inner.active_half_open_permit = Some(generation);
-                        inner.half_open_in_flight = true;
-                        inner.permit_guarded = true;
-                        inner.opened_at = Some(Instant::now());
-                        Some(TrialPermit {
-                            breaker: self.clone(),
-                            generation: Some(generation),
-                            completed: false,
-                        })
-                    } else {
-                        None
-                    }
+                    None
                 } else {
                     let generation = inner.half_open_generation.wrapping_add(1);
                     inner.half_open_generation = generation;
                     inner.active_half_open_permit = Some(generation);
                     inner.half_open_in_flight = true;
-                    inner.permit_guarded = true;
                     inner.opened_at = Some(Instant::now());
                     Some(TrialPermit {
                         breaker: self.clone(),
@@ -224,7 +176,7 @@ impl CircuitBreaker {
     }
 
     fn complete_with_permit(&self, permit_generation: Option<u64>, success: bool) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         match permit_generation {
             Some(generation) => {
                 if inner.state != CircuitState::HalfOpen
@@ -234,7 +186,6 @@ impl CircuitBreaker {
                 }
                 inner.half_open_in_flight = false;
                 inner.active_half_open_permit = None;
-                inner.permit_guarded = false;
                 if success {
                     inner.consecutive_successes += 1;
                     if inner.consecutive_successes >= self.config.success_threshold {
@@ -266,8 +217,6 @@ impl CircuitBreaker {
     }
 
     /// Transitions Open → HalfOpen when the reset timeout has elapsed.
-    /// Extracted into a helper so `state()` and `allow_request()` share one
-    /// code path instead of duplicating the transition logic.
     fn try_transition_to_half_open(inner: &mut CircuitInner, reset_timeout: Duration) {
         if inner.state == CircuitState::Open
             && let Some(opened) = inner.opened_at
@@ -278,16 +227,14 @@ impl CircuitBreaker {
             inner.opened_at = Some(Instant::now()); // mark HalfOpen entry time
             inner.half_open_in_flight = false;
             inner.active_half_open_permit = None;
-            inner.permit_guarded = false;
         }
     }
 
     /// Records a successful execution.
     pub fn on_success(&self) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.half_open_in_flight = false;
         inner.active_half_open_permit = None;
-        inner.permit_guarded = false;
         match inner.state {
             CircuitState::HalfOpen => {
                 inner.consecutive_successes += 1;
@@ -307,10 +254,9 @@ impl CircuitBreaker {
 
     /// Records a failed execution.
     pub fn on_failure(&self) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write();
         inner.half_open_in_flight = false;
         inner.active_half_open_permit = None;
-        inner.permit_guarded = false;
         match inner.state {
             CircuitState::Closed => {
                 inner.consecutive_failures += 1;
@@ -387,7 +333,7 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            let Some(permit) = breaker.acquire_permit() else {
+            let Some(permit) = breaker.try_acquire() else {
                 let err: AppError = ResilienceError::CircuitOpen.into();
                 return Ok(err.into_response());
             };
@@ -510,17 +456,13 @@ mod tests {
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
         // Trial A acquires generation 1.
-        let permit_a = breaker
-            .acquire_permit()
-            .expect("trial A should be admitted");
+        let permit_a = breaker.try_acquire().expect("trial A should be admitted");
         assert!(permit_a.generation.is_some());
 
         // Simulate trial A being superseded by another cycle (e.g., failure -> Open -> HalfOpen -> trial B).
         breaker.on_failure();
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
-        let permit_b = breaker
-            .acquire_permit()
-            .expect("trial B should be admitted");
+        let permit_b = breaker.try_acquire().expect("trial B should be admitted");
         assert_ne!(permit_a.generation, permit_b.generation);
 
         // Late completion from superseded trial A must be ignored: it must NOT
@@ -528,7 +470,7 @@ mod tests {
         permit_a.complete_success();
         assert_eq!(breaker.state(), CircuitState::HalfOpen);
         assert!(
-            breaker.acquire_permit().is_none(),
+            breaker.try_acquire().is_none(),
             "trial B's slot must remain occupied after superseded trial A completes"
         );
 

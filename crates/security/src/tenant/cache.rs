@@ -84,6 +84,20 @@ pub fn tenant_cache_tag(tenant_id: &str) -> String {
     format!("tenant:{}:{tenant_id}", tenant_id.len())
 }
 
+const TENANT_LOCK_STRIPES: usize = 64;
+type TenantLockStripes = Arc<[tokio::sync::RwLock<()>; TENANT_LOCK_STRIPES]>;
+
+fn new_tenant_lock_stripes() -> TenantLockStripes {
+    Arc::new(std::array::from_fn(|_| tokio::sync::RwLock::new(())))
+}
+
+fn tenant_stripe_index(tenant_id: &str) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    tenant_id.hash(&mut hasher);
+    (hasher.finish() as usize) % TENANT_LOCK_STRIPES
+}
+
 /// A cache wrapper that automatically isolates data per tenant using key prefixes, namespaced tags, and optional quotas.
 #[derive(Clone)]
 pub struct TenantScopedCache<B: CacheBackend> {
@@ -91,6 +105,7 @@ pub struct TenantScopedCache<B: CacheBackend> {
     max_keys_per_tenant: usize,
     quota_store: Option<Arc<dyn TenantQuotaStore>>,
     key_locks: KeyLockMap,
+    tenant_locks: TenantLockStripes,
 }
 
 impl<B: CacheBackend> TenantScopedCache<B> {
@@ -104,7 +119,12 @@ impl<B: CacheBackend> TenantScopedCache<B> {
             max_keys_per_tenant: Self::DEFAULT_MAX_KEYS_PER_TENANT,
             quota_store: None,
             key_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+            tenant_locks: new_tenant_lock_stripes(),
         }
+    }
+
+    fn tenant_lock(&self, tenant_id: &str) -> &tokio::sync::RwLock<()> {
+        &self.tenant_locks[tenant_stripe_index(tenant_id)]
     }
 
     /// Sets the maximum number of keys permitted per tenant.
@@ -164,6 +184,12 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
+        // Why: acquire a shared read lock on the tenant's stripe before the per-key lock so
+        // concurrent writes across distinct keys in the same tenant proceed in parallel while
+        // bulk `invalidate_tag` / `invalidate_tenant` (which acquire an exclusive write lock on
+        // the tenant stripe) cannot interleave between `reserve_key`, cache publication, and
+        // `record_key` (`RC-02`).
+        let _tenant_guard = self.tenant_lock(tenant_id).read().await;
         // Serialize same-key write/delete lifecycles so concurrent writers on `(tenant_id, key)`
         // never interleave `reserve_key`, backend publication, finalization, or rollback.
         let _key_lock = KeyLockGuard::acquire(&self.key_locks, &full_key).await;
@@ -267,6 +293,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     /// Deletes a specific key scoped to `tenant_id`.
     pub async fn delete(&self, tenant_id: &str, key: &str) -> Result<bool, CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
+        let _tenant_guard = self.tenant_lock(tenant_id).read().await;
         let _key_lock = KeyLockGuard::acquire(&self.key_locks, &full_key).await;
         let deleted = self.cache.delete(&full_key).await?;
         if deleted && let Some(ref quota) = self.quota_store {
@@ -277,6 +304,10 @@ impl<B: CacheBackend> TenantScopedCache<B> {
 
     /// Evicts all cached entries belonging to `tenant_id` matching `tag`.
     pub async fn invalidate_tag(&self, tenant_id: &str, tag: &str) -> Result<usize, CacheError> {
+        // Why: acquire an exclusive write guard on the tenant stripe so bulk tag invalidation
+        // waits for any in-flight `set_with_tags` / `delete` on this tenant to complete its
+        // cache + quota update before evicting tag members and removing their quota entries (`RC-02`).
+        let _tenant_guard = self.tenant_lock(tenant_id).write().await;
         let scoped = Self::scoped_tag(tenant_id, tag);
         let deleted_keys = self.cache.invalidate_tag_keys(&scoped).await?;
         let count = deleted_keys.len();
@@ -293,6 +324,9 @@ impl<B: CacheBackend> TenantScopedCache<B> {
 
     /// Evicts all cached entries belonging to `tenant_id`.
     pub async fn invalidate_tenant(&self, tenant_id: &str) -> Result<usize, CacheError> {
+        // Why: acquire an exclusive write guard on the tenant stripe so tenant-wide cache +
+        // quota reset cannot race with an in-flight `set_with_tags` reservation or publication (`RC-02`).
+        let _tenant_guard = self.tenant_lock(tenant_id).write().await;
         let tag = Self::tenant_tag(tenant_id);
         let deleted_keys = self.cache.invalidate_tag_keys(&tag).await?;
         let count = deleted_keys.len();
@@ -929,5 +963,85 @@ mod tests {
             matches!(err, CacheError::Backend(_)),
             "expected Backend error from failed compensating delete, got {err:?}"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_write_and_invalidate_tenant_serialize_without_phantom_quota_or_stale_key() {
+        for use_invalidate_tenant in [false, true] {
+            let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let backend = FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists));
+            let write_delay_ms = Arc::clone(&backend.write_delay_ms);
+            let cache = Cache::new(backend, rume_data::cache::config::CacheConfig::default());
+            let quota = Arc::new(InMemoryTenantQuotaStore::new());
+            let tenant_cache = Arc::new(
+                TenantScopedCache::new(cache)
+                    .with_max_keys_per_tenant(2)
+                    .with_quota_store(Arc::clone(&quota) as _),
+            );
+
+            // Start an in-flight write that pauses 20s inside backend `set_with_tags` while holding
+            // the tenant read lock, then issue the single invalidation operation at t=5s and
+            // assert it stays blocked until the 20s write finishes.
+            write_delay_ms.store(20_000, std::sync::atomic::Ordering::SeqCst);
+            let in_flight_write = {
+                let c = Arc::clone(&tenant_cache);
+                async move {
+                    c.set_with_tags(
+                        "t1",
+                        "k-race",
+                        &"v-race",
+                        &["tag-a"],
+                        Some(Duration::from_secs(60)),
+                    )
+                    .await
+                }
+            };
+            let inv_finished_at_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let start = tokio::time::Instant::now();
+            let concurrent_invalidation = {
+                let c = Arc::clone(&tenant_cache);
+                let delay = Arc::clone(&write_delay_ms);
+                let finished_at = Arc::clone(&inv_finished_at_ms);
+                async move {
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    delay.store(0, std::sync::atomic::Ordering::SeqCst);
+                    if use_invalidate_tenant {
+                        c.invalidate_tenant("t1")
+                            .await
+                            .expect("invalidate_tenant waits for in-flight write");
+                    } else {
+                        c.invalidate_tag("t1", "tag-a")
+                            .await
+                            .expect("invalidate_tag waits for in-flight write");
+                    }
+                    finished_at.store(
+                        start.elapsed().as_millis() as u64,
+                        std::sync::atomic::Ordering::SeqCst,
+                    );
+                }
+            };
+
+            let (write_res, ()) = tokio::join!(in_flight_write, concurrent_invalidation);
+            write_res.expect("in-flight write completes before invalidation takes exclusive lock");
+
+            assert!(
+                inv_finished_at_ms.load(std::sync::atomic::Ordering::SeqCst) >= 20_000,
+                "invalidation (tenant={use_invalidate_tenant}) must remain blocked until 20s in-flight write finishes"
+            );
+            assert_eq!(
+                tenant_cache
+                    .get::<String>("t1", "k-race")
+                    .await
+                    .expect("get"),
+                None,
+                "invalidation (tenant={use_invalidate_tenant}) must not leave stale entry from concurrent write"
+            );
+            assert_eq!(
+                tenant_cache.active_key_count("t1").await.expect("count"),
+                0,
+                "invalidation (tenant={use_invalidate_tenant}) must not leave phantom quota from concurrent write"
+            );
+        }
     }
 }
