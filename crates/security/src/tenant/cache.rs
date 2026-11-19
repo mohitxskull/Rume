@@ -38,13 +38,18 @@ impl KeyLockGuard {
                     .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
             )
         };
-        let guard = Arc::clone(&mutex).lock_owned().await;
-        Self {
+        // Why: arm `KeyLockGuard` with `_guard: None` BEFORE awaiting `lock_owned()` so if
+        // this acquisition future is cancelled while waiting and the previous holder has
+        // already released, `KeyLockGuard::drop` still evicts the idle map entry.
+        let mut key_guard = Self {
             map: Arc::clone(map),
             key: key.to_string(),
-            mutex,
-            _guard: Some(guard),
-        }
+            mutex: Arc::clone(&mutex),
+            _guard: None,
+        };
+        let guard = mutex.lock_owned().await;
+        key_guard._guard = Some(guard);
+        key_guard
     }
 }
 
@@ -54,12 +59,14 @@ impl Drop for KeyLockGuard {
             .map
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        // While `_guard` is still held, references to `self.mutex` are:
-        // 1 in `locks` map + 1 in `self.mutex` + 1 in `self._guard` == 3 when no other caller
-        // is waiting on this key. Evicting under `locks` while `strong_count == 3` is race-free.
+        // When `_guard` is `Some`, an idle entry has 3 strong refs (1 in `locks` map + 1 in
+        // `self.mutex` + 1 in `self._guard`). When `_guard` is `None` (cancelled during
+        // `lock_owned().await`, whose temporary `Arc` clone has already been dropped before
+        // `key_guard`), an idle entry has 2 strong refs (1 in `locks` map + 1 in `self.mutex`).
+        let expected_idle_refs = if self._guard.is_some() { 3 } else { 2 };
         if let Some(current) = locks.get(&self.key)
             && Arc::ptr_eq(current, &self.mutex)
-            && Arc::strong_count(&self.mutex) == 3
+            && Arc::strong_count(&self.mutex) == expected_idle_refs
         {
             locks.remove(&self.key);
         }
@@ -222,14 +229,17 @@ impl<B: CacheBackend> TenantScopedCache<B> {
                 {
                     Ok(true) => Ok(()),
                     Ok(false) => {
-                        let _ = self.cache.delete(&full_key).await;
+                        // Why: do not discard a compensating delete failure; if `delete` fails,
+                        // the entry remains live in the cache and returning `QuotaExceeded`
+                        // would falsely signal that the write was rejected without side effects.
+                        self.cache.delete(&full_key).await?;
                         Err(CacheError::QuotaExceeded(format!(
                             "tenant '{tenant_id}' exceeded quota of {} keys while finalizing write",
                             self.max_keys_per_tenant
                         )))
                     }
                     Err(err) => {
-                        let _ = self.cache.delete(&full_key).await;
+                        self.cache.delete(&full_key).await?;
                         Err(err)
                     }
                 }
@@ -400,6 +410,7 @@ mod tests {
         inner: rume_data::cache::backend::InMemoryCacheBackend,
         fail_writes: Arc<std::sync::atomic::AtomicBool>,
         fail_exists: Arc<std::sync::atomic::AtomicBool>,
+        fail_deletes: Arc<std::sync::atomic::AtomicBool>,
         /// Milliseconds each successful tagged write waits before applying (paused-time tests).
         write_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
@@ -413,6 +424,7 @@ mod tests {
                 inner: rume_data::cache::backend::InMemoryCacheBackend::new(),
                 fail_writes,
                 fail_exists,
+                fail_deletes: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 write_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
@@ -461,6 +473,9 @@ mod tests {
             &self,
             key: &str,
         ) -> rume_data::cache::backend::BoxFuture<'_, Result<bool, CacheError>> {
+            if self.fail_deletes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(CacheError::Backend("delete failed".into())) });
+            }
             self.inner.delete(key)
         }
 
@@ -844,6 +859,75 @@ mod tests {
             tenant_cache.active_key_count("t1").await.expect("count"),
             1,
             "failed serialization must never evict an active reservation for the same key"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_waiter_in_key_lock_guard_cleans_up_idle_map_entry() {
+        let map: KeyLockMap = Arc::new(std::sync::Mutex::new(BTreeMap::new()));
+        let holder = KeyLockGuard::acquire(&map, "tenant:2:t1:k1").await;
+
+        let map_waiter = Arc::clone(&map);
+        let mut waiter = Box::pin(async move {
+            let _g = KeyLockGuard::acquire(&map_waiter, "tenant:2:t1:k1").await;
+        });
+        // Poll once so the waiter inserts its `KeyLockGuard` and suspends inside `lock_owned().await`.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(waiter.as_mut(), &mut cx).is_pending());
+        assert_eq!(map.lock().unwrap().len(), 1);
+
+        // Holder releases while waiter is still queued, then waiter is cancelled before being polled.
+        drop(holder);
+        drop(waiter);
+
+        assert!(
+            map.lock().unwrap().is_empty(),
+            "cancelled waiter must evict idle entry from key_locks map"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_compensating_delete_surfaces_delete_error_instead_of_quota_exceeded() {
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists));
+        let fail_deletes = Arc::clone(&backend.fail_deletes);
+        let write_delay_ms = Arc::clone(&backend.write_delay_ms);
+        let cache = Cache::new(backend, rume_data::cache::config::CacheConfig::default());
+        let quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let tenant_cache = Arc::new(
+            TenantScopedCache::new(cache)
+                .with_max_keys_per_tenant(1)
+                .with_quota_store(Arc::clone(&quota) as _),
+        );
+
+        write_delay_ms.store(20_000, std::sync::atomic::Ordering::SeqCst);
+        let first_write = {
+            let c = Arc::clone(&tenant_cache);
+            async move {
+                c.set("t1", "k-fail-del", &"v1", Some(Duration::from_secs(10)))
+                    .await
+            }
+        };
+        let steal = {
+            let c = Arc::clone(&tenant_cache);
+            let delay = Arc::clone(&write_delay_ms);
+            let fail_del = Arc::clone(&fail_deletes);
+            async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                delay.store(0, std::sync::atomic::Ordering::SeqCst);
+                c.set("t1", "l-steal", &"vl", Some(Duration::from_secs(60)))
+                    .await
+                    .expect("L takes expired slot");
+                fail_del.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        };
+        let (first_res, ()) = tokio::join!(first_write, steal);
+
+        let err = first_res.expect_err("failed compensating delete must surface error");
+        assert!(
+            matches!(err, CacheError::Backend(_)),
+            "expected Backend error from failed compensating delete, got {err:?}"
         );
     }
 }

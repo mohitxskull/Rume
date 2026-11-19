@@ -580,7 +580,10 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
     use sqlparser::dialect::SQLiteDialect;
     use sqlparser::tokenizer::{Token, Tokenizer};
 
-    let tokens = Tokenizer::new(&SQLiteDialect {}, statement)
+    let dialect = SQLiteDialect {};
+    let sanitized =
+        crate::persistence::backend::sanitize_non_nested_block_comments(statement, &dialect);
+    let tokens = Tokenizer::new(&dialect, &sanitized)
         .tokenize_with_location()
         .map_err(|e| {
             PersistenceError::QueryFailed(format!("failed to tokenize SQLite SQL: {e}"))
@@ -708,7 +711,34 @@ mod tests {
         // Multi-statement raw execution without placeholders continues to work.
         tx.execute("CREATE TABLE extra (id INTEGER); INSERT INTO extra (id) VALUES (42);")
             .await
-            .expect("multi-statement batch without placeholders should succeed");
+            .expect("multi-statement without placeholders must succeed");
+
+        // Non-nested SQLite block comments containing an inner `/*` must close at the first `*/`
+        // across all managed transaction entrypoints (R4-3).
+        tx.execute("INSERT INTO extra (id) VALUES (77) /* example /* marker */")
+            .await
+            .expect("execute with inner /* in block comment must succeed");
+        let v = tx
+            .query_scalar("SELECT 1 /* example /* marker */")
+            .await
+            .expect("query_scalar with inner /* in block comment must succeed");
+        assert_eq!(v.as_deref(), Some("1"));
+        let rows = tx
+            .fetch_all(
+                "SELECT id FROM extra WHERE id = 77 /* example /* marker */",
+                &[],
+            )
+            .await
+            .expect("fetch_all with inner /* in block comment must succeed");
+        assert_eq!(rows.len(), 1);
+        let opt = tx
+            .fetch_optional(
+                "SELECT id FROM extra WHERE id = 77 /* example /* marker */",
+                &[],
+            )
+            .await
+            .expect("fetch_optional with inner /* in block comment must succeed");
+        assert!(opt.is_some());
 
         tx.commit().await.expect("commit tx");
 
