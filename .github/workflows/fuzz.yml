@@ -36,3 +36,10 @@ jobs:
         env:
           DURATION_SECS: ${{ inputs.duration_secs || '30' }}
         run: cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="${DURATION_SECS}"
+      - name: Upload crashing fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}/
+          if-no-files-found: ignore
