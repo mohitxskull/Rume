@@ -582,7 +582,7 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
 
     let dialect = SQLiteDialect {};
     let sanitized =
-        crate::persistence::backend::sanitize_non_nested_block_comments(statement, &dialect);
+        crate::persistence::backend::sanitize_non_nested_block_comments(statement, &dialect)?;
     let tokens = Tokenizer::new(&dialect, &sanitized)
         .tokenize_with_location()
         .map_err(|e| {
