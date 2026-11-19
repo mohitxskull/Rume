@@ -343,6 +343,7 @@ impl LeaderElector for RedisLeaderElector {
 
             let script = redis::Script::new(
                 r#"
+                if redis.replicate_commands then redis.replicate_commands() end
                 local current = redis.call('GET', KEYS[1])
                 if current then
                     local prefix = tostring(string.len(ARGV[1])) .. ':' .. ARGV[1] .. ':'

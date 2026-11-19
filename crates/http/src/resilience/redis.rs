@@ -59,7 +59,7 @@ impl RedisRateLimiter {
             .await
             .map_err(|e| ResilienceError::Backend(e.to_string()))?;
 
-        let window_ms = i64::try_from(self.config.window.as_millis().max(1)).unwrap_or(i64::MAX);
+        let window_ms = Self::effective_window_ms(self.config.window);
         let max_req = self.config.max_requests as i64;
         let rand_id = uuid::Uuid::new_v4().to_string();
 
@@ -117,7 +117,6 @@ impl RedisRateLimiter {
         }
     }
 
-    #[cfg(test)]
     fn effective_window_ms(window: std::time::Duration) -> i64 {
         i64::try_from(window.as_millis().max(1)).unwrap_or(i64::MAX)
     }

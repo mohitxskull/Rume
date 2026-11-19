@@ -159,7 +159,27 @@ async fn ensure_applied_order_column_tx<T: DatabaseTransaction>(
                 }
             }
         }
-        _ => {}
+        _ => {
+            // Why: Custom `DatabaseBackend` dialects have no dialect-specific catalog query, so
+            // probe `applied_order` directly and run standard SQL `ALTER TABLE ... ADD COLUMN`
+            // only if the probe fails (re-probing after any concurrent `ALTER` race).
+            if tx
+                .query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
+                .await
+                .is_err()
+            {
+                let alter = tx
+                    .execute(
+                        "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
+                    )
+                    .await;
+                if let Err(err) = alter {
+                    tx.query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
+                        .await
+                        .map_err(|_| err)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -220,7 +240,28 @@ async fn ensure_applied_order_column_backend<B: DatabaseBackend>(
                 }
             }
         }
-        _ => {}
+        _ => {
+            // Why: Custom `DatabaseBackend` dialects have no dialect-specific catalog query, so
+            // probe `applied_order` directly and run standard SQL `ALTER TABLE ... ADD COLUMN`
+            // only if the probe fails (re-probing after any concurrent `ALTER` race).
+            if backend
+                .query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
+                .await
+                .is_err()
+            {
+                let alter = backend
+                    .execute(
+                        "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
+                    )
+                    .await;
+                if let Err(err) = alter {
+                    backend
+                        .query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
+                        .await
+                        .map_err(|_| err)?;
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1551,6 +1592,7 @@ mod tests {
     struct MockGenericTx {
         executed_sql: Arc<Mutex<Vec<String>>>,
         ledger: Arc<Mutex<BTreeMap<String, String>>>,
+        has_applied_order: Arc<Mutex<bool>>,
     }
 
     impl DatabaseTransaction for MockGenericTx {
@@ -1567,13 +1609,20 @@ mod tests {
             let params = params.to_vec();
             let executed_sql = Arc::clone(&self.executed_sql);
             let ledger = Arc::clone(&self.ledger);
+            let has_applied_order = Arc::clone(&self.has_applied_order);
             Box::pin(async move {
                 executed_sql.lock().unwrap().push(statement.clone());
-                if statement == SQLITE_MIGRATION_INSERT
-                    && let (Some(DbValue::Text(id)), Some(DbValue::Text(checksum))) =
+                if statement == SQLITE_MIGRATION_INSERT {
+                    if !*has_applied_order.lock().unwrap() {
+                        return Err(PersistenceError::QueryFailed(
+                            "column applied_order does not exist".into(),
+                        ));
+                    }
+                    if let (Some(DbValue::Text(id)), Some(DbValue::Text(checksum))) =
                         (params.first(), params.get(3))
-                {
-                    ledger.lock().unwrap().insert(id.clone(), checksum.clone());
+                    {
+                        ledger.lock().unwrap().insert(id.clone(), checksum.clone());
+                    }
                 }
                 Ok(1)
             })
@@ -1586,8 +1635,14 @@ mod tests {
         ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
             let query = query.to_string();
             let executed_sql = Arc::clone(&self.executed_sql);
+            let has_applied_order = Arc::clone(&self.has_applied_order);
             Box::pin(async move {
-                executed_sql.lock().unwrap().push(query);
+                executed_sql.lock().unwrap().push(query.clone());
+                if query.contains("applied_order") && !*has_applied_order.lock().unwrap() {
+                    return Err(PersistenceError::QueryFailed(
+                        "column applied_order does not exist".into(),
+                    ));
+                }
                 Ok(Some("1".to_string()))
             })
         }
@@ -1621,6 +1676,7 @@ mod tests {
     struct MockGenericBackend {
         executed_sql: Arc<Mutex<Vec<String>>>,
         ledger: Arc<Mutex<BTreeMap<String, String>>>,
+        has_applied_order: Arc<Mutex<bool>>,
     }
 
     impl DatabaseBackend for MockGenericBackend {
@@ -1641,8 +1697,20 @@ mod tests {
         ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
             let statement = statement.to_string();
             let executed_sql = Arc::clone(&self.executed_sql);
+            let has_applied_order = Arc::clone(&self.has_applied_order);
             Box::pin(async move {
-                executed_sql.lock().unwrap().push(statement);
+                executed_sql.lock().unwrap().push(statement.clone());
+                if statement.starts_with("ALTER TABLE rume_migrations ADD COLUMN")
+                    && statement.contains("applied_order")
+                {
+                    let mut col = has_applied_order.lock().unwrap();
+                    if *col {
+                        return Err(PersistenceError::QueryFailed(
+                            "duplicate column applied_order".into(),
+                        ));
+                    }
+                    *col = true;
+                }
                 Ok(1)
             })
         }
@@ -1656,8 +1724,14 @@ mod tests {
             let params = params.to_vec();
             let executed_sql = Arc::clone(&self.executed_sql);
             let ledger = Arc::clone(&self.ledger);
+            let has_applied_order = Arc::clone(&self.has_applied_order);
             Box::pin(async move {
                 executed_sql.lock().unwrap().push(query.clone());
+                if query.contains("applied_order") && !*has_applied_order.lock().unwrap() {
+                    return Err(PersistenceError::QueryFailed(
+                        "column applied_order does not exist".into(),
+                    ));
+                }
                 if query == SQLITE_MIGRATION_FIND_CHECKSUM
                     && let Some(DbValue::Text(id)) = params.first()
                 {
@@ -1687,6 +1761,7 @@ mod tests {
             let tx = MockGenericTx {
                 executed_sql: Arc::clone(&self.executed_sql),
                 ledger: Arc::clone(&self.ledger),
+                has_applied_order: Arc::clone(&self.has_applied_order),
             };
             Box::pin(async move { Ok(tx) })
         }
@@ -1694,6 +1769,7 @@ mod tests {
 
     #[tokio::test]
     async fn generic_backend_fallback_ensures_applied_order_column_before_insert() {
+        // Start with a legacy ledger table lacking `applied_order` (`has_applied_order = false`).
         let backend = MockGenericBackend::default();
         let migrator = Migrator::new().add_migration(Migration::from_sql(
             "001_custom",
@@ -1704,13 +1780,39 @@ mod tests {
         let summary = migrator
             .run_pending_backend(&backend)
             .await
-            .expect("generic fallback migration succeeds");
+            .expect("generic fallback migration upgrades legacy table and succeeds");
         assert_eq!(summary.applied.len(), 1);
-
-        let log = backend.executed_sql.lock().unwrap();
         assert!(
-            log.iter().any(|s| s.contains("applied_order")),
-            "generic fallback path must ensure applied_order column exists: {log:?}"
+            *backend.has_applied_order.lock().unwrap(),
+            "generic fallback must add applied_order column when missing"
         );
+
+        let log = backend.executed_sql.lock().unwrap().clone();
+        let alter_idx = log
+            .iter()
+            .position(|s| {
+                s.starts_with("ALTER TABLE rume_migrations ADD COLUMN")
+                    && s.contains("applied_order")
+            })
+            .expect("ALTER TABLE ... ADD COLUMN applied_order must run on legacy ledger");
+        let max_order_idx = log
+            .iter()
+            .position(|s| s == NEXT_APPLIED_ORDER_SQL)
+            .expect("next_applied_order_tx must run");
+        let insert_idx = log
+            .iter()
+            .position(|s| s == SQLITE_MIGRATION_INSERT)
+            .expect("migration insert must run");
+        assert!(
+            alter_idx < max_order_idx && max_order_idx < insert_idx,
+            "column setup must precede order-dependent queries and inserts: {log:?}"
+        );
+
+        // Second run when `applied_order` already exists must succeed without re-running ALTER.
+        let summary2 = migrator
+            .run_pending_backend(&backend)
+            .await
+            .expect("second run with existing applied_order column succeeds");
+        assert!(summary2.applied.is_empty());
     }
 }
