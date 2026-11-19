@@ -322,6 +322,25 @@ impl SamlParser {
                     };
                     let new_depth = element_stack.len() + 1;
                     let parent = element_stack.last().map(|(n, pns)| (n.as_str(), *pns));
+                    let grandparent = element_stack
+                        .len()
+                        .checked_sub(2)
+                        .and_then(|idx| element_stack.get(idx))
+                        .map(|(n, pns)| (n.as_str(), *pns));
+                    let great_grandparent = element_stack
+                        .len()
+                        .checked_sub(3)
+                        .and_then(|idx| element_stack.get(idx))
+                        .map(|(n, pns)| (n.as_str(), *pns));
+                    // Why: XML-DSig enveloped-signature transforms strip the entire `<ds:Signature>`
+                    // subtree before computing the digest. An attacker who holds any validly signed
+                    // assertion can inject `<saml:Subject>`, `<saml:Conditions>`, `<saml:Audience>`,
+                    // or `<saml:Attribute>` inside `<ds:Signature>` (e.g. `<ds:Object>` or
+                    // `<ds:KeyInfo>`) without invalidating the signature. Never extract any SAML
+                    // claims while a `<ds:Signature>` element is on the ancestor stack.
+                    let in_signature = element_stack
+                        .iter()
+                        .any(|(n, el_ns)| n == "Signature" && *el_ns == XmlNs::Dsig);
 
                     if local_name == "Assertion" {
                         if !is_saml_ns {
@@ -379,7 +398,11 @@ impl SamlParser {
                                 }
                             }
                         }
-                    } else if local_name == "Issuer" && is_saml_ns && active_capture.is_none() {
+                    } else if !in_signature
+                        && local_name == "Issuer"
+                        && is_saml_ns
+                        && active_capture.is_none()
+                    {
                         // Why: anchor `<Issuer>` text accumulation to direct children of
                         // `<Assertion>` or `<Response>` and bind the capture to its opening
                         // stack depth so nested markup or comments cannot corrupt or drop it.
@@ -402,8 +425,14 @@ impl SamlParser {
                             }
                             _ => {}
                         }
-                    } else if in_assertion && is_saml_ns {
-                        if local_name == "Conditions" {
+                    } else if in_assertion && !in_signature && is_saml_ns {
+                        // Why: in addition to excluding `<ds:Signature>` subtrees, anchor SAML
+                        // claims (`Conditions`, `Subject`/`NameID`, `Audience`, `Attribute`,
+                        // `AttributeValue`) to their schema positions under `<Assertion>` so
+                        // extension containers such as `<Advice>` cannot inject forged claims.
+                        if local_name == "Conditions"
+                            && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
+                        {
                             for attr in e.attributes().flatten() {
                                 let local_k = attr.key.local_name();
                                 let k = local_k.as_ref();
@@ -414,10 +443,13 @@ impl SamlParser {
                                         Some(parse_iso8601_strict(attr.value.as_ref())?);
                                 }
                             }
-                        } else if local_name == "Attribute" {
-                            // Why: only an `<Attribute>` outside any open text capture may set
-                            // the attribute name; a nested `<Attribute>` inside an
-                            // `<AttributeValue>` is structured value content and must not
+                        } else if local_name == "Attribute"
+                            && matches!(parent, Some(("AttributeStatement", XmlNs::Assertion)))
+                            && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
+                        {
+                            // Why: only an `<Attribute>` directly under `<Assertion>/<AttributeStatement>`
+                            // and outside any open text capture may set the attribute name; a nested
+                            // `<Attribute>` inside an `<AttributeValue>` or `<ds:Signature>` must not
                             // replace (or later clear) the owning attribute's name.
                             if active_capture.is_none() {
                                 for attr in e.attributes().flatten() {
@@ -432,6 +464,7 @@ impl SamlParser {
                             if local_name == "NameID"
                                 && fields.subject.is_none()
                                 && matches!(parent, Some(("Subject", XmlNs::Assertion)))
+                                && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
                             {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::SubjectNameId,
@@ -439,14 +472,35 @@ impl SamlParser {
                                     buf: String::new(),
                                     attr_name: None,
                                 });
-                            } else if local_name == "Audience" && fields.audience.is_none() {
+                            } else if local_name == "Audience"
+                                && fields.audience.is_none()
+                                && ((matches!(
+                                    parent,
+                                    Some(("AudienceRestriction", XmlNs::Assertion))
+                                ) && matches!(
+                                    grandparent,
+                                    Some(("Conditions", XmlNs::Assertion))
+                                ) && matches!(
+                                    great_grandparent,
+                                    Some(("Assertion", XmlNs::Assertion))
+                                )) || (matches!(
+                                    parent,
+                                    Some(("Conditions", XmlNs::Assertion))
+                                ) && matches!(
+                                    grandparent,
+                                    Some(("Assertion", XmlNs::Assertion))
+                                )))
+                            {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::Audience,
                                     depth: new_depth,
                                     buf: String::new(),
                                     attr_name: None,
                                 });
-                            } else if local_name == "AttributeValue" && current_attr_name.is_some()
+                            } else if local_name == "AttributeValue"
+                                && current_attr_name.is_some()
+                                && matches!(parent, Some(("Attribute", XmlNs::Assertion)))
+                                && element_stack.len() == current_attr_depth
                             {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::AttributeValue,
@@ -619,9 +673,21 @@ impl SamlParser {
             }
         }
 
-        let issuer = assertion_issuer
-            .or(response_issuer)
-            .ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?;
+        // Why: in signed mode, only the `<Assertion>` subtree is passed to
+        // `verify_assertion_signature`, so falling back to an outer `<Response>/<Issuer>` would
+        // let an attacker wrap a signed assertion lacking its own `<Issuer>` inside a forged
+        // `<Response>` and spoof `SamlAssertion.issuer`. Signed mode requires the `<Issuer>` to
+        // live directly inside the signed `<Assertion>` (SAML 2.0 Core §2.3.3 makes `<Assertion>/<Issuer>`
+        // mandatory); `response_issuer` fallback is restricted to unverified diagnostic parsing.
+        let issuer = if signed_mode {
+            assertion_issuer.ok_or_else(|| {
+                SamlError::Malformed("missing Issuer element in signed Assertion".into())
+            })?
+        } else {
+            assertion_issuer
+                .or(response_issuer)
+                .ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?
+        };
         if issuer.is_empty() {
             return Err(SamlError::Malformed("missing Issuer element".into()));
         }
@@ -951,5 +1017,143 @@ mod saml_parser_and_iso8601_proptests {
             "nested <Attribute> must neither rename nor clear the owning attribute"
         );
         assert!(!assertion.attributes.contains_key("meta"));
+    }
+
+    #[test]
+    fn signature_subtree_injected_subject_conditions_and_attributes_are_ignored() {
+        struct AcceptVerifier;
+        impl SamlSignatureVerifier for AcceptVerifier {
+            fn verify_signature(&self, _: &str) -> Result<(), SamlError> {
+                Ok(())
+            }
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                Ok(())
+            }
+        }
+
+        let xml = r##"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_a_xsw_sig">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <ds:Signature>
+                <ds:SignedInfo>
+                    <ds:Reference URI="#_a_xsw_sig"/>
+                </ds:SignedInfo>
+                <ds:Object>
+                    <saml:Subject>
+                        <saml:NameID>alice@acme.example</saml:NameID>
+                    </saml:Subject>
+                    <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2099-01-01T00:00:00Z">
+                        <saml:AudienceRestriction>
+                            <saml:Audience>https://forged-sp.example.com</saml:Audience>
+                        </saml:AudienceRestriction>
+                    </saml:Conditions>
+                    <saml:AttributeStatement>
+                        <saml:Attribute Name="roles">
+                            <saml:AttributeValue>admin</saml:AttributeValue>
+                        </saml:Attribute>
+                    </saml:AttributeStatement>
+                </ds:Object>
+            </ds:Signature>
+            <saml:Subject>
+                <saml:NameID>mallory@acme.example</saml:NameID>
+            </saml:Subject>
+            <saml:Conditions NotBefore="2026-11-02T11:00:00Z" NotOnOrAfter="2026-11-02T13:00:00Z">
+                <saml:AudienceRestriction>
+                    <saml:Audience>https://real-sp.example.com</saml:Audience>
+                </saml:AudienceRestriction>
+            </saml:Conditions>
+            <saml:AttributeStatement>
+                <saml:Attribute Name="roles">
+                    <saml:AttributeValue>member</saml:AttributeValue>
+                </saml:Attribute>
+            </saml:AttributeStatement>
+        </saml:Assertion>"##;
+
+        let assertion = SamlParser::parse_signed(xml, &AcceptVerifier)
+            .expect("valid signed assertion with ds:Object payload must parse real claims");
+        assert_eq!(
+            assertion.subject, "mallory@acme.example",
+            "Subject injected inside ds:Signature/ds:Object must be ignored"
+        );
+        assert_eq!(
+            assertion.audience.as_deref(),
+            Some("https://real-sp.example.com"),
+            "Audience injected inside ds:Signature/ds:Object must be ignored"
+        );
+        assert_eq!(
+            assertion.attributes.get("roles"),
+            Some(&vec!["member".to_string()]),
+            "Attribute values injected inside ds:Signature/ds:Object must be ignored"
+        );
+    }
+
+    #[test]
+    fn signed_mode_rejects_unsigned_response_issuer_fallback_when_assertion_lacks_issuer() {
+        struct AcceptVerifier;
+        impl SamlSignatureVerifier for AcceptVerifier {
+            fn verify_signature(&self, _: &str) -> Result<(), SamlError> {
+                Ok(())
+            }
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                Ok(())
+            }
+        }
+
+        let xml = r##"<saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_resp_forged">
+            <saml:Issuer>https://attacker-chosen-issuer.example.com</saml:Issuer>
+            <saml:Assertion ID="_assert_no_issuer">
+                <ds:Signature>
+                    <ds:SignedInfo>
+                        <ds:Reference URI="#_assert_no_issuer"/>
+                    </ds:SignedInfo>
+                </ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>user@enterprise.com</saml:NameID>
+                </saml:Subject>
+            </saml:Assertion>
+        </saml2p:Response>"##;
+
+        let err = SamlParser::parse_signed(xml, &AcceptVerifier)
+            .expect_err("signed assertion missing its own <Issuer> must not fall back to unsigned Response <Issuer>");
+        assert!(matches!(err, SamlError::Malformed(_)));
+    }
+
+    #[test]
+    fn advice_extension_audience_cannot_override_assertion_conditions_audience() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ext="urn:example:ext" ID="_a_adv_aud">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@acme.example</saml:NameID>
+            </saml:Subject>
+            <saml:Advice>
+                <ext:Payload>
+                    <saml:AudienceRestriction>
+                        <saml:Audience>https://forged-advice-sp.example.com</saml:Audience>
+                    </saml:AudienceRestriction>
+                </ext:Payload>
+            </saml:Advice>
+            <saml:Conditions NotBefore="2026-11-02T11:00:00Z" NotOnOrAfter="2026-11-02T13:00:00Z">
+                <saml:AudienceRestriction>
+                    <saml:Audience>https://real-sp.example.com</saml:Audience>
+                </saml:AudienceRestriction>
+            </saml:Conditions>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml)
+            .expect("valid assertion with Advice extension must parse");
+        assert_eq!(
+            assertion.audience.as_deref(),
+            Some("https://real-sp.example.com"),
+            "Audience nested under Advice/ext:Payload must not override Assertion/Conditions/AudienceRestriction/Audience"
+        );
     }
 }

@@ -340,6 +340,7 @@ async fn circuit_breaker_trips_on_service_transport_errors() {
 
 #[tokio::test]
 async fn test_tenant_extension_rate_limiting() {
+    use rume::auth::identity::AuthUser;
     use rume::tenant::Tenant;
 
     let config = RateLimitConfig {
@@ -355,23 +356,27 @@ async fn test_tenant_extension_rate_limiting() {
 
     let app = TestApp::new(router);
 
-    // Tenant 1 request 1
+    // Tenant 1 request 1 (authenticated member of tenant_123)
     let mut req1 = axum::http::Request::builder()
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
     req1.extensions_mut()
         .insert(Tenant::new("tenant_123", "acme"));
+    req1.extensions_mut()
+        .insert(AuthUser::new("user-1").with_tenant_id("tenant_123"));
     let res1 = app.request(req1).await;
     assert_eq!(res1.status(), StatusCode::OK);
 
-    // Tenant 1 request 2
+    // Tenant 1 request 2 (authenticated member of tenant_123)
     let mut req2 = axum::http::Request::builder()
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
         .unwrap();
     req2.extensions_mut()
         .insert(Tenant::new("tenant_123", "acme"));
+    req2.extensions_mut()
+        .insert(AuthUser::new("user-1").with_tenant_id("tenant_123"));
     let res2 = app.request(req2).await;
     assert_eq!(res2.status(), StatusCode::OK);
 
@@ -382,10 +387,12 @@ async fn test_tenant_extension_rate_limiting() {
         .unwrap();
     req3.extensions_mut()
         .insert(Tenant::new("tenant_123", "acme"));
+    req3.extensions_mut()
+        .insert(AuthUser::new("user-1").with_tenant_id("tenant_123"));
     let res3 = app.request(req3).await;
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
 
-    // Tenant 2 should NOT be rate limited
+    // Tenant 2 (authenticated member of tenant_456) should NOT be rate limited
     let mut req_t2 = axum::http::Request::builder()
         .uri("/tenant-api")
         .body(axum::body::Body::empty())
@@ -393,6 +400,9 @@ async fn test_tenant_extension_rate_limiting() {
     req_t2
         .extensions_mut()
         .insert(Tenant::new("tenant_456", "beta"));
+    req_t2
+        .extensions_mut()
+        .insert(AuthUser::new("user-2").with_tenant_id("tenant_456"));
     let res_t2 = app.request(req_t2).await;
     assert_eq!(res_t2.status(), StatusCode::OK);
 }
@@ -542,6 +552,118 @@ async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
         .unwrap();
     let res3 = app.request(req3).await;
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client_ip() {
+    tokio::time::pause();
+
+    use axum::extract::ConnectInfo;
+    use rume::auth::identity::AuthUser;
+    use rume::tenant::TenantLayer;
+    use rume::tenant::resolver::HeaderTenantResolver;
+    use std::net::SocketAddr;
+
+    let config = RateLimitConfig {
+        max_requests: 2,
+        window: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let limiter = RateLimiter::new(config);
+
+    // Stack TenantLayer::optional(HeaderTenantResolver) outside RateLimitLayer.
+    // Also register a second tenant whose ID ends with IP A's client key suffix
+    // (`acme:198.51.100.10`) to prove anonymous traffic to `acme` from IP A cannot
+    // collide with the authenticated bucket of tenant `acme:198.51.100.10`.
+    let resolver = HeaderTenantResolver::default();
+    resolver
+        .try_add_tenant(rume::tenant::Tenant::new("acme", "acme"))
+        .unwrap();
+    resolver
+        .try_add_tenant(rume::tenant::Tenant::new("globex", "globex"))
+        .unwrap();
+    resolver
+        .try_add_tenant(rume::tenant::Tenant::new(
+            "acme:198.51.100.10",
+            "acme-ip-suffix",
+        ))
+        .unwrap();
+    let router = rume::routing::Router::new()
+        .get("/api/tenant-scoped", || async { "ok" })
+        .layer(RateLimitLayer::new(limiter))
+        .layer(TenantLayer::optional(resolver));
+
+    let app = TestApp::new(router);
+    let ip_a: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+    let ip_b: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+
+    // Anonymous IP A sends max_requests (2) with X-Tenant-ID: acme -> both succeed
+    for _ in 0..2 {
+        let mut req = axum::http::Request::builder()
+            .uri("/api/tenant-scoped")
+            .header("x-tenant-id", "acme")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(ip_a));
+        let res = app.request(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // 3rd anonymous request from IP A with X-Tenant-ID: acme is rate-limited (429)
+    let mut req_a_overflow = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_a_overflow.extensions_mut().insert(ConnectInfo(ip_a));
+    let res_a_overflow = app.request(req_a_overflow).await;
+    assert_eq!(res_a_overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Anonymous IP A rotating X-Tenant-ID to another registered tenant (`globex`) must NOT
+    // receive a fresh allowance; it shares the same per-IP bucket (`ip_anon:ip:198.51.100.10`).
+    let mut req_a_rotated = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "globex")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_a_rotated.extensions_mut().insert(ConnectInfo(ip_a));
+    let res_a_rotated = app.request(req_a_rotated).await;
+    assert_eq!(
+        res_a_rotated.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "anonymous client IP A rotating X-Tenant-ID to 'globex' must not bypass its IP rate limit"
+    );
+
+    // Anonymous request from IP B for the same tenant (X-Tenant-ID: acme) still succeeds!
+    let mut req_b = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_b.extensions_mut().insert(ConnectInfo(ip_b));
+    let res_b = app.request(req_b).await;
+    assert_eq!(
+        res_b.status(),
+        StatusCode::OK,
+        "anonymous client IP A must not drain tenant 'acme' rate-limit bucket for IP B"
+    );
+
+    // Authenticated member of tenant `acme:198.51.100.10` must NOT share a bucket with
+    // anonymous requests to `acme` from `198.51.100.10`.
+    let mut req_auth_suffix = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme:198.51.100.10")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_auth_suffix
+        .extensions_mut()
+        .insert(AuthUser::new("member-1").with_tenant_id("acme:198.51.100.10"));
+    let res_auth_suffix = app.request(req_auth_suffix).await;
+    assert_eq!(
+        res_auth_suffix.status(),
+        StatusCode::OK,
+        "anonymous traffic to 'acme' from 198.51.100.10 must not collide with authenticated tenant 'acme:198.51.100.10'"
+    );
 }
 
 /// Regression test for RC-08: `RateLimiter::check` must not panic on a `current_thread`

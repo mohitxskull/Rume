@@ -332,35 +332,59 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         // Extract client key:
-        // 1. Authenticated tenant context from request extensions (if present)
-        let tenant_key = req
+        // 1. Resolved tenant context from request extensions (if present)
+        let resolved_tenant_id = req
             .extensions()
             .get::<rume_security::tenant::Tenant>()
-            .map(|t| format!("tenant:{}", t.id))
+            .map(|t| t.id.as_str())
             .or_else(|| {
                 req.extensions()
                     .get::<rume_security::tenant::TenantContext>()
-                    .map(|tc| format!("tenant:{}", tc.id))
+                    .map(|tc| tc.id.as_str())
             });
 
-        // 2. Otherwise derive client identity from socket peer (ConnectInfo) or trusted proxy
-        let client_key = tenant_key.unwrap_or_else(|| {
-            let socket_ip = req
-                .extensions()
-                .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
-                .map(|ci| ci.0.ip());
+        // 2. Client identity from socket peer (ConnectInfo) or trusted proxy
+        let socket_ip = req
+            .extensions()
+            .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+            .map(|ci| ci.0.ip());
 
-            let forwarded_header = req
-                .headers()
-                .get("x-forwarded-for")
-                .and_then(|h| h.to_str().ok());
+        let forwarded_header = req
+            .headers()
+            .get("x-forwarded-for")
+            .and_then(|h| h.to_str().ok());
 
-            resolve_forwarded_client_ip(
-                socket_ip,
-                forwarded_header,
-                &limiter.config().trusted_proxies,
-            )
+        let ip_key = resolve_forwarded_client_ip(
+            socket_ip,
+            forwarded_header,
+            &limiter.config().trusted_proxies,
+        );
+
+        // Why: `TenantLayer` resolves `Tenant` from untrusted request input (e.g. `X-Tenant-ID`)
+        // before authentication or `RateLimitLayer` runs. Keying by `tenant:<id>` without
+        // verifying that an authenticated `AuthUser` is bound to that tenant would let an
+        // unauthenticated caller exhaust a victim tenant's shared bucket (DoS) or rotate
+        // `X-Tenant-ID` across tenants to gain a fresh allowance per tenant and bypass their IP
+        // rate limit. Therefore, only use the shared `tenant_auth:<len>:<id>` bucket when an
+        // authenticated `AuthUser` matches the resolved tenant; all unauthenticated requests (even
+        // when a resolved `Tenant` extension is present) share one per-client IP bucket
+        // (`ip_anon:<ip_key>`) that does not reset when the resolved tenant changes.
+        let authenticated_for_tenant = resolved_tenant_id.is_some_and(|tid| {
+            req.extensions()
+                .get::<rume_security::auth::identity::AuthUser>()
+                .and_then(|u| {
+                    u.tenant_id
+                        .as_deref()
+                        .or_else(|| u.metadata.get("tenant_id").map(String::as_str))
+                        .or_else(|| u.metadata.get("organization_id").map(String::as_str))
+                })
+                == Some(tid)
         });
+
+        let client_key = match (resolved_tenant_id, authenticated_for_tenant) {
+            (Some(tid), true) => format!("tenant_auth:{}:{tid}", tid.len()),
+            _ => format!("ip_anon:{ip_key}"),
+        };
 
         Box::pin(async move {
             match limiter.check_async(&client_key).await {
