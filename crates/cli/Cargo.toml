@@ -18,7 +18,7 @@ tokio.workspace = true
 console = "=0.16.6"
 indicatif = "=0.18.6"
 comfy-table = "=8.0.1"
-inquire = "=0.9.4"
+inquire = "=0.9.5"
 toml.workspace = true
 serde.workspace = true
 serde_json.workspace = true

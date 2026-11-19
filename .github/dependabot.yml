@@ -11,6 +11,11 @@ updates:
     labels:
       - "dependencies"
       - "rust"
+    groups:
+      rust-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
 
   # Enable version updates for GitHub Actions workflows
   - package-ecosystem: "github-actions"
@@ -23,3 +28,10 @@ updates:
     labels:
       - "dependencies"
       - "ci"
+    ignore:
+      # Why: `dtolnay/rust-toolchain@1.96` in ci.yml intentionally pins the workspace MSRV.
+      - dependency-name: "dtolnay/rust-toolchain"
+    groups:
+      github-actions:
+        patterns:
+          - "*"

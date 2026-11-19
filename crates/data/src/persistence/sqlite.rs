@@ -570,7 +570,7 @@ pub(crate) fn sqlx_sqlite_row_to_db_row(row: &SqliteRow) -> Result<DbRow, Persis
 /// string literals, quoted identifiers, and comments when executing with empty params.
 ///
 /// Why: Delegate SQLite lexical scanning (comments, single/double/backtick quotes, `[...]`
-/// identifiers) to `sqlparser = "=0.53.0"` instead of maintaining a hand-rolled byte scanner.
+/// identifiers) to `sqlparser = "=0.64.0"` instead of maintaining a hand-rolled byte scanner.
 /// `SQLiteDialect` tokenizes `?`, `?NNN`, and `$name` as `Token::Placeholder`, while `:name`
 /// and `@name` tokenize as `Token::Colon` / `Token::AtSign` immediately adjacent (`tok.span.end
 /// == next.span.start`) to an unquoted `Token::Word` (plus `Token::Number` after `@`). Fails
