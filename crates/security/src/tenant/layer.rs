@@ -110,24 +110,47 @@ where
 ///
 /// If an `AuthUser` has a `tenant_id` or `"tenant_id"` / `"organization_id"` metadata entry,
 /// it must match the resolved `Tenant::id`. Mismatches are rejected with 403 Forbidden.
-/// If `require_tenant_id` is true, an authenticated user without any tenant attribute is also rejected with 403 Forbidden.
-#[derive(Clone, Debug, Default)]
+/// By default (`TenantMembershipLayer::new()`, `TenantMembershipLayer::default()`, and
+/// `TenantMembershipLayer::strict()`), `require_tenant_id` is `true`, so an authenticated user
+/// without any tenant attribute is also rejected with 403 Forbidden. Callers that explicitly
+/// support global tenantless identities can opt in via [`TenantMembershipLayer::allow_unassigned`].
+#[derive(Clone, Debug)]
 pub struct TenantMembershipLayer {
     require_tenant_id: bool,
 }
 
+impl Default for TenantMembershipLayer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TenantMembershipLayer {
-    /// Creates a new tenant membership layer that enforces tenant matching when a user has an assigned tenant ID.
+    /// Creates a new tenant membership layer that enforces tenant matching and rejects
+    /// authenticated users that lack an assigned tenant ID (fail-closed by default).
     pub fn new() -> Self {
+        // Why: fail-closed by default (`require_tenant_id: true`) so an authenticated user
+        // whose identity lacks a `tenant_id` claim cannot access arbitrary tenants by setting
+        // `X-Tenant-ID`. Use `allow_unassigned()` only when global tenantless accounts are
+        // explicitly desired.
         Self {
-            require_tenant_id: false,
+            require_tenant_id: true,
         }
     }
 
-    /// Creates a strict tenant membership layer that additionally rejects any user lacking a tenant association.
+    /// Creates a strict tenant membership layer that rejects any user lacking a tenant association.
     pub fn strict() -> Self {
         Self {
             require_tenant_id: true,
+        }
+    }
+
+    /// Creates a tenant membership layer that allows authenticated users without any tenant
+    /// association (`tenant_id: None` and no `"tenant_id"`/`"organization_id"` metadata) to pass
+    /// through, while still rejecting users whose assigned tenant mismatches the resolved tenant.
+    pub fn allow_unassigned() -> Self {
+        Self {
+            require_tenant_id: false,
         }
     }
 }
@@ -509,6 +532,37 @@ mod tests {
 
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn test_tenant_membership_new_and_default_reject_unassigned_user_by_default() {
+        for layer in [
+            TenantMembershipLayer::new(),
+            TenantMembershipLayer::default(),
+        ] {
+            let app = Router::new().route("/test", get(ok_handler)).layer(layer);
+
+            let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+            req.extensions_mut().insert(Tenant::new("acme", "acme"));
+            req.extensions_mut().insert(AuthUser::new("user-no-tenant"));
+
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::FORBIDDEN,
+                "TenantMembershipLayer::new() and Default must reject tenantless AuthUser with 403"
+            );
+        }
+
+        // Explicit opt-in via allow_unassigned() permits tenantless global user
+        let app_unassigned = Router::new()
+            .route("/test", get(ok_handler))
+            .layer(TenantMembershipLayer::allow_unassigned());
+        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(Tenant::new("acme", "acme"));
+        req.extensions_mut().insert(AuthUser::new("user-no-tenant"));
+        let res = app_unassigned.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
     }
 
     #[tokio::test]

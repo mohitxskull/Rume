@@ -544,6 +544,71 @@ async fn test_rate_limiter_ignores_unauthenticated_tenant_header() {
     assert_eq!(res3.status(), StatusCode::TOO_MANY_REQUESTS);
 }
 
+#[tokio::test]
+async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client_ip() {
+    use axum::extract::ConnectInfo;
+    use rume::tenant::TenantLayer;
+    use rume::tenant::resolver::HeaderTenantResolver;
+    use std::net::SocketAddr;
+
+    let config = RateLimitConfig {
+        max_requests: 2,
+        window: Duration::from_secs(60),
+        ..Default::default()
+    };
+    let limiter = RateLimiter::new(config);
+
+    // Stack TenantLayer::optional(HeaderTenantResolver) outside RateLimitLayer
+    let resolver = HeaderTenantResolver::default();
+    resolver
+        .try_add_tenant(rume::tenant::Tenant::new("acme", "acme"))
+        .unwrap();
+    let router = rume::routing::Router::new()
+        .get("/api/tenant-scoped", || async { "ok" })
+        .layer(RateLimitLayer::new(limiter))
+        .layer(TenantLayer::optional(resolver));
+
+    let app = TestApp::new(router);
+    let ip_a: SocketAddr = "198.51.100.10:40000".parse().unwrap();
+    let ip_b: SocketAddr = "198.51.100.20:40000".parse().unwrap();
+
+    // Anonymous IP A sends max_requests (2) with X-Tenant-ID: acme -> both succeed
+    for _ in 0..2 {
+        let mut req = axum::http::Request::builder()
+            .uri("/api/tenant-scoped")
+            .header("x-tenant-id", "acme")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        req.extensions_mut().insert(ConnectInfo(ip_a));
+        let res = app.request(req).await;
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // 3rd anonymous request from IP A with X-Tenant-ID: acme is rate-limited (429)
+    let mut req_a_overflow = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_a_overflow.extensions_mut().insert(ConnectInfo(ip_a));
+    let res_a_overflow = app.request(req_a_overflow).await;
+    assert_eq!(res_a_overflow.status(), StatusCode::TOO_MANY_REQUESTS);
+
+    // Anonymous request from IP B for the same tenant (X-Tenant-ID: acme) still succeeds!
+    let mut req_b = axum::http::Request::builder()
+        .uri("/api/tenant-scoped")
+        .header("x-tenant-id", "acme")
+        .body(axum::body::Body::empty())
+        .unwrap();
+    req_b.extensions_mut().insert(ConnectInfo(ip_b));
+    let res_b = app.request(req_b).await;
+    assert_eq!(
+        res_b.status(),
+        StatusCode::OK,
+        "anonymous client IP A must not drain tenant 'acme' rate-limit bucket for IP B"
+    );
+}
+
 /// Regression test for RC-08: `RateLimiter::check` must not panic on a `current_thread`
 /// runtime when a Redis backend is configured. It must return a clear error directing
 /// callers to `check_async` instead of blocking on the async Redis client via

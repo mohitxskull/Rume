@@ -239,6 +239,28 @@ async fn test_compose_multi_instance_system_qualification() {
     let user_data: serde_json::Value = get_user_resp.json().await.expect("invalid json");
     assert_eq!(user_data["name"], "Tony Stark");
 
+    // Verify a non-admin member cannot provision a new admin account (privilege escalation block)
+    let escalation_payload = json!({
+        "id": "user-rogue-admin",
+        "email": "rogue@acme.com",
+        "name": "Rogue Escalation",
+        "role": "admin",
+        "api_token": "token-rogue-admin"
+    });
+    let escalation_resp = client
+        .post("http://127.0.0.1:8081/api/v1/users")
+        .header("X-Tenant-Id", "acme-corp")
+        .header("Authorization", "Bearer token-tony-ironman")
+        .json(&escalation_payload)
+        .send()
+        .await
+        .expect("failed to send member user-creation attempt");
+    assert_eq!(
+        escalation_resp.status(),
+        403,
+        "non-admin member must be forbidden from creating users"
+    );
+
     // =========================================================================
     // Scenario 3: Cross-Instance Jobs & Transactional Outbox Processing
     // Event written by instance 1 is processed by background worker across instances.

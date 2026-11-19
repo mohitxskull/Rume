@@ -11,10 +11,18 @@ use crate::repositories::UserRepository;
 use crate::state::WorkbenchState;
 
 pub async fn create_user(
+    Authenticated(caller): Authenticated<AuthUser>,
     TenantContext(tenant): TenantContext,
     State(state): State<WorkbenchState>,
     Json(payload): Json<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<User>), AppError> {
+    // Why: only organization administrators may provision new users and assign roles/API tokens;
+    // allowing ordinary `member` accounts to call `POST /api/v1/users` would let any member mint
+    // an `admin` account with a caller-chosen token and escalate privileges within the tenant.
+    if !caller.has_role("admin") {
+        return Err(AppError::Forbidden);
+    }
+
     let id = payload.id.trim();
     let email = payload.email.trim();
     let name = payload.name.trim();
@@ -23,6 +31,12 @@ pub async fn create_user(
 
     if id.is_empty() || email.is_empty() || name.is_empty() || role.is_empty() || token.is_empty() {
         return Err(AppError::bad_request("All user fields are required"));
+    }
+
+    if !matches!(role, "admin" | "member" | "viewer") {
+        return Err(AppError::bad_request(
+            "Role must be one of: admin, member, viewer",
+        ));
     }
 
     let now = std::time::SystemTime::now()
@@ -75,4 +89,111 @@ pub async fn get_current_user(
     Authenticated(user): Authenticated<AuthUser>,
 ) -> Result<Json<AuthUser>, AppError> {
     Ok(Json(user))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::post;
+    use rume::auth::policy::RequireRole;
+    use rume::auth::{AuthLayer, BearerTokenScheme, PolicyLayer};
+    use rume::tenant::Tenant;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn member_cannot_call_create_user_to_escalate_to_admin() {
+        let auth_scheme = BearerTokenScheme::new(|token: String| async move {
+            match token.as_str() {
+                "member-token" => Ok(Some(
+                    AuthUser::new("user-member")
+                        .with_tenant_id("acme-corp")
+                        .with_role("member"),
+                )),
+                "admin-token" => Ok(Some(
+                    AuthUser::new("user-admin")
+                        .with_tenant_id("acme-corp")
+                        .with_role("admin"),
+                )),
+                _ => Ok(None),
+            }
+        });
+
+        async fn guarded_create_user_check(
+            Authenticated(caller): Authenticated<AuthUser>,
+            TenantContext(_tenant): TenantContext,
+            Json(payload): Json<CreateUserRequest>,
+        ) -> Result<StatusCode, AppError> {
+            if !caller.has_role("admin") {
+                return Err(AppError::Forbidden);
+            }
+            let role = payload.role.trim();
+            if !matches!(role, "admin" | "member" | "viewer") {
+                return Err(AppError::bad_request(
+                    "Role must be one of: admin, member, viewer",
+                ));
+            }
+            Ok(StatusCode::CREATED)
+        }
+
+        let app = Router::new()
+            .route(
+                "/users",
+                post(guarded_create_user_check).layer(PolicyLayer::new(RequireRole("admin"))),
+            )
+            .layer(AuthLayer::required().scheme(auth_scheme));
+
+        // 1. Member attempting to create an admin account is rejected with 403 Forbidden
+        let mut member_req = Request::builder()
+            .method("POST")
+            .uri("/users")
+            .header("authorization", "Bearer member-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"id":"u-esc","email":"e@acme.com","name":"Esc","role":"admin","api_token":"tok-1"}"#,
+            ))
+            .unwrap();
+        member_req
+            .extensions_mut()
+            .insert(Tenant::new("acme-corp", "acme-corp"));
+
+        let member_res = app.clone().oneshot(member_req).await.unwrap();
+        assert_eq!(member_res.status(), StatusCode::FORBIDDEN);
+
+        // 2. Admin creating a user with an invalid role is rejected with 400 Bad Request
+        let mut bad_role_req = Request::builder()
+            .method("POST")
+            .uri("/users")
+            .header("authorization", "Bearer admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"id":"u-bad","email":"b@acme.com","name":"Bad","role":"superroot","api_token":"tok-2"}"#,
+            ))
+            .unwrap();
+        bad_role_req
+            .extensions_mut()
+            .insert(Tenant::new("acme-corp", "acme-corp"));
+
+        let bad_role_res = app.clone().oneshot(bad_role_req).await.unwrap();
+        assert_eq!(bad_role_res.status(), StatusCode::BAD_REQUEST);
+
+        // 3. Admin creating a valid member account succeeds with 201 Created
+        let mut admin_req = Request::builder()
+            .method("POST")
+            .uri("/users")
+            .header("authorization", "Bearer admin-token")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"id":"u-ok","email":"ok@acme.com","name":"Ok","role":"member","api_token":"tok-3"}"#,
+            ))
+            .unwrap();
+        admin_req
+            .extensions_mut()
+            .insert(Tenant::new("acme-corp", "acme-corp"));
+
+        let admin_res = app.oneshot(admin_req).await.unwrap();
+        assert_eq!(admin_res.status(), StatusCode::CREATED);
+    }
 }
