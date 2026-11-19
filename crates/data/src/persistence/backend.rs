@@ -427,20 +427,45 @@ pub(crate) fn sanitize_non_nested_block_comments<'a>(
                 }
             }
             b'/' if bytes.get(i + 1) == Some(&b'*') => {
-                i += 2;
-                while i + 1 < bytes.len() {
-                    if bytes[i] == b'*' && bytes[i + 1] == b'/' {
-                        i += 2;
+                // Why: In C-style non-nested block-comment dialects (SQLite `tokenize.c` and
+                // MySQL `sql_lex.cc`), a `/*` comment opened at `i` ends unconditionally at the
+                // very first `*/` at `j >= i + 2` (or EOF if unclosed). Locate that closing `*/`
+                // first and blank every interior byte in `body_start..body_end` (preserving `\n`
+                // for line/column spans and a leading `!` on MySQL so `/*!` is still rejected).
+                // Because the closing `*/` at `j..(j + 2)` is never modified, overlapping
+                // delimiters like `/* /*/; COMMIT; /* */` and nested-comment payloads like
+                // `/* /* */ ; COMMIT; /* */ */` always close at the exact byte offset the
+                // database engine uses.
+                let body_start = if is_mysql && bytes.get(i + 2) == Some(&b'!') {
+                    i + 3
+                } else {
+                    i + 2
+                };
+                let mut close_idx = None;
+                let mut j = i + 2;
+                while j + 1 < bytes.len() {
+                    if bytes[j] == b'*' && bytes[j + 1] == b'/' {
+                        close_idx = Some(j);
                         break;
                     }
-                    if bytes[i] == b'/' && bytes[i + 1] == b'*' {
-                        let buf = out.get_or_insert_with(|| bytes.to_vec());
-                        buf[i + 1] = b' ';
-                        i += 2;
-                        continue;
-                    }
-                    i += 1;
+                    j += 1;
                 }
+                let body_end = close_idx.unwrap_or(bytes.len());
+                if body_start < body_end
+                    && (bytes[body_start..body_end].contains(&b'/')
+                        || bytes[body_start..body_end].contains(&b'*'))
+                {
+                    let buf = out.get_or_insert_with(|| bytes.to_vec());
+                    for b_ref in &mut buf[body_start..body_end] {
+                        if *b_ref != b'\n' {
+                            *b_ref = b' ';
+                        }
+                    }
+                }
+                i = match close_idx {
+                    Some(j) => j + 2,
+                    None => bytes.len(),
+                };
             }
             _ => {
                 i += 1;

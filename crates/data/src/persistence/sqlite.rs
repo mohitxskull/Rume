@@ -740,6 +740,22 @@ mod tests {
             .expect("fetch_optional with inner /* in block comment must succeed");
         assert!(opt.is_some());
 
+        // Overlapping inner opener/closer (`/* /*/`) and nested-comment payloads (`/* /* */ ...`)
+        // must close at the first `*/` and reject any trailing transaction-control statement (R5-1).
+        for smuggled in [
+            "UPDATE notes SET note = 'changed' /* /*/; COMMIT; /* */",
+            "UPDATE notes SET note = 'changed' /* /* */ ; COMMIT; /* */ */",
+        ] {
+            let err = tx
+                .execute_params(smuggled, &[])
+                .await
+                .expect_err(&format!("expected TransactionError for: {smuggled}"));
+            assert!(
+                matches!(err, PersistenceError::TransactionError(_)),
+                "expected TransactionError for {smuggled}, got {err:?}"
+            );
+        }
+
         tx.commit().await.expect("commit tx");
 
         let note = backend
