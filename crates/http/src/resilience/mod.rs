@@ -12,6 +12,7 @@ pub mod timeout;
 pub use self::redis::RedisRateLimiter;
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitBreakerLayer, CircuitBreakerService, CircuitState,
+    TrialPermit,
 };
 pub use concurrency::{ConcurrencyLimitLayer, ConcurrencyLimiter, ConcurrencyPermit};
 pub use error::ResilienceError;

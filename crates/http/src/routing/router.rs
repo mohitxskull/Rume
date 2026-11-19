@@ -5,7 +5,8 @@
 //!
 //! Mounting a route and recording its metadata are one atomic operation.
 
-use std::sync::{Arc, RwLock};
+use parking_lot::RwLock;
+use std::sync::Arc;
 
 use axum::handler::Handler;
 use axum::http::Method;
@@ -47,12 +48,12 @@ where
 
     /// Record route metadata into this router's registry.
     pub fn record_route(&self, info: RouteInfo) {
-        self.registry.write().unwrap().register(info);
+        self.registry.write().register(info);
     }
 
     /// Clear all registered route metadata from this router.
     pub fn clear_registry(&self) {
-        self.registry.write().unwrap().clear();
+        self.registry.write().clear();
     }
 
     /// Mount a `GET` route and register its metadata.
@@ -299,7 +300,7 @@ where
     /// with their full prefixed paths.
     pub fn nest(mut self, path: &str, other: Router<S>) -> Self {
         self.inner = self.inner.nest(path, other.inner);
-        let other_routes = other.registry.read().unwrap().clone();
+        let other_routes = other.registry.read().clone();
         for r in other_routes.routes() {
             self.record_route(RouteInfo {
                 method: r.method.clone(),
@@ -318,8 +319,8 @@ where
     /// Merges both the Axum routing tree and the route registries.
     pub fn merge(mut self, other: Router<S>) -> Self {
         self.inner = self.inner.merge(other.inner);
-        let other_routes = other.registry.read().unwrap().clone();
-        self.registry.write().unwrap().extend(other_routes);
+        let other_routes = other.registry.read().clone();
+        self.registry.write().extend(other_routes);
         self
     }
 
@@ -362,7 +363,7 @@ where
 
     /// Consume this router and return both the [`axum::Router`] and [`RouteRegistry`].
     pub fn into_parts(self) -> (axum::Router<S>, RouteRegistry) {
-        let registry = self.registry.read().unwrap().clone();
+        let registry = self.registry.read().clone();
         (self.inner, registry)
     }
 
@@ -376,17 +377,17 @@ where
 
     /// Access a snapshot of the route registry.
     pub fn registry(&self) -> RouteRegistry {
-        self.registry.read().unwrap().clone()
+        self.registry.read().clone()
     }
 
     /// Return all registered routes.
     pub fn routes(&self) -> Vec<RouteInfo> {
-        self.registry.read().unwrap().routes().to_vec()
+        self.registry.read().routes().to_vec()
     }
 
     /// Generates an OpenAPI v3.1 specification for all registered routes on this router.
     pub fn openapi_spec(&self, info: crate::openapi::OpenApiInfo) -> crate::openapi::OpenApiSpec {
-        self.registry.read().unwrap().to_openapi(info)
+        self.registry.read().to_openapi(info)
     }
 
     /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
@@ -399,7 +400,7 @@ where
             let reg = Arc::clone(&registry);
             let inf = info.clone();
             async move {
-                let spec = reg.read().unwrap().to_openapi(inf);
+                let spec = reg.read().to_openapi(inf);
                 axum::Json(spec.to_json_value())
             }
         })
@@ -414,7 +415,7 @@ where
         let (axum_router, registry) = stateless.into_parts();
         let adapted: axum::Router<S> = axum_router.with_state(());
         self.inner = self.inner.merge(adapted);
-        self.registry.write().unwrap().extend(registry);
+        self.registry.write().extend(registry);
         self
     }
 }

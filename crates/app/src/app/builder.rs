@@ -350,7 +350,10 @@ where
     }
 
     fn record_route(&self, info: rume_http::routing::RouteInfo) {
-        self.route_registry.write().unwrap().register(info);
+        self.route_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .register(info);
     }
 
     /// Register a first-class application module.
@@ -522,7 +525,10 @@ where
     ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.merge(axum_router);
-        self.route_registry.write().unwrap().extend(registry);
+        self.route_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(registry);
         self
     }
 
@@ -645,7 +651,10 @@ where
         let rume_router = rume_http::routing::Router::new().route_spec(spec, handler);
         let (axum_router, registry) = rume_router.into_parts();
         self.router = self.router.merge(axum_router);
-        self.route_registry.write().unwrap().extend(registry);
+        self.route_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .extend(registry);
         self
     }
 
@@ -659,7 +668,10 @@ where
             let reg = Arc::clone(&registry);
             let inf = info.clone();
             async move {
-                let spec = reg.read().unwrap().to_openapi(inf);
+                let spec = reg
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .to_openapi(inf);
                 axum::Json(spec.to_json_value())
             }
         })
@@ -675,7 +687,10 @@ where
     ) -> Self {
         let (axum_router, registry) = router.into().into_parts();
         self.router = axum_router;
-        *self.route_registry.write().unwrap() = registry;
+        *self
+            .route_registry
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = registry;
         self
     }
 
@@ -2293,7 +2308,7 @@ mod tests {
                 "timed out waiting for server to reach Ready (state={:?})",
                 lifecycle.state()
             );
-            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::task::yield_now().await;
         }
     }
 }

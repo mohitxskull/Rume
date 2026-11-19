@@ -4,9 +4,10 @@
 //! result caching (shared across clones via `Arc`), and singleflight
 //! stampede suppression.
 
+use parking_lot::RwLock;
 use std::collections::{BTreeMap, HashSet};
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -212,7 +213,7 @@ impl HealthChecks {
     /// marking each returned check with `cached: true`.
     fn get_cached_report(&self, ttl: Duration) -> Option<HealthReport> {
         let now = Instant::now();
-        let cache = self.cache.read().unwrap();
+        let cache = self.cache.read();
         if self.checks.is_empty() {
             return None;
         }
@@ -346,7 +347,7 @@ impl HealthChecks {
 
                 // Persist fresh results
                 {
-                    let mut cache = self.cache.write().unwrap();
+                    let mut cache = self.cache.write();
                     for result in &report.checks {
                         cache.insert(result.name.clone(), (Instant::now(), result.clone()));
                     }
@@ -572,7 +573,7 @@ mod tests {
 
         // Backdate the cached timestamp past TTL instead of sleeping so expiry is deterministic.
         {
-            let mut cache = short_ttl.cache.write().unwrap();
+            let mut cache = short_ttl.cache.write();
             let entry = cache.get_mut("db").expect("cached entry for db");
             entry.0 = Instant::now() - Duration::from_secs(10);
         }

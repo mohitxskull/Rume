@@ -73,6 +73,10 @@ impl DistributedLock for RedisDistributedLock {
     ) -> CoordinationFuture<'a, Option<LockGuard>> {
         let res = resource.to_string();
         Box::pin(async move {
+            // Why: Compute the conservative deadline before pool checkout and script dispatch
+            // so pool wait and network RTT count against the local lease deadline (`RC-01`).
+            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+
             let mut conn = self
                 .pool
                 .get()
@@ -82,7 +86,6 @@ impl DistributedLock for RedisDistributedLock {
             let lock_key = self.lock_key(&res);
             let fence_key = self.fence_key(&res);
             let lease_id = Uuid::new_v4().to_string();
-            let ttl_ms = ttl.as_millis().max(1) as u64;
 
             // Lua script: atomically set lock key if not exists (NX) with TTL (PX)
             // and increment the monotonic fencing counter if acquired.
@@ -112,7 +115,7 @@ impl DistributedLock for RedisDistributedLock {
                     resource: res,
                     lease_id,
                     fencing_token: token as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)
@@ -266,6 +269,10 @@ impl LeaderElector for RedisLeaderElector {
         let r = role.to_string();
         let c = candidate_id.to_string();
         Box::pin(async move {
+            // Why: Compute the conservative deadline before pool checkout and script dispatch
+            // so pool wait and network RTT count against the local leader lease (`RC-01`).
+            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+
             let mut conn = self
                 .pool
                 .get()
@@ -274,7 +281,6 @@ impl LeaderElector for RedisLeaderElector {
 
             let leader_key = self.leader_key(&r);
             let term_key = self.term_key(&r);
-            let ttl_ms = ttl.as_millis().max(1) as u64;
 
             // Lua script: if leader key is not set, increment term and set length-prefixed candidate_id:term
             let script = redis::Script::new(
@@ -305,7 +311,7 @@ impl LeaderElector for RedisLeaderElector {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)
@@ -322,6 +328,11 @@ impl LeaderElector for RedisLeaderElector {
         let r = role.to_string();
         let c = candidate_id.to_string();
         Box::pin(async move {
+            // Why: Compute the conservative deadline before pool checkout and script dispatch
+            // and only extend Redis `PEXPIRE` when `PTTL < requested_ttl` so renewal never
+            // shortens an existing longer leader lease (`RC-01`).
+            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+
             let mut conn = self
                 .pool
                 .get()
@@ -329,7 +340,6 @@ impl LeaderElector for RedisLeaderElector {
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
             let leader_key = self.leader_key(&r);
-            let ttl_ms = ttl.as_millis().max(1) as u64;
 
             let script = redis::Script::new(
                 r#"
@@ -337,7 +347,11 @@ impl LeaderElector for RedisLeaderElector {
                 if current then
                     local prefix = tostring(string.len(ARGV[1])) .. ':' .. ARGV[1] .. ':'
                     if string.sub(current, 1, string.len(prefix)) == prefix then
-                        redis.call('PEXPIRE', KEYS[1], ARGV[2])
+                        local requested_ttl = tonumber(ARGV[2])
+                        local remaining_ttl = redis.call('PTTL', KEYS[1])
+                        if remaining_ttl < 0 or remaining_ttl < requested_ttl then
+                            redis.call('PEXPIRE', KEYS[1], requested_ttl)
+                        end
                         local term = string.sub(current, string.len(prefix) + 1)
                         return tonumber(term)
                     end
@@ -359,7 +373,7 @@ impl LeaderElector for RedisLeaderElector {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
-                    expires_at: Some(std::time::Instant::now() + ttl),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)

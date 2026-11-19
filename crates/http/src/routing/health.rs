@@ -262,7 +262,7 @@ mod tests {
         assert_eq!(report.status, "warning");
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn health_checks_run_concurrently() {
         // A slow check must not block a fast check: both run concurrently.
         let order: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -292,7 +292,7 @@ mod tests {
         assert!(elapsed < Duration::from_millis(300));
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn health_check_timeout_marks_failed() {
         // A check that sleeps longer than the per-check timeout is Failed.
         let checks = HealthChecks::new()
@@ -675,7 +675,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn test_health_checks_singleflight_stampede_protection() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 

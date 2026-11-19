@@ -237,19 +237,6 @@ impl SamlParser {
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion.
-    ///
-    /// Deprecated: Unverified assertion parsing in production is insecure.
-    /// Prefer [`SamlParser::parse_verified`] with an injected [`SamlSignatureVerifier`].
-    // Why: Zero workspace callers remain, but this `#[deprecated]` shim is retained
-    // until the next breaking release per the SAML parser public-API contract.
-    #[deprecated(
-        since = "0.1.0",
-        note = "use SamlParser::parse_verified() in production or SamlParser::parse_unverified() for tests"
-    )]
-    pub fn parse(xml: &str) -> Result<SamlAssertion, SamlError> {
-        Self::parse_unverified(xml)
-    }
-
     /// Parses an XML string containing a SAML 2.0 Assertion without signature verification.
     /// Explicitly intended for offline tests and diagnostics.
     pub fn parse_unverified(xml: &str) -> Result<SamlAssertion, SamlError> {
@@ -262,17 +249,6 @@ impl SamlParser {
         verifier: &dyn SamlSignatureVerifier,
     ) -> Result<SamlAssertion, SamlError> {
         Self::parse_internal(xml, Some(verifier), false)
-    }
-
-    /// Parses an XML string containing a SAML 2.0 Assertion with mandatory cryptographic signature verification.
-    ///
-    /// Alias for [`SamlParser::parse_signed`]; kept so the verified entry point is
-    /// discoverable under its descriptive name.
-    pub fn parse_verified(
-        xml: &str,
-        verifier: &dyn SamlSignatureVerifier,
-    ) -> Result<SamlAssertion, SamlError> {
-        Self::parse_signed(xml, verifier)
     }
 
     /// Parses an XML string containing a SAML 2.0 Assertion using a namespace-aware XML parser

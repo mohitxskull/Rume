@@ -54,6 +54,7 @@ const MYSQL_MIGRATION_FIND_CHECKSUM: &str = include_str!("sql/mysql/migration_fi
 const MYSQL_MIGRATION_INSERT: &str = include_str!("sql/mysql/migration_insert.sql");
 const MYSQL_MIGRATION_DELETE: &str = include_str!("sql/mysql/migration_delete.sql");
 const MYSQL_MIGRATION_FIND_ID: &str = include_str!("sql/mysql/migration_find_id.sql");
+#[cfg(any(feature = "mysql", test))]
 const MYSQL_CLOCK: &str = include_str!("sql/mysql/mysql_clock.sql");
 #[cfg(feature = "mysql")]
 const MYSQL_MIGRATION_LOCK: &str = include_str!("sql/mysql/mysql_migration_lock.sql");
@@ -1021,6 +1022,7 @@ impl Migrator {
         }
 
         backend.execute(ddl).await?;
+        ensure_applied_order_column_backend(backend).await?;
 
         let mut applied = Vec::new();
         for migration in &self.migrations {
@@ -1045,22 +1047,12 @@ impl Migrator {
                             message: err.to_string(),
                         })?;
                 }
-                let clock_query = match dialect {
-                    "mysql" => Some(MYSQL_CLOCK),
-                    "sqlite" => Some(SQLITE_CLOCK),
-                    _ => None,
-                };
-                let now = if let Some(query) = clock_query
-                    && let Ok(Some(s)) = tx.query_scalar(query).await
-                    && let Ok(ts) = s.parse::<u64>()
-                {
-                    ts as i64
-                } else {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs() as i64
-                };
+                // Why: `postgres`, `mysql`, and `sqlite` all return early above; this fallback
+                // serves custom `DatabaseBackend` dialects, which record system wall-clock time.
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs() as i64;
                 let next_order = next_applied_order_tx(&tx).await?;
                 let params = [
                     DbValue::from(migration.id.as_str()),
@@ -1553,5 +1545,172 @@ mod tests {
         ];
         let target = select_rollback_target(&migrations, &applied).expect("target present");
         assert_eq!(target.id, "audit");
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct MockGenericTx {
+        executed_sql: Arc<Mutex<Vec<String>>>,
+        ledger: Arc<Mutex<BTreeMap<String, String>>>,
+    }
+
+    impl DatabaseTransaction for MockGenericTx {
+        fn dialect(&self) -> &'static str {
+            "custom_sql"
+        }
+
+        fn execute_params(
+            &self,
+            statement: &str,
+            params: &[DbValue],
+        ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
+            let statement = statement.to_string();
+            let params = params.to_vec();
+            let executed_sql = Arc::clone(&self.executed_sql);
+            let ledger = Arc::clone(&self.ledger);
+            Box::pin(async move {
+                executed_sql.lock().unwrap().push(statement.clone());
+                if statement == SQLITE_MIGRATION_INSERT
+                    && let (Some(DbValue::Text(id)), Some(DbValue::Text(checksum))) =
+                        (params.first(), params.get(3))
+                {
+                    ledger.lock().unwrap().insert(id.clone(), checksum.clone());
+                }
+                Ok(1)
+            })
+        }
+
+        fn query_scalar_params(
+            &self,
+            query: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
+            let query = query.to_string();
+            let executed_sql = Arc::clone(&self.executed_sql);
+            Box::pin(async move {
+                executed_sql.lock().unwrap().push(query);
+                Ok(Some("1".to_string()))
+            })
+        }
+
+        fn fetch_all(
+            &self,
+            _statement: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fetch_optional(
+            &self,
+            _statement: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Debug, Clone, Default)]
+    struct MockGenericBackend {
+        executed_sql: Arc<Mutex<Vec<String>>>,
+        ledger: Arc<Mutex<BTreeMap<String, String>>>,
+    }
+
+    impl DatabaseBackend for MockGenericBackend {
+        type Transaction = MockGenericTx;
+
+        fn dialect(&self) -> &'static str {
+            "custom_sql"
+        }
+
+        fn ping(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn execute_params(
+            &self,
+            statement: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<u64, PersistenceError>> {
+            let statement = statement.to_string();
+            let executed_sql = Arc::clone(&self.executed_sql);
+            Box::pin(async move {
+                executed_sql.lock().unwrap().push(statement);
+                Ok(1)
+            })
+        }
+
+        fn query_scalar_params(
+            &self,
+            query: &str,
+            params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Option<String>, PersistenceError>> {
+            let query = query.to_string();
+            let params = params.to_vec();
+            let executed_sql = Arc::clone(&self.executed_sql);
+            let ledger = Arc::clone(&self.ledger);
+            Box::pin(async move {
+                executed_sql.lock().unwrap().push(query.clone());
+                if query == SQLITE_MIGRATION_FIND_CHECKSUM
+                    && let Some(DbValue::Text(id)) = params.first()
+                {
+                    return Ok(ledger.lock().unwrap().get(id).cloned());
+                }
+                Ok(None)
+            })
+        }
+
+        fn fetch_all(
+            &self,
+            _statement: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn fetch_optional(
+            &self,
+            _statement: &str,
+            _params: &[DbValue],
+        ) -> BoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
+            let tx = MockGenericTx {
+                executed_sql: Arc::clone(&self.executed_sql),
+                ledger: Arc::clone(&self.ledger),
+            };
+            Box::pin(async move { Ok(tx) })
+        }
+    }
+
+    #[tokio::test]
+    async fn generic_backend_fallback_ensures_applied_order_column_before_insert() {
+        let backend = MockGenericBackend::default();
+        let migrator = Migrator::new().add_migration(Migration::from_sql(
+            "001_custom",
+            "custom migration",
+            "CREATE TABLE t_custom (id INT);",
+        ));
+
+        let summary = migrator
+            .run_pending_backend(&backend)
+            .await
+            .expect("generic fallback migration succeeds");
+        assert_eq!(summary.applied.len(), 1);
+
+        let log = backend.executed_sql.lock().unwrap();
+        assert!(
+            log.iter().any(|s| s.contains("applied_order")),
+            "generic fallback path must ensure applied_order column exists: {log:?}"
+        );
     }
 }

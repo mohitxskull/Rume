@@ -1,7 +1,8 @@
 //! Sliding-window rate limiter and Tower middleware.
 
+use parking_lot::RwLock;
 use std::collections::BTreeMap;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::time::Instant;
@@ -148,7 +149,7 @@ impl RateLimiter {
         shards: &[RwLock<BTreeMap<String, RateLimitEntry>>],
         key: &str,
     ) -> Result<RateLimitStatus, ResilienceError> {
-        let mut clients = Self::shard_for(shards, key).write().unwrap();
+        let mut clients = Self::shard_for(shards, key).write();
         let now = Instant::now();
         let window_start = now.checked_sub(config.window).unwrap_or(now);
 
@@ -254,7 +255,7 @@ impl RateLimiter {
                 let now = Instant::now();
                 let window_start = now.checked_sub(self.config.window).unwrap_or(now);
                 for shard in shards.iter() {
-                    let mut clients = shard.write().unwrap();
+                    let mut clients = shard.write();
                     clients.retain(|_, entry| {
                         entry.timestamps.retain(|&t| t > window_start);
                         !entry.timestamps.is_empty()

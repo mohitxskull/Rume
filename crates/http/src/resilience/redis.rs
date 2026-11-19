@@ -59,11 +59,16 @@ impl RedisRateLimiter {
             .await
             .map_err(|e| ResilienceError::Backend(e.to_string()))?;
 
-        let window_ms = self.config.window.as_millis() as i64;
+        let window_ms = i64::try_from(self.config.window.as_millis().max(1)).unwrap_or(i64::MAX);
         let max_req = self.config.max_requests as i64;
         let rand_id = uuid::Uuid::new_v4().to_string();
 
+        // Why: `redis.replicate_commands()` is required on Redis < 7.0 before calling
+        // non-deterministic `TIME` followed by write commands (`ZREMRANGEBYSCORE`, `ZADD`,
+        // `PEXPIRE`), and `window_ms` is clamped to `>= 1` so sub-millisecond windows never
+        // issue `PEXPIRE key 0` (`RC-04`).
         let script = r#"
+            if redis.replicate_commands then redis.replicate_commands() end
             local key = KEYS[1]
             local redis_time = redis.call('TIME')
             local now = tonumber(redis_time[1]) * 1000 + math.floor(tonumber(redis_time[2]) / 1000)
@@ -110,5 +115,30 @@ impl RedisRateLimiter {
                 retry_after_secs: res.2 as u64,
             })
         }
+    }
+
+    #[cfg(test)]
+    fn effective_window_ms(window: std::time::Duration) -> i64 {
+        i64::try_from(window.as_millis().max(1)).unwrap_or(i64::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::RedisRateLimiter;
+
+    #[test]
+    fn sub_millisecond_window_clamps_to_at_least_one_ms() {
+        assert_eq!(
+            RedisRateLimiter::effective_window_ms(Duration::from_micros(500)),
+            1
+        );
+        assert_eq!(RedisRateLimiter::effective_window_ms(Duration::ZERO), 1);
+        assert_eq!(
+            RedisRateLimiter::effective_window_ms(Duration::from_millis(250)),
+            250
+        );
     }
 }
