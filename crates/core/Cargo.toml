@@ -81,6 +81,7 @@ rstest = "=0.28.0"
 wiremock = "=0.6.5"
 ureq = "=3.5.2"
 proptest.workspace = true
+criterion = { version = "=0.8.2", features = ["async_tokio"] }
 
 [[test]]
 name = "integration"
@@ -89,3 +90,8 @@ path = "tests/integration.rs"
 [[test]]
 name = "containers"
 path = "tests/containers.rs"
+
+[[bench]]
+name = "hot_path"
+path = "benches/hot_path.rs"
+harness = false

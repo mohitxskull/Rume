@@ -21,6 +21,7 @@ members = [
 ]
 exclude = [
     "lab",
+    "fuzz",
 ]
 default-members = ["crates/core", "crates/cli"]
 
