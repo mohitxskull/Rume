@@ -66,7 +66,7 @@ sqlparser = "=0.53.0"
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
-redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
+redis = { version = "=1.8.2", default-features = false, features = ["tokio-comp", "script"] }
 # SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
 # `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
 # XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
