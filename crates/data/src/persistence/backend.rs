@@ -362,18 +362,35 @@ fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), Persistence
 /// block comments at the first `*/` (SQLite and MySQL), while leaving PostgreSQL's nested
 /// `/* ... /* ... */ ... */` comments untouched.
 ///
-/// Why: `sqlparser = "=0.53.0"` unconditionally counts every inner `/*` inside a block comment
-/// as a nested opener, causing valid SQLite/MySQL SQL like `SELECT 1 /* example /* marker */`
-/// to fail with `"Unexpected EOF while in a multi-line comment"`. Replacing inner `/*` with
-/// `/ ` (same byte length, preserving token spans) inside a comment up to the first `*/` aligns
-/// `sqlparser` with SQLite's `tokenize.c` without weakening unclosed-comment rejection.
-#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+/// Why: `sqlparser 0.64.0` applies nested block-comment handling when the active dialect's
+/// `supports_nested_comments()` returns `true` (and blanking interior `/` and `*` bytes up to
+/// the first `*/` guarantees C-style non-nested closing semantics across SQLite/MySQL without
+/// relying on dialect flag defaults). Returns `Result` so callers propagate any validation
+/// failure without `expect()` in production code.
+#[cfg(any(feature = "sqlite", test))]
 pub(crate) fn sanitize_non_nested_block_comments<'a>(
     statement: &'a str,
     dialect: &dyn sqlparser::dialect::Dialect,
-) -> std::borrow::Cow<'a, str> {
+) -> Result<std::borrow::Cow<'a, str>, PersistenceError> {
+    sanitize_non_nested_block_comments_inner(statement, dialect, false)
+}
+
+/// Scans `statement` for C-style non-nested block comments (`/* ... */`) in SQLite/MySQL
+/// dialects. When `reject_mysql_exec_comments` is `true` and `dialect` is `MySqlDialect`,
+/// any `/*! ... */` executable comment is rejected before `sqlparser` tokenization.
+///
+/// Why: `sqlparser 0.64.0`'s `MySqlDialect` parses `/*!99999 ... */` as executable SQL tokens
+/// rather than `Whitespace::MultiLineComment`, so checking at the raw comment-scanner layer
+/// guarantees every `/*! ... */` (including version-gated `/*!99999 ... */` whose server-version
+/// predicate cannot be resolved statically) is rejected deterministically before tokenization.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+fn sanitize_non_nested_block_comments_inner<'a>(
+    statement: &'a str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+    reject_mysql_exec_comments: bool,
+) -> Result<std::borrow::Cow<'a, str>, PersistenceError> {
     if dialect.is::<sqlparser::dialect::PostgreSqlDialect>() || !statement.contains("/*") {
-        return std::borrow::Cow::Borrowed(statement);
+        return Ok(std::borrow::Cow::Borrowed(statement));
     }
 
     let is_mysql = dialect.is::<sqlparser::dialect::MySqlDialect>();
@@ -436,6 +453,12 @@ pub(crate) fn sanitize_non_nested_block_comments<'a>(
                 // delimiters like `/* /*/; COMMIT; /* */` and nested-comment payloads like
                 // `/* /* */ ; COMMIT; /* */ */` always close at the exact byte offset the
                 // database engine uses.
+                if reject_mysql_exec_comments && is_mysql && bytes.get(i + 2) == Some(&b'!') {
+                    return Err(PersistenceError::TransactionError(
+                        "MySQL executable comments (`/*! ... */`) are not allowed in managed transactions or migrations"
+                            .into(),
+                    ));
+                }
                 let body_start = if is_mysql && bytes.get(i + 2) == Some(&b'!') {
                     i + 3
                 } else {
@@ -473,12 +496,12 @@ pub(crate) fn sanitize_non_nested_block_comments<'a>(
         }
     }
 
-    match out {
+    Ok(match out {
         Some(vec) => std::borrow::Cow::Owned(
             String::from_utf8(vec).expect("replacing ASCII '*' with ' ' preserves valid UTF-8"),
         ),
         None => std::borrow::Cow::Borrowed(statement),
-    }
+    })
 }
 
 /// Tokenizes `statement` with `sqlparser` and strips whitespace tokens. When `is_mysql` is
@@ -494,7 +517,7 @@ fn tokenize_sql_filtered(
 ) -> Result<Vec<sqlparser::tokenizer::Token>, PersistenceError> {
     use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 
-    let sanitized = sanitize_non_nested_block_comments(statement, dialect);
+    let sanitized = sanitize_non_nested_block_comments_inner(statement, dialect, is_mysql)?;
     let raw_tokens = Tokenizer::new(dialect, &sanitized)
         .tokenize()
         .map_err(|e| {
@@ -669,7 +692,7 @@ fn is_mysql_implicit_commit_ast(stmt: &sqlparser::ast::Statement) -> bool {
 /// Rejects top-level transaction-control statements in a raw SQL batch so a managed
 /// [`DatabaseTransaction`] cannot be committed or rolled back out-of-band.
 ///
-/// Why: Delegate SQL lexing and AST inspection to `sqlparser = "=0.53.0"` instead of maintaining
+/// Why: Delegate SQL lexing and AST inspection to `sqlparser = "=0.64.0"` instead of maintaining
 /// hand-rolled dialect scanners; fail closed on `TokenizerError` so malformed quotes cannot
 /// smuggle transaction-control keywords past the guard.
 // Why: MySQL transactions call `validate_managed_mysql_transaction_sql` instead (it adds the

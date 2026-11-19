@@ -79,7 +79,7 @@ testcontainers-modules = { workspace = true }
 insta = { version = "=1.49.0", features = ["json"] }
 rstest = "=0.28.0"
 wiremock = "=0.6.5"
-ureq = "=3.5.1"
+ureq = "=3.5.2"
 proptest.workspace = true
 
 [[test]]

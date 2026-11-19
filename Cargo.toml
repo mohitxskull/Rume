@@ -59,14 +59,14 @@ tempfile = "3.27.0"
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
 # SQL parsing and validation used by `rume sql:check` and `rume-data` transaction/placeholder checks.
 # Pinned to an exact version so dialect-aware placeholder, statement, and comment lexing is deterministic.
-sqlparser = "=0.53.0"
+sqlparser = "=0.64.0"
 # RFC 3339 / ISO 8601 date-time parsing used by SAML assertion condition/instant validation.
 # Default features are disabled so consumers that only parse fixed-offset timestamps do not
 # pull in `clock`; crates that need `Utc::now()` enable `clock` explicitly.
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
-redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
+redis = { version = "=1.8.2", default-features = false, features = ["tokio-comp", "script"] }
 # SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
 # `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
 # XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
