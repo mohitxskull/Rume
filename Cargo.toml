@@ -11,6 +11,7 @@ members = [
     "crates/app",
     "crates/testing",
     "crates/core",
+    "crates/crash-harness",
     "crates/cli",
     "crates/macro",
     "crates/xtask",

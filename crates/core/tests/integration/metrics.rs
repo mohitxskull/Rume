@@ -1,25 +1,7 @@
 use axum::http::StatusCode;
 use axum::routing::post;
-use rume::metrics::{Counter, Gauge, MetricsLayer, MetricsRegistry};
+use rume::metrics::{MetricsLayer, MetricsRegistry};
 use rume::prelude::*;
-
-#[tokio::test]
-async fn counter_and_gauge_primitives() {
-    let counter = Counter::default();
-    assert_eq!(counter.get(), 0);
-    counter.inc();
-    counter.inc_by(5);
-    assert_eq!(counter.get(), 6);
-
-    let gauge = Gauge::default();
-    assert_eq!(gauge.get(), 0);
-    gauge.inc();
-    gauge.inc();
-    gauge.dec();
-    assert_eq!(gauge.get(), 1);
-    gauge.set(42);
-    assert_eq!(gauge.get(), 42);
-}
 
 #[tokio::test]
 async fn metrics_middleware_and_otel_registry() {

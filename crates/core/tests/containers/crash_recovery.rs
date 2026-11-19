@@ -35,19 +35,61 @@ impl Job for CrashTestJob {
 }
 
 fn crash_harness_binary() -> std::path::PathBuf {
-    // Cargo automatically provides this environment variable when testing binary targets.
-    // If not present, fallback to searching target/debug/rume-crash-harness.
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    static BUILT_BIN: OnceLock<PathBuf> = OnceLock::new();
+
+    // Why: `rume-crash-harness` was extracted out of `crates/core` into its own `publish = false`
+    // workspace crate (`crates/crash-harness`), so Cargo does not set
+    // `CARGO_BIN_EXE_rume-crash-harness` when running `rume` container tests.
+    // `OnceLock` compiles the harness once per test binary invocation into the active
+    // `target/<profile>` directory so parallel tests do not race on builds.
     if let Ok(bin) = std::env::var("CARGO_BIN_EXE_rume-crash-harness") {
-        std::path::PathBuf::from(bin)
-    } else {
-        let manifest_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let bin = manifest_dir.join("../target/debug/rume-crash-harness");
-        if bin.exists() {
-            bin
-        } else {
-            manifest_dir.join("target/debug/rume-crash-harness")
-        }
+        return PathBuf::from(bin);
     }
+
+    BUILT_BIN
+        .get_or_init(|| {
+            let exe = std::env::current_exe().expect("resolve current test executable path");
+            let profile_dir = exe
+                .parent()
+                .and_then(|deps| deps.parent())
+                .expect("test executable must live under target/<profile>/deps");
+            let bin_name = format!("rume-crash-harness{}", std::env::consts::EXE_SUFFIX);
+            let bin_path = profile_dir.join(bin_name);
+
+            let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+            let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let mut cmd = Command::new(cargo);
+            cmd.current_dir(&workspace_root).args([
+                "build",
+                "-p",
+                "rume-crash-harness",
+                "--bin",
+                "rume-crash-harness",
+            ]);
+            if !cfg!(debug_assertions) {
+                cmd.arg("--release");
+            }
+
+            let output = cmd
+                .output()
+                .expect("invoke cargo build for rume-crash-harness");
+            assert!(
+                output.status.success(),
+                "cargo build -p rume-crash-harness failed ({}): {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                bin_path.is_file(),
+                "expected rume-crash-harness binary at {}",
+                bin_path.display()
+            );
+            bin_path
+        })
+        .clone()
 }
 
 #[tokio::test]

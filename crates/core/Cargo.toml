@@ -27,28 +27,15 @@ rume-app.workspace = true
 rume-testing = { workspace = true, optional = true }
 # Core HTTP substrate (used by `rume::prelude`).
 axum.workspace = true
-# Async runtime (used by `rume-crash-harness` and tests).
-tokio.workspace = true
 # Serialization (used by `rume::prelude`).
 serde.workspace = true
-# SQLx (optional, used by `rume-crash-harness` and container tests).
-sqlx = { workspace = true, optional = true }
-# UUID generation (used by `rume-crash-harness` and tests).
-uuid = { version = "=1.29.2", features = ["v4"] }
 rume-macros = { path = "../../crates/macro", version = "=0.1.0" }
-
-[[bin]]
-name = "rume-crash-harness"
-path = "src/bin/crash_harness.rs"
-required-features = ["postgres", "redis"]
 
 [features]
 default = ["sqlite", "testing"]
 otel = ["rume-observability/otel"]
 testing = ["dep:rume-testing", "rume-testing/testing"]
 postgres = [
-    "dep:sqlx",
-    "sqlx/postgres",
     "rume-data/postgres",
     "rume-messaging/postgres",
     "rume-testing?/postgres",
@@ -60,15 +47,11 @@ redis = [
     "rume-http/redis",
 ]
 sqlite = [
-    "dep:sqlx",
-    "sqlx/sqlite",
     "rume-data/sqlite",
     "rume-messaging/sqlite",
     "rume-testing?/sqlite",
 ]
 mysql = [
-    "dep:sqlx",
-    "sqlx/mysql",
     "rume-data/mysql",
     "rume-messaging/mysql",
     "rume-testing?/mysql",
@@ -78,6 +61,13 @@ enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]
 
 [dev-dependencies]
+# Why: `tokio`, `sqlx`, and `uuid` belong in `[dev-dependencies]` rather than runtime
+# `[dependencies]` after extracting `rume-crash-harness` to `crates/crash-harness`; Cargo
+# feature unification propagates backend `sqlx/*` drivers from `rume-data`/`rume-messaging`
+# when tests enable `postgres`, `sqlite`, or `mysql`.
+tokio.workspace = true
+sqlx.workspace = true
+uuid = { version = "=1.29.2", features = ["v4"] }
 deadpool-redis.workspace = true
 futures-util.workspace = true
 garde = { workspace = true, features = ["derive", "email", "url"] }

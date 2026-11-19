@@ -20,35 +20,23 @@ fn current_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
-const JOBS_SCHEMA: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_schema.sql");
-const JOBS_CLAIM_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_claim.sql");
-const INSERT_JOB_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_insert.sql");
-const JOBS_REAP_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_reap.sql");
+const JOBS_SCHEMA: &str = rume_data::persistence::sql::PG_JOBS_SCHEMA;
+const JOBS_CLAIM_SQL: &str = include_str!("sql/postgres/jobs_claim.sql");
+const INSERT_JOB_SQL: &str = include_str!("sql/postgres/jobs_insert.sql");
+const JOBS_REAP_SQL: &str = include_str!("sql/postgres/jobs_reap.sql");
 
 // Per-operation jobs SQL, externalized from inline string literals.
-const JOBS_PENDING_COUNT_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_pending_count.sql");
-const JOBS_DEAD_LETTER_COUNT_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_dead_letter_count.sql");
-const JOBS_IDEMPOTENCY_CHECK_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_idempotency_check.sql");
-const JOBS_ACK_SQL: &str = include_str!("../../../data/src/persistence/sql/postgres/jobs_ack.sql");
-const JOBS_NACK_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_nack.sql");
-const JOBS_DEAD_LETTER_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_dead_letter.sql");
-const JOBS_RENEW_LEASE_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_renew_lease.sql");
-const JOBS_LIST_DEAD_LETTERS_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_list_dead_letters.sql");
-const JOBS_REPLAY_DEAD_LETTER_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_replay_dead_letter.sql");
-const JOBS_PURGE_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/postgres/jobs_purge.sql");
+const JOBS_PENDING_COUNT_SQL: &str = include_str!("sql/postgres/jobs_pending_count.sql");
+const JOBS_DEAD_LETTER_COUNT_SQL: &str = include_str!("sql/postgres/jobs_dead_letter_count.sql");
+const JOBS_IDEMPOTENCY_CHECK_SQL: &str = include_str!("sql/postgres/jobs_idempotency_check.sql");
+const JOBS_ACK_SQL: &str = include_str!("sql/postgres/jobs_ack.sql");
+const JOBS_NACK_SQL: &str = include_str!("sql/postgres/jobs_nack.sql");
+const JOBS_DEFER_SQL: &str = include_str!("sql/postgres/jobs_defer.sql");
+const JOBS_DEAD_LETTER_SQL: &str = include_str!("sql/postgres/jobs_dead_letter.sql");
+const JOBS_RENEW_LEASE_SQL: &str = include_str!("sql/postgres/jobs_renew_lease.sql");
+const JOBS_LIST_DEAD_LETTERS_SQL: &str = include_str!("sql/postgres/jobs_list_dead_letters.sql");
+const JOBS_REPLAY_DEAD_LETTER_SQL: &str = include_str!("sql/postgres/jobs_replay_dead_letter.sql");
+const JOBS_PURGE_SQL: &str = include_str!("sql/postgres/jobs_purge.sql");
 
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]
@@ -321,25 +309,13 @@ impl JobQueue for PostgresJobQueue {
         Box::pin(async move {
             let delay_ms = delay.as_millis() as i64;
 
-            let res = sqlx::query(
-                "UPDATE rume_jobs \
-                 SET status = 'pending', \
-                     assigned_worker = NULL, \
-                     lease_expires_at = NULL, \
-                     lease_token = NULL, \
-                     attempt = GREATEST(attempt - 1, 0), \
-                     available_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $1 \
-                 WHERE id = $2 \
-                   AND lease_token = $3 \
-                   AND status = 'in_flight' \
-                   AND lease_expires_at > (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT",
-            )
-            .bind(delay_ms)
-            .bind(&job.id)
-            .bind(&token)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let res = sqlx::query(JOBS_DEFER_SQL)
+                .bind(delay_ms)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
@@ -534,5 +510,18 @@ impl JobQueue for PostgresJobQueue {
 
             Ok(res.rows_affected())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_job_queue_defer_uses_externalized_sql_constant() {
+        assert!(!JOBS_DEFER_SQL.trim().is_empty());
+        assert!(JOBS_DEFER_SQL.contains("status = 'pending'"));
+        assert!(JOBS_DEFER_SQL.contains("attempt = GREATEST(attempt - 1, 0)"));
+        assert!(JOBS_DEFER_SQL.contains("lease_expires_at >"));
     }
 }

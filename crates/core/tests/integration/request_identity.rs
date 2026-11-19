@@ -401,10 +401,12 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
         }
     }
 
+    let captured_handler_tc = Arc::new(tokio::sync::Mutex::new(None));
     let captured_outbox_tc = Arc::new(tokio::sync::Mutex::new(None));
     let captured_job_tc = Arc::new(tokio::sync::Mutex::new(None));
     let memory_queue = Arc::new(TestJobQueue::new());
 
+    let handler_tc_clone = Arc::clone(&captured_handler_tc);
     let outbox_tc_clone = Arc::clone(&captured_outbox_tc);
     let job_tc_clone = Arc::clone(&captured_job_tc);
     let queue_clone = Arc::clone(&memory_queue);
@@ -413,14 +415,16 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     let builder = Rume::builder(ctx).route(
         "/trigger-trace",
         get(move || {
+            let handler_tc_clone = Arc::clone(&handler_tc_clone);
             let outbox_tc_clone = Arc::clone(&outbox_tc_clone);
             let job_tc_clone = Arc::clone(&job_tc_clone);
             let queue = Arc::clone(&queue_clone);
             async move {
-                // Inside HTTP handler, TraceContext::current() must be available
+                // Inside HTTP handler, TraceContext::current() must be the server span's child TraceContext
                 let current_tc =
                     TraceContext::current().expect("TraceContext must be present in HTTP handler");
                 assert_eq!(current_tc.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
+                *handler_tc_clone.lock().await = Some(current_tc.traceparent.clone());
 
                 // OutboxMessage::new automatically inherits current trace_context
                 let msg = OutboxMessage::new("msg-1", "user.created", vec![]);
@@ -464,29 +468,42 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     let resp = app.request(req).await;
     assert_eq!(resp.status(), StatusCode::OK);
 
-    // 1. Response has matching traceparent
+    let handler_tp = captured_handler_tc
+        .lock()
+        .await
+        .clone()
+        .expect("handler trace context captured");
+    let handler_tc = TraceContext::from_traceparent(handler_tp.clone());
+    assert_eq!(handler_tc.trace_id(), incoming_trace_id);
+    assert_ne!(
+        handler_tc.span_id(),
+        incoming_span_id,
+        "HTTP server span must mint a child span_id rather than echoing caller span_id"
+    );
+
+    // 1. Response has server span's child traceparent
     let resp_traceparent = resp
         .headers()
         .get("traceparent")
         .and_then(|v| v.to_str().ok())
         .expect("missing traceparent in response");
-    assert_eq!(resp_traceparent, incoming_traceparent);
+    assert_eq!(resp_traceparent, handler_tp);
 
-    // 2. Outbox message inherited exact incoming traceparent
+    // 2. Outbox message inherited exact server child traceparent
     let outbox_tc = captured_outbox_tc
         .lock()
         .await
         .clone()
         .expect("outbox trace context captured");
-    assert_eq!(outbox_tc, incoming_traceparent);
+    assert_eq!(outbox_tc, handler_tp);
 
-    // 3. Queued job inherited exact incoming traceparent
+    // 3. Queued job inherited exact server child traceparent
     let job_tc = captured_job_tc
         .lock()
         .await
         .clone()
         .expect("job trace context captured");
-    assert_eq!(job_tc, incoming_traceparent);
+    assert_eq!(job_tc, handler_tp);
 
     // 4. Now dispatch the queued job through JobRegistry and verify child span creation
     let job_handler_tid = Arc::new(tokio::sync::Mutex::new(None));

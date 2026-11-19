@@ -3114,7 +3114,6 @@ dependencies = [
  "portable-atomic",
  "rand 0.9.5",
  "thiserror",
- "tokio",
 ]
 
 [[package]]
@@ -3928,6 +3927,16 @@ dependencies = [
  "tokio",
  "toml 1.2.1+spec-1.1.0",
  "unicode-width",
+]
+
+[[package]]
+name = "rume-crash-harness"
+version = "0.1.0"
+dependencies = [
+ "rume",
+ "sqlx",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

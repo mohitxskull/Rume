@@ -11,8 +11,7 @@ use crate::outbox::{
     TransactionalOutbox,
 };
 
-const MYSQL_SET_ISOLATION_LEVEL_SQL: &str =
-    include_str!("../../../data/src/persistence/sql/mysql/set_isolation_level.sql");
+const MYSQL_SET_ISOLATION_LEVEL_SQL: &str = rume_data::persistence::sql::MYSQL_SET_ISOLATION_LEVEL;
 const OUTBOX_CLAIM_SQL: &str = include_str!("sql/mysql/outbox_claim.sql");
 // Why: `fetch_pending` is a non-claiming read inspection path, whereas
 // `claim_pending_with_lease` owns `FOR UPDATE SKIP LOCKED`. Using a plain
