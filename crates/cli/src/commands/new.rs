@@ -1,3 +1,4 @@
+use crate::cli::NewProjectDialect;
 use std::fs;
 use std::path::Path;
 
@@ -50,6 +51,7 @@ pub fn resolve_rume_dependency(
 struct TemplateContext<'a> {
     name: &'a str,
     rume_dependency: &'a str,
+    dialect: NewProjectDialect,
 }
 
 const TEMPLATES: &[(&str, &str)] = &[
@@ -125,10 +127,15 @@ const TEMPLATES: &[(&str, &str)] = &[
     ("README.md", include_str!("../../templates/README.md.tpl")),
 ];
 
-pub fn run(name: &str, path_override: Option<&str>, version_override: Option<&str>) {
+pub fn run(
+    name: &str,
+    path_override: Option<&str>,
+    version_override: Option<&str>,
+    dialect: NewProjectDialect,
+) {
     let (rume_dep, resolved_path) = resolve_rume_dependency(path_override, version_override);
 
-    if let Err(err) = run_inner(name, &rume_dep) {
+    if let Err(err) = run_inner(name, &rume_dep, dialect) {
         eprintln!("error: {err}");
         // `run_inner` already removed any directory this command created.
         // An `AlreadyExists` error means the directory pre-existed and must
@@ -170,7 +177,11 @@ pub fn run(name: &str, path_override: Option<&str>, version_override: Option<&st
     }
 }
 
-fn run_inner(name: &str, rume_dependency: &str) -> Result<(), NewError> {
+fn run_inner(
+    name: &str,
+    rume_dependency: &str,
+    dialect: NewProjectDialect,
+) -> Result<(), NewError> {
     validate_name(name)?;
 
     let root = Path::new(name);
@@ -191,6 +202,7 @@ fn run_inner(name: &str, rume_dependency: &str) -> Result<(), NewError> {
         let context = TemplateContext {
             name,
             rume_dependency,
+            dialect,
         };
 
         for (relative_path, template) in TEMPLATES {
@@ -245,10 +257,23 @@ fn validate_name(name: &str) -> Result<(), NewError> {
 
 fn render(template: &str, context: &TemplateContext<'_>) -> String {
     let crate_name = context.name.replace('-', "_");
+    // Why: Keep `sql/items/*.sql` un-dialected (`dialect: None`) while substituting `?` vs
+    // `$1`/`$2`/`$3` placeholders per `--dialect` so `sql_assets!` preserves flat
+    // `queries::items::*` bindings and `tests/smoke.rs`'s `SqliteTestFixture` continues to pass
+    // across `--dialect sqlite|postgres|mysql`.
+    let (p1, p2, p3, dialect_name) = match context.dialect {
+        NewProjectDialect::Sqlite => ("?", "?", "?", "sqlite"),
+        NewProjectDialect::Mysql => ("?", "?", "?", "mysql"),
+        NewProjectDialect::Postgres => ("$1", "$2", "$3", "postgres"),
+    };
     template
         .replace("{{name}}", context.name)
         .replace("{{crate_name}}", &crate_name)
         .replace("{{rume_dependency}}", context.rume_dependency)
+        .replace("{{dialect}}", dialect_name)
+        .replace("{{p1}}", p1)
+        .replace("{{p2}}", p2)
+        .replace("{{p3}}", p3)
 }
 
 fn write_file(path: &Path, content: &str) -> Result<(), NewError> {
@@ -303,9 +328,23 @@ mod tests {
         let context = TemplateContext {
             name: "demo",
             rume_dependency: "rume = \"0.1.0\"",
+            dialect: NewProjectDialect::Sqlite,
         };
-        let rendered = render("name={{name}} dep={{rume_dependency}}", &context);
-        assert_eq!(rendered, "name=demo dep=rume = \"0.1.0\"");
+        let rendered = render(
+            "name={{name}} dep={{rume_dependency}} d={{dialect}} ({{p1}},{{p2}},{{p3}})",
+            &context,
+        );
+        assert_eq!(rendered, "name=demo dep=rume = \"0.1.0\" d=sqlite (?,?,?)");
+
+        let pg_context = TemplateContext {
+            name: "demo",
+            rume_dependency: "rume = \"0.1.0\"",
+            dialect: NewProjectDialect::Postgres,
+        };
+        assert_eq!(
+            render("{{dialect}} ({{p1}},{{p2}},{{p3}})", &pg_context),
+            "postgres ($1,$2,$3)"
+        );
     }
 
     #[test]
@@ -315,7 +354,7 @@ mod tests {
         fs::create_dir_all(root).expect("create dummy dir");
         fs::write(root.join("keep.txt"), "original contents").expect("write dummy file");
 
-        let err = run_inner(&name, "rume = \"0.1.0\"").unwrap_err();
+        let err = run_inner(&name, "rume = \"0.1.0\"", NewProjectDialect::Sqlite).unwrap_err();
         assert!(matches!(err, NewError::AlreadyExists(_)));
 
         // The directory and its original contents must still exist.

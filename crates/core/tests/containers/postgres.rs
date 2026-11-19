@@ -1868,3 +1868,46 @@ async fn postgres_list_dead_letters_preserves_trace_context() {
 
     pool.close_async().await;
 }
+
+#[tokio::test]
+async fn postgres_schema_fixture_drop_cleans_up_on_current_thread_runtime() {
+    let (_container, admin_pool) = setup_postgres_pool(4).await;
+    let fixture = rume::testing::PostgresSchemaFixture::create(&admin_pool)
+        .await
+        .expect("create PostgresSchemaFixture");
+    let schema = fixture.schema_name().to_string();
+
+    fixture
+        .execute("CREATE TABLE drop_check (id INT PRIMARY KEY)")
+        .await
+        .expect("create table inside fixture schema");
+
+    let exists_before = admin_pool
+        .backend()
+        .query_scalar_params(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1",
+            &[DbValue::Text(schema.clone())],
+        )
+        .await
+        .expect("query schemata before drop");
+    assert_eq!(exists_before.as_deref(), Some(schema.as_str()));
+
+    // Drop without `.close()` inside a `current_thread` `#[tokio::test]`: must drop the schema
+    // synchronously via the isolated helper-thread connection without hanging.
+    drop(fixture);
+
+    let exists_after = admin_pool
+        .backend()
+        .query_scalar_params(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1",
+            &[DbValue::Text(schema)],
+        )
+        .await
+        .expect("query schemata after drop");
+    assert_eq!(
+        exists_after, None,
+        "schema must be dropped synchronously when PostgresSchemaFixture is dropped"
+    );
+
+    admin_pool.close_async().await;
+}

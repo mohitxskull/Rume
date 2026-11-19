@@ -10,6 +10,11 @@ use std::path::{Path, PathBuf};
 
 /// An RAII transaction guard that automatically rolls back the transaction on Drop
 /// unless explicitly committed.
+///
+/// For SQLite transactions (or any driver dropped on a `#[tokio::test(flavor = "multi_thread")]`
+/// runtime), `Drop` completes rollback synchronously (5s timeout). Synchronous drop rollback
+/// barriers for Postgres/MySQL transactions require `#[tokio::test(flavor = "multi_thread")]`
+/// or calling `.rollback().await` / `.close().await` explicitly.
 pub struct TestTransactionFixture<T: DatabaseTransaction + 'static> {
     tx: Option<T>,
     committed: bool,
@@ -71,11 +76,51 @@ impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
     fn drop(&mut self) {
         if !self.committed
             && let Some(tx) = self.tx.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            handle.spawn(async move {
-                let _ = tx.rollback().await;
-            });
+            let timeout = std::time::Duration::from_secs(5);
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    // Why: Multi-thread Tokio supports `block_in_place` so other worker threads
+                    // keep polling the I/O reactor while this thread waits synchronously for
+                    // rollback (up to 5s).
+                    tokio::task::block_in_place(|| {
+                        let _ = handle.block_on(tokio::time::timeout(timeout, tx.rollback()));
+                    });
+                }
+                _ if tx.dialect() == "sqlite" => {
+                    // Why: `sqlx-sqlite` runs queries over channels on its own dedicated OS worker
+                    // thread rather than Tokio's socket reactor, so awaiting `tx.rollback()` on a
+                    // joined helper thread's runtime finishes synchronously without deadlocking
+                    // `epoll_wait` on `current_thread` tests or outside Tokio.
+                    let _ = std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            rt.block_on(async move {
+                                let _ = tokio::time::timeout(timeout, tx.rollback()).await;
+                            });
+                        }
+                    })
+                    .join();
+                }
+                Ok(handle) => {
+                    // Why: Outer-reactor TCP sockets (`postgres`, `mysql`) on a `current_thread`
+                    // runtime cannot be driven by a joined helper thread because blocking the sole
+                    // test thread halts `epoll_wait` and deadlocks. Fall back to `handle.spawn`;
+                    // callers requiring synchronous drop barriers must use
+                    // `#[tokio::test(flavor = "multi_thread")]` or `.rollback().await`.
+                    handle.spawn(async move {
+                        let _ = tx.rollback().await;
+                    });
+                }
+                Err(_) => {
+                    // Outside any Tokio runtime, TCP sockets have no active reactor to drive
+                    // `rollback().await`; dropping `tx` falls back to SQLx's connection cleanup.
+                }
+            }
         }
     }
 }
@@ -181,6 +226,13 @@ impl Drop for SqliteTestFixture {
 }
 
 /// An isolated PostgreSQL test fixture utilizing a unique dedicated schema per test.
+///
+/// Dropping this fixture without calling [`PostgresSchemaFixture::close`] executes
+/// `DROP SCHEMA IF EXISTS ... CASCADE` synchronously (5s timeout): via `block_in_place` on
+/// multi-thread Tokio runtimes, or via a fresh 1-connection `PostgresBackend` on an isolated
+/// helper thread on `current_thread` runtimes. Any [`TestTransactionFixture`] created from this
+/// fixture on a `current_thread` runtime still requires explicit `.rollback().await` or
+/// `#[tokio::test(flavor = "multi_thread")]` for synchronous transaction-drop barriers.
 #[cfg(feature = "postgres")]
 pub struct PostgresSchemaFixture {
     schema_name: String,
@@ -283,13 +335,53 @@ impl Drop for PostgresSchemaFixture {
             && let Some(admin) = self.admin_pool.take()
         {
             let schema = self.schema_name.clone();
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = admin
-                        .backend()
-                        .execute(&format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE"))
-                        .await;
-                });
+            let drop_sql = format!("DROP SCHEMA IF EXISTS \"{schema}\" CASCADE");
+            let timeout = std::time::Duration::from_secs(5);
+            match tokio::runtime::Handle::try_current() {
+                Ok(handle)
+                    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread =>
+                {
+                    // Why: Multi-thread Tokio lets `block_in_place` block this thread while other
+                    // worker threads keep driving `admin`'s existing socket reactor.
+                    tokio::task::block_in_place(|| {
+                        let _ = handle.block_on(tokio::time::timeout(
+                            timeout,
+                            admin.backend().execute(&drop_sql),
+                        ));
+                    });
+                }
+                _ => {
+                    // Why: On `current_thread` runtimes (all `containers/postgres.rs` tests) or
+                    // outside Tokio, `.join()`ing over `admin_pool`'s outer-reactor sockets would
+                    // halt `epoll_wait` and deadlock, while `handle.spawn` leaves orphan schemas.
+                    // Clone `DatabaseConfig` (1 conn, 0 min) into a fresh `PostgresBackend` on an
+                    // isolated helper thread's runtime so schema cleanup runs synchronously without
+                    // sharing sockets across reactors.
+                    let mut drop_cfg = admin.config().clone();
+                    drop_cfg.max_connections = 1;
+                    drop_cfg.min_connections = 0;
+                    drop(admin);
+                    let _ = std::thread::spawn(move || {
+                        if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            rt.block_on(async move {
+                                let _ = tokio::time::timeout(timeout, async {
+                                    if let Ok(backend) =
+                                        rume_data::persistence::PostgresBackend::connect(&drop_cfg)
+                                            .await
+                                    {
+                                        let _ = backend.execute(&drop_sql).await;
+                                        backend.close().await;
+                                    }
+                                })
+                                .await;
+                            });
+                        }
+                    })
+                    .join();
+                }
             }
         }
     }
@@ -351,8 +443,6 @@ mod tests {
                 .expect("insert in tx");
             // drop tx
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         let count: Option<String> = fixture
             .pool()
@@ -474,5 +564,39 @@ mod tests {
         for h in handles {
             h.await.expect("task completes successfully");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_transaction_fixture_multi_thread_sync_rollback() {
+        let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+        fixture
+            .pool()
+            .backend()
+            .execute("CREATE TABLE mt_items (val INT)")
+            .await
+            .expect("create table");
+
+        {
+            let tx = fixture.begin_test_tx().await.expect("begin tx");
+            tx.execute("INSERT INTO mt_items VALUES (777)")
+                .await
+                .expect("insert in tx");
+            // Drop without commit on multi_thread runtime: `block_in_place` must synchronously
+            // complete rollback before returning from drop(tx).
+        }
+
+        let count: Option<String> = fixture
+            .pool()
+            .backend()
+            .query_scalar("SELECT COUNT(*) FROM mt_items")
+            .await
+            .expect("count");
+        assert_eq!(
+            count.as_deref(),
+            Some("0"),
+            "uncommitted transaction must roll back synchronously on multi_thread drop"
+        );
+
+        fixture.close().await.expect("fixture close");
     }
 }

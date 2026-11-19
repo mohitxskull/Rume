@@ -698,3 +698,104 @@ impl SamlParser {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod saml_parser_and_iso8601_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_unverified_never_panics_on_arbitrary_utf8(xml in "\\PC*") {
+            let _ = SamlParser::parse_unverified(&xml);
+            let _ = SamlParser::parse_entity_id(&xml);
+        }
+
+        #[test]
+        fn parse_iso8601_strict_never_panics_on_arbitrary_or_multibyte_offsets(
+            s in "\\PC*",
+            suffix in "\\PC*",
+        ) {
+            let _ = parse_iso8601_strict(&s);
+            let combined = format!("2026-11-19T12:00:00{suffix}");
+            let _ = parse_iso8601_strict(&combined);
+        }
+
+        #[test]
+        fn parse_iso8601_strict_converts_valid_rfc3339_instants_and_rejects_pre_epoch(
+            year in 1970i32..=2099,
+            month in 1u32..=12,
+            day in 1u32..=28,
+            hour in 0u32..=23,
+            minute in 0u32..=59,
+            second in 0u32..=59,
+            use_z in any::<bool>(),
+            positive_offset in any::<bool>(),
+            off_h in 0u32..=23,
+            off_m in 0u32..=59,
+        ) {
+            let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(hour, minute, second)
+                .unwrap();
+
+            let (tz_suffix, offset_secs) = if use_z {
+                ("Z".to_string(), 0i64)
+            } else {
+                let sign = if positive_offset { '+' } else { '-' };
+                let secs = (off_h as i64) * 3600 + (off_m as i64) * 60;
+                let signed = if positive_offset { secs } else { -secs };
+                (format!("{sign}{off_h:02}:{off_m:02}"), signed)
+            };
+
+            let ts = format!(
+                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{tz_suffix}"
+            );
+            let expected_utc = naive.and_utc().timestamp() - offset_secs;
+
+            match expected_utc {
+                secs if secs >= 0 => {
+                    let parsed = parse_iso8601_strict(&ts)
+                        .expect("valid post-epoch RFC 3339 timestamp must succeed");
+                    prop_assert_eq!(parsed, secs as u64);
+                }
+                _ => {
+                    let err = parse_iso8601_strict(&ts)
+                        .expect_err("pre-1970 UTC instant must fail closed");
+                    prop_assert!(matches!(err, SamlError::Malformed(_)));
+                }
+            }
+        }
+
+        #[test]
+        fn parse_iso8601_strict_rejects_out_of_range_offsets_space_separator_and_pre_1970(
+            bad_hour in 24u32..=99,
+            bad_min in 60u32..=99,
+            pre_year in 1900i32..=1969,
+            sign in prop::sample::select(vec!['+', '-']),
+        ) {
+            let bad_offset_h = format!("2026-11-19T12:00:00{sign}{bad_hour:02}:00");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&bad_offset_h),
+                Err(SamlError::Malformed(_))
+            ));
+
+            let bad_offset_m = format!("2026-11-19T12:00:00{sign}00:{bad_min:02}");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&bad_offset_m),
+                Err(SamlError::Malformed(_))
+            ));
+
+            prop_assert!(matches!(
+                parse_iso8601_strict("2026-11-19 12:00:00Z"),
+                Err(SamlError::Malformed(_))
+            ));
+
+            let pre_epoch = format!("{pre_year:04}-06-15T12:00:00Z");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&pre_epoch),
+                Err(SamlError::Malformed(_))
+            ));
+        }
+    }
+}

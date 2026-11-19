@@ -34,3 +34,17 @@ Wave 2 verified clean with `cargo fmt --all --check && cargo clippy --workspace 
 Task 8 (`RC-08`, Worker C): complete — `ObservabilityLayer` extracts incoming `traceparent` without ambient `OtelContext::current()` leaks and emits server child `TraceContext`, `EventBus::publish_sync` creates `event.publish_sync` span + `Why:` notes in `bus.rs`/`coordinator.rs`, `MetricsRegistry` migrated from `PeriodicReader` + `InMemoryMetricExporter` to `ManualReader` (`experimental_metrics_custom_reader`), and unused `Counter`/`Gauge` deleted.
 Task 9 (`RC-05`, Worker B): complete — eliminated all 22 cross-crate `include_str!("../../../data/...")` paths, externalized `PostgresJobQueue::defer` to `jobs_defer.sql`, moved `rume-crash-harness` + `crash_*.sql` into `publish = false` `crates/crash-harness`, demoted `tokio`/`sqlx`/`uuid` to `[dev-dependencies]` in `crates/core/Cargo.toml`, and verified all 12 publishable crates with `cargo package --list --allow-dirty` + 4/4 live Docker `crash_recovery` tests.
 Wave 3a verified clean with `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -j 2 -- -D warnings`.
+
+## Wave 3b
+Task 10 (`RC-10`, `RC-11`, Worker A): complete — deterministic reactor-safe `Drop` in `crates/testing/src/fixtures.rs` (`block_in_place` on `MultiThread`, fresh 1-conn pool on joined helper thread for `PostgresSchemaFixture`, joined helper thread for SQLite `TestTransactionFixture`, removed `tokio::time::sleep(50ms)` + added live Docker `current_thread` and `multi_thread` regression tests), added `proptest` suites for `env/interpolation.rs`, `persistence/{backend,sqlite}.rs`, and `enterprise/saml.rs`, added `NewProjectDialect` `--dialect` support to `rume new` with dialect-aware templates + `rume sql:check` integration tests, and verified `#![forbid(unsafe_code)]` across all workspace crates.
+
+## Whole-Workspace Verification (All Gates Passed)
+- Static checks: 0 cross-crate `include_str!("../../../data/...")`, 0 `safe_equal_hashed`/`escape_lua_pattern`/`InMemoryMetricExporter`, 0 `tokio::time::sleep` in `crates/testing/src/fixtures.rs`.
+- `cargo fmt --all --check`: exit 0.
+- `cargo clippy --workspace --all-targets --all-features -j 2 -- -D warnings`: exit 0 (0 warnings).
+- Feature matrix `cargo check -p rume --no-default-features --features <sqlite|postgres|mysql|redis>,testing -j 2`: exit 0 (all 4).
+- `cargo test --workspace --lib --all-features -j 2`: exit 0.
+- `cargo test -p rume --test integration --all-features -j 2`: exit 0.
+- `cargo test -p rume-cli -j 2`: exit 0.
+- `cargo test --workspace --doc --all-features -j 2`: exit 0.
+- `cargo package -p <pkg> --list --allow-dirty` across all 12 publishable crates: exit 0 (12/12).

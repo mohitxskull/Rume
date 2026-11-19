@@ -205,3 +205,87 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod interpolate_value_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn interpolate_value_never_panics_on_arbitrary_utf8(
+            input in "\\PC*",
+            vars in prop::collection::btree_map("[a-zA-Z0-9_]{1,12}", "\\PC{0,32}", 0..8),
+        ) {
+            let _ = interpolate_value(&input, &vars);
+        }
+
+        #[test]
+        fn interpolate_value_escaped_dollar_brace_roundtrips_regardless_of_vars(
+            var in "[a-zA-Z0-9_]{1,16}",
+            secret in "[a-zA-Z0-9_!@#]{4,24}",
+            prefix in "[a-zA-Z0-9_ ]{0,16}",
+            suffix in "[a-zA-Z0-9_ ]{0,16}",
+        ) {
+            let vars = BTreeMap::from([(var.clone(), secret)]);
+            let input = format!("{prefix}\\${{{var}}}{suffix}");
+            let expected = format!("{prefix}${{{var}}}{suffix}");
+            let actual = interpolate_value(&input, &vars)
+                .expect("escaped substitution must always succeed");
+            prop_assert_eq!(actual, expected);
+        }
+
+        #[test]
+        fn interpolate_value_acyclic_chains_respect_max_depth_without_leaking_values(
+            depth in 1usize..=MAX_INTERPOLATION_DEPTH,
+            excess in 1usize..=5,
+            leaf in "[a-zA-Z0-9_ ]{8,24}",
+        ) {
+            let mut valid_vars = BTreeMap::new();
+            for i in 0..depth.saturating_sub(1) {
+                valid_vars.insert(format!("K{i}"), format!("${{K{}}}", i + 1));
+            }
+            valid_vars.insert(format!("K{}", depth - 1), leaf.clone());
+            prop_assert_eq!(
+                interpolate_value("${K0}", &valid_vars).expect("within MAX_INTERPOLATION_DEPTH"),
+                leaf.clone()
+            );
+
+            let too_deep = MAX_INTERPOLATION_DEPTH + excess;
+            let mut deep_vars = BTreeMap::new();
+            for i in 0..too_deep {
+                deep_vars.insert(format!("D{i}"), format!("${{D{}}}", i + 1));
+            }
+            deep_vars.insert(format!("D{too_deep}"), leaf.clone());
+            let err = interpolate_value("${D0}", &deep_vars)
+                .expect_err("chain exceeding MAX_INTERPOLATION_DEPTH must fail");
+            let is_max_depth = matches!(err, EnvError::MaxDepthExceeded { .. });
+            prop_assert!(is_max_depth, "expected MaxDepthExceeded, got: {err:?}");
+            prop_assert!(
+                !err.to_string().contains(&leaf),
+                "MaxDepthExceeded error leaked variable value"
+            );
+        }
+
+        #[test]
+        fn interpolate_value_cycles_fail_closed_without_leaking_values(
+            cycle_len in 1usize..=5,
+            secret in "[a-zA-Z0-9_]{8,24}",
+        ) {
+            let mut vars = BTreeMap::new();
+            for i in 0..cycle_len.saturating_sub(1) {
+                vars.insert(format!("C{i}"), format!("${{C{}}}", i + 1));
+            }
+            vars.insert(format!("C{}", cycle_len - 1), format!("{secret}${{C0}}"));
+
+            let err = interpolate_value("${C0}", &vars)
+                .expect_err("cyclic chain must fail closed");
+            let is_circular = matches!(err, EnvError::CircularReference { .. });
+            prop_assert!(is_circular, "expected CircularReference, got: {err:?}");
+            prop_assert!(
+                !err.to_string().contains(&secret),
+                "CircularReference error leaked variable value"
+            );
+        }
+    }
+}

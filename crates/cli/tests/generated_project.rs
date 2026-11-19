@@ -425,3 +425,139 @@ fn make_migration_and_db_commands_workflow() {
     let rollback_out = String::from_utf8_lossy(&rollback_res.stdout);
     assert!(rollback_out.contains("Rolled back"));
 }
+
+#[test]
+fn new_project_passes_rume_sql_check_across_dialects() {
+    let tmp_dir = TempDir::new().expect("failed to create temp directory");
+
+    // 0. Invalid --dialect must fail closed at CLI argument parsing.
+    let invalid_out = Command::new(rume_binary())
+        .args(["new", "bad-dialect-app", "--dialect", "oracle"])
+        .current_dir(tmp_dir.path())
+        .output()
+        .expect("execute rume new with invalid dialect");
+    assert!(
+        !invalid_out.status.success(),
+        "invalid --dialect must fail closed"
+    );
+
+    // 1. Default scaffold uses SQLite-compatible `?` placeholders.
+    let sqlite_name = "sqlite-sql-check-app";
+    let sqlite_dir = tmp_dir.path().join(sqlite_name);
+    let sqlite_new = Command::new(rume_binary())
+        .arg("new")
+        .arg(sqlite_name)
+        .arg("--path")
+        .arg(framework_path())
+        .current_dir(tmp_dir.path())
+        .output()
+        .expect("scaffold default sqlite project");
+    assert!(
+        sqlite_new.status.success(),
+        "default `rume new` failed: {}",
+        String::from_utf8_lossy(&sqlite_new.stderr)
+    );
+
+    let default_sql_check = Command::new(rume_binary())
+        .arg("sql:check")
+        .current_dir(&sqlite_dir)
+        .output()
+        .expect("run rume sql:check on default project");
+    assert!(
+        default_sql_check.status.success(),
+        "`rume sql:check` failed on default project:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&default_sql_check.stdout),
+        String::from_utf8_lossy(&default_sql_check.stderr)
+    );
+
+    let sqlite_sql_check = Command::new(rume_binary())
+        .args(["sql:check", "--dialect", "sqlite"])
+        .current_dir(&sqlite_dir)
+        .output()
+        .expect("run rume sql:check --dialect sqlite");
+    assert!(
+        sqlite_sql_check.status.success(),
+        "`rume sql:check --dialect sqlite` failed on default project:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&sqlite_sql_check.stdout),
+        String::from_utf8_lossy(&sqlite_sql_check.stderr)
+    );
+
+    let sqlite_test_ok = run_command(Command::new("cargo").arg("test").current_dir(&sqlite_dir));
+    assert!(sqlite_test_ok, "`cargo test` must pass on default project");
+
+    // 2. `--dialect postgres` scaffold uses `$1, $2, $3` placeholders and passes both sql:check and smoke tests.
+    let pg_name = "postgres-sql-check-app";
+    let pg_dir = tmp_dir.path().join(pg_name);
+    let pg_new = Command::new(rume_binary())
+        .arg("new")
+        .arg(pg_name)
+        .arg("--path")
+        .arg(framework_path())
+        .args(["--dialect", "postgres"])
+        .current_dir(tmp_dir.path())
+        .output()
+        .expect("scaffold postgres project");
+    assert!(
+        pg_new.status.success(),
+        "`rume new --dialect postgres` failed: {}",
+        String::from_utf8_lossy(&pg_new.stderr)
+    );
+
+    let pg_sql_check = Command::new(rume_binary())
+        .args(["sql:check", "--dialect", "postgres"])
+        .current_dir(&pg_dir)
+        .output()
+        .expect("run rume sql:check --dialect postgres");
+    assert!(
+        pg_sql_check.status.success(),
+        "`rume sql:check --dialect postgres` failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&pg_sql_check.stdout),
+        String::from_utf8_lossy(&pg_sql_check.stderr)
+    );
+
+    let pg_rejected_as_sqlite = Command::new(rume_binary())
+        .args(["sql:check", "--dialect", "sqlite"])
+        .current_dir(&pg_dir)
+        .output()
+        .expect("run rume sql:check --dialect sqlite on postgres project");
+    assert!(
+        !pg_rejected_as_sqlite.status.success(),
+        "postgres `$N` templates must be rejected when checked with `--dialect sqlite`"
+    );
+
+    let pg_test_ok = run_command(Command::new("cargo").arg("test").current_dir(&pg_dir));
+    assert!(
+        pg_test_ok,
+        "`cargo test` must pass on `--dialect postgres` project"
+    );
+
+    // 3. `--dialect mysql` scaffold uses `?` placeholders and passes `rume sql:check --dialect mysql`.
+    let mysql_name = "mysql-sql-check-app";
+    let mysql_dir = tmp_dir.path().join(mysql_name);
+    let mysql_new = Command::new(rume_binary())
+        .arg("new")
+        .arg(mysql_name)
+        .arg("--path")
+        .arg(framework_path())
+        .args(["--dialect", "mysql"])
+        .current_dir(tmp_dir.path())
+        .output()
+        .expect("scaffold mysql project");
+    assert!(
+        mysql_new.status.success(),
+        "`rume new --dialect mysql` failed: {}",
+        String::from_utf8_lossy(&mysql_new.stderr)
+    );
+
+    let mysql_sql_check = Command::new(rume_binary())
+        .args(["sql:check", "--dialect", "mysql"])
+        .current_dir(&mysql_dir)
+        .output()
+        .expect("run rume sql:check --dialect mysql");
+    assert!(
+        mysql_sql_check.status.success(),
+        "`rume sql:check --dialect mysql` failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&mysql_sql_check.stdout),
+        String::from_utf8_lossy(&mysql_sql_check.stderr)
+    );
+}

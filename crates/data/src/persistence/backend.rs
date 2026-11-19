@@ -589,3 +589,94 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+mod data_sql_scanners_proptests {
+    use super::*;
+    use proptest::prelude::*;
+    use sqlparser::dialect::{MySqlDialect, PostgreSqlDialect, SQLiteDialect};
+
+    proptest! {
+        #[test]
+        fn validate_managed_transaction_sql_never_panics_on_arbitrary_utf8(s in "\\PC*") {
+            let _ = validate_managed_transaction_sql(&s, &PostgreSqlDialect {});
+            let _ = validate_managed_transaction_sql(&s, &MySqlDialect {});
+            let _ = validate_managed_transaction_sql(&s, &SQLiteDialect {});
+        }
+
+        #[test]
+        fn validate_managed_transaction_sql_always_rejects_unquoted_tx_control(
+            prefix in prop::sample::select(vec![
+                "",
+                "SELECT 1; ",
+                "INSERT INTO t VALUES (1); /* ok */ ",
+                "-- comment\n",
+            ]),
+            kw in prop::sample::select(vec![
+                "COMMIT",
+                "commit",
+                "CoMmIt",
+                "ROLLBACK",
+                "rollback",
+                "BEGIN",
+                "begin",
+                "START TRANSACTION",
+                "start transaction",
+                "END",
+                "ABORT",
+                "PREPARE TRANSACTION 'tx1'",
+            ]),
+            suffix in prop::sample::select(vec!["", ";", "; SELECT 2;"]),
+        ) {
+            let sql = format!("{prefix}{kw}{suffix}");
+            let pg = PostgreSqlDialect {};
+            let mysql = MySqlDialect {};
+            let sqlite = SQLiteDialect {};
+            for (name, dialect) in [
+                ("postgres", &pg as &dyn sqlparser::dialect::Dialect),
+                ("mysql", &mysql),
+                ("sqlite", &sqlite),
+            ] {
+                let err = validate_managed_transaction_sql(&sql, dialect)
+                    .expect_err(&format!("{name} must reject '{sql}'"));
+                prop_assert!(matches!(err, PersistenceError::TransactionError(_)));
+            }
+        }
+
+        #[test]
+        fn validate_managed_transaction_sql_permits_keywords_in_literals_comments_and_delimited_ids(
+            pad in "[a-zA-Z0-9_ ;]{0,12}",
+            kw in prop::sample::select(vec!["COMMIT", "ROLLBACK", "BEGIN", "START TRANSACTION"]),
+        ) {
+            let pg = PostgreSqlDialect {};
+            let mysql = MySqlDialect {};
+            let sqlite = SQLiteDialect {};
+
+            let single_quoted = format!("SELECT '{pad} {kw} {pad}';");
+            let line_commented = format!("-- {pad} {kw}\nSELECT 1;");
+            let block_commented = format!("/* {pad} {kw} */ SELECT 1;");
+            for dialect in [
+                &pg as &dyn sqlparser::dialect::Dialect,
+                &mysql,
+                &sqlite,
+            ] {
+                prop_assert!(validate_managed_transaction_sql(&single_quoted, dialect).is_ok());
+                prop_assert!(validate_managed_transaction_sql(&line_commented, dialect).is_ok());
+                prop_assert!(validate_managed_transaction_sql(&block_commented, dialect).is_ok());
+            }
+
+            let mysql_hash = format!("# {pad} {kw}\nSELECT 1;");
+            let mysql_backtick = format!("SELECT `{kw}` FROM t;");
+            prop_assert!(validate_managed_transaction_sql(&mysql_hash, &mysql).is_ok());
+            prop_assert!(validate_managed_transaction_sql(&mysql_backtick, &mysql).is_ok());
+
+            let sqlite_bracket = format!("SELECT [{kw}] FROM t;");
+            prop_assert!(validate_managed_transaction_sql(&sqlite_bracket, &sqlite).is_ok());
+
+            let pg_dollar = format!("DO $$ {pad} {kw} {pad} $$;");
+            let pg_double_quote = format!("SELECT \"{kw}\" FROM t;");
+            prop_assert!(validate_managed_transaction_sql(&pg_dollar, &pg).is_ok());
+            prop_assert!(validate_managed_transaction_sql(&pg_double_quote, &pg).is_ok());
+        }
+    }
+}

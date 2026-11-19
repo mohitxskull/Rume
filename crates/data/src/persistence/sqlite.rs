@@ -706,3 +706,57 @@ mod tests {
         tx.rollback().await.expect("rollback tx");
     }
 }
+
+#[cfg(test)]
+mod data_sql_scanners_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn reject_unbound_sqlite_placeholders_never_panics_on_arbitrary_utf8(s in "\\PC*") {
+            let _ = reject_unbound_sqlite_placeholders(&s);
+        }
+
+        #[test]
+        fn reject_unbound_sqlite_placeholders_always_rejects_unbound_markers(
+            ident in "[a-zA-Z_][a-zA-Z0-9_]{0,14}",
+            digits in "[0-9]{1,4}",
+        ) {
+            for ph in [
+                "?".to_string(),
+                format!("?{digits}"),
+                format!(":{ident}"),
+                format!("@{ident}"),
+                format!("@{digits}"),
+                format!("${ident}"),
+            ] {
+                let sql = format!("SELECT * FROM t WHERE a = {ph}");
+                let err = reject_unbound_sqlite_placeholders(&sql)
+                    .expect_err(&format!("expected QueryFailed for '{sql}'"));
+                prop_assert!(matches!(err, PersistenceError::QueryFailed(_)));
+            }
+        }
+
+        #[test]
+        fn reject_unbound_sqlite_placeholders_permits_markers_in_quotes_comments_and_ids(
+            ident in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+            pad in "[a-zA-Z0-9_ ]{0,8}",
+        ) {
+            let markers = format!("? ?1 :{ident} @{ident} ${ident}");
+            for sql in [
+                format!("SELECT '{pad} {markers} {pad}';"),
+                format!("-- {pad} {markers}\nSELECT 1;"),
+                format!("/* {pad} {markers} */ SELECT 1;"),
+                format!("SELECT \"{ident}?\" FROM t;"),
+                format!("SELECT `{ident}:{ident}` FROM t;"),
+                format!("SELECT [{ident}@{ident}] FROM t;"),
+            ] {
+                prop_assert!(
+                    reject_unbound_sqlite_placeholders(&sql).is_ok(),
+                    "quoted/commented markers must be permitted: {sql}"
+                );
+            }
+        }
+    }
+}

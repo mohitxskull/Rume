@@ -27,6 +27,7 @@ pub async fn run(cli: Cli) {
             name,
             path,
             version,
+            dialect,
         }) => {
             let name = match name {
                 Some(n) => n,
@@ -36,7 +37,7 @@ pub async fn run(cli: Cli) {
                 eprintln!("error: project name is required");
                 std::process::exit(1);
             }
-            new::run(&name, path.as_deref(), version.as_deref());
+            new::run(&name, path.as_deref(), version.as_deref(), dialect);
         }
         Some(Commands::Env { command }) => {
             require_rume_project();
