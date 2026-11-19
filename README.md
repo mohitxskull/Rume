@@ -72,6 +72,7 @@ Default features: `sqlite`, `testing`.
 | `crates/crash/` | `rume-crash` — internal crash-recovery test harness (`publish = false`) |
 | `crates/xtask/` | `xtask` — workspace automation tasks |
 | `fuzz/` | `rume-fuzz` — standalone `cargo-fuzz` targets for untrusted-input parsers (`publish = false`) |
+| `benchmarks/load/` | `rume-load-bench` — standalone Goose 80/20 load harness for `workbench/multi-instance` (`publish = false`) |
 | `workbench/simple-api/` | Simple API reference app |
 | `workbench/modular-monolith/` | Modular monolith reference app |
 | `workbench/multi-instance/` | Multi-instance reference app + Docker Compose qualification suite |
@@ -105,6 +106,10 @@ cargo +nightly fuzz run saml_parser -- -max_total_time=30
 ```
 
 CI (`.github/workflows/ci.yml`) runs `rustfmt`, `clippy` (`-D warnings`), `doc & doctests`, `cargo audit`, MSRV (`1.96`), all-features and feature-isolated backend test matrices (`sqlite`, `postgres`, `mysql`, `redis`), `rume-cli`, `rume-macros`, all three `workbench` apps, and a Docker Compose multi-instance qualification suite. CodeQL runs via `.github/workflows/codeql.yml`.
+
+## Benchmarks & load testing
+
+See [BENCHMARKS.md](BENCHMARKS.md) for measured Criterion hot-path numbers (`raw_axum_router` vs. `ObservabilityLayer`, `CircuitBreaker`, `RateLimiter`, `TenantScopedCache`, 64-task singleflight contention), the `workbench` multi-instance system baseline, and the Goose 80/20 load-testing harness.
 
 ## License
 
