@@ -6,7 +6,7 @@ use std::time::Duration;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-use crate::tenant::quota::TenantQuotaStore;
+use crate::tenant::quota::{KeyReservation, TenantQuotaStore};
 use rume_data::cache::backend::CacheBackend;
 use rume_data::cache::error::CacheError;
 use rume_data::cache::typed::Cache;
@@ -99,24 +99,32 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
-        let key_already_existed = self.cache.exists(&full_key).await.unwrap_or(false);
         // Why: `Cache::set_json_with_tags` substitutes `Cache::default_ttl()` when `ttl` is
-        // `None`. Passing raw `ttl` to `quota.record_key` would record an unbounded (`+inf`)
-        // quota entry while the cache entry expires after `default_ttl()`, permanently leaking
-        // tenant quota slots. Resolving once up front guarantees quota and cache share one TTL.
+        // `None`. Passing raw `ttl` to `quota.reserve_key` / `record_key` would record an
+        // unbounded (`+inf`) quota entry while the cache entry expires after `default_ttl()`,
+        // permanently leaking tenant quota slots. Resolving once up front guarantees quota
+        // and cache share one TTL.
         let effective_ttl = self.cache.resolve_ttl(ttl);
 
-        if let Some(ref quota) = self.quota_store {
-            let acquired = quota
-                .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
+        // Why: `reserve_key` inserts a new slot only when the key is not already tracked
+        // and leaves an existing key's expiration untouched. That way (1) a failed overwrite
+        // never shortens an existing reservation's TTL, and (2) rollback only removes a slot
+        // owned by this call (`NewlyReserved`), never evicting a pre-existing reservation even
+        // when `exists()` also fails during a backend outage.
+        let reservation = if let Some(ref quota) = self.quota_store {
+            let outcome = quota
+                .reserve_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
                 .await?;
-            if !acquired {
+            if outcome == KeyReservation::QuotaExceeded {
                 return Err(CacheError::QuotaExceeded(format!(
                     "tenant '{tenant_id}' exceeded quota of {} keys",
                     self.max_keys_per_tenant
                 )));
             }
-        }
+            Some(outcome)
+        } else {
+            None
+        };
 
         let tenant_tag = Self::tenant_tag(tenant_id);
         let mut all_tags = vec![tenant_tag];
@@ -130,13 +138,15 @@ impl<B: CacheBackend> TenantScopedCache<B> {
             .set_json_with_tags(&full_key, value, &tag_refs, effective_ttl)
             .await;
 
-        // Why: Roll back the newly acquired quota slot whenever the write failed and
-        // `self.cache.exists(&full_key)` does not confirm `Ok(true)`. Checking `matches!(..., Ok(false))`
-        // skipped rollback on `CacheError::Closed` and `CacheError::Backend` because `exists`
-        // also returns `Err(...)` there, leaving the slot permanently leaked even though the write
-        // did not succeed. Best-effort cleanup errs on the side of freeing an unconfirmed slot.
-        if res.is_err()
-            && !key_already_existed
+        if res.is_ok()
+            && reservation == Some(KeyReservation::AlreadyTracked)
+            && let Some(ref quota) = self.quota_store
+        {
+            let _ = quota
+                .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
+                .await;
+        } else if res.is_err()
+            && reservation == Some(KeyReservation::NewlyReserved)
             && let Some(ref quota) = self.quota_store
             && !matches!(self.cache.exists(&full_key).await, Ok(true))
         {
@@ -474,6 +484,72 @@ mod tests {
                 .expect("count"),
             1,
             "existing key quota slot must not be removed when overwrite fails"
+        );
+
+        // 4. Existing reservation must be preserved even when BOTH write and exists() fail (#29).
+        fail_exists.store(true, std::sync::atomic::Ordering::SeqCst);
+        let both_fail_err = existing_tenant_cache
+            .set("t1", "existing-key", &"v3", None)
+            .await
+            .expect_err("failed overwrite with failing exists must return Backend error");
+        assert!(matches!(both_fail_err, CacheError::Backend(_)));
+        assert_eq!(
+            existing_tenant_cache
+                .active_key_count("t1")
+                .await
+                .expect("count"),
+            1,
+            "existing key quota slot must survive when both write and exists() fail"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tenant_cache_failed_overwrite_preserves_previous_quota_expiration() {
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let config = rume_data::cache::config::CacheConfig::default().with_default_ttl(42);
+        let cache = Cache::new(
+            FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists)),
+            config,
+        );
+        let quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let tenant_cache = TenantScopedCache::new(cache)
+            .with_max_keys_per_tenant(1)
+            .with_quota_store(Arc::clone(&quota) as _);
+
+        // Write with a 1-hour TTL.
+        tenant_cache
+            .set("t1", "k1", &"v1", Some(Duration::from_secs(3600)))
+            .await
+            .expect("initial 1h write succeeds");
+
+        // Fail an overwrite with `ttl = None` (which resolves to 42s default).
+        fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = tenant_cache
+            .set("t1", "k1", &"v2", None)
+            .await
+            .expect_err("failed overwrite must return Backend error");
+        assert!(matches!(err, CacheError::Backend(_)));
+
+        // Advance past the 42s default TTL; the original 1h reservation must still be active.
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(
+            tenant_cache.active_key_count("t1").await.expect("count"),
+            1,
+            "failed overwrite with shorter TTL must not shorten the existing reservation"
+        );
+
+        // Once writes recover, a successful overwrite with `ttl = None` refreshes to 42s.
+        fail_writes.store(false, std::sync::atomic::Ordering::SeqCst);
+        tenant_cache
+            .set("t1", "k1", &"v3", None)
+            .await
+            .expect("successful overwrite refreshes TTL");
+        tokio::time::advance(Duration::from_secs(43)).await;
+        assert_eq!(
+            tenant_cache.active_key_count("t1").await.expect("count"),
+            0,
+            "successful overwrite must refresh the reservation to the new 42s TTL"
         );
     }
 }

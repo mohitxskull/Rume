@@ -599,11 +599,22 @@ async fn test_mysql_transaction_raw_no_param_and_error_classification() {
 
     let (_node, backend, _config) = start_mysql_node().await;
 
-    // 1. Raw no-param `execute` and `execute_params(..., &[])` on a transaction.
-    let tx = backend.begin_transaction().await.expect("begin tx");
-    tx.execute("CREATE TABLE mysql_raw_a (id INT PRIMARY KEY)")
+    // 1. Implicit-commit DDL must be rejected inside a managed MySQL transaction (#20),
+    // while non-transactional DDL on the backend and raw no-param DML inside the transaction succeed.
+    backend
+        .execute("CREATE TABLE mysql_raw_a (id INT PRIMARY KEY)")
         .await
-        .expect("tx.execute raw DDL must succeed");
+        .expect("backend.execute raw DDL must succeed");
+
+    let tx = backend.begin_transaction().await.expect("begin tx");
+    let ddl_err = tx
+        .execute("CREATE TABLE mysql_raw_forbidden (id INT PRIMARY KEY)")
+        .await
+        .expect_err("implicit-commit DDL inside MysqlTransaction must fail closed");
+    assert!(
+        matches!(ddl_err, PersistenceError::TransactionError(_)),
+        "expected TransactionError for implicit-commit DDL, got {ddl_err:?}"
+    );
     tx.execute_params("INSERT INTO mysql_raw_a (id) VALUES (1)", &[])
         .await
         .expect("tx.execute_params with empty params must succeed");
@@ -614,7 +625,7 @@ async fn test_mysql_transaction_raw_no_param_and_error_classification() {
         .expect("query mysql_raw_a")
         .expect("count present");
     assert_eq!(count_a, "1");
-    tx.commit().await.expect("commit raw DDL tx");
+    tx.commit().await.expect("commit raw DML tx");
 
     // 2. Killing the transaction's MySQL connection causes subsequent transaction calls to hit
     // an IO/EOF error, which must classify via `map_sqlx_error` as `ConnectionFailed` (not `QueryFailed`).

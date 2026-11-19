@@ -298,6 +298,10 @@ impl DatabaseBackend for MysqlBackend {
     fn dialect(&self) -> &'static str {
         "mysql"
     }
+
+    fn mysql_migration_pool(&self) -> Option<&sqlx::MySqlPool> {
+        Some(&self.pool)
+    }
 }
 
 /// Active transaction handle for MySQL.
@@ -369,13 +373,12 @@ impl DatabaseTransaction for MysqlTransaction {
             // Why: Match `MysqlBackend::execute_params` by routing empty-param
             // calls through `sqlx::raw_sql` for unprepared SQL and mapping all
             // sqlx errors via `map_sqlx_error` to preserve error classification.
-            // Validate managed transaction SQL first (matching `PostgresTransaction`)
-            // so raw batches cannot commit or roll back the caller's managed transaction.
+            // Validate managed MySQL transaction SQL first so neither explicit
+            // transaction-control commands nor MySQL implicit-commit DDL (such as
+            // `CREATE TABLE` / `ALTER TABLE`) can silently commit pending InnoDB
+            // updates out-of-band.
             let res = if params_vec.is_empty() {
-                crate::persistence::backend::validate_managed_transaction_sql(
-                    &statement,
-                    &sqlparser::dialect::MySqlDialect {},
-                )?;
+                crate::persistence::backend::validate_managed_mysql_transaction_sql(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await

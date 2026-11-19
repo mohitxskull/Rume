@@ -1,0 +1,18 @@
+[package]
+name = "rume-crash"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Subprocess crash and recovery test harness for Rume."
+
+[[bin]]
+name = "rume-crash"
+path = "src/main.rs"
+
+[dependencies]
+rume = { path = "../core", features = ["postgres", "redis"] }
+tokio.workspace = true
+sqlx = { workspace = true, features = ["postgres"] }
+uuid = { version = "=1.29.2", features = ["v4"] }

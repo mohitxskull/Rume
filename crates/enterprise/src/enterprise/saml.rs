@@ -43,6 +43,7 @@ fn is_ns(res: &ResolveResult<'_>, expected: &str) -> bool {
 enum XmlNs {
     Assertion,
     Protocol,
+    Dsig,
     Other,
 }
 
@@ -53,55 +54,34 @@ struct AssertionFields {
     attributes: BTreeMap<String, Vec<String>>,
 }
 
-fn record_assertion_text_chunk(
-    chunk: &str,
-    element_stack: &[(String, XmlNs)],
-    in_assertion: bool,
-    active_issuer_buf: &mut Option<String>,
-    current_attr_name: Option<&str>,
-    fields: &mut AssertionFields,
-) {
-    let parent = element_stack.last().map(|(name, ns)| (name.as_str(), *ns));
-    if matches!(parent, Some(("Issuer", XmlNs::Assertion)))
-        && let Some(buf) = active_issuer_buf.as_mut()
-    {
-        buf.push_str(chunk);
-        return;
-    }
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextTarget {
+    AssertionIssuer,
+    ResponseIssuer,
+    SubjectNameId,
+    Audience,
+    AttributeValue,
+}
 
-    if !in_assertion {
-        return;
-    }
+struct ActiveTextCapture {
+    target: TextTarget,
+    depth: usize,
+    buf: String,
+}
 
-    let text = chunk.trim();
-    if text.is_empty() {
-        return;
+fn resolve_general_ref(raw_ref: &quick_xml::events::BytesRef<'_>) -> Result<String, SamlError> {
+    if let Some(ch) = raw_ref.resolve_char_ref().map_err(|err| {
+        SamlError::Malformed(format!("invalid numeric XML character reference: {err}"))
+    })? {
+        return Ok(ch.to_string());
     }
-
-    let grand_parent = element_stack
-        .len()
-        .checked_sub(2)
-        .and_then(|idx| element_stack.get(idx))
-        .map(|(name, ns)| (name.as_str(), *ns));
-
-    if let Some((p_name, XmlNs::Assertion)) = parent {
-        if p_name == "NameID"
-            && fields.subject.is_none()
-            && matches!(grand_parent, Some(("Subject", XmlNs::Assertion)))
-        {
-            fields.subject = Some(text.to_string());
-        } else if p_name == "Audience" && fields.audience.is_none() {
-            fields.audience = Some(text.to_string());
-        } else if p_name == "AttributeValue"
-            && let Some(attr_name) = current_attr_name
-        {
-            fields
-                .attributes
-                .entry(attr_name.to_string())
-                .or_default()
-                .push(text.to_string());
-        }
+    let name = raw_ref.as_ref();
+    if let Some(resolved) = quick_xml::escape::resolve_xml_entity(name) {
+        return Ok(resolved.to_string());
     }
+    Err(SamlError::Malformed(format!(
+        "unresolved XML entity reference '&{name};'"
+    )))
 }
 
 /// SAML processing and validation errors.
@@ -307,7 +287,9 @@ impl SamlParser {
         allow_unverified: bool,
     ) -> Result<SamlAssertion, SamlError> {
         let mut reader = NsReader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        // Why: keep internal whitespace intact across text, CDATA, comment, and entity-ref
+        // boundaries; outer whitespace is trimmed once when each captured claim element closes.
+        reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = true;
 
         let mut assertion_count = 0usize;
@@ -317,7 +299,7 @@ impl SamlParser {
 
         let mut assertion_issuer: Option<String> = None;
         let mut response_issuer: Option<String> = None;
-        let mut active_issuer_buf: Option<String> = None;
+        let mut active_capture: Option<ActiveTextCapture> = None;
         let mut fields = AssertionFields::default();
         let mut not_before: Option<u64> = None;
         let mut not_on_or_after: Option<u64> = None;
@@ -350,9 +332,13 @@ impl SamlParser {
                         XmlNs::Assertion
                     } else if is_protocol_ns {
                         XmlNs::Protocol
+                    } else if is_dsig_ns {
+                        XmlNs::Dsig
                     } else {
                         XmlNs::Other
                     };
+                    let new_depth = element_stack.len() + 1;
+                    let parent = element_stack.last().map(|(n, pns)| (n.as_str(), *pns));
 
                     if local_name == "Assertion" {
                         if !is_saml_ns {
@@ -386,25 +372,50 @@ impl SamlParser {
                             }
                         }
                     } else if local_name == "Reference" && is_dsig_ns {
-                        for attr in e.attributes().flatten() {
-                            let local_k = attr.key.local_name();
-                            if local_k.as_ref() == "URI" {
-                                let uri = attr.value.as_ref();
-                                let ref_id = uri.strip_prefix('#').unwrap_or(uri);
-                                signature_references.push(ref_id.to_string());
+                        // Why: only `<ds:Reference>` elements directly under
+                        // `<ds:Signature>/<ds:SignedInfo>` belong to a signature's signed
+                        // info block; stray `<ds:Reference>` nodes elsewhere in the document
+                        // must not satisfy the signed-mode structural gate.
+                        let in_signed_info = element_stack.len() >= 2
+                            && matches!(
+                                (
+                                    element_stack[element_stack.len() - 2].0.as_str(),
+                                    element_stack[element_stack.len() - 2].1,
+                                    element_stack[element_stack.len() - 1].0.as_str(),
+                                    element_stack[element_stack.len() - 1].1,
+                                ),
+                                ("Signature", XmlNs::Dsig, "SignedInfo", XmlNs::Dsig)
+                            );
+                        if in_signed_info {
+                            for attr in e.attributes().flatten() {
+                                let local_k = attr.key.local_name();
+                                if local_k.as_ref() == "URI" {
+                                    let uri = attr.value.as_ref();
+                                    let ref_id = uri.strip_prefix('#').unwrap_or(uri);
+                                    signature_references.push(ref_id.to_string());
+                                }
                             }
                         }
-                    } else if local_name == "Issuer" && is_saml_ns {
+                    } else if local_name == "Issuer" && is_saml_ns && active_capture.is_none() {
                         // Why: anchor `<Issuer>` text accumulation to direct children of
-                        // `<Assertion>` or `<Response>` so nested elements like `<Advice><Issuer>`
-                        // cannot spoof the assertion issuer and XML comments cannot split/drop text.
-                        if matches!(
-                            element_stack
-                                .last()
-                                .map(|(name, parent_ns)| (name.as_str(), *parent_ns)),
-                            Some(("Assertion", XmlNs::Assertion) | ("Response", XmlNs::Protocol))
-                        ) {
-                            active_issuer_buf = Some(String::new());
+                        // `<Assertion>` or `<Response>` and bind the capture to its opening
+                        // stack depth so nested markup or comments cannot corrupt or drop it.
+                        match parent {
+                            Some(("Assertion", XmlNs::Assertion)) => {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::AssertionIssuer,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                });
+                            }
+                            Some(("Response", XmlNs::Protocol)) => {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::ResponseIssuer,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                });
+                            }
+                            _ => {}
                         }
                     } else if in_assertion && is_saml_ns {
                         if local_name == "Conditions" {
@@ -425,6 +436,30 @@ impl SamlParser {
                                     current_attr_name = Some(attr.value.as_ref().to_string());
                                 }
                             }
+                        } else if active_capture.is_none() {
+                            if local_name == "NameID"
+                                && fields.subject.is_none()
+                                && matches!(parent, Some(("Subject", XmlNs::Assertion)))
+                            {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::SubjectNameId,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                });
+                            } else if local_name == "Audience" && fields.audience.is_none() {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::Audience,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                });
+                            } else if local_name == "AttributeValue" && current_attr_name.is_some()
+                            {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::AttributeValue,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                });
+                            }
                         }
                     }
 
@@ -433,37 +468,54 @@ impl SamlParser {
                 Ok((res, Event::End(ref e))) => {
                     let local = e.local_name();
                     let local_name = local.as_ref();
-                    if local_name == "Issuer" && is_ns(&res, ASSERTION) {
-                        if let Some(raw_issuer) = active_issuer_buf.take() {
-                            let text = raw_issuer.trim().to_string();
-                            if !text.is_empty() {
-                                let grand_parent = element_stack
-                                    .len()
-                                    .checked_sub(2)
-                                    .and_then(|idx| element_stack.get(idx))
-                                    .map(|(name, ns)| (name.as_str(), *ns));
-                                match grand_parent {
-                                    Some(("Assertion", XmlNs::Assertion)) => {
-                                        if let Some(prev) = &assertion_issuer {
-                                            if prev != &text {
-                                                return Err(SamlError::SignatureWrappingDetected(
-                                                    "multiple conflicting Issuer elements detected in Assertion".into(),
-                                                ));
-                                            }
-                                        } else {
-                                            assertion_issuer = Some(text);
+                    if active_capture
+                        .as_ref()
+                        .is_some_and(|cap| cap.depth == element_stack.len())
+                        && let Some(capture) = active_capture.take()
+                    {
+                        let text = capture.buf.trim().to_string();
+                        if !text.is_empty() {
+                            match capture.target {
+                                TextTarget::AssertionIssuer => {
+                                    if let Some(prev) = &assertion_issuer {
+                                        if prev != &text {
+                                            return Err(SamlError::SignatureWrappingDetected(
+                                                "multiple conflicting Issuer elements detected in Assertion".into(),
+                                            ));
                                         }
+                                    } else {
+                                        assertion_issuer = Some(text);
                                     }
-                                    Some(("Response", XmlNs::Protocol))
-                                        if response_issuer.is_none() =>
-                                    {
+                                }
+                                TextTarget::ResponseIssuer => {
+                                    if response_issuer.is_none() {
                                         response_issuer = Some(text);
                                     }
-                                    _ => {}
+                                }
+                                TextTarget::SubjectNameId => {
+                                    if fields.subject.is_none() {
+                                        fields.subject = Some(text);
+                                    }
+                                }
+                                TextTarget::Audience => {
+                                    if fields.audience.is_none() {
+                                        fields.audience = Some(text);
+                                    }
+                                }
+                                TextTarget::AttributeValue => {
+                                    if let Some(attr_name) = current_attr_name.as_deref() {
+                                        fields
+                                            .attributes
+                                            .entry(attr_name.to_string())
+                                            .or_default()
+                                            .push(text);
+                                    }
                                 }
                             }
                         }
-                    } else if local_name == "Assertion" && is_ns(&res, ASSERTION) {
+                    }
+
+                    if local_name == "Assertion" && is_ns(&res, ASSERTION) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
                     } else if local_name == "Attribute" && is_ns(&res, ASSERTION) {
@@ -472,27 +524,26 @@ impl SamlParser {
                     element_stack.pop();
                 }
                 Ok((_res, Event::Text(ref t))) => {
-                    let chunk = quick_xml::escape::unescape(t.as_ref())
-                        .map(|c| c.into_owned())
-                        .unwrap_or_else(|_| t.as_ref().to_string());
-                    record_assertion_text_chunk(
-                        &chunk,
-                        &element_stack,
-                        in_assertion,
-                        &mut active_issuer_buf,
-                        current_attr_name.as_deref(),
-                        &mut fields,
-                    );
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(t.as_ref());
+                    }
                 }
                 Ok((_res, Event::CData(ref c))) => {
-                    record_assertion_text_chunk(
-                        c.as_ref(),
-                        &element_stack,
-                        in_assertion,
-                        &mut active_issuer_buf,
-                        current_attr_name.as_deref(),
-                        &mut fields,
-                    );
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(c.as_ref());
+                    }
+                }
+                Ok((_res, Event::GeneralRef(ref r))) => {
+                    let resolved = resolve_general_ref(r)?;
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(&resolved);
+                    }
                 }
                 Ok((_res, Event::Eof)) => break,
                 Err(err) => {
@@ -797,5 +848,88 @@ mod saml_parser_and_iso8601_proptests {
                 Err(SamlError::Malformed(_))
             ));
         }
+    }
+
+    #[test]
+    fn signed_mode_rejects_reference_outside_signature_signed_info() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PanicIfCalled(AtomicBool);
+        impl SamlSignatureVerifier for PanicIfCalled {
+            fn verify_signature(&self, _: &str) -> Result<(), SamlError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        // Stray `<ds:Reference URI="#_a1"/>` outside `<ds:Signature><ds:SignedInfo>`.
+        let xml = r##"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_a1">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <ds:Reference URI="#_a1"/>
+            <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+        </saml:Assertion>"##;
+
+        let verifier = PanicIfCalled(AtomicBool::new(false));
+        let err = SamlParser::parse_signed(xml, &verifier)
+            .expect_err("stray ds:Reference outside SignedInfo must be rejected");
+        assert!(matches!(err, SamlError::SignatureWrappingDetected(_)));
+        assert!(
+            !verifier.0.load(Ordering::SeqCst),
+            "verifier must not be invoked when ds:Reference lacks ds:Signature/ds:SignedInfo ancestry"
+        );
+    }
+
+    #[test]
+    fn claims_assemble_across_cdata_comments_entities_and_nested_issuer() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a2">
+            <saml:Issuer>https://idp.example.com<saml:Issuer>nested</saml:Issuer>/sso</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice<![CDATA[@example.org]]></saml:NameID>
+            </saml:Subject>
+            <saml:Conditions>
+                <saml:AudienceRestriction>
+                    <saml:Audience>https://sp.example.com/a&amp;b&#63;v=1</saml:Audience>
+                </saml:AudienceRestriction>
+            </saml:Conditions>
+            <saml:AttributeStatement>
+                <saml:Attribute Name="roles">
+                    <saml:AttributeValue>team <!-- split --> lead &amp; ops</saml:AttributeValue>
+                    <saml:AttributeValue>auditor</saml:AttributeValue>
+                </saml:Attribute>
+            </saml:AttributeStatement>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion must parse");
+        assert_eq!(assertion.issuer, "https://idp.example.com/sso");
+        assert_eq!(assertion.subject, "alice@example.org");
+        assert_eq!(
+            assertion.audience.as_deref(),
+            Some("https://sp.example.com/a&b?v=1")
+        );
+        assert_eq!(
+            assertion.attributes.get("roles"),
+            Some(&vec!["team  lead & ops".to_string(), "auditor".to_string()])
+        );
+    }
+
+    #[test]
+    fn unresolved_xml_entity_reference_fails_closed() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a3">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject><saml:NameID>alice&unknown;example.org</saml:NameID></saml:Subject>
+        </saml:Assertion>"#;
+
+        let err = SamlParser::parse_unverified(xml)
+            .expect_err("unresolved XML entity reference must fail closed");
+        assert!(matches!(err, SamlError::Malformed(_)));
     }
 }

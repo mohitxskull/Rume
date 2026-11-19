@@ -41,7 +41,7 @@ where
     fn build_test_app(self) -> Pin<Box<dyn Future<Output = Result<TestApp, BuildError>> + Send>> {
         Box::pin(async move {
             let parts = self.into_test_parts()?;
-            let resolved = lifecycle::resolve_modules(&parts.modules)?;
+            let resolved = parts.resolved_modules;
 
             let ctx = parts.ctx;
             let mut on_shutdown = parts.on_shutdown;

@@ -577,6 +577,19 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
     for (idx, tok) in tokens.iter().enumerate() {
         match &tok.token {
             Token::Placeholder(placeholder) => {
+                // Why: SQLite allows `$` inside an unquoted identifier (e.g. `price$usd`),
+                // which `sqlparser`'s `SQLiteDialect` splits into `Word("price")` immediately
+                // adjacent to `Placeholder("$usd")`. Preserve identifiers containing `$` while
+                // still rejecting standalone `$name` bind parameters.
+                if placeholder.starts_with('$')
+                    && idx > 0
+                    && let Some(prev) = tokens.get(idx - 1)
+                    && prev.span.end == tok.span.start
+                    && (matches!(&prev.token, Token::Word(w) if w.quote_style.is_none())
+                        || matches!(&prev.token, Token::Placeholder(p) if p.starts_with('$')))
+                {
+                    continue;
+                }
                 return Err(PersistenceError::QueryFailed(format!(
                     "statement contains unbound SQLite placeholder '{placeholder}' with empty parameters"
                 )));
@@ -584,7 +597,8 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
             Token::Colon => {
                 if let Some(next) = tokens.get(idx + 1)
                     && tok.span.end == next.span.start
-                    && matches!(&next.token, Token::Word(w) if w.quote_style.is_none())
+                    && (matches!(&next.token, Token::Word(w) if w.quote_style.is_none())
+                        || matches!(&next.token, Token::Number(_, _)))
                 {
                     return Err(PersistenceError::QueryFailed(
                         "statement contains unbound SQLite named placeholder ':' with empty parameters"
@@ -635,6 +649,7 @@ mod tests {
 
         for stmt in [
             "UPDATE notes SET note = :note WHERE id = 1",
+            "UPDATE notes SET note = :1 WHERE id = 1",
             "UPDATE notes SET note = ? WHERE id = 1",
             "UPDATE notes SET note = ?1 WHERE id = 1",
             "UPDATE notes SET note = @note WHERE id = 1",
@@ -650,6 +665,18 @@ mod tests {
                 "expected QueryFailed for {stmt}, got {err:?}"
             );
         }
+
+        // Verify original value remained untouched by rejected placeholder statements.
+        let note_before_update = tx
+            .query_scalar("SELECT note FROM notes WHERE id = 1")
+            .await
+            .expect("query original note");
+        assert_eq!(note_before_update.as_deref(), Some("original"));
+
+        // Unquoted SQLite identifiers containing `$` (e.g. `price$usd`) must pass (#21).
+        tx.execute_params("CREATE TABLE prices (price$usd INTEGER);", &[])
+            .await
+            .expect("unquoted SQLite identifier containing '$' must pass");
 
         // Quoted literals, quoted identifiers, and comments containing placeholder-like tokens must pass.
         tx.execute_params(

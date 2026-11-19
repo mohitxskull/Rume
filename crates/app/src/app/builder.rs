@@ -82,6 +82,8 @@ pub enum BuildError {
     Startup(String),
     /// Duplicate route collision across modules or application routes.
     DuplicateRoute { method: String, path: String },
+    /// Internal route registry lock was poisoned.
+    RouteRegistryPoisoned,
 }
 
 impl std::fmt::Display for BuildError {
@@ -93,6 +95,7 @@ impl std::fmt::Display for BuildError {
             Self::DuplicateRoute { method, path } => {
                 write!(f, "duplicate route collision for {method} {path}")
             }
+            Self::RouteRegistryPoisoned => write!(f, "route registry lock poisoned"),
         }
     }
 }
@@ -263,6 +266,7 @@ where
     pub ctx: AppContext<E, C, S>,
     pub router: axum::Router<()>,
     pub modules: Vec<Arc<dyn crate::module::Module>>,
+    pub resolved_modules: crate::app::lifecycle::ResolvedModules,
     pub mode: ApplicationMode,
     pub on_ready: Vec<ReadyHook<E, C, S>>,
     pub on_shutdown: Vec<ShutdownHook<E, C, S>>,
@@ -591,18 +595,20 @@ where
     /// without creating a circular dependency between `rume-app` and `rume-testing`.
     pub fn into_test_parts(mut self) -> Result<TestAppParts<E, C, S>, BuildError> {
         let modules = self.modules.clone();
+        let resolved_modules = crate::app::lifecycle::resolve_modules(&modules)?;
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
         let mode = self.mode;
 
-        let (app_router, ctx) = self.build_router_with_ctx(ctx)?;
+        let (app_router, ctx) = self.build_router_with_resolved(ctx, &resolved_modules.startup)?;
 
         Ok(TestAppParts {
             router: app_router.with_state(ctx.clone()),
             ctx,
             modules,
+            resolved_modules,
             mode,
             on_ready,
             on_shutdown,
@@ -834,7 +840,18 @@ where
     /// module-registered routes and health checks.
     fn build_router_with_ctx(
         self,
+        ctx: AppContext<E, C, S>,
+    ) -> Result<BuiltRouterWithCtx<E, C, S>, BuildError> {
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        self.build_router_with_resolved(ctx, &resolved.startup)
+    }
+
+    /// Build the router using a pre-resolved module startup order so callers like
+    /// `prepare_serve` and `into_test_parts` resolve the module graph exactly once.
+    fn build_router_with_resolved(
+        self,
         mut ctx: AppContext<E, C, S>,
+        startup_modules: &[Arc<dyn crate::module::Module>],
     ) -> Result<BuiltRouterWithCtx<E, C, S>, BuildError> {
         let RumeBuilder {
             router,
@@ -844,23 +861,29 @@ where
             groups_order,
             applied_middleware,
             applied_groups,
-            modules,
             route_registry,
             ..
         } = self;
 
         // --- Step 1: Module preflight & route mounting ---
-        let startup_modules = crate::app::lifecycle::resolve_modules(&modules)?.startup;
+        let app_routes = route_registry
+            .read()
+            .map_err(|_| BuildError::RouteRegistryPoisoned)?
+            .clone();
         let (module_axum, module_routes) =
-            collect_and_validate_routes(&startup_modules, &route_registry.read().unwrap())?;
-        for m in &startup_modules {
+            collect_and_validate_routes(startup_modules, &app_routes)?;
+        for m in startup_modules {
             m.register_health_checks(&mut ctx.health_checks);
         }
 
-        let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
-        let router = router.merge(adapted);
-        route_registry.write().unwrap().extend(module_routes);
-        ctx.route_registry = route_registry.read().unwrap().clone();
+        let router = merge_module_router(router, module_axum)?;
+        {
+            let mut reg = route_registry
+                .write()
+                .map_err(|_| BuildError::RouteRegistryPoisoned)?;
+            reg.extend(module_routes);
+            ctx.route_registry = reg.clone();
+        }
 
         // --- Step 2: Validation phase (fail closed, before any middleware wraps) ---
         let mut seen_middleware: HashSet<&str> = HashSet::new();
@@ -990,15 +1013,27 @@ where
     fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
         // Why: `Inspect` mode skips `on_start`, `on_ready`, and `on_shutdown` hooks so
         // `rume list:routes` and boot checks remain side-effect-free, while still
-        // running `ModuleRegistry` DAG validation and `check_and_record_route`
-        // preflight so module cycles and duplicate routes fail closed identically
-        // to `build_router`.
+        // running `ModuleRegistry` DAG validation, `check_and_record_route`, and the
+        // actual Axum router merge so module cycles and duplicate routes (including
+        // app `.route()` + module collisions) fail closed identically to `build_router`.
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
-        let (_module_axum, module_routes) =
-            collect_and_validate_routes(&resolved.startup, &self.route_registry.read().unwrap())?;
+        let app_routes = self
+            .route_registry
+            .read()
+            .map_err(|_| BuildError::RouteRegistryPoisoned)?
+            .clone();
+        let (module_axum, module_routes) =
+            collect_and_validate_routes(&resolved.startup, &app_routes)?;
+        let _merged = merge_module_router(self.router, module_axum)?;
 
-        self.route_registry.write().unwrap().extend(module_routes);
-        self.ctx.route_registry = self.route_registry.read().unwrap().clone();
+        {
+            let mut reg = self
+                .route_registry
+                .write()
+                .map_err(|_| BuildError::RouteRegistryPoisoned)?;
+            reg.extend(module_routes);
+            self.ctx.route_registry = reg.clone();
+        }
 
         self.ctx.lifecycle.set(LifecycleState::Booted);
         self.ctx.availability.set(AvailabilityState::Live);
@@ -1021,7 +1056,7 @@ where
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
 
-        let (router, serve_ctx) = self.build_router_with_ctx(ctx)?;
+        let (router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
 
         Ok(PreparedServe {
             router,
@@ -1198,7 +1233,7 @@ fn collect_and_validate_routes(
         for r in routes.routes() {
             check_and_record_route(&mut seen_routes, r)?;
         }
-        module_axum = module_axum.merge(axum_r);
+        module_axum = merge_module_router(module_axum, axum_r)?;
         module_routes.extend(routes);
     }
 
@@ -1210,6 +1245,46 @@ fn collect_and_validate_routes(
     }
 
     Ok((module_axum, module_routes))
+}
+
+/// Merge a module router onto a target router, catching Axum's overlapping-route
+/// panic and converting it into a typed [`BuildError::DuplicateRoute`].
+fn merge_module_router<S>(
+    router: Router<S>,
+    module_axum: axum::Router<()>,
+) -> Result<Router<S>, BuildError>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let adapted: Router<S> = module_axum.with_state(());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| router.merge(adapted))).map_err(
+        |payload| {
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.as_str()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                s
+            } else {
+                "overlapping route detected during router merge"
+            };
+            parse_axum_merge_conflict(msg)
+        },
+    )
+}
+
+fn parse_axum_merge_conflict(msg: &str) -> BuildError {
+    if let Some((_, rest)) = msg.split_once("Handler for `")
+        && let Some((sig, _)) = rest.split_once('`')
+        && let Some((method, path)) = sig.split_once(' ')
+    {
+        return BuildError::DuplicateRoute {
+            method: method.to_string(),
+            path: path.to_string(),
+        };
+    }
+    BuildError::DuplicateRoute {
+        method: rume_http::routing::RouteInfo::UNKNOWN_METHOD.to_string(),
+        path: msg.to_string(),
+    }
 }
 
 /// Normalize route capture segments (e.g. `{id}`, `{user_id}`, `:id` -> `{}`,
@@ -1954,7 +2029,7 @@ mod tests {
         let lifecycle = ctx.lifecycle.clone();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server = tokio::spawn(async move {
+        let mut server = tokio::spawn(async move {
             RumeBuilder::new(ctx)
                 .bind("127.0.0.1:0")
                 .module(ObservedModule)
@@ -2004,13 +2079,7 @@ mod tests {
                 .await
         });
 
-        for _ in 0..500 {
-            if lifecycle.state() == LifecycleState::Ready {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(lifecycle.state(), LifecycleState::Ready);
+        wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
         let _ = shutdown_tx.send(());
         server
             .await
@@ -2045,7 +2114,7 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let server = tokio::spawn(async move {
+        let mut server = tokio::spawn(async move {
             RumeBuilder::new(ctx)
                 .module(ObservedModule)
                 .on_ready(move |ctx| {
@@ -2074,13 +2143,7 @@ mod tests {
                 .await
         });
 
-        for _ in 0..500 {
-            if lifecycle.state() == LifecycleState::Ready {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(lifecycle.state(), LifecycleState::Ready);
+        wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
         let _ = shutdown_tx.send(());
         server
             .await
@@ -2175,5 +2238,62 @@ mod tests {
             .await
             .expect_err("listener inspect mode must reject duplicate routes");
         assert_eq!(listener_dup_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // (c) App `.route("/dup", get(...))` (UNKNOWN metadata) colliding with module
+        // `.get("/dup", ...)` must fail cleanly in both Inspect and Run/build_router,
+        // while `.route("/dup", post(...))` + module `.get("/dup", ...)` remains valid.
+        let unknown_dup_inspect = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .route("/dup", axum::routing::get(|| async { "app" }))
+            .module(DupRouteMod)
+            .run()
+            .await
+            .expect_err("inspect mode must reject app .route(get) + module .get collision");
+        assert_eq!(unknown_dup_inspect.kind(), std::io::ErrorKind::InvalidInput);
+
+        let ctx = test_ctx();
+        let unknown_dup_build = RumeBuilder::new(ctx.clone())
+            .route("/dup", axum::routing::get(|| async { "app" }))
+            .module(DupRouteMod)
+            .build_router(ctx)
+            .expect_err("build_router must return DuplicateRoute instead of panicking");
+        assert!(matches!(
+            unknown_dup_build,
+            BuildError::DuplicateRoute { .. }
+        ));
+
+        RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .route("/dup", axum::routing::post(|| async { "app-post" }))
+            .module(DupRouteMod)
+            .run()
+            .await
+            .expect("POST /dup and GET /dup on the same path must remain valid in Inspect");
+    }
+
+    async fn wait_for_ready(
+        lifecycle: &crate::app::state::Lifecycle,
+        server: &mut tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if lifecycle.state() == LifecycleState::Ready {
+                return;
+            }
+            if server.is_finished() {
+                let res = server.await;
+                panic!(
+                    "server task exited early before reaching Ready (state={:?}): {res:?}",
+                    lifecycle.state()
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for server to reach Ready (state={:?})",
+                lifecycle.state()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }

@@ -87,7 +87,8 @@ pub fn resolve_modules(modules: &[Arc<dyn Module>]) -> Result<ResolvedModules, M
         registry.register(Arc::clone(module))?;
     }
     let startup = registry.resolve_startup_modules()?;
-    let shutdown = registry.resolve_shutdown_modules()?;
+    let mut shutdown = startup.clone();
+    shutdown.reverse();
     Ok(ResolvedModules { startup, shutdown })
 }
 
@@ -124,8 +125,10 @@ where
 
         // Why: Poll the latched shutdown receiver first (`biased;`) when present so an
         // already-received signal aborts boot deterministically rather than racing an
-        // immediately-ready hook; passing `None` lets `build_test_app` reuse the exact
-        // same startup and rollback state machine via `pending()`.
+        // immediately-ready hook; wrap `on_start` in an `async` block so `select!` does
+        // not eagerly invoke the hook before polling the signal branch. Passing `None`
+        // lets `build_test_app` reuse the exact same startup and rollback state machine
+        // via `pending()`.
         tokio::select! {
             biased;
             _ = wait_for_shutdown(shutdown_rx.as_ref()) => {
@@ -135,7 +138,7 @@ where
                     "shutdown signal received during module startup".to_string(),
                 ));
             }
-            res = module.on_start(&mod_ctx) => {
+            res = async { module.on_start(&mod_ctx).await } => {
                 if let Err(err) = res {
                     tracing::error!(
                         "module '{}' failed to start: {err}; executing cleanup",
@@ -164,7 +167,7 @@ where
                     "shutdown signal received during application startup".to_string(),
                 ));
             }
-            res = hook(ctx.clone()) => {
+            res = async { hook(ctx.clone()).await } => {
                 if let Err(err) = res {
                     tracing::error!(
                         "startup hook failed: {err}; executing registered cleanup hooks"
@@ -176,6 +179,17 @@ where
                 }
             }
         }
+    }
+
+    // Why: when both `startup_modules` and `on_ready` are empty (or shutdown latched right as
+    // the last hook completed), neither `select!` catches it; check the latched receiver
+    // before publishing `Ready` so we never transition to `Ready` after shutdown was signaled.
+    if shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow()) {
+        tracing::warn!("shutdown signal received before Ready transition; aborting boot");
+        rollback_on_signal(ctx, on_shutdown, started_modules, shutdown_timeout).await;
+        return Err(LifecycleError::Interrupted(
+            "shutdown signal received before application reached Ready".to_string(),
+        ));
     }
 
     ctx.lifecycle.set(LifecycleState::Ready);
@@ -299,12 +313,136 @@ async fn execute_cleanup<E, C, S>(
     }
 }
 
+/// Waits until the shutdown channel latches `true`.
+///
+/// If all senders are dropped while the channel still holds `false`, signal monitoring
+/// is treated as disabled (parks permanently) rather than falsely aborting startup.
+/// A channel whose final latched value is `true` still interrupts startup immediately.
 async fn wait_for_shutdown(rx: Option<&watch::Receiver<bool>>) {
     match rx {
         Some(rx) => {
             let mut rx = rx.clone();
-            let _ = rx.wait_for(|&shutting_down| shutting_down).await;
+            if rx.wait_for(|&shutting_down| shutting_down).await.is_err() {
+                if *rx.borrow() {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            }
         }
         None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use crate::app::paths::ProjectPaths;
+    use crate::app::state::Availability;
+    use crate::module::BoxFuture;
+    use rume_foundation::health::HealthChecks;
+
+    fn test_ctx() -> AppContext<(), (), ()> {
+        AppContext::new(
+            (),
+            (),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+            (),
+        )
+    }
+
+    #[tokio::test]
+    async fn pre_latched_shutdown_prevents_eager_on_start_and_ready_transition() {
+        struct EagerSideEffectModule {
+            invoked: Arc<AtomicBool>,
+        }
+        impl Module for EagerSideEffectModule {
+            fn name(&self) -> &'static str {
+                "eager"
+            }
+            fn on_start<'a>(
+                &'a self,
+                _ctx: &'a ModuleContext,
+            ) -> BoxFuture<'a, Result<(), Box<dyn std::error::Error + Send + Sync>>> {
+                self.invoked.store(true, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        // Case 1: pre-latched shutdown must NOT invoke `on_start` even synchronously.
+        let invoked = Arc::new(AtomicBool::new(false));
+        let module: Arc<dyn Module> = Arc::new(EagerSideEffectModule {
+            invoked: Arc::clone(&invoked),
+        });
+        let (_tx, rx) = watch::channel(true);
+        let ctx = test_ctx();
+        let mut on_shutdown = Vec::new();
+        let err = run_startup(
+            &ctx,
+            &[module],
+            Vec::new(),
+            &mut on_shutdown,
+            Duration::from_secs(1),
+            Some(rx),
+        )
+        .await
+        .expect_err("pre-latched shutdown must interrupt startup");
+        assert!(matches!(err, LifecycleError::Interrupted(_)));
+        assert!(
+            !invoked.load(Ordering::SeqCst),
+            "on_start must not be invoked when shutdown is already latched"
+        );
+
+        // Case 2: empty startup_modules and on_ready with pre-latched shutdown must NOT publish Ready.
+        let (_tx2, rx2) = watch::channel(true);
+        let ctx2 = test_ctx();
+        let mut on_shutdown2 = Vec::new();
+        let err2 = run_startup(
+            &ctx2,
+            &[],
+            Vec::new(),
+            &mut on_shutdown2,
+            Duration::from_secs(1),
+            Some(rx2),
+        )
+        .await
+        .expect_err("pre-latched shutdown with empty hooks must interrupt before Ready");
+        assert!(matches!(err2, LifecycleError::Interrupted(_)));
+        assert_ne!(ctx2.lifecycle.state(), LifecycleState::Ready);
+    }
+
+    #[tokio::test]
+    async fn dropped_shutdown_sender_with_false_does_not_abort_startup() {
+        let (tx, rx) = watch::channel(false);
+        drop(tx);
+
+        let ctx = test_ctx();
+        let mut on_shutdown = Vec::new();
+        let ready_ran = Arc::new(AtomicBool::new(false));
+        let spy = Arc::clone(&ready_ran);
+        let hook: ReadyHook<(), (), ()> = Box::new(move |_| {
+            let spy = Arc::clone(&spy);
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                spy.store(true, Ordering::SeqCst);
+                Ok(())
+            })
+        });
+
+        run_startup(
+            &ctx,
+            &[],
+            vec![hook],
+            &mut on_shutdown,
+            Duration::from_secs(1),
+            Some(rx),
+        )
+        .await
+        .expect("closed shutdown channel holding false must not abort startup");
+        assert!(ready_ran.load(Ordering::SeqCst));
+        assert_eq!(ctx.lifecycle.state(), LifecycleState::Ready);
     }
 }

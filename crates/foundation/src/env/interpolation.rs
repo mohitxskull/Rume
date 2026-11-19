@@ -259,12 +259,17 @@ mod interpolate_value_proptests {
             deep_vars.insert(format!("D{too_deep}"), leaf.clone());
             let err = interpolate_value("${D0}", &deep_vars)
                 .expect_err("chain exceeding MAX_INTERPOLATION_DEPTH must fail");
-            let is_max_depth = matches!(err, EnvError::MaxDepthExceeded { .. });
-            prop_assert!(is_max_depth, "expected MaxDepthExceeded, got: {err:?}");
-            prop_assert!(
-                !err.to_string().contains(&leaf),
-                "MaxDepthExceeded error leaked variable value"
+            let is_max_depth = matches!(
+                &err,
+                EnvError::MaxDepthExceeded { variable, depth }
+                    if variable == &format!("D{MAX_INTERPOLATION_DEPTH}")
+                        && *depth == MAX_INTERPOLATION_DEPTH
             );
+            prop_assert!(is_max_depth, "expected MaxDepthExceeded, got: {err:?}");
+            let expected = format!(
+                "maximum interpolation depth ({MAX_INTERPOLATION_DEPTH}) exceeded while interpolating ${{D{MAX_INTERPOLATION_DEPTH}}}"
+            );
+            prop_assert_eq!(err.to_string(), expected);
         }
 
         #[test]
@@ -280,11 +285,14 @@ mod interpolate_value_proptests {
 
             let err = interpolate_value("${C0}", &vars)
                 .expect_err("cyclic chain must fail closed");
-            let is_circular = matches!(err, EnvError::CircularReference { .. });
+            let is_circular = matches!(
+                &err,
+                EnvError::CircularReference { variable } if variable == "C0"
+            );
             prop_assert!(is_circular, "expected CircularReference, got: {err:?}");
-            prop_assert!(
-                !err.to_string().contains(&secret),
-                "CircularReference error leaked variable value"
+            prop_assert_eq!(
+                err.to_string(),
+                "circular reference detected while interpolating ${C0}"
             );
         }
     }

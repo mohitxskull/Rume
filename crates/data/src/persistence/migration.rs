@@ -24,8 +24,6 @@ const SQLITE_OUTBOX: &str = include_str!("sql/sqlite/outbox_schema.sql");
 const SQLITE_AUDIT: &str = include_str!("sql/sqlite/audit_schema.sql");
 const SQLITE_CORE_DOWN: &str = include_str!("sql/sqlite/core_down.sql");
 
-const AUDIT_DOWN_SQL: &str = "DROP TABLE IF EXISTS rume_audit_log;";
-
 const PG_MIGRATIONS_SCHEMA: &str = include_str!("sql/postgres/migrations_schema.sql");
 const MYSQL_MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.sql");
 const SQLITE_MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
@@ -102,6 +100,192 @@ fn find_migration_id_query(dialect: &str) -> &'static str {
 }
 
 const LIST_APPLIED_MIGRATIONS_SQL: &str = PG_MIGRATION_LIST_APPLIED;
+const NEXT_APPLIED_ORDER_SQL: &str =
+    "SELECT COALESCE(MAX(applied_order), 0) + 1 FROM rume_migrations";
+const LIST_APPLIED_ORDER_SQL: &str = "SELECT id, applied_order, applied_at FROM rume_migrations ORDER BY applied_order DESC, applied_at DESC";
+
+fn select_rollback_target<'a>(
+    migrations: &'a [Migration],
+    applied_rows: &[(String, i64, i64)],
+) -> Option<&'a Migration> {
+    let mut best: Option<(i64, i64, usize, &'a Migration)> = None;
+    for (id, applied_order, applied_at) in applied_rows {
+        if let Some((registry_idx, migration)) =
+            migrations.iter().enumerate().find(|(_, m)| m.id == *id)
+        {
+            let key = (*applied_order, *applied_at, registry_idx);
+            let replace = match best {
+                None => true,
+                Some((bo, ba, bi, _)) => key > (bo, ba, bi),
+            };
+            if replace {
+                best = Some((*applied_order, *applied_at, registry_idx, migration));
+            }
+        }
+    }
+    best.map(|(_, _, _, m)| m)
+}
+
+async fn ensure_applied_order_column_tx<T: DatabaseTransaction>(
+    tx: &T,
+    dialect: &str,
+) -> Result<(), PersistenceError> {
+    match dialect {
+        "postgres" => {
+            tx.execute(
+                "ALTER TABLE rume_migrations ADD COLUMN IF NOT EXISTS applied_order BIGINT NOT NULL DEFAULT 0",
+            )
+            .await?;
+        }
+        "sqlite" => {
+            let count = tx
+                .query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('rume_migrations') WHERE name = 'applied_order'",
+                )
+                .await?;
+            if count.as_deref() == Some("0") {
+                tx.execute(
+                    "ALTER TABLE rume_migrations ADD COLUMN applied_order INTEGER NOT NULL DEFAULT 0",
+                )
+                .await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn ensure_applied_order_column_backend<B: DatabaseBackend>(
+    backend: &B,
+) -> Result<(), PersistenceError> {
+    match backend.dialect() {
+        "postgres" => {
+            backend
+                .execute(
+                    "ALTER TABLE rume_migrations ADD COLUMN IF NOT EXISTS applied_order BIGINT NOT NULL DEFAULT 0",
+                )
+                .await?;
+        }
+        "sqlite" => {
+            let count = backend
+                .query_scalar(
+                    "SELECT COUNT(*) FROM pragma_table_info('rume_migrations') WHERE name = 'applied_order'",
+                )
+                .await?;
+            if count.as_deref() == Some("0") {
+                backend
+                    .execute(
+                        "ALTER TABLE rume_migrations ADD COLUMN applied_order INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .await?;
+            }
+        }
+        "mysql" => {
+            let count = backend
+                .query_scalar(
+                    "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rume_migrations' AND COLUMN_NAME = 'applied_order'",
+                )
+                .await?;
+            if count.as_deref() == Some("0") {
+                backend
+                    .execute(
+                        "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
+                    )
+                    .await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn next_applied_order_tx<T: DatabaseTransaction>(tx: &T) -> Result<i64, PersistenceError> {
+    let raw = tx.query_scalar(NEXT_APPLIED_ORDER_SQL).await?;
+    Ok(raw
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1))
+}
+
+async fn fetch_applied_order_rows_tx<T: DatabaseTransaction>(
+    tx: &T,
+) -> Result<Vec<(String, i64, i64)>, PersistenceError> {
+    let rows = tx.fetch_all(LIST_APPLIED_ORDER_SQL, &[]).await?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row.get("id")?;
+        let applied_order: i64 = row.get("applied_order")?;
+        let applied_at: i64 = row.get("applied_at")?;
+        out.push((id, applied_order, applied_at));
+    }
+    Ok(out)
+}
+
+#[cfg(feature = "mysql")]
+async fn ensure_applied_order_column_mysql(
+    conn: &mut sqlx::MySqlConnection,
+) -> Result<(), PersistenceError> {
+    let count = mysql_conn_query_scalar_params(
+        conn,
+        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rume_migrations' AND COLUMN_NAME = 'applied_order'",
+        &[],
+    )
+    .await?;
+    if count.as_deref() == Some("0") {
+        mysql_conn_execute_raw(
+            conn,
+            "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "mysql")]
+async fn next_applied_order_mysql(
+    conn: &mut sqlx::MySqlConnection,
+) -> Result<i64, PersistenceError> {
+    let raw = mysql_conn_query_scalar_params(conn, NEXT_APPLIED_ORDER_SQL, &[]).await?;
+    Ok(raw
+        .as_deref()
+        .and_then(|s| s.parse::<i64>().ok())
+        .unwrap_or(1))
+}
+
+#[cfg(feature = "mysql")]
+async fn fetch_applied_order_rows_mysql(
+    conn: &mut sqlx::MySqlConnection,
+) -> Result<Vec<(String, i64, i64)>, PersistenceError> {
+    use sqlx::Row;
+    let rows = sqlx::query(LIST_APPLIED_ORDER_SQL)
+        .fetch_all(conn)
+        .await
+        .map_err(crate::persistence::backend::map_sqlx_error)?;
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id: String = row
+            .try_get("id")
+            .map_err(|e| PersistenceError::DecodeError {
+                column: "id".into(),
+                message: e.to_string(),
+            })?;
+        let applied_order: i64 =
+            row.try_get("applied_order")
+                .map_err(|e| PersistenceError::DecodeError {
+                    column: "applied_order".into(),
+                    message: e.to_string(),
+                })?;
+        let applied_at: i64 = row
+            .try_get::<i64, _>("applied_at")
+            .or_else(|_| row.try_get::<u64, _>("applied_at").map(|v| v as i64))
+            .map_err(|e| PersistenceError::DecodeError {
+                column: "applied_at".into(),
+                message: e.to_string(),
+            })?;
+        out.push((id, applied_order, applied_at));
+    }
+    Ok(out)
+}
 
 fn parse_clock_or_now(clock_res: Result<Option<String>, PersistenceError>) -> i64 {
     let now = if let Ok(Some(s)) = clock_res
@@ -196,19 +380,31 @@ async fn mysql_conn_query_scalar_params(
     Ok(row.and_then(|r| extract_mysql_scalar(&r)))
 }
 
+/// Acquisition / ownership state of [`MysqlMigrationLockGuard`].
+#[cfg(feature = "mysql")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MysqlLockState {
+    /// `GET_LOCK` is in-flight or returned an indeterminate transport error; the session may
+    /// hold `rume_migrations_lock` on the server, so dropping in this state MUST detach and
+    /// close the physical connection rather than returning it to the pool.
+    Acquiring,
+    /// `GET_LOCK` returned `"1"`; session definitely holds `rume_migrations_lock`.
+    Locked,
+    /// `RELEASE_LOCK` returned `"1"` or `GET_LOCK` definitively returned non-`"1"`.
+    Released,
+}
+
 /// RAII guard owning a pinned MySQL pool connection while `rume_migrations_lock` is held.
 ///
 /// Why: MySQL `GET_LOCK`/`RELEASE_LOCK` are session-bound (`CONNECTION_ID()`), and MySQL DDL
 /// implicitly auto-commits every statement. Pinning a single `PoolConnection<MySql>` directly via
-/// `MysqlBackend::pool().acquire()` keeps lock acquisition, per-migration execution, and lock
-/// release on the same physical session without calling `begin_transaction()`, issuing misleading
-/// multi-migration `"START TRANSACTION"`/`"COMMIT"`/`"ROLLBACK"` wrappers, or adding
-/// `MysqlTransaction::execute_unvalidated` (revisit only if targeting a transactional-DDL MySQL
-/// fork).
+/// `DatabaseBackend::mysql_migration_pool()` keeps lock acquisition, per-migration execution
+/// (transactional for pure InnoDB DML, direct for implicit-commit DDL), and lock release on the
+/// same physical session.
 #[cfg(feature = "mysql")]
 struct MysqlMigrationLockGuard {
     conn: Option<sqlx::pool::PoolConnection<sqlx::MySql>>,
-    locked: bool,
+    state: MysqlLockState,
 }
 
 #[cfg(feature = "mysql")]
@@ -218,35 +414,48 @@ impl MysqlMigrationLockGuard {
             .acquire()
             .await
             .map_err(crate::persistence::backend::map_sqlx_error)?;
+        // Why: mark `Acquiring` BEFORE awaiting `GET_LOCK` so cancelling the future after
+        // MySQL receives `GET_LOCK` (or hitting a transport error) detaches the physical
+        // connection in `Drop` instead of returning a potentially-locked session to the pool.
         let mut guard = Self {
             conn: Some(conn),
-            locked: false,
+            state: MysqlLockState::Acquiring,
         };
         let lock_res =
-            mysql_conn_query_scalar_params(guard.conn_mut(), MYSQL_MIGRATION_LOCK, &[]).await?;
+            mysql_conn_query_scalar_params(guard.conn_mut()?, MYSQL_MIGRATION_LOCK, &[]).await?;
         if lock_res.as_deref() != Some("1") {
+            // Definitive non-acquisition (`0` or `NULL`): session does not hold the lock,
+            // so it is safe to return the connection to the pool.
+            guard.state = MysqlLockState::Released;
             return Err(PersistenceError::Timeout);
         }
-        guard.locked = true;
+        guard.state = MysqlLockState::Locked;
         Ok(guard)
     }
 
-    fn conn_mut(&mut self) -> &mut sqlx::MySqlConnection {
-        self.conn
-            .as_mut()
-            .expect("MySQL migration connection already released")
+    fn conn_mut(&mut self) -> Result<&mut sqlx::MySqlConnection, PersistenceError> {
+        self.conn.as_deref_mut().ok_or_else(|| {
+            PersistenceError::TransactionError("MySQL migration connection already released".into())
+        })
     }
 
     async fn release(mut self) -> Result<(), PersistenceError> {
-        if !self.locked {
+        if self.state != MysqlLockState::Locked {
             return Ok(());
         }
         let unlock_res =
-            mysql_conn_query_scalar_params(self.conn_mut(), MYSQL_MIGRATION_UNLOCK, &[]).await;
-        // Why: Disarm only after awaiting `RELEASE_LOCK` so cancellation mid-unlock still
-        // triggers `Drop` cleanup, while completed calls never spawn a redundant unlock task.
-        self.locked = false;
-        let _ = self.conn.take();
+            mysql_conn_query_scalar_params(self.conn_mut()?, MYSQL_MIGRATION_UNLOCK, &[]).await;
+        // Why: disarm only after awaiting `RELEASE_LOCK` so cancellation mid-unlock still
+        // triggers `Drop` cleanup. Only return the connection to the pool when `RELEASE_LOCK`
+        // affirmatively returned `"1"`; otherwise detach and close the session so MySQL drops
+        // any named lock it still holds.
+        self.state = MysqlLockState::Released;
+        let released = matches!(&unlock_res, Ok(Some(s)) if s == "1");
+        if released {
+            let _ = self.conn.take();
+        } else if let Some(conn) = self.conn.take() {
+            drop(conn.detach());
+        }
 
         match unlock_res {
             Ok(Some(s)) if s == "1" => Ok(()),
@@ -261,23 +470,36 @@ impl MysqlMigrationLockGuard {
 #[cfg(feature = "mysql")]
 impl Drop for MysqlMigrationLockGuard {
     fn drop(&mut self) {
-        if self.locked
-            && let Some(mut conn) = self.conn.take()
-        {
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // Why: Cancellation-safe cleanup matching `MysqlTransaction::drop`; if the
-                // migration future is dropped while locked, release `rume_migrations_lock` on
-                // this exact session before returning the connection to the pool.
-                handle.spawn(async move {
-                    let _ = sqlx::query(MYSQL_MIGRATION_UNLOCK)
-                        .execute(&mut *conn)
-                        .await;
-                });
-            } else {
-                // Why: Outside a Tokio runtime we cannot spawn `RELEASE_LOCK`; detaching closes
-                // the physical socket immediately so MySQL drops the session lock instead of
-                // returning a still-locked session to the pool.
-                drop(conn.detach());
+        match self.state {
+            MysqlLockState::Released => {}
+            MysqlLockState::Acquiring => {
+                if let Some(conn) = self.conn.take() {
+                    // Acquisition outcome is unknown (cancelled or transport error); close the
+                    // physical session so MySQL releases any lock it may have granted.
+                    drop(conn.detach());
+                }
+            }
+            MysqlLockState::Locked => {
+                if let Some(mut conn) = self.conn.take() {
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        // Why: Cancellation-safe cleanup matching `MysqlTransaction::drop`; if
+                        // `RELEASE_LOCK` does not affirmatively return `"1"`, detach the
+                        // connection so MySQL closes the session and drops the named lock.
+                        handle.spawn(async move {
+                            let res = mysql_conn_query_scalar_params(
+                                &mut conn,
+                                MYSQL_MIGRATION_UNLOCK,
+                                &[],
+                            )
+                            .await;
+                            if !matches!(res, Ok(Some(ref s)) if s == "1") {
+                                drop(conn.detach());
+                            }
+                        });
+                    } else {
+                        drop(conn.detach());
+                    }
+                }
             }
         }
     }
@@ -398,14 +620,18 @@ impl Migrator {
             )
             .with_down(core_down_sql),
         );
+        // Why: `RUME_AUDIT_MIGRATION_ID` uses `CREATE TABLE IF NOT EXISTS rume_audit_log` so
+        // databases upgraded from `SqlAuditLogger::init_table()` succeed without error. Because
+        // the runner cannot distinguish a pre-existing populated audit table from a freshly
+        // created one, this migration is intentionally irreversible (`down_sql: None`) so
+        // rolling back never drops pre-existing audit history.
         self.migrations.insert(
             1,
             Migration::from_sql(
                 RUME_AUDIT_MIGRATION_ID,
                 "Initialize Rume audit log table",
                 audit_up_sql,
-            )
-            .with_down(AUDIT_DOWN_SQL),
+            ),
         );
         self
     }
@@ -457,6 +683,7 @@ impl Migrator {
     ) -> Result<Vec<(String, i64)>, PersistenceError> {
         let ddl = migrations_schema_ddl(backend.dialect());
         backend.execute(ddl).await?;
+        ensure_applied_order_column_backend(backend).await?;
         let rows = backend.fetch_all(LIST_APPLIED_MIGRATIONS_SQL, &[]).await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
@@ -536,6 +763,7 @@ impl Migrator {
             let tx = backend.begin_transaction().await?;
             tx.execute(PG_ADVISORY_LOCK).await?;
             tx.execute(ddl).await?;
+            ensure_applied_order_column_tx(&tx, dialect).await?;
 
             let mut applied = Vec::new();
             for migration in &self.migrations {
@@ -559,21 +787,14 @@ impl Migrator {
                                 message: err.to_string(),
                             })?;
                     }
-                    let now = if let Ok(Some(s)) = tx.query_scalar(PG_CLOCK).await
-                        && let Ok(ts) = s.parse::<u64>()
-                    {
-                        ts
-                    } else {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    };
+                    let now = parse_clock_or_now(tx.query_scalar(PG_CLOCK).await);
+                    let next_order = next_applied_order_tx(&tx).await?;
                     let params = [
                         DbValue::from(migration.id.as_str()),
                         DbValue::from(migration.description.as_str()),
-                        DbValue::Int(now as i64),
+                        DbValue::Int(now),
                         DbValue::from(migration.checksum().as_str()),
+                        DbValue::Int(next_order),
                     ];
                     tx.execute_params(insert_sql, &params).await?;
                     applied.push(migration.id.clone());
@@ -584,22 +805,27 @@ impl Migrator {
         }
 
         if dialect == "mysql" {
-            // Why: MySQL DDL implicitly commits every statement, so an outer multi-migration
-            // `START TRANSACTION` / `COMMIT` / `ROLLBACK` wrapper is non-atomic and causes ledger
-            // drift. Downcast to `MysqlBackend` to execute each migration and its immediate
-            // `rume_migrations` insert on one `GET_LOCK`-pinned `PoolConnection<MySql>` without
-            // `begin_transaction()` or transaction wrappers (revisit only if targeting a
-            // transactional-DDL MySQL fork); non-`MysqlBackend` mocks fall back to direct
-            // non-transactional `backend` calls.
+            // Why: Acquire the database-wide `rume_migrations_lock` on a pinned session BEFORE
+            // reading or mutating `rume_migrations`. If a MySQL backend (or wrapper) does not
+            // expose `mysql_migration_pool()`, fail closed before mutating the database rather
+            // than silently running unlocked. For each pending migration, pure InnoDB DML runs
+            // atomically with its ledger insert inside an explicit transaction on the pinned
+            // connection, while DDL (which implicitly commits in MySQL) runs directly followed
+            // by an immediate ledger insert.
             #[cfg(feature = "mysql")]
-            if let Some(mysql_backend) =
-                (backend as &dyn std::any::Any).downcast_ref::<crate::persistence::MysqlBackend>()
             {
-                let mut guard = MysqlMigrationLockGuard::acquire(mysql_backend.pool()).await?;
+                let pool = backend.mysql_migration_pool().ok_or_else(|| {
+                    PersistenceError::TransactionError(
+                        "MySQL migrations require a session-pinned migration lock capability (mysql_migration_pool)"
+                            .into(),
+                    )
+                })?;
+                let mut guard = MysqlMigrationLockGuard::acquire(pool).await?;
                 let mut applied = Vec::new();
                 let run_res: Result<(), PersistenceError> = async {
-                    let conn = guard.conn_mut();
+                    let conn = guard.conn_mut()?;
                     mysql_conn_execute_raw(conn, ddl).await?;
+                    ensure_applied_order_column_mysql(conn).await?;
                     for migration in &self.migrations {
                         let id_param = [DbValue::from(migration.id.as_str())];
                         let stored_checksum =
@@ -614,24 +840,72 @@ impl Migrator {
                                 });
                             }
                         } else {
-                            if let Some(sql) = &migration.up_sql {
-                                mysql_conn_execute_raw(conn, sql).await.map_err(|err| {
-                                    PersistenceError::MigrationError {
-                                        migration: migration.id.clone(),
-                                        message: err.to_string(),
+                            let is_transactional_dml = match &migration.up_sql {
+                                Some(sql) => {
+                                    !crate::persistence::backend::mysql_sql_causes_implicit_commit(
+                                        sql,
+                                    )?
+                                }
+                                None => true,
+                            };
+                            if is_transactional_dml {
+                                mysql_conn_execute_raw(conn, "START TRANSACTION").await?;
+                                let dml_res: Result<(), PersistenceError> = async {
+                                    if let Some(sql) = &migration.up_sql {
+                                        mysql_conn_execute_raw(conn, sql).await.map_err(|err| {
+                                            PersistenceError::MigrationError {
+                                                migration: migration.id.clone(),
+                                                message: err.to_string(),
+                                            }
+                                        })?;
                                     }
-                                })?;
+                                    let now = parse_clock_or_now(
+                                        mysql_conn_query_scalar_params(conn, MYSQL_CLOCK, &[])
+                                            .await,
+                                    );
+                                    let next_order = next_applied_order_mysql(conn).await?;
+                                    let params = [
+                                        DbValue::from(migration.id.as_str()),
+                                        DbValue::from(migration.description.as_str()),
+                                        DbValue::Int(now),
+                                        DbValue::from(migration.checksum().as_str()),
+                                        DbValue::Int(next_order),
+                                    ];
+                                    mysql_conn_execute_params(conn, insert_sql, &params).await?;
+                                    Ok(())
+                                }
+                                .await;
+                                match dml_res {
+                                    Ok(()) => {
+                                        mysql_conn_execute_raw(conn, "COMMIT").await?;
+                                    }
+                                    Err(err) => {
+                                        let _ = mysql_conn_execute_raw(conn, "ROLLBACK").await;
+                                        return Err(err);
+                                    }
+                                }
+                            } else {
+                                if let Some(sql) = &migration.up_sql {
+                                    mysql_conn_execute_raw(conn, sql).await.map_err(|err| {
+                                        PersistenceError::MigrationError {
+                                            migration: migration.id.clone(),
+                                            message: err.to_string(),
+                                        }
+                                    })?;
+                                }
+                                let now = parse_clock_or_now(
+                                    mysql_conn_query_scalar_params(conn, MYSQL_CLOCK, &[]).await,
+                                );
+                                let next_order = next_applied_order_mysql(conn).await?;
+                                let params = [
+                                    DbValue::from(migration.id.as_str()),
+                                    DbValue::from(migration.description.as_str()),
+                                    DbValue::Int(now),
+                                    DbValue::from(migration.checksum().as_str()),
+                                    DbValue::Int(next_order),
+                                ];
+                                mysql_conn_execute_params(conn, insert_sql, &params).await?;
                             }
-                            let now = parse_clock_or_now(
-                                mysql_conn_query_scalar_params(conn, MYSQL_CLOCK, &[]).await,
-                            );
-                            let params = [
-                                DbValue::from(migration.id.as_str()),
-                                DbValue::from(migration.description.as_str()),
-                                DbValue::Int(now),
-                                DbValue::from(migration.checksum().as_str()),
-                            ];
-                            mysql_conn_execute_params(conn, insert_sql, &params).await?;
                             applied.push(migration.id.clone());
                         }
                     }
@@ -653,41 +927,10 @@ impl Migrator {
                 };
             }
 
-            backend.execute(ddl).await?;
-            let mut applied = Vec::new();
-            for migration in &self.migrations {
-                let id_param = [DbValue::from(migration.id.as_str())];
-                let stored_checksum = backend.query_scalar_params(check_sql, &id_param).await?;
-                if let Some(actual) = stored_checksum {
-                    let expected = migration.checksum();
-                    if actual.is_empty() || actual != expected {
-                        return Err(PersistenceError::MigrationChecksumMismatch {
-                            migration: migration.id.clone(),
-                            expected,
-                            actual,
-                        });
-                    }
-                } else {
-                    if let Some(sql) = &migration.up_sql {
-                        backend.execute(sql).await.map_err(|err| {
-                            PersistenceError::MigrationError {
-                                migration: migration.id.clone(),
-                                message: err.to_string(),
-                            }
-                        })?;
-                    }
-                    let now = parse_clock_or_now(backend.query_scalar(MYSQL_CLOCK).await);
-                    let params = [
-                        DbValue::from(migration.id.as_str()),
-                        DbValue::from(migration.description.as_str()),
-                        DbValue::Int(now),
-                        DbValue::from(migration.checksum().as_str()),
-                    ];
-                    backend.execute_params(insert_sql, &params).await?;
-                    applied.push(migration.id.clone());
-                }
-            }
-            return Ok(MigrationSummary { applied });
+            #[cfg(not(feature = "mysql"))]
+            return Err(PersistenceError::TransactionError(
+                "MySQL migrations require the `mysql` feature for session-pinned locking".into(),
+            ));
         }
 
         if dialect == "sqlite" {
@@ -695,6 +938,7 @@ impl Migrator {
             // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
             tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;
+            ensure_applied_order_column_tx(&tx, dialect).await?;
 
             let mut applied = Vec::new();
             for migration in &self.migrations {
@@ -718,21 +962,14 @@ impl Migrator {
                                 message: err.to_string(),
                             })?;
                     }
-                    let now = if let Ok(Some(s)) = tx.query_scalar(SQLITE_CLOCK).await
-                        && let Ok(ts) = s.parse::<u64>()
-                    {
-                        ts
-                    } else {
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs()
-                    };
+                    let now = parse_clock_or_now(tx.query_scalar(SQLITE_CLOCK).await);
+                    let next_order = next_applied_order_tx(&tx).await?;
                     let params = [
                         DbValue::from(migration.id.as_str()),
                         DbValue::from(migration.description.as_str()),
-                        DbValue::Int(now as i64),
+                        DbValue::Int(now),
                         DbValue::from(migration.checksum().as_str()),
+                        DbValue::Int(next_order),
                     ];
                     tx.execute_params(insert_sql, &params).await?;
                     applied.push(migration.id.clone());
@@ -776,18 +1013,20 @@ impl Migrator {
                     && let Ok(Some(s)) = tx.query_scalar(query).await
                     && let Ok(ts) = s.parse::<u64>()
                 {
-                    ts
+                    ts as i64
                 } else {
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .unwrap_or_default()
-                        .as_secs()
+                        .as_secs() as i64
                 };
+                let next_order = next_applied_order_tx(&tx).await?;
                 let params = [
                     DbValue::from(migration.id.as_str()),
                     DbValue::from(migration.description.as_str()),
-                    DbValue::Int(now as i64),
+                    DbValue::Int(now),
                     DbValue::from(migration.checksum().as_str()),
+                    DbValue::Int(next_order),
                 ];
                 tx.execute_params(insert_sql, &params).await?;
                 tx.commit().await?;
@@ -812,51 +1051,81 @@ impl Migrator {
             let tx = backend.begin_transaction().await?;
             tx.execute(PG_ADVISORY_LOCK).await?;
             tx.execute(ddl).await?;
+            ensure_applied_order_column_tx(&tx, dialect).await?;
 
-            for migration in self.migrations.iter().rev() {
+            let applied_rows = fetch_applied_order_rows_tx(&tx).await?;
+            if let Some(migration) = select_rollback_target(&self.migrations, &applied_rows) {
+                let down_sql = migration
+                    .down_sql
+                    .as_deref()
+                    .ok_or_else(|| PersistenceError::IrreversibleMigration(migration.id.clone()))?;
                 let id_param = [DbValue::from(migration.id.as_str())];
-                let applied = tx.query_scalar_params(check_sql, &id_param).await?;
-                if applied.is_some() {
-                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
-                        PersistenceError::IrreversibleMigration(migration.id.clone())
+                tx.execute(down_sql)
+                    .await
+                    .map_err(|err| PersistenceError::MigrationError {
+                        migration: migration.id.clone(),
+                        message: err.to_string(),
                     })?;
-                    tx.execute(down_sql)
-                        .await
-                        .map_err(|err| PersistenceError::MigrationError {
-                            migration: migration.id.clone(),
-                            message: err.to_string(),
-                        })?;
-                    tx.execute_params(delete_sql, &id_param).await?;
-                    tx.commit().await?;
-                    return Ok(Some(migration.id.clone()));
-                }
+                tx.execute_params(delete_sql, &id_param).await?;
+                tx.commit().await?;
+                return Ok(Some(migration.id.clone()));
             }
             tx.commit().await?;
             return Ok(None);
         }
 
         if dialect == "mysql" {
-            // Why: See `run_pending_backend` MySQL branch — MySQL DDL auto-commits per statement,
-            // so `rollback_last_backend` pins one `PoolConnection<MySql>` under `GET_LOCK` and
-            // deletes the `rume_migrations` row immediately after `down_sql`, without
-            // `begin_transaction()` or fake `START TRANSACTION`/`COMMIT`/`ROLLBACK` wrappers.
+            // Why: See `run_pending_backend` MySQL branch — require session-pinned `GET_LOCK`
+            // via `mysql_migration_pool()` before reading or mutating `rume_migrations`, wrap
+            // pure InnoDB DML `down_sql` + ledger delete in a transaction, and run DDL directly.
             #[cfg(feature = "mysql")]
-            if let Some(mysql_backend) =
-                (backend as &dyn std::any::Any).downcast_ref::<crate::persistence::MysqlBackend>()
             {
-                let mut guard = MysqlMigrationLockGuard::acquire(mysql_backend.pool()).await?;
+                let pool = backend.mysql_migration_pool().ok_or_else(|| {
+                    PersistenceError::TransactionError(
+                        "MySQL migrations require a session-pinned migration lock capability (mysql_migration_pool)"
+                            .into(),
+                    )
+                })?;
+                let mut guard = MysqlMigrationLockGuard::acquire(pool).await?;
                 let mut rolled_back = None;
                 let run_res: Result<(), PersistenceError> = async {
-                    let conn = guard.conn_mut();
+                    let conn = guard.conn_mut()?;
                     mysql_conn_execute_raw(conn, ddl).await?;
-                    for migration in self.migrations.iter().rev() {
+                    ensure_applied_order_column_mysql(conn).await?;
+                    let applied_rows = fetch_applied_order_rows_mysql(conn).await?;
+                    if let Some(migration) = select_rollback_target(&self.migrations, &applied_rows)
+                    {
+                        let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
+                            PersistenceError::IrreversibleMigration(migration.id.clone())
+                        })?;
                         let id_param = [DbValue::from(migration.id.as_str())];
-                        let applied =
-                            mysql_conn_query_scalar_params(conn, check_sql, &id_param).await?;
-                        if applied.is_some() {
-                            let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
-                                PersistenceError::IrreversibleMigration(migration.id.clone())
-                            })?;
+                        let is_transactional_dml =
+                            !crate::persistence::backend::mysql_sql_causes_implicit_commit(
+                                down_sql,
+                            )?;
+                        if is_transactional_dml {
+                            mysql_conn_execute_raw(conn, "START TRANSACTION").await?;
+                            let dml_res: Result<(), PersistenceError> = async {
+                                mysql_conn_execute_raw(conn, down_sql)
+                                    .await
+                                    .map_err(|err| PersistenceError::MigrationError {
+                                        migration: migration.id.clone(),
+                                        message: err.to_string(),
+                                    })?;
+                                mysql_conn_execute_params(conn, delete_sql, &id_param).await?;
+                                Ok(())
+                            }
+                            .await;
+                            match dml_res {
+                                Ok(()) => {
+                                    mysql_conn_execute_raw(conn, "COMMIT").await?;
+                                }
+                                Err(err) => {
+                                    let _ = mysql_conn_execute_raw(conn, "ROLLBACK").await;
+                                    return Err(err);
+                                }
+                            }
+                        } else {
                             mysql_conn_execute_raw(conn, down_sql)
                                 .await
                                 .map_err(|err| PersistenceError::MigrationError {
@@ -864,9 +1133,8 @@ impl Migrator {
                                     message: err.to_string(),
                                 })?;
                             mysql_conn_execute_params(conn, delete_sql, &id_param).await?;
-                            rolled_back = Some(migration.id.clone());
-                            break;
                         }
+                        rolled_back = Some(migration.id.clone());
                     }
                     Ok(())
                 }
@@ -884,25 +1152,10 @@ impl Migrator {
                 };
             }
 
-            backend.execute(ddl).await?;
-            for migration in self.migrations.iter().rev() {
-                let id_param = [DbValue::from(migration.id.as_str())];
-                let exists = backend.query_scalar_params(check_sql, &id_param).await?;
-                if exists.is_some() {
-                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
-                        PersistenceError::IrreversibleMigration(migration.id.clone())
-                    })?;
-                    backend.execute(down_sql).await.map_err(|err| {
-                        PersistenceError::MigrationError {
-                            migration: migration.id.clone(),
-                            message: err.to_string(),
-                        }
-                    })?;
-                    backend.execute_params(delete_sql, &id_param).await?;
-                    return Ok(Some(migration.id.clone()));
-                }
-            }
-            return Ok(None);
+            #[cfg(not(feature = "mysql"))]
+            return Err(PersistenceError::TransactionError(
+                "MySQL migrations require the `mysql` feature for session-pinned locking".into(),
+            ));
         }
 
         if dialect == "sqlite" {
@@ -910,24 +1163,24 @@ impl Migrator {
             // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
             tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;
+            ensure_applied_order_column_tx(&tx, dialect).await?;
 
-            for migration in self.migrations.iter().rev() {
+            let applied_rows = fetch_applied_order_rows_tx(&tx).await?;
+            if let Some(migration) = select_rollback_target(&self.migrations, &applied_rows) {
+                let down_sql = migration
+                    .down_sql
+                    .as_deref()
+                    .ok_or_else(|| PersistenceError::IrreversibleMigration(migration.id.clone()))?;
                 let id_param = [DbValue::from(migration.id.as_str())];
-                let applied = tx.query_scalar_params(check_sql, &id_param).await?;
-                if applied.is_some() {
-                    let down_sql = migration.down_sql.as_deref().ok_or_else(|| {
-                        PersistenceError::IrreversibleMigration(migration.id.clone())
+                tx.execute(down_sql)
+                    .await
+                    .map_err(|err| PersistenceError::MigrationError {
+                        migration: migration.id.clone(),
+                        message: err.to_string(),
                     })?;
-                    tx.execute(down_sql)
-                        .await
-                        .map_err(|err| PersistenceError::MigrationError {
-                            migration: migration.id.clone(),
-                            message: err.to_string(),
-                        })?;
-                    tx.execute_params(delete_sql, &id_param).await?;
-                    tx.commit().await?;
-                    return Ok(Some(migration.id.clone()));
-                }
+                tx.execute_params(delete_sql, &id_param).await?;
+                tx.commit().await?;
+                return Ok(Some(migration.id.clone()));
             }
             tx.commit().await?;
             return Ok(None);
@@ -1200,6 +1453,10 @@ mod tests {
             );
             assert_eq!(migrations[0].id, RUME_CORE_MIGRATION_ID);
             assert_eq!(migrations[1].id, RUME_AUDIT_MIGRATION_ID);
+            assert!(
+                migrations[1].down_sql.is_none(),
+                "{dialect} audit migration must be irreversible to protect pre-existing audit history"
+            );
             assert_eq!(migrations[2].id, "20261105_001_app");
         }
 
@@ -1208,45 +1465,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mysql_dialect_non_mysql_backend_mock_runs_and_rolls_back_without_transactions() {
+    async fn mysql_dialect_without_migration_lock_capability_fails_closed_before_mutation() {
         let backend = MockMysqlBackend::default();
-        let migrator = Migrator::new()
-            .add_migration(
-                Migration::from_sql("001_first", "first", "CREATE TABLE t1 (id INT);")
-                    .with_down("DROP TABLE t1;"),
-            )
-            .add_migration(Migration::from_sql(
-                "002_fail",
-                "second fails",
-                "CREATE TABLE t2 (id INT); FAIL_MIGRATION;",
-            ));
-
-        let err = migrator
-            .run_pending_backend(&backend)
-            .await
-            .expect_err("second migration must fail");
-        assert!(matches!(
-            err,
-            PersistenceError::MigrationError { ref migration, .. } if migration == "002_fail"
-        ));
-        assert_eq!(*backend.begin_tx_calls.lock().unwrap(), 0);
-        assert!(backend.ledger.lock().unwrap().contains_key("001_first"));
-        assert!(!backend.ledger.lock().unwrap().contains_key("002_fail"));
-
-        let executed = backend.executed_sql.lock().unwrap().clone();
-        assert!(
-            !executed
-                .iter()
-                .any(|s| { matches!(s.trim(), "START TRANSACTION" | "COMMIT" | "ROLLBACK") }),
-            "MySQL migration runner must not execute START TRANSACTION/COMMIT/ROLLBACK: {executed:?}"
+        let migrator = Migrator::new().add_migration(
+            Migration::from_sql("001_first", "first", "CREATE TABLE t1 (id INT);")
+                .with_down("DROP TABLE t1;"),
         );
 
-        let rolled_back = migrator
+        let run_err = migrator
+            .run_pending_backend(&backend)
+            .await
+            .expect_err("MySQL backend without migration lock capability must fail closed");
+        assert!(matches!(run_err, PersistenceError::TransactionError(_)));
+        assert!(
+            backend.executed_sql.lock().unwrap().is_empty(),
+            "no SQL must execute before acquiring MySQL migration lock"
+        );
+        assert!(backend.ledger.lock().unwrap().is_empty());
+
+        let rb_err = migrator
             .rollback_last_backend(&backend)
             .await
-            .expect("rollback of 001_first should succeed without begin_transaction");
-        assert_eq!(rolled_back.as_deref(), Some("001_first"));
-        assert_eq!(*backend.begin_tx_calls.lock().unwrap(), 0);
-        assert!(!backend.ledger.lock().unwrap().contains_key("001_first"));
+            .expect_err("MySQL rollback without migration lock capability must fail closed");
+        assert!(matches!(rb_err, PersistenceError::TransactionError(_)));
+        assert!(
+            backend.executed_sql.lock().unwrap().is_empty(),
+            "no SQL must execute during unlocked MySQL rollback"
+        );
+    }
+
+    #[test]
+    fn select_rollback_target_prefers_actual_application_order_over_registry_order() {
+        let migrations = vec![
+            Migration::from_sql("core", "core", "SELECT 1;"),
+            Migration::from_sql("audit", "audit", "SELECT 1;"),
+            Migration::from_sql("app_a", "app_a", "SELECT 1;"),
+        ];
+
+        // Upgraded DB: core (order 1) and app_a (order 2) applied first, then audit (order 3)
+        // applied in the same second. Even though `audit` precedes `app_a` in `migrations`,
+        // actual application order selects `audit`.
+        let applied = vec![
+            ("audit".to_string(), 3, 1700000000),
+            ("app_a".to_string(), 2, 1700000000),
+            ("core".to_string(), 1, 1700000000),
+        ];
+        let target = select_rollback_target(&migrations, &applied).expect("target present");
+        assert_eq!(target.id, "audit");
     }
 }

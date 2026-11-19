@@ -2813,9 +2813,14 @@ mod tests {
         });
 
         let worker = JobWorker::new(queue, Arc::new(registry)).with_concurrency(32);
+        // Register the waiter before starting the worker so `notify_waiters()` cannot
+        // fire before the future is armed.
+        let started = hanging_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
         let handle = worker.start();
 
-        tokio::time::timeout(Duration::from_secs(5), hanging_started.notified())
+        tokio::time::timeout(Duration::from_secs(5), started)
             .await
             .expect("hanging job must start");
 

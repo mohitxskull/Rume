@@ -593,43 +593,136 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
         Some("0")
     );
 
-    // Roll back 20261104_002_rume_audit_schema first.
-    let rb_audit = migrator.rollback_last_backend(&backend).await.unwrap();
-    assert_eq!(
-        rb_audit.as_deref(),
-        Some(rume::persistence::migration::RUME_AUDIT_MIGRATION_ID)
-    );
+    // Rolling back 20261104_002_rume_audit_schema must fail closed as IrreversibleMigration
+    // so pre-existing audit history is never dropped (#13).
+    let rb_audit_err = migrator
+        .rollback_last_backend(&backend)
+        .await
+        .expect_err("audit migration must be irreversible");
     assert!(
+        matches!(
+            rb_audit_err,
+            rume::persistence::PersistenceError::IrreversibleMigration(ref id)
+                if id == rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
+        ),
+        "expected IrreversibleMigration for audit schema, got {rb_audit_err:?}"
+    );
+    assert_eq!(
         backend
             .query_scalar("SELECT count(*) FROM rume_audit_log")
             .await
-            .is_err(),
-        "rume_audit_log must be dropped on audit rollback"
+            .unwrap()
+            .as_deref(),
+        Some("0"),
+        "rume_audit_log must survive rejected rollback"
     );
+
+    // Upgrade scenario: pre-existing rume_audit_log populated via SqlAuditLogger::init_table()
+    // plus an already-applied app migration before upgrading to with_rume_core (#13 & #17).
+    let upgrade_backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+    upgrade_backend
+        .execute(rume::persistence::sql::SQLITE_AUDIT_SCHEMA)
+        .await
+        .expect("pre-create rume_audit_log");
+    upgrade_backend
+        .record_audit_log(
+            "pre-upgrade-1",
+            "login",
+            "session",
+            "ok",
+            Some("alice"),
+            None,
+            None,
+            "{}",
+            1700000000,
+        )
+        .await
+        .expect("seed pre-existing audit record");
+
+    let app_m = Migration::from_sql(
+        "20261105_001_app_items",
+        "App items table",
+        "CREATE TABLE app_items (id INTEGER PRIMARY KEY);",
+    )
+    .with_down("DROP TABLE app_items;");
+    // Apply app_m first on the pre-upgrade DB.
+    Migrator::new()
+        .add_migration(app_m.clone())
+        .run_pending_backend(&upgrade_backend)
+        .await
+        .expect("apply pre-upgrade app migration");
+
+    // Upgrade to with_rume_core + app_m: core and audit apply AFTER app_m.
+    let upgraded_migrator = Migrator::new()
+        .add_migration(app_m)
+        .with_rume_core("sqlite");
+    let upgraded = upgraded_migrator
+        .run_pending_backend(&upgrade_backend)
+        .await
+        .expect("apply core and audit on upgraded DB");
     assert_eq!(
-        backend
-            .query_scalar("SELECT count(*) FROM rume_outbox")
+        upgraded.applied,
+        vec![
+            rume::persistence::migration::RUME_CORE_MIGRATION_ID.to_string(),
+            rume::persistence::migration::RUME_AUDIT_MIGRATION_ID.to_string(),
+        ]
+    );
+
+    // Rollback must target RUME_AUDIT_MIGRATION_ID (the actually most-recently-applied migration,
+    // NOT app_m!) and fail closed with IrreversibleMigration, keeping both app_items and the
+    // pre-existing audit record intact.
+    let upgrade_rb_err = upgraded_migrator
+        .rollback_last_backend(&upgrade_backend)
+        .await
+        .expect_err("rollback must target most-recently-applied audit migration and fail closed");
+    assert!(matches!(
+        upgrade_rb_err,
+        rume::persistence::PersistenceError::IrreversibleMigration(ref id)
+            if id == rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
+    ));
+    assert_eq!(
+        upgrade_backend
+            .query_scalar("SELECT count(*) FROM rume_audit_log WHERE id = 'pre-upgrade-1'")
             .await
             .unwrap()
             .as_deref(),
-        Some("0")
+        Some("1"),
+        "pre-existing audit record must remain intact"
+    );
+    assert_eq!(
+        upgrade_backend
+            .query_scalar("SELECT count(*) FROM app_items")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0"),
+        "earlier app_items migration must not be rolled back ahead of audit"
     );
 
-    // Roll back 20261104_001_rume_core_schemas next; ledger table must survive with 0 rows.
-    let rb_core = migrator.rollback_last_backend(&backend).await.unwrap();
+    // Core-only rollback still preserves rume_migrations ledger with 0 rows.
+    let core_only_backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+    let core_only = Migrator::new().add_migration(migrator.migrations()[0].clone());
+    core_only
+        .run_pending_backend(&core_only_backend)
+        .await
+        .expect("apply core only");
+    let rb_core = core_only
+        .rollback_last_backend(&core_only_backend)
+        .await
+        .unwrap();
     assert_eq!(
         rb_core.as_deref(),
         Some(rume::persistence::migration::RUME_CORE_MIGRATION_ID)
     );
     assert!(
-        backend
+        core_only_backend
             .query_scalar("SELECT count(*) FROM rume_outbox")
             .await
             .is_err(),
         "rume_outbox must be dropped on core rollback"
     );
     assert_eq!(
-        backend
+        core_only_backend
             .query_scalar("SELECT count(*) FROM rume_migrations")
             .await
             .unwrap()
@@ -638,14 +731,17 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
         "rume_migrations ledger must remain queryable with 0 rows after full rollback"
     );
     assert!(
-        migrator
-            .applied_migrations(&backend)
+        core_only
+            .applied_migrations(&core_only_backend)
             .await
             .unwrap()
             .is_empty()
     );
     assert_eq!(
-        migrator.rollback_last_backend(&backend).await.unwrap(),
+        core_only
+            .rollback_last_backend(&core_only_backend)
+            .await
+            .unwrap(),
         None
     );
 }

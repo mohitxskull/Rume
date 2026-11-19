@@ -269,6 +269,17 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
         "default"
     }
 
+    /// Returns the underlying MySQL pool when this backend (or a wrapper around it)
+    /// supports session-pinned `GET_LOCK`/`RELEASE_LOCK` migration locking.
+    ///
+    /// Wrappers around [`crate::persistence::MysqlBackend`] MUST forward this method so
+    /// [`crate::persistence::Migrator`] acquires the database-wide migration lock before
+    /// reading or mutating `rume_migrations`.
+    #[cfg(feature = "mysql")]
+    fn mysql_migration_pool(&self) -> Option<&sqlx::MySqlPool> {
+        None
+    }
+
     /// Records an audit log event using parameterized query binding.
     #[allow(clippy::too_many_arguments)]
     fn record_audit_log(
@@ -347,6 +358,101 @@ fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), Persistence
     Ok(())
 }
 
+/// Scans `statement` into top-level statement leading-word triples (up to 3 uppercased
+/// unquoted words per statement), keeping semicolons inside compound SQL bodies
+/// (`CREATE TRIGGER ... BEGIN ...; END;` in SQLite and `CREATE FUNCTION/PROCEDURE ...
+/// BEGIN ATOMIC ...; END;` in PostgreSQL) attached to the enclosing `CREATE` statement
+/// rather than splitting them into bogus top-level `END` statements.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+fn collect_top_level_statement_heads(
+    statement: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Result<Vec<Vec<String>>, PersistenceError> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    let tokens: Vec<Token> = Tokenizer::new(dialect, statement)
+        .tokenize()
+        .map_err(|e| {
+            PersistenceError::TransactionError(format!("failed to tokenize SQL statement: {e}"))
+        })?
+        .into_iter()
+        .filter(|tok| !matches!(tok, Token::Whitespace(_)))
+        .collect();
+
+    let mut heads: Vec<Vec<String>> = Vec::new();
+    let mut leading_words: Vec<String> = Vec::with_capacity(3);
+    let mut block_depth: usize = 0;
+
+    let mut i = 0;
+    while i < tokens.len() {
+        match &tokens[i] {
+            Token::SemiColon => {
+                if block_depth == 0 && !leading_words.is_empty() {
+                    heads.push(std::mem::take(&mut leading_words));
+                }
+            }
+            Token::Word(word) if word.quote_style.is_none() => {
+                let upper = word.value.to_ascii_uppercase();
+                if block_depth == 0 {
+                    if leading_words.len() < 3 {
+                        leading_words.push(upper.clone());
+                    }
+                    // Enter a compound body only when `BEGIN` appears inside an already-started
+                    // `CREATE` statement (e.g. SQLite `CREATE TRIGGER ... BEGIN ... END;` or
+                    // PostgreSQL `CREATE FUNCTION ... BEGIN ATOMIC ... END;`). A standalone
+                    // `BEGIN` at statement start stays at `block_depth == 0` so it is caught
+                    // as transaction control.
+                    if upper == "BEGIN"
+                        && leading_words.first().map(String::as_str) == Some("CREATE")
+                    {
+                        block_depth = 1;
+                    }
+                } else {
+                    match upper.as_str() {
+                        "BEGIN" | "CASE" => {
+                            block_depth += 1;
+                        }
+                        "END" => {
+                            // Do not decrement for `END IF` / `END LOOP` / `END WHILE` / `END REPEAT`
+                            // because we only increment for `BEGIN` and `CASE`.
+                            let next_is_non_block_closer = matches!(
+                                tokens.get(i + 1),
+                                Some(Token::Word(next))
+                                    if next.quote_style.is_none()
+                                        && matches!(
+                                            next.value.to_ascii_uppercase().as_str(),
+                                            "IF" | "LOOP" | "WHILE" | "REPEAT"
+                                        )
+                            );
+                            if !next_is_non_block_closer {
+                                block_depth = block_depth.saturating_sub(1);
+                                // Consume optional `END CASE` pair without double-processing.
+                                if matches!(
+                                    tokens.get(i + 1),
+                                    Some(Token::Word(next))
+                                        if next.quote_style.is_none()
+                                            && next.value.eq_ignore_ascii_case("CASE")
+                                ) {
+                                    i += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    if !leading_words.is_empty() {
+        heads.push(leading_words);
+    }
+
+    Ok(heads)
+}
+
 /// Rejects top-level transaction-control statements in a raw SQL batch so a managed
 /// [`DatabaseTransaction`] cannot be committed or rolled back out-of-band.
 ///
@@ -360,28 +466,56 @@ pub(crate) fn validate_managed_transaction_sql(
     statement: &str,
     dialect: &dyn sqlparser::dialect::Dialect,
 ) -> Result<(), PersistenceError> {
-    use sqlparser::tokenizer::{Token, Tokenizer};
+    for words in collect_top_level_statement_heads(statement, dialect)? {
+        check_managed_tx_control_keywords(&words)?;
+    }
+    Ok(())
+}
 
-    let tokens = Tokenizer::new(dialect, statement).tokenize().map_err(|e| {
-        PersistenceError::TransactionError(format!("failed to tokenize SQL statement: {e}"))
-    })?;
+/// Returns `true` if a top-level statement head causes an implicit commit in MySQL
+/// (MySQL 8.4 Ref Manual §15.3.3). `CREATE TEMPORARY TABLE` and `DROP TEMPORARY TABLE`
+/// do NOT cause an implicit commit and are allowed.
+#[cfg(any(feature = "mysql", test))]
+fn is_mysql_implicit_commit_head(words: &[String]) -> bool {
+    let Some(first) = words.first().map(String::as_str) else {
+        return false;
+    };
+    let second = words.get(1).map(String::as_str);
+    match first {
+        "CREATE" | "DROP" => second != Some("TEMPORARY"),
+        "ALTER" | "TRUNCATE" | "RENAME" | "LOCK" | "UNLOCK" | "LOAD" | "GRANT" | "REVOKE"
+        | "ANALYZE" | "CACHE" | "CHECK" | "FLUSH" | "OPTIMIZE" | "REPAIR" | "RESET" | "INSTALL"
+        | "UNINSTALL" | "XA" => true,
+        "SET" => second == Some("PASSWORD"),
+        _ => false,
+    }
+}
 
-    let mut leading_words: Vec<String> = Vec::with_capacity(3);
-    for token in tokens {
-        match token {
-            Token::Whitespace(_) => {}
-            Token::SemiColon => {
-                check_managed_tx_control_keywords(&leading_words)?;
-                leading_words.clear();
-            }
-            Token::Word(word) if word.quote_style.is_none() && leading_words.len() < 3 => {
-                leading_words.push(word.value.to_ascii_uppercase());
-            }
-            _ => {}
+/// Returns `true` if `statement` contains any MySQL implicit-commit statement (e.g. DDL).
+#[cfg(any(feature = "mysql", test))]
+pub(crate) fn mysql_sql_causes_implicit_commit(statement: &str) -> Result<bool, PersistenceError> {
+    let heads = collect_top_level_statement_heads(statement, &sqlparser::dialect::MySqlDialect {})?;
+    Ok(heads.iter().any(|w| is_mysql_implicit_commit_head(w)))
+}
+
+/// Validates raw SQL executed inside a managed MySQL transaction, rejecting both explicit
+/// transaction-control statements and MySQL implicit-commit statements (such as `CREATE TABLE`,
+/// `ALTER TABLE`, `DROP TABLE`) that would silently commit pending InnoDB updates on the server.
+#[cfg(any(feature = "mysql", test))]
+pub(crate) fn validate_managed_mysql_transaction_sql(
+    statement: &str,
+) -> Result<(), PersistenceError> {
+    let heads = collect_top_level_statement_heads(statement, &sqlparser::dialect::MySqlDialect {})?;
+    for words in &heads {
+        check_managed_tx_control_keywords(words)?;
+        if is_mysql_implicit_commit_head(words) {
+            let first = words.first().map(String::as_str).unwrap_or("DDL");
+            return Err(PersistenceError::TransactionError(format!(
+                "MySQL implicit-commit statement '{first}' is not allowed inside a managed transaction; execute DDL on MysqlBackend directly"
+            )));
         }
     }
-
-    check_managed_tx_control_keywords(&leading_words)
+    Ok(())
 }
 
 /// Active transaction handle providing isolated mutation and explicit commit/rollback.
@@ -677,6 +811,86 @@ mod data_sql_scanners_proptests {
             let pg_double_quote = format!("SELECT \"{kw}\" FROM t;");
             prop_assert!(validate_managed_transaction_sql(&pg_dollar, &pg).is_ok());
             prop_assert!(validate_managed_transaction_sql(&pg_double_quote, &pg).is_ok());
+        }
+    }
+
+    #[test]
+    fn validate_managed_transaction_sql_allows_compound_bodies_and_rejects_trailing_tx_control() {
+        let sqlite = SQLiteDialect {};
+        let pg = PostgreSqlDialect {};
+
+        let sqlite_trigger = r#"
+            CREATE TRIGGER trg_audit AFTER INSERT ON items
+            BEGIN
+                INSERT INTO audit(msg) VALUES (CASE WHEN NEW.id > 0 THEN 'pos' ELSE 'neg' END);
+                UPDATE stats SET cnt = cnt + 1;
+            END;
+        "#;
+        assert!(
+            validate_managed_transaction_sql(sqlite_trigger, &sqlite).is_ok(),
+            "valid SQLite CREATE TRIGGER body must be accepted"
+        );
+        let sqlite_trigger_then_commit = format!("{sqlite_trigger}\nCOMMIT;");
+        assert!(
+            matches!(
+                validate_managed_transaction_sql(&sqlite_trigger_then_commit, &sqlite),
+                Err(PersistenceError::TransactionError(_))
+            ),
+            "trailing COMMIT after SQLite trigger body must be rejected"
+        );
+
+        let pg_atomic_fn = r#"
+            CREATE OR REPLACE FUNCTION add_one(x INT) RETURNS INT
+            LANGUAGE SQL
+            BEGIN ATOMIC
+                SELECT x + 1;
+            END;
+        "#;
+        assert!(
+            validate_managed_transaction_sql(pg_atomic_fn, &pg).is_ok(),
+            "valid PostgreSQL BEGIN ATOMIC function body must be accepted"
+        );
+        let pg_fn_then_rollback = format!("{pg_atomic_fn}\nROLLBACK;");
+        assert!(
+            matches!(
+                validate_managed_transaction_sql(&pg_fn_then_rollback, &pg),
+                Err(PersistenceError::TransactionError(_))
+            ),
+            "trailing ROLLBACK after PostgreSQL BEGIN ATOMIC body must be rejected"
+        );
+    }
+
+    #[test]
+    fn validate_managed_mysql_transaction_sql_rejects_implicit_commit_ddl_and_allows_dml() {
+        for ddl in [
+            "CREATE TABLE t (id INT)",
+            "ALTER TABLE t ADD COLUMN x INT",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "LOCK TABLES t WRITE",
+            "INSERT INTO t VALUES (1); CREATE TABLE t2 (id INT);",
+        ] {
+            assert!(
+                matches!(
+                    validate_managed_mysql_transaction_sql(ddl),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "MySQL implicit-commit statement must be rejected in managed tx: {ddl}"
+            );
+            assert!(mysql_sql_causes_implicit_commit(ddl).unwrap());
+        }
+
+        for allowed in [
+            "INSERT INTO t VALUES (1); UPDATE t SET v = 2 WHERE id = 1;",
+            "DELETE FROM t WHERE id = 1",
+            "CREATE TEMPORARY TABLE tmp_t (id INT); DROP TEMPORARY TABLE tmp_t;",
+            "SAVEPOINT sp1; ROLLBACK TO SAVEPOINT sp1;",
+        ] {
+            assert!(
+                validate_managed_mysql_transaction_sql(allowed).is_ok(),
+                "transactional MySQL DML/temp-table must be allowed: {allowed}"
+            );
+            assert!(!mysql_sql_causes_implicit_commit(allowed).unwrap());
         }
     }
 }

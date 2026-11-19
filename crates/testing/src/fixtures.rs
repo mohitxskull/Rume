@@ -7,6 +7,23 @@ use rume_data::persistence::{DatabaseBackend, DatabasePool};
 use rume_data::persistence::{DatabaseTransaction, PersistenceError};
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+/// RAII tracker decremented when a transaction owned by a schema fixture finishes
+/// committing or rolling back (including inside a background rollback task).
+struct PendingTxGuard {
+    counter: Arc<AtomicUsize>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl Drop for PendingTxGuard {
+    fn drop(&mut self) {
+        if self.counter.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.notify.notify_waiters();
+        }
+    }
+}
 
 /// An RAII transaction guard that automatically rolls back the transaction on Drop
 /// unless explicitly committed.
@@ -18,6 +35,7 @@ use std::path::{Path, PathBuf};
 pub struct TestTransactionFixture<T: DatabaseTransaction + 'static> {
     tx: Option<T>,
     committed: bool,
+    pending_guard: Option<PendingTxGuard>,
 }
 
 impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
@@ -26,6 +44,21 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
         Self {
             tx: Some(tx),
             committed: false,
+            pending_guard: None,
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    fn with_pending_guard(
+        tx: T,
+        counter: Arc<AtomicUsize>,
+        notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        counter.fetch_add(1, Ordering::AcqRel);
+        Self {
+            tx: Some(tx),
+            committed: false,
+            pending_guard: Some(PendingTxGuard { counter, notify }),
         }
     }
 
@@ -36,6 +69,7 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
 
     /// Atomically commits the transaction, consuming the fixture and preventing rollback on Drop.
     pub async fn commit(mut self) -> Result<(), PersistenceError> {
+        let _guard = self.pending_guard.take();
         if let Some(tx) = self.tx.take() {
             self.committed = true;
             tx.commit().await?;
@@ -45,6 +79,7 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
 
     /// Discards and rolls back the transaction explicitly, awaiting completion.
     pub async fn rollback(mut self) -> Result<(), PersistenceError> {
+        let _guard = self.pending_guard.take();
         if let Some(tx) = self.tx.take() {
             tx.rollback().await?;
         }
@@ -109,10 +144,14 @@ impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
                 Ok(handle) => {
                     // Why: Outer-reactor TCP sockets (`postgres`, `mysql`) on a `current_thread`
                     // runtime cannot be driven by a joined helper thread because blocking the sole
-                    // test thread halts `epoll_wait` and deadlocks. Fall back to `handle.spawn`;
-                    // callers requiring synchronous drop barriers must use
-                    // `#[tokio::test(flavor = "multi_thread")]` or `.rollback().await`.
+                    // test thread halts `epoll_wait` and deadlocks. Fall back to `handle.spawn` and
+                    // move `pending_guard` into the task so any owning `PostgresSchemaFixture` knows
+                    // a rollback is still pending on this executor; callers requiring synchronous
+                    // drop barriers must use `#[tokio::test(flavor = "multi_thread")]` or
+                    // `.rollback().await`.
+                    let pending_guard = self.pending_guard.take();
                     handle.spawn(async move {
+                        let _guard = pending_guard;
                         let _ = tx.rollback().await;
                     });
                 }
@@ -228,16 +267,21 @@ impl Drop for SqliteTestFixture {
 /// An isolated PostgreSQL test fixture utilizing a unique dedicated schema per test.
 ///
 /// Dropping this fixture without calling [`PostgresSchemaFixture::close`] executes
-/// `DROP SCHEMA IF EXISTS ... CASCADE` synchronously (5s timeout): via `block_in_place` on
-/// multi-thread Tokio runtimes, or via a fresh 1-connection `PostgresBackend` on an isolated
-/// helper thread on `current_thread` runtimes. Any [`TestTransactionFixture`] created from this
-/// fixture on a `current_thread` runtime still requires explicit `.rollback().await` or
-/// `#[tokio::test(flavor = "multi_thread")]` for synchronous transaction-drop barriers.
+/// `DROP SCHEMA IF EXISTS ... CASCADE` (5s timeout):
+/// - On multi-thread Tokio runtimes: synchronously via `block_in_place`.
+/// - On `current_thread` runtimes with no pending [`TestTransactionFixture`] rollbacks:
+///   synchronously via a fresh 1-connection `PostgresBackend` on an isolated helper thread.
+/// - On `current_thread` runtimes while a transaction created via [`Self::begin_test_tx`] is
+///   still open or rolling back asynchronously: asynchronously on the active runtime after
+///   pending rollbacks release schema locks, avoiding deadlocking the single-threaded executor.
+///   Callers requiring a synchronous barrier in that case must call [`Self::close`].
 #[cfg(feature = "postgres")]
 pub struct PostgresSchemaFixture {
     schema_name: String,
     pool: DatabasePool<rume_data::persistence::PostgresBackend>,
     admin_pool: Option<DatabasePool<rume_data::persistence::PostgresBackend>>,
+    pending_txs: Arc<AtomicUsize>,
+    tx_done_notify: Arc<tokio::sync::Notify>,
     closed: bool,
 }
 
@@ -270,6 +314,8 @@ impl PostgresSchemaFixture {
             schema_name,
             pool,
             admin_pool: Some(admin_pool.clone()),
+            pending_txs: Arc::new(AtomicUsize::new(0)),
+            tx_done_notify: Arc::new(tokio::sync::Notify::new()),
             closed: false,
         })
     }
@@ -290,7 +336,11 @@ impl PostgresSchemaFixture {
     ) -> Result<TestTransactionFixture<rume_data::persistence::PostgresTransaction>, PersistenceError>
     {
         let tx = self.pool.backend().begin_transaction().await?;
-        Ok(TestTransactionFixture::new(tx))
+        Ok(TestTransactionFixture::with_pending_guard(
+            tx,
+            Arc::clone(&self.pending_txs),
+            Arc::clone(&self.tx_done_notify),
+        ))
     }
 
     /// Explicitly drains the pool and drops the schema, returning any cleanup errors to the test runner.
@@ -348,6 +398,31 @@ impl Drop for PostgresSchemaFixture {
                             timeout,
                             admin.backend().execute(&drop_sql),
                         ));
+                    });
+                }
+                Ok(handle) if self.pending_txs.load(Ordering::Acquire) > 0 => {
+                    // Why: on a `current_thread` runtime, an uncommitted transaction created
+                    // from this fixture queues its rollback on `handle`. Blocking this thread
+                    // in a `.join()` would prevent that rollback task from running, causing
+                    // `DROP SCHEMA ... CASCADE` to wait on the transaction's table locks until
+                    // the 5s timeout expires. Defer teardown onto `handle` so rollback runs
+                    // first and releases schema locks before dropping the schema.
+                    let pending_txs = Arc::clone(&self.pending_txs);
+                    let tx_done_notify = Arc::clone(&self.tx_done_notify);
+                    handle.spawn(async move {
+                        let _ = tokio::time::timeout(timeout, async move {
+                            while pending_txs.load(Ordering::Acquire) > 0 {
+                                let notified = tx_done_notify.notified();
+                                tokio::pin!(notified);
+                                notified.as_mut().enable();
+                                if pending_txs.load(Ordering::Acquire) == 0 {
+                                    break;
+                                }
+                                notified.await;
+                            }
+                            let _ = admin.backend().execute(&drop_sql).await;
+                        })
+                        .await;
                     });
                 }
                 _ => {
@@ -568,6 +643,90 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_transaction_fixture_multi_thread_sync_rollback() {
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug)]
+        struct DelayedRollbackTx {
+            rolled_back: Arc<AtomicBool>,
+        }
+
+        impl DatabaseTransaction for DelayedRollbackTx {
+            fn dialect(&self) -> &'static str {
+                "postgres"
+            }
+
+            fn execute_params(
+                &self,
+                _sql: &str,
+                _params: &[rume_data::persistence::DbValue],
+            ) -> rume_data::persistence::BoxFuture<'_, Result<u64, PersistenceError>> {
+                Box::pin(async { Ok(0) })
+            }
+
+            fn query_scalar_params(
+                &self,
+                _sql: &str,
+                _params: &[rume_data::persistence::DbValue],
+            ) -> rume_data::persistence::BoxFuture<'_, Result<Option<String>, PersistenceError>>
+            {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn fetch_all(
+                &self,
+                _sql: &str,
+                _params: &[rume_data::persistence::DbValue],
+            ) -> rume_data::persistence::BoxFuture<
+                '_,
+                Result<Vec<rume_data::persistence::DbRow>, PersistenceError>,
+            > {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn fetch_optional(
+                &self,
+                _sql: &str,
+                _params: &[rume_data::persistence::DbValue],
+            ) -> rume_data::persistence::BoxFuture<
+                '_,
+                Result<Option<rume_data::persistence::DbRow>, PersistenceError>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn commit(
+                &self,
+            ) -> rume_data::persistence::BoxFuture<'_, Result<(), PersistenceError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn rollback(
+                &self,
+            ) -> rume_data::persistence::BoxFuture<'_, Result<(), PersistenceError>> {
+                let flag = Arc::clone(&self.rolled_back);
+                Box::pin(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                    flag.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        // 1. Synchronous-barrier proof: check completion flag IMMEDIATELY after `drop`
+        // before any `.await` so a spawn-based async rollback cannot pass by finishing
+        // during a subsequent yield.
+        let rolled_back = Arc::new(AtomicBool::new(false));
+        {
+            let _tx = TestTransactionFixture::new(DelayedRollbackTx {
+                rolled_back: Arc::clone(&rolled_back),
+            });
+        }
+        assert!(
+            rolled_back.load(Ordering::SeqCst),
+            "multi_thread drop must synchronously complete rollback before returning from drop()"
+        );
+
+        // 2. Real SQLite data check.
         let fixture = SqliteTestFixture::create().await.expect("fixture creates");
         fixture
             .pool()
@@ -581,8 +740,6 @@ mod tests {
             tx.execute("INSERT INTO mt_items VALUES (777)")
                 .await
                 .expect("insert in tx");
-            // Drop without commit on multi_thread runtime: `block_in_place` must synchronously
-            // complete rollback before returning from drop(tx).
         }
 
         let count: Option<String> = fixture

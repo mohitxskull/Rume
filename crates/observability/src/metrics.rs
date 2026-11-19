@@ -1,6 +1,6 @@
 //! OpenTelemetry metrics collection, registry, and Tower middleware.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -157,6 +157,7 @@ impl std::fmt::Debug for MetricsRegistry {
 struct Inner {
     manual_reader: Arc<ManualReader>,
     meter_provider: SdkMeterProvider,
+    shut_down: AtomicBool,
     #[cfg(feature = "otel")]
     has_otlp_exporter: bool,
     export_lock: Mutex<()>,
@@ -176,10 +177,14 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
         // Why: shut down `meter_provider` explicitly on drop so attached readers release
         // resources cleanly. When `feature = "otel"` attaches a background OTLP periodic
         // exporter and drop happens inside a Tokio runtime, offload shutdown to an OS thread so
-        // it cannot deadlock a `current_thread` runtime.
+        // it cannot deadlock a `current_thread` runtime. Callers that need guaranteed OTLP
+        // delivery before process exit must await `MetricsRegistry::shutdown()` before teardown.
         #[cfg(feature = "otel")]
         if self.has_otlp_exporter && tokio::runtime::Handle::try_current().is_ok() {
             let provider = self.meter_provider.clone();
@@ -299,6 +304,7 @@ impl MetricsRegistry {
             inner: Arc::new(Inner {
                 manual_reader,
                 meter_provider,
+                shut_down: AtomicBool::new(false),
                 #[cfg(feature = "otel")]
                 has_otlp_exporter,
                 export_lock: Mutex::new(()),
@@ -315,6 +321,27 @@ impl MetricsRegistry {
                 health_check_failures_total,
                 pool_exporters: Arc::new(RwLock::new(Vec::new())),
             }),
+        }
+    }
+
+    /// Shuts down the underlying OpenTelemetry `SdkMeterProvider`, flushing any
+    /// pending OTLP metrics on a dedicated OS thread so awaiting this method
+    /// before runtime teardown cannot deadlock a `current_thread` Tokio runtime
+    /// and ensures final OTLP exports complete before process exit.
+    ///
+    /// Subsequent calls (including [`Drop`]) are no-ops.
+    pub async fn shutdown(&self) -> OTelSdkResult {
+        if self.inner.shut_down.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let provider = self.inner.meter_provider.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(provider.shutdown());
+        });
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Ok(()),
         }
     }
 
@@ -961,7 +988,16 @@ mod tests {
             Some(2.0)
         );
 
-        // Must drop cleanly inside current-thread #[tokio::test] without hanging.
+        // Must shut down and drop cleanly inside current-thread #[tokio::test] without hanging.
+        registry
+            .shutdown()
+            .await
+            .expect("explicit async shutdown must succeed");
+        // Idempotent second shutdown call.
+        registry
+            .shutdown()
+            .await
+            .expect("second shutdown must be a no-op");
         drop(registry);
     }
 }

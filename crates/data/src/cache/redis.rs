@@ -135,55 +135,71 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            let mut cmd = redis::cmd("SET");
-            cmd.arg(&k).arg(&value);
-            if let Some(ttl) = ttl {
-                cmd.arg("PX").arg(ttl.as_millis() as u64);
-            }
-
-            cmd.query_async::<()>(&mut *conn)
-                .await
-                .map_err(|e| CacheError::Backend(e.to_string()))?;
-
-            for tk in tag_keys {
-                redis::cmd("SADD")
-                    .arg(&tk)
-                    .arg(&k)
-                    .query_async::<()>(&mut *conn)
+            if tag_keys.is_empty() {
+                let mut cmd = redis::cmd("SET");
+                cmd.arg(&k).arg(&value);
+                if let Some(ttl) = ttl {
+                    cmd.arg("PX").arg(ttl.as_millis().max(1) as u64);
+                }
+                cmd.query_async::<()>(&mut *conn)
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
-
-                let persist_key = format!("{tk}:persist");
-                let tag_ttl_arg: i64 = match ttl {
-                    Some(t) => (t.as_millis() as i64).saturating_add(3_600_000),
-                    None => -1,
-                };
-
-                let script = r#"
-                    local new_ttl = tonumber(ARGV[1])
-                    if new_ttl < 0 then
-                        redis.call('SET', KEYS[2], '1')
-                        redis.call('PERSIST', KEYS[1])
-                        return 1
-                    end
-                    if redis.call('EXISTS', KEYS[2]) == 1 then
-                        redis.call('PERSIST', KEYS[1])
-                        return 1
-                    end
-                    local cur = redis.call('PTTL', KEYS[1])
-                    if cur == -2 or cur == -1 or cur < new_ttl then
-                        redis.call('PEXPIRE', KEYS[1], new_ttl)
-                    end
-                    return 1
-                "#;
-
-                let _ = redis::Script::new(script)
-                    .key(&tk)
-                    .key(&persist_key)
-                    .arg(tag_ttl_arg)
-                    .invoke_async::<()>(&mut *conn)
-                    .await;
+                return Ok(());
             }
+
+            // Why: publish the value and all of its tag memberships + tag TTL updates inside
+            // one atomic Lua script so cancelling the Rust future mid-flight can never leave
+            // an untagged value visible in Redis that `invalidate_tag` would miss.
+            const SET_WITH_TAGS_SCRIPT: &str = r#"
+                local val_ttl = tonumber(ARGV[2])
+                if val_ttl < 0 then
+                    redis.call('SET', KEYS[1], ARGV[1])
+                else
+                    redis.call('SET', KEYS[1], ARGV[1], 'PX', val_ttl)
+                end
+                local tag_ttl = tonumber(ARGV[3])
+                for i = 2, #KEYS, 2 do
+                    local tk = KEYS[i]
+                    local pk = KEYS[i + 1]
+                    redis.call('SADD', tk, KEYS[1])
+                    if tag_ttl < 0 then
+                        redis.call('SET', pk, '1')
+                        redis.call('PERSIST', tk)
+                    elseif redis.call('EXISTS', pk) == 1 then
+                        redis.call('PERSIST', tk)
+                    else
+                        local cur = redis.call('PTTL', tk)
+                        if cur == -2 or cur == -1 or cur < tag_ttl then
+                            redis.call('PEXPIRE', tk, tag_ttl)
+                        end
+                    end
+                end
+                return 1
+            "#;
+
+            let val_ttl_arg: i64 = match ttl {
+                Some(t) => i64::try_from(t.as_millis().max(1)).unwrap_or(i64::MAX),
+                None => -1,
+            };
+            let tag_ttl_arg: i64 = match ttl {
+                Some(t) => (t.as_millis().max(1) as i64).saturating_add(3_600_000),
+                None => -1,
+            };
+
+            let script = redis::Script::new(SET_WITH_TAGS_SCRIPT);
+            let mut invocation = script.prepare_invoke();
+            invocation.key(&k);
+            for tk in &tag_keys {
+                let persist_key = format!("{tk}:persist");
+                invocation.key(tk).key(persist_key);
+            }
+            invocation
+                .arg(&value)
+                .arg(val_ttl_arg)
+                .arg(tag_ttl_arg)
+                .invoke_async::<()>(&mut *conn)
+                .await
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
 
             Ok(())
         })

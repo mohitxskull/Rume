@@ -40,51 +40,67 @@ fn crash_harness_binary() -> std::path::PathBuf {
 
     static BUILT_BIN: OnceLock<PathBuf> = OnceLock::new();
 
-    // Why: `rume-crash-harness` was extracted out of `crates/core` into its own `publish = false`
-    // workspace crate (`crates/crash-harness`), so Cargo does not set
-    // `CARGO_BIN_EXE_rume-crash-harness` when running `rume` container tests.
+    // Why: `rume-crash` was extracted out of `crates/core` into its own `publish = false`
+    // workspace crate (`crates/crash`), so Cargo does not set
+    // `CARGO_BIN_EXE_rume-crash` when running `rume` container tests.
     // `OnceLock` compiles the harness once per test binary invocation into the active
     // `target/<profile>` directory so parallel tests do not race on builds.
-    if let Ok(bin) = std::env::var("CARGO_BIN_EXE_rume-crash-harness") {
+    if let Ok(bin) = std::env::var("CARGO_BIN_EXE_rume-crash") {
         return PathBuf::from(bin);
     }
 
     BUILT_BIN
         .get_or_init(|| {
-            let exe = std::env::current_exe().expect("resolve current test executable path");
-            let profile_dir = exe
-                .parent()
-                .and_then(|deps| deps.parent())
-                .expect("test executable must live under target/<profile>/deps");
-            let bin_name = format!("rume-crash-harness{}", std::env::consts::EXE_SUFFIX);
-            let bin_path = profile_dir.join(bin_name);
-
             let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
             let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
             let mut cmd = Command::new(cargo);
             cmd.current_dir(&workspace_root).args([
                 "build",
                 "-p",
-                "rume-crash-harness",
+                "rume-crash",
                 "--bin",
-                "rume-crash-harness",
+                "rume-crash",
+                "--message-format=json-render-diagnostics",
             ]);
             if !cfg!(debug_assertions) {
                 cmd.arg("--release");
             }
 
-            let output = cmd
-                .output()
-                .expect("invoke cargo build for rume-crash-harness");
+            let output = cmd.output().expect("invoke cargo build for rume-crash");
             assert!(
                 output.status.success(),
-                "cargo build -p rume-crash-harness failed ({}): {}",
+                "cargo build -p rume-crash failed ({}): {}",
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
+
+            // Why: parsing Cargo's JSON artifact stream returns the exact executable path
+            // produced by the nested build, even when the outer test invocation used a
+            // custom `--target-dir` that the nested `cargo build` does not inherit.
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let bin_path = stdout
+                .lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .filter(|msg| {
+                    msg.get("reason").and_then(|v| v.as_str()) == Some("compiler-artifact")
+                })
+                .filter(|msg| {
+                    msg.get("target")
+                        .and_then(|t| t.get("name"))
+                        .and_then(|n| n.as_str())
+                        == Some("rume-crash")
+                })
+                .filter_map(|msg| {
+                    msg.get("executable")
+                        .and_then(|e| e.as_str())
+                        .map(PathBuf::from)
+                })
+                .next_back()
+                .expect("cargo build did not report a rume-crash executable artifact");
+
             assert!(
                 bin_path.is_file(),
-                "expected rume-crash-harness binary at {}",
+                "expected rume-crash binary at {}",
                 bin_path.display()
             );
             bin_path

@@ -15,17 +15,28 @@ use crate::cache::config::CacheConfig;
 use crate::cache::error::CacheError;
 use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
 
+struct SingleflightState {
+    notify: Arc<tokio::sync::Notify>,
+    succeeded: AtomicBool,
+}
+
 /// Why: `std::sync::Mutex` is used (and never held across `.await`) instead of
 /// `tokio::sync::Mutex` so [`SingleflightLeaderGuard::drop`] can unconditionally lock and
 /// remove the flight slot on error, panic, or future cancellation; `tokio::sync::Mutex::try_lock`
 /// in synchronous `Drop` could lose contention and leave followers stranded forever. Revisit if
 /// Rust stabilizes async `Drop` or singleflight moves to a lock-free concurrent map.
-type SingleflightMap = Arc<std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Notify>>>>;
+type SingleflightMap = Arc<std::sync::Mutex<BTreeMap<String, Arc<SingleflightState>>>>;
 
 struct SingleflightLeaderGuard {
     singleflight: SingleflightMap,
     key: String,
-    notify: Arc<tokio::sync::Notify>,
+    state: Arc<SingleflightState>,
+}
+
+impl SingleflightLeaderGuard {
+    fn mark_succeeded(&self) {
+        self.state.succeeded.store(true, Ordering::Release);
+    }
 }
 
 impl Drop for SingleflightLeaderGuard {
@@ -36,21 +47,21 @@ impl Drop for SingleflightLeaderGuard {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Why: verify `Arc::ptr_eq` before removing so a guard can never evict a successor
-            // leader's `Notify` slot if the map entry were ever replaced; notify waiters outside
-            // the lock so woken tasks do not immediately contend on `singleflight`.
+            // leader's `SingleflightState` slot if the map entry were ever replaced; notify
+            // waiters outside the lock so woken tasks do not immediately contend on `singleflight`.
             if let Some(current) = flights.get(&self.key)
-                && Arc::ptr_eq(current, &self.notify)
+                && Arc::ptr_eq(current, &self.state)
             {
                 flights.remove(&self.key);
             }
         }
-        self.notify.notify_waiters();
+        self.state.notify.notify_waiters();
     }
 }
 
 enum FlightSlot {
     Leader(SingleflightLeaderGuard),
-    Follower(tokio::sync::futures::OwnedNotified),
+    Follower(Arc<SingleflightState>, tokio::sync::futures::OwnedNotified),
 }
 
 /// High-level typed cache interface providing JSON serialization, cache-aside patterns, and tag invalidation.
@@ -210,8 +221,7 @@ impl<B: CacheBackend> Cache<B> {
         // Stampede protection: contend for singleflight leadership in a loop so followers woken
         // after a failed, panicked, or cancelled leader re-contend instead of falling through to
         // execute `f` unguarded.
-        let mut waited_as_follower = false;
-        let _leader_guard = loop {
+        let leader_guard = loop {
             let slot = {
                 let mut flights = self
                     .singleflight
@@ -220,43 +230,56 @@ impl<B: CacheBackend> Cache<B> {
                 if let Some(existing) = flights.get(&full_key) {
                     // Register `OwnedNotified` while holding `flights` so `SingleflightLeaderGuard`
                     // cannot call `notify_waiters()` between lookup and registration.
-                    FlightSlot::Follower(Arc::clone(existing).notified_owned())
+                    FlightSlot::Follower(
+                        Arc::clone(existing),
+                        Arc::clone(&existing.notify).notified_owned(),
+                    )
                 } else {
-                    let notify = Arc::new(tokio::sync::Notify::new());
-                    flights.insert(full_key.clone(), Arc::clone(&notify));
+                    let state = Arc::new(SingleflightState {
+                        notify: Arc::new(tokio::sync::Notify::new()),
+                        succeeded: AtomicBool::new(false),
+                    });
+                    flights.insert(full_key.clone(), Arc::clone(&state));
                     FlightSlot::Leader(SingleflightLeaderGuard {
                         singleflight: Arc::clone(&self.singleflight),
                         key: full_key.clone(),
-                        notify,
+                        state,
                     })
                 }
             };
 
             match slot {
                 FlightSlot::Leader(guard) => {
-                    // Why: re-check cache only when promoted after waiting as a follower, closing
-                    // the race where another retried leader populated the cache while this task's
-                    // post-wakeup `get_json` was in-flight, without doubling reads on cold misses.
-                    if waited_as_follower && let Some(cached) = self.get_json::<T>(key).await? {
+                    // Why: always re-check the cache after acquiring leadership so a caller that
+                    // saw a miss and paused before locking `singleflight` does not overwrite a
+                    // value populated in the meantime.
+                    if let Some(cached) = self.get_json::<T>(key).await? {
+                        guard.mark_succeeded();
                         return Ok(cached);
                     }
                     break guard;
                 }
-                FlightSlot::Follower(notified) => {
+                FlightSlot::Follower(state, notified) => {
                     notified.await;
-                    if let Some(cached) = self.get_json::<T>(key).await? {
+                    // Why: only read the backend from followers when the leader actually
+                    // published a value. On leader failure/cancellation, skip the follower read
+                    // and re-contend so only the next single leader queries the backend instead
+                    // of O(N^2) backend reads across failing followers.
+                    if state.succeeded.load(Ordering::Acquire)
+                        && let Some(cached) = self.get_json::<T>(key).await?
+                    {
                         return Ok(cached);
                     }
-                    waited_as_follower = true;
                 }
             }
         };
 
-        // Hold `_leader_guard` across both `f().await` and `set_json_with_tags` so followers wake
+        // Hold `leader_guard` across both `f().await` and `set_json_with_tags` so followers wake
         // only after the cache write completes (or after error/panic/cancellation cleanup).
         let fresh = f().await?;
         self.set_json_with_tags(key, &fresh, tags, ttl).await?;
-        drop(_leader_guard);
+        leader_guard.mark_succeeded();
+        drop(leader_guard);
 
         Ok(fresh)
     }
@@ -466,7 +489,7 @@ mod tests {
         ) -> BoxFuture<'_, Result<(), CacheError>> {
             let should_fail = self
                 .fail_next_sets
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
                     if v > 0 { Some(v - 1) } else { None }
                 })
                 .is_ok();
@@ -787,6 +810,98 @@ mod tests {
                 .try_lock()
                 .expect("singleflight uncontended")
                 .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_failing_leaders_do_not_trigger_quadratic_follower_reads() {
+        let backend = TestCacheBackend::new(0);
+        let cache = Arc::new(Cache::new(backend, CacheConfig::new("memory://test")));
+        let callers = 12usize;
+        let start_barrier = Arc::new(tokio::sync::Barrier::new(callers));
+
+        let mut handles = Vec::with_capacity(callers);
+        for i in 0..callers {
+            let c = Arc::clone(&cache);
+            let b = Arc::clone(&start_barrier);
+            handles.push(tokio::spawn(async move {
+                b.wait().await;
+                c.remember_with_tags::<String, _, _>("all-fail-key", &[], None, || async move {
+                    tokio::task::yield_now().await;
+                    Err(CacheError::Backend(format!("boom-{i}")))
+                })
+                .await
+            }));
+        }
+
+        for h in handles {
+            assert!(h.await.expect("task ok").is_err());
+        }
+
+        // Each caller does at most 2 reads (initial miss + leader recheck when promoted),
+        // never O(N^2) post-wakeup follower reads.
+        let total_gets = cache.backend.get_calls.load(Ordering::SeqCst);
+        assert!(
+            total_gets <= callers * 2,
+            "expected linear <= {} backend reads across {callers} failing callers, got {total_gets}",
+            callers * 2
+        );
+    }
+
+    #[tokio::test]
+    async fn singleflight_cancelled_tagged_write_recovers_with_intact_tag_invalidation() {
+        let backend = InMemoryCacheBackend::new();
+        let cache = Arc::new(Cache::new(backend, CacheConfig::new("memory://test")));
+
+        // Cancel a tagged remember_with_tags while the leader is in-flight; a follower
+        // recovers and publishes the tagged value, and `invalidate_tag` must evict it.
+        let leader_entered = Arc::new(tokio::sync::Notify::new());
+        let entered_clone = Arc::clone(&leader_entered);
+        let c1 = Arc::clone(&cache);
+        let leader = tokio::spawn(async move {
+            c1.remember_with_tags("tagged-k", &["group-a"], None, || async move {
+                entered_clone.notify_waiters();
+                std::future::pending::<Result<String, CacheError>>().await
+            })
+            .await
+        });
+
+        let notified = leader_entered.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        // Wait for leader to enter factory.
+        tokio::task::yield_now().await;
+
+        let c2 = Arc::clone(&cache);
+        let follower = tokio::spawn(async move {
+            c2.remember_with_tags("tagged-k", &["group-a"], None, || async move {
+                Ok::<_, CacheError>("recovered".to_string())
+            })
+            .await
+        });
+
+        settle_followers().await;
+        leader.abort();
+        let _ = leader.await;
+
+        let val = follower
+            .await
+            .expect("follower task ok")
+            .expect("follower recovery ok");
+        assert_eq!(val, "recovered");
+
+        let evicted = cache
+            .invalidate_tag("group-a")
+            .await
+            .expect("invalidate_tag ok");
+        assert_eq!(
+            evicted, 1,
+            "recovered value must be registered under its tag and evicted by invalidate_tag"
+        );
+        assert_eq!(
+            cache.get_json::<String>("tagged-k").await.unwrap(),
+            None,
+            "key must be absent after tag invalidation"
         );
     }
 }

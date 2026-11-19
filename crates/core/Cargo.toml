@@ -62,7 +62,7 @@ schemars = ["rume-foundation/schemars"]
 
 [dev-dependencies]
 # Why: `tokio`, `sqlx`, and `uuid` belong in `[dev-dependencies]` rather than runtime
-# `[dependencies]` after extracting `rume-crash-harness` to `crates/crash-harness`; Cargo
+# `[dependencies]` after extracting `rume-crash` to `crates/crash`; Cargo
 # feature unification propagates backend `sqlx/*` drivers from `rume-data`/`rume-messaging`
 # when tests enable `postgres`, `sqlite`, or `mysql`.
 tokio.workspace = true
