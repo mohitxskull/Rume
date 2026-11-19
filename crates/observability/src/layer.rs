@@ -135,11 +135,10 @@ where
             )
         };
 
-        // Why: call `set_parent(parent_cx)` BEFORE `span.context()` so an incoming W3C parent is
-        // bound before `span.context()` starts the OTel span builder.
-        if parent_cx.span().span_context().is_valid() {
-            let _ = span.set_parent(parent_cx.clone());
-        }
+        // Why: unconditionally call `set_parent(parent_cx)` BEFORE `span.context()` so both
+        // incoming W3C trace parents and baggage-only `parent_cx` contexts (no `traceparent`,
+        // valid `baggage`) are bound before `span.context()` starts the OTel span builder.
+        let _ = span.set_parent(parent_cx.clone());
         let span_cx = {
             let _isolated = opentelemetry::Context::new().attach();
             span.context()
@@ -768,5 +767,55 @@ mod tests {
             .expect("handler must see active TraceContext");
         assert_eq!(handler_tc.trace_id(), trace_id);
         assert_eq!(handler_tc.span_id(), resp_tc.span_id());
+    }
+
+    #[tokio::test]
+    async fn observability_otel_layer_preserves_baggage_only_request_without_traceparent() {
+        use opentelemetry::baggage::BaggageExt as _;
+        use opentelemetry::propagation::TextMapCompositePropagator;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+
+        let composite = TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]);
+        opentelemetry::global::set_text_map_propagator(composite);
+
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("baggage-only-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        let observed_baggage = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let observed_baggage_clone = std::sync::Arc::clone(&observed_baggage);
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
+            let bag_cap = std::sync::Arc::clone(&observed_baggage_clone);
+            async move {
+                let cx = opentelemetry::Context::current();
+                let val = cx.baggage().get("region").map(|v| v.as_str().to_string());
+                *bag_cap.lock().unwrap() = val;
+                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+            }
+        }));
+
+        let req = Request::builder()
+            .uri("/baggage-only")
+            .header("baggage", "region=west")
+            .body(Body::empty())
+            .unwrap();
+
+        let _resp = svc.call(req).await.unwrap();
+        assert_eq!(
+            observed_baggage.lock().unwrap().as_deref(),
+            Some("west"),
+            "OpenTelemetryLayer execution context must retain baggage on requests without traceparent"
+        );
     }
 }
