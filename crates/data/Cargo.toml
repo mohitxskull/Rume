@@ -31,3 +31,5 @@ sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:sqlparser"]
 postgres = ["dep:sqlx", "sqlx/postgres", "dep:sqlparser"]
 mysql = ["dep:sqlx", "sqlx/mysql", "dep:sqlparser"]
 redis = ["dep:deadpool-redis", "dep:redis"]
+# Exposes internal SQL validation entry points for `fuzz/` targets only.
+fuzzing = ["sqlite", "postgres", "mysql"]

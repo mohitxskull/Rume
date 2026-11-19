@@ -962,6 +962,27 @@ pub(crate) fn validate_managed_mysql_transaction_sql(
     Ok(())
 }
 
+/// Fuzzing-only entry points exposing the managed transaction SQL validators without widening
+/// the normal public API (`fuzz/` targets only, gated behind `feature = "fuzzing"`).
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_support {
+    use super::{
+        mysql_sql_causes_implicit_commit, validate_managed_mysql_transaction_sql,
+        validate_managed_transaction_sql,
+    };
+
+    /// Fuzz entry point for PostgreSQL, SQLite, and MySQL managed transaction validators.
+    pub fn fuzz_validate_sql_validators(statement: &str) {
+        let _ =
+            validate_managed_transaction_sql(statement, &sqlparser::dialect::PostgreSqlDialect {});
+        let _ = validate_managed_transaction_sql(statement, &sqlparser::dialect::SQLiteDialect {});
+        let _ = validate_managed_mysql_transaction_sql(statement);
+        let _ = mysql_sql_causes_implicit_commit(statement);
+        let _ = crate::persistence::sqlite::reject_unbound_sqlite_placeholders(statement);
+    }
+}
+
 /// Active transaction handle providing isolated mutation and explicit commit/rollback.
 pub trait DatabaseTransaction: Debug + Send + Sync {
     /// Returns the database dialect of this transaction (e.g. "postgres", "sqlite", "mysql", "default").

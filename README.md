@@ -49,8 +49,8 @@ Default features: `sqlite`, `testing`.
 | `redis` | Redis caching, distributed locks/leader election, rate limiting, sessions, and quotas |
 | `otel` | OpenTelemetry OTLP/metrics integration in `rume-observability` |
 | `testing` | `rume-testing` (`TestApp`, `TestServer`, database/container harnesses) |
-| `saml` | SAML 2.0 assertion parsing & validation |
-| `enterprise` | `saml` + SCIM and Saga orchestration |
+| `saml` | *(Experimental)* SAML 2.0 assertion parsing & validation via caller-supplied `SamlSignatureVerifier` |
+| `enterprise` | *(Experimental)* `saml` + SCIM models and Saga orchestration |
 | `schemars` | JSON Schema generation support in `rume-foundation` |
 
 ## Workspace layout
@@ -71,6 +71,7 @@ Default features: `sqlite`, `testing`.
 | `crates/cli/` | `rume-cli` — `rume` CLI (`new`, `doctor`, `sql:check`, `list:routes`, `db`, `config`, `make:migration`, `generate`, `codegen`) |
 | `crates/crash/` | `rume-crash` — internal crash-recovery test harness (`publish = false`) |
 | `crates/xtask/` | `xtask` — workspace automation tasks |
+| `fuzz/` | `rume-fuzz` — standalone `cargo-fuzz` targets for untrusted-input parsers (`publish = false`) |
 | `workbench/simple-api/` | Simple API reference app |
 | `workbench/modular-monolith/` | Modular monolith reference app |
 | `workbench/multi-instance/` | Multi-instance reference app + Docker Compose qualification suite |
@@ -95,6 +96,12 @@ cargo test --workspace --doc --all-features
 for feat in "sqlite,testing" "postgres,testing" "mysql,testing" "redis,testing"; do
   cargo clippy -p rume --all-targets --no-default-features --features "$feat" -- -D warnings
 done
+
+# Hot-path Criterion micro-benchmarks
+cargo bench -p rume --bench hot_path
+
+# Continuous fuzzing (requires nightly + cargo-fuzz)
+cargo +nightly fuzz run saml_parser -- -max_total_time=30
 ```
 
 CI (`.github/workflows/ci.yml`) runs `rustfmt`, `clippy` (`-D warnings`), `doc & doctests`, `cargo audit`, MSRV (`1.96`), all-features and feature-isolated backend test matrices (`sqlite`, `postgres`, `mysql`, `redis`), `rume-cli`, `rume-macros`, all three `workbench` apps, and a Docker Compose multi-instance qualification suite. CodeQL runs via `.github/workflows/codeql.yml`.
