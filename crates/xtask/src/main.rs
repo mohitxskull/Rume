@@ -2,6 +2,8 @@
 //!
 //! Run via `cargo xtask <subcommand>` (aliased in `.cargo/config.toml`).
 
+#![forbid(unsafe_code)]
+
 pub mod commands;
 pub mod util;
 

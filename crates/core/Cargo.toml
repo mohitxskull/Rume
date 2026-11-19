@@ -90,7 +90,7 @@ insta = { version = "=1.49.0", features = ["json"] }
 rstest = "=0.28.0"
 wiremock = "=0.6.5"
 ureq = "=3.5.1"
-proptest = "=1.12.0"
+proptest.workspace = true
 
 [[test]]
 name = "integration"

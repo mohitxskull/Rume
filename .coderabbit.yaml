@@ -7,12 +7,13 @@ reviews:
     - "!docs/scratch/**"
     - "!**/scratch/**"
   path_instructions:
-    - path: crates/**/*.rs
+    - path: crates/**
       instructions: >-
         Enforce #![forbid(unsafe_code)], avoid unwrap()/expect() in non-test production code,
-        and preserve W3C TraceContext propagation and OpenTelemetry span bridging across async boundaries.
-    - path: workbench/**/*.rs
+        preserve W3C TraceContext propagation and OpenTelemetry span bridging across async boundaries,
+        and keep SQL assets, templates, and Cargo dependency pins strictly scoped to their owning crate.
+    - path: workbench/**
       instructions: >-
         Reference application scenarios (simple-api, modular-monolith, multi-instance) must use the
         public rume umbrella API and prelude, avoid bypassing framework module/persistence boundaries,
-        and keep test/SLA assertions deterministic.
+        and keep compose/Docker configs, SQL assets, and test/SLA assertions deterministic.

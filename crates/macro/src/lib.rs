@@ -1,5 +1,7 @@
 //! Procedural macros for Rume persistence: SQL asset embedding and migration discovery.
 
+#![forbid(unsafe_code)]
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -3935,12 +3935,14 @@ name = "rume-data"
 version = "0.1.0"
 dependencies = [
  "deadpool-redis",
+ "proptest",
  "redis",
  "rume-foundation",
  "rume-observability",
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "sqlparser",
  "sqlx",
  "thiserror",
  "tokio",
@@ -3952,9 +3954,11 @@ dependencies = [
 name = "rume-enterprise"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "futures-util",
  "opentelemetry",
  "opentelemetry_sdk",
+ "proptest",
  "quick-xml",
  "rume-foundation",
  "rume-observability",
@@ -3976,6 +3980,7 @@ dependencies = [
  "axum",
  "dotenvy",
  "figment",
+ "proptest",
  "schemars 1.2.3",
  "secrecy",
  "serde",
