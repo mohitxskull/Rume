@@ -150,12 +150,17 @@ mod saml_tests {
             }
         }
 
-        let saml_xml = r#"
+        let saml_xml = r##"
     <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_sig123">
         <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#_sig123" />
+            </ds:SignedInfo>
+        </ds:Signature>
         <saml2:Subject><saml2:NameID>user@test.org</saml2:NameID></saml2:Subject>
     </saml2:Assertion>
-    "#;
+    "##;
 
         let valid_verifier = MockVerifier { should_pass: true };
         let res = SamlParser::parse_with_verifier(saml_xml, Some(&valid_verifier));
@@ -470,14 +475,19 @@ mod saml_tests {
             }
         }
 
-        let saml_xml = r#"
+        let saml_xml = r##"
     <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp_bound_1">
         <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assert_bound_42">
             <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+                <ds:SignedInfo>
+                    <ds:Reference URI="#_assert_bound_42" />
+                </ds:SignedInfo>
+            </ds:Signature>
             <saml2:Subject><saml2:NameID>corp@enterprise.com</saml2:NameID></saml2:Subject>
         </saml2:Assertion>
     </saml2p:Response>
-    "#;
+    "##;
 
         let verified_flag = Arc::new(AtomicBool::new(false));
         let verifier = TrustBoundaryVerifier {
@@ -555,5 +565,174 @@ mod saml_tests {
         let assertion = SamlParser::parse_unverified(saml_xml).unwrap();
         let res = SamlParser::validate(&assertion, 1700000000, Some("https://sp.myapp.io"));
         assert!(matches!(res, Err(SamlError::MissingExpirationCondition)));
+    }
+
+    #[test]
+    fn saml_signed_mode_requires_non_empty_assertion_id_and_matching_reference() {
+        struct AlwaysAcceptVerifier;
+        impl SamlSignatureVerifier for AlwaysAcceptVerifier {
+            fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
+                Ok(())
+            }
+
+            fn verify_assertion_signature(
+                &self,
+                _raw_xml: &str,
+                _assertion_id: &str,
+                _assertion_xml: &str,
+            ) -> Result<(), SamlError> {
+                Ok(())
+            }
+        }
+
+        let verifier = AlwaysAcceptVerifier;
+
+        // 1. Missing <ds:Signature>
+        let no_sig = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_id1">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+        assert!(matches!(
+            SamlParser::parse_signed(no_sig, &verifier),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+
+        // 2. Empty <ds:SignedInfo> (no <ds:Reference>)
+        let empty_signed_info = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_id2">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo />
+        </ds:Signature>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+        assert!(matches!(
+            SamlParser::parse_signed(empty_signed_info, &verifier),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+
+        // 3. Missing Assertion/@ID
+        let missing_assertion_id = r##"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp3">
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#_resp3" />
+            </ds:SignedInfo>
+        </ds:Signature>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "##;
+        assert!(matches!(
+            SamlParser::parse_signed(missing_assertion_id, &verifier),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+
+        // 4. Empty/whitespace Assertion/@ID
+        let empty_assertion_id = r##"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="   ">
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#   " />
+            </ds:SignedInfo>
+        </ds:Signature>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "##;
+        assert!(matches!(
+            SamlParser::parse_signed(empty_assertion_id, &verifier),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+
+        // 5. Reference covers only Response/@ID, not Assertion/@ID
+        let response_only_ref = r##"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_resp5">
+        <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+            <ds:SignedInfo>
+                <ds:Reference URI="#_resp5" />
+            </ds:SignedInfo>
+        </ds:Signature>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_assert5">
+            <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+            <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "##;
+        assert!(matches!(
+            SamlParser::parse_signed(response_only_ref, &verifier),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+    }
+
+    #[test]
+    fn saml_issuer_anchoring_and_rfc3339_timestamp_bounds() {
+        // 1. Nested <Advice><Issuer> cannot spoof Assertion <Issuer>
+        let advice_spoof = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_adv1">
+        <saml2:Advice>
+            <saml2:Issuer>https://evil-advice-spoof.example.com</saml2:Issuer>
+        </saml2:Advice>
+        <saml2:Issuer>https://idp.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+        let parsed = SamlParser::parse_unverified(advice_spoof).unwrap();
+        assert_eq!(parsed.issuer, "https://idp.enterprise.com");
+
+        // 2. Duplicate conflicting Assertion <Issuer>s fail closed with SignatureWrappingDetected
+        let duplicate_issuers = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_dup1">
+        <saml2:Issuer>https://idp-a.enterprise.com</saml2:Issuer>
+        <saml2:Issuer>https://idp-b.enterprise.com</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+        assert!(matches!(
+            SamlParser::parse_unverified(duplicate_issuers),
+            Err(SamlError::SignatureWrappingDetected(_))
+        ));
+
+        // 3. Comment-split <Issuer> chunks accumulate cleanly
+        let comment_split = r#"
+    <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_csplit">
+        <saml2:Issuer>https://idp.<!-- injected -->enterprise.com/saml</saml2:Issuer>
+        <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+    </saml2:Assertion>
+    "#;
+        let split_parsed = SamlParser::parse_unverified(comment_split).unwrap();
+        assert_eq!(split_parsed.issuer, "https://idp.enterprise.com/saml");
+
+        // 4. Response <Issuer> acts as fallback when Assertion lacks one
+        let response_fallback = r#"
+    <saml2p:Response xmlns:saml2p="urn:oasis:names:tc:SAML:2.0:protocol" ID="_rfb">
+        <saml2:Issuer xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion">https://idp-response-fallback.com</saml2:Issuer>
+        <saml2:Assertion xmlns:saml2="urn:oasis:names:tc:SAML:2.0:assertion" ID="_afb">
+            <saml2:Subject><saml2:NameID>user@enterprise.com</saml2:NameID></saml2:Subject>
+        </saml2:Assertion>
+    </saml2p:Response>
+    "#;
+        let fallback_parsed = SamlParser::parse_unverified(response_fallback).unwrap();
+        assert_eq!(fallback_parsed.issuer, "https://idp-response-fallback.com");
+
+        // 5. RFC 3339 / ISO 8601 timestamp bounds (rejects bad offsets, non-ASCII UTF-8, spaces, pre-1970)
+        for bad in [
+            "2026-11-02T12:00:00+24:00",
+            "2026-11-02T12:00:00+00:60",
+            "2026-11-02T12:00:00+1é2",
+            "2026-11-02T12:00:00+-05:00",
+            "2026-11-02 10:00:00Z",
+            "1969-12-31T23:59:59Z",
+        ] {
+            assert!(
+                matches!(parse_iso8601_strict(bad), Err(SamlError::Malformed(_))),
+                "timestamp '{bad}' must be rejected as Malformed"
+            );
+        }
     }
 }

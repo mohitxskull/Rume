@@ -358,8 +358,21 @@ fn resolve_file_value(value: String, dir: &Path, source_path: &Path) -> Result<S
     } else {
         dir.join(rel_or_abs)
     };
-    let canonical_dir = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let canonical_full = fs::canonicalize(&full).unwrap_or_else(|_| full.clone());
+    // Why: fail closed on `fs::canonicalize` errors rather than falling back to raw paths, and
+    // read `&canonical_full` instead of `&full` so dangling targets or symlink escapes cannot
+    // bypass workspace containment.
+    let canonical_dir = fs::canonicalize(dir).map_err(|e| {
+        format!(
+            "failed to canonicalize workspace directory for file: reference in {}: {e}",
+            source_path.display()
+        )
+    })?;
+    let canonical_full = fs::canonicalize(&full).map_err(|e| {
+        format!(
+            "failed to canonicalize file: reference in {}: {e}",
+            source_path.display()
+        )
+    })?;
     if !canonical_full.starts_with(&canonical_dir) {
         return Err(format!(
             "failed to resolve file: reference in {}: path escapes workspace directory",
@@ -367,7 +380,7 @@ fn resolve_file_value(value: String, dir: &Path, source_path: &Path) -> Result<S
         ));
     }
 
-    let contents = fs::read_to_string(&full).map_err(|e| {
+    let contents = fs::read_to_string(&canonical_full).map_err(|e| {
         format!(
             "failed to read file: reference in {}: {e}",
             source_path.display()
@@ -605,7 +618,8 @@ pub async fn rollback() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendHandle, connect_backend, resolve_db_url_for_env_in, resolve_db_url_for_env_with_vars,
+        BackendHandle, connect_backend, resolve_db_url_for_env_in,
+        resolve_db_url_for_env_with_vars, resolve_file_value,
     };
     use std::path::Path;
 
@@ -730,5 +744,44 @@ mod tests {
             !err.contains("unclosed-secret-value") && !err.contains("super-secret-pw"),
             "error must not leak secret values: {err}"
         );
+    }
+
+    #[test]
+    fn file_value_nonexistent_and_symlink_escape_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join(".env");
+
+        let missing_err = resolve_file_value("file:missing.key".to_string(), dir.path(), &source)
+            .expect_err("missing file: target must fail closed during canonicalization");
+        assert!(
+            missing_err.contains("failed to canonicalize"),
+            "expected canonicalization error, got: {missing_err}"
+        );
+
+        let missing_dir = dir.path().join("missing_dir");
+        let missing_dir_err =
+            resolve_file_value("file:secret.key".to_string(), &missing_dir, &source)
+                .expect_err("nonexistent workspace dir must fail closed during canonicalization");
+        assert!(
+            missing_dir_err.contains("failed to canonicalize"),
+            "expected canonicalization error, got: {missing_dir_err}"
+        );
+
+        #[cfg(unix)]
+        {
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside_secret = outside_dir.path().join("outside.key");
+            std::fs::write(&outside_secret, "secret").unwrap();
+
+            let escape_link = dir.path().join("escape.key");
+            std::os::unix::fs::symlink(&outside_secret, &escape_link).unwrap();
+
+            let escape_err = resolve_file_value("file:escape.key".to_string(), dir.path(), &source)
+                .expect_err("symlink pointing outside workspace must be rejected");
+            assert!(
+                escape_err.contains("path escapes workspace directory"),
+                "unexpected error: {escape_err}"
+            );
+        }
     }
 }

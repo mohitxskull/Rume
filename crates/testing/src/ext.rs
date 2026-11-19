@@ -2,11 +2,10 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 
 use rume_app::app::builder::{BuildError, RumeBuilder};
+use rume_app::app::lifecycle;
 use rume_app::app::state::{ApplicationMode, AvailabilityState, LifecycleState};
-use rume_app::module::{Module, ModuleContext, ModuleRegistry};
 
 use crate::app::TestApp;
 
@@ -42,12 +41,7 @@ where
     fn build_test_app(self) -> Pin<Box<dyn Future<Output = Result<TestApp, BuildError>> + Send>> {
         Box::pin(async move {
             let parts = self.into_test_parts()?;
-            let mut module_registry = ModuleRegistry::new();
-            for m in &parts.modules {
-                module_registry.register(Arc::clone(m))?;
-            }
-            let startup_modules = module_registry.resolve_startup_modules()?;
-            let shutdown_modules = module_registry.resolve_shutdown_modules()?;
+            let resolved = parts.resolved_modules;
 
             let ctx = parts.ctx;
             let mut on_shutdown = parts.on_shutdown;
@@ -61,106 +55,33 @@ where
                 return Ok(TestApp::new(parts.router));
             }
 
-            // 1. Booted & Live
-            ctx.lifecycle.set(LifecycleState::Booted);
-            ctx.availability.set(AvailabilityState::Live);
+            lifecycle::run_startup(
+                &ctx,
+                &resolved.startup,
+                on_ready,
+                &mut on_shutdown,
+                shutdown_timeout,
+                None,
+            )
+            .await?;
 
-            // 2. Run module on_start hooks in topological order with rollback
-            let mut started_modules: Vec<Arc<dyn Module>> = Vec::new();
-            for m in startup_modules {
-                let mod_ctx = ModuleContext::new(
-                    m.name(),
-                    ctx.paths.clone(),
-                    ctx.availability.clone(),
-                    ctx.lifecycle.clone(),
-                );
-                if let Err(err) = m.on_start(&mod_ctx).await {
-                    ctx.lifecycle.set(LifecycleState::Terminating);
-                    ctx.availability.set(AvailabilityState::Broken);
-
-                    started_modules.reverse();
-                    let cleanup_ctx = ctx.clone();
-                    for hook in std::mem::take(&mut on_shutdown) {
-                        let _ = hook(cleanup_ctx.clone()).await;
-                    }
-                    for sm in started_modules {
-                        let sm_ctx = ModuleContext::new(
-                            sm.name(),
-                            cleanup_ctx.paths.clone(),
-                            cleanup_ctx.availability.clone(),
-                            cleanup_ctx.lifecycle.clone(),
-                        );
-                        sm.on_shutdown(&sm_ctx).await;
-                    }
-                    ctx.lifecycle.set(LifecycleState::Terminated);
-                    return Err(BuildError::Startup(format!(
-                        "module '{}' failed to start: {err}",
-                        m.name()
-                    )));
-                }
-                started_modules.push(m);
-            }
-
-            // 3. Application on_ready hooks
-            for hook in on_ready {
-                if let Err(err) = hook(ctx.clone()).await {
-                    ctx.lifecycle.set(LifecycleState::Terminating);
-                    ctx.availability.set(AvailabilityState::Broken);
-
-                    started_modules.reverse();
-                    let cleanup_ctx = ctx.clone();
-                    for hook in std::mem::take(&mut on_shutdown) {
-                        let _ = hook(cleanup_ctx.clone()).await;
-                    }
-                    for sm in started_modules {
-                        let sm_ctx = ModuleContext::new(
-                            sm.name(),
-                            cleanup_ctx.paths.clone(),
-                            cleanup_ctx.availability.clone(),
-                            cleanup_ctx.lifecycle.clone(),
-                        );
-                        sm.on_shutdown(&sm_ctx).await;
-                    }
-                    ctx.lifecycle.set(LifecycleState::Terminated);
-                    return Err(BuildError::Startup(format!("startup hook failed: {err}")));
-                }
-            }
-
-            ctx.lifecycle.set(LifecycleState::Ready);
-            ctx.availability.set(AvailabilityState::Ready);
-
-            // 4. Attach teardown closure
+            // Attach teardown closure that runs synchronous-drop cleanup on a dedicated
+            // current-thread runtime so `Drop for TestApp` works even inside an active
+            // Tokio runtime without panicking.
             let cleanup_ctx = ctx.clone();
+            let shutdown_modules = resolved.shutdown;
             let cleanup = Box::new(move || {
-                let shutdown_future = async move {
-                    cleanup_ctx.lifecycle.set(LifecycleState::Terminating);
-                    cleanup_ctx
-                        .availability
-                        .set(AvailabilityState::RefusingTraffic);
-
-                    for hook in on_shutdown {
-                        let _ = hook(cleanup_ctx.clone()).await;
-                    }
-                    for m in shutdown_modules {
-                        let sm_ctx = ModuleContext::new(
-                            m.name(),
-                            cleanup_ctx.paths.clone(),
-                            cleanup_ctx.availability.clone(),
-                            cleanup_ctx.lifecycle.clone(),
-                        );
-                        m.on_shutdown(&sm_ctx).await;
-                    }
-                    cleanup_ctx.lifecycle.set(LifecycleState::Terminated);
-                };
-
                 let _ = std::thread::spawn(move || {
                     if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                     {
-                        rt.block_on(async {
-                            let _ = tokio::time::timeout(shutdown_timeout, shutdown_future).await;
-                        });
+                        rt.block_on(lifecycle::run_shutdown(
+                            &cleanup_ctx,
+                            on_shutdown,
+                            shutdown_modules,
+                            shutdown_timeout,
+                        ));
                     }
                 })
                 .join();
@@ -182,12 +103,17 @@ mod tests {
 
     struct LifecycleModule {
         name: &'static str,
+        deps: Vec<&'static str>,
         events: Arc<Mutex<Vec<String>>>,
     }
 
     impl Module for LifecycleModule {
         fn name(&self) -> &str {
             self.name
+        }
+
+        fn dependencies(&self) -> Vec<&str> {
+            self.deps.clone()
         }
 
         fn on_start<'a>(&'a self, _ctx: &'a ModuleContext) -> BoxFuture<'a, ModuleHookResult> {
@@ -208,6 +134,13 @@ mod tests {
                     .push(format!("shutdown:{}", self.name));
             })
         }
+
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router,
+        ) -> rume_http::routing::Router {
+            router.get(&format!("/mod-{}", self.name), || async { "ok" })
+        }
     }
 
     #[tokio::test]
@@ -216,6 +149,7 @@ mod tests {
         let app = Rume::new()
             .module(LifecycleModule {
                 name: "alpha",
+                deps: vec![],
                 events: Arc::clone(&events),
             })
             .build_test_app()
@@ -228,5 +162,58 @@ mod tests {
             *events.lock().unwrap(),
             vec!["start:alpha", "shutdown:alpha"]
         );
+    }
+
+    #[tokio::test]
+    async fn build_test_app_shares_rollback_on_on_ready_failure() {
+        use rume_app::app::builder::BuildError;
+        use rume_app::app::context::AppContext;
+        use rume_app::app::state::{AvailabilityState, LifecycleState};
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ctx = AppContext::new_with_defaults((), ());
+        let lifecycle = ctx.lifecycle.clone();
+        let availability = ctx.availability.clone();
+
+        let err = Rume::builder(ctx)
+            .module(LifecycleModule {
+                name: "beta",
+                deps: vec!["alpha"],
+                events: Arc::clone(&events),
+            })
+            .module(LifecycleModule {
+                name: "alpha",
+                deps: vec![],
+                events: Arc::clone(&events),
+            })
+            .on_ready(|ctx| async move {
+                assert!(
+                    ctx.route_registry
+                        .routes()
+                        .iter()
+                        .any(|r| r.path == "/mod-alpha"),
+                    "on_ready in build_test_app must observe module routes"
+                );
+                Err::<(), _>(std::io::Error::other("ready hook boom"))
+            })
+            .build_test_app()
+            .await
+            .expect_err("build_test_app must fail when on_ready fails");
+
+        assert!(
+            matches!(err, BuildError::Startup(ref msg) if msg.contains("ready hook boom")),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                "start:alpha",
+                "start:beta",
+                "shutdown:beta",
+                "shutdown:alpha",
+            ]
+        );
+        assert_eq!(lifecycle.state(), LifecycleState::Terminated);
+        assert_eq!(availability.state(), AvailabilityState::Broken);
     }
 }

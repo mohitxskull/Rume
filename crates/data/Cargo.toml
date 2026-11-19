@@ -16,13 +16,18 @@ tracing.workspace = true
 thiserror.workspace = true
 uuid = { version = "=1.29.2", features = ["v4"] }
 sha2 = "=0.11.1"
+sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
+[dev-dependencies]
+proptest.workspace = true
+sqlparser.workspace = true
+
 [features]
 default = []
-sqlite = ["dep:sqlx", "sqlx/sqlite"]
-postgres = ["dep:sqlx", "sqlx/postgres"]
-mysql = ["dep:sqlx", "sqlx/mysql"]
+sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:sqlparser"]
+postgres = ["dep:sqlx", "sqlx/postgres", "dep:sqlparser"]
+mysql = ["dep:sqlx", "sqlx/mysql", "dep:sqlparser"]
 redis = ["dep:deadpool-redis", "dep:redis"]

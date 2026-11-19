@@ -2,6 +2,7 @@
 
 pub mod builder;
 pub mod context;
+pub mod lifecycle;
 pub mod observability;
 pub use rume_foundation::paths;
 pub mod shutdown;

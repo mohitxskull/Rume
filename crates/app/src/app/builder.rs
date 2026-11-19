@@ -11,7 +11,6 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpListener;
-use tokio::time::timeout;
 
 use crate::app::context::AppContext;
 use crate::app::paths::ProjectPaths;
@@ -83,6 +82,8 @@ pub enum BuildError {
     Startup(String),
     /// Duplicate route collision across modules or application routes.
     DuplicateRoute { method: String, path: String },
+    /// Internal route registry lock was poisoned.
+    RouteRegistryPoisoned,
 }
 
 impl std::fmt::Display for BuildError {
@@ -94,6 +95,7 @@ impl std::fmt::Display for BuildError {
             Self::DuplicateRoute { method, path } => {
                 write!(f, "duplicate route collision for {method} {path}")
             }
+            Self::RouteRegistryPoisoned => write!(f, "route registry lock poisoned"),
         }
     }
 }
@@ -264,6 +266,7 @@ where
     pub ctx: AppContext<E, C, S>,
     pub router: axum::Router<()>,
     pub modules: Vec<Arc<dyn crate::module::Module>>,
+    pub resolved_modules: crate::app::lifecycle::ResolvedModules,
     pub mode: ApplicationMode,
     pub on_ready: Vec<ReadyHook<E, C, S>>,
     pub on_shutdown: Vec<ShutdownHook<E, C, S>>,
@@ -279,7 +282,6 @@ where
     S: Clone + Send + Sync + 'static,
 {
     ctx: AppContext<E, C, S>,
-    state: S,
     router: Router<AppContext<E, C, S>>,
     /// Application-scoped route registry. Cloned from the [`AppContext`] at
     /// construction; [`run`](Self::run) passes it back into the context.
@@ -327,11 +329,9 @@ where
     /// Intentionally `pub(crate)`: `Rume::builder` is the only public entry
     /// point for building a Rume application.
     pub(crate) fn new(ctx: AppContext<E, C, S>) -> Self {
-        let state = ctx.state.clone();
         let route_registry = Arc::new(std::sync::RwLock::new(ctx.route_registry.clone()));
         Self {
             ctx,
-            state,
             router: Router::new(),
             route_registry,
             modules: Vec::new(),
@@ -595,18 +595,20 @@ where
     /// without creating a circular dependency between `rume-app` and `rume-testing`.
     pub fn into_test_parts(mut self) -> Result<TestAppParts<E, C, S>, BuildError> {
         let modules = self.modules.clone();
+        let resolved_modules = crate::app::lifecycle::resolve_modules(&modules)?;
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
         let ctx = self.ctx.clone();
         let mode = self.mode;
 
-        let app_router = self.build_router(ctx.clone())?;
+        let (app_router, ctx) = self.build_router_with_resolved(ctx, &resolved_modules.startup)?;
 
         Ok(TestAppParts {
             router: app_router.with_state(ctx.clone()),
             ctx,
             modules,
+            resolved_modules,
             mode,
             on_ready,
             on_shutdown,
@@ -694,8 +696,7 @@ where
     /// This is synced into the [`AppContext`] that Axum serves as state, so
     /// handlers observe it through [`State<AppContext<E, C, S>>`].
     pub fn state(mut self, state: S) -> Self {
-        self.ctx.state = state.clone();
-        self.state = state;
+        self.ctx.state = state;
         self
     }
 
@@ -830,8 +831,28 @@ where
     /// on `Router<AppContext<E, C, S>>`.
     pub fn build_router(
         self,
-        mut ctx: AppContext<E, C, S>,
+        ctx: AppContext<E, C, S>,
     ) -> Result<Router<AppContext<E, C, S>>, BuildError> {
+        Ok(self.build_router_with_ctx(ctx)?.0)
+    }
+
+    /// Build the router and return the finalized [`AppContext`] carrying all
+    /// module-registered routes and health checks.
+    fn build_router_with_ctx(
+        self,
+        ctx: AppContext<E, C, S>,
+    ) -> Result<BuiltRouterWithCtx<E, C, S>, BuildError> {
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        self.build_router_with_resolved(ctx, &resolved.startup)
+    }
+
+    /// Build the router using a pre-resolved module startup order so callers like
+    /// `prepare_serve` and `into_test_parts` resolve the module graph exactly once.
+    fn build_router_with_resolved(
+        self,
+        mut ctx: AppContext<E, C, S>,
+        startup_modules: &[Arc<dyn crate::module::Module>],
+    ) -> Result<BuiltRouterWithCtx<E, C, S>, BuildError> {
         let RumeBuilder {
             router,
             middleware,
@@ -840,48 +861,29 @@ where
             groups_order,
             applied_middleware,
             applied_groups,
-            modules,
             route_registry,
             ..
         } = self;
 
         // --- Step 1: Module preflight & route mounting ---
-        let mut module_registry = crate::module::ModuleRegistry::new();
-        for m in &modules {
-            module_registry.register(Arc::clone(m))?;
-        }
-        let startup_modules = module_registry.resolve_startup_modules()?;
-
-        let mut module_axum = axum::Router::new();
-        let mut module_routes = rume_http::routing::RouteRegistry::new();
-        let mut seen_routes: Vec<(String, String)> = Vec::new();
-
-        // Register module routes FIRST: they must occupy `seen_routes` before
-        // app routes are read from `route_registry`, so that module routes
-        // participate in duplicate-route detection (App M4) instead of being
-        // invisible to it.
-        for m in &startup_modules {
-            let single_mod_router = m.register_routes(rume_http::routing::Router::new());
-            let (axum_r, routes) = single_mod_router.into_parts();
-            for r in routes.routes() {
-                check_and_record_route(&mut seen_routes, r)?;
-            }
-            module_axum = module_axum.merge(axum_r);
-            module_routes.extend(routes);
+        let app_routes = route_registry
+            .read()
+            .map_err(|_| BuildError::RouteRegistryPoisoned)?
+            .clone();
+        let (module_axum, module_routes) =
+            collect_and_validate_routes(startup_modules, &app_routes)?;
+        for m in startup_modules {
             m.register_health_checks(&mut ctx.health_checks);
         }
 
-        // Then read app routes into `seen_routes`. Module routes are already
-        // present, so app/module collisions are caught fail-closed; app routes
-        // are checked against each other as they are recorded.
-        for r in route_registry.read().unwrap().routes() {
-            check_and_record_route(&mut seen_routes, r)?;
+        let router = merge_module_router(router, module_axum)?;
+        {
+            let mut reg = route_registry
+                .write()
+                .map_err(|_| BuildError::RouteRegistryPoisoned)?;
+            reg.extend(module_routes);
+            ctx.route_registry = reg.clone();
         }
-
-        let adapted: Router<AppContext<E, C, S>> = module_axum.with_state(());
-        let router = router.merge(adapted);
-        route_registry.write().unwrap().extend(module_routes);
-        ctx.route_registry = route_registry.read().unwrap().clone();
 
         // --- Step 2: Validation phase (fail closed, before any middleware wraps) ---
         let mut seen_middleware: HashSet<&str> = HashSet::new();
@@ -962,7 +964,11 @@ where
             router
         };
 
-        let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx);
+        // Why: Axum's `with_state(ctx)` snapshots `ctx` by value (including non-`Arc`
+        // `RouteRegistry` and `HealthChecks`), so cloning `ctx` into `with_state`
+        // and returning the finalized `ctx` keeps `TestAppParts.ctx`, `on_ready`,
+        // and `on_shutdown` in sync with module routes and health checks.
+        let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx.clone());
 
         // 1. Apply group middleware (innermost middleware layers)
         for name in groups_order.iter().rev() {
@@ -989,7 +995,78 @@ where
         // and attaches request_id to Problem Details error responses.
         router = router.layer(crate::app::observability::ObservabilityLayer::new());
 
-        Ok(router)
+        Ok((router, ctx))
+    }
+
+    fn effective_mode(&self) -> ApplicationMode {
+        if std::env::var("RUME_INSPECT").is_ok()
+            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
+        {
+            ApplicationMode::Inspect
+        } else {
+            self.mode
+        }
+    }
+
+    /// Execute `ApplicationMode::Inspect` preflight without starting HTTP
+    /// serving or lifecycle hooks (`on_start`, `on_ready`, `on_shutdown`).
+    fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
+        // Why: `Inspect` mode skips `on_start`, `on_ready`, and `on_shutdown` hooks so
+        // `rume list:routes` and boot checks remain side-effect-free, while still
+        // running `ModuleRegistry` DAG validation, `check_and_record_route`, and the
+        // actual Axum router merge so module cycles and duplicate routes (including
+        // app `.route()` + module collisions) fail closed identically to `build_router`.
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        let app_routes = self
+            .route_registry
+            .read()
+            .map_err(|_| BuildError::RouteRegistryPoisoned)?
+            .clone();
+        let (module_axum, module_routes) =
+            collect_and_validate_routes(&resolved.startup, &app_routes)?;
+        let _merged = merge_module_router(self.router, module_axum)?;
+
+        {
+            let mut reg = self
+                .route_registry
+                .write()
+                .map_err(|_| BuildError::RouteRegistryPoisoned)?;
+            reg.extend(module_routes);
+            self.ctx.route_registry = reg.clone();
+        }
+
+        self.ctx.lifecycle.set(LifecycleState::Booted);
+        self.ctx.availability.set(AvailabilityState::Live);
+
+        if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
+            || std::env::args().any(|a| a == "--rume-inspect-routes")
+        {
+            let json = serde_json::to_string(self.ctx.route_registry.routes())
+                .unwrap_or_else(|_| "[]".to_string());
+            println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
+        }
+
+        Ok(())
+    }
+
+    fn prepare_serve(mut self) -> Result<PreparedServe<E, C, S>, std::io::Error> {
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        let on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
+        let shutdown_timeout = self.shutdown_timeout;
+        let ctx = self.ctx.clone();
+
+        let (router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
+
+        Ok(PreparedServe {
+            router,
+            serve_ctx,
+            startup_modules: resolved.startup,
+            shutdown_modules: resolved.shutdown,
+            on_ready,
+            on_shutdown,
+            shutdown_timeout,
+        })
     }
 
     /// Run the application until a shutdown signal is received.
@@ -999,67 +1076,16 @@ where
     }
 
     /// Run the application with an injectable shutdown signal.
-    pub async fn run_with_signal<F>(mut self, signal: F) -> Result<(), std::io::Error>
+    pub async fn run_with_signal<F>(self, signal: F) -> Result<(), std::io::Error>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Pass the builder's route registry into the app context so the
-        // application's routes are observable from `AppContext::route_registry`
-        // (e.g. by `rume list:routes`).
-        self.ctx.route_registry = self.route_registry.read().unwrap().clone();
-
-        let mode = if std::env::var("RUME_INSPECT").is_ok()
-            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
-        {
-            ApplicationMode::Inspect
-        } else {
-            self.mode
-        };
-
-        // In Inspect mode, boot the application context without serving HTTP
-        // and without running any hooks (on_ready or on_shutdown).
-        if mode == ApplicationMode::Inspect {
-            let ctx = self.ctx.clone();
-            ctx.lifecycle.set(LifecycleState::Booted);
-            ctx.availability.set(AvailabilityState::Live);
-
-            if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
-                || std::env::args().any(|a| a == "--rume-inspect-routes")
-            {
-                let mut module_router = rume_http::routing::Router::new();
-                for m in &self.modules {
-                    module_router = m.register_routes(module_router);
-                }
-                let (_, module_routes) = module_router.into_parts();
-                self.route_registry.write().unwrap().extend(module_routes);
-                self.ctx.route_registry = self.route_registry.read().unwrap().clone();
-
-                let json = serde_json::to_string(self.ctx.route_registry.routes())
-                    .unwrap_or_else(|_| "[]".to_string());
-                println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
-            }
-
-            return Ok(());
+        if self.effective_mode() == ApplicationMode::Inspect {
+            return self.run_inspect_mode();
         }
 
-        // --- Step 1: Preflight validation and router construction ---
-        let mut module_registry = crate::module::ModuleRegistry::new();
-        for m in &self.modules {
-            module_registry.register(Arc::clone(m))?;
-        }
-        let startup_modules = module_registry.resolve_startup_modules()?;
-        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
-
-        let on_shutdown = std::mem::take(&mut self.on_shutdown);
-        let on_ready = std::mem::take(&mut self.on_ready);
-        let shutdown_timeout = self.shutdown_timeout;
-        let serve_ctx = self.ctx.clone();
         let bind_addr = self.bind.clone();
-
-        let router = match self.build_router(serve_ctx.clone()) {
-            Ok(router) => router,
-            Err(err) => return Err(err.into()),
-        };
+        let prepared = self.prepare_serve()?;
 
         // --- Step 2: Bind listener ---
         let listener = TcpListener::bind(&bind_addr).await.map_err(|err| {
@@ -1069,109 +1095,44 @@ where
             )
         })?;
 
-        Self::run_with_bound_listener(
-            serve_ctx,
-            listener,
-            router,
-            startup_modules,
-            shutdown_modules,
-            on_ready,
-            on_shutdown,
-            shutdown_timeout,
-            signal,
-        )
-        .await
+        Self::run_with_bound_listener(prepared, listener, signal).await
     }
 
     /// Run the application with a pre-bound listener and an injectable shutdown signal.
     pub async fn run_with_listener_and_signal<F>(
-        mut self,
+        self,
         listener: TcpListener,
         signal: F,
     ) -> Result<(), std::io::Error>
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        self.ctx.route_registry = self.route_registry.read().unwrap().clone();
-
-        let mode = if std::env::var("RUME_INSPECT").is_ok()
-            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
-        {
-            ApplicationMode::Inspect
-        } else {
-            self.mode
-        };
-
-        if mode == ApplicationMode::Inspect {
-            let ctx = self.ctx.clone();
-            ctx.lifecycle.set(LifecycleState::Booted);
-            ctx.availability.set(AvailabilityState::Live);
-
-            if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
-                || std::env::args().any(|a| a == "--rume-inspect-routes")
-            {
-                let mut module_router = rume_http::routing::Router::new();
-                for m in &self.modules {
-                    module_router = m.register_routes(module_router);
-                }
-                let (_, module_routes) = module_router.into_parts();
-                self.route_registry.write().unwrap().extend(module_routes);
-                self.ctx.route_registry = self.route_registry.read().unwrap().clone();
-
-                let json = serde_json::to_string(self.ctx.route_registry.routes())
-                    .unwrap_or_else(|_| "[]".to_string());
-                println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
-            }
-
-            return Ok(());
+        if self.effective_mode() == ApplicationMode::Inspect {
+            return self.run_inspect_mode();
         }
 
-        let mut module_registry = crate::module::ModuleRegistry::new();
-        for m in &self.modules {
-            module_registry.register(Arc::clone(m))?;
-        }
-        let startup_modules = module_registry.resolve_startup_modules()?;
-        let shutdown_modules = module_registry.resolve_shutdown_modules()?;
+        let prepared = self.prepare_serve()?;
+        Self::run_with_bound_listener(prepared, listener, signal).await
+    }
 
-        let on_shutdown = std::mem::take(&mut self.on_shutdown);
-        let on_ready = std::mem::take(&mut self.on_ready);
-        let shutdown_timeout = self.shutdown_timeout;
-        let serve_ctx = self.ctx.clone();
-
-        let router = match self.build_router(serve_ctx.clone()) {
-            Ok(router) => router,
-            Err(err) => return Err(err.into()),
-        };
-
-        Self::run_with_bound_listener(
-            serve_ctx,
-            listener,
+    async fn run_with_bound_listener<F>(
+        prepared: PreparedServe<E, C, S>,
+        listener: TcpListener,
+        signal: F,
+    ) -> Result<(), std::io::Error>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let PreparedServe {
             router,
+            serve_ctx,
             startup_modules,
             shutdown_modules,
             on_ready,
-            on_shutdown,
+            mut on_shutdown,
             shutdown_timeout,
-            signal,
-        )
-        .await
-    }
+        } = prepared;
 
-    #[allow(clippy::too_many_arguments)]
-    async fn run_with_bound_listener<F>(
-        serve_ctx: AppContext<E, C, S>,
-        listener: TcpListener,
-        router: Router<AppContext<E, C, S>>,
-        startup_modules: Vec<Arc<dyn crate::module::Module>>,
-        shutdown_modules: Vec<Arc<dyn crate::module::Module>>,
-        on_ready: Vec<ReadyHook<E, C, S>>,
-        mut on_shutdown: Vec<ShutdownHook<E, C, S>>,
-        shutdown_timeout: Duration,
-        signal: F,
-    ) -> Result<(), std::io::Error>
-    where
-        F: Future<Output = ()> + Send + 'static,
-    {
         let addr = listener.local_addr()?;
 
         // Shutdown signal monitoring for boot hooks and server.
@@ -1187,157 +1148,16 @@ where
             let _ = sf_task.send(true);
         });
 
-        let wait_shutdown = |mut rx: tokio::sync::watch::Receiver<bool>| async move {
-            let _ = rx.wait_for(|&shutting_down| shutting_down).await;
-        };
-
-        // --- Step 3: Booted & Live ---
-        serve_ctx.lifecycle.set(LifecycleState::Booted);
-        serve_ctx.availability.set(AvailabilityState::Live);
-
-        // --- Step 4: Module startup hooks in topological dependency order ---
-        let mut started_modules: Vec<Arc<dyn crate::module::Module>> = Vec::new();
-        for m in startup_modules {
-            let mod_ctx = crate::module::ModuleContext::new(
-                m.name(),
-                serve_ctx.paths.clone(),
-                serve_ctx.availability.clone(),
-                serve_ctx.lifecycle.clone(),
-            );
-            tokio::select! {
-                _ = wait_shutdown(shutdown_rx.clone()) => {
-                    tracing::warn!("shutdown signal received during module startup; aborting boot");
-                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                    serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
-
-                    started_modules.reverse();
-                    let cleanup_ctx = serve_ctx.clone();
-                    let rollback_fut = async {
-                        for hook in std::mem::take(&mut on_shutdown) {
-                            hook(cleanup_ctx.clone()).await;
-                        }
-                        for sm in started_modules {
-                            let sm_ctx = crate::module::ModuleContext::new(
-                                sm.name(),
-                                cleanup_ctx.paths.clone(),
-                                cleanup_ctx.availability.clone(),
-                                cleanup_ctx.lifecycle.clone(),
-                            );
-                            sm.on_shutdown(&sm_ctx).await;
-                        }
-                    };
-                    let _ = timeout(shutdown_timeout, rollback_fut).await;
-                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                    serve_ctx.availability.set(AvailabilityState::Unknown);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "shutdown signal received during module startup",
-                    ));
-                }
-                res = m.on_start(&mod_ctx) => {
-                    if let Err(err) = res {
-                        tracing::error!(
-                            "module '{}' failed to start: {err}; executing cleanup",
-                            m.name()
-                        );
-                        serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                        serve_ctx.availability.set(AvailabilityState::Broken);
-
-                        started_modules.reverse();
-                        let cleanup_ctx = serve_ctx.clone();
-                        let rollback_fut = async {
-                            for hook in std::mem::take(&mut on_shutdown) {
-                                hook(cleanup_ctx.clone()).await;
-                            }
-                            for sm in started_modules {
-                                let sm_ctx = crate::module::ModuleContext::new(
-                                    sm.name(),
-                                    cleanup_ctx.paths.clone(),
-                                    cleanup_ctx.availability.clone(),
-                                    cleanup_ctx.lifecycle.clone(),
-                                );
-                                sm.on_shutdown(&sm_ctx).await;
-                            }
-                        };
-                        let _ = timeout(shutdown_timeout, rollback_fut).await;
-
-                        serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                        return Err(std::io::Error::other(format!(
-                            "module '{}' failed to start: {err}",
-                            m.name()
-                        )));
-                    }
-                }
-            }
-            started_modules.push(m);
-        }
-
-        // --- Step 5: Application startup hooks with cleanup on failure ---
-        for hook in on_ready {
-            tokio::select! {
-                _ = wait_shutdown(shutdown_rx.clone()) => {
-                    tracing::warn!("shutdown signal received during application startup hooks; aborting boot");
-                    serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                    serve_ctx.availability.set(AvailabilityState::RefusingTraffic);
-
-                    started_modules.reverse();
-                    let cleanup_ctx = serve_ctx.clone();
-                    let rollback_fut = async {
-                        for h in std::mem::take(&mut on_shutdown) {
-                            h(cleanup_ctx.clone()).await;
-                        }
-                        for sm in started_modules {
-                            let sm_ctx = crate::module::ModuleContext::new(
-                                sm.name(),
-                                cleanup_ctx.paths.clone(),
-                                cleanup_ctx.availability.clone(),
-                                cleanup_ctx.lifecycle.clone(),
-                            );
-                            sm.on_shutdown(&sm_ctx).await;
-                        }
-                    };
-                    let _ = timeout(shutdown_timeout, rollback_fut).await;
-                    serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                    serve_ctx.availability.set(AvailabilityState::Unknown);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::Interrupted,
-                        "shutdown signal received during application startup",
-                    ));
-                }
-                res = hook(serve_ctx.clone()) => {
-                    if let Err(err) = res {
-                        tracing::error!("startup hook failed: {err}; executing registered cleanup hooks");
-                        serve_ctx.lifecycle.set(LifecycleState::Terminating);
-                        serve_ctx.availability.set(AvailabilityState::Broken);
-
-                        started_modules.reverse();
-                        let cleanup_ctx = serve_ctx.clone();
-                        let cleanup_fut = async {
-                            for h in std::mem::take(&mut on_shutdown) {
-                                h(cleanup_ctx.clone()).await;
-                            }
-                            for sm in started_modules {
-                                let sm_ctx = crate::module::ModuleContext::new(
-                                    sm.name(),
-                                    cleanup_ctx.paths.clone(),
-                                    cleanup_ctx.availability.clone(),
-                                    cleanup_ctx.lifecycle.clone(),
-                                );
-                                sm.on_shutdown(&sm_ctx).await;
-                            }
-                        };
-                        let _ = timeout(shutdown_timeout, cleanup_fut).await;
-
-                        serve_ctx.lifecycle.set(LifecycleState::Terminated);
-                        return Err(std::io::Error::other(format!("startup hook failed: {err}")));
-                    }
-                }
-            }
-        }
-
-        // --- Step 6: Declare Ready ---
-        serve_ctx.lifecycle.set(LifecycleState::Ready);
-        serve_ctx.availability.set(AvailabilityState::Ready);
+        // --- Step 3–6: Boot, module on_start, application on_ready, and Ready transition ---
+        crate::app::lifecycle::run_startup(
+            &serve_ctx,
+            &startup_modules,
+            on_ready,
+            &mut on_shutdown,
+            shutdown_timeout,
+            Some(shutdown_rx.clone()),
+        )
+        .await?;
 
         println!("listening on http://{addr}");
 
@@ -1364,36 +1184,106 @@ where
         .await;
 
         // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
-        let on_shutdown_fut = async {
-            for hook in on_shutdown {
-                hook(serve_ctx.clone()).await;
-            }
-            for sm in shutdown_modules {
-                let sm_ctx = crate::module::ModuleContext::new(
-                    sm.name(),
-                    serve_ctx.paths.clone(),
-                    serve_ctx.availability.clone(),
-                    serve_ctx.lifecycle.clone(),
-                );
-                sm.on_shutdown(&sm_ctx).await;
-            }
-        };
-        match timeout(shutdown_timeout, on_shutdown_fut).await {
-            Ok(()) => {}
-            Err(_) => {
-                tracing::warn!(
-                    "shutdown hooks exceeded {}s timeout in aggregate, aborting remaining hooks",
-                    shutdown_timeout.as_secs()
-                );
-            }
-        }
-
-        serve_ctx.lifecycle.set(LifecycleState::Terminated);
-        serve_ctx.availability.set(AvailabilityState::Unknown);
+        crate::app::lifecycle::run_shutdown(
+            &serve_ctx,
+            on_shutdown,
+            shutdown_modules,
+            shutdown_timeout,
+        )
+        .await;
 
         result.map_err(|err| {
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
         })
+    }
+}
+
+type BuiltRouterWithCtx<E, C, S> = (Router<AppContext<E, C, S>>, AppContext<E, C, S>);
+
+struct PreparedServe<E, C, S>
+where
+    E: Clone + Send + Sync + 'static,
+    C: Clone + Send + Sync + 'static,
+    S: Clone + Send + Sync + 'static,
+{
+    router: Router<AppContext<E, C, S>>,
+    serve_ctx: AppContext<E, C, S>,
+    startup_modules: Vec<Arc<dyn crate::module::Module>>,
+    shutdown_modules: Vec<Arc<dyn crate::module::Module>>,
+    on_ready: Vec<ReadyHook<E, C, S>>,
+    on_shutdown: Vec<ShutdownHook<E, C, S>>,
+    shutdown_timeout: Duration,
+}
+
+fn collect_and_validate_routes(
+    startup_modules: &[Arc<dyn crate::module::Module>],
+    app_routes: &RouteRegistry,
+) -> Result<(axum::Router<()>, RouteRegistry), BuildError> {
+    let mut module_axum = axum::Router::new();
+    let mut module_routes = RouteRegistry::new();
+    let mut seen_routes: Vec<(String, String)> = Vec::new();
+
+    // Register module routes FIRST: they must occupy `seen_routes` before
+    // app routes are read from `route_registry`, so that module routes
+    // participate in duplicate-route detection (App M4) instead of being
+    // invisible to it.
+    for m in startup_modules {
+        let single_mod_router = m.register_routes(rume_http::routing::Router::new());
+        let (axum_r, routes) = single_mod_router.into_parts();
+        for r in routes.routes() {
+            check_and_record_route(&mut seen_routes, r)?;
+        }
+        module_axum = merge_module_router(module_axum, axum_r)?;
+        module_routes.extend(routes);
+    }
+
+    // Then read app routes into `seen_routes`. Module routes are already
+    // present, so app/module collisions are caught fail-closed; app routes
+    // are checked against each other as they are recorded.
+    for r in app_routes.routes() {
+        check_and_record_route(&mut seen_routes, r)?;
+    }
+
+    Ok((module_axum, module_routes))
+}
+
+/// Merge a module router onto a target router, catching Axum's overlapping-route
+/// panic and converting it into a typed [`BuildError::DuplicateRoute`].
+fn merge_module_router<S>(
+    router: Router<S>,
+    module_axum: axum::Router<()>,
+) -> Result<Router<S>, BuildError>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    let adapted: Router<S> = module_axum.with_state(());
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| router.merge(adapted))).map_err(
+        |payload| {
+            let msg = if let Some(s) = payload.downcast_ref::<String>() {
+                s.as_str()
+            } else if let Some(s) = payload.downcast_ref::<&str>() {
+                s
+            } else {
+                "overlapping route detected during router merge"
+            };
+            parse_axum_merge_conflict(msg)
+        },
+    )
+}
+
+fn parse_axum_merge_conflict(msg: &str) -> BuildError {
+    if let Some((_, rest)) = msg.split_once("Handler for `")
+        && let Some((sig, _)) = rest.split_once('`')
+        && let Some((method, path)) = sig.split_once(' ')
+    {
+        return BuildError::DuplicateRoute {
+            method: method.to_string(),
+            path: path.to_string(),
+        };
+    }
+    BuildError::DuplicateRoute {
+        method: rume_http::routing::RouteInfo::UNKNOWN_METHOD.to_string(),
+        path: msg.to_string(),
     }
 }
 
@@ -2059,5 +1949,351 @@ mod tests {
             BuildError::DuplicateRoute { method, path }
             if method == "POST" && path == "/items"
         ));
+    }
+
+    #[tokio::test]
+    async fn into_test_parts_and_on_ready_observe_module_routes_and_health_checks() {
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Debug)]
+        struct ModDbHealthCheck;
+
+        impl rume_http::routing::HealthCheck for ModDbHealthCheck {
+            fn name(&self) -> &str {
+                "mod_db"
+            }
+
+            fn run(
+                &self,
+            ) -> std::pin::Pin<Box<dyn Future<Output = rume_http::routing::HealthCheckResult> + Send>>
+            {
+                Box::pin(async {
+                    rume_http::routing::HealthCheckResult {
+                        name: "mod_db".to_string(),
+                        status: rume_http::routing::HealthStatus::Ok,
+                        message: "ok".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                        duration_ms: None,
+                    }
+                })
+            }
+        }
+
+        struct ObservedModule;
+
+        impl crate::module::Module for ObservedModule {
+            fn name(&self) -> &str {
+                "observed"
+            }
+
+            fn register_routes(
+                &self,
+                router: rume_http::routing::Router,
+            ) -> rume_http::routing::Router {
+                router.get("/mod-items", || async { "mod-items" })
+            }
+
+            fn register_health_checks(&self, checks: &mut rume_http::routing::HealthChecks) {
+                checks.add(ModDbHealthCheck);
+            }
+        }
+
+        // 1. `into_test_parts` must expose module routes & health checks on `TestAppParts.ctx`.
+        let parts = RumeBuilder::new(test_ctx())
+            .module(ObservedModule)
+            .into_test_parts()
+            .expect("into_test_parts should succeed");
+        assert!(
+            parts
+                .ctx
+                .route_registry
+                .routes()
+                .iter()
+                .any(|r| r.path == "/mod-items"),
+            "TestAppParts.ctx.route_registry must contain module route /mod-items"
+        );
+        let report = parts.ctx.health_checks.run().await;
+        assert!(
+            report.checks.iter().any(|c| c.name == "mod_db"),
+            "TestAppParts.ctx.health_checks must contain module health check mod_db"
+        );
+
+        // 2. `run_with_signal` must pass finalized context to `on_ready` and `on_shutdown`.
+        let ready_observed = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let shutdown_observed = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let ready_spy = Arc::clone(&ready_observed);
+        let shutdown_spy = Arc::clone(&shutdown_observed);
+
+        let ctx = test_ctx();
+        let lifecycle = ctx.lifecycle.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let mut server = tokio::spawn(async move {
+            RumeBuilder::new(ctx)
+                .bind("127.0.0.1:0")
+                .module(ObservedModule)
+                .on_ready(move |ctx| {
+                    let ready_spy = Arc::clone(&ready_spy);
+                    async move {
+                        let routes: Vec<String> = ctx
+                            .route_registry
+                            .routes()
+                            .iter()
+                            .map(|r| r.path.clone())
+                            .collect();
+                        let checks: Vec<String> = ctx
+                            .health_checks
+                            .run()
+                            .await
+                            .checks
+                            .into_iter()
+                            .map(|c| c.name)
+                            .collect();
+                        *ready_spy.lock().unwrap() = (routes, checks);
+                    }
+                })
+                .on_shutdown(move |ctx| {
+                    let shutdown_spy = Arc::clone(&shutdown_spy);
+                    async move {
+                        let routes: Vec<String> = ctx
+                            .route_registry
+                            .routes()
+                            .iter()
+                            .map(|r| r.path.clone())
+                            .collect();
+                        let checks: Vec<String> = ctx
+                            .health_checks
+                            .run()
+                            .await
+                            .checks
+                            .into_iter()
+                            .map(|c| c.name)
+                            .collect();
+                        *shutdown_spy.lock().unwrap() = (routes, checks);
+                    }
+                })
+                .run_with_signal(async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+        let _ = shutdown_tx.send(());
+        server
+            .await
+            .expect("server task should join")
+            .expect("run_with_signal should exit cleanly");
+
+        let (ready_routes, ready_checks) = ready_observed.lock().unwrap().clone();
+        assert!(
+            ready_routes.iter().any(|p| p == "/mod-items"),
+            "on_ready must observe /mod-items in route_registry, got {ready_routes:?}"
+        );
+        assert!(
+            ready_checks.iter().any(|c| c == "mod_db"),
+            "on_ready must observe mod_db in health_checks, got {ready_checks:?}"
+        );
+
+        let (shutdown_routes, shutdown_checks) = shutdown_observed.lock().unwrap().clone();
+        assert!(
+            shutdown_routes.iter().any(|p| p == "/mod-items"),
+            "on_shutdown must observe /mod-items in route_registry, got {shutdown_routes:?}"
+        );
+        assert!(
+            shutdown_checks.iter().any(|c| c == "mod_db"),
+            "on_shutdown must observe mod_db in health_checks, got {shutdown_checks:?}"
+        );
+
+        // 3. `run_with_listener_and_signal` must also pass finalized context to `on_ready` and `on_shutdown`.
+        let listener_ready = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+        let listener_ready_spy = Arc::clone(&listener_ready);
+        let ctx = test_ctx();
+        let lifecycle = ctx.lifecycle.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let mut server = tokio::spawn(async move {
+            RumeBuilder::new(ctx)
+                .module(ObservedModule)
+                .on_ready(move |ctx| {
+                    let listener_ready_spy = Arc::clone(&listener_ready_spy);
+                    async move {
+                        let routes: Vec<String> = ctx
+                            .route_registry
+                            .routes()
+                            .iter()
+                            .map(|r| r.path.clone())
+                            .collect();
+                        let checks: Vec<String> = ctx
+                            .health_checks
+                            .run()
+                            .await
+                            .checks
+                            .into_iter()
+                            .map(|c| c.name)
+                            .collect();
+                        *listener_ready_spy.lock().unwrap() = (routes, checks);
+                    }
+                })
+                .run_with_listener_and_signal(listener, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+        });
+
+        wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+        let _ = shutdown_tx.send(());
+        server
+            .await
+            .expect("listener server task should join")
+            .expect("run_with_listener_and_signal should exit cleanly");
+
+        let (routes, checks) = listener_ready.lock().unwrap().clone();
+        assert!(routes.iter().any(|p| p == "/mod-items"));
+        assert!(checks.iter().any(|c| c == "mod_db"));
+    }
+
+    #[tokio::test]
+    async fn inspect_mode_rejects_module_cycle_and_duplicate_routes() {
+        struct CycleMod {
+            name: &'static str,
+            deps: Vec<&'static str>,
+        }
+
+        impl crate::module::Module for CycleMod {
+            fn name(&self) -> &str {
+                self.name
+            }
+
+            fn dependencies(&self) -> Vec<&str> {
+                self.deps.clone()
+            }
+        }
+
+        struct DupRouteMod;
+
+        impl crate::module::Module for DupRouteMod {
+            fn name(&self) -> &str {
+                "dup_route"
+            }
+
+            fn register_routes(
+                &self,
+                router: rume_http::routing::Router,
+            ) -> rume_http::routing::Router {
+                router.get("/dup", || async { "module" })
+            }
+        }
+
+        // (a) Cyclic module dependencies must fail closed with InvalidInput in Inspect mode.
+        let cycle_err = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .module(CycleMod {
+                name: "a",
+                deps: vec!["b"],
+            })
+            .module(CycleMod {
+                name: "b",
+                deps: vec!["a"],
+            })
+            .run()
+            .await
+            .expect_err("inspect mode must reject cyclic module dependencies");
+        assert_eq!(cycle_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_cycle_err = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .module(CycleMod {
+                name: "a",
+                deps: vec!["b"],
+            })
+            .module(CycleMod {
+                name: "b",
+                deps: vec!["a"],
+            })
+            .run_with_listener_and_signal(listener, std::future::pending())
+            .await
+            .expect_err("listener inspect mode must reject cyclic module dependencies");
+        assert_eq!(listener_cycle_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // (b) Colliding app/module routes must fail closed with InvalidInput in Inspect mode.
+        let dup_err = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .get("/dup", || async { "app" })
+            .module(DupRouteMod)
+            .run()
+            .await
+            .expect_err("inspect mode must reject duplicate routes");
+        assert_eq!(dup_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_dup_err = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .get("/dup", || async { "app" })
+            .module(DupRouteMod)
+            .run_with_listener_and_signal(listener, std::future::pending())
+            .await
+            .expect_err("listener inspect mode must reject duplicate routes");
+        assert_eq!(listener_dup_err.kind(), std::io::ErrorKind::InvalidInput);
+
+        // (c) App `.route("/dup", get(...))` (UNKNOWN metadata) colliding with module
+        // `.get("/dup", ...)` must fail cleanly in both Inspect and Run/build_router,
+        // while `.route("/dup", post(...))` + module `.get("/dup", ...)` remains valid.
+        let unknown_dup_inspect = RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .route("/dup", axum::routing::get(|| async { "app" }))
+            .module(DupRouteMod)
+            .run()
+            .await
+            .expect_err("inspect mode must reject app .route(get) + module .get collision");
+        assert_eq!(unknown_dup_inspect.kind(), std::io::ErrorKind::InvalidInput);
+
+        let ctx = test_ctx();
+        let unknown_dup_build = RumeBuilder::new(ctx.clone())
+            .route("/dup", axum::routing::get(|| async { "app" }))
+            .module(DupRouteMod)
+            .build_router(ctx)
+            .expect_err("build_router must return DuplicateRoute instead of panicking");
+        assert!(matches!(
+            unknown_dup_build,
+            BuildError::DuplicateRoute { .. }
+        ));
+
+        RumeBuilder::new(test_ctx())
+            .mode(ApplicationMode::Inspect)
+            .route("/dup", axum::routing::post(|| async { "app-post" }))
+            .module(DupRouteMod)
+            .run()
+            .await
+            .expect("POST /dup and GET /dup on the same path must remain valid in Inspect");
+    }
+
+    async fn wait_for_ready(
+        lifecycle: &crate::app::state::Lifecycle,
+        server: &mut tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        timeout: Duration,
+    ) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if lifecycle.state() == LifecycleState::Ready {
+                return;
+            }
+            if server.is_finished() {
+                let res = server.await;
+                panic!(
+                    "server task exited early before reaching Ready (state={:?}): {res:?}",
+                    lifecycle.state()
+                );
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for server to reach Ready (state={:?})",
+                lifecycle.state()
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 }

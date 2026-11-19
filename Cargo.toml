@@ -11,6 +11,7 @@ members = [
     "crates/app",
     "crates/testing",
     "crates/core",
+    "crates/crash",
     "crates/cli",
     "crates/macro",
     "crates/xtask",
@@ -56,15 +57,20 @@ serde_json = "1.0.154"
 clap = { version = "=4.6.7", features = ["derive"] }
 tempfile = "3.27.0"
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
-# SQL parsing and validation used by `rume sql:check`. Pinned to an exact version so the
-# dialect-aware placeholder and comment handling is deterministic across builds.
+# SQL parsing and validation used by `rume sql:check` and `rume-data` transaction/placeholder checks.
+# Pinned to an exact version so dialect-aware placeholder, statement, and comment lexing is deterministic.
 sqlparser = "=0.53.0"
+# RFC 3339 / ISO 8601 date-time parsing used by SAML assertion condition/instant validation.
+# Default features are disabled so consumers that only parse fixed-offset timestamps do not
+# pull in `clock`; crates that need `Utc::now()` enable `clock` explicitly.
+chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
+proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
 redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
-# SAML 2.0 assertion parsing and signature verification (used by the `saml`
-# feature of `rume`; see crates/core/src/enterprise/saml.rs). saml-rs owns the
-# SAML namespace constants, strict ISO 8601 time validation, and signed-reference
-# / anti-wrapping rules we delegate to.
+# SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
+# `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
+# XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
+# XML-DSig verification is delegated to the pluggable `SamlSignatureVerifier` boundary.
 saml-rs = "=0.8.0"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
@@ -94,4 +100,10 @@ tracing-opentelemetry = "=0.34.0"
 # inherits this setting; use CARGO_PROFILE_DEV_DEBUG=2 for a one-off build
 # that needs full debug info.
 [profile.dev]
+debug = "line-tables-only"
+
+# Why: third-party crates (`sqlx`, `tonic`, `opentelemetry`, `sqlparser`, etc.) bloat
+# `target/` and link times when compiled with full DWARF (`debug = 2`); `line-tables-only`
+# preserves file:line backtraces while keeping full debug info for workspace crates.
+[profile.dev.package."*"]
 debug = "line-tables-only"

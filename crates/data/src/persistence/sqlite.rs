@@ -118,6 +118,23 @@ impl SqliteBackend {
     }
 }
 
+fn bind_sqlite_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+    params: &'q [DbValue],
+) -> sqlx::query::Query<'q, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+    for param in params {
+        query = match param {
+            DbValue::Null => query.bind(None as Option<String>),
+            DbValue::Text(s) => query.bind(s.as_str()),
+            DbValue::Int(i) => query.bind(*i),
+            DbValue::Float(f) => query.bind(*f),
+            DbValue::Bool(b) => query.bind(*b),
+            DbValue::Bytes(b) => query.bind(b.as_slice()),
+        };
+    }
+    query
+}
+
 fn extract_sqlite_scalar(row: &SqliteRow) -> Option<String> {
     if let Ok(val) = row.try_get::<String, _>(0) {
         return Some(val);
@@ -169,17 +186,7 @@ impl DatabaseBackend for SqliteBackend {
                     .map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             } else {
-                let mut query = sqlx::query(AssertSqlSafe(statement));
-                for param in &params_vec {
-                    query = match param {
-                        DbValue::Null => query.bind(None as Option<String>),
-                        DbValue::Text(s) => query.bind(s.as_str()),
-                        DbValue::Int(i) => query.bind(*i),
-                        DbValue::Float(f) => query.bind(*f),
-                        DbValue::Bool(b) => query.bind(*b),
-                        DbValue::Bytes(b) => query.bind(b.as_slice()),
-                    };
-                }
+                let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
                 let res = query.execute(&self.pool).await.map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             }
@@ -194,17 +201,7 @@ impl DatabaseBackend for SqliteBackend {
         let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            let query_obj = bind_sqlite_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&self.pool)
                 .await
@@ -222,17 +219,7 @@ impl DatabaseBackend for SqliteBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<SqliteRow> = query.fetch_all(&self.pool).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
         })
@@ -246,17 +233,7 @@ impl DatabaseBackend for SqliteBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<SqliteRow> = query
                 .fetch_optional(&self.pool)
                 .await
@@ -380,8 +357,15 @@ impl DatabaseTransaction for SqliteTransaction {
             // Why: Match `SqliteBackend::execute_params` by routing empty-param
             // calls through `sqlx::raw_sql` for unprepared/multi-statement SQL
             // and mapping all sqlx errors via `map_sqlx_error` to preserve
-            // driver error classification. Reject unbound SQLite placeholders
-            // first so `raw_sql` cannot silently bind them as NULL.
+            // driver error classification. Enforce `validate_managed_transaction_sql`
+            // (matching `PostgresTransaction` and `MysqlTransaction`) so raw SQL
+            // batches cannot resolve the managed transaction out-of-band, and reject
+            // unbound SQLite placeholders first so `raw_sql` cannot silently bind them
+            // as NULL.
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
             let res = if params_vec.is_empty() {
                 reject_unbound_sqlite_placeholders(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
@@ -389,17 +373,7 @@ impl DatabaseTransaction for SqliteTransaction {
                     .await
                     .map_err(map_sqlx_error)?
             } else {
-                let mut query = sqlx::query(AssertSqlSafe(statement));
-                for param in &params_vec {
-                    query = match param {
-                        DbValue::Null => query.bind(None as Option<String>),
-                        DbValue::Text(s) => query.bind(s.as_str()),
-                        DbValue::Int(i) => query.bind(*i),
-                        DbValue::Float(f) => query.bind(*f),
-                        DbValue::Bool(b) => query.bind(*b),
-                        DbValue::Bytes(b) => query.bind(b.as_slice()),
-                    };
-                }
+                let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
                 query.execute(&mut **tx).await.map_err(map_sqlx_error)?
             };
             Ok(res.rows_affected())
@@ -423,17 +397,11 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &query,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
+            let query_obj = bind_sqlite_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
@@ -455,17 +423,11 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
+            let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<SqliteRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
         })
@@ -484,17 +446,11 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
+            let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<SqliteRow> = query
                 .fetch_optional(&mut **tx)
                 .await
@@ -610,80 +566,74 @@ pub(crate) fn sqlx_sqlite_row_to_db_row(row: &SqliteRow) -> Result<DbRow, Persis
     Ok(DbRow::new(columns, values))
 }
 
-fn is_sqlite_ident_start(b: u8, allow_digit: bool) -> bool {
-    b.is_ascii_alphabetic() || b == b'_' || !b.is_ascii() || (allow_digit && b.is_ascii_digit())
-}
-
 /// Rejects SQLite bind placeholders (`?`, `?NNN`, `:name`, `@name`, `$name`) outside
 /// string literals, quoted identifiers, and comments when executing with empty params.
+///
+/// Why: Delegate SQLite lexical scanning (comments, single/double/backtick quotes, `[...]`
+/// identifiers) to `sqlparser = "=0.53.0"` instead of maintaining a hand-rolled byte scanner.
+/// `SQLiteDialect` tokenizes `?`, `?NNN`, and `$name` as `Token::Placeholder`, while `:name`
+/// and `@name` tokenize as `Token::Colon` / `Token::AtSign` immediately adjacent (`tok.span.end
+/// == next.span.start`) to an unquoted `Token::Word` (plus `Token::Number` after `@`). Fails
+/// closed with `PersistenceError::QueryFailed` on `TokenizerError` (revisit only if `sqlparser`
+/// natively tokenizes `:name` / `@name` as `Token::Placeholder` under `SQLiteDialect`).
 pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), PersistenceError> {
-    let bytes = statement.as_bytes();
-    let mut i = 0;
+    use sqlparser::dialect::SQLiteDialect;
+    use sqlparser::tokenizer::{Token, Tokenizer};
 
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'-' && bytes.get(i + 1) == Some(&b'-') {
-            i += 2;
-            while i < bytes.len() && bytes[i] != b'\n' {
-                i += 1;
-            }
-        } else if b == b'/' && bytes.get(i + 1) == Some(&b'*') {
-            i += 2;
-            while i < bytes.len() {
-                if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
-                    i += 2;
-                    break;
+    let dialect = SQLiteDialect {};
+    let sanitized =
+        crate::persistence::backend::sanitize_non_nested_block_comments(statement, &dialect);
+    let tokens = Tokenizer::new(&dialect, &sanitized)
+        .tokenize_with_location()
+        .map_err(|e| {
+            PersistenceError::QueryFailed(format!("failed to tokenize SQLite SQL: {e}"))
+        })?;
+
+    for (idx, tok) in tokens.iter().enumerate() {
+        match &tok.token {
+            Token::Placeholder(placeholder) => {
+                // Why: SQLite allows `$` inside an unquoted identifier (e.g. `price$usd`),
+                // which `sqlparser`'s `SQLiteDialect` splits into `Word("price")` immediately
+                // adjacent to `Placeholder("$usd")`. Preserve identifiers containing `$` while
+                // still rejecting standalone `$name` bind parameters.
+                if placeholder.starts_with('$')
+                    && idx > 0
+                    && let Some(prev) = tokens.get(idx - 1)
+                    && prev.span.end == tok.span.start
+                    && (matches!(&prev.token, Token::Word(w) if w.quote_style.is_none())
+                        || matches!(&prev.token, Token::Placeholder(p) if p.starts_with('$')))
+                {
+                    continue;
                 }
-                i += 1;
+                return Err(PersistenceError::QueryFailed(format!(
+                    "statement contains unbound SQLite placeholder '{placeholder}' with empty parameters"
+                )));
             }
-        } else if b == b'\'' || b == b'"' || b == b'`' {
-            let quote = b;
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == quote {
-                    if bytes.get(i + 1) == Some(&quote) {
-                        i += 2;
-                    } else {
-                        i += 1;
-                        break;
-                    }
-                } else {
-                    i += 1;
+            Token::Colon => {
+                if let Some(next) = tokens.get(idx + 1)
+                    && tok.span.end == next.span.start
+                    && (matches!(&next.token, Token::Word(w) if w.quote_style.is_none())
+                        || matches!(&next.token, Token::Number(_, _)))
+                {
+                    return Err(PersistenceError::QueryFailed(
+                        "statement contains unbound SQLite named placeholder ':' with empty parameters"
+                            .into(),
+                    ));
                 }
             }
-        } else if b == b'[' {
-            i += 1;
-            while i < bytes.len() {
-                if bytes[i] == b']' {
-                    i += 1;
-                    break;
+            Token::AtSign => {
+                if let Some(next) = tokens.get(idx + 1)
+                    && tok.span.end == next.span.start
+                    && (matches!(&next.token, Token::Word(w) if w.quote_style.is_none())
+                        || matches!(&next.token, Token::Number(_, _)))
+                {
+                    return Err(PersistenceError::QueryFailed(
+                        "statement contains unbound SQLite named placeholder '@' with empty parameters"
+                            .into(),
+                    ));
                 }
-                i += 1;
             }
-        } else if b == b'?' {
-            return Err(PersistenceError::QueryFailed(
-                "statement contains unbound SQLite placeholder '?' with empty parameters".into(),
-            ));
-        } else if b == b':'
-            && bytes
-                .get(i + 1)
-                .is_some_and(|&next| is_sqlite_ident_start(next, false))
-        {
-            return Err(PersistenceError::QueryFailed(
-                "statement contains unbound SQLite named placeholder ':' with empty parameters"
-                    .into(),
-            ));
-        } else if (b == b'@' || b == b'$')
-            && bytes
-                .get(i + 1)
-                .is_some_and(|&next| is_sqlite_ident_start(next, true))
-        {
-            return Err(PersistenceError::QueryFailed(format!(
-                "statement contains unbound SQLite named placeholder '{}' with empty parameters",
-                b as char
-            )));
-        } else {
-            i += 1;
+            _ => {}
         }
     }
 
@@ -714,9 +664,11 @@ mod tests {
 
         for stmt in [
             "UPDATE notes SET note = :note WHERE id = 1",
+            "UPDATE notes SET note = :1 WHERE id = 1",
             "UPDATE notes SET note = ? WHERE id = 1",
             "UPDATE notes SET note = ?1 WHERE id = 1",
             "UPDATE notes SET note = @note WHERE id = 1",
+            "UPDATE notes SET note = @1 WHERE id = 1",
             "UPDATE notes SET note = $note WHERE id = 1",
         ] {
             let err = tx
@@ -729,6 +681,18 @@ mod tests {
             );
         }
 
+        // Verify original value remained untouched by rejected placeholder statements.
+        let note_before_update = tx
+            .query_scalar("SELECT note FROM notes WHERE id = 1")
+            .await
+            .expect("query original note");
+        assert_eq!(note_before_update.as_deref(), Some("original"));
+
+        // Unquoted SQLite identifiers containing `$` (e.g. `price$usd`) must pass (#21).
+        tx.execute_params("CREATE TABLE prices (price$usd INTEGER);", &[])
+            .await
+            .expect("unquoted SQLite identifier containing '$' must pass");
+
         // Quoted literals, quoted identifiers, and comments containing placeholder-like tokens must pass.
         tx.execute_params(
             "/* :note ? */ -- @note $note\nUPDATE notes SET note = 'kept :note ? @a $b' WHERE id = 1",
@@ -737,10 +701,60 @@ mod tests {
         .await
         .expect("quoted/commented placeholders should be allowed");
 
+        tx.execute_params(
+            "CREATE TABLE quoted_ph ([col?] TEXT, `col:name` TEXT, \"col@name\" TEXT);",
+            &[],
+        )
+        .await
+        .expect("quoted identifiers containing placeholder characters must pass");
+
         // Multi-statement raw execution without placeholders continues to work.
         tx.execute("CREATE TABLE extra (id INTEGER); INSERT INTO extra (id) VALUES (42);")
             .await
-            .expect("multi-statement batch without placeholders should succeed");
+            .expect("multi-statement without placeholders must succeed");
+
+        // Non-nested SQLite block comments containing an inner `/*` must close at the first `*/`
+        // across all managed transaction entrypoints (R4-3).
+        tx.execute("INSERT INTO extra (id) VALUES (77) /* example /* marker */")
+            .await
+            .expect("execute with inner /* in block comment must succeed");
+        let v = tx
+            .query_scalar("SELECT 1 /* example /* marker */")
+            .await
+            .expect("query_scalar with inner /* in block comment must succeed");
+        assert_eq!(v.as_deref(), Some("1"));
+        let rows = tx
+            .fetch_all(
+                "SELECT id FROM extra WHERE id = 77 /* example /* marker */",
+                &[],
+            )
+            .await
+            .expect("fetch_all with inner /* in block comment must succeed");
+        assert_eq!(rows.len(), 1);
+        let opt = tx
+            .fetch_optional(
+                "SELECT id FROM extra WHERE id = 77 /* example /* marker */",
+                &[],
+            )
+            .await
+            .expect("fetch_optional with inner /* in block comment must succeed");
+        assert!(opt.is_some());
+
+        // Overlapping inner opener/closer (`/* /*/`) and nested-comment payloads (`/* /* */ ...`)
+        // must close at the first `*/` and reject any trailing transaction-control statement (R5-1).
+        for smuggled in [
+            "UPDATE notes SET note = 'changed' /* /*/; COMMIT; /* */",
+            "UPDATE notes SET note = 'changed' /* /* */ ; COMMIT; /* */ */",
+        ] {
+            let err = tx
+                .execute_params(smuggled, &[])
+                .await
+                .expect_err(&format!("expected TransactionError for: {smuggled}"));
+            assert!(
+                matches!(err, PersistenceError::TransactionError(_)),
+                "expected TransactionError for {smuggled}, got {err:?}"
+            );
+        }
 
         tx.commit().await.expect("commit tx");
 
@@ -749,5 +763,85 @@ mod tests {
             .await
             .expect("query note");
         assert_eq!(note.as_deref(), Some("kept :note ? @a $b"));
+    }
+
+    #[tokio::test]
+    async fn sqlite_tx_rejects_managed_transaction_control_sql() {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("in-memory sqlite");
+        let backend = SqliteBackend::from_pool(pool);
+        let tx = backend.begin_transaction().await.expect("begin tx");
+
+        for stmt in ["COMMIT;", "BEGIN;", "ROLLBACK;"] {
+            let err = tx
+                .execute_params(stmt, &[])
+                .await
+                .expect_err(&format!("expected TransactionError for {stmt}"));
+            assert!(
+                matches!(err, PersistenceError::TransactionError(_)),
+                "expected TransactionError for {stmt}, got {err:?}"
+            );
+        }
+
+        // Quoted `[BEGIN]` identifier in SQLite must still execute cleanly.
+        tx.execute_params("CREATE TABLE [BEGIN] (id INTEGER PRIMARY KEY);", &[])
+            .await
+            .expect("bracketed identifier [BEGIN] should be allowed");
+        tx.rollback().await.expect("rollback tx");
+    }
+}
+
+#[cfg(test)]
+mod data_sql_scanners_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn reject_unbound_sqlite_placeholders_never_panics_on_arbitrary_utf8(s in "\\PC*") {
+            let _ = reject_unbound_sqlite_placeholders(&s);
+        }
+
+        #[test]
+        fn reject_unbound_sqlite_placeholders_always_rejects_unbound_markers(
+            ident in "[a-zA-Z_][a-zA-Z0-9_]{0,14}",
+            digits in "[0-9]{1,4}",
+        ) {
+            for ph in [
+                "?".to_string(),
+                format!("?{digits}"),
+                format!(":{ident}"),
+                format!("@{ident}"),
+                format!("@{digits}"),
+                format!("${ident}"),
+            ] {
+                let sql = format!("SELECT * FROM t WHERE a = {ph}");
+                let err = reject_unbound_sqlite_placeholders(&sql)
+                    .expect_err(&format!("expected QueryFailed for '{sql}'"));
+                prop_assert!(matches!(err, PersistenceError::QueryFailed(_)));
+            }
+        }
+
+        #[test]
+        fn reject_unbound_sqlite_placeholders_permits_markers_in_quotes_comments_and_ids(
+            ident in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
+            pad in "[a-zA-Z0-9_ ]{0,8}",
+        ) {
+            let markers = format!("? ?1 :{ident} @{ident} ${ident}");
+            for sql in [
+                format!("SELECT '{pad} {markers} {pad}';"),
+                format!("-- {pad} {markers}\nSELECT 1;"),
+                format!("/* {pad} {markers} */ SELECT 1;"),
+                format!("SELECT \"{ident}?\" FROM t;"),
+                format!("SELECT `{ident}:{ident}` FROM t;"),
+                format!("SELECT [{ident}@{ident}] FROM t;"),
+            ] {
+                prop_assert!(
+                    reject_unbound_sqlite_placeholders(&sql).is_ok(),
+                    "quoted/commented markers must be permitted: {sql}"
+                );
+            }
+        }
     }
 }

@@ -26,7 +26,7 @@ tempfile.workspace = true
 sqlparser.workspace = true
 unicode-width = "=0.2.3"
 proc-macro2.workspace = true
-chrono = "=0.4.45"
+chrono = { workspace = true, features = ["clock"] }
 dotenvy.workspace = true
 redis.workspace = true
 syn.workspace = true

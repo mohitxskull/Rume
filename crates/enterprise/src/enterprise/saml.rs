@@ -12,17 +12,18 @@
 //!
 //! # Dependency basis
 //!
-//! SAML XML handling is delegated to the [`saml-rs`](https://crates.io/crates/saml-rs) crate
-//! (v0.8.0) rather than hand-rolled. `saml-rs` owns the SAML 2.0 namespace URNs, enforces strict
-//! ISO 8601 time instants, and rejects empty/unresolvable signed references (signature-wrapping
-//! bypasses). This module uses `saml_rs::constants::namespace::{ASSERTION, DSIG, PROTOCOL}` for
-//! the SAML assertion, XML-DSig, and protocol namespaces, and quick-xml (saml-rs's own XML engine
-//! at the same `=0.42.0` version) for structural traversal of the `<Assertion>` subtree.
+//! [`saml-rs`](https://crates.io/crates/saml-rs) (v0.8.0) supplies only the SAML 2.0 and
+//! XML-DSig namespace URN constants (`saml_rs::constants::namespace::{ASSERTION, DSIG, PROTOCOL}`).
+//! Structural XML parsing is handled by `quick-xml` (namespace-aware `NsReader`), strict
+//! RFC 3339 / ISO 8601 instant validation is handled by `chrono`, and cryptographic XML-DSig
+//! verification is delegated to the caller-supplied [`SamlSignatureVerifier`] trait.
 //!
-//! The high-level `saml_rs::Saml` browser-SSO API is intentionally *not* used here: it requires an
-//! `SpConfig`, signed `IdpDescriptor` metadata, a `ReplayCache`, a `SamlValidationContext`, and
-//! browser form input — none of which exist in the standalone-assertion / verifier-injected
-//! contract this module implements.
+//! Why: the high-level `saml_rs::Saml` browser-SSO API is intentionally not used because it
+//! requires an `SpConfig`, signed `IdpDescriptor` metadata, a `ReplayCache`, a
+//! `SamlValidationContext`, and HTTP form bindings that do not match this module's standalone
+//! assertion / injected-verifier API. Canonicalization (`exc-c14n`) and X.509 RSA-SHA256
+//! verification are intentionally not hand-rolled here; callers must supply a real
+//! [`SamlSignatureVerifier`] implementation, and the `saml` feature remains Experimental.
 
 use quick_xml::events::Event;
 use quick_xml::name::ResolveResult;
@@ -36,6 +37,57 @@ fn is_ns(res: &ResolveResult<'_>, expected: &str) -> bool {
         ResolveResult::Bound(ns) => ns.as_ref() == expected,
         _ => false,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum XmlNs {
+    Assertion,
+    Protocol,
+    Dsig,
+    Other,
+}
+
+#[derive(Default)]
+struct AssertionFields {
+    subject: Option<String>,
+    audience: Option<String>,
+    attributes: BTreeMap<String, Vec<String>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextTarget {
+    AssertionIssuer,
+    ResponseIssuer,
+    SubjectNameId,
+    Audience,
+    AttributeValue,
+}
+
+struct ActiveTextCapture {
+    target: TextTarget,
+    depth: usize,
+    buf: String,
+    /// Owning `<Attribute Name="...">` captured when an `AttributeValue` capture opens.
+    ///
+    /// Why: SAML permits structured XML inside `<AttributeValue>`, so a nested `<Attribute>`
+    /// start/end must not change or clear the name the buffered text belongs to; the capture
+    /// carries its own copy instead of reading the parser-wide `current_attr_name` at close.
+    attr_name: Option<String>,
+}
+
+fn resolve_general_ref(raw_ref: &quick_xml::events::BytesRef<'_>) -> Result<String, SamlError> {
+    if let Some(ch) = raw_ref.resolve_char_ref().map_err(|err| {
+        SamlError::Malformed(format!("invalid numeric XML character reference: {err}"))
+    })? {
+        return Ok(ch.to_string());
+    }
+    let name = raw_ref.as_ref();
+    if let Some(resolved) = quick_xml::escape::resolve_xml_entity(name) {
+        return Ok(resolved.to_string());
+    }
+    Err(SamlError::Malformed(format!(
+        "unresolved XML entity reference '&{name};'"
+    )))
 }
 
 /// SAML processing and validation errors.
@@ -120,176 +172,33 @@ pub struct SamlAssertion {
     pub attributes: BTreeMap<String, Vec<String>>,
 }
 
-/// Parses an ISO 8601 timestamp strictly, including UTC 'Z', fractional seconds,
-/// and explicit timezone offsets (+HH:MM, -HH:MM, +HHMM, -HHMM).
+/// Parses an ISO 8601 / RFC 3339 timestamp strictly, including UTC `'Z'`, fractional seconds,
+/// and explicit colon-separated timezone offsets (`±HH:MM`).
 ///
-/// saml-rs enforces strict ISO 8601 time instants: an explicit timezone (`Z` or
-/// `±HH:MM`/`±HHMM`) is mandatory. This parser mirrors that stance — raw epoch
-/// integers and naive timestamps without a timezone are rejected fail-closed,
-/// because a wall-clock instant cannot resolve unambiguously to UTC otherwise.
-///
-/// Fails closed: if the timestamp is malformed or invalid, returns an error rather
-/// than ignoring it.
+/// An explicit timezone (`'Z'` or `±HH:MM`) and a `'T'`/`'t'` date-time separator are mandatory:
+/// raw epoch integers, space-separated RFC 3339 timestamps, naive wall-clock strings without a
+/// timezone, and pre-Unix-epoch instants are rejected fail-closed.
 pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
-    let s = s.trim();
+    let trimmed = s.trim();
 
-    // Reject raw epoch integers: ISO 8601 wall-clock timestamps must carry an
-    // explicit timezone so they resolve unambiguously to UTC (saml-rs requirement).
-    let (date_str, time_with_tz) = s.split_once('T').ok_or_else(|| {
-        SamlError::Malformed(format!("invalid ISO 8601 timestamp '{s}': missing 'T'"))
+    // Why: delegate calendar, leap-year, and `-23:59..=+23:59` offset validation to
+    // `chrono::DateTime::parse_from_rfc3339` (already pinned in `Cargo.lock`) instead of
+    // hand-rolled date math and UTF-8 byte slicing that can panic on multi-byte inputs; check
+    // byte index 10 for `'T'`/`'t'` to reject RFC 3339 space separators and use `u64::try_from`
+    // so pre-1970 instants fail closed instead of wrapping.
+    if !matches!(trimmed.as_bytes().get(10), Some(b'T' | b't')) {
+        return Err(SamlError::Malformed(format!(
+            "invalid ISO 8601 timestamp '{trimmed}': missing 'T' separator"
+        )));
+    }
+
+    let dt = chrono::DateTime::parse_from_rfc3339(trimmed).map_err(|err| {
+        SamlError::Malformed(format!("invalid ISO 8601 timestamp '{trimmed}': {err}"))
     })?;
 
-    let mut date_parts = date_str.split('-');
-    let year: u64 = date_parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid year in timestamp '{s}'")))?;
-    let month: u64 = date_parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid month in timestamp '{s}'")))?;
-    let day: u64 = date_parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid day in timestamp '{s}'")))?;
-
-    if year < 1970 || !(1..=12).contains(&month) {
-        return Err(SamlError::Malformed(format!(
-            "timestamp '{s}' out of valid date bounds"
-        )));
-    }
-
-    let is_leap = (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let max_days = match month {
-        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
-        4 | 6 | 9 | 11 => 30,
-        2 => {
-            if is_leap {
-                29
-            } else {
-                28
-            }
-        }
-        _ => 0,
-    };
-    if day == 0 || day > max_days {
-        return Err(SamlError::Malformed(format!(
-            "timestamp '{s}' day {day} is invalid for month {month} in year {year}"
-        )));
-    }
-
-    // Parse time and timezone offset. An explicit timezone is required: 'Z' or
-    // ±HH:MM / ±HHMM. Naive timestamps (no timezone) are rejected fail-closed.
-    let (time_str, tz_offset_secs) = if let Some(idx) = time_with_tz.find('Z') {
-        // 'Z' must terminate the instant; anything after it is malformed.
-        if idx != time_with_tz.len() - 1 {
-            return Err(SamlError::Malformed(format!(
-                "invalid ISO 8601 timestamp '{s}': 'Z' must terminate the instant"
-            )));
-        }
-        (&time_with_tz[..idx], 0i64)
-    } else if let Some(idx) = time_with_tz.rfind('+') {
-        let tz_str = &time_with_tz[idx + 1..];
-        let offset = parse_tz_offset(tz_str)?;
-        (&time_with_tz[..idx], offset)
-    } else if let Some(idx) = time_with_tz.rfind('-') {
-        let tz_str = &time_with_tz[idx + 1..];
-        let offset = parse_tz_offset(tz_str)?;
-        (&time_with_tz[..idx], -offset)
-    } else {
-        return Err(SamlError::Malformed(format!(
-            "invalid ISO 8601 timestamp '{s}': missing timezone (required 'Z' or ±HH:MM/±HHMM)"
-        )));
-    };
-
-    let mut time_parts = time_str.split(':');
-    let hour: u64 = time_parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid hour in timestamp '{s}'")))?;
-    let min: u64 = time_parts
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid minute in timestamp '{s}'")))?;
-    let sec_str = time_parts
-        .next()
-        .ok_or_else(|| SamlError::Malformed(format!("invalid second in timestamp '{s}'")))?;
-    let sec: u64 = sec_str
-        .split('.')
-        .next()
-        .and_then(|p| p.parse().ok())
-        .ok_or_else(|| SamlError::Malformed(format!("invalid second value in timestamp '{s}'")))?;
-
-    if hour > 23 || min > 59 || sec > 60 {
-        return Err(SamlError::Malformed(format!(
-            "timestamp '{s}' out of valid time bounds"
-        )));
-    }
-
-    let mut days: u64 = 0;
-    for y in 1970..year {
-        let is_leap = (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400);
-        days += if is_leap { 366 } else { 365 };
-    }
-    let is_leap_year =
-        (year.is_multiple_of(4) && !year.is_multiple_of(100)) || year.is_multiple_of(400);
-    let days_in_months = [
-        31,
-        if is_leap_year { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    for m in 1..month {
-        days += days_in_months[(m - 1) as usize];
-    }
-    days += day - 1;
-
-    let total_secs_utc = (days * 86400 + hour * 3600 + min * 60 + sec) as i64 - tz_offset_secs;
-    if total_secs_utc < 0 {
-        return Err(SamlError::Malformed(format!(
-            "timestamp '{s}' resolves before Unix epoch"
-        )));
-    }
-
-    Ok(total_secs_utc as u64)
-}
-
-fn parse_tz_offset(s: &str) -> Result<i64, SamlError> {
-    let s = s.trim();
-    if let Some((h_str, m_str)) = s.split_once(':') {
-        let h: i64 = h_str
-            .parse()
-            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
-        let m: i64 = m_str
-            .parse()
-            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
-        Ok(h * 3600 + m * 60)
-    } else if s.len() == 4 {
-        let h: i64 = s[..2]
-            .parse()
-            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
-        let m: i64 = s[2..]
-            .parse()
-            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
-        Ok(h * 3600 + m * 60)
-    } else if s.len() == 2 {
-        let h: i64 = s
-            .parse()
-            .map_err(|_| SamlError::Malformed(format!("invalid timezone offset '{s}'")))?;
-        Ok(h * 3600)
-    } else {
-        Err(SamlError::Malformed(format!(
-            "invalid timezone offset '{s}'"
-        )))
-    }
+    u64::try_from(dt.timestamp()).map_err(|_| {
+        SamlError::Malformed(format!("timestamp '{trimmed}' resolves before Unix epoch"))
+    })
 }
 
 /// Parser and validator for SAML 2.0 assertions.
@@ -384,7 +293,9 @@ impl SamlParser {
         allow_unverified: bool,
     ) -> Result<SamlAssertion, SamlError> {
         let mut reader = NsReader::from_str(xml);
-        reader.config_mut().trim_text(true);
+        // Why: keep internal whitespace intact across text, CDATA, comment, and entity-ref
+        // boundaries; outer whitespace is trimmed once when each captured claim element closes.
+        reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = true;
 
         let mut assertion_count = 0usize;
@@ -392,26 +303,26 @@ impl SamlParser {
         let mut response_id: Option<String> = None;
         let mut destination: Option<String> = None;
 
-        let mut issuer: Option<String> = None;
-        let mut subject: Option<String> = None;
-        let mut audience: Option<String> = None;
+        let mut assertion_issuer: Option<String> = None;
+        let mut response_issuer: Option<String> = None;
+        let mut active_capture: Option<ActiveTextCapture> = None;
+        let mut fields = AssertionFields::default();
         let mut not_before: Option<u64> = None;
         let mut not_on_or_after: Option<u64> = None;
-        let mut attributes: BTreeMap<String, Vec<String>> = BTreeMap::new();
 
         let mut assertion_start_offset: Option<usize> = None;
         let mut assertion_end_offset: Option<usize> = None;
 
         let mut signature_references: Vec<String> = Vec::new();
 
-        let mut element_stack: Vec<(String, bool)> = Vec::new();
+        let mut element_stack: Vec<(String, XmlNs)> = Vec::new();
         let mut in_assertion = false;
         let mut current_attr_name: Option<String> = None;
+        let mut current_attr_depth: usize = 0;
 
         // Why: in signed mode an empty `<ds:Reference>` does not bind to any signed
-        // element and is a signature-verification bypass (saml-rs rejects unresolved /
-        // empty signed references). Unverified diagnostic mode keeps RFC 3275 leniency
-        // for the root-document `URI=""` binding.
+        // element and is a signature-verification bypass. Unverified diagnostic mode keeps
+        // RFC 3275 leniency for root-document `URI=""` and Response-level envelopes.
         let signed_mode = verifier.is_some();
 
         loop {
@@ -424,6 +335,17 @@ impl SamlParser {
                     let is_saml_ns = is_ns(&res, ASSERTION);
                     let is_protocol_ns = is_ns(&res, PROTOCOL);
                     let is_dsig_ns = is_ns(&res, DSIG);
+                    let ns = if is_saml_ns {
+                        XmlNs::Assertion
+                    } else if is_protocol_ns {
+                        XmlNs::Protocol
+                    } else if is_dsig_ns {
+                        XmlNs::Dsig
+                    } else {
+                        XmlNs::Other
+                    };
+                    let new_depth = element_stack.len() + 1;
+                    let parent = element_stack.last().map(|(n, pns)| (n.as_str(), *pns));
 
                     if local_name == "Assertion" {
                         if !is_saml_ns {
@@ -457,13 +379,52 @@ impl SamlParser {
                             }
                         }
                     } else if local_name == "Reference" && is_dsig_ns {
-                        for attr in e.attributes().flatten() {
-                            let local_k = attr.key.local_name();
-                            if local_k.as_ref() == "URI" {
-                                let uri = attr.value.as_ref();
-                                let ref_id = uri.strip_prefix('#').unwrap_or(uri);
-                                signature_references.push(ref_id.to_string());
+                        // Why: only `<ds:Reference>` elements directly under
+                        // `<ds:Signature>/<ds:SignedInfo>` belong to a signature's signed
+                        // info block; stray `<ds:Reference>` nodes elsewhere in the document
+                        // must not satisfy the signed-mode structural gate.
+                        let in_signed_info = element_stack.len() >= 2
+                            && matches!(
+                                (
+                                    element_stack[element_stack.len() - 2].0.as_str(),
+                                    element_stack[element_stack.len() - 2].1,
+                                    element_stack[element_stack.len() - 1].0.as_str(),
+                                    element_stack[element_stack.len() - 1].1,
+                                ),
+                                ("Signature", XmlNs::Dsig, "SignedInfo", XmlNs::Dsig)
+                            );
+                        if in_signed_info {
+                            for attr in e.attributes().flatten() {
+                                let local_k = attr.key.local_name();
+                                if local_k.as_ref() == "URI" {
+                                    let uri = attr.value.as_ref();
+                                    let ref_id = uri.strip_prefix('#').unwrap_or(uri);
+                                    signature_references.push(ref_id.to_string());
+                                }
                             }
+                        }
+                    } else if local_name == "Issuer" && is_saml_ns && active_capture.is_none() {
+                        // Why: anchor `<Issuer>` text accumulation to direct children of
+                        // `<Assertion>` or `<Response>` and bind the capture to its opening
+                        // stack depth so nested markup or comments cannot corrupt or drop it.
+                        match parent {
+                            Some(("Assertion", XmlNs::Assertion)) => {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::AssertionIssuer,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                    attr_name: None,
+                                });
+                            }
+                            Some(("Response", XmlNs::Protocol)) => {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::ResponseIssuer,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                    attr_name: None,
+                                });
+                            }
+                            _ => {}
                         }
                     } else if in_assertion && is_saml_ns {
                         if local_name == "Conditions" {
@@ -478,93 +439,130 @@ impl SamlParser {
                                 }
                             }
                         } else if local_name == "Attribute" {
-                            for attr in e.attributes().flatten() {
-                                let local_k = attr.key.local_name();
-                                if local_k.as_ref() == "Name" {
-                                    current_attr_name = Some(attr.value.as_ref().to_string());
+                            // Why: only an `<Attribute>` outside any open text capture may set
+                            // the attribute name; a nested `<Attribute>` inside an
+                            // `<AttributeValue>` is structured value content and must not
+                            // replace (or later clear) the owning attribute's name.
+                            if active_capture.is_none() {
+                                for attr in e.attributes().flatten() {
+                                    let local_k = attr.key.local_name();
+                                    if local_k.as_ref() == "Name" {
+                                        current_attr_name = Some(attr.value.as_ref().to_string());
+                                        current_attr_depth = new_depth;
+                                    }
+                                }
+                            }
+                        } else if active_capture.is_none() {
+                            if local_name == "NameID"
+                                && fields.subject.is_none()
+                                && matches!(parent, Some(("Subject", XmlNs::Assertion)))
+                            {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::SubjectNameId,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                    attr_name: None,
+                                });
+                            } else if local_name == "Audience" && fields.audience.is_none() {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::Audience,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                    attr_name: None,
+                                });
+                            } else if local_name == "AttributeValue" && current_attr_name.is_some()
+                            {
+                                active_capture = Some(ActiveTextCapture {
+                                    target: TextTarget::AttributeValue,
+                                    depth: new_depth,
+                                    buf: String::new(),
+                                    attr_name: current_attr_name.clone(),
+                                });
+                            }
+                        }
+                    }
+
+                    element_stack.push((local_name.to_string(), ns));
+                }
+                Ok((res, Event::End(ref e))) => {
+                    let local = e.local_name();
+                    let local_name = local.as_ref();
+                    if active_capture
+                        .as_ref()
+                        .is_some_and(|cap| cap.depth == element_stack.len())
+                        && let Some(capture) = active_capture.take()
+                    {
+                        let text = capture.buf.trim().to_string();
+                        if !text.is_empty() {
+                            match capture.target {
+                                TextTarget::AssertionIssuer => {
+                                    if let Some(prev) = &assertion_issuer {
+                                        if prev != &text {
+                                            return Err(SamlError::SignatureWrappingDetected(
+                                                "multiple conflicting Issuer elements detected in Assertion".into(),
+                                            ));
+                                        }
+                                    } else {
+                                        assertion_issuer = Some(text);
+                                    }
+                                }
+                                TextTarget::ResponseIssuer => {
+                                    if response_issuer.is_none() {
+                                        response_issuer = Some(text);
+                                    }
+                                }
+                                TextTarget::SubjectNameId => {
+                                    if fields.subject.is_none() {
+                                        fields.subject = Some(text);
+                                    }
+                                }
+                                TextTarget::Audience => {
+                                    if fields.audience.is_none() {
+                                        fields.audience = Some(text);
+                                    }
+                                }
+                                TextTarget::AttributeValue => {
+                                    if let Some(attr_name) = capture.attr_name {
+                                        fields.attributes.entry(attr_name).or_default().push(text);
+                                    }
                                 }
                             }
                         }
                     }
 
-                    element_stack.push((local_name.to_string(), is_saml_ns));
-                }
-                Ok((res, Event::End(ref e))) => {
-                    let local = e.local_name();
-                    let local_name = local.as_ref();
                     if local_name == "Assertion" && is_ns(&res, ASSERTION) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
-                    } else if local_name == "Attribute" && is_ns(&res, ASSERTION) {
+                    } else if local_name == "Attribute"
+                        && is_ns(&res, ASSERTION)
+                        && element_stack.len() == current_attr_depth
+                    {
+                        // Why: clear only when the owning `<Attribute>` itself closes, not a
+                        // nested one (see the matching Start-side guard).
                         current_attr_name = None;
                     }
                     element_stack.pop();
                 }
                 Ok((_res, Event::Text(ref t))) => {
-                    if in_assertion {
-                        let parent = element_stack.last();
-                        let grand_parent = if element_stack.len() >= 2 {
-                            element_stack.get(element_stack.len() - 2)
-                        } else {
-                            None
-                        };
-
-                        let text = quick_xml::escape::unescape(t.as_ref())
-                            .map(|c| c.trim().to_string())
-                            .unwrap_or_else(|_| t.as_ref().trim().to_string());
-
-                        if !text.is_empty()
-                            && let Some((p_name, true)) = parent
-                        {
-                            if p_name == "Issuer" && issuer.is_none() {
-                                issuer = Some(text);
-                            } else if p_name == "NameID"
-                                && subject.is_none()
-                                && let Some((gp_name, true)) = grand_parent
-                                && gp_name == "Subject"
-                            {
-                                subject = Some(text);
-                            } else if p_name == "Audience" && audience.is_none() {
-                                audience = Some(text);
-                            } else if p_name == "AttributeValue" && current_attr_name.is_some() {
-                                attributes
-                                    .entry(current_attr_name.clone().unwrap())
-                                    .or_default()
-                                    .push(text);
-                            }
-                        }
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(t.as_ref());
                     }
                 }
                 Ok((_res, Event::CData(ref c))) => {
-                    if in_assertion {
-                        let parent = element_stack.last();
-                        let grand_parent = if element_stack.len() >= 2 {
-                            element_stack.get(element_stack.len() - 2)
-                        } else {
-                            None
-                        };
-
-                        let text = c.as_ref().trim().to_string();
-                        if !text.is_empty()
-                            && let Some((p_name, true)) = parent
-                        {
-                            if p_name == "Issuer" && issuer.is_none() {
-                                issuer = Some(text);
-                            } else if p_name == "NameID"
-                                && subject.is_none()
-                                && let Some((gp_name, true)) = grand_parent
-                                && gp_name == "Subject"
-                            {
-                                subject = Some(text);
-                            } else if p_name == "Audience" && audience.is_none() {
-                                audience = Some(text);
-                            } else if p_name == "AttributeValue" && current_attr_name.is_some() {
-                                attributes
-                                    .entry(current_attr_name.clone().unwrap())
-                                    .or_default()
-                                    .push(text);
-                            }
-                        }
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(c.as_ref());
+                    }
+                }
+                Ok((_res, Event::GeneralRef(ref r))) => {
+                    let resolved = resolve_general_ref(r)?;
+                    if let Some(capture) = active_capture.as_mut()
+                        && capture.depth == element_stack.len()
+                    {
+                        capture.buf.push_str(&resolved);
                     }
                 }
                 Ok((_res, Event::Eof)) => break,
@@ -582,10 +580,9 @@ impl SamlParser {
         }
 
         // Validate signature references against assertion ID or response ID.
-        // Why: saml-rs rejects empty/unresolvable signed references (XSW bypass). An empty
-        // `<ds:Reference URI="">` binds to the whole document rather than a signed element;
-        // it is only tolerated in unverified diagnostic mode. In signed mode it is rejected
-        // outright as a signature-verification bypass.
+        // Why: an empty `<ds:Reference URI="">` binds to the whole document rather than a
+        // signed element; it is tolerated only in unverified diagnostic mode and rejected
+        // outright in signed mode as a signature-wrapping bypass.
         for ref_id in &signature_references {
             if ref_id.is_empty() {
                 if signed_mode {
@@ -620,13 +617,42 @@ impl SamlParser {
             }
         }
 
-        let issuer = issuer.ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?;
+        // Why: in signed mode (`verifier.is_some()`), mandate non-empty Assertion/@ID and at least
+        // one `<ds:Reference>` covering that Assertion/@ID so an assertion without a signature or
+        // covered only by a Response-level reference cannot slip past signature verification.
+        if signed_mode {
+            let Some(bound_assertion_id) =
+                assertion_id.as_deref().filter(|id| !id.trim().is_empty())
+            else {
+                return Err(SamlError::SignatureWrappingDetected(
+                    "signed Assertion is missing a non-empty ID attribute".into(),
+                ));
+            };
+            if signature_references.is_empty() {
+                return Err(SamlError::SignatureWrappingDetected(
+                    "signed SAML payload is missing ds:Signature/ds:SignedInfo/ds:Reference".into(),
+                ));
+            }
+            if !signature_references
+                .iter()
+                .any(|ref_id| ref_id == bound_assertion_id)
+            {
+                return Err(SamlError::SignatureWrappingDetected(format!(
+                    "no ds:Reference URI covers signed assertion ID '{bound_assertion_id}'"
+                )));
+            }
+        }
+
+        let issuer = assertion_issuer
+            .or(response_issuer)
+            .ok_or_else(|| SamlError::Malformed("missing Issuer element".into()))?;
         if issuer.is_empty() {
             return Err(SamlError::Malformed("missing Issuer element".into()));
         }
 
-        let subject =
-            subject.ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?;
+        let subject = fields
+            .subject
+            .ok_or_else(|| SamlError::Malformed("missing NameID in Subject".into()))?;
         if subject.is_empty() {
             return Err(SamlError::Malformed("missing NameID in Subject".into()));
         }
@@ -648,11 +674,11 @@ impl SamlParser {
             id,
             issuer,
             subject,
-            audience,
+            audience: fields.audience,
             destination,
             not_before,
             not_on_or_after,
-            attributes,
+            attributes: fields.attributes,
         })
     }
 
@@ -741,5 +767,213 @@ impl SamlParser {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod saml_parser_and_iso8601_proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn parse_unverified_never_panics_on_arbitrary_utf8(xml in "\\PC*") {
+            let _ = SamlParser::parse_unverified(&xml);
+            let _ = SamlParser::parse_entity_id(&xml);
+        }
+
+        #[test]
+        fn parse_iso8601_strict_never_panics_on_arbitrary_or_multibyte_offsets(
+            s in "\\PC*",
+            suffix in "\\PC*",
+        ) {
+            let _ = parse_iso8601_strict(&s);
+            let combined = format!("2026-11-19T12:00:00{suffix}");
+            let _ = parse_iso8601_strict(&combined);
+        }
+
+        #[test]
+        fn parse_iso8601_strict_converts_valid_rfc3339_instants_and_rejects_pre_epoch(
+            year in 1970i32..=2099,
+            month in 1u32..=12,
+            day in 1u32..=28,
+            hour in 0u32..=23,
+            minute in 0u32..=59,
+            second in 0u32..=59,
+            use_z in any::<bool>(),
+            positive_offset in any::<bool>(),
+            off_h in 0u32..=23,
+            off_m in 0u32..=59,
+        ) {
+            let naive = chrono::NaiveDate::from_ymd_opt(year, month, day)
+                .unwrap()
+                .and_hms_opt(hour, minute, second)
+                .unwrap();
+
+            let (tz_suffix, offset_secs) = if use_z {
+                ("Z".to_string(), 0i64)
+            } else {
+                let sign = if positive_offset { '+' } else { '-' };
+                let secs = (off_h as i64) * 3600 + (off_m as i64) * 60;
+                let signed = if positive_offset { secs } else { -secs };
+                (format!("{sign}{off_h:02}:{off_m:02}"), signed)
+            };
+
+            let ts = format!(
+                "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}{tz_suffix}"
+            );
+            let expected_utc = naive.and_utc().timestamp() - offset_secs;
+
+            match expected_utc {
+                secs if secs >= 0 => {
+                    let parsed = parse_iso8601_strict(&ts)
+                        .expect("valid post-epoch RFC 3339 timestamp must succeed");
+                    prop_assert_eq!(parsed, secs as u64);
+                }
+                _ => {
+                    let err = parse_iso8601_strict(&ts)
+                        .expect_err("pre-1970 UTC instant must fail closed");
+                    prop_assert!(matches!(err, SamlError::Malformed(_)));
+                }
+            }
+        }
+
+        #[test]
+        fn parse_iso8601_strict_rejects_out_of_range_offsets_space_separator_and_pre_1970(
+            bad_hour in 24u32..=99,
+            bad_min in 60u32..=99,
+            pre_year in 1900i32..=1969,
+            sign in prop::sample::select(vec!['+', '-']),
+        ) {
+            let bad_offset_h = format!("2026-11-19T12:00:00{sign}{bad_hour:02}:00");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&bad_offset_h),
+                Err(SamlError::Malformed(_))
+            ));
+
+            let bad_offset_m = format!("2026-11-19T12:00:00{sign}00:{bad_min:02}");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&bad_offset_m),
+                Err(SamlError::Malformed(_))
+            ));
+
+            prop_assert!(matches!(
+                parse_iso8601_strict("2026-11-19 12:00:00Z"),
+                Err(SamlError::Malformed(_))
+            ));
+
+            let pre_epoch = format!("{pre_year:04}-06-15T12:00:00Z");
+            prop_assert!(matches!(
+                parse_iso8601_strict(&pre_epoch),
+                Err(SamlError::Malformed(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn signed_mode_rejects_reference_outside_signature_signed_info() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        struct PanicIfCalled(AtomicBool);
+        impl SamlSignatureVerifier for PanicIfCalled {
+            fn verify_signature(&self, _: &str) -> Result<(), SamlError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                self.0.store(true, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        // Stray `<ds:Reference URI="#_a1"/>` outside `<ds:Signature><ds:SignedInfo>`.
+        let xml = r##"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_a1">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <ds:Reference URI="#_a1"/>
+            <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+        </saml:Assertion>"##;
+
+        let verifier = PanicIfCalled(AtomicBool::new(false));
+        let err = SamlParser::parse_signed(xml, &verifier)
+            .expect_err("stray ds:Reference outside SignedInfo must be rejected");
+        assert!(matches!(err, SamlError::SignatureWrappingDetected(_)));
+        assert!(
+            !verifier.0.load(Ordering::SeqCst),
+            "verifier must not be invoked when ds:Reference lacks ds:Signature/ds:SignedInfo ancestry"
+        );
+    }
+
+    #[test]
+    fn claims_assemble_across_cdata_comments_entities_and_nested_issuer() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a2">
+            <saml:Issuer>https://idp.example.com<saml:Issuer>nested</saml:Issuer>/sso</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice<![CDATA[@example.org]]></saml:NameID>
+            </saml:Subject>
+            <saml:Conditions>
+                <saml:AudienceRestriction>
+                    <saml:Audience>https://sp.example.com/a&amp;b&#63;v=1</saml:Audience>
+                </saml:AudienceRestriction>
+            </saml:Conditions>
+            <saml:AttributeStatement>
+                <saml:Attribute Name="roles">
+                    <saml:AttributeValue>team <!-- split --> lead &amp; ops</saml:AttributeValue>
+                    <saml:AttributeValue>auditor</saml:AttributeValue>
+                </saml:Attribute>
+            </saml:AttributeStatement>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion must parse");
+        assert_eq!(assertion.issuer, "https://idp.example.com/sso");
+        assert_eq!(assertion.subject, "alice@example.org");
+        assert_eq!(
+            assertion.audience.as_deref(),
+            Some("https://sp.example.com/a&b?v=1")
+        );
+        assert_eq!(
+            assertion.attributes.get("roles"),
+            Some(&vec!["team  lead & ops".to_string(), "auditor".to_string()])
+        );
+    }
+
+    #[test]
+    fn unresolved_xml_entity_reference_fails_closed() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a3">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject><saml:NameID>alice&unknown;example.org</saml:NameID></saml:Subject>
+        </saml:Assertion>"#;
+
+        let err = SamlParser::parse_unverified(xml)
+            .expect_err("unresolved XML entity reference must fail closed");
+        assert!(matches!(err, SamlError::Malformed(_)));
+    }
+
+    #[test]
+    fn nested_attribute_inside_attribute_value_keeps_owning_attribute_name() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a4">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@example.org</saml:NameID>
+            </saml:Subject>
+            <saml:AttributeStatement>
+                <saml:Attribute Name="roles">
+                    <saml:AttributeValue>user<saml:Attribute Name="meta"/></saml:AttributeValue>
+                    <saml:AttributeValue>admin</saml:AttributeValue>
+                </saml:Attribute>
+            </saml:AttributeStatement>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion must parse");
+        assert_eq!(
+            assertion.attributes.get("roles"),
+            Some(&vec!["user".to_string(), "admin".to_string()]),
+            "nested <Attribute> must neither rename nor clear the owning attribute"
+        );
+        assert!(!assertion.attributes.contains_key("meta"));
     }
 }

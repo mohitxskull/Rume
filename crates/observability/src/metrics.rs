@@ -1,7 +1,7 @@
 //! OpenTelemetry metrics collection, registry, and Tower middleware.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -12,9 +12,12 @@ use opentelemetry::metrics::{
     Counter as OtelCounter, Gauge as OtelGauge, Histogram as OtelHistogram, MeterProvider as _,
     ObservableGauge,
 };
+use opentelemetry_sdk::error::OTelSdkResult;
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+use opentelemetry_sdk::metrics::reader::MetricReader;
 use opentelemetry_sdk::metrics::{
-    Aggregation, InMemoryMetricExporter, Instrument, PeriodicReader, SdkMeterProvider, Stream,
+    Aggregation, Instrument, InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Stream,
+    Temporality,
 };
 use rume_foundation::health::{HealthCheckObserver, HealthStatus};
 use rume_foundation::telemetry::PoolStatus;
@@ -47,47 +50,33 @@ fn http_method_label(method: &str) -> &'static str {
     }
 }
 
-/// Atomic counter metric.
-#[derive(Debug, Default)]
-pub struct Counter {
-    value: AtomicU64,
-}
+// Why: `ManualReader` (`experimental_metrics_custom_reader`) replaces the periodic reader and
+// in-memory testing exporter so `MetricsRegistry` neither spawns a 60s background OS thread per
+// registry nor risks shutdown deadlocks inside a single-threaded Tokio runtime, while removing
+// `opentelemetry_sdk`'s `testing` feature from production dependencies. Revisit when
+// `ManualReader` stabilizes without the `experimental_*` feature flag.
+#[derive(Debug)]
+struct SharedManualReader(Arc<ManualReader>);
 
-impl Counter {
-    pub fn inc(&self) {
-        self.inc_by(1);
+impl MetricReader for SharedManualReader {
+    fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+        self.0.register_pipeline(pipeline);
     }
 
-    pub fn inc_by(&self, amount: u64) {
-        self.value.fetch_add(amount, Ordering::Relaxed);
+    fn collect(&self, rm: &mut ResourceMetrics) -> OTelSdkResult {
+        self.0.collect(rm)
     }
 
-    pub fn get(&self) -> u64 {
-        self.value.load(Ordering::Relaxed)
-    }
-}
-
-/// Atomic gauge metric.
-#[derive(Debug, Default)]
-pub struct Gauge {
-    value: AtomicI64,
-}
-
-impl Gauge {
-    pub fn inc(&self) {
-        self.value.fetch_add(1, Ordering::Relaxed);
+    fn force_flush(&self) -> OTelSdkResult {
+        self.0.force_flush()
     }
 
-    pub fn dec(&self) {
-        self.value.fetch_sub(1, Ordering::Relaxed);
+    fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+        self.0.shutdown_with_timeout(timeout)
     }
 
-    pub fn set(&self, val: i64) {
-        self.value.store(val, Ordering::Relaxed);
-    }
-
-    pub fn get(&self) -> i64 {
-        self.value.load(Ordering::Relaxed)
+    fn temporality(&self, kind: InstrumentKind) -> Temporality {
+        self.0.temporality(kind)
     }
 }
 
@@ -142,8 +131,8 @@ where
 /// Standard HTTP, database pool, and health check metrics registry backed by
 /// [`opentelemetry_sdk::metrics::SdkMeterProvider`].
 ///
-/// Metrics are collected in-process via [`InMemoryMetricExporter`] for inspection
-/// via [`MetricsRegistry::export_metrics`] and [`MetricsRegistry::snapshot`], and
+/// Metrics are collected on demand via [`ManualReader`] for inspection through
+/// [`MetricsRegistry::export_metrics`] and [`MetricsRegistry::snapshot`], and
 /// optionally exported over OTLP when `feature = "otel"` is enabled and
 /// `OTEL_EXPORTER_OTLP_ENDPOINT` is configured.
 #[derive(Clone)]
@@ -166,8 +155,11 @@ impl std::fmt::Debug for MetricsRegistry {
 }
 
 struct Inner {
-    in_memory_exporter: InMemoryMetricExporter,
+    manual_reader: Arc<ManualReader>,
     meter_provider: SdkMeterProvider,
+    shut_down: AtomicBool,
+    #[cfg(feature = "otel")]
+    has_otlp_exporter: bool,
     export_lock: Mutex<()>,
     requests_total: OtelCounter<u64>,
     request_duration: OtelHistogram<f64>,
@@ -183,14 +175,36 @@ struct Inner {
     pool_exporters: Arc<RwLock<Vec<Arc<dyn PoolMetricsExporter>>>>,
 }
 
+impl Drop for Inner {
+    fn drop(&mut self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Why: shut down `meter_provider` explicitly on drop so attached readers release
+        // resources cleanly. When `feature = "otel"` attaches a background OTLP periodic
+        // exporter and drop happens inside a Tokio runtime, offload shutdown to an OS thread so
+        // it cannot deadlock a `current_thread` runtime. Callers that need guaranteed OTLP
+        // delivery before process exit must await `MetricsRegistry::shutdown()` before teardown.
+        #[cfg(feature = "otel")]
+        if self.has_otlp_exporter && tokio::runtime::Handle::try_current().is_ok() {
+            let provider = self.meter_provider.clone();
+            std::thread::spawn(move || {
+                let _ = provider.shutdown();
+            });
+            return;
+        }
+        let _ = self.meter_provider.shutdown();
+    }
+}
+
 impl MetricsRegistry {
     /// Creates a new metrics registry backed by an OpenTelemetry `SdkMeterProvider`
-    /// with an in-memory exporter (and OTLP periodic exporter when `feature = "otel"`
+    /// with a [`ManualReader`] (and OTLP periodic exporter when `feature = "otel"`
     /// is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
     pub fn new() -> Self {
-        let in_memory_exporter = InMemoryMetricExporter::default();
+        let manual_reader = Arc::new(ManualReader::builder().build());
         let builder = SdkMeterProvider::builder()
-            .with_reader(PeriodicReader::builder(in_memory_exporter.clone()).build())
+            .with_reader(SharedManualReader(Arc::clone(&manual_reader)))
             .with_view(|instrument: &Instrument| {
                 if instrument.name() == "http_request_duration_seconds" {
                     Stream::builder()
@@ -206,9 +220,10 @@ impl MetricsRegistry {
             });
 
         #[cfg(feature = "otel")]
-        let builder = {
+        let (builder, has_otlp_exporter) = {
             use opentelemetry_otlp::{Protocol, WithExportConfig};
             let mut builder = builder;
+            let mut attached = false;
             if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 && !endpoint.trim().is_empty()
                 && let Ok(otlp_exporter) = opentelemetry_otlp::MetricExporter::builder()
@@ -218,8 +233,9 @@ impl MetricsRegistry {
                     .build()
             {
                 builder = builder.with_periodic_exporter(otlp_exporter);
+                attached = true;
             }
-            builder
+            (builder, attached)
         };
 
         let meter_provider = builder.build();
@@ -286,8 +302,11 @@ impl MetricsRegistry {
 
         Self {
             inner: Arc::new(Inner {
-                in_memory_exporter,
+                manual_reader,
                 meter_provider,
+                shut_down: AtomicBool::new(false),
+                #[cfg(feature = "otel")]
+                has_otlp_exporter,
                 export_lock: Mutex::new(()),
                 requests_total,
                 request_duration,
@@ -302,6 +321,27 @@ impl MetricsRegistry {
                 health_check_failures_total,
                 pool_exporters: Arc::new(RwLock::new(Vec::new())),
             }),
+        }
+    }
+
+    /// Shuts down the underlying OpenTelemetry `SdkMeterProvider`, flushing any
+    /// pending OTLP metrics on a dedicated OS thread so awaiting this method
+    /// before runtime teardown cannot deadlock a `current_thread` Tokio runtime
+    /// and ensures final OTLP exports complete before process exit.
+    ///
+    /// Subsequent calls (including [`Drop`]) are no-ops.
+    pub async fn shutdown(&self) -> OTelSdkResult {
+        if self.inner.shut_down.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let provider = self.inner.meter_provider.clone();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(provider.shutdown());
+        });
+        match rx.await {
+            Ok(res) => res,
+            Err(_) => Ok(()),
         }
     }
 
@@ -395,8 +435,8 @@ impl MetricsRegistry {
         }
     }
 
-    /// Flushes and returns a snapshot of all OpenTelemetry [`ResourceMetrics`]
-    /// collected by the in-memory exporter.
+    /// Collects and returns a snapshot of all OpenTelemetry [`ResourceMetrics`]
+    /// from the manual reader without spawning background threads.
     pub fn export_metrics(&self) -> Vec<ResourceMetrics> {
         let _guard = self
             .inner
@@ -404,19 +444,19 @@ impl MetricsRegistry {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        // Refresh pool metrics via registered exporters before flushing.
+        // Refresh pool metrics via registered exporters before collecting.
         if let Ok(exporters) = self.inner.pool_exporters.read() {
             for exp in exporters.iter() {
                 exp.export_metrics(self);
             }
         }
 
-        self.inner.in_memory_exporter.reset();
-        let _ = self.inner.meter_provider.force_flush();
-        self.inner
-            .in_memory_exporter
-            .get_finished_metrics()
-            .unwrap_or_default()
+        let mut rm = ResourceMetrics::default();
+        if self.inner.manual_reader.collect(&mut rm).is_ok() {
+            vec![rm]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Returns a queryable [`MetricsSnapshot`] of all current OpenTelemetry metrics.
@@ -642,6 +682,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicU64;
     use tower::service_fn;
 
     #[test]
@@ -902,5 +943,61 @@ mod tests {
         assert_eq!(registry.in_flight(), 1);
         drop(fut);
         assert_eq!(registry.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_registry_collects_without_spawning_periodic_reader_thread() {
+        let registry = MetricsRegistry::new();
+
+        let initial = registry.snapshot();
+        assert_eq!(initial.gauge_i64("http_requests_in_flight", &[]), Some(0));
+
+        let exporter = Arc::new(DynamicPoolExporter::new("manual_pool", || PoolStatus {
+            leased_connections: 1,
+            active_connections: 2,
+            idle_connections: 4,
+            total_connections: 6,
+            max_connections: 10,
+            in_flight_transactions: 0,
+            is_closed: false,
+        }));
+        registry.register_pool_exporter(exporter);
+
+        registry.record_http_request("GET", 200, Duration::from_millis(12));
+
+        let snap = registry.snapshot();
+        assert_eq!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "GET"), ("status", "200")]
+            ),
+            Some(1)
+        );
+        let (count, _sum, bounds, buckets) = snap
+            .histogram_f64("http_request_duration_seconds", &[("method", "GET")])
+            .expect("histogram recorded for GET");
+        assert_eq!(count, 1);
+        assert_eq!(bounds, HISTOGRAM_BUCKETS.to_vec());
+        assert_eq!(buckets[2], 1);
+        assert_eq!(snap.gauge_i64("http_requests_in_flight", &[]), Some(0));
+        assert_eq!(
+            snap.gauge_f64(
+                "db_pool_connections",
+                &[("pool", "manual_pool"), ("state", "active")]
+            ),
+            Some(2.0)
+        );
+
+        // Must shut down and drop cleanly inside current-thread #[tokio::test] without hanging.
+        registry
+            .shutdown()
+            .await
+            .expect("explicit async shutdown must succeed");
+        // Idempotent second shutdown call.
+        registry
+            .shutdown()
+            .await
+            .expect("second shutdown must be a no-op");
+        drop(registry);
     }
 }

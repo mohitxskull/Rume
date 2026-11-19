@@ -1,4 +1,12 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
+
+/// Supported database SQL dialects for newly scaffolded projects.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewProjectDialect {
+    Sqlite,
+    Postgres,
+    Mysql,
+}
 
 #[derive(Parser)]
 #[command(name = "rume", version, about = "Rume framework CLI")]
@@ -25,6 +33,9 @@ pub enum Commands {
         /// Rume version to depend on (defaults to CLI version).
         #[arg(long)]
         version: Option<String>,
+        /// Target SQL dialect for scaffolded query placeholders (sqlite, postgres, mysql).
+        #[arg(long, value_enum, default_value_t = NewProjectDialect::Sqlite)]
+        dialect: NewProjectDialect,
     },
     /// Inspect and validate environment/configuration.
     Env {

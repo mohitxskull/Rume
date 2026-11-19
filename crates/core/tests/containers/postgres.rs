@@ -1768,3 +1768,153 @@ async fn test_postgres_transaction_raw_no_param_and_error_classification() {
         "expected ConnectionFailed on dead tx query_scalar, got: {qs_err:?}"
     );
 }
+
+#[tokio::test]
+async fn test_postgres_fetch_pending_does_not_skip_locked_rows() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let backend = pool.backend();
+    backend
+        .init_outbox_table()
+        .await
+        .expect("init outbox table failed");
+
+    let msg_locked = OutboxMessage::new("msg-1-locked", "order.created", b"{}".to_vec());
+    let msg_free = OutboxMessage::new("msg-2-free", "order.created", b"{}".to_vec());
+    backend.save(msg_locked).await.expect("save locked msg");
+    backend.save(msg_free).await.expect("save free msg");
+
+    // Hold a row-level `FOR UPDATE` lock on `msg-1-locked` inside an open claim transaction
+    // without committing yet, simulating an active relay worker mid-claim.
+    let mut lock_tx = backend.pool().begin().await.expect("begin lock tx");
+    let locked_id: String =
+        sqlx::query_scalar("SELECT id FROM rume_outbox WHERE id = $1 FOR UPDATE SKIP LOCKED")
+            .bind("msg-1-locked")
+            .fetch_one(&mut *lock_tx)
+            .await
+            .expect("lock msg-1-locked");
+    assert_eq!(locked_id, "msg-1-locked");
+
+    // Non-claiming `fetch_pending` must neither block on the open `FOR UPDATE` lock
+    // nor skip `msg-1-locked` (unlike `claim_pending_with_lease`).
+    let pending = tokio::time::timeout(Duration::from_secs(2), backend.fetch_pending(10))
+        .await
+        .expect("fetch_pending must not block on FOR UPDATE row lock")
+        .expect("fetch_pending failed");
+    let pending_ids: HashSet<String> = pending.into_iter().map(|m| m.id).collect();
+    assert!(
+        pending_ids.contains("msg-1-locked") && pending_ids.contains("msg-2-free"),
+        "fetch_pending must include locked pending rows rather than skipping them, got: {pending_ids:?}"
+    );
+
+    // Confirm the `FOR UPDATE` lock is genuinely held by verifying `claim_pending_with_lease`
+    // skips `msg-1-locked` (which sorts before `msg-2-free`) and claims `msg-2-free`.
+    let claimed = backend
+        .claim_pending_with_lease(1, 30)
+        .await
+        .expect("claim_pending_with_lease failed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].id, "msg-2-free");
+
+    lock_tx.rollback().await.expect("rollback lock tx");
+    pool.close_async().await;
+}
+
+#[tokio::test]
+async fn postgres_list_dead_letters_preserves_trace_context() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    let traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+    let job_id = queue
+        .enqueue_with_trace(
+            SendInvoiceJob {
+                invoice_id: "inv-dlq-trace".into(),
+                amount: 420,
+            },
+            Some(traceparent.to_string()),
+        )
+        .await
+        .expect("enqueue_with_trace failed");
+
+    let dequeued = queue
+        .dequeue_for("worker-dlq-trace")
+        .await
+        .expect("dequeue failed")
+        .expect("job should be dequeued");
+    assert_eq!(dequeued.id, job_id);
+    assert_eq!(dequeued.trace_context.as_deref(), Some(traceparent));
+
+    let token = dequeued
+        .lease_token
+        .clone()
+        .expect("dequeued job must have lease token");
+    queue
+        .dead_letter(dequeued, &token, "unrecoverable trace test failure".into())
+        .await
+        .expect("dead_letter failed");
+
+    let dead_letters = queue
+        .list_dead_letters(10)
+        .await
+        .expect("list_dead_letters failed");
+    assert_eq!(dead_letters.len(), 1);
+    assert_eq!(dead_letters[0].id, job_id);
+    assert_eq!(
+        dead_letters[0].trace_context.as_deref(),
+        Some(traceparent),
+        "list_dead_letters must preserve trace_context from rume_jobs"
+    );
+
+    pool.close_async().await;
+}
+
+#[tokio::test]
+async fn postgres_schema_fixture_drop_cleans_up_on_current_thread_runtime() {
+    let (_container, admin_pool) = setup_postgres_pool(4).await;
+    let fixture = rume::testing::PostgresSchemaFixture::create(&admin_pool)
+        .await
+        .expect("create PostgresSchemaFixture");
+    let schema = fixture.schema_name().to_string();
+
+    fixture
+        .execute("CREATE TABLE drop_check (id INT PRIMARY KEY)")
+        .await
+        .expect("create table inside fixture schema");
+
+    let exists_before = admin_pool
+        .backend()
+        .query_scalar_params(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1",
+            &[DbValue::Text(schema.clone())],
+        )
+        .await
+        .expect("query schemata before drop");
+    assert_eq!(exists_before.as_deref(), Some(schema.as_str()));
+
+    // Begin an uncommitted transaction holding table locks inside `schema`, then drop both `tx`
+    // and `fixture` back-to-back with NO intervening `.await` on this `current_thread` runtime.
+    // `PostgresSchemaFixture::drop` must abort the unpolled rollback task, terminate the server
+    // backend holding the locks, and drop the schema synchronously before `drop(fixture)` returns.
+    let tx = fixture.begin_test_tx().await.expect("begin_test_tx");
+    tx.execute("INSERT INTO drop_check (id) VALUES (1)")
+        .await
+        .expect("insert inside uncommitted tx");
+    drop(tx);
+    drop(fixture);
+
+    let exists_after = admin_pool
+        .backend()
+        .query_scalar_params(
+            "SELECT schema_name FROM information_schema.schemata WHERE schema_name = $1",
+            &[DbValue::Text(schema)],
+        )
+        .await
+        .expect("query schemata after drop");
+    assert_eq!(
+        exists_after, None,
+        "schema must be dropped synchronously when PostgresSchemaFixture is dropped"
+    );
+
+    admin_pool.close_async().await;
+}

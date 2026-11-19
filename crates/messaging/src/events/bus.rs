@@ -105,22 +105,42 @@ impl EventBus {
 
         let count = listeners.len();
         let event_arc: Arc<dyn Any + Send + Sync> = Arc::new(event.clone());
+        let current_tc = rume_observability::TraceContext::current();
+        let span = tracing::info_span!(
+            "event.publish_sync",
+            event.type = E::TYPE,
+            traceparent = current_tc
+                .as_ref()
+                .map(|tc| tc.traceparent.as_str())
+                .unwrap_or(""),
+        );
 
-        for listener in listeners {
-            let fut = listener(Arc::clone(&event_arc));
-            match AssertUnwindSafe(fut).catch_unwind().await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => return Err(err),
-                Err(_) => {
-                    return Err(EventError::ListenerError {
-                        event_type: E::TYPE,
-                        message: "event listener panicked".into(),
-                    });
+        let run_listeners = async move {
+            for listener in listeners {
+                let fut = listener(Arc::clone(&event_arc));
+                match AssertUnwindSafe(fut).catch_unwind().await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => return Err(err),
+                    Err(_) => {
+                        return Err(EventError::ListenerError {
+                            event_type: E::TYPE,
+                            message: "event listener panicked".into(),
+                        });
+                    }
                 }
             }
-        }
+            Ok(count)
+        };
 
-        Ok(count)
+        if let Some(tc) = current_tc {
+            // Why: pass `tc` directly into `scope_future(span, ...)` so `OpenTelemetryLayer`
+            // creates a child `event.publish_sync` span under `tc` (passing `tc.new_child()` would
+            // reference a nonexistent parent span ID), while without an OTel layer `with_context`
+            // keeps `OtelContext::current()` populated for `TraceContext::current()` in listeners.
+            tc.scope_future(span, run_listeners).await
+        } else {
+            run_listeners.instrument(span).await
+        }
     }
 
     /// Dispatches an event asynchronously in a background task, returning immediately to the caller.
@@ -159,6 +179,10 @@ impl EventBus {
                 }
             };
             if let Some(tc) = current_tc {
+                // Why: pass `tc` directly to `scope_future(span, ...)` so `OpenTelemetryLayer`
+                // parents `event.publish_async` under `tc` across the `tokio::spawn` boundary
+                // without inventing a phantom intermediate `span_id`, and non-OTel subscribers
+                // still retain `OtelContext::current()` fallback inside spawned listeners.
                 tokio::spawn(tc.scope_future(span, run_listeners));
             } else {
                 tokio::spawn(run_listeners.instrument(span));
@@ -166,5 +190,111 @@ impl EventBus {
         }
 
         count
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opentelemetry::trace::TracerProvider as _;
+    use opentelemetry_sdk::trace::SdkTracerProvider;
+    use serde::{Deserialize, Serialize};
+    use std::sync::Mutex;
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct TestSyncEvent {
+        id: String,
+    }
+
+    impl Event for TestSyncEvent {
+        const TYPE: &'static str = "test.sync_event";
+    }
+
+    #[tokio::test]
+    async fn event_bus_publish_sync_creates_span_and_propagates_trace_context() {
+        let parent_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let parent_tc = rume_observability::TraceContext::from_traceparent(format!(
+            "00-{parent_trace_id}-{parent_span_id}-01"
+        ));
+
+        // 1. With OpenTelemetryLayer active: listener observes preserved trace_id and child span_id
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("event-bus-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let bus = EventBus::new();
+        let seen_otel = Arc::new(Mutex::new(None::<rume_observability::TraceContext>));
+        let seen_otel_clone = Arc::clone(&seen_otel);
+        bus.subscribe_fn::<TestSyncEvent, _, _>(move |_evt| {
+            let seen = Arc::clone(&seen_otel_clone);
+            async move {
+                *seen.lock().unwrap() = rume_observability::TraceContext::current();
+                Ok(())
+            }
+        });
+
+        let caller_tc = Arc::new(Mutex::new(None::<rume_observability::TraceContext>));
+        let caller_tc_clone = Arc::clone(&caller_tc);
+        let root_span = tracing::info_span!("test.caller");
+        parent_tc
+            .scope_future(root_span, async move {
+                *caller_tc_clone.lock().unwrap() = rume_observability::TraceContext::current();
+                bus.publish_sync(&TestSyncEvent { id: "evt-1".into() })
+                    .await
+                    .unwrap();
+            })
+            .await;
+
+        let caller_tc = caller_tc
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("caller must observe TraceContext::current()");
+        let listener_tc = seen_otel
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener must observe TraceContext::current()");
+        assert_eq!(listener_tc.trace_id(), parent_trace_id);
+        assert_ne!(
+            listener_tc.span_id(),
+            caller_tc.span_id(),
+            "event.publish_sync span must allocate a child span_id under OpenTelemetryLayer"
+        );
+
+        // 2. Without OpenTelemetryLayer: fallback preserves TraceContext::current() trace_id
+        drop(_guard);
+        let no_otel_sub = tracing_subscriber::registry();
+        let _no_otel_guard = tracing::subscriber::set_default(no_otel_sub);
+        let bus_no_otel = EventBus::new();
+        let seen_no_otel = Arc::new(Mutex::new(None::<rume_observability::TraceContext>));
+        let seen_no_otel_clone = Arc::clone(&seen_no_otel);
+        bus_no_otel.subscribe_fn::<TestSyncEvent, _, _>(move |_evt| {
+            let seen = Arc::clone(&seen_no_otel_clone);
+            async move {
+                *seen.lock().unwrap() = rume_observability::TraceContext::current();
+                Ok(())
+            }
+        });
+
+        let fallback_span = tracing::info_span!("test.caller_no_otel");
+        parent_tc
+            .scope_future(fallback_span, async move {
+                bus_no_otel
+                    .publish_sync(&TestSyncEvent { id: "evt-2".into() })
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let fallback_tc = seen_no_otel
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("listener must observe TraceContext::current() without OTel layer");
+        assert_eq!(fallback_tc.trace_id(), parent_trace_id);
     }
 }

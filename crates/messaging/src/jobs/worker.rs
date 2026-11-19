@@ -128,19 +128,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-struct InFlightHandleGuard {
-    seq: u64,
-    handles: Arc<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>>,
-}
-
-impl Drop for InFlightHandleGuard {
-    fn drop(&mut self) {
-        if let Ok(mut map) = self.handles.lock() {
-            map.remove(&self.seq);
-        }
-    }
-}
-
 /// Runtime status summary of a background job worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerStatus {
@@ -171,10 +158,10 @@ pub struct WorkerHandle {
     pub recovery_task: Option<tokio::task::JoinHandle<()>>,
     is_stopping: Arc<AtomicBool>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    abort_requested: Arc<AtomicBool>,
+    abort_notify: Arc<tokio::sync::Notify>,
     in_flight_count: Arc<AtomicU32>,
     active_tasks: Arc<AtomicU32>,
-    in_flight_handles:
-        Arc<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>>,
     worker_result: Option<bool>,
     heartbeat_result: Option<bool>,
     recovery_result: Option<bool>,
@@ -196,6 +183,8 @@ impl WorkerHandle {
     /// Aborts all worker, auxiliary, and in-flight executing job tasks immediately.
     pub fn abort_all(&self) {
         self.is_stopping.store(true, Ordering::SeqCst);
+        self.abort_requested.store(true, Ordering::SeqCst);
+        self.abort_notify.notify_waiters();
         self.shutdown_notify.notify_waiters();
         self.worker_task.abort();
         if let Some(h) = &self.heartbeat_task {
@@ -203,11 +192,6 @@ impl WorkerHandle {
         }
         if let Some(r) = &self.recovery_task {
             r.abort();
-        }
-        if let Ok(handles) = self.in_flight_handles.lock() {
-            for handle in handles.values() {
-                handle.abort();
-            }
         }
     }
 
@@ -298,6 +282,21 @@ impl WorkerHandle {
     pub async fn shutdown(mut self, timeout: Duration) -> bool {
         let clean = self.try_shutdown(timeout).await;
         if !clean {
+            // Why: signal `run_loop` to execute `JoinSet::shutdown().await` before falling back
+            // to `abort_all()`, because `worker_task.abort()` only drops child tasks
+            // asynchronously via `JoinSet::drop` and can leave `InFlightGuard` decrements
+            // incomplete when `shutdown()` returns; `abort_all()` remains the hard fallback if
+            // `run_loop` is blocked inside `dequeue_for`.
+            self.abort_requested.store(true, Ordering::SeqCst);
+            self.abort_notify.notify_waiters();
+            if self.worker_result.is_none()
+                && self.in_flight_count.load(Ordering::SeqCst) > 0
+                && tokio::time::timeout(Duration::from_millis(50), &mut self.worker_task)
+                    .await
+                    .is_ok()
+            {
+                self.worker_result = Some(false);
+            }
             self.abort_all();
         }
         clean
@@ -354,10 +353,11 @@ pub struct JobWorker<Q: JobQueue> {
     transition_errors: Arc<AtomicU64>,
     lost_leases: Arc<AtomicU64>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    abort_requested: Arc<AtomicBool>,
+    abort_notify: Arc<tokio::sync::Notify>,
     active_tasks: Arc<AtomicU32>,
-    in_flight_handles:
-        Arc<std::sync::Mutex<std::collections::HashMap<u64, tokio::task::AbortHandle>>>,
-    next_job_seq: Arc<AtomicU64>,
+    #[cfg(test)]
+    join_set_len: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl<Q: JobQueue> Clone for JobWorker<Q> {
@@ -378,9 +378,11 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             transition_errors: Arc::clone(&self.transition_errors),
             lost_leases: Arc::clone(&self.lost_leases),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
+            abort_requested: Arc::clone(&self.abort_requested),
+            abort_notify: Arc::clone(&self.abort_notify),
             active_tasks: Arc::clone(&self.active_tasks),
-            in_flight_handles: Arc::clone(&self.in_flight_handles),
-            next_job_seq: Arc::clone(&self.next_job_seq),
+            #[cfg(test)]
+            join_set_len: Arc::clone(&self.join_set_len),
         }
     }
 }
@@ -436,9 +438,11 @@ impl<Q: JobQueue> JobWorker<Q> {
             transition_errors: Arc::new(AtomicU64::new(0)),
             lost_leases: Arc::new(AtomicU64::new(0)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(tokio::sync::Notify::new()),
             active_tasks: Arc::new(AtomicU32::new(0)),
-            in_flight_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            next_job_seq: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            join_set_len: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
     }
 
@@ -591,25 +595,94 @@ impl<Q: JobQueue> JobWorker<Q> {
             recovery_task,
             is_stopping: Arc::clone(&self.is_stopping),
             shutdown_notify: Arc::clone(&self.shutdown_notify),
+            abort_requested: Arc::clone(&self.abort_requested),
+            abort_notify: Arc::clone(&self.abort_notify),
             in_flight_count: Arc::clone(&self.in_flight_count),
             active_tasks: Arc::clone(&self.active_tasks),
-            in_flight_handles: Arc::clone(&self.in_flight_handles),
             worker_result: None,
             heartbeat_result: None,
             recovery_result: None,
         }
     }
 
+    fn record_join_set_len(&self, _len: usize) {
+        #[cfg(test)]
+        self.join_set_len.store(_len, Ordering::SeqCst);
+    }
+
+    fn log_in_flight_outcome(outcome: Result<(), tokio::task::JoinError>) {
+        if let Err(join_err) = outcome {
+            if join_err.is_panic() {
+                tracing::error!("In-flight job task panicked unexpectedly: {join_err}");
+            } else if join_err.is_cancelled() {
+                tracing::debug!("In-flight job task was cancelled");
+            } else {
+                tracing::error!("In-flight job task failed: {join_err}");
+            }
+        }
+    }
+
+    async fn sleep_while_reaping(
+        &self,
+        duration: Duration,
+        in_flight_tasks: &mut tokio::task::JoinSet<()>,
+    ) -> bool {
+        let timer = sleep(duration);
+        tokio::pin!(timer);
+        loop {
+            let shutdown_notified = self.shutdown_notify.notified();
+            if self.is_stopping.load(Ordering::SeqCst) {
+                return true;
+            }
+            tokio::select! {
+                _ = &mut timer => return false,
+                res = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
+                    if let Some(outcome) = res {
+                        Self::log_in_flight_outcome(outcome);
+                    }
+                    self.record_join_set_len(in_flight_tasks.len());
+                }
+                _ = shutdown_notified => return true,
+            }
+        }
+    }
+
     /// Internal worker execution loop.
     async fn run_loop(&self) {
+        // Why: own all spawned job tasks in a local `tokio::task::JoinSet` instead of a shared
+        // `Mutex<HashMap<u64, AbortHandle>>` paired with a per-task map-removal guard; `JoinSet`
+        // eliminates the spawn-before-insert race (where a fast-completing task could drop its
+        // removal guard before `map.insert` and leak an `AbortHandle`), removes per-job mutex
+        // contention, reaps completed `JoinHandle`s in steady state, and aborts all remaining
+        // child tasks on drop or `shutdown()`. Revisit only if callers outside `run_loop` need
+        // per-job abort handles.
+        let mut in_flight_tasks = tokio::task::JoinSet::<()>::new();
         let mut consecutive_errors: u32 = 0;
-        while !self.is_stopping.load(Ordering::SeqCst) {
+
+        loop {
+            while let Some(outcome) = in_flight_tasks.try_join_next() {
+                Self::log_in_flight_outcome(outcome);
+            }
+            self.record_join_set_len(in_flight_tasks.len());
+
+            let shutdown_notified = self.shutdown_notify.notified();
+            if self.is_stopping.load(Ordering::SeqCst) {
+                break;
+            }
+
             let permit = tokio::select! {
                 res = self.semaphore.clone().acquire_owned() => match res {
                     Ok(permit) => permit,
                     Err(_) => break,
                 },
-                _ = self.shutdown_notify.notified() => break,
+                res = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
+                    if let Some(outcome) = res {
+                        Self::log_in_flight_outcome(outcome);
+                    }
+                    self.record_join_set_len(in_flight_tasks.len());
+                    continue;
+                }
+                _ = shutdown_notified => break,
             };
 
             if self.is_stopping.load(Ordering::SeqCst) {
@@ -645,18 +718,10 @@ impl<Q: JobQueue> JobWorker<Q> {
                         traceparent = job.trace_context.as_deref().unwrap_or("")
                     );
 
-                    let job_seq = self.next_job_seq.fetch_add(1, Ordering::Relaxed);
-                    let handles_map = Arc::clone(&self.in_flight_handles);
-                    let handle_guard = InFlightHandleGuard {
-                        seq: job_seq,
-                        handles: Arc::clone(&handles_map),
-                    };
-
-                    let join_handle = tokio::spawn(
+                    in_flight_tasks.spawn(
                         async move {
                             let _permit = permit;
                             let _guard = InFlightGuard(in_flight);
-                            let _handle_guard = handle_guard;
                             Self::execute_job(
                                 queue,
                                 registry,
@@ -670,29 +735,60 @@ impl<Q: JobQueue> JobWorker<Q> {
                         }
                         .instrument(job_span),
                     );
-                    if let Ok(mut map) = handles_map.lock() {
-                        map.insert(job_seq, join_handle.abort_handle());
+                    while let Some(outcome) = in_flight_tasks.try_join_next() {
+                        Self::log_in_flight_outcome(outcome);
                     }
+                    self.record_join_set_len(in_flight_tasks.len());
                 }
                 Ok(None) => {
                     consecutive_errors = 0;
                     drop(permit);
-                    tokio::select! {
-                        _ = sleep(Duration::from_millis(25)) => {},
-                        _ = self.shutdown_notify.notified() => { break; }
+                    if self
+                        .sleep_while_reaping(Duration::from_millis(25), &mut in_flight_tasks)
+                        .await
+                    {
+                        break;
                     }
                 }
                 Err(_) => {
                     consecutive_errors = consecutive_errors.saturating_add(1);
                     drop(permit);
                     let backoff_ms = (50u64 * 2u64.pow(consecutive_errors.min(6))).min(5000);
-                    tokio::select! {
-                        _ = sleep(Duration::from_millis(backoff_ms)) => {},
-                        _ = self.shutdown_notify.notified() => { break; }
+                    if self
+                        .sleep_while_reaping(
+                            Duration::from_millis(backoff_ms),
+                            &mut in_flight_tasks,
+                        )
+                        .await
+                    {
+                        break;
                     }
                 }
             }
         }
+
+        // Drain all active job tasks on graceful shutdown, or abort immediately if shutdown
+        // timed out and `WorkerHandle::shutdown` signaled `abort_notify`.
+        while !in_flight_tasks.is_empty() {
+            let abort_notified = self.abort_notify.notified();
+            if self.abort_requested.load(Ordering::SeqCst) {
+                in_flight_tasks.shutdown().await;
+                break;
+            }
+            tokio::select! {
+                res = in_flight_tasks.join_next() => {
+                    if let Some(outcome) = res {
+                        Self::log_in_flight_outcome(outcome);
+                    }
+                }
+                _ = abort_notified => {
+                    in_flight_tasks.shutdown().await;
+                    break;
+                }
+            }
+            self.record_join_set_len(in_flight_tasks.len());
+        }
+        self.record_join_set_len(in_flight_tasks.len());
     }
 
     /// Executes a single dequeued job, handling acknowledgments, retries, and dead-lettering.
@@ -1296,9 +1392,10 @@ mod tests {
             recovery_task: None,
             is_stopping,
             shutdown_notify,
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight_count,
             active_tasks,
-            in_flight_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             worker_result: None,
             heartbeat_result: None,
             recovery_result: None,
@@ -1330,9 +1427,10 @@ mod tests {
             recovery_task: None,
             is_stopping,
             shutdown_notify,
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight_count,
             active_tasks,
-            in_flight_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             worker_result: None,
             heartbeat_result: None,
             recovery_result: None,
@@ -1372,9 +1470,10 @@ mod tests {
             recovery_task: None,
             is_stopping: Arc::new(AtomicBool::new(false)),
             shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_requested: Arc::new(AtomicBool::new(false)),
+            abort_notify: Arc::new(tokio::sync::Notify::new()),
             in_flight_count: Arc::new(AtomicU32::new(0)),
             active_tasks: Arc::new(AtomicU32::new(2)),
-            in_flight_handles: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             worker_result: None,
             heartbeat_result: None,
             recovery_result: None,
@@ -2545,5 +2644,214 @@ mod tests {
             1,
             "defer must restore attempt count so next claim does not burn retry budget"
         );
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct BurstOrHangJob {
+        hang: bool,
+    }
+
+    impl Job for BurstOrHangJob {
+        const NAME: &'static str = "burst_or_hang_job";
+    }
+
+    struct DropCanary(Arc<AtomicBool>);
+
+    impl Drop for DropCanary {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct BurstOrHangHandler {
+        fast_completed: Arc<AtomicUsize>,
+        hanging_started: Arc<tokio::sync::Notify>,
+        hanging_dropped: Arc<AtomicBool>,
+    }
+
+    impl JobHandler<BurstOrHangJob> for BurstOrHangHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            job: BurstOrHangJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let fast_completed = Arc::clone(&self.fast_completed);
+            let hanging_started = Arc::clone(&self.hanging_started);
+            let hanging_dropped = Arc::clone(&self.hanging_dropped);
+            Box::pin(async move {
+                if !job.hang {
+                    fast_completed.fetch_add(1, Ordering::SeqCst);
+                    return Ok(());
+                }
+                let _canary = DropCanary(hanging_dropped);
+                hanging_started.notify_waiters();
+                std::future::pending::<()>().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct BurstTestQueue {
+        jobs: std::sync::Mutex<std::collections::VecDeque<QueuedJob>>,
+        acked: Arc<AtomicUsize>,
+    }
+
+    impl JobQueue for BurstTestQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+
+        fn dequeue_for(
+            &self,
+            worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            let mut guard = self.jobs.lock().unwrap();
+            let job = guard.pop_front().map(|mut j| {
+                j.assigned_worker = Some(worker_id.to_string());
+                j.lease_token = Some(format!("tok-{}", j.id));
+                j
+            });
+            Box::pin(async move { Ok(job) })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            self.acked.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(self.jobs.lock().unwrap().len()) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn worker_fast_completing_job_never_leaks_abort_handle() {
+        let mut jobs = std::collections::VecDeque::with_capacity(1001);
+        for idx in 0..1000 {
+            jobs.push_back(QueuedJob {
+                id: format!("fast-{idx}"),
+                name: BurstOrHangJob::NAME.to_string(),
+                payload: serde_json::to_vec(&BurstOrHangJob { hang: false }).unwrap(),
+                attempt: 1,
+                retry_policy: RetryPolicy::new(),
+                timeout: None,
+                idempotency_key: None,
+                tenant_id: None,
+                assigned_worker: None,
+                lease_token: None,
+                available_at: Instant::now(),
+                lease_duration: Duration::from_secs(30),
+                trace_context: None,
+            });
+        }
+        jobs.push_back(QueuedJob {
+            id: "hang-job".to_string(),
+            name: BurstOrHangJob::NAME.to_string(),
+            payload: serde_json::to_vec(&BurstOrHangJob { hang: true }).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: None,
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: None,
+            lease_token: None,
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(30),
+            trace_context: None,
+        });
+
+        let acked = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(BurstTestQueue {
+            jobs: std::sync::Mutex::new(jobs),
+            acked: Arc::clone(&acked),
+        });
+
+        let fast_completed = Arc::new(AtomicUsize::new(0));
+        let hanging_started = Arc::new(tokio::sync::Notify::new());
+        let hanging_dropped = Arc::new(AtomicBool::new(false));
+
+        let mut registry = JobRegistry::new();
+        registry.register(BurstOrHangHandler {
+            fast_completed: Arc::clone(&fast_completed),
+            hanging_started: Arc::clone(&hanging_started),
+            hanging_dropped: Arc::clone(&hanging_dropped),
+        });
+
+        let worker = JobWorker::new(queue, Arc::new(registry)).with_concurrency(32);
+        // Register the waiter before starting the worker so `notify_waiters()` cannot
+        // fire before the future is armed.
+        let started = hanging_started.notified();
+        tokio::pin!(started);
+        started.as_mut().enable();
+        let handle = worker.start();
+
+        tokio::time::timeout(Duration::from_secs(5), started)
+            .await
+            .expect("hanging job must start");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while acked.load(Ordering::SeqCst) < 1000
+            || worker.in_flight_count() != 1
+            || worker.join_set_len.load(Ordering::SeqCst) != 1
+        {
+            assert!(
+                Instant::now() < deadline,
+                "steady-state convergence failed: acked={}, in_flight={}, join_set_len={}",
+                acked.load(Ordering::SeqCst),
+                worker.in_flight_count(),
+                worker.join_set_len.load(Ordering::SeqCst),
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(fast_completed.load(Ordering::SeqCst), 1000);
+        assert!(
+            !hanging_dropped.load(Ordering::SeqCst),
+            "hanging job should still be active before shutdown"
+        );
+
+        let clean = handle.shutdown(Duration::from_millis(50)).await;
+        assert!(!clean, "shutdown must time out on hanging job");
+        assert!(
+            hanging_dropped.load(Ordering::SeqCst),
+            "hanging job must be aborted and dropped on shutdown timeout"
+        );
+        assert_eq!(worker.in_flight_count(), 0);
+        assert_eq!(worker.join_set_len.load(Ordering::SeqCst), 0);
     }
 }

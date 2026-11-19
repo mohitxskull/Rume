@@ -45,6 +45,18 @@ fn validate_ttl(ttl: Option<Duration>) -> Result<(), CacheError> {
     Ok(())
 }
 
+/// Outcome of reserving a quota slot for a key prior to a cache write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyReservation {
+    /// A brand-new slot was inserted for this key; caller owns rollback on write failure.
+    NewlyReserved,
+    /// The key was already actively tracked; its existing expiration was left untouched
+    /// so a failed overwrite cannot shorten or remove it.
+    AlreadyTracked,
+    /// The tenant has reached `max_keys` and this key is not currently tracked.
+    QuotaExceeded,
+}
+
 /// Trait for tracking and enforcing tenant cache quotas across single or multiple instances.
 pub trait TenantQuotaStore: Send + Sync + 'static {
     /// Attempts to record a new key for `tenant_id`.
@@ -114,6 +126,30 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
         ttl: Option<std::time::Duration>,
         max_keys: usize,
     ) -> BoxFuture<'a, Result<bool, CacheError>>;
+
+    /// Reserves a quota slot for `key` prior to writing to the backing cache without
+    /// modifying the expiration of an already-tracked key.
+    ///
+    /// Returns [`KeyReservation::AlreadyTracked`] when `key` is already present and
+    /// unexpired (preserving its current expiration until the caller confirms the write
+    /// succeeded and refreshes via [`TenantQuotaStore::record_key`]),
+    /// [`KeyReservation::NewlyReserved`] when a new slot was inserted for this call, or
+    /// [`KeyReservation::QuotaExceeded`] when `max_keys` would be exceeded.
+    ///
+    /// # Contract Invariants (MANDATORY METHOD):
+    /// Intentionally **NOT defaulted** to delegate to [`TenantQuotaStore::record_key`]: that
+    /// method refreshes an existing key's TTL and cannot tell the caller the key already
+    /// existed, so a default would report `NewlyReserved` for a tracked key. A failed overwrite
+    /// would then shorten the existing reservation and, if the existence check also failed,
+    /// grant the caller rollback ownership of a slot it never created. Every store must
+    /// implement the non-mutating existing-key path itself.
+    fn reserve_key<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key: &'a str,
+        ttl: Option<std::time::Duration>,
+        max_keys: usize,
+    ) -> BoxFuture<'a, Result<KeyReservation, CacheError>>;
 
     /// Removes a key from quota tracking for `tenant_id`.
     ///
@@ -215,6 +251,35 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
         })
     }
 
+    fn reserve_key<'a>(
+        &'a self,
+        tenant_id: &'a str,
+        key: &'a str,
+        ttl: Option<std::time::Duration>,
+        max_keys: usize,
+    ) -> BoxFuture<'a, Result<KeyReservation, CacheError>> {
+        let tid = tenant_id.to_string();
+        let k = key.to_string();
+        Box::pin(async move {
+            validate_ttl(ttl)?;
+            let mut map = self.keys.write().await;
+            let now = tokio::time::Instant::now();
+            let expires_at = ttl.map(|d| now + d);
+            let tenant_map = map.entry(tid).or_default();
+            Self::prune_expired_inline(tenant_map, now);
+
+            if tenant_map.contains_key(&k) {
+                // Preserve existing expiration untouched until the overwrite succeeds.
+                Ok(KeyReservation::AlreadyTracked)
+            } else if tenant_map.len() >= max_keys {
+                Ok(KeyReservation::QuotaExceeded)
+            } else {
+                tenant_map.insert(k, expires_at);
+                Ok(KeyReservation::NewlyReserved)
+            }
+        })
+    }
+
     fn remove_key<'a>(
         &'a self,
         tenant_id: &'a str,
@@ -276,6 +341,12 @@ mod redis_store {
         prefix: String,
     }
 
+    // Why: A tenant's sorted set holds entries with heterogeneous (or unbounded) expirations.
+    // Blindly calling `PEXPIRE KEYS[1] ttl_ms` on every `ZADD` would cause a short-lived key to
+    // wipe out the whole sorted set before longer-lived keys expire (or expire `+inf` entries).
+    // Instead, inspect the highest-scoring member via `ZREVRANGE ... WITHSCORES` and `PERSIST`
+    // when any member is unbounded (`ttl_ms < 0` or `+inf`/`inf`), or `PEXPIRE` up to the
+    // furthest member's remaining milliseconds.
     pub(super) const REDIS_RECORD_KEY_SCRIPT: &str = r#"
         if redis.replicate_commands then redis.replicate_commands() end
         local t = redis.call('TIME')
@@ -294,8 +365,48 @@ mod redis_store {
                 score = now_ms + ttl_ms
             end
             redis.call('ZADD', KEYS[1], score, ARGV[3])
+            local top = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+            local max_score_str = top[2]
+            local max_score = max_score_str and tonumber(max_score_str) or nil
+            if ttl_ms < 0 or max_score_str == 'inf' or max_score_str == '+inf' or not max_score or max_score == math.huge then
+                redis.call('PERSIST', KEYS[1])
+            else
+                redis.call('PEXPIRE', KEYS[1], math.max(1, math.ceil(max_score - now_ms)))
+            end
             return 1
         end
+    "#;
+
+    pub(super) const REDIS_RESERVE_KEY_SCRIPT: &str = r#"
+        if redis.replicate_commands then redis.replicate_commands() end
+        local t = redis.call('TIME')
+        local now_ms = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+        redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
+        local exists = redis.call('ZSCORE', KEYS[1], ARGV[3])
+        if exists then
+            return 2
+        end
+        local count = redis.call('ZCARD', KEYS[1])
+        if count >= tonumber(ARGV[2]) then
+            return 0
+        end
+        local ttl_ms = tonumber(ARGV[1])
+        local score
+        if ttl_ms < 0 then
+            score = '+inf'
+        else
+            score = now_ms + ttl_ms
+        end
+        redis.call('ZADD', KEYS[1], score, ARGV[3])
+        local top = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+        local max_score_str = top[2]
+        local max_score = max_score_str and tonumber(max_score_str) or nil
+        if ttl_ms < 0 or max_score_str == 'inf' or max_score_str == '+inf' or not max_score or max_score == math.huge then
+            redis.call('PERSIST', KEYS[1])
+        else
+            redis.call('PEXPIRE', KEYS[1], math.max(1, math.ceil(max_score - now_ms)))
+        end
+        return 1
     "#;
 
     pub(super) const REDIS_COUNT_SCRIPT: &str = r#"
@@ -329,8 +440,12 @@ mod redis_store {
             self
         }
 
-        fn key(&self, tenant_id: &str) -> String {
-            format!("{}quota:{{{}}}:keys", self.prefix, tenant_id)
+        // Why: `{prefix}{{{tenant_id}}}:keys` is the canonical pre-1.0 (0.1.0) key format
+        // using Redis Cluster hash tags so all keys for a tenant hash to one slot. Because
+        // 0.1.0 has not been published, no legacy dual-read shim is needed; revisit with a
+        // cutover/migration plan if the namespace changes after a public release.
+        pub(super) fn key(&self, tenant_id: &str) -> String {
+            format!("{}{{{}}}:keys", self.prefix, tenant_id)
         }
     }
 
@@ -385,6 +500,46 @@ mod redis_store {
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
 
                 Ok(res == 1)
+            })
+        }
+
+        fn reserve_key<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            key: &'a str,
+            ttl: Option<std::time::Duration>,
+            max_keys: usize,
+        ) -> BoxFuture<'a, Result<super::KeyReservation, CacheError>> {
+            let k = self.key(tenant_id);
+            let k_item = key.to_string();
+
+            Box::pin(async move {
+                validate_ttl(ttl)?;
+                let ttl_ms: i64 = match ttl {
+                    Some(t) => i64::try_from(t.as_millis().max(1)).unwrap_or(i64::MAX),
+                    None => -1,
+                };
+
+                let mut conn = self
+                    .pool
+                    .get()
+                    .await
+                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+
+                let res: i32 = redis::Script::new(REDIS_RESERVE_KEY_SCRIPT)
+                    .key(&k)
+                    .arg(ttl_ms)
+                    .arg(max_keys)
+                    .arg(&k_item)
+                    .invoke_async(&mut *conn)
+                    .await
+                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+
+                Ok(match res {
+                    2 => super::KeyReservation::AlreadyTracked,
+                    1 => super::KeyReservation::NewlyReserved,
+                    _ => super::KeyReservation::QuotaExceeded,
+                })
             })
         }
 
@@ -576,5 +731,29 @@ mod tests {
 
         assert!(redis_store::REDIS_RECORD_KEY_SCRIPT.contains("redis.call('TIME')"));
         assert!(redis_store::REDIS_COUNT_SCRIPT.contains("redis.call('TIME')"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_quota_key_avoids_double_prefix_and_script_sets_rolling_pexpire() {
+        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let pool = cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool config");
+        let store = RedisTenantQuotaStore::new(pool.clone());
+        assert_eq!(store.key("t1"), "rume:quota:{t1}:keys");
+
+        let custom = RedisTenantQuotaStore::new(pool).with_prefix("custom:quota:");
+        assert_eq!(custom.key("t1"), "custom:quota:{t1}:keys");
+
+        let script = redis_store::REDIS_RECORD_KEY_SCRIPT;
+        assert!(
+            script.contains("ZREVRANGE") && script.contains("WITHSCORES"),
+            "REDIS_RECORD_KEY_SCRIPT must inspect max score via ZREVRANGE ... WITHSCORES"
+        );
+        assert!(
+            script.contains("PEXPIRE") && script.contains("PERSIST"),
+            "REDIS_RECORD_KEY_SCRIPT must maintain rolling PEXPIRE / PERSIST on KEYS[1]"
+        );
     }
 }

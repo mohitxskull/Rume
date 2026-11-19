@@ -12,6 +12,13 @@ use rume::persistence::{
 
 use crate::common;
 
+// Why: Tests in this module share one MySQL server container (`shared_mysql()`), and
+// `GET_LOCK('rume_migrations_lock', 60)` is server-global across databases; serializing tests
+// that acquire or inspect `rume_migrations_lock` prevents parallel test runs from racing on
+// `IS_FREE_LOCK('rume_migrations_lock')` (revisit if tests use per-test containers or
+// schema-scoped lock names).
+static MYSQL_MIGRATION_TEST_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn start_mysql_node() -> (
     &'static testcontainers_modules::testcontainers::ContainerAsync<Mysql>,
     MysqlBackend,
@@ -33,6 +40,7 @@ async fn start_mysql_node() -> (
 
 #[tokio::test]
 async fn test_mysql_unified_database_conformance_suite() {
+    let _migration_lock_guard = MYSQL_MIGRATION_TEST_GUARD.lock().await;
     let (_node, backend, config) = start_mysql_node().await;
     let pool = DatabasePool::new(backend, config.with_max_connections(16));
     rume::testing::verify_database_conformance(&pool, "mysql")
@@ -405,6 +413,7 @@ async fn test_mysql_parameterized_transaction_and_native_escape_hatch() {
 
 #[tokio::test]
 async fn test_mysql_migration_lock_ordering_and_durability() {
+    let _migration_lock_guard = MYSQL_MIGRATION_TEST_GUARD.lock().await;
     let (_node, backend, config) = start_mysql_node().await;
 
     let migrator = Migrator::new().add_migration(
@@ -511,16 +520,101 @@ async fn test_mysql_migration_lock_ordering_and_durability() {
 }
 
 #[tokio::test]
+async fn mysql_per_migration_records_prior_migration_when_later_migration_fails() {
+    let _migration_lock_guard = MYSQL_MIGRATION_TEST_GUARD.lock().await;
+    let (_node, backend, config) = start_mysql_node().await;
+
+    let migrator = Migrator::new()
+        .add_migration(
+            Migration::from_sql(
+                "20261108_01_valid_table",
+                "create valid table",
+                "CREATE TABLE valid_mig_table (id INT PRIMARY KEY);",
+            )
+            .with_down("DROP TABLE valid_mig_table;"),
+        )
+        .add_migration(Migration::from_sql(
+            "20261108_02_failing_migration",
+            "fails mid-way",
+            "CREATE TABLE partial_mig_table (id INT PRIMARY KEY); SELECT * FROM non_existent_table_boom;",
+        ));
+
+    let err = migrator
+        .run_pending_backend(&backend)
+        .await
+        .expect_err("second migration must fail");
+    assert!(
+        matches!(
+            err,
+            rume::persistence::PersistenceError::MigrationError { ref migration, .. }
+            if migration == "20261108_02_failing_migration"
+        ),
+        "expected MigrationError for second migration, got: {err:?}"
+    );
+
+    // #1 table exists AND #1 remains recorded in rume_migrations (no false outer rollback drift).
+    let mig1_count = backend
+        .query_scalar("SELECT count(*) FROM rume_migrations WHERE id = '20261108_01_valid_table'")
+        .await
+        .expect("query migration #1 ledger row")
+        .expect("count present");
+    assert_eq!(mig1_count, "1", "#1 must stay recorded in rume_migrations");
+
+    let table1_rows = backend
+        .query_scalar("SELECT count(*) FROM valid_mig_table")
+        .await
+        .expect("valid_mig_table must exist")
+        .expect("count present");
+    assert_eq!(table1_rows, "0");
+
+    // #2 must NOT be recorded in rume_migrations.
+    let mig2_count = backend
+        .query_scalar(
+            "SELECT count(*) FROM rume_migrations WHERE id = '20261108_02_failing_migration'",
+        )
+        .await
+        .expect("query migration #2 ledger row")
+        .expect("count present");
+    assert_eq!(
+        mig2_count, "0",
+        "#2 must not be recorded in rume_migrations"
+    );
+
+    // Lock must be released synchronously before returning the error, verified from an independent session.
+    let probe_backend = MysqlBackend::new(&config).expect("independent mysql probe backend");
+    let is_free = probe_backend
+        .query_scalar("SELECT IS_FREE_LOCK('rume_migrations_lock')")
+        .await
+        .expect("check IS_FREE_LOCK")
+        .expect("IS_FREE_LOCK present");
+    assert_eq!(
+        is_free, "1",
+        "rume_migrations_lock must be released after migration failure"
+    );
+}
+
+#[tokio::test]
 async fn test_mysql_transaction_raw_no_param_and_error_classification() {
     use rume::persistence::PersistenceError;
 
     let (_node, backend, _config) = start_mysql_node().await;
 
-    // 1. Raw no-param `execute` and `execute_params(..., &[])` on a transaction.
-    let tx = backend.begin_transaction().await.expect("begin tx");
-    tx.execute("CREATE TABLE mysql_raw_a (id INT PRIMARY KEY)")
+    // 1. Implicit-commit DDL must be rejected inside a managed MySQL transaction (#20),
+    // while non-transactional DDL on the backend and raw no-param DML inside the transaction succeed.
+    backend
+        .execute("CREATE TABLE mysql_raw_a (id INT PRIMARY KEY)")
         .await
-        .expect("tx.execute raw DDL must succeed");
+        .expect("backend.execute raw DDL must succeed");
+
+    let tx = backend.begin_transaction().await.expect("begin tx");
+    let ddl_err = tx
+        .execute("CREATE TABLE mysql_raw_forbidden (id INT PRIMARY KEY)")
+        .await
+        .expect_err("implicit-commit DDL inside MysqlTransaction must fail closed");
+    assert!(
+        matches!(ddl_err, PersistenceError::TransactionError(_)),
+        "expected TransactionError for implicit-commit DDL, got {ddl_err:?}"
+    );
     tx.execute_params("INSERT INTO mysql_raw_a (id) VALUES (1)", &[])
         .await
         .expect("tx.execute_params with empty params must succeed");
@@ -531,7 +625,7 @@ async fn test_mysql_transaction_raw_no_param_and_error_classification() {
         .expect("query mysql_raw_a")
         .expect("count present");
     assert_eq!(count_a, "1");
-    tx.commit().await.expect("commit raw DDL tx");
+    tx.commit().await.expect("commit raw DML tx");
 
     // 2. Killing the transaction's MySQL connection causes subsequent transaction calls to hit
     // an IO/EOF error, which must classify via `map_sqlx_error` as `ConnectionFailed` (not `QueryFailed`).

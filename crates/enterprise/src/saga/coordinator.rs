@@ -650,6 +650,10 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             let idempotency_key = forward_idempotency_key(saga_id, step.name());
             let fut =
                 AssertUnwindSafe(step.execute_with_key(&mut ctx, &idempotency_key)).catch_unwind();
+            // Why: pass `parent_tc` directly to `scope_future(step_span, ...)` so `OpenTelemetryLayer`
+            // links each `saga.step` directly to the initiating span across step boundaries (instead
+            // of a phantom `new_child()` parent ID), while non-OTel runs keep `OtelContext::current()`
+            // fallback populated inside step handlers.
             let res = if let Some(ref tc) = parent_tc {
                 tc.scope_future(step_span, fut).await
             } else {
@@ -796,6 +800,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             let comp_key = compensation_idempotency_key(saga_id, prev_step.name());
             let fut =
                 AssertUnwindSafe(prev_step.compensate_with_key(&mut ctx, &comp_key)).catch_unwind();
+            // Why: pass `parent_tc` directly to `scope_future(comp_span, ...)` so `OpenTelemetryLayer`
+            // links each `saga.compensate` directly to the initiating trace across compensation
+            // boundaries, while non-OTel runs preserve `OtelContext::current()` fallback.
             let comp_res = if let Some(ref tc) = parent_tc {
                 tc.scope_future(comp_span, fut).await
             } else {

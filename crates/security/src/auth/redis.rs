@@ -14,66 +14,50 @@ fn current_timestamp() -> u64 {
         .as_secs()
 }
 
-/// Escape a string for safe use as a Lua *pattern* (not literal) in
-/// `string.match`/`string.gsub`. Lua pattern magic characters
-/// (`^ $ ( ) % . [ ] * + - ?`) are prefixed with `%` so they match
-/// literally. This prevents hyphenated UUIDs (e.g. session IDs) from
-/// being misinterpreted as pattern operators.
-fn escape_lua_pattern(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '^' | '$' | '(' | ')' | '%' | '.' | '[' | ']' | '*' | '+' | '-' | '?' => {
-                result.push('%');
-                result.push(c);
-            }
-            _ => result.push(c),
-        }
-    }
-    result
-}
-
-/// Escape `%` in a string used as a Lua *replacement* (in `string.gsub`),
-/// where `%` introduces capture references (`%0`..`%9`, `%1`..`%9`).
-fn escape_lua_replacement(s: &str) -> String {
-    s.replace('%', "%%")
-}
-
+// Why: mutate the session JSON structurally via `cjson` instead of pattern-matching raw JSON
+// strings, failing closed with `MALFORMED` on corrupt/non-object payloads or invalid `expires_at`.
+// Empty `roles`/`permissions`/`data` tables are cleared to `nil` (paired with `#[serde(default)]`
+// on `Session`) because Redis Lua's `cjson` encodes empty tables as `{}` rather than `[]`.
 const REGENERATE_ID_SCRIPT: &str = r#"
     local old_key = KEYS[1]
     local new_key = KEYS[2]
-    local old_id_pat = ARGV[1]
-    local new_id_rep = ARGV[2]
-    local now = tonumber(ARGV[3])
+    local new_id = ARGV[1]
+    local now = tonumber(ARGV[2])
 
     local data = redis.call('GET', old_key)
     if not data then
         return nil
     end
 
-    local exp_str = string.match(data, '"expires_at":%s*(%d+)')
-    if exp_str and tonumber(exp_str) <= now then
+    local ok, decoded = pcall(cjson.decode, data)
+    if not ok
+        or type(decoded) ~= 'table'
+        or type(decoded.id) ~= 'string'
+        or type(decoded.user_id) ~= 'string' then
+        return redis.error_reply("MALFORMED")
+    end
+
+    local exp = tonumber(decoded.expires_at)
+    if type(decoded.expires_at) ~= 'number' or not exp or not now then
+        return redis.error_reply("MALFORMED")
+    end
+    if exp <= now then
         redis.call('DEL', old_key)
         return redis.error_reply("EXPIRED")
     end
 
-    -- Replace "id":"<old_id>" with "id":"<new_id>" using plain
-    -- string search (not pattern matching) to avoid Lua pattern
-    -- magic characters in UUIDs (e.g. hyphens).
-    local start, stop = string.find(data, '"id":"' .. old_id_pat .. '"', 1, true)
-    local updated
-    if start then
-        updated = string.sub(data, 1, start - 1)
-            .. '"id":"' .. new_id_rep .. '"'
-            .. string.sub(data, stop + 1)
-    else
-        -- Fallback: try with optional whitespace after colon
-        local target = '"id":%s*"' .. old_id_pat .. '"'
-        local replacement = '"id":"' .. new_id_rep .. '"'
-        local _sub_count
-        updated, _sub_count = string.gsub(data, target, replacement, 1)
+    decoded.id = new_id
+    if type(decoded.roles) == 'table' and next(decoded.roles) == nil then
+        decoded.roles = nil
+    end
+    if type(decoded.permissions) == 'table' and next(decoded.permissions) == nil then
+        decoded.permissions = nil
+    end
+    if type(decoded.data) == 'table' and next(decoded.data) == nil then
+        decoded.data = nil
     end
 
+    local updated = cjson.encode(decoded)
     local ttl = redis.call('PTTL', old_key)
     if ttl > 0 then
         redis.call('SET', new_key, updated, 'PX', ttl)
@@ -203,11 +187,6 @@ impl SessionStore for RedisSessionStore {
         let old_key = self.key(old_id);
         let new_id = uuid::Uuid::new_v4().to_string();
         let new_key = self.key(&new_id);
-        // Escape old_id for use as a Lua pattern (UUID hyphens are pattern
-        // operators, not literals). Escape new_id for use as a replacement
-        // string (% introduces capture references).
-        let old_id_pat = escape_lua_pattern(old_id);
-        let new_id_rep = escape_lua_replacement(&new_id);
 
         Box::pin(async move {
             let mut conn = self
@@ -222,8 +201,7 @@ impl SessionStore for RedisSessionStore {
                 redis::Script::new(REGENERATE_ID_SCRIPT)
                     .key(&old_key)
                     .key(&new_key)
-                    .arg(&old_id_pat)
-                    .arg(&new_id_rep)
+                    .arg(&new_id)
                     .arg(now)
                     .invoke_async(&mut *conn)
                     .await;
@@ -253,24 +231,42 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_regenerate_id_script_binds_gsub_count_locally() {
+    fn regenerate_id_script_uses_guarded_cjson_without_lua_pattern_helpers() {
         assert!(
-            !REGENERATE_ID_SCRIPT.contains("updated, _ ="),
-            "Lua script must not assign string.gsub count to global `_`"
+            REGENERATE_ID_SCRIPT.contains("pcall(cjson.decode, data)"),
+            "Lua script must decode JSON structurally with pcall(cjson.decode, data)"
         );
         assert!(
-            REGENERATE_ID_SCRIPT.contains("local _sub_count"),
-            "Lua script must declare local _sub_count before string.gsub"
+            REGENERATE_ID_SCRIPT.contains("tonumber(decoded.expires_at)")
+                && REGENERATE_ID_SCRIPT.contains("MALFORMED"),
+            "Lua script must validate expires_at before comparing and return MALFORMED"
         );
-    }
+        assert!(
+            !REGENERATE_ID_SCRIPT.contains("string.gsub")
+                && !REGENERATE_ID_SCRIPT.contains("string.find")
+                && !REGENERATE_ID_SCRIPT.contains("string.match"),
+            "Lua script must not rely on string.gsub/string.find/string.match"
+        );
 
-    #[test]
-    fn test_escape_lua_pattern_and_replacement_uuid() {
-        let uuid = "550e8400-e29b-41d4-a716-446655440000";
-        assert_eq!(
-            escape_lua_pattern(uuid),
-            "550e8400%-e29b%-41d4%-a716%-446655440000"
-        );
-        assert_eq!(escape_lua_replacement("abc%1def"), "abc%%1def");
+        let omitted_collections = r#"{"id":"s1","user_id":"u1","expires_at":9999999999}"#;
+        let parsed: Session = serde_json::from_str(omitted_collections)
+            .expect("Session must deserialize with omitted optional collections");
+        assert_eq!(parsed.id, "s1");
+        assert_eq!(parsed.user_id, "u1");
+        assert_eq!(parsed.tenant_id, None);
+        assert!(parsed.roles.is_empty());
+        assert!(parsed.permissions.is_empty());
+        assert!(parsed.data.is_empty());
+
+        for required_missing in [
+            r#"{"user_id":"u1","expires_at":9999999999}"#,
+            r#"{"id":"s1","expires_at":9999999999}"#,
+            r#"{"id":"s1","user_id":"u1"}"#,
+        ] {
+            assert!(
+                serde_json::from_str::<Session>(required_missing).is_err(),
+                "missing core field in {required_missing} must fail deserialization"
+            );
+        }
     }
 }

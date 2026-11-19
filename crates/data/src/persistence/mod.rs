@@ -14,6 +14,7 @@ pub mod pool;
 pub mod postgres;
 pub mod query;
 pub mod row;
+pub mod sql;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 

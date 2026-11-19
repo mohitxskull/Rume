@@ -90,7 +90,15 @@ impl TraceContext {
 
     /// Converts this `TraceContext` into an [`opentelemetry::Context`] using W3C `TraceContextPropagator`.
     pub fn to_otel_context(&self) -> OtelContext {
-        TraceContextPropagator::new().extract(self)
+        // Why: `extract(self)` defaults to `&OtelContext::current()`, which would leak ambient
+        // context entries (or fall back to the ambient span) when no global propagator is used.
+        self.apply_to_otel_context(&OtelContext::new())
+    }
+
+    /// Layers this `TraceContext`'s span context onto `base`, preserving other entries
+    /// (such as propagated baggage) already carried in `base`.
+    pub fn apply_to_otel_context(&self, base: &OtelContext) -> OtelContext {
+        TraceContextPropagator::new().extract_with_context(base, self)
     }
 
     /// Extracts a `TraceContext` from an [`opentelemetry::Context`] if it carries a valid span context.

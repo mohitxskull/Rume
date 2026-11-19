@@ -121,12 +121,14 @@ impl CacheBackend for InMemoryCacheBackend {
         let key = key.to_string();
         let tags_vec: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
         Box::pin(async move {
-            let expires_at = ttl.map(|t| std::time::Instant::now() + t);
-            let mut map = self.entries.write().await;
-            map.insert(key.clone(), (value, expires_at));
-            drop(map);
-
+            // Why: acquire `tag_map` before `entries` (matching `invalidate_tag_keys` and
+            // `clear` to prevent lock-order inversion) and hold both guards across the
+            // synchronous inserts so future cancellation while waiting for a lock can never
+            // publish a value without its tag memberships.
             let mut tag_map = self.tag_map.write().await;
+            let mut map = self.entries.write().await;
+            let expires_at = ttl.map(|t| std::time::Instant::now() + t);
+            map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
                 tag_map.entry(tag).or_default().insert(key.clone());
             }
@@ -162,11 +164,16 @@ impl CacheBackend for InMemoryCacheBackend {
     fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tag = tag.to_string();
         Box::pin(async move {
+            // Why: take BOTH locks (`tag_map` then `entries`, the order used by `set_with_tags`
+            // and `clear`) before removing the tag, with no await between removal and entry
+            // deletion. Removing the tag first and then awaiting `entries` let a cancellation
+            // in between drop the tag index while leaving its values readable, and a retry
+            // would then return zero.
             let mut tag_map = self.tag_map.write().await;
+            let mut map = self.entries.write().await;
             let Some(keys) = tag_map.remove(&tag) else {
                 return Ok(Vec::new());
             };
-            let mut map = self.entries.write().await;
             let mut deleted = Vec::new();
             for key in keys {
                 if let Some((_, expires_at)) = map.remove(&key) {
@@ -192,9 +199,10 @@ impl CacheBackend for InMemoryCacheBackend {
 
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>> {
         Box::pin(async move {
+            // Lock `tag_map` before `entries` to match `set_with_tags` and `invalidate_tag_keys`.
+            let mut tag_map = self.tag_map.write().await;
             let mut map = self.entries.write().await;
             map.clear();
-            let mut tag_map = self.tag_map.write().await;
             tag_map.clear();
             Ok(())
         })

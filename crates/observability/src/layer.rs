@@ -79,36 +79,44 @@ where
             None => RequestId::generate(),
         };
 
-        let trace_context = match req.headers().get(&TRACEPARENT) {
-            Some(val) => match val.to_str() {
-                Ok(s) if TraceContext::is_valid_traceparent(s) => {
-                    let tracestate = req
-                        .headers()
-                        .get(&TRACESTATE)
-                        .and_then(|v| v.to_str().ok())
-                        .map(ToString::to_string);
-                    TraceContext {
-                        traceparent: s.to_string(),
-                        tracestate,
-                    }
+        let incoming_tc = req
+            .headers()
+            .get(&TRACEPARENT)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| TraceContext::is_valid_traceparent(s))
+            .map(|tp| {
+                let tracestate = req
+                    .headers()
+                    .get(&TRACESTATE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(ToString::to_string);
+                TraceContext {
+                    traceparent: tp.to_string(),
+                    tracestate,
                 }
-                _ => TraceContext::generate(),
-            },
-            None => TraceContext::generate(),
-        };
+            });
 
-        let propagated_cx = opentelemetry::global::get_text_map_propagator(|prop| {
-            prop.extract(&HeaderMapExtractor(req.headers()))
-        });
-        let otel_cx = if propagated_cx.span().span_context().is_valid() {
+        // Why: extract into an explicit empty `opentelemetry::Context::new()` while temporarily
+        // attaching `Context::new()` as current. In `opentelemetry 0.33`,
+        // `NoopTextMapPropagator::extract_with_context` ignores its `cx` argument and returns
+        // `Context::current()`, so without detaching the ambient thread-local context, any request
+        // arriving while a global propagator has not yet been registered would inherit ambient traces.
+        let propagated_cx = {
+            let _isolated = opentelemetry::Context::new().attach();
+            opentelemetry::global::get_text_map_propagator(|prop| {
+                prop.extract_with_context(
+                    &opentelemetry::Context::new(),
+                    &HeaderMapExtractor(req.headers()),
+                )
+            })
+        };
+        let parent_cx = if propagated_cx.span().span_context().is_valid() {
             propagated_cx
+        } else if let Some(ref tc) = incoming_tc {
+            tc.apply_to_otel_context(&propagated_cx)
         } else {
-            trace_context.to_otel_context()
+            propagated_cx
         };
-
-        // Propagate RequestId and TraceContext through request extensions for handlers & other layers.
-        req.extensions_mut().insert(request_id.clone());
-        req.extensions_mut().insert(trace_context.clone());
 
         let method = req.method().clone();
         let matched_path = req
@@ -116,19 +124,44 @@ where
             .get::<axum::extract::MatchedPath>()
             .map(|mp| mp.as_str().to_string());
 
-        let tracestate_str = trace_context.tracestate.clone();
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
-            traceparent = %trace_context.traceparent,
-            tracestate = trace_context.tracestate.as_deref().unwrap_or(""),
+            traceparent = tracing::field::Empty,
+            tracestate = tracing::field::Empty,
             method = %method,
             route = tracing::field::Empty,
             status = tracing::field::Empty,
             latency_ms = tracing::field::Empty,
         );
 
-        let _ = span.set_parent(otel_cx.clone());
+        // Why: unconditionally call `set_parent(parent_cx)` BEFORE `span.context()`. When an
+        // `OpenTelemetryLayer` is installed, `on_new_span` captures ambient `OtelContext::current()`
+        // on the span builder, so passing `Context::new()` for unheadered requests clears any
+        // ambient parent while headered requests bind the extracted parent; calling `span.context()`
+        // first would start the span (`AlreadyStarted`) and silently reject `set_parent`.
+        let _ = span.set_parent(parent_cx.clone());
+        let span_cx = span.context();
+
+        let (server_tc, exec_cx) = if let Some(tc) = TraceContext::from_otel_context(&span_cx) {
+            (tc, span_cx)
+        } else {
+            // Why: when no `OpenTelemetryLayer` is active, `span.context()` is invalid; derive a
+            // fresh child from `parent_cx` (preserving traces accepted by the global propagator
+            // such as future W3C versions) or a new root when `parent_cx` has no valid span, and
+            // layer the child span context onto `parent_cx` so propagated baggage is retained.
+            let tc = TraceContext::from_otel_context(&parent_cx)
+                .map_or_else(TraceContext::generate, |parent| parent.new_child());
+            let cx = tc.apply_to_otel_context(&parent_cx);
+            (tc, cx)
+        };
+
+        span.record("traceparent", server_tc.traceparent.as_str());
+        span.record("tracestate", server_tc.tracestate.as_deref().unwrap_or(""));
+
+        // Propagate RequestId and server span TraceContext through request extensions.
+        req.extensions_mut().insert(request_id.clone());
+        req.extensions_mut().insert(server_tc.clone());
 
         if let Some(ref route) = matched_path {
             span.record("route", route.as_str());
@@ -137,7 +170,8 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         let req_id_str = request_id.0.clone();
-        let trace_parent_str = trace_context.traceparent.clone();
+        let trace_parent_str = server_tc.traceparent.clone();
+        let tracestate_str = server_tc.tracestate.clone();
         let span_clone = span.clone();
 
         Box::pin(
@@ -280,7 +314,7 @@ where
 
                 Ok(response)
             }
-            .with_context(otel_cx)
+            .with_context(exec_cx)
             .instrument(span),
         )
     }
@@ -293,38 +327,184 @@ mod tests {
 
     #[tokio::test]
     async fn observability_layer_extracts_w3c_traceparent_into_otel_span_and_response() {
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(|_req: Request<Body>| async {
-            let current = TraceContext::current().expect("TraceContext::current() must be active");
-            assert_eq!(current.trace_id(), "4bf92f3577b34da6a3ce929d0e0e4736");
-            assert_eq!(
-                current.tracestate.as_deref(),
-                Some("vendor=val1,other=val2")
-            );
-            Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+        let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let incoming_span_id = "00f067aa0ba902b7";
+        let captured_handler_tp = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let captured_clone = std::sync::Arc::clone(&captured_handler_tp);
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
+            let captured = std::sync::Arc::clone(&captured_clone);
+            async move {
+                let current =
+                    TraceContext::current().expect("TraceContext::current() must be active");
+                let ext = req
+                    .extensions()
+                    .get::<TraceContext>()
+                    .expect("TraceContext extension must be inserted");
+                assert_eq!(&current, ext);
+                assert_eq!(current.trace_id(), incoming_trace_id);
+                assert_ne!(current.span_id(), incoming_span_id);
+                assert_eq!(
+                    current.tracestate.as_deref(),
+                    Some("vendor=val1,other=val2")
+                );
+                *captured.lock().unwrap() = Some(current.traceparent);
+                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+            }
         }));
 
         let req = Request::builder()
             .uri("/test")
             .header(
                 "traceparent",
-                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                format!("00-{incoming_trace_id}-{incoming_span_id}-01"),
             )
             .header("tracestate", "vendor=val1,other=val2")
             .body(Body::empty())
             .unwrap();
 
         let resp = svc.call(req).await.expect("service call succeeds");
+        let handler_tp = captured_handler_tp.lock().unwrap().clone().unwrap();
         assert_eq!(
             resp.headers()
                 .get("traceparent")
                 .and_then(|h| h.to_str().ok()),
-            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+            Some(handler_tp.as_str())
         );
         assert_eq!(
             resp.headers()
                 .get("tracestate")
                 .and_then(|h| h.to_str().ok()),
             Some("vendor=val1,other=val2")
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_layer_emits_child_span_id_with_and_without_otel_subscriber() {
+        use opentelemetry::propagation::TextMapPropagator;
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::propagation::TraceContextPropagator;
+        use opentelemetry_sdk::trace::SdkTracerProvider;
+        use tracing::Instrument as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let incoming_span_id = "00f067aa0ba902b7";
+        let incoming_tp = format!("00-{incoming_trace_id}-{incoming_span_id}-01");
+
+        // (a) Incoming traceparent without OpenTelemetryLayer
+        let no_otel_captured = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
+        let no_otel_captured_clone = std::sync::Arc::clone(&no_otel_captured);
+        let mut no_otel_svc =
+            ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
+                let cap = std::sync::Arc::clone(&no_otel_captured_clone);
+                async move {
+                    let current = TraceContext::current().expect("TraceContext::current() active");
+                    let ext = req
+                        .extensions()
+                        .get::<TraceContext>()
+                        .expect("TraceContext extension active")
+                        .clone();
+                    assert_eq!(current, ext);
+                    *cap.lock().unwrap() = Some(current);
+                    Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            }));
+        let req = Request::builder()
+            .uri("/no-otel")
+            .header("traceparent", &incoming_tp)
+            .header("tracestate", "k=v")
+            .body(Body::empty())
+            .unwrap();
+        let resp = no_otel_svc.call(req).await.unwrap();
+        let no_otel_tc = no_otel_captured.lock().unwrap().clone().unwrap();
+        assert_eq!(no_otel_tc.trace_id(), incoming_trace_id);
+        assert_ne!(no_otel_tc.span_id(), incoming_span_id);
+        assert_eq!(no_otel_tc.tracestate.as_deref(), Some("k=v"));
+        assert_eq!(
+            resp.headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok()),
+            Some(no_otel_tc.traceparent.as_str())
+        );
+
+        // (b) Incoming traceparent + unheadered isolation WITH explicit SdkTracerProvider + OpenTelemetryLayer
+        let provider = SdkTracerProvider::builder().build();
+        let tracer = provider.tracer("layer-test");
+        let subscriber =
+            tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+
+        let otel_captured = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
+        let otel_captured_clone = std::sync::Arc::clone(&otel_captured);
+        let mut otel_svc =
+            ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
+                let cap = std::sync::Arc::clone(&otel_captured_clone);
+                async move {
+                    let current = TraceContext::current().expect("TraceContext::current() active");
+                    let ext = req
+                        .extensions()
+                        .get::<TraceContext>()
+                        .expect("TraceContext extension active")
+                        .clone();
+                    assert_eq!(current, ext);
+                    *cap.lock().unwrap() = Some(current);
+                    Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            }));
+
+        // Note: simulate incoming request with traceparent while an ambient OTel context is active
+        let ambient_trace_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let ambient_tc =
+            TraceContext::from_traceparent(format!("00-{ambient_trace_id}-1111111111111111-01"));
+        let ambient_cx = TraceContextPropagator::new().extract(&ambient_tc);
+
+        let headered_req = Request::builder()
+            .uri("/with-otel")
+            .header("traceparent", &incoming_tp)
+            .header("tracestate", "vendor=val1")
+            .body(Body::empty())
+            .unwrap();
+        let headered_resp = async { otel_svc.call(headered_req).await }
+            .with_context(ambient_cx.clone())
+            .await
+            .unwrap();
+        let headered_tc = otel_captured.lock().unwrap().clone().unwrap();
+        assert_eq!(headered_tc.trace_id(), incoming_trace_id);
+        assert_ne!(headered_tc.span_id(), incoming_span_id);
+        assert_eq!(headered_tc.tracestate.as_deref(), Some("vendor=val1"));
+        assert_eq!(
+            headered_resp
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok()),
+            Some(headered_tc.traceparent.as_str())
+        );
+
+        // Unheadered request executed under an ambient OTel context must start an isolated root trace
+        let ambient_span = tracing::info_span!("ambient_caller");
+        let _ = ambient_span.set_parent(ambient_cx.clone());
+        let unheadered_req = Request::builder()
+            .uri("/unheadered")
+            .body(Body::empty())
+            .unwrap();
+        let unheadered_resp = async { otel_svc.call(unheadered_req).await }
+            .with_context(ambient_cx)
+            .instrument(ambient_span)
+            .await
+            .unwrap();
+        let unheadered_tc = otel_captured.lock().unwrap().clone().unwrap();
+        assert_ne!(
+            unheadered_tc.trace_id(),
+            ambient_trace_id,
+            "unheadered request must not inherit ambient OtelContext::current()"
+        );
+        assert_eq!(
+            unheadered_resp
+                .headers()
+                .get("traceparent")
+                .and_then(|v| v.to_str().ok()),
+            Some(unheadered_tc.traceparent.as_str())
         );
     }
 
@@ -501,5 +681,78 @@ mod tests {
             res.is_err(),
             "mid-stream error must be preserved and propagated to body consumer"
         );
+    }
+
+    #[tokio::test]
+    async fn observability_fallback_preserves_future_trace_version_and_baggage() {
+        use opentelemetry::baggage::BaggageExt as _;
+        use opentelemetry::propagation::TextMapCompositePropagator;
+        use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
+
+        // Install a composite propagator (trace + baggage) without any OpenTelemetryLayer.
+        let composite = TextMapCompositePropagator::new(vec![
+            Box::new(TraceContextPropagator::new()),
+            Box::new(BaggagePropagator::new()),
+        ]);
+        opentelemetry::global::set_text_map_propagator(composite);
+
+        let observed_baggage = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+        let observed_trace = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
+        let obs_b = std::sync::Arc::clone(&observed_baggage);
+        let obs_t = std::sync::Arc::clone(&observed_trace);
+
+        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
+            let obs_b = std::sync::Arc::clone(&obs_b);
+            let obs_t = std::sync::Arc::clone(&obs_t);
+            async move {
+                let cx = opentelemetry::Context::current();
+                let region = cx.baggage().get("region").map(|v| v.to_string());
+                *obs_b.lock().unwrap() = region;
+                *obs_t.lock().unwrap() = TraceContext::current();
+                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+            }
+        }));
+
+        // Version-02 traceparent is accepted by SDK 0.33.1's TraceContextPropagator even though
+        // `TraceContext::is_valid_traceparent` only validates version `00`.
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let parent_span_id = "00f067aa0ba902b7";
+        let req = Request::builder()
+            .uri("/baggage-and-v02")
+            .header("traceparent", format!("02-{trace_id}-{parent_span_id}-01"))
+            .header("baggage", "region=west")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.call(req).await.unwrap();
+        let resp_tp = resp
+            .headers()
+            .get(&TRACEPARENT)
+            .and_then(|v| v.to_str().ok())
+            .expect("response must carry traceparent");
+        let resp_tc = TraceContext::from_traceparent(resp_tp);
+        assert_eq!(
+            resp_tc.trace_id(),
+            trace_id,
+            "fallback child must inherit trace ID from parent_cx"
+        );
+        assert_ne!(
+            resp_tc.span_id(),
+            parent_span_id,
+            "fallback child must mint a fresh server span ID"
+        );
+
+        assert_eq!(
+            observed_baggage.lock().unwrap().as_deref(),
+            Some("west"),
+            "fallback execution context must retain propagated baggage"
+        );
+        let handler_tc = observed_trace
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("handler must see active TraceContext");
+        assert_eq!(handler_tc.trace_id(), trace_id);
+        assert_eq!(handler_tc.span_id(), resp_tc.span_id());
     }
 }
