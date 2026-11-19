@@ -102,6 +102,10 @@ fn find_migration_id_query(dialect: &str) -> &'static str {
 const LIST_APPLIED_MIGRATIONS_SQL: &str = PG_MIGRATION_LIST_APPLIED;
 const NEXT_APPLIED_ORDER_SQL: &str =
     "SELECT COALESCE(MAX(applied_order), 0) + 1 FROM rume_migrations";
+#[cfg(feature = "mysql")]
+const APPLIED_ORDER_MYSQL_COUNT_SQL: &str = "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rume_migrations' AND COLUMN_NAME = 'applied_order'";
+const APPLIED_ORDER_SQLITE_COUNT_SQL: &str =
+    "SELECT COUNT(*) FROM pragma_table_info('rume_migrations') WHERE name = 'applied_order'";
 const LIST_APPLIED_ORDER_SQL: &str = "SELECT id, applied_order, applied_at FROM rume_migrations ORDER BY applied_order DESC, applied_at DESC";
 
 fn select_rollback_target<'a>(
@@ -138,16 +142,20 @@ async fn ensure_applied_order_column_tx<T: DatabaseTransaction>(
             .await?;
         }
         "sqlite" => {
-            let count = tx
-                .query_scalar(
-                    "SELECT COUNT(*) FROM pragma_table_info('rume_migrations') WHERE name = 'applied_order'",
-                )
-                .await?;
+            let count = tx.query_scalar(APPLIED_ORDER_SQLITE_COUNT_SQL).await?;
             if count.as_deref() == Some("0") {
-                tx.execute(
-                    "ALTER TABLE rume_migrations ADD COLUMN applied_order INTEGER NOT NULL DEFAULT 0",
-                )
-                .await?;
+                let alter = tx
+                    .execute(
+                        "ALTER TABLE rume_migrations ADD COLUMN applied_order INTEGER NOT NULL DEFAULT 0",
+                    )
+                    .await;
+                if let Err(err) = alter {
+                    // Why: tolerate a concurrent ADD COLUMN only after re-verifying the column.
+                    let recount = tx.query_scalar(APPLIED_ORDER_SQLITE_COUNT_SQL).await?;
+                    if recount.as_deref() == Some("0") {
+                        return Err(err);
+                    }
+                }
             }
         }
         _ => {}
@@ -167,17 +175,21 @@ async fn ensure_applied_order_column_backend<B: DatabaseBackend>(
                 .await?;
         }
         "sqlite" => {
-            let count = backend
-                .query_scalar(
-                    "SELECT COUNT(*) FROM pragma_table_info('rume_migrations') WHERE name = 'applied_order'",
-                )
-                .await?;
+            let count = backend.query_scalar(APPLIED_ORDER_SQLITE_COUNT_SQL).await?;
             if count.as_deref() == Some("0") {
-                backend
+                let alter = backend
                     .execute(
                         "ALTER TABLE rume_migrations ADD COLUMN applied_order INTEGER NOT NULL DEFAULT 0",
                     )
-                    .await?;
+                    .await;
+                if let Err(err) = alter {
+                    // Why: `applied_migrations` runs outside the migration lock, so a concurrent
+                    // migrator may add the column first; tolerate only after re-verifying it.
+                    let recount = backend.query_scalar(APPLIED_ORDER_SQLITE_COUNT_SQL).await?;
+                    if recount.as_deref() == Some("0") {
+                        return Err(err);
+                    }
+                }
             }
         }
         "mysql" => {
@@ -187,11 +199,24 @@ async fn ensure_applied_order_column_backend<B: DatabaseBackend>(
                 )
                 .await?;
             if count.as_deref() == Some("0") {
-                backend
+                let alter = backend
                     .execute(
                         "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
                     )
-                    .await?;
+                    .await;
+                if let Err(err) = alter {
+                    // Why: `applied_migrations` runs outside the named lock, so a concurrent
+                    // migrator may add the column first (duplicate-column error); tolerate only
+                    // after re-verifying the column exists.
+                    let recount = backend
+                        .query_scalar(
+                            "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rume_migrations' AND COLUMN_NAME = 'applied_order'",
+                        )
+                        .await?;
+                    if recount.as_deref() == Some("0") {
+                        return Err(err);
+                    }
+                }
             }
         }
         _ => {}
@@ -225,18 +250,22 @@ async fn fetch_applied_order_rows_tx<T: DatabaseTransaction>(
 async fn ensure_applied_order_column_mysql(
     conn: &mut sqlx::MySqlConnection,
 ) -> Result<(), PersistenceError> {
-    let count = mysql_conn_query_scalar_params(
-        conn,
-        "SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'rume_migrations' AND COLUMN_NAME = 'applied_order'",
-        &[],
-    )
-    .await?;
+    let count = mysql_conn_query_scalar_params(conn, APPLIED_ORDER_MYSQL_COUNT_SQL, &[]).await?;
     if count.as_deref() == Some("0") {
-        mysql_conn_execute_raw(
+        let alter = mysql_conn_execute_raw(
             conn,
             "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
         )
-        .await?;
+        .await;
+        if let Err(err) = alter {
+            // Why: a concurrent migrator may have added the column between the check and the
+            // ALTER; tolerate the duplicate-column failure only after re-verifying the column.
+            let recount =
+                mysql_conn_query_scalar_params(conn, APPLIED_ORDER_MYSQL_COUNT_SQL, &[]).await?;
+            if recount.as_deref() == Some("0") {
+                return Err(err);
+            }
+        }
     }
     Ok(())
 }
@@ -380,6 +409,24 @@ async fn mysql_conn_query_scalar_params(
     Ok(row.and_then(|r| extract_mysql_scalar(&r)))
 }
 
+/// Rolls back any transaction still open on the pinned session, then releases the named lock.
+///
+/// Why: a cancelled migration (or a failed explicit `ROLLBACK`, whose result the migration loops
+/// discard) can leave `START TRANSACTION` open. SQLx only `ping()`s a connection before reusing
+/// it from the pool, so the next borrower would run inside that open transaction, see
+/// uncommitted migration rows, and could `COMMIT` them without their ledger row. `ROLLBACK` with
+/// no open transaction is a no-op in MySQL, so issuing it unconditionally needs no extra state
+/// tracking. If `ROLLBACK` fails, `RELEASE_LOCK` is skipped and the error is returned so the
+/// caller detaches the session (MySQL then discards the transaction and drops the lock itself).
+/// Revisit if the pool gains an `after_release` hook that resets session state.
+#[cfg(feature = "mysql")]
+async fn mysql_rollback_then_unlock(
+    conn: &mut sqlx::MySqlConnection,
+) -> Result<Option<String>, PersistenceError> {
+    mysql_conn_execute_raw(conn, "ROLLBACK").await?;
+    mysql_conn_query_scalar_params(conn, MYSQL_MIGRATION_UNLOCK, &[]).await
+}
+
 /// Acquisition / ownership state of [`MysqlMigrationLockGuard`].
 #[cfg(feature = "mysql")]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -443,12 +490,11 @@ impl MysqlMigrationLockGuard {
         if self.state != MysqlLockState::Locked {
             return Ok(());
         }
-        let unlock_res =
-            mysql_conn_query_scalar_params(self.conn_mut()?, MYSQL_MIGRATION_UNLOCK, &[]).await;
-        // Why: disarm only after awaiting `RELEASE_LOCK` so cancellation mid-unlock still
-        // triggers `Drop` cleanup. Only return the connection to the pool when `RELEASE_LOCK`
-        // affirmatively returned `"1"`; otherwise detach and close the session so MySQL drops
-        // any named lock it still holds.
+        let unlock_res = mysql_rollback_then_unlock(self.conn_mut()?).await;
+        // Why: disarm only after awaiting cleanup so cancellation mid-unlock still triggers
+        // `Drop` cleanup. Only return the connection to the pool when `ROLLBACK` succeeded AND
+        // `RELEASE_LOCK` affirmatively returned `"1"`; otherwise detach and close the session so
+        // MySQL discards any open transaction and drops any named lock it still holds.
         self.state = MysqlLockState::Released;
         let released = matches!(&unlock_res, Ok(Some(s)) if s == "1");
         if released {
@@ -486,12 +532,7 @@ impl Drop for MysqlMigrationLockGuard {
                         // `RELEASE_LOCK` does not affirmatively return `"1"`, detach the
                         // connection so MySQL closes the session and drops the named lock.
                         handle.spawn(async move {
-                            let res = mysql_conn_query_scalar_params(
-                                &mut conn,
-                                MYSQL_MIGRATION_UNLOCK,
-                                &[],
-                            )
-                            .await;
+                            let res = mysql_rollback_then_unlock(&mut conn).await;
                             if !matches!(res, Ok(Some(ref s)) if s == "1") {
                                 drop(conn.detach());
                             }

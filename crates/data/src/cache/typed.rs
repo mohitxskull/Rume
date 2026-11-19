@@ -520,6 +520,32 @@ mod tests {
         }
     }
 
+    /// Waits until a follower holds an `OwnedNotified` for `key`'s in-flight slot.
+    ///
+    /// Why: each follower's `OwnedNotified` owns one clone of the flight's `Arc<Notify>`, so a
+    /// strong count above the slot's own reference proves the follower joined the flight
+    /// (instead of guessing with scheduler yields) and aborting the leader now exercises the
+    /// follower-recovery path.
+    async fn wait_for_follower_registration(cache: &Cache<InMemoryCacheBackend>, key: &str) {
+        let full_key = cache.format_key(key);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let joined = {
+                    let flights = cache.singleflight.lock().unwrap();
+                    flights
+                        .get(&full_key)
+                        .is_some_and(|state| Arc::strong_count(&state.notify) > 1)
+                };
+                if joined {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("follower must join the in-flight slot");
+    }
+
     async fn settle_followers() {
         for _ in 0..8 {
             tokio::task::yield_now().await;
@@ -866,11 +892,12 @@ mod tests {
             .await
         });
 
-        let notified = leader_entered.notified();
-        tokio::pin!(notified);
-        notified.as_mut().enable();
-        // Wait for leader to enter factory.
-        tokio::task::yield_now().await;
+        // Why: register the notification BEFORE spawning is impossible here (the leader task
+        // is already spawned), so await it under a guard timeout: `notify_waiters` only wakes
+        // registered waiters, and a missed signal must fail the test rather than hang it.
+        tokio::time::timeout(Duration::from_secs(10), leader_entered.notified())
+            .await
+            .expect("leader must enter its factory");
 
         let c2 = Arc::clone(&cache);
         let follower = tokio::spawn(async move {
@@ -880,9 +907,10 @@ mod tests {
             .await
         });
 
-        settle_followers().await;
+        wait_for_follower_registration(&cache, "tagged-k").await;
         leader.abort();
-        let _ = leader.await;
+        let leader_err = leader.await.expect_err("aborted leader must not complete");
+        assert!(leader_err.is_cancelled(), "leader must end by cancellation");
 
         let val = follower
             .await

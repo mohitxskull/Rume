@@ -1892,8 +1892,15 @@ async fn postgres_schema_fixture_drop_cleans_up_on_current_thread_runtime() {
         .expect("query schemata before drop");
     assert_eq!(exists_before.as_deref(), Some(schema.as_str()));
 
-    // Drop without `.close()` inside a `current_thread` `#[tokio::test]`: must drop the schema
-    // synchronously via the isolated helper-thread connection without hanging.
+    // Begin an uncommitted transaction holding table locks inside `schema`, then drop both `tx`
+    // and `fixture` back-to-back with NO intervening `.await` on this `current_thread` runtime.
+    // `PostgresSchemaFixture::drop` must abort the unpolled rollback task, terminate the server
+    // backend holding the locks, and drop the schema synchronously before `drop(fixture)` returns.
+    let tx = fixture.begin_test_tx().await.expect("begin_test_tx");
+    tx.execute("INSERT INTO drop_check (id) VALUES (1)")
+        .await
+        .expect("insert inside uncommitted tx");
+    drop(tx);
     drop(fixture);
 
     let exists_after = admin_pool

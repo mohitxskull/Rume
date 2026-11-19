@@ -150,7 +150,28 @@ impl CacheBackend for RedisCacheBackend {
             // Why: publish the value and all of its tag memberships + tag TTL updates inside
             // one atomic Lua script so cancelling the Rust future mid-flight can never leave
             // an untagged value visible in Redis that `invalidate_tag` would miss.
+            //
+            // Why: validate every key's role and Redis type BEFORE the first write. Redis does
+            // not undo a `SET` when a later `SADD` fails with WRONGTYPE, so a tag key that
+            // already holds a string would leave the value written but untagged; the next
+            // leader would then read it as a hit and report success without tag membership.
+            // Missing tag sets and existing sets stay valid.
             const SET_WITH_TAGS_SCRIPT: &str = r#"
+                for i = 2, #KEYS, 2 do
+                    local tk = KEYS[i]
+                    local pk = KEYS[i + 1]
+                    if tk == KEYS[1] or pk == KEYS[1] then
+                        return redis.error_reply('WRONGTYPE value key collides with a tag key')
+                    end
+                    local tt = redis.call('TYPE', tk)['ok']
+                    if tt ~= 'none' and tt ~= 'set' then
+                        return redis.error_reply('WRONGTYPE tag key is not a set')
+                    end
+                    local pt = redis.call('TYPE', pk)['ok']
+                    if pt ~= 'none' and pt ~= 'string' then
+                        return redis.error_reply('WRONGTYPE tag persist key is not a string')
+                    end
+                end
                 local val_ttl = tonumber(ARGV[2])
                 if val_ttl < 0 then
                     redis.call('SET', KEYS[1], ARGV[1])

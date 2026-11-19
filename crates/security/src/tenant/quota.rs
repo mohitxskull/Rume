@@ -135,21 +135,21 @@ pub trait TenantQuotaStore: Send + Sync + 'static {
     /// succeeded and refreshes via [`TenantQuotaStore::record_key`]),
     /// [`KeyReservation::NewlyReserved`] when a new slot was inserted for this call, or
     /// [`KeyReservation::QuotaExceeded`] when `max_keys` would be exceeded.
+    ///
+    /// # Contract Invariants (MANDATORY METHOD):
+    /// Intentionally **NOT defaulted** to delegate to [`TenantQuotaStore::record_key`]: that
+    /// method refreshes an existing key's TTL and cannot tell the caller the key already
+    /// existed, so a default would report `NewlyReserved` for a tracked key. A failed overwrite
+    /// would then shorten the existing reservation and, if the existence check also failed,
+    /// grant the caller rollback ownership of a slot it never created. Every store must
+    /// implement the non-mutating existing-key path itself.
     fn reserve_key<'a>(
         &'a self,
         tenant_id: &'a str,
         key: &'a str,
         ttl: Option<std::time::Duration>,
         max_keys: usize,
-    ) -> BoxFuture<'a, Result<KeyReservation, CacheError>> {
-        Box::pin(async move {
-            if self.record_key(tenant_id, key, ttl, max_keys).await? {
-                Ok(KeyReservation::NewlyReserved)
-            } else {
-                Ok(KeyReservation::QuotaExceeded)
-            }
-        })
-    }
+    ) -> BoxFuture<'a, Result<KeyReservation, CacheError>>;
 
     /// Removes a key from quota tracking for `tenant_id`.
     ///

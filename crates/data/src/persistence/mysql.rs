@@ -377,8 +377,11 @@ impl DatabaseTransaction for MysqlTransaction {
             // transaction-control commands nor MySQL implicit-commit DDL (such as
             // `CREATE TABLE` / `ALTER TABLE`) can silently commit pending InnoDB
             // updates out-of-band.
+            // Why: validate BEFORE choosing raw vs prepared execution; a parameterized
+            // `CREATE TABLE copy_t AS SELECT ? AS id` implicitly commits just like the
+            // parameterless form, so the guard must not depend on `params_vec`.
+            crate::persistence::backend::validate_managed_mysql_transaction_sql(&statement)?;
             let res = if params_vec.is_empty() {
-                crate::persistence::backend::validate_managed_mysql_transaction_sql(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await

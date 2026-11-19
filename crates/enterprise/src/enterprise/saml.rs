@@ -67,6 +67,12 @@ struct ActiveTextCapture {
     target: TextTarget,
     depth: usize,
     buf: String,
+    /// Owning `<Attribute Name="...">` captured when an `AttributeValue` capture opens.
+    ///
+    /// Why: SAML permits structured XML inside `<AttributeValue>`, so a nested `<Attribute>`
+    /// start/end must not change or clear the name the buffered text belongs to; the capture
+    /// carries its own copy instead of reading the parser-wide `current_attr_name` at close.
+    attr_name: Option<String>,
 }
 
 fn resolve_general_ref(raw_ref: &quick_xml::events::BytesRef<'_>) -> Result<String, SamlError> {
@@ -312,6 +318,7 @@ impl SamlParser {
         let mut element_stack: Vec<(String, XmlNs)> = Vec::new();
         let mut in_assertion = false;
         let mut current_attr_name: Option<String> = None;
+        let mut current_attr_depth: usize = 0;
 
         // Why: in signed mode an empty `<ds:Reference>` does not bind to any signed
         // element and is a signature-verification bypass. Unverified diagnostic mode keeps
@@ -406,6 +413,7 @@ impl SamlParser {
                                     target: TextTarget::AssertionIssuer,
                                     depth: new_depth,
                                     buf: String::new(),
+                                    attr_name: None,
                                 });
                             }
                             Some(("Response", XmlNs::Protocol)) => {
@@ -413,6 +421,7 @@ impl SamlParser {
                                     target: TextTarget::ResponseIssuer,
                                     depth: new_depth,
                                     buf: String::new(),
+                                    attr_name: None,
                                 });
                             }
                             _ => {}
@@ -430,10 +439,17 @@ impl SamlParser {
                                 }
                             }
                         } else if local_name == "Attribute" {
-                            for attr in e.attributes().flatten() {
-                                let local_k = attr.key.local_name();
-                                if local_k.as_ref() == "Name" {
-                                    current_attr_name = Some(attr.value.as_ref().to_string());
+                            // Why: only an `<Attribute>` outside any open text capture may set
+                            // the attribute name; a nested `<Attribute>` inside an
+                            // `<AttributeValue>` is structured value content and must not
+                            // replace (or later clear) the owning attribute's name.
+                            if active_capture.is_none() {
+                                for attr in e.attributes().flatten() {
+                                    let local_k = attr.key.local_name();
+                                    if local_k.as_ref() == "Name" {
+                                        current_attr_name = Some(attr.value.as_ref().to_string());
+                                        current_attr_depth = new_depth;
+                                    }
                                 }
                             }
                         } else if active_capture.is_none() {
@@ -445,12 +461,14 @@ impl SamlParser {
                                     target: TextTarget::SubjectNameId,
                                     depth: new_depth,
                                     buf: String::new(),
+                                    attr_name: None,
                                 });
                             } else if local_name == "Audience" && fields.audience.is_none() {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::Audience,
                                     depth: new_depth,
                                     buf: String::new(),
+                                    attr_name: None,
                                 });
                             } else if local_name == "AttributeValue" && current_attr_name.is_some()
                             {
@@ -458,6 +476,7 @@ impl SamlParser {
                                     target: TextTarget::AttributeValue,
                                     depth: new_depth,
                                     buf: String::new(),
+                                    attr_name: current_attr_name.clone(),
                                 });
                             }
                         }
@@ -503,12 +522,8 @@ impl SamlParser {
                                     }
                                 }
                                 TextTarget::AttributeValue => {
-                                    if let Some(attr_name) = current_attr_name.as_deref() {
-                                        fields
-                                            .attributes
-                                            .entry(attr_name.to_string())
-                                            .or_default()
-                                            .push(text);
+                                    if let Some(attr_name) = capture.attr_name {
+                                        fields.attributes.entry(attr_name).or_default().push(text);
                                     }
                                 }
                             }
@@ -518,7 +533,12 @@ impl SamlParser {
                     if local_name == "Assertion" && is_ns(&res, ASSERTION) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
-                    } else if local_name == "Attribute" && is_ns(&res, ASSERTION) {
+                    } else if local_name == "Attribute"
+                        && is_ns(&res, ASSERTION)
+                        && element_stack.len() == current_attr_depth
+                    {
+                        // Why: clear only when the owning `<Attribute>` itself closes, not a
+                        // nested one (see the matching Start-side guard).
                         current_attr_name = None;
                     }
                     element_stack.pop();
@@ -931,5 +951,29 @@ mod saml_parser_and_iso8601_proptests {
         let err = SamlParser::parse_unverified(xml)
             .expect_err("unresolved XML entity reference must fail closed");
         assert!(matches!(err, SamlError::Malformed(_)));
+    }
+
+    #[test]
+    fn nested_attribute_inside_attribute_value_keeps_owning_attribute_name() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a4">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@example.org</saml:NameID>
+            </saml:Subject>
+            <saml:AttributeStatement>
+                <saml:Attribute Name="roles">
+                    <saml:AttributeValue>user<saml:Attribute Name="meta"/></saml:AttributeValue>
+                    <saml:AttributeValue>admin</saml:AttributeValue>
+                </saml:Attribute>
+            </saml:AttributeStatement>
+        </saml:Assertion>"#;
+
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion must parse");
+        assert_eq!(
+            assertion.attributes.get("roles"),
+            Some(&vec!["user".to_string(), "admin".to_string()]),
+            "nested <Attribute> must neither rename nor clear the owning attribute"
+        );
+        assert!(!assertion.attributes.contains_key("meta"));
     }
 }

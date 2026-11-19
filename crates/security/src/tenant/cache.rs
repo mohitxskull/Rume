@@ -138,22 +138,53 @@ impl<B: CacheBackend> TenantScopedCache<B> {
             .set_json_with_tags(&full_key, value, &tag_refs, effective_ttl)
             .await;
 
-        if res.is_ok()
-            && reservation == Some(KeyReservation::AlreadyTracked)
-            && let Some(ref quota) = self.quota_store
-        {
-            let _ = quota
-                .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
-                .await;
-        } else if res.is_err()
-            && reservation == Some(KeyReservation::NewlyReserved)
-            && let Some(ref quota) = self.quota_store
-            && !matches!(self.cache.exists(&full_key).await, Ok(true))
-        {
-            let _ = quota.remove_key(tenant_id, key).await;
-        }
+        let Some(ref quota) = self.quota_store else {
+            return res;
+        };
 
-        res
+        match (&res, reservation) {
+            (Ok(()), Some(KeyReservation::AlreadyTracked)) => {
+                // Why: the overwrite succeeded, so refresh the reservation to the new TTL. The
+                // original reservation may have expired while the overwrite was in flight and
+                // another key may have taken the slot, so `record_key` can now reject this key
+                // (or fail). The entry is live but would be untracked; do not report a
+                // quota-enforced success. Evict it (best effort) and surface the failure.
+                match quota
+                    .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
+                    .await
+                {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let _ = self.cache.delete(&full_key).await;
+                        Err(CacheError::QuotaExceeded(format!(
+                            "tenant '{tenant_id}' exceeded quota of {} keys while finalizing overwrite",
+                            self.max_keys_per_tenant
+                        )))
+                    }
+                    Err(err) => {
+                        let _ = self.cache.delete(&full_key).await;
+                        Err(err)
+                    }
+                }
+            }
+            (Err(err), Some(KeyReservation::NewlyReserved)) => {
+                // Why: roll back the slot this call created only when the write is KNOWN not to
+                // have applied. `Serialization`/`Closed` fail before reaching the backend. For
+                // `Backend`/`Connection` errors the write is ambiguous (the Lua script may have
+                // run before the reply was lost), so remove the slot only if `exists` positively
+                // reports the entry absent. If `exists` also fails, keep the reservation: a live
+                // entry must never lose its quota slot, and the slot still expires with its TTL.
+                let definitely_not_written =
+                    matches!(err, CacheError::Serialization(_) | CacheError::Closed);
+                let absent = definitely_not_written
+                    || matches!(self.cache.exists(&full_key).await, Ok(false));
+                if absent {
+                    let _ = quota.remove_key(tenant_id, key).await;
+                }
+                res
+            }
+            _ => res,
+        }
     }
 
     /// Deletes a specific key scoped to `tenant_id`.
@@ -263,6 +294,30 @@ mod tests {
             self.inner.record_key(tenant_id, key, ttl, max_keys)
         }
 
+        fn reserve_key<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            key: &'a str,
+            ttl: Option<Duration>,
+            max_keys: usize,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<KeyReservation, CacheError>> {
+            Box::pin(async move {
+                let outcome = self
+                    .inner
+                    .reserve_key(tenant_id, key, ttl, max_keys)
+                    .await?;
+                // Only a newly inserted slot carries the caller's TTL; an already-tracked key
+                // keeps its existing expiration and records nothing.
+                if outcome == KeyReservation::NewlyReserved {
+                    self.recorded_ttls
+                        .lock()
+                        .expect("spy mutex poisoned")
+                        .push((key.to_string(), ttl));
+                }
+                Ok(outcome)
+            })
+        }
+
         fn remove_key<'a>(
             &'a self,
             tenant_id: &'a str,
@@ -291,6 +346,8 @@ mod tests {
         inner: rume_data::cache::backend::InMemoryCacheBackend,
         fail_writes: Arc<std::sync::atomic::AtomicBool>,
         fail_exists: Arc<std::sync::atomic::AtomicBool>,
+        /// Milliseconds each successful tagged write waits before applying (paused-time tests).
+        write_delay_ms: Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl FailingBackend {
@@ -302,6 +359,7 @@ mod tests {
                 inner: rume_data::cache::backend::InMemoryCacheBackend::new(),
                 fail_writes,
                 fail_exists,
+                write_delay_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             }
         }
     }
@@ -333,7 +391,16 @@ mod tests {
             if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
                 return Box::pin(async { Err(CacheError::Backend("redis unreachable".into())) });
             }
-            self.inner.set_with_tags(key, value, tags, ttl)
+            let delay = self
+                .write_delay_ms
+                .load(std::sync::atomic::Ordering::SeqCst);
+            let write = self.inner.set_with_tags(key, value, tags, ttl);
+            Box::pin(async move {
+                if delay > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+                write.await
+            })
         }
 
         fn delete(
@@ -452,8 +519,30 @@ mod tests {
                 .active_key_count("t1")
                 .await
                 .expect("count"),
+            1,
+            "ambiguous backend error with a failing exists() must keep the reservation"
+        );
+
+        // 2b. A backend write error is rolled back once `exists()` positively reports absence.
+        let write_only_fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let exists_ok = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let absent_cache = Cache::new(
+            FailingBackend::new(Arc::clone(&write_only_fail), Arc::clone(&exists_ok)),
+            rume_data::cache::config::CacheConfig::default(),
+        );
+        let absent_tenant_cache = TenantScopedCache::new(absent_cache)
+            .with_quota_store(Arc::new(InMemoryTenantQuotaStore::new()) as _);
+        absent_tenant_cache
+            .set("t1", "absent-key", &"val", None)
+            .await
+            .expect_err("failing write must return Backend error");
+        assert_eq!(
+            absent_tenant_cache
+                .active_key_count("t1")
+                .await
+                .expect("count"),
             0,
-            "quota slot must be rolled back when backend set and exists both fail"
+            "slot must be rolled back when exists() confirms the entry was not written"
         );
 
         // 3. Updating an already-existing key that fails write preserves its existing quota slot.
@@ -550,6 +639,60 @@ mod tests {
             tenant_cache.active_key_count("t1").await.expect("count"),
             0,
             "successful overwrite must refresh the reservation to the new 42s TTL"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn overwrite_finalization_rejection_evicts_untracked_entry() {
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists));
+        let write_delay_ms = Arc::clone(&backend.write_delay_ms);
+        let cache = Cache::new(backend, rume_data::cache::config::CacheConfig::default());
+        let quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let tenant_cache = Arc::new(
+            TenantScopedCache::new(cache)
+                .with_max_keys_per_tenant(1)
+                .with_quota_store(Arc::clone(&quota) as _),
+        );
+
+        // K is tracked with a 10s reservation.
+        tenant_cache
+            .set("t1", "k", &"v1", Some(Duration::from_secs(10)))
+            .await
+            .expect("initial write");
+
+        // K's overwrite stays in flight for 20s while its reservation expires at t=10s and a
+        // different key L takes the only slot at t=15s.
+        write_delay_ms.store(20_000, std::sync::atomic::Ordering::SeqCst);
+        let overwrite = {
+            let c = Arc::clone(&tenant_cache);
+            async move { c.set("t1", "k", &"v2", Some(Duration::from_secs(60))).await }
+        };
+        let steal = {
+            let c = Arc::clone(&tenant_cache);
+            let delay = Arc::clone(&write_delay_ms);
+            async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                delay.store(0, std::sync::atomic::Ordering::SeqCst);
+                c.set("t1", "l", &"vl", Some(Duration::from_secs(60))).await
+            }
+        };
+        let (overwrite_res, steal_res) = tokio::join!(overwrite, steal);
+
+        steal_res.expect("L takes the slot freed by K's expired reservation");
+        let err =
+            overwrite_res.expect_err("K's finalization must be rejected, not reported as success");
+        assert!(matches!(err, CacheError::QuotaExceeded(_)), "got {err:?}");
+        assert_eq!(
+            tenant_cache.get::<String>("t1", "k").await.expect("get"),
+            None,
+            "untracked K must be evicted so no live entry escapes quota accounting"
+        );
+        assert_eq!(
+            tenant_cache.active_key_count("t1").await.expect("count"),
+            1,
+            "only L remains tracked"
         );
     }
 }
