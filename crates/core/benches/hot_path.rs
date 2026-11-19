@@ -29,13 +29,32 @@ fn bench_router_observability_dispatch(c: &mut Criterion) {
         .build()
         .expect("tokio runtime");
 
-    let app = axum::Router::new()
+    let raw_axum = axum::Router::new().route("/ping", get(|| async { "pong" }));
+    let rume_with_obs = axum::Router::new()
         .route("/ping", get(|| async { "pong" }))
         .layer(ObservabilityLayer::new());
 
+    c.bench_function("hot_path/raw_axum_router", |b| {
+        b.to_async(&rt).iter(|| {
+            let app = raw_axum.clone();
+            async move {
+                let req = Request::builder()
+                    .uri("/ping")
+                    .header(
+                        "traceparent",
+                        "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+                    )
+                    .body(Body::empty())
+                    .expect("valid request");
+                let resp = app.oneshot(req).await.expect("infallible response");
+                black_box(resp.status());
+            }
+        });
+    });
+
     c.bench_function("hot_path/router_plus_observability_layer", |b| {
         b.to_async(&rt).iter(|| {
-            let app = app.clone();
+            let app = rume_with_obs.clone();
             async move {
                 let req = Request::builder()
                     .uri("/ping")
@@ -147,11 +166,50 @@ fn bench_tenant_scoped_cache(c: &mut Criterion) {
     });
 }
 
+fn bench_singleflight_cache_contention(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+
+    c.bench_function("hot_path/singleflight_cache_64_concurrent_tasks", |b| {
+        b.to_async(&rt).iter_batched(
+            || {
+                Arc::new(Cache::new(
+                    InMemoryCacheBackend::new(),
+                    CacheConfig::default(),
+                ))
+            },
+            |cache| async move {
+                let mut handles = Vec::with_capacity(64);
+                for _ in 0..64 {
+                    let cache = Arc::clone(&cache);
+                    handles.push(tokio::spawn(async move {
+                        cache
+                            .remember("contended-key", Some(Duration::from_secs(60)), || async {
+                                Ok::<_, rume::cache::CacheError>("computed-value".to_string())
+                            })
+                            .await
+                            .expect("singleflight remember")
+                    }));
+                }
+                for handle in handles {
+                    let val = handle.await.expect("task join");
+                    black_box(val);
+                }
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     hot_path_benches,
     bench_router_observability_dispatch,
     bench_rate_limiter_check,
     bench_circuit_breaker_closed_fast_path,
     bench_tenant_scoped_cache,
+    bench_singleflight_cache_contention,
 );
 criterion_main!(hot_path_benches);
