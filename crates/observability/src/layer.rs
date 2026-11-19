@@ -79,23 +79,6 @@ where
             None => RequestId::generate(),
         };
 
-        let incoming_tc = req
-            .headers()
-            .get(&TRACEPARENT)
-            .and_then(|v| v.to_str().ok())
-            .filter(|s| TraceContext::is_valid_traceparent(s))
-            .map(|tp| {
-                let tracestate = req
-                    .headers()
-                    .get(&TRACESTATE)
-                    .and_then(|v| v.to_str().ok())
-                    .map(ToString::to_string);
-                TraceContext {
-                    traceparent: tp.to_string(),
-                    tracestate,
-                }
-            });
-
         // Why: extract into an explicit empty `opentelemetry::Context::new()` while temporarily
         // attaching `Context::new()` as current. In `opentelemetry 0.33`,
         // `NoopTextMapPropagator::extract_with_context` ignores its `cx` argument and returns
@@ -112,24 +95,32 @@ where
         };
         let parent_cx = if propagated_cx.span().span_context().is_valid() {
             propagated_cx
-        } else if let Some(ref tc) = incoming_tc {
-            tc.apply_to_otel_context(&propagated_cx)
+        } else if let Some(tp) = req
+            .headers()
+            .get(&TRACEPARENT)
+            .and_then(|v| v.to_str().ok())
+            .filter(|s| TraceContext::is_valid_traceparent(s))
+        {
+            let tracestate = req
+                .headers()
+                .get(&TRACESTATE)
+                .and_then(|v| v.to_str().ok())
+                .map(ToString::to_string);
+            let incoming_tc = TraceContext {
+                traceparent: tp.to_string(),
+                tracestate,
+            };
+            incoming_tc.apply_to_otel_context(&propagated_cx)
         } else {
             propagated_cx
         };
-
-        let method = req.method().clone();
-        let matched_path = req
-            .extensions()
-            .get::<axum::extract::MatchedPath>()
-            .map(|mp| mp.as_str().to_string());
 
         let span = tracing::info_span!(
             "http_request",
             request_id = %request_id,
             traceparent = tracing::field::Empty,
             tracestate = tracing::field::Empty,
-            method = %method,
+            method = %req.method(),
             route = tracing::field::Empty,
             status = tracing::field::Empty,
             latency_ms = tracing::field::Empty,
@@ -158,20 +149,19 @@ where
 
         span.record("traceparent", server_tc.traceparent.as_str());
         span.record("tracestate", server_tc.tracestate.as_deref().unwrap_or(""));
+        if let Some(mp) = req.extensions().get::<axum::extract::MatchedPath>() {
+            span.record("route", mp.as_str());
+        }
 
         // Propagate RequestId and server span TraceContext through request extensions.
         req.extensions_mut().insert(request_id.clone());
         req.extensions_mut().insert(server_tc.clone());
 
-        if let Some(ref route) = matched_path {
-            span.record("route", route.as_str());
-        }
-
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
-        let req_id_str = request_id.0.clone();
-        let trace_parent_str = server_tc.traceparent.clone();
-        let tracestate_str = server_tc.tracestate.clone();
+        let req_id_str = request_id.0;
+        let trace_parent_str = server_tc.traceparent;
+        let tracestate_str = server_tc.tracestate;
         let span_clone = span.clone();
 
         Box::pin(
