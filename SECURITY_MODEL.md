@@ -42,7 +42,7 @@ Dev-only: `crates/testing`, `crates/crash`, `crates/xtask`, `fuzz/`.
 - **Malicious tenant or authenticated user** trying to cross tenant boundaries or escalate privileges.
 - **Forged or replayed SAML/SCIM payloads**: Enterprise is in scope nothing is out of scope.
 
-All components matter equally. The user set no extra priorities.
+All components matter equally; there are no extra priorities.
 
 ## Existing controls
 
