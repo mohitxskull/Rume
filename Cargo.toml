@@ -78,7 +78,7 @@ garde = { version = "=0.23.0", features = ["derive", "email", "url"] }
 # Constant-time comparison for security-sensitive equality checks (RC-14).
 subtle = "=2.6.1"
 # Non-poisoning synchronous RwLock/Mutex for hot-path resilience, routing, and health registries.
-parking_lot = "=0.12.5"
+parking_lot = "=0.13.0"
 
 # Rust source parsing used by `rume doctor` to validate module DAG acyclicity
 # (RC-20). Pinned to match crates/macro. syn::parse_file tokenizes the whole
