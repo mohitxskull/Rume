@@ -52,17 +52,36 @@ async fn ensure_success(
     mut goose: GooseResponse,
     label: &str,
 ) -> TransactionResult {
-    if let Ok(resp) = goose.response
-        && !resp.status().is_success()
-    {
-        return user.set_failure(
-            &format!("{label} returned non-2xx"),
+    match goose.response {
+        Ok(resp) => {
+            let status = resp.status();
+            // Why: always drain the HTTP response body so Hyper returns the connection to the
+            // keep-alive pool instead of closing it and distorting load-test latency.
+            if let Err(err) = resp.bytes().await {
+                return user.set_failure(
+                    &format!("{label} body read failed: {err}"),
+                    &mut goose.request,
+                    None,
+                    None,
+                );
+            }
+            if !status.is_success() {
+                return user.set_failure(
+                    &format!("{label} returned non-2xx ({status})"),
+                    &mut goose.request,
+                    None,
+                    None,
+                );
+            }
+            Ok(())
+        }
+        Err(err) => user.set_failure(
+            &format!("{label} transport error: {err}"),
             &mut goose.request,
             None,
             None,
-        );
+        ),
     }
-    Ok(())
 }
 
 async fn load_health(user: &mut GooseUser) -> TransactionResult {
@@ -84,7 +103,10 @@ async fn load_list_projects(user: &mut GooseUser) -> TransactionResult {
         .get_request_builder(&GooseMethod::Get, "/api/v1/projects")?
         .header("X-Tenant-Id", &cfg.tenant_id)
         .bearer_auth(&cfg.bearer_token);
-    let goose_req = GooseRequest::builder().set_request_builder(req).build();
+    let goose_req = GooseRequest::builder()
+        .name("GET /api/v1/projects")
+        .set_request_builder(req)
+        .build();
     let goose = user.request(goose_req).await?;
     ensure_success(user, goose, "list_projects").await
 }
@@ -99,7 +121,10 @@ async fn load_list_issues(user: &mut GooseUser) -> TransactionResult {
         .get_request_builder(&GooseMethod::Get, &path)?
         .header("X-Tenant-Id", &cfg.tenant_id)
         .bearer_auth(&cfg.bearer_token);
-    let goose_req = GooseRequest::builder().set_request_builder(req).build();
+    let goose_req = GooseRequest::builder()
+        .name("GET /api/v1/projects/{id}/issues")
+        .set_request_builder(req)
+        .build();
     let goose = user.request(goose_req).await?;
     ensure_success(user, goose, "list_issues").await
 }
@@ -121,7 +146,10 @@ async fn load_create_issue_with_outbox(user: &mut GooseUser) -> TransactionResul
         .header("X-Tenant-Id", &cfg.tenant_id)
         .bearer_auth(&cfg.bearer_token)
         .json(&body);
-    let goose_req = GooseRequest::builder().set_request_builder(req).build();
+    let goose_req = GooseRequest::builder()
+        .name("POST /api/v1/projects/{id}/issues")
+        .set_request_builder(req)
+        .build();
     let goose = user.request(goose_req).await?;
     ensure_success(user, goose, "create_issue").await
 }
