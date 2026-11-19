@@ -1,5 +1,6 @@
 //! Tenant-isolated cache scoping and bulk invalidation.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,6 +11,61 @@ use crate::tenant::quota::{KeyReservation, TenantQuotaStore};
 use rume_data::cache::backend::CacheBackend;
 use rume_data::cache::error::CacheError;
 use rume_data::cache::typed::Cache;
+
+type KeyLockMap = Arc<std::sync::Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
+
+/// Per-key async write/delete serialization guard with automatic map eviction when idle.
+///
+/// Why: `TenantScopedCache::set_with_tags` coordinates two independent stores (`quota_store`
+/// and `cache`) across three async steps (`reserve_key` -> `set_json_with_tags` -> `record_key`
+/// or `remove_key`). Serializing same-key mutations ensures concurrent writers A and B on the
+/// same `(tenant_id, key)` cannot interleave reservation and rollback to delete each other's
+/// active quota accounting.
+struct KeyLockGuard {
+    map: KeyLockMap,
+    key: String,
+    mutex: Arc<tokio::sync::Mutex<()>>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl KeyLockGuard {
+    async fn acquire(map: &KeyLockMap, key: &str) -> Self {
+        let mutex = {
+            let mut locks = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            Arc::clone(
+                locks
+                    .entry(key.to_string())
+                    .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+            )
+        };
+        let guard = Arc::clone(&mutex).lock_owned().await;
+        Self {
+            map: Arc::clone(map),
+            key: key.to_string(),
+            mutex,
+            _guard: Some(guard),
+        }
+    }
+}
+
+impl Drop for KeyLockGuard {
+    fn drop(&mut self) {
+        let mut locks = self
+            .map
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // While `_guard` is still held, references to `self.mutex` are:
+        // 1 in `locks` map + 1 in `self.mutex` + 1 in `self._guard` == 3 when no other caller
+        // is waiting on this key. Evicting under `locks` while `strong_count == 3` is race-free.
+        if let Some(current) = locks.get(&self.key)
+            && Arc::ptr_eq(current, &self.mutex)
+            && Arc::strong_count(&self.mutex) == 3
+        {
+            locks.remove(&self.key);
+        }
+        drop(self._guard.take());
+    }
+}
 
 /// Returns the disambiguated length-prefixed cache key scoped to `tenant_id`.
 pub fn scoped_cache_key(tenant_id: &str, key: &str) -> String {
@@ -27,6 +83,7 @@ pub struct TenantScopedCache<B: CacheBackend> {
     cache: Cache<B>,
     max_keys_per_tenant: usize,
     quota_store: Option<Arc<dyn TenantQuotaStore>>,
+    key_locks: KeyLockMap,
 }
 
 impl<B: CacheBackend> TenantScopedCache<B> {
@@ -39,6 +96,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
             cache,
             max_keys_per_tenant: Self::DEFAULT_MAX_KEYS_PER_TENANT,
             quota_store: None,
+            key_locks: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
         }
     }
 
@@ -99,6 +157,14 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         ttl: Option<Duration>,
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
+        // Serialize same-key write/delete lifecycles so concurrent writers on `(tenant_id, key)`
+        // never interleave `reserve_key`, backend publication, finalization, or rollback.
+        let _key_lock = KeyLockGuard::acquire(&self.key_locks, &full_key).await;
+
+        // Pre-validate JSON serialization before touching `quota_store` so a serialization failure
+        // never creates or rolls back a quota reservation.
+        let _ = serde_json::to_vec(value).map_err(|e| CacheError::Serialization(e.to_string()))?;
+
         // Why: `Cache::set_json_with_tags` substitutes `Cache::default_ttl()` when `ttl` is
         // `None`. Passing raw `ttl` to `quota.reserve_key` / `record_key` would record an
         // unbounded (`+inf`) quota entry while the cache entry expires after `default_ttl()`,
@@ -143,12 +209,13 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         };
 
         match (&res, reservation) {
-            (Ok(()), Some(KeyReservation::AlreadyTracked)) => {
-                // Why: the overwrite succeeded, so refresh the reservation to the new TTL. The
-                // original reservation may have expired while the overwrite was in flight and
-                // another key may have taken the slot, so `record_key` can now reject this key
-                // (or fail). The entry is live but would be untracked; do not report a
-                // quota-enforced success. Evict it (best effort) and surface the failure.
+            (Ok(()), Some(KeyReservation::NewlyReserved | KeyReservation::AlreadyTracked)) => {
+                // Why: finalize quota accounting after publication for BOTH `NewlyReserved` and
+                // `AlreadyTracked`. The initial reservation may have expired while a slow backend
+                // write was in flight and another key may have taken the slot while the cache
+                // write started a fresh entry TTL; `record_key` refreshes the quota TTL to match
+                // post-publication time or rejects if the slot was lost. If rejected or errored,
+                // evict the newly written entry so no live cache key ever escapes quota tracking.
                 match quota
                     .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
                     .await
@@ -157,7 +224,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
                     Ok(false) => {
                         let _ = self.cache.delete(&full_key).await;
                         Err(CacheError::QuotaExceeded(format!(
-                            "tenant '{tenant_id}' exceeded quota of {} keys while finalizing overwrite",
+                            "tenant '{tenant_id}' exceeded quota of {} keys while finalizing write",
                             self.max_keys_per_tenant
                         )))
                     }
@@ -190,6 +257,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     /// Deletes a specific key scoped to `tenant_id`.
     pub async fn delete(&self, tenant_id: &str, key: &str) -> Result<bool, CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
+        let _key_lock = KeyLockGuard::acquire(&self.key_locks, &full_key).await;
         let deleted = self.cache.delete(&full_key).await?;
         if deleted && let Some(ref quota) = self.quota_store {
             let _ = quota.remove_key(tenant_id, key).await;
@@ -301,21 +369,7 @@ mod tests {
             ttl: Option<Duration>,
             max_keys: usize,
         ) -> crate::tenant::quota::BoxFuture<'a, Result<KeyReservation, CacheError>> {
-            Box::pin(async move {
-                let outcome = self
-                    .inner
-                    .reserve_key(tenant_id, key, ttl, max_keys)
-                    .await?;
-                // Only a newly inserted slot carries the caller's TTL; an already-tracked key
-                // keeps its existing expiration and records nothing.
-                if outcome == KeyReservation::NewlyReserved {
-                    self.recorded_ttls
-                        .lock()
-                        .expect("spy mutex poisoned")
-                        .push((key.to_string(), ttl));
-                }
-                Ok(outcome)
-            })
+            self.inner.reserve_key(tenant_id, key, ttl, max_keys)
         }
 
         fn remove_key<'a>(
@@ -693,6 +747,103 @@ mod tests {
             tenant_cache.active_key_count("t1").await.expect("count"),
             1,
             "only L remains tracked"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newly_reserved_write_finalizes_after_publication_and_evicts_if_slot_expired() {
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let backend = FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists));
+        let write_delay_ms = Arc::clone(&backend.write_delay_ms);
+        let cache = Cache::new(backend, rume_data::cache::config::CacheConfig::default());
+        let quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let tenant_cache = Arc::new(
+            TenantScopedCache::new(cache)
+                .with_max_keys_per_tenant(1)
+                .with_quota_store(Arc::clone(&quota) as _),
+        );
+
+        // Reserve a brand-new key K (`NewlyReserved`) with a 10s TTL at t=0, but delay its
+        // backend publication for 20s while L steals the expired slot at t=15s.
+        write_delay_ms.store(20_000, std::sync::atomic::Ordering::SeqCst);
+        let first_write = {
+            let c = Arc::clone(&tenant_cache);
+            async move {
+                c.set("t1", "k-new", &"v1", Some(Duration::from_secs(10)))
+                    .await
+            }
+        };
+        let steal = {
+            let c = Arc::clone(&tenant_cache);
+            let delay = Arc::clone(&write_delay_ms);
+            async move {
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                delay.store(0, std::sync::atomic::Ordering::SeqCst);
+                c.set("t1", "l-steal", &"vl", Some(Duration::from_secs(60)))
+                    .await
+            }
+        };
+        let (first_res, steal_res) = tokio::join!(first_write, steal);
+
+        steal_res.expect("L takes the slot after K's initial reservation expired");
+        let err =
+            first_res.expect_err("NewlyReserved K must fail finalization when slot was stolen");
+        assert!(matches!(err, CacheError::QuotaExceeded(_)), "got {err:?}");
+        assert_eq!(
+            tenant_cache
+                .get::<String>("t1", "k-new")
+                .await
+                .expect("get"),
+            None,
+            "untracked NewlyReserved key must be evicted on finalization rejection"
+        );
+        assert_eq!(
+            tenant_cache.active_key_count("t1").await.expect("count"),
+            1,
+            "only L remains tracked"
+        );
+    }
+
+    #[tokio::test]
+    async fn serialization_failure_never_reserves_or_evicts_peer_quota_slot() {
+        struct FailingSerialize;
+        impl Serialize for FailingSerialize {
+            fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: serde::Serializer,
+            {
+                Err(serde::ser::Error::custom("intentional serialize error"))
+            }
+        }
+
+        let cache = Cache::new(
+            rume_data::cache::backend::InMemoryCacheBackend::new(),
+            rume_data::cache::config::CacheConfig::default(),
+        );
+        let quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let tenant_cache = TenantScopedCache::new(cache)
+            .with_max_keys_per_tenant(1)
+            .with_quota_store(Arc::clone(&quota) as _);
+
+        tenant_cache
+            .set("t1", "shared-k", &"good", Some(Duration::from_secs(60)))
+            .await
+            .expect("initial write succeeds");
+        let err = tenant_cache
+            .set(
+                "t1",
+                "shared-k",
+                &FailingSerialize,
+                Some(Duration::from_secs(60)),
+            )
+            .await
+            .expect_err("failing serialization must return Serialization error");
+        assert!(matches!(err, CacheError::Serialization(_)));
+        assert_eq!(
+            tenant_cache.active_key_count("t1").await.expect("count"),
+            1,
+            "failed serialization must never evict an active reservation for the same key"
         );
     }
 }

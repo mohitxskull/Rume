@@ -411,6 +411,10 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            // Why: MySQL supports prepared `COMMIT` / `ROLLBACK` / DDL and executes the statement
+            // even when fetching returns zero rows, so every query entrypoint on a managed
+            // transaction must enforce the same SQL guard as `execute_params`.
+            crate::persistence::backend::validate_managed_mysql_transaction_sql(&query)?;
             let query_obj = bind_mysql_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<MySqlRow> = query_obj
                 .fetch_optional(&mut **tx)
@@ -433,6 +437,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_mysql_transaction_sql(&statement)?;
             let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<MySqlRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_mysql_row_to_db_row).collect()
@@ -452,6 +457,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_mysql_transaction_sql(&statement)?;
             let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<MySqlRow> = query
                 .fetch_optional(&mut **tx)

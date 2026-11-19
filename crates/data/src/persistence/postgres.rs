@@ -359,11 +359,11 @@ impl DatabaseTransaction for PostgresTransaction {
             // (`Timeout`, `Closed`, `ConnectionFailed`, `QueryFailed`) are preserved.
             // Reject transaction-control statements first so a raw batch cannot commit
             // or roll back the caller's managed transaction.
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::PostgreSqlDialect {},
+            )?;
             let res = if params_vec.is_empty() {
-                crate::persistence::backend::validate_managed_transaction_sql(
-                    &statement,
-                    &sqlparser::dialect::PostgreSqlDialect {},
-                )?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await
@@ -393,6 +393,10 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &query,
+                &sqlparser::dialect::PostgreSqlDialect {},
+            )?;
             let query_obj = bind_pg_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<PgRow> = query_obj
                 .fetch_optional(&mut **tx)
@@ -419,6 +423,10 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::PostgreSqlDialect {},
+            )?;
             let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &p);
             let rows: Vec<PgRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_pg_row_to_db_row).collect()
@@ -438,6 +446,10 @@ impl DatabaseTransaction for PostgresTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::PostgreSqlDialect {},
+            )?;
             let query = bind_pg_params(sqlx::query(AssertSqlSafe(statement)), &p);
             let row: Option<PgRow> = query
                 .fetch_optional(&mut **tx)

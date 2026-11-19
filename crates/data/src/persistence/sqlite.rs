@@ -362,11 +362,11 @@ impl DatabaseTransaction for SqliteTransaction {
             // batches cannot resolve the managed transaction out-of-band, and reject
             // unbound SQLite placeholders first so `raw_sql` cannot silently bind them
             // as NULL.
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
             let res = if params_vec.is_empty() {
-                crate::persistence::backend::validate_managed_transaction_sql(
-                    &statement,
-                    &sqlparser::dialect::SQLiteDialect {},
-                )?;
                 reject_unbound_sqlite_placeholders(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
@@ -397,6 +397,10 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &query,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
             let query_obj = bind_sqlite_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&mut **tx)
@@ -419,6 +423,10 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<SqliteRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
@@ -438,6 +446,10 @@ impl DatabaseTransaction for SqliteTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            crate::persistence::backend::validate_managed_transaction_sql(
+                &statement,
+                &sqlparser::dialect::SQLiteDialect {},
+            )?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<SqliteRow> = query
                 .fetch_optional(&mut **tx)

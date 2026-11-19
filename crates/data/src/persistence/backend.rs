@@ -358,26 +358,70 @@ fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), Persistence
     Ok(())
 }
 
-/// Scans `statement` into top-level statement leading-word triples (up to 3 uppercased
+/// Tokenizes `statement` with `sqlparser` and strips whitespace tokens. When
+/// `expand_mysql_executable_comments` is `true`, MySQL executable block comments
+/// (`/*! ... */` and `/*!50000 ... */`) are unwrapped and their inner SQL tokens are
+/// spliced directly into the token stream so `/*! COMMIT */` or `SET /*! autocommit = 1 */`
+/// cannot bypass transaction-control or implicit-commit validation.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+fn tokenize_sql_filtered(
+    statement: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+    expand_mysql_executable_comments: bool,
+    depth: usize,
+) -> Result<Vec<sqlparser::tokenizer::Token>, PersistenceError> {
+    use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
+
+    if depth > 8 {
+        return Err(PersistenceError::TransactionError(
+            "nested MySQL executable comment depth exceeded".into(),
+        ));
+    }
+
+    let raw_tokens = Tokenizer::new(dialect, statement).tokenize().map_err(|e| {
+        PersistenceError::TransactionError(format!("failed to tokenize SQL statement: {e}"))
+    })?;
+
+    let mut out = Vec::with_capacity(raw_tokens.len());
+    for tok in raw_tokens {
+        match tok {
+            Token::Whitespace(Whitespace::MultiLineComment(ref content))
+                if expand_mysql_executable_comments && content.starts_with('!') =>
+            {
+                let rest = &content[1..];
+                let leading_digits = rest.bytes().take_while(|b| b.is_ascii_digit()).count();
+                // MySQL (`/*!50000 ... */`) and MariaDB (`/*!100100 ... */`) strip a 5- or 6-digit
+                // version number after `!` and execute the remaining SQL payload inline.
+                let inner_sql = if (5..=6).contains(&leading_digits) {
+                    &rest[leading_digits..]
+                } else {
+                    rest
+                };
+                let inner_tokens = tokenize_sql_filtered(
+                    inner_sql,
+                    dialect,
+                    expand_mysql_executable_comments,
+                    depth + 1,
+                )?;
+                out.extend(inner_tokens);
+            }
+            Token::Whitespace(_) => {}
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
+/// Scans pre-tokenized `tokens` into top-level statement leading-word triples (up to 3 uppercased
 /// unquoted words per statement), keeping semicolons inside compound SQL bodies
 /// (`CREATE TRIGGER ... BEGIN ...; END;` in SQLite and `CREATE FUNCTION/PROCEDURE ...
 /// BEGIN ATOMIC ...; END;` in PostgreSQL) attached to the enclosing `CREATE` statement
 /// rather than splitting them into bogus top-level `END` statements.
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
-fn collect_top_level_statement_heads(
-    statement: &str,
-    dialect: &dyn sqlparser::dialect::Dialect,
-) -> Result<Vec<Vec<String>>, PersistenceError> {
-    use sqlparser::tokenizer::{Token, Tokenizer};
-
-    let tokens: Vec<Token> = Tokenizer::new(dialect, statement)
-        .tokenize()
-        .map_err(|e| {
-            PersistenceError::TransactionError(format!("failed to tokenize SQL statement: {e}"))
-        })?
-        .into_iter()
-        .filter(|tok| !matches!(tok, Token::Whitespace(_)))
-        .collect();
+fn collect_top_level_statement_heads_from_tokens(
+    tokens: &[sqlparser::tokenizer::Token],
+) -> Vec<Vec<String>> {
+    use sqlparser::tokenizer::Token;
 
     let mut heads: Vec<Vec<String>> = Vec::new();
     let mut leading_words: Vec<String> = Vec::with_capacity(3);
@@ -450,17 +494,77 @@ fn collect_top_level_statement_heads(
         heads.push(leading_words);
     }
 
-    Ok(heads)
+    heads
+}
+
+/// Inspects a parsed `sqlparser::ast::Statement` for explicit transaction control.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+fn check_ast_tx_control(stmt: &sqlparser::ast::Statement) -> Result<(), PersistenceError> {
+    use sqlparser::ast::Statement;
+
+    let offending = match stmt {
+        Statement::Commit { .. } => Some("COMMIT"),
+        Statement::StartTransaction { .. } => Some("START TRANSACTION"),
+        Statement::Rollback { savepoint, .. } if savepoint.is_none() => Some("ROLLBACK"),
+        _ => None,
+    };
+    if let Some(kw) = offending {
+        return Err(PersistenceError::TransactionError(format!(
+            "transaction-control statement '{kw}' is not allowed inside a managed transaction"
+        )));
+    }
+    Ok(())
+}
+
+/// Inspects a parsed `sqlparser::ast::Statement` for MySQL implicit-commit DDL.
+#[cfg(any(feature = "mysql", test))]
+fn is_mysql_implicit_commit_ast(stmt: &sqlparser::ast::Statement) -> bool {
+    use sqlparser::ast::Statement;
+
+    match stmt {
+        Statement::CreateTable(ct) => !ct.temporary,
+        Statement::Drop { temporary, .. } => !*temporary,
+        Statement::CreateIndex(_)
+        | Statement::CreateView { .. }
+        | Statement::CreateRole { .. }
+        | Statement::CreateSchema { .. }
+        | Statement::CreateDatabase { .. }
+        | Statement::CreateFunction(_)
+        | Statement::CreateProcedure { .. }
+        | Statement::CreateTrigger { .. }
+        | Statement::CreateSequence { .. }
+        | Statement::CreateType { .. }
+        | Statement::CreateVirtualTable { .. }
+        | Statement::DropFunction { .. }
+        | Statement::DropProcedure { .. }
+        | Statement::DropTrigger { .. }
+        | Statement::AlterTable { .. }
+        | Statement::AlterIndex { .. }
+        | Statement::AlterView { .. }
+        | Statement::AlterRole { .. }
+        | Statement::Truncate { .. }
+        | Statement::LockTables { .. }
+        | Statement::UnlockTables
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::Analyze { .. }
+        | Statement::Cache { .. }
+        | Statement::UNCache { .. }
+        | Statement::Flush { .. }
+        | Statement::OptimizeTable { .. }
+        | Statement::Install { .. }
+        | Statement::Load { .. }
+        | Statement::LoadData { .. } => true,
+        _ => false,
+    }
 }
 
 /// Rejects top-level transaction-control statements in a raw SQL batch so a managed
 /// [`DatabaseTransaction`] cannot be committed or rolled back out-of-band.
 ///
-/// Why: Delegate SQL lexing to `sqlparser = "=0.53.0"` instead of maintaining hand-rolled dialect
-/// scanners for MySQL `#` comments and `` `...` `` identifiers, SQLite `[...]` identifiers, and
-/// PostgreSQL `$tag$...$tag$` dollar-quoted strings, `E'...'` escapes, and nested `/* ... */`
-/// comments; fail closed on `TokenizerError` so malformed quotes cannot smuggle transaction-control
-/// keywords past the guard (revisit only if replaced by a full AST statement filter).
+/// Why: Delegate SQL lexing and AST inspection to `sqlparser = "=0.53.0"` instead of maintaining
+/// hand-rolled dialect scanners; fail closed on `TokenizerError` so malformed quotes cannot
+/// smuggle transaction-control keywords past the guard.
 // Why: MySQL transactions call `validate_managed_mysql_transaction_sql` instead (it adds the
 // implicit-commit rules), so compiling this generic validator under a `mysql`-only build is
 // dead code that `-D warnings` rejects. Revisit if MySQL starts delegating to it.
@@ -469,7 +573,16 @@ pub(crate) fn validate_managed_transaction_sql(
     statement: &str,
     dialect: &dyn sqlparser::dialect::Dialect,
 ) -> Result<(), PersistenceError> {
-    for words in collect_top_level_statement_heads(statement, dialect)? {
+    let is_mysql = dialect.is::<sqlparser::dialect::MySqlDialect>();
+    let tokens = tokenize_sql_filtered(statement, dialect, is_mysql, 0)?;
+    if let Ok(mut parser) = sqlparser::parser::Parser::new(dialect).try_with_sql(statement)
+        && let Ok(stmts) = parser.parse_statements()
+    {
+        for stmt in &stmts {
+            check_ast_tx_control(stmt)?;
+        }
+    }
+    for words in collect_top_level_statement_heads_from_tokens(&tokens) {
         check_managed_tx_control_keywords(&words)?;
     }
     Ok(())
@@ -494,74 +607,191 @@ fn is_mysql_implicit_commit_head(words: &[String]) -> bool {
     }
 }
 
-/// Returns `true` if `statement` contains any MySQL implicit-commit statement (e.g. DDL).
+/// Returns `true` if `lhs` tokens (the left-hand side of `=` or `:=` in a MySQL `SET` assignment)
+/// target the session `autocommit` system variable (`autocommit`, `@@autocommit`,
+/// `SESSION autocommit`, `LOCAL autocommit`, `@@session.autocommit`, `@@local.autocommit`).
 ///
-/// Why: errors on explicit transaction control (`COMMIT`, `ROLLBACK`, `START TRANSACTION`, ...)
-/// instead of classifying it. A migration script that commits itself would persist its writes
-/// before Rume inserts (or deletes) the ledger row, so a failed ledger write could not be rolled
-/// back and a retry would replay the already-committed change. Rejecting it here keeps ordinary
-/// InnoDB DML and its ledger change inside one Rume-owned transaction.
+/// Why: user variables (`@autocommit`, `@saved_autocommit` — single leading `@`), global/persist
+/// scopes (`GLOBAL autocommit`, `@@global.autocommit`), and right-hand-side expression reads
+/// (`SET @saved_autocommit = @@autocommit`) do not alter the current session's `autocommit` mode
+/// and must remain valid in migrations and transactions.
 #[cfg(any(feature = "mysql", test))]
-pub(crate) fn mysql_sql_causes_implicit_commit(statement: &str) -> Result<bool, PersistenceError> {
-    let heads = collect_top_level_statement_heads(statement, &sqlparser::dialect::MySqlDialect {})?;
-    for words in &heads {
-        check_managed_tx_control_keywords(words)?;
+fn is_mysql_session_autocommit_lhs(lhs: &[sqlparser::tokenizer::Token]) -> bool {
+    use sqlparser::tokenizer::Token;
+
+    let is_autocommit_word = |tok: &Token| -> bool {
+        matches!(tok, Token::Word(w) if w.value.eq_ignore_ascii_case("autocommit"))
+    };
+    let is_sys_autocommit_word = |tok: &Token| -> bool {
+        matches!(
+            tok,
+            Token::Word(w)
+                if w.value.eq_ignore_ascii_case("autocommit")
+                    || (w.quote_style.is_none()
+                        && w.value.eq_ignore_ascii_case("@@autocommit"))
+        )
+    };
+    let is_session_scope_word = |tok: &Token| -> bool {
+        matches!(
+            tok,
+            Token::Word(w)
+                if w.quote_style.is_none()
+                    && matches!(
+                        w.value.to_ascii_lowercase().as_str(),
+                        "session" | "local" | "@@session" | "@@local" | "@@"
+                    )
+        )
+    };
+
+    match lhs {
+        [single] => is_sys_autocommit_word(single),
+        [scope, target] => is_session_scope_word(scope) && is_autocommit_word(target),
+        [scope, Token::Period, target] => {
+            is_session_scope_word(scope) && is_autocommit_word(target)
+        }
+        [Token::Word(at), scope, Token::Period, target]
+            if at.quote_style.is_none() && at.value == "@@" =>
+        {
+            is_session_scope_word(scope) && is_autocommit_word(target)
+        }
+        _ => false,
     }
-    check_mysql_autocommit_assignment(statement)?;
-    Ok(heads.iter().any(|w| is_mysql_implicit_commit_head(w)))
 }
 
-/// Rejects `SET ... autocommit ...` (including `@@autocommit`, `SESSION`/`LOCAL` and qualified
-/// `@@session.autocommit` forms).
+/// Rejects MySQL `SET` assignments whose LHS target is the session `autocommit` system variable.
 ///
-/// Why: with session autocommit disabled, `SET autocommit = 1` commits every pending InnoDB
-/// update (MySQL 8.4 Ref Manual §15.3.3), so a later Rume `rollback()` could not undo it. The
-/// 3-word statement heads cannot see the assignment target (`SET @@session.autocommit = 1`), so
-/// this scans the statement's own tokens; `autocommit` inside strings/comments is a different
-/// token kind and never matches.
+/// Why: with session autocommit disabled, enabling `autocommit` commits every pending InnoDB
+/// update (MySQL 8.4 Ref Manual §15.3.3), so a later Rume `rollback()` could not undo it.
+/// Scans the pre-expanded token stream (after unwrapping `/*! ... */` executable comments) and
+/// separates each comma-delimited `SET` assignment into its LHS target vs. RHS value expression
+/// so user-variable assignments (`SET @saved_autocommit = @@autocommit`) and RHS reads are allowed.
 #[cfg(any(feature = "mysql", test))]
-fn check_mysql_autocommit_assignment(statement: &str) -> Result<(), PersistenceError> {
-    use sqlparser::tokenizer::{Token, Tokenizer};
+fn check_mysql_autocommit_assignment_tokens(
+    tokens: &[sqlparser::tokenizer::Token],
+) -> Result<(), PersistenceError> {
+    use sqlparser::tokenizer::Token;
 
-    let dialect = sqlparser::dialect::MySqlDialect {};
-    let tokens = Tokenizer::new(&dialect, statement)
-        .tokenize()
-        .map_err(|e| PersistenceError::TransactionError(format!("unparseable SQL: {e}")))?;
-    let mut in_set = false;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SetScanState {
+        OutsideSet,
+        InSetLhs,
+        InSetRhs { paren_depth: usize },
+    }
+
+    let mut state = SetScanState::OutsideSet;
     let mut at_statement_start = true;
-    for token in &tokens {
+    let mut lhs_tokens: Vec<Token> = Vec::new();
+
+    for token in tokens {
         match token {
-            Token::Whitespace(_) => {}
             Token::SemiColon => {
-                in_set = false;
+                state = SetScanState::OutsideSet;
                 at_statement_start = true;
+                lhs_tokens.clear();
             }
-            Token::Word(w) => {
-                if at_statement_start {
-                    in_set = w.value.eq_ignore_ascii_case("SET");
-                    at_statement_start = false;
-                } else if in_set && w.value.to_ascii_lowercase().ends_with("autocommit") {
-                    return Err(PersistenceError::TransactionError(
-                        "assigning session `autocommit` is not allowed inside a managed transaction (it can commit pending writes)"
-                            .into(),
-                    ));
+            Token::Word(w) if at_statement_start => {
+                at_statement_start = false;
+                if w.quote_style.is_none() && w.value.eq_ignore_ascii_case("SET") {
+                    state = SetScanState::InSetLhs;
+                    lhs_tokens.clear();
                 }
             }
-            _ => at_statement_start = false,
+            _ => {
+                at_statement_start = false;
+                match &mut state {
+                    SetScanState::OutsideSet => {}
+                    SetScanState::InSetLhs => match token {
+                        Token::Eq | Token::Assignment => {
+                            if is_mysql_session_autocommit_lhs(&lhs_tokens) {
+                                return Err(PersistenceError::TransactionError(
+                                    "assigning session `autocommit` is not allowed inside a managed transaction (it can commit pending writes)"
+                                        .into(),
+                                ));
+                            }
+                            lhs_tokens.clear();
+                            state = SetScanState::InSetRhs { paren_depth: 0 };
+                        }
+                        other => lhs_tokens.push(other.clone()),
+                    },
+                    SetScanState::InSetRhs { paren_depth } => match token {
+                        Token::LParen => *paren_depth += 1,
+                        Token::RParen => *paren_depth = paren_depth.saturating_sub(1),
+                        Token::Comma if *paren_depth == 0 => {
+                            lhs_tokens.clear();
+                            state = SetScanState::InSetLhs;
+                        }
+                        _ => {}
+                    },
+                }
+            }
         }
     }
     Ok(())
 }
 
+/// Returns `true` if `statement` contains any MySQL implicit-commit statement (e.g. DDL).
+///
+/// Why: errors on explicit transaction control (`COMMIT`, `ROLLBACK`, `START TRANSACTION`, ...)
+/// and session `autocommit` changes (including inside `/*! ... */` executable comments) instead of
+/// classifying them. A migration script that commits itself would persist its writes before Rume
+/// inserts (or deletes) the ledger row, so a failed ledger write could not be rolled back and a
+/// retry would replay the already-committed change.
+#[cfg(any(feature = "mysql", test))]
+pub(crate) fn mysql_sql_causes_implicit_commit(statement: &str) -> Result<bool, PersistenceError> {
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    let tokens = tokenize_sql_filtered(statement, &dialect, true, 0)?;
+    check_mysql_autocommit_assignment_tokens(&tokens)?;
+
+    let mut ast_implicit_commit = false;
+    if !tokens.is_empty()
+        && let Ok(stmts) = sqlparser::parser::Parser::new(&dialect)
+            .with_tokens(tokens.clone())
+            .parse_statements()
+    {
+        for stmt in &stmts {
+            check_ast_tx_control(stmt)?;
+            if is_mysql_implicit_commit_ast(stmt) {
+                ast_implicit_commit = true;
+            }
+        }
+    }
+
+    let heads = collect_top_level_statement_heads_from_tokens(&tokens);
+    for words in &heads {
+        check_managed_tx_control_keywords(words)?;
+    }
+    Ok(ast_implicit_commit || heads.iter().any(|w| is_mysql_implicit_commit_head(w)))
+}
+
 /// Validates raw SQL executed inside a managed MySQL transaction, rejecting both explicit
 /// transaction-control statements and MySQL implicit-commit statements (such as `CREATE TABLE`,
-/// `ALTER TABLE`, `DROP TABLE`) that would silently commit pending InnoDB updates on the server.
+/// `ALTER TABLE`, `DROP TABLE`, or session `autocommit` assignments, including inside `/*! ... */`
+/// executable comments) that would silently commit pending InnoDB updates on the server.
 #[cfg(any(feature = "mysql", test))]
 pub(crate) fn validate_managed_mysql_transaction_sql(
     statement: &str,
 ) -> Result<(), PersistenceError> {
-    let heads = collect_top_level_statement_heads(statement, &sqlparser::dialect::MySqlDialect {})?;
-    check_mysql_autocommit_assignment(statement)?;
+    let dialect = sqlparser::dialect::MySqlDialect {};
+    let tokens = tokenize_sql_filtered(statement, &dialect, true, 0)?;
+    check_mysql_autocommit_assignment_tokens(&tokens)?;
+
+    if !tokens.is_empty()
+        && let Ok(stmts) = sqlparser::parser::Parser::new(&dialect)
+            .with_tokens(tokens.clone())
+            .parse_statements()
+    {
+        for stmt in &stmts {
+            check_ast_tx_control(stmt)?;
+            if is_mysql_implicit_commit_ast(stmt) {
+                return Err(PersistenceError::TransactionError(
+                    "MySQL implicit-commit DDL statement is not allowed inside a managed transaction; execute DDL on MysqlBackend directly"
+                        .into(),
+                ));
+            }
+        }
+    }
+
+    let heads = collect_top_level_statement_heads_from_tokens(&tokens);
     for words in &heads {
         check_managed_tx_control_keywords(words)?;
         if is_mysql_implicit_commit_head(words) {
@@ -953,12 +1183,18 @@ mod data_sql_scanners_proptests {
     fn mysql_guard_rejects_autocommit_assignment_but_allows_lookalikes() {
         for sql in [
             "SET autocommit = 1",
+            "SET `autocommit` = 1",
             "SET @@autocommit = 1",
             "SET SESSION autocommit = 1",
+            "SET LOCAL autocommit = 1",
             "SET @@session.autocommit = 1",
+            "SET @@session.`autocommit` = 1",
             "SET @@local.autocommit=1",
             "SET sql_mode = '', autocommit = 1",
+            "SET @saved_autocommit = @@autocommit, @@session.autocommit = 1",
             "UPDATE t SET v = 1; SET autocommit = 1;",
+            "UPDATE t SET v = 1; /*! SET autocommit = 1 */;",
+            "UPDATE t SET v = 1; /*!50000 SET @@session.autocommit = 1 */;",
         ] {
             assert!(
                 matches!(
@@ -967,6 +1203,13 @@ mod data_sql_scanners_proptests {
                 ),
                 "autocommit assignment must be rejected: {sql}"
             );
+            assert!(
+                matches!(
+                    mysql_sql_causes_implicit_commit(sql),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "migration classifier must also reject autocommit assignment: {sql}"
+            );
         }
         for ok in [
             "SELECT @@autocommit",
@@ -974,10 +1217,19 @@ mod data_sql_scanners_proptests {
             "UPDATE t SET autocommit_note = 'x' WHERE id = 1",
             "UPDATE t SET v = 1 /* SET autocommit = 1 */",
             "SET @x = 1",
+            "SET @autocommit = 1",
+            "SET @saved_autocommit = @@autocommit",
+            "SET @saved_autocommit = @@session.autocommit",
+            "SET GLOBAL autocommit = 1",
+            "SET @@global.autocommit = 1",
         ] {
             assert!(
                 validate_managed_mysql_transaction_sql(ok).is_ok(),
                 "must not be flagged: {ok}"
+            );
+            assert!(
+                !mysql_sql_causes_implicit_commit(ok).unwrap(),
+                "must not be flagged as implicit commit: {ok}"
             );
         }
     }
@@ -990,6 +1242,9 @@ mod data_sql_scanners_proptests {
             "UPDATE t SET v = 2; ROLLBACK;",
             "CREATE TABLE t2 (id INT); COMMIT;",
             "SET autocommit = 1; UPDATE t SET v = 2;",
+            "UPDATE t SET v = v + 1; /*! COMMIT */;",
+            "UPDATE t SET v = v + 1; /*!50000 COMMIT */;",
+            "UPDATE t SET v = v + 1; /*!80000 ROLLBACK */;",
         ] {
             assert!(
                 matches!(
@@ -998,10 +1253,23 @@ mod data_sql_scanners_proptests {
                 ),
                 "migration script with transaction control must be rejected: {sql}"
             );
+            assert!(
+                matches!(
+                    validate_managed_mysql_transaction_sql(sql),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "managed tx guard must also reject: {sql}"
+            );
         }
         assert!(
-            !mysql_sql_causes_implicit_commit("UPDATE t SET v = 2; INSERT INTO t VALUES (3);")
-                .unwrap()
+            mysql_sql_causes_implicit_commit("/*! CREATE TABLE t_exec (id INT) */").unwrap(),
+            "executable comment containing DDL must be classified as implicit commit"
+        );
+        assert!(
+            !mysql_sql_causes_implicit_commit(
+                "UPDATE t SET v = 2; /*!50000 INSERT INTO t VALUES (3) */;"
+            )
+            .unwrap()
         );
     }
 }
