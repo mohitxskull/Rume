@@ -147,7 +147,16 @@ async fn sqlite_auto_migrate_applies_pending_migrations() {
         .await
         .expect("core auto migrate");
     assert!(res3.is_some());
-    assert_eq!(res3.unwrap().applied.len(), 1);
+    let summary3 = res3.unwrap();
+    assert_eq!(summary3.applied.len(), 2);
+    assert_eq!(
+        summary3.applied[0],
+        rume::persistence::migration::RUME_CORE_MIGRATION_ID
+    );
+    assert_eq!(
+        summary3.applied[1],
+        rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
+    );
 }
 
 #[tokio::test]

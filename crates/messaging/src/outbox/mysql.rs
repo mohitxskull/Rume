@@ -14,6 +14,11 @@ use crate::outbox::{
 const MYSQL_SET_ISOLATION_LEVEL_SQL: &str =
     include_str!("../../../data/src/persistence/sql/mysql/set_isolation_level.sql");
 const OUTBOX_CLAIM_SQL: &str = include_str!("sql/mysql/outbox_claim.sql");
+// Why: `fetch_pending` is a non-claiming read inspection path, whereas
+// `claim_pending_with_lease` owns `FOR UPDATE SKIP LOCKED`. Using a plain
+// `SELECT` keeps `fetch_pending` from acquiring row locks or skipping rows
+// currently locked by concurrent claim transactions.
+const OUTBOX_FETCH_PENDING_SQL: &str = include_str!("sql/mysql/outbox_fetch_pending.sql");
 const INSERT_OUTBOX_SQL: &str = include_str!("sql/mysql/outbox_insert.sql");
 const OUTBOX_RECOVER_SQL: &str = include_str!("sql/mysql/outbox_recover.sql");
 const MYSQL_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/mysql/outbox_claim_lease.sql");
@@ -110,7 +115,7 @@ impl OutboxRepository for MysqlBackend {
         limit: usize,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
-            let rows = sqlx::query(OUTBOX_CLAIM_SQL)
+            let rows = sqlx::query(OUTBOX_FETCH_PENDING_SQL)
                 .bind(limit as i64)
                 .fetch_all(self.pool())
                 .await
@@ -459,5 +464,29 @@ impl TransactionalOutbox<MysqlTransaction> for MysqlBackend {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_and_mysql_outbox_fetch_pending_sql_omits_for_update_skip_locked() {
+        let fetch_upper = OUTBOX_FETCH_PENDING_SQL.to_ascii_uppercase();
+        let claim_upper = OUTBOX_CLAIM_SQL.to_ascii_uppercase();
+
+        assert!(
+            !fetch_upper.contains("FOR UPDATE"),
+            "OUTBOX_FETCH_PENDING_SQL must omit FOR UPDATE: {OUTBOX_FETCH_PENDING_SQL}"
+        );
+        assert!(
+            !fetch_upper.contains("SKIP LOCKED"),
+            "OUTBOX_FETCH_PENDING_SQL must omit SKIP LOCKED: {OUTBOX_FETCH_PENDING_SQL}"
+        );
+        assert!(
+            claim_upper.contains("FOR UPDATE SKIP LOCKED"),
+            "OUTBOX_CLAIM_SQL must retain FOR UPDATE SKIP LOCKED: {OUTBOX_CLAIM_SQL}"
+        );
     }
 }

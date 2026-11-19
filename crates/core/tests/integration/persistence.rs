@@ -510,14 +510,144 @@ async fn migrator_with_rume_core_registers_and_applies_core_persistence() {
         ));
 
     let summary = migrator.run_pending_backend(&backend).await.unwrap();
-    assert_eq!(summary.applied.len(), 2);
+    assert_eq!(summary.applied.len(), 3);
     assert_eq!(
         summary.applied[0],
         rume::persistence::migration::RUME_CORE_MIGRATION_ID
     );
-    assert_eq!(summary.applied[1], "20261104_002_custom_app");
+    assert_eq!(
+        summary.applied[1],
+        rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
+    );
+    assert_eq!(summary.applied[2], "20261104_002_custom_app");
 
     migrator.verify_no_pending_backend(&backend).await.unwrap();
+}
+
+#[tokio::test]
+async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledger() {
+    let expected_digests = [
+        (
+            "sqlite",
+            "089cf2a10e1a27763d7af263900ff224e3951655d6fa029e11fc6471d5573d84",
+        ),
+        (
+            "mysql",
+            "ec8511c2d5c7dd2ca4b9e68b5f0a3f7da639bc86e04617854820959cc2f88d16",
+        ),
+        (
+            "postgres",
+            "cd9cef147434fa0efa944539bf0b33445546de6d78208bad2176804bd0bdb1c3",
+        ),
+    ];
+
+    for (dialect, expected_core_checksum) in expected_digests {
+        let migrator = Migrator::new().with_rume_core(dialect);
+        assert_eq!(
+            migrator.migrations().len(),
+            2,
+            "{dialect} core migrator must register 2 migrations"
+        );
+        assert_eq!(
+            migrator.migrations()[0].id,
+            rume::persistence::migration::RUME_CORE_MIGRATION_ID
+        );
+        assert_eq!(
+            migrator.migrations()[0].checksum(),
+            expected_core_checksum,
+            "{dialect} RUME_CORE_MIGRATION_ID checksum must remain immutable"
+        );
+        assert_eq!(
+            migrator.migrations()[1].id,
+            rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
+        );
+    }
+
+    let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
+    let migrator = Migrator::new().with_rume_core("sqlite");
+
+    let summary = migrator.run_pending_backend(&backend).await.unwrap();
+    assert_eq!(
+        summary.applied,
+        vec![
+            rume::persistence::migration::RUME_CORE_MIGRATION_ID.to_string(),
+            rume::persistence::migration::RUME_AUDIT_MIGRATION_ID.to_string(),
+        ]
+    );
+
+    // Both rume_outbox and rume_audit_log must exist after applying core migrations.
+    assert_eq!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_outbox")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0")
+    );
+    assert_eq!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_audit_log")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0")
+    );
+
+    // Roll back 20261104_002_rume_audit_schema first.
+    let rb_audit = migrator.rollback_last_backend(&backend).await.unwrap();
+    assert_eq!(
+        rb_audit.as_deref(),
+        Some(rume::persistence::migration::RUME_AUDIT_MIGRATION_ID)
+    );
+    assert!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_audit_log")
+            .await
+            .is_err(),
+        "rume_audit_log must be dropped on audit rollback"
+    );
+    assert_eq!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_outbox")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0")
+    );
+
+    // Roll back 20261104_001_rume_core_schemas next; ledger table must survive with 0 rows.
+    let rb_core = migrator.rollback_last_backend(&backend).await.unwrap();
+    assert_eq!(
+        rb_core.as_deref(),
+        Some(rume::persistence::migration::RUME_CORE_MIGRATION_ID)
+    );
+    assert!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_outbox")
+            .await
+            .is_err(),
+        "rume_outbox must be dropped on core rollback"
+    );
+    assert_eq!(
+        backend
+            .query_scalar("SELECT count(*) FROM rume_migrations")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("0"),
+        "rume_migrations ledger must remain queryable with 0 rows after full rollback"
+    );
+    assert!(
+        migrator
+            .applied_migrations(&backend)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        migrator.rollback_last_backend(&backend).await.unwrap(),
+        None
+    );
 }
 
 #[derive(Debug, PartialEq, Eq)]

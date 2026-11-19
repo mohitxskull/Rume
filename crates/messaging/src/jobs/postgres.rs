@@ -472,7 +472,12 @@ impl JobQueue for PostgresJobQueue {
                 let idempotency_key: Option<String> = r.try_get(9).ok();
                 let tenant_id: Option<String> = r.try_get(10).ok();
                 let assigned_worker: Option<String> = r.try_get(11).ok();
-                let trace_context: Option<String> = r.try_get("trace_context").ok();
+                // Why: `trace_context` is explicitly projected by `jobs_list_dead_letters.sql`;
+                // failing loudly instead of `.ok()` ensures any future projection or schema
+                // regression surfaces immediately rather than silently dropping W3C trace links.
+                let trace_context: Option<String> = r
+                    .try_get::<Option<String>, _>("trace_context")
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
                     initial_backoff_ms: initial_backoff_ms.max(0) as u64,

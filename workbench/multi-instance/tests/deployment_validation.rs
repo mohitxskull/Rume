@@ -85,7 +85,7 @@ async fn test_workbench_deployment_validation_multi_instance_concurrent_tenants_
         .await
         .expect("apply auto migrations")
         .expect("migration summary");
-    assert_eq!(migration_summary.applied.len(), 3);
+    assert_eq!(migration_summary.applied.len(), 4);
 
     // =========================================================================
     // 2. Redis Idempotency Store & Background Jobs Setup

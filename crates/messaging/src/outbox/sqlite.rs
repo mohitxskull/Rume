@@ -128,9 +128,20 @@ impl OutboxRepository for SqliteBackend {
         lease_duration_secs: u64,
     ) -> OutboxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
         Box::pin(async move {
+            // Why: Acquire the SQLite write lock up front with `BEGIN IMMEDIATE` instead of
+            // deferred `pool().begin()` + `SELECT` + `UPDATE`. Under deferred `BEGIN` (even in
+            // WAL mode), `SELECT` takes a `SHARED` snapshot lock and the subsequent `UPDATE`
+            // attempts a `SHARED -> RESERVED` lock upgrade; if another writer committed since
+            // our snapshot began, SQLite rejects the upgrade immediately with
+            // `SQLITE_BUSY` / `SQLITE_BUSY_SNAPSHOT` without waiting on `busy_timeout`.
+            // `BEGIN IMMEDIATE` queues on `busy_timeout` before starting the read snapshot.
+            // We also keep the `SELECT` + per-row `UPDATE` loop rather than collapsing to a
+            // single `UPDATE ... RETURNING` because each claimed row requires a distinct
+            // `Uuid::new_v4()` lease token generated per row. Revisit if SQLite gains a
+            // built-in per-row random UUID expression or lease tokens become batch-scoped.
             let mut tx = self
                 .pool()
-                .begin()
+                .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
@@ -144,13 +155,19 @@ impl OutboxRepository for SqliteBackend {
             for row in &rows {
                 let mut msg = parse_sqlite_outbox_row(row)?;
                 let token = Uuid::new_v4().to_string();
-                let updated = sqlx::query(SQLITE_OUTBOX_CLAIM_LEASE_SQL)
+                // Why: Use `fetch_optional` rather than `fetch_one` so a row whose state
+                // changed outside this query's `status = 'pending'` predicate is skipped
+                // defensively instead of aborting the whole batch with `RowNotFound`.
+                let Some(updated) = sqlx::query(SQLITE_OUTBOX_CLAIM_LEASE_SQL)
                     .bind(&token)
                     .bind(lease_duration_secs as i64)
                     .bind(&msg.id)
-                    .fetch_one(&mut *tx)
+                    .fetch_optional(&mut *tx)
                     .await
-                    .map_err(|e| OutboxError::Repository(e.to_string()))?;
+                    .map_err(|e| OutboxError::Repository(e.to_string()))?
+                else {
+                    continue;
+                };
 
                 let exp: i64 = updated.try_get(0).unwrap_or(0);
                 msg.status = OutboxStatus::InFlight;
@@ -443,5 +460,125 @@ impl TransactionalOutbox<SqliteTransaction> for SqliteBackend {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod sqlite_outbox_tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    use rume_data::persistence::DatabaseConfig;
+    use tokio::sync::Barrier;
+
+    use super::*;
+
+    struct TempSqliteDir {
+        path: PathBuf,
+    }
+
+    impl TempSqliteDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("rume-sqlite-outbox-{}", Uuid::new_v4()));
+            std::fs::create_dir_all(&path).expect("create temp sqlite dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempSqliteDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn sqlite_concurrent_outbox_claims_with_immediate_tx_never_hit_busy_or_duplicate() {
+        let temp_dir = TempSqliteDir::new();
+        let db_path = temp_dir.path.join("outbox.db");
+        let config = DatabaseConfig::new(db_path.display().to_string()).with_max_connections(8);
+        let backend = Arc::new(
+            SqliteBackend::new(&config)
+                .await
+                .expect("open multi-connection sqlite backend"),
+        );
+        backend
+            .init_outbox_table()
+            .await
+            .expect("init outbox table");
+
+        const TOTAL_MESSAGES: usize = 40;
+        const WORKER_COUNT: usize = 8;
+
+        for i in 0..TOTAL_MESSAGES {
+            let msg = OutboxMessage::new(
+                format!("msg-{i:03}"),
+                "order.created",
+                format!(r#"{{"seq":{i}}}"#).into_bytes(),
+            );
+            backend.save(msg).await.expect("save outbox message");
+        }
+
+        let barrier = Arc::new(Barrier::new(WORKER_COUNT));
+        let mut handles = Vec::with_capacity(WORKER_COUNT);
+        for _ in 0..WORKER_COUNT {
+            let backend = Arc::clone(&backend);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                let mut claimed_ids = Vec::new();
+                loop {
+                    let batch = backend.claim_pending_with_lease(2, 30).await?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for msg in batch {
+                        assert_eq!(msg.status, OutboxStatus::InFlight);
+                        assert!(msg.lease_token.is_some());
+                        assert!(msg.lease_expires_at.is_some());
+                        claimed_ids.push(msg.id);
+                    }
+                }
+                Ok::<Vec<String>, OutboxError>(claimed_ids)
+            }));
+        }
+
+        let mut all_claimed = Vec::with_capacity(TOTAL_MESSAGES);
+        let mut errors = Vec::new();
+        for handle in handles {
+            match handle.await.expect("worker task must not panic") {
+                Ok(ids) => all_claimed.extend(ids),
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+
+        assert!(
+            errors.is_empty(),
+            "concurrent claims must not hit SQLITE_BUSY or RowNotFound, got: {errors:?}"
+        );
+        assert_eq!(
+            all_claimed.len(),
+            TOTAL_MESSAGES,
+            "all seeded messages must be claimed across workers"
+        );
+        let unique: HashSet<String> = all_claimed.into_iter().collect();
+        assert_eq!(
+            unique.len(),
+            TOTAL_MESSAGES,
+            "claimed message IDs must be strictly disjoint across workers"
+        );
+        assert!(
+            backend
+                .fetch_pending(TOTAL_MESSAGES)
+                .await
+                .expect("fetch_pending")
+                .is_empty(),
+            "no messages should remain in pending status after all are claimed"
+        );
+        // `pending_count` includes both `'pending'` and `'inflight'` rows until published.
+        assert_eq!(
+            backend.pending_count().await.expect("pending_count"),
+            TOTAL_MESSAGES
+        );
     }
 }

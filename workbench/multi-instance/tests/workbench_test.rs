@@ -69,8 +69,8 @@ async fn test_workbench_full_lifecycle_multitenant_outbox_jobs_and_drain() {
         .expect("migrations summary present");
     assert_eq!(
         migration_summary.applied.len(),
-        3,
-        "all three core, domain, and auth migrations must apply"
+        4,
+        "all four core, audit, domain, and auth migrations must apply"
     );
 
     // Verify initial pool health
