@@ -18,6 +18,12 @@ fn current_timestamp() -> u64 {
 }
 
 /// An active authenticated user session.
+///
+/// Why: `tenant_id`, `roles`, `permissions`, and `data` carry `#[serde(default)]` because Redis
+/// Lua's `cjson` library cannot distinguish empty JSON arrays `[]` from empty objects `{}` and
+/// encodes empty Lua tables as `{}`; omitting empty optional collections in Lua during session
+/// rotation while keeping `id`, `user_id`, and `expires_at` mandatory preserves structural JSON
+/// round-tripping without string-hacking.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Session {
     /// Unique session identifier (e.g. cookie value).
@@ -25,14 +31,18 @@ pub struct Session {
     /// Associated user or subject identifier.
     pub user_id: String,
     /// Tenant this session is bound to (None for non-tenant sessions).
+    #[serde(default)]
     pub tenant_id: Option<String>,
     /// Roles associated with this session.
+    #[serde(default)]
     pub roles: Vec<String>,
     /// Permissions associated with this session.
+    #[serde(default)]
     pub permissions: Vec<String>,
     /// Epoch timestamp when this session expires.
     pub expires_at: u64,
     /// Arbitrary session payload data.
+    #[serde(default)]
     pub data: BTreeMap<String, String>,
 }
 

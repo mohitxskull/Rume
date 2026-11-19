@@ -112,7 +112,11 @@ impl From<u64> for DbValue {
 
 impl From<usize> for DbValue {
     fn from(u: usize) -> Self {
-        DbValue::Int(u as i64)
+        // Why: Delegate through `u64` rather than casting `u as i64` directly so `usize`
+        // values above `i64::MAX` degrade losslessly to `DbValue::Text` instead of wrapping to
+        // negative `DbValue::Int` without altering the `DbValue::Int(i64)` wire variant
+        // (revisit only if `DbValue` adds an unsigned integer variant).
+        Self::from(u as u64)
     }
 }
 
@@ -315,6 +319,71 @@ pub(crate) fn map_sqlx_error(err: sqlx::Error) -> PersistenceError {
     }
 }
 
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), PersistenceError> {
+    let Some(first) = words.first().map(String::as_str) else {
+        return Ok(());
+    };
+    let second = words.get(1).map(String::as_str);
+    let third = words.get(2).map(String::as_str);
+
+    let is_tx_control = match first {
+        "COMMIT" | "END" | "ABORT" | "BEGIN" => true,
+        "START" | "PREPARE" => second == Some("TRANSACTION"),
+        "ROLLBACK" => {
+            let is_savepoint = second == Some("TO")
+                || (matches!(second, Some("WORK" | "TRANSACTION")) && third == Some("TO"));
+            !is_savepoint
+        }
+        _ => false,
+    };
+
+    if is_tx_control {
+        return Err(PersistenceError::TransactionError(format!(
+            "transaction-control statement '{first}' is not allowed inside a managed transaction"
+        )));
+    }
+
+    Ok(())
+}
+
+/// Rejects top-level transaction-control statements in a raw SQL batch so a managed
+/// [`DatabaseTransaction`] cannot be committed or rolled back out-of-band.
+///
+/// Why: Delegate SQL lexing to `sqlparser = "=0.53.0"` instead of maintaining hand-rolled dialect
+/// scanners for MySQL `#` comments and `` `...` `` identifiers, SQLite `[...]` identifiers, and
+/// PostgreSQL `$tag$...$tag$` dollar-quoted strings, `E'...'` escapes, and nested `/* ... */`
+/// comments; fail closed on `TokenizerError` so malformed quotes cannot smuggle transaction-control
+/// keywords past the guard (revisit only if replaced by a full AST statement filter).
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
+pub(crate) fn validate_managed_transaction_sql(
+    statement: &str,
+    dialect: &dyn sqlparser::dialect::Dialect,
+) -> Result<(), PersistenceError> {
+    use sqlparser::tokenizer::{Token, Tokenizer};
+
+    let tokens = Tokenizer::new(dialect, statement).tokenize().map_err(|e| {
+        PersistenceError::TransactionError(format!("failed to tokenize SQL statement: {e}"))
+    })?;
+
+    let mut leading_words: Vec<String> = Vec::with_capacity(3);
+    for token in tokens {
+        match token {
+            Token::Whitespace(_) => {}
+            Token::SemiColon => {
+                check_managed_tx_control_keywords(&leading_words)?;
+                leading_words.clear();
+            }
+            Token::Word(word) if word.quote_style.is_none() && leading_words.len() < 3 => {
+                leading_words.push(word.value.to_ascii_uppercase());
+            }
+            _ => {}
+        }
+    }
+
+    check_managed_tx_control_keywords(&leading_words)
+}
+
 /// Active transaction handle providing isolated mutation and explicit commit/rollback.
 pub trait DatabaseTransaction: Debug + Send + Sync {
     /// Returns the database dialect of this transaction (e.g. "postgres", "sqlite", "mysql", "default").
@@ -386,10 +455,116 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
     fn release_mysql_lock_on_drop(&self, _armed: bool) {}
 }
 
-#[cfg(all(test, any(feature = "postgres", feature = "mysql", feature = "sqlite")))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn db_value_from_usize_handles_values_above_i64_max() {
+        assert_eq!(DbValue::from(42usize), DbValue::Int(42));
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(
+            DbValue::from(usize::MAX),
+            DbValue::Text(usize::MAX.to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_transaction_control_statements_in_raw_batches() {
+        let pg = sqlparser::dialect::PostgreSqlDialect {};
+        for sql in [
+            "COMMIT",
+            "  commit ; ",
+            "INSERT INTO items (id) VALUES (1); COMMIT;",
+            "ROLLBACK",
+            "ROLLBACK TRANSACTION;",
+            "BEGIN; INSERT INTO items (id) VALUES (1);",
+            "START TRANSACTION;",
+            "END;",
+            "ABORT;",
+            "PREPARE TRANSACTION 'tx_1';",
+        ] {
+            let err = validate_managed_transaction_sql(sql, &pg)
+                .expect_err(&format!("expected rejection for: {sql}"));
+            assert!(
+                matches!(err, PersistenceError::TransactionError(_)),
+                "expected TransactionError for {sql}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn allows_non_resolving_batches_and_quoted_or_commented_keywords() {
+        let pg = sqlparser::dialect::PostgreSqlDialect {};
+        for sql in [
+            "INSERT INTO items (id) VALUES (1); UPDATE items SET id = 2;",
+            "SELECT 'COMMIT', E'it\\'s ROLLBACK';",
+            "/* COMMIT */ SELECT 1;",
+            "/* outer /* ROLLBACK */ inner */ SELECT 1;",
+            "-- BEGIN\nINSERT INTO items (id) VALUES (1);",
+            "DO $$ BEGIN INSERT INTO items (id) VALUES (1); END $$;",
+            "SAVEPOINT sp1; ROLLBACK TO SAVEPOINT sp1; RELEASE SAVEPOINT sp1;",
+            "ROLLBACK WORK TO sp1;",
+        ] {
+            validate_managed_transaction_sql(sql, &pg)
+                .unwrap_or_else(|e| panic!("expected '{sql}' to be allowed, got: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn validate_managed_transaction_sql_handles_all_dialects_comments_and_quotes() {
+        let pg = sqlparser::dialect::PostgreSqlDialect {};
+        let mysql = sqlparser::dialect::MySqlDialect {};
+        let sqlite = sqlparser::dialect::SQLiteDialect {};
+
+        validate_managed_transaction_sql("SELECT `COMMIT` FROM t;", &mysql)
+            .expect("MySQL backtick-quoted COMMIT identifier must pass");
+        validate_managed_transaction_sql("# COMMIT\nSELECT 1;", &mysql)
+            .expect("MySQL # single-line comment must pass");
+        validate_managed_transaction_sql("SELECT [BEGIN] FROM t;", &sqlite)
+            .expect("SQLite bracket-quoted BEGIN identifier must pass");
+        validate_managed_transaction_sql("DO $$ BEGIN INSERT INTO t VALUES (1); END $$;", &pg)
+            .expect("PostgreSQL dollar-quoted block must pass");
+
+        let dialects: [(&str, &dyn sqlparser::dialect::Dialect); 3] =
+            [("postgres", &pg), ("mysql", &mysql), ("sqlite", &sqlite)];
+        for (name, dialect) in dialects {
+            for sql in ["COMMIT", "ROLLBACK", "BEGIN", "START TRANSACTION"] {
+                let err = validate_managed_transaction_sql(sql, dialect)
+                    .expect_err(&format!("{name} must reject raw '{sql}'"));
+                assert!(
+                    matches!(err, PersistenceError::TransactionError(_)),
+                    "{name} expected TransactionError for '{sql}', got: {err:?}"
+                );
+            }
+        }
+
+        #[cfg(feature = "sqlite")]
+        {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build current-thread runtime");
+            rt.block_on(async {
+                let backend = crate::persistence::SqliteBackend::in_memory()
+                    .await
+                    .expect("in-memory sqlite");
+                let tx = backend.begin_transaction().await.expect("begin sqlite tx");
+                for sql in ["COMMIT", "BEGIN", "ROLLBACK"] {
+                    let err = tx
+                        .execute_params(sql, &[])
+                        .await
+                        .expect_err(&format!("SqliteTransaction must reject '{sql}'"));
+                    assert!(
+                        matches!(err, PersistenceError::TransactionError(_)),
+                        "expected TransactionError for '{sql}', got: {err:?}"
+                    );
+                }
+            });
+        }
+    }
+
+    #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite"))]
     #[test]
     fn map_sqlx_error_preserves_driver_classifications() {
         assert!(matches!(

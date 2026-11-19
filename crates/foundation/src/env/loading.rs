@@ -364,14 +364,11 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
 
         // Resolve canonical path and enforce that it stays within `dir` to
         // prevent path traversal (e.g. `file:../../etc/secrets/app.key`).
-        let canonical_dir = match fs::canonicalize(dir) {
-            Ok(d) => d,
-            Err(_) => dir.to_path_buf(),
-        };
-        let canonical_full = match fs::canonicalize(&full) {
-            Ok(cf) => cf,
-            Err(_) => full.clone(),
-        };
+        // Why: fail closed on `fs::canonicalize` errors instead of falling back to raw paths,
+        // and read `&canonical_full` rather than `&full` so dangling targets or symlink escapes
+        // cannot bypass directory containment.
+        let canonical_dir = fs::canonicalize(dir)?;
+        let canonical_full = fs::canonicalize(&full)?;
         if !canonical_full.starts_with(&canonical_dir) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -379,7 +376,7 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
             ));
         }
 
-        let contents = fs::read_to_string(&full)?;
+        let contents = fs::read_to_string(&canonical_full)?;
         // Environment values conventionally do not carry a trailing newline.
         Ok(contents
             .trim_end_matches('\n')
@@ -429,6 +426,34 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test content");
         std::fs::remove_file(&file_path).ok();
+    }
+
+    #[test]
+    fn file_value_nonexistent_and_symlink_escape_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let missing_err = resolve_value("file:does_not_exist.key".to_string(), dir.path())
+            .expect_err("missing file: target must fail closed");
+        assert_eq!(missing_err.kind(), std::io::ErrorKind::NotFound);
+
+        let missing_dir = dir.path().join("nonexistent_subdir");
+        let missing_dir_err = resolve_value("file:secret.key".to_string(), &missing_dir)
+            .expect_err("nonexistent base dir must fail closed");
+        assert_eq!(missing_dir_err.kind(), std::io::ErrorKind::NotFound);
+
+        #[cfg(unix)]
+        {
+            let outside_dir = tempfile::tempdir().unwrap();
+            let outside_secret = outside_dir.path().join("outside.key");
+            std::fs::write(&outside_secret, "top-secret").unwrap();
+
+            let escape_link = dir.path().join("escape.key");
+            std::os::unix::fs::symlink(&outside_secret, &escape_link).unwrap();
+
+            let escape_err = resolve_value("file:escape.key".to_string(), dir.path())
+                .expect_err("symlink pointing outside dir must be rejected");
+            assert_eq!(escape_err.kind(), std::io::ErrorKind::PermissionDenied);
+        }
     }
 
     // --- Sprint 2: environment resolution precedence tests ---

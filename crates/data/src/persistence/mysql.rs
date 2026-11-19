@@ -105,6 +105,23 @@ impl MysqlBackend {
     }
 }
 
+fn bind_mysql_params<'q>(
+    mut query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
+    params: &'q [DbValue],
+) -> sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments> {
+    for param in params {
+        query = match param {
+            DbValue::Null => query.bind(None as Option<String>),
+            DbValue::Text(s) => query.bind(s.as_str()),
+            DbValue::Int(i) => query.bind(*i),
+            DbValue::Float(f) => query.bind(*f),
+            DbValue::Bool(b) => query.bind(*b),
+            DbValue::Bytes(b) => query.bind(b.as_slice()),
+        };
+    }
+    query
+}
+
 fn extract_mysql_scalar(row: &MySqlRow) -> Option<String> {
     if let Ok(val) = row.try_get::<String, _>(0) {
         return Some(val);
@@ -156,17 +173,7 @@ impl DatabaseBackend for MysqlBackend {
                     .map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             } else {
-                let mut query = sqlx::query(AssertSqlSafe(statement));
-                for param in &params_vec {
-                    query = match param {
-                        DbValue::Null => query.bind(None as Option<String>),
-                        DbValue::Text(s) => query.bind(s.as_str()),
-                        DbValue::Int(i) => query.bind(*i),
-                        DbValue::Float(f) => query.bind(*f),
-                        DbValue::Bool(b) => query.bind(*b),
-                        DbValue::Bytes(b) => query.bind(b.as_slice()),
-                    };
-                }
+                let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
                 let res = query.execute(&self.pool).await.map_err(map_sqlx_error)?;
                 Ok(res.rows_affected())
             }
@@ -181,17 +188,7 @@ impl DatabaseBackend for MysqlBackend {
         let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            let query_obj = bind_mysql_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<MySqlRow> = query_obj
                 .fetch_optional(&self.pool)
                 .await
@@ -209,17 +206,7 @@ impl DatabaseBackend for MysqlBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<MySqlRow> = query.fetch_all(&self.pool).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_mysql_row_to_db_row).collect()
         })
@@ -233,17 +220,7 @@ impl DatabaseBackend for MysqlBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<MySqlRow> = query
                 .fetch_optional(&self.pool)
                 .await
@@ -392,23 +369,19 @@ impl DatabaseTransaction for MysqlTransaction {
             // Why: Match `MysqlBackend::execute_params` by routing empty-param
             // calls through `sqlx::raw_sql` for unprepared SQL and mapping all
             // sqlx errors via `map_sqlx_error` to preserve error classification.
+            // Validate managed transaction SQL first (matching `PostgresTransaction`)
+            // so raw batches cannot commit or roll back the caller's managed transaction.
             let res = if params_vec.is_empty() {
+                crate::persistence::backend::validate_managed_transaction_sql(
+                    &statement,
+                    &sqlparser::dialect::MySqlDialect {},
+                )?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await
                     .map_err(map_sqlx_error)?
             } else {
-                let mut query = sqlx::query(AssertSqlSafe(statement));
-                for param in &params_vec {
-                    query = match param {
-                        DbValue::Null => query.bind(None as Option<String>),
-                        DbValue::Text(s) => query.bind(s.as_str()),
-                        DbValue::Int(i) => query.bind(*i),
-                        DbValue::Float(f) => query.bind(*f),
-                        DbValue::Bool(b) => query.bind(*b),
-                        DbValue::Bytes(b) => query.bind(b.as_slice()),
-                    };
-                }
+                let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
                 query.execute(&mut **tx).await.map_err(map_sqlx_error)?
             };
             Ok(res.rows_affected())
@@ -432,17 +405,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query_obj = sqlx::query(AssertSqlSafe(query));
-            for param in &params_vec {
-                query_obj = match param {
-                    DbValue::Null => query_obj.bind(None as Option<String>),
-                    DbValue::Text(s) => query_obj.bind(s.as_str()),
-                    DbValue::Int(i) => query_obj.bind(*i),
-                    DbValue::Float(f) => query_obj.bind(*f),
-                    DbValue::Bool(b) => query_obj.bind(*b),
-                    DbValue::Bytes(b) => query_obj.bind(b.as_slice()),
-                };
-            }
+            let query_obj = bind_mysql_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<MySqlRow> = query_obj
                 .fetch_optional(&mut **tx)
                 .await
@@ -464,17 +427,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<MySqlRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_mysql_row_to_db_row).collect()
         })
@@ -493,17 +446,7 @@ impl DatabaseTransaction for MysqlTransaction {
             let tx = guard.as_mut().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
-            let mut query = sqlx::query(AssertSqlSafe(statement));
-            for param in &params_vec {
-                query = match param {
-                    DbValue::Null => query.bind(None as Option<String>),
-                    DbValue::Text(s) => query.bind(s.as_str()),
-                    DbValue::Int(i) => query.bind(*i),
-                    DbValue::Float(f) => query.bind(*f),
-                    DbValue::Bool(b) => query.bind(*b),
-                    DbValue::Bytes(b) => query.bind(b.as_slice()),
-                };
-            }
+            let query = bind_mysql_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<MySqlRow> = query
                 .fetch_optional(&mut **tx)
                 .await

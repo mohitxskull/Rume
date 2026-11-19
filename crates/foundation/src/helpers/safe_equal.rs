@@ -34,30 +34,6 @@ where
     bool::from(a.as_ref().ct_eq(b.as_ref()))
 }
 
-/// Constant-time comparison of two byte sequences or strings.
-///
-/// `safe_equal_hashed` is preserved for API compatibility. It now delegates
-/// directly to [`safe_equal`]: because `subtle::ConstantTimeEq` compares
-/// fixed-length slices in constant time and handles unequal lengths without
-/// leaking their magnitude, the separate SHA-256 pre-hashing step the previous
-/// implementation used is no longer necessary.
-///
-/// # Examples
-///
-/// ```
-/// use rume_foundation::helpers::safe_equal_hashed;
-///
-/// assert!(safe_equal_hashed("secret_token", "secret_token"));
-/// assert!(!safe_equal_hashed("secret_token", "wrong_token"));
-/// ```
-pub fn safe_equal_hashed<A, B>(a: A, b: B) -> bool
-where
-    A: AsRef<[u8]>,
-    B: AsRef<[u8]>,
-{
-    safe_equal(a, b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -87,13 +63,5 @@ mod tests {
         assert!(!safe_equal("", "a"));
         assert!(!safe_equal("aaaa", "aaab"));
         assert!(!safe_equal(b"short", b"longer_bytes"));
-    }
-
-    #[test]
-    fn safe_equal_hashed_tests() {
-        assert!(safe_equal_hashed("secret", "secret"));
-        assert!(safe_equal_hashed(b"token", b"token"));
-        assert!(!safe_equal_hashed("secret", "other"));
-        assert!(!safe_equal_hashed("short", "longer_value"));
     }
 }

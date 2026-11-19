@@ -643,8 +643,39 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(server_2.load("session_temp").await.unwrap().is_none());
 
-    // 5. Session ID regeneration (rotation): preserves data and destroys old key
-    let reg_session = Session::new("session_old", "user_rot", 300).with_role("editor");
+    // 5. Session ID regeneration (rotation):
+    //    (a) all-empty collections & None tenant_id (Lua cjson empty table handling)
+    let empty_session = Session::new("session_empty_old", "user_empty", 300);
+    server_1
+        .save(empty_session)
+        .await
+        .expect("save empty session before regen");
+    let rotated_empty = server_1
+        .regenerate_id("session_empty_old")
+        .await
+        .expect("regenerate empty session id");
+    assert_ne!(rotated_empty.id, "session_empty_old");
+    assert_eq!(rotated_empty.user_id, "user_empty");
+    assert_eq!(rotated_empty.tenant_id, None);
+    assert!(rotated_empty.roles.is_empty());
+    assert!(rotated_empty.permissions.is_empty());
+    assert!(rotated_empty.data.is_empty());
+    assert!(server_2.load("session_empty_old").await.unwrap().is_none());
+    let loaded_empty = server_2
+        .load(&rotated_empty.id)
+        .await
+        .unwrap()
+        .expect("rotated empty session active");
+    assert_eq!(loaded_empty, rotated_empty);
+
+    //    (b) fully populated Session (tenant_id, roles, permissions, data)
+    let reg_session = Session::new("session_old", "user_rot", 300)
+        .with_tenant_id("tenant-acme")
+        .with_role("editor")
+        .with_role("reviewer")
+        .with_permission("posts:publish")
+        .with_data("ip", "10.0.0.42")
+        .with_data("ua", "rume-container-test");
     server_1.save(reg_session).await.expect("save before regen");
     let rotated = server_1
         .regenerate_id("session_old")
@@ -652,17 +683,29 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
         .expect("regenerate id");
     assert_ne!(rotated.id, "session_old");
     assert_eq!(rotated.user_id, "user_rot");
-    assert_eq!(rotated.roles, vec!["editor"]);
+    assert_eq!(rotated.tenant_id.as_deref(), Some("tenant-acme"));
+    assert_eq!(rotated.roles, vec!["editor", "reviewer"]);
+    assert_eq!(rotated.permissions, vec!["posts:publish"]);
+    assert_eq!(
+        rotated.data.get("ip").map(String::as_str),
+        Some("10.0.0.42")
+    );
+    assert_eq!(
+        rotated.data.get("ua").map(String::as_str),
+        Some("rume-container-test")
+    );
     assert!(
         server_2.load("session_old").await.unwrap().is_none(),
         "old session key destroyed"
     );
-    assert!(
-        server_2.load(&rotated.id).await.unwrap().is_some(),
-        "new session key active"
-    );
+    let loaded_full = server_2
+        .load(&rotated.id)
+        .await
+        .unwrap()
+        .expect("new session key active");
+    assert_eq!(loaded_full, rotated);
 
-    // 6. Regeneration error paths: non-existent and expired sessions
+    // 6. Regeneration error paths: non-existent, expired, and corrupt/non-object JSON
     let non_existent_err = server_1
         .regenerate_id("session_does_not_exist")
         .await
@@ -683,6 +726,30 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
         expired_err,
         rume::auth::AuthError::InvalidCredentials(_)
     ));
+
+    let mut conn = pool.get().await.expect("redis conn for corrupt test");
+    for (bad_id, bad_payload) in [
+        ("session_corrupt_json", "{not-valid-json"),
+        ("session_corrupt_array", "[1,2,3]"),
+        (
+            "session_corrupt_exp",
+            r#"{"id":"session_corrupt_exp","user_id":"u1","expires_at":"not-a-number"}"#,
+        ),
+    ] {
+        let _: () = redis::cmd("SET")
+            .arg(format!("rume:session:{bad_id}"))
+            .arg(bad_payload)
+            .arg("EX")
+            .arg(60)
+            .query_async(&mut *conn)
+            .await
+            .expect("seed corrupt payload");
+        let corrupt_err = server_1.regenerate_id(bad_id).await.unwrap_err();
+        assert!(
+            matches!(corrupt_err, rume::auth::AuthError::ProviderError(_)),
+            "corrupt payload '{bad_payload}' must fail with ProviderError, got {corrupt_err:?}"
+        );
+    }
 }
 
 #[tokio::test]

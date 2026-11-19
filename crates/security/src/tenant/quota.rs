@@ -276,6 +276,12 @@ mod redis_store {
         prefix: String,
     }
 
+    // Why: A tenant's sorted set holds entries with heterogeneous (or unbounded) expirations.
+    // Blindly calling `PEXPIRE KEYS[1] ttl_ms` on every `ZADD` would cause a short-lived key to
+    // wipe out the whole sorted set before longer-lived keys expire (or expire `+inf` entries).
+    // Instead, inspect the highest-scoring member via `ZREVRANGE ... WITHSCORES` and `PERSIST`
+    // when any member is unbounded (`ttl_ms < 0` or `+inf`/`inf`), or `PEXPIRE` up to the
+    // furthest member's remaining milliseconds.
     pub(super) const REDIS_RECORD_KEY_SCRIPT: &str = r#"
         if redis.replicate_commands then redis.replicate_commands() end
         local t = redis.call('TIME')
@@ -294,6 +300,14 @@ mod redis_store {
                 score = now_ms + ttl_ms
             end
             redis.call('ZADD', KEYS[1], score, ARGV[3])
+            local top = redis.call('ZREVRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+            local max_score_str = top[2]
+            local max_score = max_score_str and tonumber(max_score_str) or nil
+            if ttl_ms < 0 or max_score_str == 'inf' or max_score_str == '+inf' or not max_score or max_score == math.huge then
+                redis.call('PERSIST', KEYS[1])
+            else
+                redis.call('PEXPIRE', KEYS[1], math.max(1, math.ceil(max_score - now_ms)))
+            end
             return 1
         end
     "#;
@@ -329,8 +343,8 @@ mod redis_store {
             self
         }
 
-        fn key(&self, tenant_id: &str) -> String {
-            format!("{}quota:{{{}}}:keys", self.prefix, tenant_id)
+        pub(super) fn key(&self, tenant_id: &str) -> String {
+            format!("{}{{{}}}:keys", self.prefix, tenant_id)
         }
     }
 
@@ -576,5 +590,29 @@ mod tests {
 
         assert!(redis_store::REDIS_RECORD_KEY_SCRIPT.contains("redis.call('TIME')"));
         assert!(redis_store::REDIS_COUNT_SCRIPT.contains("redis.call('TIME')"));
+    }
+
+    #[cfg(feature = "redis")]
+    #[test]
+    fn redis_quota_key_avoids_double_prefix_and_script_sets_rolling_pexpire() {
+        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let pool = cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool config");
+        let store = RedisTenantQuotaStore::new(pool.clone());
+        assert_eq!(store.key("t1"), "rume:quota:{t1}:keys");
+
+        let custom = RedisTenantQuotaStore::new(pool).with_prefix("custom:quota:");
+        assert_eq!(custom.key("t1"), "custom:quota:{t1}:keys");
+
+        let script = redis_store::REDIS_RECORD_KEY_SCRIPT;
+        assert!(
+            script.contains("ZREVRANGE") && script.contains("WITHSCORES"),
+            "REDIS_RECORD_KEY_SCRIPT must inspect max score via ZREVRANGE ... WITHSCORES"
+        );
+        assert!(
+            script.contains("PEXPIRE") && script.contains("PERSIST"),
+            "REDIS_RECORD_KEY_SCRIPT must maintain rolling PEXPIRE / PERSIST on KEYS[1]"
+        );
     }
 }

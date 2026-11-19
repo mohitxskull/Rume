@@ -23,3 +23,9 @@ Task 2 (`RC-02`/`OQ-01`, Worker A): complete — immutable `20261104_001_rume_co
 Task 4 (`RC-03`, Worker B): complete — SQLite `BEGIN IMMEDIATE` + `fetch_optional` outbox claim, non-locking `outbox_fetch_pending.sql` for Postgres/MySQL, strict `trace_context` selection/decoding in Postgres DLQ listings.
 Task 7 (`RC-06`, Worker D): complete — `crates/app/src/app/lifecycle.rs` shared coordinator, finalized `AppContext` propagation, removed dead `RumeBuilder::state`, `ApplicationMode::Inspect` DAG + route checks.
 Wave 1 verified clean with `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -j 2 -- -D warnings`.
+
+## Wave 2
+Task 3 (`RC-09`, Worker A): complete — `FromDbValue` emits `PersistenceError::DecodeError`, `From<usize> for DbValue` delegates to `u64`, `validate_managed_transaction_sql` & `reject_unbound_sqlite_placeholders` rewritten with `sqlparser = "=0.53.0"`, and bind loops deduplicated in `mysql.rs`/`sqlite.rs`.
+Task 5 (`RC-04`/`OQ-02`, Worker C): complete — fail-closed `fs::canonicalize` in `loading.rs`/`db/mod.rs`, `SamlParser` hardened with `chrono = "=0.4.45"` RFC 3339 parsing, `XmlNs` `<Issuer>` anchoring, `signed_mode` `Assertion/@ID` reference enforcement, Redis `REGENERATE_ID_SCRIPT` migrated to guarded `cjson` (with `#[serde(default)]` on optional `Session` fields), and unused `safe_equal_hashed` deleted.
+Task 6 (`RC-07`, Worker B): complete — `Cache::default_ttl` / `resolve_ttl` propagated before `quota.record_key`, rollback guard handles backend/closed cache errors, `RedisTenantQuotaStore::key()` double-prefix fixed, and rolling `PEXPIRE`/`PERSIST` added.
+Wave 2 verified clean with `cargo fmt --all --check && cargo clippy --workspace --all-targets --all-features -j 2 -- -D warnings`.

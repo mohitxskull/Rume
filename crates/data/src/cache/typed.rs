@@ -110,9 +110,14 @@ impl<B: CacheBackend> Cache<B> {
         }
     }
 
+    /// Returns the configured default time-to-live for cached values.
+    pub fn default_ttl(&self) -> Duration {
+        self.config.default_ttl()
+    }
+
     /// Resolves the effective TTL: uses specified duration or falls back to configured default.
-    fn resolve_ttl(&self, ttl: Option<Duration>) -> Option<Duration> {
-        ttl.or_else(|| Some(self.config.default_ttl()))
+    pub fn resolve_ttl(&self, ttl: Option<Duration>) -> Option<Duration> {
+        ttl.or_else(|| Some(self.default_ttl()))
     }
 
     /// Retrieves and deserializes a JSON value by key.

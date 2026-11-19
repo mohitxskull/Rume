@@ -10,6 +10,17 @@ pub trait FromDbValue: Sized {
     fn from_db_value(val: &DbValue) -> Result<Self, PersistenceError>;
 }
 
+// Why: Emit `PersistenceError::DecodeError` (never `QueryFailed`) inside every
+// `FromDbValue` impl so `DbRow::{get, get_by_index, get_opt}` preserve the decode
+// error taxonomy and attach the queried column name/index instead of misclassifying
+// value/type mismatches as query execution failures.
+fn decode_error(message: impl Into<String>) -> PersistenceError {
+    PersistenceError::DecodeError {
+        column: "<decode>".into(),
+        message: message.into(),
+    }
+}
+
 impl FromDbValue for String {
     fn from_db_value(val: &DbValue) -> Result<Self, PersistenceError> {
         match val {
@@ -18,9 +29,9 @@ impl FromDbValue for String {
             DbValue::Float(f) => Ok(f.to_string()),
             DbValue::Bool(b) => Ok(b.to_string()),
             DbValue::Bytes(b) => String::from_utf8(b.clone())
-                .map_err(|e| PersistenceError::QueryFailed(format!("invalid utf-8 string: {e}"))),
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable String".into(),
+                .map_err(|e| decode_error(format!("invalid utf-8 string: {e}"))),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable String",
             )),
         }
     }
@@ -30,17 +41,15 @@ impl FromDbValue for i64 {
     fn from_db_value(val: &DbValue) -> Result<Self, PersistenceError> {
         match val {
             DbValue::Int(i) => Ok(*i),
-            DbValue::Text(s) => s.parse::<i64>().map_err(|e| {
-                PersistenceError::QueryFailed(format!("failed to parse '{s}' as i64: {e}"))
-            }),
+            DbValue::Text(s) => s
+                .parse::<i64>()
+                .map_err(|e| decode_error(format!("failed to parse '{s}' as i64: {e}"))),
             DbValue::Float(f) => Ok(*f as i64),
             DbValue::Bool(b) => Ok(if *b { 1 } else { 0 }),
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable i64".into(),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable i64",
             )),
-            DbValue::Bytes(_) => Err(PersistenceError::QueryFailed(
-                "cannot convert bytes to i64".into(),
-            )),
+            DbValue::Bytes(_) => Err(decode_error("cannot convert bytes to i64")),
         }
     }
 }
@@ -96,12 +105,10 @@ impl FromDbValue for u64 {
                 Ok(*f as u64)
             }
             DbValue::Bool(b) => Ok(if *b { 1 } else { 0 }),
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable u64".into(),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable u64",
             )),
-            DbValue::Bytes(_) => Err(PersistenceError::QueryFailed(
-                "cannot convert bytes to u64".into(),
-            )),
+            DbValue::Bytes(_) => Err(decode_error("cannot convert bytes to u64")),
         }
     }
 }
@@ -161,15 +168,13 @@ impl FromDbValue for f64 {
         match val {
             DbValue::Float(f) => Ok(*f),
             DbValue::Int(i) => Ok(*i as f64),
-            DbValue::Text(s) => s.parse::<f64>().map_err(|e| {
-                PersistenceError::QueryFailed(format!("failed to parse '{s}' as f64: {e}"))
-            }),
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable f64".into(),
+            DbValue::Text(s) => s
+                .parse::<f64>()
+                .map_err(|e| decode_error(format!("failed to parse '{s}' as f64: {e}"))),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable f64",
             )),
-            _ => Err(PersistenceError::QueryFailed(
-                "cannot convert database value to f64".into(),
-            )),
+            _ => Err(decode_error("cannot convert database value to f64")),
         }
     }
 }
@@ -195,16 +200,12 @@ impl FromDbValue for bool {
             DbValue::Text(s) => match s.to_lowercase().as_str() {
                 "true" | "t" | "1" | "yes" => Ok(true),
                 "false" | "f" | "0" | "no" => Ok(false),
-                _ => Err(PersistenceError::QueryFailed(format!(
-                    "cannot parse '{s}' as boolean"
-                ))),
+                _ => Err(decode_error(format!("cannot parse '{s}' as boolean"))),
             },
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable bool".into(),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable bool",
             )),
-            _ => Err(PersistenceError::QueryFailed(
-                "cannot convert database value to bool".into(),
-            )),
+            _ => Err(decode_error("cannot convert database value to bool")),
         }
     }
 }
@@ -214,12 +215,10 @@ impl FromDbValue for Vec<u8> {
         match val {
             DbValue::Bytes(b) => Ok(b.clone()),
             DbValue::Text(s) => Ok(s.as_bytes().to_vec()),
-            DbValue::Null => Err(PersistenceError::QueryFailed(
-                "cannot convert NULL database value to non-nullable Vec<u8>".into(),
+            DbValue::Null => Err(decode_error(
+                "cannot convert NULL database value to non-nullable Vec<u8>",
             )),
-            _ => Err(PersistenceError::QueryFailed(
-                "cannot convert database value to bytes".into(),
-            )),
+            _ => Err(decode_error("cannot convert database value to bytes")),
         }
     }
 }
@@ -420,5 +419,67 @@ mod tests {
         let valid_row = DbRow::new(vec!["num".into()], vec![DbValue::Int(120)]);
         let val: u8 = valid_row.get("num").unwrap();
         assert_eq!(val, 120);
+    }
+
+    #[test]
+    fn from_db_value_errors_emit_decode_error_with_column_name() {
+        let row = DbRow::new(
+            vec![
+                "null_col".into(),
+                "bad_utf8".into(),
+                "bad_text".into(),
+                "raw_bytes".into(),
+                "int_col".into(),
+            ],
+            vec![
+                DbValue::Null,
+                DbValue::Bytes(vec![0xff, 0xfe]),
+                DbValue::Text("not_a_number".into()),
+                DbValue::Bytes(vec![1, 2, 3]),
+                DbValue::Int(7),
+            ],
+        );
+
+        fn assert_decode_err<T: Debug>(res: Result<T, PersistenceError>, expected_col: &str) {
+            let err = res.expect_err("expected DecodeError");
+            assert!(
+                matches!(err, PersistenceError::DecodeError { ref column, .. } if column == expected_col),
+                "expected DecodeError for column '{expected_col}', got: {err:?}"
+            );
+        }
+
+        // NULL into non-nullable types via get and get_by_index.
+        assert_decode_err(row.get::<String>("null_col"), "null_col");
+        assert_decode_err(row.get::<i64>("null_col"), "null_col");
+        assert_decode_err(row.get::<u64>("null_col"), "null_col");
+        assert_decode_err(row.get::<f64>("null_col"), "null_col");
+        assert_decode_err(row.get::<bool>("null_col"), "null_col");
+        assert_decode_err(row.get::<Vec<u8>>("null_col"), "null_col");
+        assert_decode_err(row.get_by_index::<String>(0), "null_col");
+        assert_decode_err(row.get_by_index::<i64>(0), "null_col");
+
+        // Invalid UTF-8 bytes into String via get, get_by_index, and get_opt.
+        assert_decode_err(row.get::<String>("bad_utf8"), "bad_utf8");
+        assert_decode_err(row.get_by_index::<String>(1), "bad_utf8");
+        assert_decode_err(row.get_opt::<String>("bad_utf8"), "bad_utf8");
+
+        // Unparseable text into i64, f64, bool via get, get_by_index, and get_opt.
+        assert_decode_err(row.get::<i64>("bad_text"), "bad_text");
+        assert_decode_err(row.get_by_index::<i64>(2), "bad_text");
+        assert_decode_err(row.get_opt::<i64>("bad_text"), "bad_text");
+        assert_decode_err(row.get::<f64>("bad_text"), "bad_text");
+        assert_decode_err(row.get_by_index::<f64>(2), "bad_text");
+        assert_decode_err(row.get_opt::<f64>("bad_text"), "bad_text");
+        assert_decode_err(row.get::<bool>("bad_text"), "bad_text");
+        assert_decode_err(row.get_by_index::<bool>(2), "bad_text");
+        assert_decode_err(row.get_opt::<bool>("bad_text"), "bad_text");
+
+        // Bytes -> numeric/bool and Int -> Vec<u8> mismatches.
+        assert_decode_err(row.get::<i64>("raw_bytes"), "raw_bytes");
+        assert_decode_err(row.get::<u64>("raw_bytes"), "raw_bytes");
+        assert_decode_err(row.get::<f64>("raw_bytes"), "raw_bytes");
+        assert_decode_err(row.get::<bool>("raw_bytes"), "raw_bytes");
+        assert_decode_err(row.get::<Vec<u8>>("int_col"), "int_col");
+        assert_decode_err(row.get_opt::<Vec<u8>>("int_col"), "int_col");
     }
 }

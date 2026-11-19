@@ -100,10 +100,15 @@ impl<B: CacheBackend> TenantScopedCache<B> {
     ) -> Result<(), CacheError> {
         let full_key = Self::scoped_key(tenant_id, key);
         let key_already_existed = self.cache.exists(&full_key).await.unwrap_or(false);
+        // Why: `Cache::set_json_with_tags` substitutes `Cache::default_ttl()` when `ttl` is
+        // `None`. Passing raw `ttl` to `quota.record_key` would record an unbounded (`+inf`)
+        // quota entry while the cache entry expires after `default_ttl()`, permanently leaking
+        // tenant quota slots. Resolving once up front guarantees quota and cache share one TTL.
+        let effective_ttl = self.cache.resolve_ttl(ttl);
 
         if let Some(ref quota) = self.quota_store {
             let acquired = quota
-                .record_key(tenant_id, key, ttl, self.max_keys_per_tenant)
+                .record_key(tenant_id, key, effective_ttl, self.max_keys_per_tenant)
                 .await?;
             if !acquired {
                 return Err(CacheError::QuotaExceeded(format!(
@@ -122,13 +127,18 @@ impl<B: CacheBackend> TenantScopedCache<B> {
 
         let res = self
             .cache
-            .set_json_with_tags(&full_key, value, &tag_refs, ttl)
+            .set_json_with_tags(&full_key, value, &tag_refs, effective_ttl)
             .await;
 
+        // Why: Roll back the newly acquired quota slot whenever the write failed and
+        // `self.cache.exists(&full_key)` does not confirm `Ok(true)`. Checking `matches!(..., Ok(false))`
+        // skipped rollback on `CacheError::Closed` and `CacheError::Backend` because `exists`
+        // also returns `Err(...)` there, leaving the slot permanently leaked even though the write
+        // did not succeed. Best-effort cleanup errs on the side of freeing an unconfirmed slot.
         if res.is_err()
             && !key_already_existed
             && let Some(ref quota) = self.quota_store
-            && matches!(self.cache.exists(&full_key).await, Ok(false))
+            && !matches!(self.cache.exists(&full_key).await, Ok(true))
         {
             let _ = quota.remove_key(tenant_id, key).await;
         }
@@ -186,6 +196,7 @@ impl<B: CacheBackend> TenantScopedCache<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tenant::quota::InMemoryTenantQuotaStore;
 
     #[test]
     fn scoped_key_disambiguates_colon_delimited_tenant_id_and_key() {
@@ -203,5 +214,266 @@ mod tests {
         assert_eq!(tag1, "tenant:3:a:b");
         assert_eq!(tag2, "tenant:1:a");
         assert_ne!(tag1, tag2);
+    }
+
+    #[derive(Debug, Default)]
+    struct SpyQuotaStore {
+        inner: InMemoryTenantQuotaStore,
+        recorded_ttls: std::sync::Mutex<Vec<(String, Option<Duration>)>>,
+    }
+
+    impl TenantQuotaStore for SpyQuotaStore {
+        fn acquire<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            max_keys: usize,
+            window: Duration,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<bool, CacheError>> {
+            self.inner.acquire(tenant_id, max_keys, window)
+        }
+
+        fn release<'a>(
+            &'a self,
+            tenant_id: &'a str,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<(), CacheError>> {
+            self.inner.release(tenant_id)
+        }
+
+        fn record_key<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            key: &'a str,
+            ttl: Option<Duration>,
+            max_keys: usize,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<bool, CacheError>> {
+            self.recorded_ttls
+                .lock()
+                .expect("spy mutex poisoned")
+                .push((key.to_string(), ttl));
+            self.inner.record_key(tenant_id, key, ttl, max_keys)
+        }
+
+        fn remove_key<'a>(
+            &'a self,
+            tenant_id: &'a str,
+            key: &'a str,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<(), CacheError>> {
+            self.inner.remove_key(tenant_id, key)
+        }
+
+        fn count<'a>(
+            &'a self,
+            tenant_id: &'a str,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<usize, CacheError>> {
+            self.inner.count(tenant_id)
+        }
+
+        fn reset<'a>(
+            &'a self,
+            tenant_id: &'a str,
+        ) -> crate::tenant::quota::BoxFuture<'a, Result<(), CacheError>> {
+            self.inner.reset(tenant_id)
+        }
+    }
+
+    #[derive(Debug)]
+    struct FailingBackend {
+        inner: rume_data::cache::backend::InMemoryCacheBackend,
+        fail_writes: Arc<std::sync::atomic::AtomicBool>,
+        fail_exists: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl FailingBackend {
+        fn new(
+            fail_writes: Arc<std::sync::atomic::AtomicBool>,
+            fail_exists: Arc<std::sync::atomic::AtomicBool>,
+        ) -> Self {
+            Self {
+                inner: rume_data::cache::backend::InMemoryCacheBackend::new(),
+                fail_writes,
+                fail_exists,
+            }
+        }
+    }
+
+    impl CacheBackend for FailingBackend {
+        fn get(
+            &self,
+            key: &str,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<Option<Vec<u8>>, CacheError>> {
+            self.inner.get(key)
+        }
+
+        fn set(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            ttl: Option<Duration>,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<(), CacheError>> {
+            self.inner.set(key, value, ttl)
+        }
+
+        fn set_with_tags(
+            &self,
+            key: &str,
+            value: Vec<u8>,
+            tags: &[&str],
+            ttl: Option<Duration>,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<(), CacheError>> {
+            if self.fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(CacheError::Backend("redis unreachable".into())) });
+            }
+            self.inner.set_with_tags(key, value, tags, ttl)
+        }
+
+        fn delete(
+            &self,
+            key: &str,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<bool, CacheError>> {
+            self.inner.delete(key)
+        }
+
+        fn exists(
+            &self,
+            key: &str,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<bool, CacheError>> {
+            if self.fail_exists.load(std::sync::atomic::Ordering::SeqCst) {
+                return Box::pin(async { Err(CacheError::Backend("redis unreachable".into())) });
+            }
+            self.inner.exists(key)
+        }
+
+        fn invalidate_tag_keys(
+            &self,
+            tag: &str,
+        ) -> rume_data::cache::backend::BoxFuture<'_, Result<Vec<String>, CacheError>> {
+            self.inner.invalidate_tag_keys(tag)
+        }
+
+        fn clear(&self) -> rume_data::cache::backend::BoxFuture<'_, Result<(), CacheError>> {
+            self.inner.clear()
+        }
+
+        fn ping(&self) -> rume_data::cache::backend::BoxFuture<'_, Result<(), CacheError>> {
+            self.inner.ping()
+        }
+    }
+
+    #[tokio::test]
+    async fn tenant_cache_none_ttl_propagates_cache_default_ttl_to_quota_store() {
+        let config = rume_data::cache::config::CacheConfig::default().with_default_ttl(42);
+        let cache = Cache::new(
+            rume_data::cache::backend::InMemoryCacheBackend::new(),
+            config,
+        );
+        assert_eq!(cache.default_ttl(), Duration::from_secs(42));
+        assert_eq!(cache.resolve_ttl(None), Some(Duration::from_secs(42)));
+        let spy = Arc::new(SpyQuotaStore::default());
+        let tenant_cache = TenantScopedCache::new(cache).with_quota_store(Arc::clone(&spy) as _);
+
+        tenant_cache
+            .set("t1", "k-default", &"v1", None)
+            .await
+            .expect("set with default ttl");
+        tenant_cache
+            .set("t1", "k-explicit", &"v2", Some(Duration::from_secs(7)))
+            .await
+            .expect("set with explicit ttl");
+
+        let calls = spy
+            .recorded_ttls
+            .lock()
+            .expect("spy mutex poisoned")
+            .clone();
+        assert_eq!(
+            calls,
+            vec![
+                ("k-default".to_string(), Some(Duration::from_secs(42))),
+                ("k-explicit".to_string(), Some(Duration::from_secs(7))),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_cache_rolls_back_quota_on_closed_and_backend_errors() {
+        use crate::tenant::quota::InMemoryTenantQuotaStore;
+
+        // 1. Closed cache fails set_json_with_tags AND exists() with CacheError::Closed.
+        let closed_cache = Cache::new(
+            rume_data::cache::backend::InMemoryCacheBackend::new(),
+            rume_data::cache::config::CacheConfig::default(),
+        );
+        let closed_quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let closed_tenant_cache = TenantScopedCache::new(closed_cache.clone())
+            .with_quota_store(Arc::clone(&closed_quota) as _);
+        closed_cache.close();
+
+        let err = closed_tenant_cache
+            .set("t1", "closed-key", &"val", None)
+            .await
+            .expect_err("closed cache must fail set");
+        assert!(matches!(err, CacheError::Closed));
+        assert_eq!(
+            closed_tenant_cache
+                .active_key_count("t1")
+                .await
+                .expect("count"),
+            0,
+            "quota slot must be rolled back when cache is closed"
+        );
+
+        // 2. Failing backend fails both set_with_tags and exists with CacheError::Backend.
+        let fail_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let failing_cache = Cache::new(
+            FailingBackend::new(Arc::clone(&fail_flag), Arc::clone(&fail_flag)),
+            rume_data::cache::config::CacheConfig::default(),
+        );
+        let backend_quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let backend_tenant_cache =
+            TenantScopedCache::new(failing_cache).with_quota_store(Arc::clone(&backend_quota) as _);
+
+        let err = backend_tenant_cache
+            .set("t1", "backend-key", &"val", None)
+            .await
+            .expect_err("failing backend must return Backend error");
+        assert!(matches!(err, CacheError::Backend(_)));
+        assert_eq!(
+            backend_tenant_cache
+                .active_key_count("t1")
+                .await
+                .expect("count"),
+            0,
+            "quota slot must be rolled back when backend set and exists both fail"
+        );
+
+        // 3. Updating an already-existing key that fails write preserves its existing quota slot.
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fail_exists = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let partial_cache = Cache::new(
+            FailingBackend::new(Arc::clone(&fail_writes), Arc::clone(&fail_exists)),
+            rume_data::cache::config::CacheConfig::default(),
+        );
+        let existing_quota = Arc::new(InMemoryTenantQuotaStore::new());
+        let existing_tenant_cache = TenantScopedCache::new(partial_cache)
+            .with_quota_store(Arc::clone(&existing_quota) as _);
+
+        existing_tenant_cache
+            .set("t1", "existing-key", &"v1", None)
+            .await
+            .expect("initial set succeeds");
+        fail_writes.store(true, std::sync::atomic::Ordering::SeqCst);
+        let update_err = existing_tenant_cache
+            .set("t1", "existing-key", &"v2", None)
+            .await
+            .expect_err("failed overwrite must return Backend error");
+        assert!(matches!(update_err, CacheError::Backend(_)));
+        assert_eq!(
+            existing_tenant_cache
+                .active_key_count("t1")
+                .await
+                .expect("count"),
+            1,
+            "existing key quota slot must not be removed when overwrite fails"
+        );
     }
 }

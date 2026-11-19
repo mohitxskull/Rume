@@ -64,10 +64,10 @@ chrono = "=0.4.45"
 proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
 redis = { version = "=1.8.1", default-features = false, features = ["tokio-comp", "script"] }
-# SAML 2.0 assertion parsing and signature verification (used by the `saml`
-# feature of `rume`; see crates/core/src/enterprise/saml.rs). saml-rs owns the
-# SAML namespace constants, strict ISO 8601 time validation, and signed-reference
-# / anti-wrapping rules we delegate to.
+# SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
+# `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
+# XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
+# XML-DSig verification is delegated to the pluggable `SamlSignatureVerifier` boundary.
 saml-rs = "=0.8.0"
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
