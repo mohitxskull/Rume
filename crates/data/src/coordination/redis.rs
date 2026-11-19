@@ -328,10 +328,12 @@ impl LeaderElector for RedisLeaderElector {
         let r = role.to_string();
         let c = candidate_id.to_string();
         Box::pin(async move {
-            // Why: Compute the conservative deadline before pool checkout and script dispatch
-            // and only extend Redis `PEXPIRE` when `PTTL < requested_ttl` so renewal never
-            // shortens an existing longer leader lease (`RC-01`).
-            let (ttl_ms, deadline) = conservative_lease_deadline(ttl);
+            // Why: Capture `pre_rtt` before pool checkout and script dispatch (`RC-01`) and return
+            // both the election term and the effective retained TTL (`max(PTTL, requested_ttl)`)
+            // from Lua so `expires_at` reflects the actual retained Redis lease without post-RTT
+            // inflation.
+            let pre_rtt = std::time::Instant::now();
+            let (ttl_ms, _) = conservative_lease_deadline(ttl);
 
             let mut conn = self
                 .pool
@@ -350,18 +352,21 @@ impl LeaderElector for RedisLeaderElector {
                     if string.sub(current, 1, string.len(prefix)) == prefix then
                         local requested_ttl = tonumber(ARGV[2])
                         local remaining_ttl = redis.call('PTTL', KEYS[1])
+                        local effective_ttl = requested_ttl
                         if remaining_ttl < 0 or remaining_ttl < requested_ttl then
                             redis.call('PEXPIRE', KEYS[1], requested_ttl)
+                        else
+                            effective_ttl = remaining_ttl
                         end
                         local term = string.sub(current, string.len(prefix) + 1)
-                        return tonumber(term)
+                        return {tonumber(term), effective_ttl}
                     end
                 end
                 return nil
                 "#,
             );
 
-            let result: Option<i64> = script
+            let result: Option<(i64, i64)> = script
                 .key(&leader_key)
                 .arg(&c)
                 .arg(ttl_ms)
@@ -369,12 +374,13 @@ impl LeaderElector for RedisLeaderElector {
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(term) = result {
+            if let Some((term, effective_ttl_ms)) = result {
+                let effective_ms = u64::try_from(effective_ttl_ms.max(1)).unwrap_or(u64::MAX);
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
-                    expires_at: Some(deadline),
+                    expires_at: Some(pre_rtt + Duration::from_millis(effective_ms)),
                 }))
             } else {
                 Ok(None)

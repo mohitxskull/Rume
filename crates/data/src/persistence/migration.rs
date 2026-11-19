@@ -160,25 +160,8 @@ async fn ensure_applied_order_column_tx<T: DatabaseTransaction>(
             }
         }
         _ => {
-            // Why: Custom `DatabaseBackend` dialects have no dialect-specific catalog query, so
-            // probe `applied_order` directly and run standard SQL `ALTER TABLE ... ADD COLUMN`
-            // only if the probe fails (re-probing after any concurrent `ALTER` race).
-            if tx
-                .query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
-                .await
-                .is_err()
-            {
-                let alter = tx
-                    .execute(
-                        "ALTER TABLE rume_migrations ADD COLUMN applied_order BIGINT NOT NULL DEFAULT 0",
-                    )
-                    .await;
-                if let Err(err) = alter {
-                    tx.query_scalar("SELECT applied_order FROM rume_migrations WHERE 1 = 0")
-                        .await
-                        .map_err(|_| err)?;
-                }
-            }
+            // Why: `ensure_applied_order_column_tx` is only invoked from the `"postgres"` and
+            // `"sqlite"` transactional paths; custom dialects use `ensure_applied_order_column_backend`.
         }
     }
     Ok(())
@@ -1809,10 +1792,26 @@ mod tests {
         );
 
         // Second run when `applied_order` already exists must succeed without re-running ALTER.
+        let count_alter = |entries: &[String]| {
+            entries
+                .iter()
+                .filter(|s| {
+                    s.starts_with("ALTER TABLE rume_migrations ADD COLUMN")
+                        && s.contains("applied_order")
+                })
+                .count()
+        };
+        let alter_count_before = count_alter(&log);
         let summary2 = migrator
             .run_pending_backend(&backend)
             .await
             .expect("second run with existing applied_order column succeeds");
         assert!(summary2.applied.is_empty());
+        let log_after = backend.executed_sql.lock().unwrap().clone();
+        assert_eq!(
+            count_alter(&log_after),
+            alter_count_before,
+            "second run must skip ALTER TABLE when applied_order already exists"
+        );
     }
 }

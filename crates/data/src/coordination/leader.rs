@@ -60,6 +60,15 @@ pub trait LeaderElector: Debug + Send + Sync + 'static {
     ) -> CoordinationFuture<'a, Option<LeaderLease>>;
 
     /// Renews an actively held leadership lease. Returns `Some(LeaderLease)` on success.
+    ///
+    /// # Lease Deadline & Resignation Contract
+    ///
+    /// Both `RedisLeaderElector::renew` and `PostgresLeaderElector::renew` enforce monotonic
+    /// remote lease extension (never shortening an existing longer backend TTL) and return a
+    /// [`LeaderLease`] whose `expires_at` reflects a conservative pre-RTT local deadline for the
+    /// retained remote lease duration (`max(remaining_remote_ttl, requested_ttl)`). Callers that
+    /// voluntarily step down before `expires_at` should call [`LeaderElector::resign`] so peers do
+    /// not wait for the retained backend TTL to elapse.
     fn renew<'a>(
         &'a self,
         role: &'a str,
