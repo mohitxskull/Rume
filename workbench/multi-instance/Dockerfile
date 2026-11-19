@@ -1,5 +1,5 @@
 FROM ubuntu:24.04 AS builder
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 --no-install-recommends \
     curl \
     ca-certificates \
     build-essential \
@@ -22,7 +22,7 @@ COPY workbench workbench
 RUN cargo build --release -p workbench --bin workbench
 
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=5 && apt-get install -y -o Acquire::Retries=5 --no-install-recommends \
     ca-certificates \
     curl \
     && rm -rf /var/lib/apt/lists/*

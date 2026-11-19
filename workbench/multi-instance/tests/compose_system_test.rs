@@ -113,7 +113,9 @@ async fn test_compose_multi_instance_system_qualification() {
     }
 
     println!("[compose_system_test] Building Docker Compose images...");
-    let build_out = guard.run_cmd(&["build"]);
+    // Build `workbench-1` (which tags `rume-workbench:test`, shared with `workbench-2`)
+    // rather than building both identical image targets concurrently in BuildKit.
+    let build_out = guard.run_cmd(&["build", "workbench-1"]);
     assert!(
         build_out.status.success(),
         "docker compose build failed: {}",
