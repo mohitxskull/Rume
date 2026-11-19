@@ -115,7 +115,15 @@ where
             propagated_cx
         };
 
+        // Why: `parent: None` makes every HTTP server request span a root in the `tracing`
+        // hierarchy instead of inheriting an ambient caller span on the current thread/task.
+        // Without `parent: None`, an unheadered request invoked under an active tracing span
+        // inherits that ambient span's OTel trace_id when `OpenTelemetryLayer` builds the span
+        // (and `span.set_parent(Context::new())` cannot override an already-resolved tracing
+        // parent if another subscriber/layer is active). Incoming W3C trace parents are attached
+        // explicitly via `span.set_parent(parent_cx)` immediately below.
         let span = tracing::info_span!(
+            parent: None,
             "http_request",
             request_id = %request_id,
             traceparent = tracing::field::Empty,
