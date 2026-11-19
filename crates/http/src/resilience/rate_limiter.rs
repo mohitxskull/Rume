@@ -361,15 +361,14 @@ where
         );
 
         // Why: `TenantLayer` resolves `Tenant` from untrusted request input (e.g. `X-Tenant-ID`)
-        // before authentication or `RateLimitLayer` runs. Keying solely by `tenant:<id>` without
+        // before authentication or `RateLimitLayer` runs. Keying by `tenant:<id>` without
         // verifying that an authenticated `AuthUser` is bound to that tenant would let an
         // unauthenticated caller exhaust a victim tenant's shared bucket (DoS) or rotate
-        // `X-Tenant-ID` across tenants to bypass their own IP rate limit. Only use the shared
-        // `tenant_auth:<len>:<id>` bucket when an authenticated `AuthUser` matches the resolved
-        // tenant; otherwise encode the anonymous tenant+client key with a disjoint prefix and
-        // length-prefixed tenant ID (`tenant_anon:<len>:<id>:<ip_key>`) so no two distinct
-        // `(tenant, client)` pairs or authenticated tenant buckets can ever collide, even when a
-        // tenant ID contains colons or ends with an IP key suffix.
+        // `X-Tenant-ID` across tenants to gain a fresh allowance per tenant and bypass their IP
+        // rate limit. Therefore, only use the shared `tenant_auth:<len>:<id>` bucket when an
+        // authenticated `AuthUser` matches the resolved tenant; all unauthenticated requests (even
+        // when a resolved `Tenant` extension is present) share one per-client IP bucket
+        // (`ip_anon:<ip_key>`) that does not reset when the resolved tenant changes.
         let authenticated_for_tenant = resolved_tenant_id.is_some_and(|tid| {
             req.extensions()
                 .get::<rume_security::auth::identity::AuthUser>()
@@ -384,8 +383,7 @@ where
 
         let client_key = match (resolved_tenant_id, authenticated_for_tenant) {
             (Some(tid), true) => format!("tenant_auth:{}:{tid}", tid.len()),
-            (Some(tid), false) => format!("tenant_anon:{}:{tid}:{ip_key}", tid.len()),
-            (None, _) => format!("ip_anon:{ip_key}"),
+            _ => format!("ip_anon:{ip_key}"),
         };
 
         Box::pin(async move {
