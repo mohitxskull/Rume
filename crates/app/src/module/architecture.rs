@@ -96,10 +96,21 @@ impl ArchitectureRules {
             }
         }
 
-        // 3. Build dependency graph and detect cycles
+        // 3. Build dependency graph and detect duplicate module names / cycles
         let mut dep_graph: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for module in modules {
-            dep_graph.insert(module.name(), module.dependencies());
+            if dep_graph
+                .insert(module.name(), module.dependencies())
+                .is_some()
+            {
+                return Err(ArchitectureViolation {
+                    rule: "duplicate_module".to_string(),
+                    details: format!(
+                        "duplicate module '{}' registered in architecture verification",
+                        module.name()
+                    ),
+                });
+            }
         }
 
         #[derive(Clone, Copy, PartialEq, Eq)]

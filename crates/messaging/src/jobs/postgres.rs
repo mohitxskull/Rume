@@ -120,12 +120,13 @@ impl JobQueue for PostgresJobQueue {
             let payload =
                 serde_json::to_vec(&job).map_err(|e| JobError::Serialization(e.to_string()))?;
 
-            let delay_ms = delay.as_millis() as i64;
-            let max_attempts = retry_policy.max_attempts as i32;
-            let initial_backoff_ms = retry_policy.initial_backoff_ms as i64;
-            let max_backoff_ms = retry_policy.max_backoff_ms as i64;
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            let max_attempts = i32::try_from(retry_policy.max_attempts).unwrap_or(i32::MAX);
+            let initial_backoff_ms =
+                i64::try_from(retry_policy.initial_backoff_ms).unwrap_or(i64::MAX);
+            let max_backoff_ms = i64::try_from(retry_policy.max_backoff_ms).unwrap_or(i64::MAX);
             let backoff_factor = retry_policy.backoff_factor;
-            let timeout_ms = timeout.map(|t| t.as_millis() as i64);
+            let timeout_ms = timeout.map(|t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
 
             let row = sqlx::query(INSERT_JOB_SQL)
                 .bind(&id)
@@ -182,7 +183,8 @@ impl JobQueue for PostgresJobQueue {
         Box::pin(async move {
             // Use database-evaluated time: lease_expires_at = clock_timestamp() + $2 ms
             // No host-clock values are bound; the DB is the sole clock authority.
-            let lease_duration_ms = self.default_lease_duration.as_millis() as i64;
+            let lease_duration_ms =
+                i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
             let new_lease_token = Uuid::new_v4().to_string();
 
             let row: Option<PgRow> = sqlx::query(JOBS_CLAIM_SQL)
@@ -278,7 +280,7 @@ impl JobQueue for PostgresJobQueue {
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let token = lease_token.to_string();
         Box::pin(async move {
-            let delay_ms = delay.as_millis() as i64;
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
 
             let res = sqlx::query(JOBS_NACK_SQL)
                 .bind(delay_ms)
@@ -307,7 +309,7 @@ impl JobQueue for PostgresJobQueue {
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let token = lease_token.to_string();
         Box::pin(async move {
-            let delay_ms = delay.as_millis() as i64;
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
 
             let res = sqlx::query(JOBS_DEFER_SQL)
                 .bind(delay_ms)
@@ -366,7 +368,7 @@ impl JobQueue for PostgresJobQueue {
         Box::pin(async move {
             // Both the new expiry and the validity check use clock_timestamp() so all
             // lease decisions are made by the database clock, not the worker clock.
-            let extension_ms = extension.as_millis() as i64;
+            let extension_ms = i64::try_from(extension.as_millis()).unwrap_or(i64::MAX);
 
             let res = sqlx::query(JOBS_RENEW_LEASE_SQL)
                 .bind(extension_ms)
@@ -500,7 +502,7 @@ impl JobQueue for PostgresJobQueue {
     }
 
     fn purge_completed(&self, retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
-        let retention_ms = retention.as_millis() as i64;
+        let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
         Box::pin(async move {
             let res = sqlx::query(JOBS_PURGE_SQL)
                 .bind(retention_ms)

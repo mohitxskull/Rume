@@ -62,7 +62,11 @@ const REGENERATE_ID_SCRIPT: &str = r#"
     if ttl > 0 then
         redis.call('SET', new_key, updated, 'PX', ttl)
     else
-        redis.call('SET', new_key, updated)
+        -- Why: if `old_key` was PERSISTed (`PTTL == -1`), writing `SET new_key updated`
+        -- without a TTL would create an immortal session key. Fall back to the session's
+        -- own remaining lifetime (min 1000ms).
+        local fallback_ttl = math.max((exp - now) * 1000, 1000)
+        redis.call('SET', new_key, updated, 'PX', fallback_ttl)
     end
     redis.call('DEL', old_key)
     return updated
@@ -208,7 +212,7 @@ impl SessionStore for RedisSessionStore {
 
             let data = match res {
                 Ok(opt) => opt,
-                Err(err) if err.to_string().contains("EXPIRED") => {
+                Err(err) if err.code() == Some("EXPIRED") => {
                     return Err(AuthError::InvalidCredentials("session expired".into()));
                 }
                 Err(err) => return Err(AuthError::ProviderError(err.to_string())),

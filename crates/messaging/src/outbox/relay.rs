@@ -16,11 +16,6 @@ use crate::outbox::message::OutboxMessage;
 use crate::outbox::repository::{BoxFuture, OutboxRepository};
 use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
 
-/// Type alias for the message dispatch callback.
-pub type MessageDispatcher = Arc<
-    dyn Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static,
->;
-
 /// Type alias for a cancellable message dispatch callback that observes a lost-lease cancellation flag.
 pub type CancellableMessageDispatcher = Arc<
     dyn Fn(&OutboxMessage, Arc<AtomicBool>) -> BoxFuture<'static, Result<(), OutboxError>>
@@ -155,7 +150,10 @@ pub struct OutboxRelay<R: OutboxRepository> {
     failed_transitions: Arc<AtomicU64>,
     total_purged: Arc<AtomicU64>,
     last_error: Arc<RwLock<Option<String>>>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    // Why: `watch::Sender<bool>` latches shutdown state (`false` -> `true`) so
+    // `start_sweeper` and `start_with_config` cannot miss a shutdown signal sent
+    // while `sweep_published` or `poll_and_dispatch` is in-flight.
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl<R: OutboxRepository> Clone for OutboxRelay<R> {
@@ -170,7 +168,7 @@ impl<R: OutboxRepository> Clone for OutboxRelay<R> {
             failed_transitions: Arc::clone(&self.failed_transitions),
             total_purged: Arc::clone(&self.total_purged),
             last_error: Arc::clone(&self.last_error),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
         }
     }
 }
@@ -192,6 +190,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         F: Fn(&OutboxMessage) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), OutboxError>> + Send + 'static,
     {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             repository,
             dispatcher: Arc::new(move |msg, _cancel| Box::pin(dispatcher(msg))),
@@ -202,7 +201,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             failed_transitions: Arc::new(AtomicU64::new(0)),
             total_purged: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
         }
     }
 
@@ -213,6 +212,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         F: Fn(&OutboxMessage, Arc<AtomicBool>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Result<(), OutboxError>> + Send + 'static,
     {
+        let (shutdown_tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             repository,
             dispatcher: Arc::new(move |msg, cancel| Box::pin(dispatcher(msg, cancel))),
@@ -223,7 +223,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             failed_transitions: Arc::new(AtomicU64::new(0)),
             total_purged: Arc::new(AtomicU64::new(0)),
             last_error: Arc::new(RwLock::new(None)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
         }
     }
 
@@ -447,8 +447,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// Spawns a background maintenance sweeper that periodically purges old published outbox rows.
     pub fn start_sweeper(&self, config: OutboxSweeperConfig) -> tokio::task::JoinHandle<()> {
         let relay = self.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
-            while !relay.is_stopping.load(Ordering::Relaxed) {
+            while !*shutdown_rx.borrow() {
                 if let Err(err) = relay
                     .sweep_published(config.retention_secs, config.batch_size)
                     .await
@@ -456,8 +457,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     tracing::error!(error = %err, "Outbox background sweeper encountered an error");
                 }
                 tokio::select! {
+                    biased;
+                    _ = shutdown_rx.wait_for(|&stopped| stopped) => { break; }
                     _ = sleep(config.interval) => {},
-                    _ = relay.shutdown_notify.notified() => { break; }
                 }
             }
         })
@@ -481,10 +483,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// To monitor operational health, inspect [`OutboxRelay::status`] or register [`OutboxRelay::health_check`].
     pub fn start_with_config(&self) -> tokio::task::JoinHandle<()> {
         let relay = self.clone();
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         tokio::spawn(async move {
             let interval = relay.config.poll_interval;
             let batch = relay.config.batch_size;
-            while !relay.is_stopping.load(Ordering::Relaxed) {
+            while !*shutdown_rx.borrow() {
                 match relay.poll_and_dispatch(batch).await {
                     Ok(res) => {
                         relay.consecutive_errors.store(0, Ordering::SeqCst);
@@ -510,8 +513,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     }
                 }
                 tokio::select! {
+                    biased;
+                    _ = shutdown_rx.wait_for(|&stopped| stopped) => { break; }
                     _ = sleep(interval) => {},
-                    _ = relay.shutdown_notify.notified() => { break; }
                 }
             }
         })
@@ -545,7 +549,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// checking pending count or dispatching messages.
     pub async fn try_drain(&self, timeout: Duration) -> Result<bool, OutboxError> {
         self.is_stopping.store(true, Ordering::SeqCst);
-        self.shutdown_notify.notify_waiters();
+        let _ = self.shutdown_tx.send(true);
         let start = std::time::Instant::now();
         let deadline = start + timeout;
 
@@ -581,7 +585,12 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             }
             let remaining = deadline.saturating_duration_since(now);
 
-            let res = match tokio::time::timeout(remaining, self.poll_and_dispatch(50)).await {
+            let res = match tokio::time::timeout(
+                remaining,
+                self.poll_and_dispatch(self.config.batch_size),
+            )
+            .await
+            {
                 Ok(Ok(res)) => res,
                 Ok(Err(err)) => return Err(err),
                 Err(_) => {

@@ -44,6 +44,14 @@ pub fn make_migration(name: Option<String>) {
         })
         .collect();
     let clean_name = clean_name.trim_matches('_');
+    if clean_name.is_empty() {
+        eprintln!(
+            "{}",
+            style("error: migration name must contain at least one ASCII alphanumeric character")
+                .red()
+        );
+        std::process::exit(1);
+    }
 
     let timestamp = chrono::Utc::now().format("%Y%m%d_%H%M%S").to_string();
     let migration_id = format!("{timestamp}_{clean_name}");

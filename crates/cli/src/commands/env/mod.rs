@@ -14,10 +14,6 @@ pub fn run(command: EnvCommands) {
             let fmt = if json { "json" } else { &format };
             check::run(all, unredacted, fmt);
         }
-        EnvCommands::Explain {
-            key,
-            unredacted,
-            json,
-        } => explain::run(&key, unredacted, json),
+        EnvCommands::Explain { key, json } => explain::run(&key, json),
     }
 }

@@ -17,10 +17,11 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
         return false;
     }
     let normalized = name.to_ascii_lowercase().replace('-', "_");
+    // Rust 2024 reserved keywords (lowercased; `Self` is unreachable after lowercasing).
     const RESERVED_KEYWORDS: &[&str] = &[
         "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
+        "for", "gen", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+        "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "unsafe",
         "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
         "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
     ];

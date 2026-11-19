@@ -51,19 +51,6 @@ impl<T: OpenApiRoute> OpenApiRouteSource for Vec<T> {
     }
 }
 
-fn extract_path_params(path: &str) -> Vec<String> {
-    let mut params = Vec::new();
-    for segment in path.split('/') {
-        let segment = segment.trim();
-        if segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2 {
-            params.push(segment[1..segment.len() - 1].to_string());
-        } else if let Some(stripped) = segment.strip_prefix(':').filter(|s| !s.is_empty()) {
-            params.push(stripped.to_string());
-        }
-    }
-    params
-}
-
 /// API metadata for the OpenAPI document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpenApiInfo {
@@ -361,6 +348,7 @@ pub type OpenApiResponses = BTreeMap<String, OpenApiResponse>;
 
 /// Operation object describing an endpoint and method.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenApiOperation {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operation_id: Option<String>,
@@ -431,14 +419,20 @@ pub fn generate_openapi<S: OpenApiRouteSource + ?Sized>(
     let mut paths: BTreeMap<String, OpenApiPathItem> = BTreeMap::new();
 
     for route in source.openapi_routes() {
-        // Standardize path: convert `:id` to `{id}` if present
+        // Standardize path segment-by-segment: convert `:id` to `{id}` without
+        // corrupting prefix-sharing segments like `:id_ext` -> `{id}_ext`.
         let route_path = route.path();
-        let mut openapi_path = route_path.to_string();
-        for param in extract_path_params(route_path) {
-            let colon_form = format!(":{param}");
-            let brace_form = format!("{{{param}}}");
-            openapi_path = openapi_path.replace(&colon_form, &brace_form);
-        }
+        let openapi_path = route_path
+            .split('/')
+            .map(|seg| {
+                if let Some(name) = seg.strip_prefix(':') {
+                    format!("{{{name}}}")
+                } else {
+                    seg.to_string()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
 
         let mut parameters = Vec::new();
         for param in route.params() {
@@ -574,5 +568,30 @@ pub fn generate_openapi<S: OpenApiRouteSource + ?Sized>(
         info,
         paths,
         components,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::routing::{RouteRegistry, RouteSpec};
+
+    #[test]
+    fn openapi_uses_camelcase_operation_fields_and_segment_colon_conversion() {
+        let mut reg = RouteRegistry::new();
+        reg.register(
+            RouteSpec::post("/users/:id/items/:id_ext")
+                .r#as("users.items.create")
+                .with_request_schema(OpenApiSchema::string())
+                .into_route_info(),
+        );
+        let spec = generate_openapi(&reg, OpenApiInfo::new("Test", "1.0.0"));
+        assert!(spec.paths.contains_key("/users/{id}/items/{id_ext}"));
+        let json = spec.to_json_value();
+        let op = &json["paths"]["/users/{id}/items/{id_ext}"]["post"];
+        assert!(op.get("operationId").is_some());
+        assert!(op.get("requestBody").is_some());
+        assert!(op.get("operation_id").is_none());
+        assert!(op.get("request_body").is_none());
     }
 }

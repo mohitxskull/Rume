@@ -1,4 +1,4 @@
-//! Tenant resolution strategies (headers, subdomains, path prefixes).
+//! Tenant resolution strategies (headers and subdomains).
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -55,11 +55,11 @@ impl HeaderTenantResolver {
         let mut id_map = self
             .by_id
             .write()
-            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
         let mut slug_map = self
             .by_slug
             .write()
-            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
 
         if let Some(existing) = slug_map.get(&tenant.slug)
             && existing.id != tenant.id
@@ -127,7 +127,9 @@ impl TenantResolver for HeaderTenantResolver {
             };
 
             let Ok(key) = header_val.to_str() else {
-                return Err(TenantError::ResolverError("malformed tenant header".into()));
+                return Err(TenantError::InvalidIdentifier(
+                    "malformed tenant header".into(),
+                ));
             };
 
             // Why: Look up by ID first, falling back to slug lookup only if not found in by_id,
@@ -136,7 +138,7 @@ impl TenantResolver for HeaderTenantResolver {
                 let id_map = self
                     .by_id
                     .read()
-                    .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
                 id_map.get(key).cloned()
             };
 
@@ -147,7 +149,7 @@ impl TenantResolver for HeaderTenantResolver {
             let slug_map = self
                 .by_slug
                 .read()
-                .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
 
             if let Some(tenant) = slug_map.get(key) {
                 Ok(Some(tenant.clone()))
@@ -168,8 +170,13 @@ pub struct SubdomainTenantResolver {
 impl SubdomainTenantResolver {
     /// Creates a new subdomain resolver for the given base domain.
     pub fn new(base_domain: impl Into<String>) -> Self {
+        let normalized = base_domain
+            .into()
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         Self {
-            base_domain: base_domain.into(),
+            base_domain: normalized,
             tenants: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -179,7 +186,7 @@ impl SubdomainTenantResolver {
         let mut map = self
             .tenants
             .write()
-            .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
         if let Some(existing) = map.get(&tenant.slug)
             && existing.id != tenant.id
         {
@@ -207,16 +214,24 @@ impl TenantResolver for SubdomainTenantResolver {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
         Box::pin(async move {
-            let Some(host_val) = parts.headers.get(HOST) else {
+            // Why: HTTP/1.1 sends the `Host` header, while HTTP/2 requests carry
+            // the target authority in `:authority` (`parts.uri.authority()`).
+            let raw_host = if let Some(host_val) = parts.headers.get(HOST) {
+                let Ok(host_str) = host_val.to_str() else {
+                    return Err(TenantError::InvalidIdentifier(
+                        "malformed host header".into(),
+                    ));
+                };
+                host_str
+            } else if let Some(authority) = parts.uri.authority() {
+                authority.as_str()
+            } else {
                 return Ok(None);
             };
 
-            let Ok(host_str) = host_val.to_str() else {
-                return Err(TenantError::ResolverError("malformed host header".into()));
-            };
-
-            // Convert host to lowercase and remove optional port: "ACME.myplatform.com:8080" -> "acme.myplatform.com", "[::1]:8080" -> "[::1]"
-            let host_lower = host_str.to_ascii_lowercase();
+            // Convert host to lowercase, remove optional port, and strip trailing FQDN dot:
+            // "ACME.myplatform.com.:8080" -> "acme.myplatform.com"
+            let host_lower = raw_host.to_ascii_lowercase();
             let host_no_port = if host_lower.starts_with('[') {
                 if let Some(bracket_end) = host_lower.find(']') {
                     &host_lower[1..bracket_end]
@@ -226,6 +241,7 @@ impl TenantResolver for SubdomainTenantResolver {
             } else {
                 host_lower.split(':').next().unwrap_or(&host_lower)
             };
+            let host_normalized = host_no_port.trim_end_matches('.');
 
             // Why: Normalizing base_domain to guarantee a leading dot (".{base_domain}") ensures that
             // host.strip_suffix matches strictly on a DNS label boundary. Without the leading dot,
@@ -236,7 +252,7 @@ impl TenantResolver for SubdomainTenantResolver {
                 format!(".{}", self.base_domain)
             };
 
-            if let Some(subdomain) = host_no_port.strip_suffix(&normalized_base) {
+            if let Some(subdomain) = host_normalized.strip_suffix(&normalized_base) {
                 // Why: A tenant subdomain must be a single DNS label. Subdomains containing dots
                 // (e.g. "attacker.acme.app.platform.io") represent nested domain delegations that must
                 // not be treated as a composite slug.
@@ -252,7 +268,7 @@ impl TenantResolver for SubdomainTenantResolver {
                 let map = self
                     .tenants
                     .read()
-                    .map_err(|e| TenantError::ResolverError(e.to_string()))?;
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
 
                 if let Some(tenant) = map.get(subdomain) {
                     return Ok(Some(tenant.clone()));
@@ -388,5 +404,19 @@ mod tests {
 
         let res = resolver.resolve(&parts).await.expect("resolution ok");
         assert_eq!(res, Some(tenant1));
+    }
+
+    #[tokio::test]
+    async fn subdomain_resolver_handles_mixed_case_base_http2_authority_and_fqdn_dot() {
+        let tenant = Tenant::new("t-1", "acme");
+        let resolver = SubdomainTenantResolver::new("MyPlatform.COM.").add_tenant(tenant.clone());
+
+        // HTTP/2 :authority without Host header + trailing FQDN dot
+        let (parts_h2, _) = Request::builder()
+            .uri("https://ACME.myplatform.com.:443/api/items")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(resolver.resolve(&parts_h2).await.unwrap(), Some(tenant));
     }
 }

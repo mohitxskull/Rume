@@ -68,7 +68,6 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
     }
 
     let mut out = String::with_capacity(input.len());
-    let mut in_tag = false;
     let mut tag_name = String::new();
     let mut pending_separator = false;
 
@@ -77,46 +76,73 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
     while i < chars.len() {
         let ch = chars[i];
         if ch == '<' {
-            in_tag = true;
-            tag_name.clear();
-            i += 1;
-            if i < chars.len() && chars[i] == '/' {
-                i += 1;
+            // Why: an HTML/XML tag starts with `<` followed by an ASCII letter,
+            // `/`, `!`, or `?`, and ends at the first unquoted `>` before any
+            // nested unquoted `<`. Scanning ahead with these rules prevents
+            // premature termination on `>` inside quoted attributes (e.g.
+            // `<a title="a > b">`) and preserves literal `<` in prose (e.g.
+            // `"Price < 100 USD"` or `"<p>Price < 100 USD</p>"`).
+            let looks_like_tag = chars
+                .get(i + 1)
+                .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'));
+            let mut j = i + 1;
+            let mut quote: Option<char> = None;
+            let mut found_close = false;
+            if looks_like_tag {
+                while j < chars.len() {
+                    let c = chars[j];
+                    if let Some(q) = quote {
+                        if c == q {
+                            quote = None;
+                        }
+                    } else if c == '"' || c == '\'' {
+                        quote = Some(c);
+                    } else if c == '<' {
+                        break;
+                    } else if c == '>' {
+                        found_close = true;
+                        break;
+                    }
+                    j += 1;
+                }
             }
-            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == ':') {
-                tag_name.push(chars[i].to_ascii_lowercase());
-                i += 1;
-            }
-            let is_block_tag = matches!(
-                tag_name.as_str(),
-                "p" | "div"
-                    | "h1"
-                    | "h2"
-                    | "h3"
-                    | "h4"
-                    | "h5"
-                    | "h6"
-                    | "br"
-                    | "hr"
-                    | "li"
-                    | "ul"
-                    | "ol"
-                    | "tr"
-                    | "td"
-                    | "th"
-                    | "blockquote"
-                    | "pre"
-                    | "article"
-                    | "section"
-                    | "header"
-                    | "footer"
-                    | "nav"
-            );
-            while i < chars.len() && chars[i] != '>' {
-                i += 1;
-            }
-            if i < chars.len() && chars[i] == '>' {
-                in_tag = false;
+
+            if found_close {
+                let mut name_idx = i + 1;
+                if name_idx < j && chars[name_idx] == '/' {
+                    name_idx += 1;
+                }
+                tag_name.clear();
+                while name_idx < j && (chars[name_idx].is_alphanumeric() || chars[name_idx] == ':')
+                {
+                    tag_name.push(chars[name_idx].to_ascii_lowercase());
+                    name_idx += 1;
+                }
+                let is_block_tag = matches!(
+                    tag_name.as_str(),
+                    "p" | "div"
+                        | "h1"
+                        | "h2"
+                        | "h3"
+                        | "h4"
+                        | "h5"
+                        | "h6"
+                        | "br"
+                        | "hr"
+                        | "li"
+                        | "ul"
+                        | "ol"
+                        | "tr"
+                        | "td"
+                        | "th"
+                        | "blockquote"
+                        | "pre"
+                        | "article"
+                        | "section"
+                        | "header"
+                        | "footer"
+                        | "nav"
+                );
                 if is_block_tag {
                     if !out.is_empty() && !out.ends_with(' ') {
                         out.push(' ');
@@ -125,63 +151,58 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
                 } else {
                     pending_separator = true;
                 }
-                i += 1;
+                i = j + 1;
+                continue;
             }
-            continue;
         }
 
-        if !in_tag {
-            if ch == '&' {
-                let mut entity = String::new();
-                let mut j = i + 1;
-                while j < chars.len()
-                    && j - i < 10
-                    && chars[j] != ';'
-                    && !chars[j].is_whitespace()
-                    && chars[j] != '<'
-                {
-                    entity.push(chars[j]);
-                    j += 1;
-                }
-                if j < chars.len() && chars[j] == ';' {
-                    let decoded_char = match entity.as_str() {
-                        "amp" => Some('&'),
-                        "lt" => Some('<'),
-                        "gt" => Some('>'),
-                        "quot" => Some('"'),
-                        "#39" | "#x27" | "apos" => Some('\''),
-                        "nbsp" => Some(' '),
-                        _ => None,
-                    };
-                    if let Some(dec) = decoded_char {
-                        if pending_separator {
-                            let prev_is_alnum =
-                                out.chars().last().is_some_and(|c| c.is_alphanumeric());
-                            if prev_is_alnum && dec.is_alphanumeric() && !out.ends_with(' ') {
-                                out.push(' ');
-                            }
-                            pending_separator = false;
+        if ch == '&' {
+            let mut entity = String::new();
+            let mut j = i + 1;
+            while j < chars.len()
+                && j - i < 10
+                && chars[j] != ';'
+                && !chars[j].is_whitespace()
+                && chars[j] != '<'
+            {
+                entity.push(chars[j]);
+                j += 1;
+            }
+            if j < chars.len() && chars[j] == ';' {
+                let decoded_char = match entity.as_str() {
+                    "amp" => Some('&'),
+                    "lt" => Some('<'),
+                    "gt" => Some('>'),
+                    "quot" => Some('"'),
+                    "#39" | "#x27" | "apos" => Some('\''),
+                    "nbsp" => Some(' '),
+                    _ => None,
+                };
+                if let Some(dec) = decoded_char {
+                    if pending_separator {
+                        let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+                        if prev_is_alnum && dec.is_alphanumeric() && !out.ends_with(' ') {
+                            out.push(' ');
                         }
-                        out.push(dec);
-                        i = j + 1;
-                        continue;
+                        pending_separator = false;
                     }
+                    out.push(dec);
+                    i = j + 1;
+                    continue;
                 }
             }
-
-            if pending_separator {
-                let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
-                if prev_is_alnum && ch.is_alphanumeric() && !out.ends_with(' ') {
-                    out.push(' ');
-                }
-                pending_separator = false;
-            }
-
-            out.push(ch);
-            i += 1;
-        } else {
-            i += 1;
         }
+
+        if pending_separator {
+            let prev_is_alnum = out.chars().last().is_some_and(|c| c.is_alphanumeric());
+            if prev_is_alnum && ch.is_alphanumeric() && !out.ends_with(' ') {
+                out.push(' ');
+            }
+            pending_separator = false;
+        }
+
+        out.push(ch);
+        i += 1;
     }
 
     if out.ends_with(' ') {
@@ -257,5 +278,13 @@ mod tests {
     fn excerpt_strips_and_truncates() {
         let html = "<div><h1>Hello World</h1><p>This is a paragraph.</p></div>";
         assert_eq!(excerpt(html, 15), "Hello World...");
+    }
+
+    #[test]
+    fn strip_html_tags_handles_quoted_gt_and_unclosed_lt() {
+        assert_eq!(strip_html_tags(r#"<a title="a > b">Click</a>"#), "Click");
+        assert_eq!(strip_html_tags("<a title='x > y'>Link</a>"), "Link");
+        assert_eq!(strip_html_tags("Price < 100 USD"), "Price < 100 USD");
+        assert_eq!(strip_html_tags("<p>Price < 100 USD</p>"), "Price < 100 USD");
     }
 }

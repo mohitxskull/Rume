@@ -5,7 +5,7 @@
 
 use rume::env::{ResolvedEnv, is_secret_key, redact_value};
 
-pub fn run(key: &str, unredacted: bool, json: bool) {
+pub fn run(key: &str, json: bool) {
     let resolved = match ResolvedEnv::load() {
         Ok(r) => r,
         Err(err) => {
@@ -88,12 +88,6 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
     println!("  Highest priority wins.");
     if is_secret {
         println!();
-        if unredacted {
-            println!(
-                "Note: this value is treated as a secret; secret values are always redacted by policy even with --unredacted."
-            );
-        } else {
-            println!("Note: this value is treated as a secret and is redacted in output.");
-        }
+        println!("Note: this value is treated as a secret and is redacted in output.");
     }
 }

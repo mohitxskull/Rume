@@ -214,31 +214,7 @@ where
 
         let is_https = config.native_tls
             || req.uri().scheme() == Some(&axum::http::uri::Scheme::HTTPS)
-            || (proxy_trusted
-                && (req
-                    .headers()
-                    .get("x-forwarded-proto")
-                    .and_then(|v| v.to_str().ok())
-                    .map(|v| v.trim().eq_ignore_ascii_case("https"))
-                    .unwrap_or(false)
-                    || req
-                        .headers()
-                        .get("forwarded")
-                        .and_then(|v| v.to_str().ok())
-                        .map(|v| {
-                            v.split([';', ',']).any(|part| {
-                                if let Some((k, val)) = part.trim().split_once('=') {
-                                    k.trim().eq_ignore_ascii_case("proto")
-                                        && val
-                                            .trim()
-                                            .trim_matches('"')
-                                            .eq_ignore_ascii_case("https")
-                                } else {
-                                    false
-                                }
-                            })
-                        })
-                        .unwrap_or(false)));
+            || (proxy_trusted && forwarded_headers_indicate_https(req.headers()));
 
         Box::pin(async move {
             let mut response = inner.call(req).await?;
@@ -291,6 +267,106 @@ where
 
             Ok(response)
         })
+    }
+}
+
+/// Checks whether reverse-proxy `X-Forwarded-Proto` or RFC 7239 `Forwarded`
+/// headers indicate HTTPS on the rightmost (closest trusted proxy) hop.
+///
+/// Why: per RFC 9110 §5.3, multiple header lines are folded in order so the
+/// closest trusted proxy appends at the end; evaluating only the first header
+/// or any hop (`.any(...)`) lets a client spoof `proto=https` in an earlier hop
+/// or inside a quoted `Forwarded` parameter value (e.g. `host="a;proto=https"`).
+fn forwarded_headers_indicate_https(headers: &axum::http::HeaderMap) -> bool {
+    // 1. Check rightmost non-empty value across all `X-Forwarded-Proto` headers.
+    let mut xfp_rightmost: Option<&str> = None;
+    for val in headers.get_all("x-forwarded-proto") {
+        if let Ok(s) = val.to_str() {
+            for part in s.split(',') {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    xfp_rightmost = Some(trimmed);
+                }
+            }
+        }
+    }
+    if xfp_rightmost.is_some_and(|p| p.eq_ignore_ascii_case("https")) {
+        return true;
+    }
+
+    // 2. Check rightmost RFC 7239 `Forwarded` element across all `Forwarded` headers.
+    let mut rightmost_element: Option<&str> = None;
+    for val in headers.get_all("forwarded") {
+        if let Ok(s) = val.to_str() {
+            for elem in split_unquoted(s, ',') {
+                let trimmed = elem.trim();
+                if !trimmed.is_empty() {
+                    rightmost_element = Some(trimmed);
+                }
+            }
+        }
+    }
+    if let Some(elem) = rightmost_element {
+        for param in split_unquoted(elem, ';') {
+            if let Some((k, raw_v)) = param.trim().split_once('=')
+                && k.trim().eq_ignore_ascii_case("proto")
+            {
+                let v = unquote_rfc7239(raw_v.trim());
+                return v.eq_ignore_ascii_case("https");
+            }
+        }
+    }
+
+    false
+}
+
+/// Splits `input` by `delim` while ignoring delimiters inside double-quoted strings
+/// (respecting `\"` and `\\` escapes per RFC 7239 / RFC 9110).
+fn split_unquoted(input: &str, delim: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut start = 0;
+
+    for (idx, ch) in input.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes {
+            if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_quotes = false;
+            }
+        } else if ch == '"' {
+            in_quotes = true;
+        } else if ch == delim {
+            parts.push(&input[start..idx]);
+            start = idx + ch.len_utf8();
+        }
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn unquote_rfc7239(raw: &str) -> String {
+    if let Some(inner) = raw.strip_prefix('"').and_then(|s| s.strip_suffix('"')) {
+        let mut out = String::with_capacity(inner.len());
+        let mut escaped = false;
+        for ch in inner.chars() {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    } else {
+        raw.to_string()
     }
 }
 
@@ -352,5 +428,47 @@ mod tests {
 
         let res3 = service.call(req3).await.unwrap();
         assert!(res3.headers().contains_key("strict-transport-security"));
+    }
+
+    #[test]
+    fn forwarded_header_parsing_respects_quotes_and_rightmost_hop() {
+        let mut h1 = axum::http::HeaderMap::new();
+        h1.append(
+            "forwarded",
+            HeaderValue::from_static(r#"for=192.0.2.60;host="a;proto=https""#),
+        );
+        assert!(
+            !forwarded_headers_indicate_https(&h1),
+            "proto=https inside quoted host parameter must not be treated as HTTPS"
+        );
+
+        let mut h2 = axum::http::HeaderMap::new();
+        h2.append(
+            "forwarded",
+            HeaderValue::from_static("proto=https, for=10.0.0.1;proto=http"),
+        );
+        assert!(
+            !forwarded_headers_indicate_https(&h2),
+            "earlier hop proto=https must not override rightmost hop proto=http"
+        );
+
+        let mut h3 = axum::http::HeaderMap::new();
+        h3.append("x-forwarded-proto", HeaderValue::from_static("https"));
+        h3.append("x-forwarded-proto", HeaderValue::from_static("http"));
+        assert!(
+            !forwarded_headers_indicate_https(&h3),
+            "rightmost X-Forwarded-Proto header wins"
+        );
+
+        let mut h4 = axum::http::HeaderMap::new();
+        h4.append(
+            "forwarded",
+            HeaderValue::from_static("for=10.0.0.1;proto=http"),
+        );
+        h4.append(
+            "forwarded",
+            HeaderValue::from_static(r#"for=10.0.0.2;host="x,y";proto="https""#),
+        );
+        assert!(forwarded_headers_indicate_https(&h4));
     }
 }

@@ -55,7 +55,7 @@ impl Session {
             tenant_id: None,
             roles: Vec::new(),
             permissions: Vec::new(),
-            expires_at: current_timestamp() + ttl_secs,
+            expires_at: current_timestamp().saturating_add(ttl_secs),
             data: BTreeMap::new(),
         }
     }
@@ -101,28 +101,13 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Invalidates and removes a session.
     fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>>;
 
-    /// Rotates a session identifier to prevent session fixation, copying existing data to the new ID and deleting the old ID.
-    fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>> {
-        Box::pin(async move {
-            let existing = self.load(old_id).await?.ok_or_else(|| {
-                AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
-            })?;
-            let new_session = Session {
-                id: uuid::Uuid::new_v4().to_string(),
-                user_id: existing.user_id,
-                tenant_id: existing.tenant_id.clone(),
-                roles: existing.roles,
-                permissions: existing.permissions,
-                data: existing.data,
-                expires_at: existing.expires_at,
-            };
-            self.save(new_session.clone()).await?;
-            if let Err(err) = self.destroy(old_id).await {
-                tracing::warn!(error = %err, old_id = %old_id, "Failed to destroy old session during id regeneration");
-            }
-            Ok(new_session)
-        })
-    }
+    /// Atomically rotates a session identifier to prevent session fixation, copying existing data
+    /// to the new ID and deleting the old ID.
+    ///
+    /// Why: required trait method (no default `load -> save -> destroy` body) because a
+    /// non-atomic default permits logout resurrection (TOCTOU) and leaves pre-rotation IDs valid
+    /// if `destroy` fails.
+    fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>>;
 }
 
 /// Thread-safe in-memory session store suitable for testing and single-instance deployments.
@@ -142,22 +127,32 @@ impl SessionStore for InMemorySessionStore {
     fn load(&self, id: &str) -> BoxFuture<'_, Result<Option<Session>, AuthError>> {
         let id = id.to_string();
         Box::pin(async move {
-            let map = self.sessions.read().await;
-            if let Some(session) = map.get(&id) {
-                if session.is_expired() {
-                    Ok(None)
+            let expired = {
+                let map = self.sessions.read().await;
+                if let Some(session) = map.get(&id) {
+                    if session.is_expired() {
+                        true
+                    } else {
+                        return Ok(Some(session.clone()));
+                    }
                 } else {
-                    Ok(Some(session.clone()))
+                    return Ok(None);
                 }
-            } else {
-                Ok(None)
+            };
+            if expired {
+                let mut map = self.sessions.write().await;
+                if map.get(&id).is_some_and(Session::is_expired) {
+                    map.remove(&id);
+                }
             }
+            Ok(None)
         })
     }
 
     fn save(&self, session: Session) -> BoxFuture<'_, Result<(), AuthError>> {
         Box::pin(async move {
             let mut map = self.sessions.write().await;
+            map.retain(|_, s| !s.is_expired());
             map.insert(session.id.clone(), session);
             Ok(())
         })
@@ -179,18 +174,20 @@ impl SessionStore for InMemorySessionStore {
         let old_id = old_id.to_string();
         Box::pin(async move {
             let mut map = self.sessions.write().await;
-            let existing = map
-                .get(&old_id)
-                .ok_or_else(|| {
-                    AuthError::InvalidCredentials("cannot regenerate nonexistent session".into())
-                })?
-                .clone();
+            let Some(existing) = map.get(&old_id).cloned() else {
+                return Err(AuthError::InvalidCredentials(
+                    "cannot regenerate nonexistent session".into(),
+                ));
+            };
 
             if existing.is_expired() {
+                map.remove(&old_id);
                 return Err(AuthError::InvalidCredentials(
                     "cannot regenerate expired session".into(),
                 ));
             }
+
+            map.retain(|_, s| !s.is_expired());
 
             let new_session = Session {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -205,5 +202,26 @@ impl SessionStore for InMemorySessionStore {
             map.remove(&old_id);
             Ok(new_session)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn in_memory_session_store_evicts_expired_sessions() {
+        let store = InMemorySessionStore::new();
+        let mut expired = Session::new("s-old", "u1", 0);
+        expired.expires_at = 0;
+        store.save(expired).await.unwrap();
+        assert!(store.load("s-old").await.unwrap().is_none());
+        assert_eq!(store.sessions.read().await.len(), 0);
+    }
+
+    #[test]
+    fn session_new_saturates_expiry_on_overflow() {
+        let s = Session::new("s1", "u1", u64::MAX);
+        assert_eq!(s.expires_at, u64::MAX);
     }
 }

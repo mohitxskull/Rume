@@ -1000,7 +1000,7 @@ impl Migrator {
         }
 
         if dialect == "sqlite" {
-            let tx = backend.begin_transaction().await?;
+            let tx = backend.begin_immediate_transaction().await?;
             // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
             tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;
@@ -1216,7 +1216,7 @@ impl Migrator {
         }
 
         if dialect == "sqlite" {
-            let tx = backend.begin_transaction().await?;
+            let tx = backend.begin_immediate_transaction().await?;
             // Set PRAGMA busy_timeout on the exact transaction connection rather than an arbitrary pooled connection.
             tx.execute(SQLITE_BUSY_TIMEOUT).await?;
             tx.execute(ddl).await?;

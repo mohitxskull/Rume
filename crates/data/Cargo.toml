@@ -22,6 +22,7 @@ deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 proptest.workspace = true
 sqlparser.workspace = true
 

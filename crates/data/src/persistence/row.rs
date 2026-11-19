@@ -44,7 +44,19 @@ impl FromDbValue for i64 {
             DbValue::Text(s) => s
                 .parse::<i64>()
                 .map_err(|e| decode_error(format!("failed to parse '{s}' as i64: {e}"))),
-            DbValue::Float(f) => Ok(*f as i64),
+            DbValue::Float(f) => {
+                // Why: `f64 as i64` silently saturates `NaN` to `0` and
+                // `Inf`/out-of-range floats to `i64::MIN`/`i64::MAX`. Reject
+                // non-finite and out-of-range floats explicitly, matching `u64`.
+                // Note: `i64::MAX as f64` rounds up to `2^63` (`9223372036854775808.0`),
+                // so the strict upper bound is `*f >= 9223372036854775808.0`.
+                if !f.is_finite() || *f < (i64::MIN as f64) || *f >= 9_223_372_036_854_775_808.0 {
+                    return Err(decode_error(format!(
+                        "float value {f} out of range for i64"
+                    )));
+                }
+                Ok(*f as i64)
+            }
             DbValue::Bool(b) => Ok(if *b { 1 } else { 0 }),
             DbValue::Null => Err(decode_error(
                 "cannot convert NULL database value to non-nullable i64",
@@ -481,5 +493,25 @@ mod tests {
         assert_decode_err(row.get::<bool>("raw_bytes"), "raw_bytes");
         assert_decode_err(row.get::<Vec<u8>>("int_col"), "int_col");
         assert_decode_err(row.get_opt::<Vec<u8>>("int_col"), "int_col");
+    }
+
+    #[test]
+    fn i64_rejects_non_finite_and_out_of_range_floats() {
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e30,
+            -1e30,
+            9_223_372_036_854_775_808.0,
+        ] {
+            let err = i64::from_db_value(&DbValue::Float(bad));
+            assert!(
+                matches!(err, Err(PersistenceError::DecodeError { .. })),
+                "expected DecodeError for float {bad}, got {err:?}"
+            );
+        }
+        assert_eq!(i64::from_db_value(&DbValue::Float(42.0)).unwrap(), 42);
+        assert_eq!(i64::from_db_value(&DbValue::Float(-42.0)).unwrap(), -42);
     }
 }

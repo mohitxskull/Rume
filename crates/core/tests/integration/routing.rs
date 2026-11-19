@@ -174,16 +174,19 @@ async fn route_registry_metadata_is_correct() {
 
 #[tokio::test]
 async fn route_group_applies_prefix() {
-    async fn handler() {}
+    async fn handler() -> &'static str {
+        "ok"
+    }
 
     let group = RouteGroup::<()>::new()
         .prefix("/api")
         .add("/users", get(handler))
         .add("posts", get(handler));
 
-    let router = group.build();
-    // Router builds without panicking; prefix normalization covered by unit tests.
-    let _ = router;
+    let app = TestApp::new(group.build());
+    assert_eq!(app.get("/api/users").await.status(), StatusCode::OK);
+    assert_eq!(app.get("/api/posts").await.status(), StatusCode::OK);
+    assert_eq!(app.get("/users").await.status(), StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

@@ -127,13 +127,19 @@ impl<S: Clone + Send + Sync + 'static> RouteGroup<S> {
     pub fn resource(mut self, resource: Resource<S>) -> Self {
         for r in resource.routes() {
             let full_path = join_path(&self.prefix, &r.path);
+            let mut params = crate::routing::registry::extract_path_params(&full_path);
+            for p in &r.params {
+                if !params.contains(p) {
+                    params.push(p.clone());
+                }
+            }
             let sub_router = Router::new().route(&full_path, r.router.clone());
             sub_router.clear_registry();
             sub_router.record_route(RouteInfo {
                 method: r.method.clone(),
                 path: full_path,
                 name: Some(r.name.clone()),
-                params: r.params.clone(),
+                params,
                 matchers: Vec::new(),
                 request_schema: None,
             });

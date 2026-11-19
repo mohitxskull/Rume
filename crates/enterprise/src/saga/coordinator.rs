@@ -48,6 +48,9 @@ pub enum SagaStatus {
     CompensationFailed {
         error: SagaError,
         compensation_error: SagaError,
+        /// All compensation errors encountered during rollback, in execution order.
+        #[serde(default)]
+        compensation_errors: Vec<SagaError>,
     },
 }
 
@@ -81,12 +84,23 @@ pub struct SagaRecord {
     pub compensated_steps: Vec<String>,
     /// Epoch timestamp (in seconds) of the last status update.
     pub updated_at: u64,
+    /// Monotonically increasing optimistic concurrency version for CAS updates.
+    #[serde(default)]
+    pub version: u64,
 }
 
 /// Storage contract for persisting saga execution records and state transitions.
 pub trait SagaStore: Send + Sync + 'static {
-    /// Saves or updates a saga execution record.
-    fn save_record(&self, record: &SagaRecord) -> BoxFuture<'_, Result<(), SagaError>>;
+    /// Atomically saves or updates a saga execution record if and only if the
+    /// persisted record's `version` equals `expected_version` (`0` for a new record).
+    ///
+    /// Why: blind last-write-wins overwrites allow two concurrent recovery workers
+    /// to interleave forward steps and compensations on the same `saga_id`.
+    fn save_record_cas(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+    ) -> BoxFuture<'_, Result<(), SagaError>>;
 
     /// Loads a saga execution record by its unique ID.
     fn load_record(&self, saga_id: &str) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>>;
@@ -99,6 +113,7 @@ pub trait SagaStore: Send + Sync + 'static {
 #[derive(Debug, Clone, Default)]
 pub struct InMemorySagaStore {
     records: Arc<RwLock<HashMap<String, SagaRecord>>>,
+    max_retained_terminal: Option<usize>,
 }
 
 impl InMemorySagaStore {
@@ -106,15 +121,65 @@ impl InMemorySagaStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Caps the number of terminal saga records retained in memory, evicting
+    /// the oldest terminal records when the limit is exceeded.
+    pub fn with_max_retained_terminal(mut self, max: usize) -> Self {
+        self.max_retained_terminal = Some(max);
+        self
+    }
+
+    /// Prunes terminal saga records beyond `max_retained` (keeping the newest by
+    /// `updated_at`), returning the number of evicted records.
+    pub async fn prune_terminal(&self, max_retained: usize) -> usize {
+        let mut map = self.records.write().await;
+        Self::prune_terminal_locked(&mut map, max_retained)
+    }
+
+    fn prune_terminal_locked(map: &mut HashMap<String, SagaRecord>, max_retained: usize) -> usize {
+        let mut terminal: Vec<(String, u64)> = map
+            .iter()
+            .filter(|(_, r)| r.status.is_terminal())
+            .map(|(k, r)| (k.clone(), r.updated_at))
+            .collect();
+        if terminal.len() <= max_retained {
+            return 0;
+        }
+        // Evict oldest terminal records first.
+        terminal.sort_by_key(|(_, ts)| *ts);
+        let to_remove = terminal.len() - max_retained;
+        for (id, _) in terminal.into_iter().take(to_remove) {
+            map.remove(&id);
+        }
+        to_remove
+    }
 }
 
 impl SagaStore for InMemorySagaStore {
-    fn save_record(&self, record: &SagaRecord) -> BoxFuture<'_, Result<(), SagaError>> {
+    fn save_record_cas(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
         let record = record.clone();
         let records = Arc::clone(&self.records);
+        let max_retained = self.max_retained_terminal;
         Box::pin(async move {
             let mut map = records.write().await;
+            let current_version = map.get(&record.saga_id).map(|r| r.version).unwrap_or(0);
+            if current_version != expected_version {
+                return Err(SagaError::Storage {
+                    saga_id: Some(record.saga_id.clone()),
+                    message: format!(
+                        "saga version conflict: expected version {expected_version}, found {current_version}"
+                    ),
+                });
+            }
+            let is_terminal = record.status.is_terminal();
             map.insert(record.saga_id.clone(), record);
+            if is_terminal && let Some(max) = max_retained {
+                Self::prune_terminal_locked(&mut map, max);
+            }
             Ok(())
         })
     }
@@ -174,8 +239,8 @@ pub enum SagaRecoveryPhase {
     Compensating {
         /// Original forward error that triggered compensation, if known.
         error: Option<SagaError>,
-        /// First compensation error encountered so far, if any.
-        compensation_error: Option<SagaError>,
+        /// Compensation errors encountered so far, in order.
+        compensation_errors: Vec<SagaError>,
     },
 }
 
@@ -205,6 +270,8 @@ pub struct SagaRecoveryHandle<Ctx> {
     pub completed_steps: Vec<String>,
     /// Step names that completed compensation.
     pub compensated_steps: Vec<String>,
+    /// Last persisted CAS version observed before the failure.
+    pub version: u64,
 }
 
 impl<Ctx> Debug for SagaRecoveryHandle<Ctx> {
@@ -370,11 +437,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     async fn persist_state(
         &self,
         saga_id: &str,
+        version: &mut u64,
         status: SagaStatus,
         completed_steps: &[String],
         compensated_steps: &[String],
     ) -> Result<(), SagaError> {
         if let Some(store) = &self.store {
+            let expected_version = *version;
+            let next_version = expected_version.saturating_add(1);
             let record = SagaRecord {
                 saga_id: saga_id.to_string(),
                 saga_name: self.name.clone(),
@@ -382,14 +452,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 completed_steps: completed_steps.to_vec(),
                 compensated_steps: compensated_steps.to_vec(),
                 updated_at: current_timestamp(),
+                version: next_version,
             };
-            // Why: Propagate `save_record` errors (annotated with `saga_id`) instead of
-            // logging and continuing, so a persistence failure aborts the transition rather
-            // than leaving the store stale while execution advances.
+            // Why: Propagate `save_record_cas` errors (annotated with `saga_id`) instead of
+            // logging and continuing, so a persistence failure or CAS conflict aborts the
+            // transition rather than leaving the store stale or interleaving two workers.
             store
-                .save_record(&record)
+                .save_record_cas(&record, expected_version)
                 .await
                 .map_err(|err| attach_saga_id(err, saga_id))?;
+            *version = next_version;
         }
         Ok(())
     }
@@ -437,8 +509,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
+        let mut version = 0u64;
         if let Err(error) = self
-            .persist_state(saga_id, SagaStatus::Pending, &[], &[])
+            .persist_state(saga_id, &mut version, SagaStatus::Pending, &[], &[])
             .await
         {
             return Err(SagaRecoveryError::new(
@@ -449,12 +522,21 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: Vec::new(),
                     compensated_steps: Vec::new(),
+                    version,
                 },
             ));
         }
 
-        self.execute_forward_from_recoverable(saga_id, ctx, 0, Vec::new(), Vec::new(), Vec::new())
-            .await
+        self.execute_forward_from_recoverable(
+            saga_id,
+            version,
+            ctx,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
     }
 
     /// Resumes an incomplete or crashed saga from its persisted state record.
@@ -498,6 +580,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
@@ -517,6 +600,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
@@ -529,10 +613,31 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
         };
+
+        if record.saga_name != self.name {
+            return Err(SagaRecoveryError::new(
+                SagaError::Aborted {
+                    saga: self.name.clone(),
+                    reason: format!(
+                        "saga record '{saga_id}' belongs to '{}', not '{}'",
+                        record.saga_name, self.name
+                    ),
+                },
+                SagaRecoveryHandle {
+                    saga_id: saga_id.to_string(),
+                    context: ctx,
+                    phase: SagaRecoveryPhase::Forward,
+                    completed_steps: record.completed_steps,
+                    compensated_steps: record.compensated_steps,
+                    version: record.version,
+                },
+            ));
+        }
 
         match record.status {
             SagaStatus::Success
@@ -560,12 +665,16 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         handle: SagaRecoveryHandle<Ctx>,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        let completed_indices = self.resolve_completed_indices(&handle.completed_steps);
+        let completed_indices = match self.resolve_completed_indices(&handle.completed_steps) {
+            Ok(indices) => indices,
+            Err(err) => return Err(SagaRecoveryError::new(err, handle)),
+        };
         match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
                 self.execute_forward_from_recoverable(
                     &handle.saga_id,
+                    handle.version,
                     handle.context,
                     start_idx,
                     completed_indices,
@@ -576,23 +685,27 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             }
             SagaRecoveryPhase::Compensating {
                 error,
-                compensation_error,
+                compensation_errors,
             } => {
                 self.compensate_completed_recoverable(
                     &handle.saga_id,
+                    handle.version,
                     handle.context,
                     &completed_indices,
                     &handle.completed_steps,
                     handle.compensated_steps,
                     error,
-                    compensation_error,
+                    compensation_errors,
                 )
                 .await
             }
         }
     }
 
-    fn resolve_completed_indices(&self, completed_names: &[String]) -> Vec<usize> {
+    fn resolve_completed_indices(
+        &self,
+        completed_names: &[String],
+    ) -> Result<Vec<usize>, SagaError> {
         let mut indices = Vec::with_capacity(completed_names.len());
         for name in completed_names {
             if let Some((idx, _)) = self
@@ -602,14 +715,27 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 .find(|(_, s)| s.name() == name)
             {
                 indices.push(idx);
+            } else {
+                // Why: silently dropping unknown/renamed step names during recovery
+                // would skip compensating them or restart forward execution from the
+                // wrong index. Fail closed instead.
+                return Err(SagaError::Aborted {
+                    saga: self.name.clone(),
+                    reason: format!(
+                        "persisted step '{name}' does not exist in saga '{}'",
+                        self.name
+                    ),
+                });
             }
         }
-        indices
+        Ok(indices)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_forward_from_recoverable(
         &self,
         saga_id: &str,
+        mut version: u64,
         mut ctx: Ctx,
         start_idx: usize,
         mut completed_indices: Vec<usize>,
@@ -621,6 +747,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             if let Err(error) = self
                 .persist_state(
                     saga_id,
+                    &mut version,
                     SagaStatus::Running {
                         current_step: step.name().to_string(),
                     },
@@ -637,6 +764,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: completed_names,
                         compensated_steps: compensated_names,
+                        version,
                     },
                 ));
             }
@@ -680,6 +808,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     if let Err(error) = self
                         .persist_state(
                             saga_id,
+                            &mut version,
                             SagaStatus::Running {
                                 current_step: step.name().to_string(),
                             },
@@ -696,6 +825,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 phase: SagaRecoveryPhase::Forward,
                                 completed_steps: completed_names,
                                 compensated_steps: compensated_names,
+                                version,
                             },
                         ));
                     }
@@ -704,12 +834,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     return self
                         .compensate_completed_recoverable(
                             saga_id,
+                            version,
                             ctx,
                             &completed_indices,
                             &completed_names,
                             compensated_names,
                             Some(err),
-                            None,
+                            Vec::new(),
                         )
                         .await;
                 }
@@ -719,6 +850,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         if let Err(error) = self
             .persist_state(
                 saga_id,
+                &mut version,
                 SagaStatus::Success,
                 &completed_names,
                 &compensated_names,
@@ -733,6 +865,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: completed_names,
                     compensated_steps: compensated_names,
+                    version,
                 },
             ));
         }
@@ -749,15 +882,15 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     async fn compensate_completed_recoverable(
         &self,
         saga_id: &str,
+        mut version: u64,
         mut ctx: Ctx,
         completed_indices: &[usize],
         completed_names: &[String],
         mut compensated_names: Vec<String>,
         original_error: Option<SagaError>,
-        initial_comp_error: Option<SagaError>,
+        mut compensation_errors: Vec<SagaError>,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
         let parent_tc = rume_observability::TraceContext::current();
-        let mut first_comp_error = initial_comp_error;
         for &prev_idx in completed_indices.iter().rev() {
             let prev_step = &self.steps[prev_idx];
             if compensated_names.iter().any(|n| n == prev_step.name()) {
@@ -767,6 +900,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             if let Err(error) = self
                 .persist_state(
                     saga_id,
+                    &mut version,
                     SagaStatus::Compensating {
                         current_step: prev_step.name().to_string(),
                         error: original_error.clone(),
@@ -783,10 +917,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: original_error,
-                            compensation_error: first_comp_error,
+                            compensation_errors,
                         },
                         completed_steps: completed_names.to_vec(),
                         compensated_steps: compensated_names,
+                        version,
                     },
                 ));
             }
@@ -831,6 +966,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     if let Err(error) = self
                         .persist_state(
                             saga_id,
+                            &mut version,
                             SagaStatus::Compensating {
                                 current_step: prev_step.name().to_string(),
                                 error: original_error.clone(),
@@ -847,42 +983,56 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 context: ctx,
                                 phase: SagaRecoveryPhase::Compensating {
                                     error: original_error,
-                                    compensation_error: first_comp_error,
+                                    compensation_errors,
                                 },
                                 completed_steps: completed_names.to_vec(),
                                 compensated_steps: compensated_names,
+                                version,
                             },
                         ));
                     }
                 }
                 Err(comp_err) => {
-                    if first_comp_error.is_none() {
-                        first_comp_error = Some(comp_err);
-                    }
+                    tracing::error!(
+                        saga.name = %self.name,
+                        saga.id = %saga_id,
+                        saga.step = %prev_step.name(),
+                        error = %comp_err,
+                        "Saga step compensation failed"
+                    );
+                    compensation_errors.push(comp_err);
                 }
             }
         }
 
         let resolved_error = original_error.unwrap_or_else(|| SagaError::Aborted {
             saga: self.name.clone(),
-            reason: if first_comp_error.is_some() {
+            reason: if !compensation_errors.is_empty() {
                 "resumed compensation encountered failure".into()
             } else {
                 "resumed compensation completed successfully".into()
             },
         });
-        let status = match &first_comp_error {
-            Some(compensation_error) => SagaStatus::CompensationFailed {
+        let status = if let Some(first_comp_error) = compensation_errors.first().cloned() {
+            SagaStatus::CompensationFailed {
                 error: resolved_error.clone(),
-                compensation_error: compensation_error.clone(),
-            },
-            None => SagaStatus::Compensated {
+                compensation_error: first_comp_error,
+                compensation_errors: compensation_errors.clone(),
+            }
+        } else {
+            SagaStatus::Compensated {
                 error: resolved_error.clone(),
-            },
+            }
         };
 
         if let Err(error) = self
-            .persist_state(saga_id, status.clone(), completed_names, &compensated_names)
+            .persist_state(
+                saga_id,
+                &mut version,
+                status.clone(),
+                completed_names,
+                &compensated_names,
+            )
             .await
         {
             return Err(SagaRecoveryError::new(
@@ -892,10 +1042,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     context: ctx,
                     phase: SagaRecoveryPhase::Compensating {
                         error: Some(resolved_error),
-                        compensation_error: first_comp_error,
+                        compensation_errors,
                     },
                     completed_steps: completed_names.to_vec(),
                     compensated_steps: compensated_names,
+                    version,
                 },
             ));
         }
@@ -914,11 +1065,27 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        let completed_indices = self.resolve_completed_indices(&record.completed_steps);
+        let completed_indices = match self.resolve_completed_indices(&record.completed_steps) {
+            Ok(indices) => indices,
+            Err(err) => {
+                return Err(SagaRecoveryError::new(
+                    err,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Forward,
+                        completed_steps: record.completed_steps,
+                        compensated_steps: record.compensated_steps,
+                        version: record.version,
+                    },
+                ));
+            }
+        };
         let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
 
         self.execute_forward_from_recoverable(
             saga_id,
+            record.version,
             ctx,
             start_idx,
             completed_indices,
@@ -934,20 +1101,39 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        let completed_indices = self.resolve_completed_indices(&record.completed_steps);
         let original_error = match record.status {
             SagaStatus::Compensating { error, .. } => error,
             _ => None,
         };
+        let completed_indices = match self.resolve_completed_indices(&record.completed_steps) {
+            Ok(indices) => indices,
+            Err(err) => {
+                return Err(SagaRecoveryError::new(
+                    err,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Compensating {
+                            error: original_error,
+                            compensation_errors: Vec::new(),
+                        },
+                        completed_steps: record.completed_steps,
+                        compensated_steps: record.compensated_steps,
+                        version: record.version,
+                    },
+                ));
+            }
+        };
 
         self.compensate_completed_recoverable(
             saga_id,
+            record.version,
             ctx,
             &completed_indices,
             &record.completed_steps,
             record.compensated_steps,
             original_error,
-            None,
+            Vec::new(),
         )
         .await
     }
@@ -984,10 +1170,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
-                            compensation_error: None,
+                            compensation_errors: Vec::new(),
                         },
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
@@ -1006,10 +1193,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
-                            compensation_error: None,
+                            compensation_errors: Vec::new(),
                         },
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
@@ -1021,17 +1209,70 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
-                            compensation_error: None,
+                            compensation_errors: Vec::new(),
                         },
                         completed_steps: Vec::new(),
                         compensated_steps: Vec::new(),
+                        version: 0,
                     },
                 ));
             }
         };
 
-        self.resume_compensation_recoverable(saga_id, record, ctx)
-            .await
+        if record.saga_name != self.name {
+            return Err(SagaRecoveryError::new(
+                SagaError::Aborted {
+                    saga: self.name.clone(),
+                    reason: format!(
+                        "saga record '{saga_id}' belongs to '{}', not '{}'",
+                        record.saga_name, self.name
+                    ),
+                },
+                SagaRecoveryHandle {
+                    saga_id: saga_id.to_string(),
+                    context: ctx,
+                    phase: SagaRecoveryPhase::Compensating {
+                        error: None,
+                        compensation_errors: Vec::new(),
+                    },
+                    completed_steps: record.completed_steps,
+                    compensated_steps: record.compensated_steps,
+                    version: record.version,
+                },
+            ));
+        }
+
+        // Why: terminal sagas must never be rolled back or overwritten. A `Success`
+        // saga already committed; already-`Compensated` / `CompensationFailed`
+        // sagas are returned intact to preserve their original error record.
+        match record.status {
+            SagaStatus::Success => Err(SagaRecoveryError::new(
+                SagaError::Aborted {
+                    saga: self.name.clone(),
+                    reason: format!("cannot compensate already succeeded saga '{saga_id}'"),
+                },
+                SagaRecoveryHandle {
+                    saga_id: saga_id.to_string(),
+                    context: ctx,
+                    phase: SagaRecoveryPhase::Forward,
+                    completed_steps: record.completed_steps,
+                    compensated_steps: record.compensated_steps,
+                    version: record.version,
+                },
+            )),
+            SagaStatus::Compensated { .. } | SagaStatus::CompensationFailed { .. } => {
+                Ok(SagaReport {
+                    context: ctx,
+                    status: record.status,
+                    completed_steps: record.completed_steps,
+                    compensated_steps: record.compensated_steps,
+                })
+            }
+            SagaStatus::Pending | SagaStatus::Running { .. } | SagaStatus::Compensating { .. } => {
+                self.resume_compensation_recoverable(saga_id, record, ctx)
+                    .await
+            }
+        }
     }
 }
 
@@ -1076,7 +1317,11 @@ mod tests {
     }
 
     impl SagaStore for FaultySagaStore {
-        fn save_record(&self, record: &SagaRecord) -> BoxFuture<'_, Result<(), SagaError>> {
+        fn save_record_cas(
+            &self,
+            record: &SagaRecord,
+            expected_version: u64,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
             let should_fail = self
                 .fail_on
                 .lock()
@@ -1091,7 +1336,7 @@ mod tests {
                     })
                 });
             }
-            self.inner.save_record(record)
+            self.inner.save_record_cas(record, expected_version)
         }
 
         fn load_record(
@@ -1310,8 +1555,8 @@ mod tests {
             err.handle.phase,
             SagaRecoveryPhase::Compensating {
                 error: Some(ref e),
-                compensation_error: None
-            } if *e == original_err
+                ref compensation_errors,
+            } if *e == original_err && compensation_errors.is_empty()
         ));
 
         store.clear_failure();
@@ -1417,5 +1662,132 @@ mod tests {
             "step_b undo must not be applied twice"
         );
         assert_eq!(a_releases.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn compensate_crashed_rejects_success_and_preserves_compensated() {
+        let store = Arc::new(InMemorySagaStore::new());
+        let comp_runs = Arc::new(AtomicUsize::new(0));
+        let comp_runs_c = Arc::clone(&comp_runs);
+
+        let saga = Saga::<()>::new("order").with_store(store.clone()).step(
+            "reserve",
+            |_| async { Ok(()) },
+            move |_| {
+                comp_runs_c.fetch_add(1, Ordering::SeqCst);
+                async { Ok(()) }
+            },
+        );
+
+        saga.run_with_id("s-ok", ()).await.unwrap();
+        let err = saga.compensate_crashed("s-ok", ()).await.err().unwrap();
+        assert!(matches!(err, SagaError::Aborted { .. }));
+        assert_eq!(comp_runs.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            store.load_record("s-ok").await.unwrap().unwrap().status,
+            SagaStatus::Success
+        );
+    }
+
+    #[tokio::test]
+    async fn resume_rejects_mismatched_saga_name_and_unknown_step() {
+        let store = Arc::new(InMemorySagaStore::new());
+        store
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: "s-other".into(),
+                    saga_name: "other_saga".into(),
+                    status: SagaStatus::Running {
+                        current_step: "step_1".into(),
+                    },
+                    completed_steps: vec!["step_1".into()],
+                    compensated_steps: vec![],
+                    updated_at: 1,
+                    version: 1,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        let saga = Saga::<()>::new("order").with_store(store.clone()).step(
+            "step_1",
+            |_| async { Ok(()) },
+            |_| async { Ok(()) },
+        );
+        let err = saga.resume("s-other", ()).await.err().unwrap();
+        assert!(matches!(err, SagaError::Aborted { .. }));
+
+        store
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: "s-bad-step".into(),
+                    saga_name: "order".into(),
+                    status: SagaStatus::Running {
+                        current_step: "ghost_step".into(),
+                    },
+                    completed_steps: vec!["ghost_step".into()],
+                    compensated_steps: vec![],
+                    updated_at: 1,
+                    version: 1,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+        let err2 = saga.resume("s-bad-step", ()).await.err().unwrap();
+        assert!(matches!(err2, SagaError::Aborted { .. }));
+    }
+
+    #[tokio::test]
+    async fn concurrent_resume_cas_allows_single_winner_and_retains_all_comp_errors() {
+        let store = Arc::new(InMemorySagaStore::new().with_max_retained_terminal(1));
+        let saga = Arc::new(
+            Saga::<()>::new("dual_comp")
+                .with_store(store.clone())
+                .step(
+                    "s1",
+                    |_| async { Ok(()) },
+                    |_| async {
+                        Err(SagaError::CompensationFailed {
+                            step: "s1".into(),
+                            message: "c1".into(),
+                        })
+                    },
+                )
+                .step(
+                    "s2",
+                    |_| async { Ok(()) },
+                    |_| async {
+                        Err(SagaError::CompensationFailed {
+                            step: "s2".into(),
+                            message: "c2".into(),
+                        })
+                    },
+                )
+                .step(
+                    "s3",
+                    |_| async {
+                        Err(SagaError::ActionFailed {
+                            step: "s3".into(),
+                            message: "boom".into(),
+                        })
+                    },
+                    |_| async { Ok(()) },
+                ),
+        );
+
+        let report = saga.run_with_id("s-dual", ()).await.unwrap();
+        match report.status {
+            SagaStatus::CompensationFailed {
+                compensation_errors,
+                ..
+            } => assert_eq!(compensation_errors.len(), 2),
+            other => panic!("expected CompensationFailed, got {other:?}"),
+        }
+
+        // Second terminal saga triggers max_retained_terminal(1) pruning.
+        let _ = saga.run_with_id("s-dual-2", ()).await.unwrap();
+        assert_eq!(store.records.read().await.len(), 1);
     }
 }

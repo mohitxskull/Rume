@@ -216,6 +216,9 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
                 if let Some(first_key) = tenant_map.keys().next().cloned() {
                     tenant_map.remove(&first_key);
                 }
+                if tenant_map.is_empty() {
+                    map.remove(&tid);
+                }
             }
             Ok(())
         })
@@ -235,19 +238,29 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
             let mut map = self.keys.write().await;
             let now = tokio::time::Instant::now();
             let expires_at = ttl.map(|d| now + d);
-            let tenant_map = map.entry(tid).or_default();
-            Self::prune_expired_inline(tenant_map, now);
-
-            if tenant_map.contains_key(&k) {
-                // Key already exists for this tenant: repeated writes/updates refresh TTL without consuming quota
+            if let Some(tenant_map) = map.get_mut(&tid) {
+                Self::prune_expired_inline(tenant_map, now);
+                if let Some(slot) = tenant_map.get_mut(&k) {
+                    // Key already exists for this tenant: repeated writes/updates refresh TTL without consuming quota
+                    *slot = expires_at;
+                    return Ok(true);
+                }
+                if tenant_map.len() >= max_keys {
+                    if tenant_map.is_empty() {
+                        map.remove(&tid);
+                    }
+                    return Ok(false);
+                }
                 tenant_map.insert(k, expires_at);
-                Ok(true)
-            } else if tenant_map.len() >= max_keys {
-                Ok(false)
-            } else {
-                tenant_map.insert(k, expires_at);
-                Ok(true)
+                return Ok(true);
             }
+            if max_keys == 0 {
+                return Ok(false);
+            }
+            let mut tenant_map = TenantKeyStore::new();
+            tenant_map.insert(k, expires_at);
+            map.insert(tid, tenant_map);
+            Ok(true)
         })
     }
 
@@ -265,18 +278,28 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
             let mut map = self.keys.write().await;
             let now = tokio::time::Instant::now();
             let expires_at = ttl.map(|d| now + d);
-            let tenant_map = map.entry(tid).or_default();
-            Self::prune_expired_inline(tenant_map, now);
-
-            if tenant_map.contains_key(&k) {
-                // Preserve existing expiration untouched until the overwrite succeeds.
-                Ok(KeyReservation::AlreadyTracked)
-            } else if tenant_map.len() >= max_keys {
-                Ok(KeyReservation::QuotaExceeded)
-            } else {
+            if let Some(tenant_map) = map.get_mut(&tid) {
+                Self::prune_expired_inline(tenant_map, now);
+                if tenant_map.contains_key(&k) {
+                    // Preserve existing expiration untouched until the overwrite succeeds.
+                    return Ok(KeyReservation::AlreadyTracked);
+                }
+                if tenant_map.len() >= max_keys {
+                    if tenant_map.is_empty() {
+                        map.remove(&tid);
+                    }
+                    return Ok(KeyReservation::QuotaExceeded);
+                }
                 tenant_map.insert(k, expires_at);
-                Ok(KeyReservation::NewlyReserved)
+                return Ok(KeyReservation::NewlyReserved);
             }
+            if max_keys == 0 {
+                return Ok(KeyReservation::QuotaExceeded);
+            }
+            let mut tenant_map = TenantKeyStore::new();
+            tenant_map.insert(k, expires_at);
+            map.insert(tid, tenant_map);
+            Ok(KeyReservation::NewlyReserved)
         })
     }
 
@@ -293,6 +316,9 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
             if let Some(tenant_map) = map.get_mut(&tid) {
                 Self::prune_expired_inline(tenant_map, now);
                 tenant_map.remove(&k);
+                if tenant_map.is_empty() {
+                    map.remove(&tid);
+                }
             }
             Ok(())
         })
@@ -577,7 +603,14 @@ mod redis_store {
                     .await
                     .map_err(|e| CacheError::Backend(e.to_string()))?;
 
+                // Why: prune expired members using Redis server TIME before popping
+                // rank 0 so `release` frees an active slot rather than an already-expired
+                // entry. `replicate_commands()` is required on Redis 5/6 after `TIME`.
                 let script = r#"
+                    if redis.replicate_commands then redis.replicate_commands() end
+                    local server_time = redis.call('TIME')
+                    local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
+                    redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now_ms)
                     local oldest = redis.call('ZRANGE', KEYS[1], 0, 0)
                     if oldest and #oldest > 0 then
                         redis.call('ZREM', KEYS[1], oldest[1])

@@ -140,6 +140,7 @@ impl DistributedLock for RedisDistributedLock {
 
             let script = redis::Script::new(
                 r#"
+                if redis.replicate_commands then redis.replicate_commands() end
                 local current = redis.call('GET', KEYS[1])
                 if current == ARGV[1] then
                     local requested_ttl = tonumber(ARGV[2])

@@ -214,6 +214,8 @@ fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv, EnvError> {
 
 /// Load the merged environment map rooted at `dir` for a specific environment name.
 fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv, EnvError> {
+    validate_env_name(env_name)?;
+
     // Collect raw values from all file sources, lowest to highest priority.
     // Later files override earlier ones. `file:` resolution happens here, per
     // value, before interpolation.
@@ -269,17 +271,22 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
-    // Interpolate all values against the final merged map, then route to
-    // secrets vs plain values based on the key OR the value content. A
-    // sensitive value under a non-secret key (e.g. DATABASE_URL with a
-    // credential URL) must be treated as a secret to avoid plaintext
-    // leakage in diagnostics (RC-03).
+    // Why: only interpolate values for keys that originated from an env file
+    // (`file_keys`). Inherited OS variables (e.g. `PS1`, shell prompts, or
+    // CI runner vars) frequently contain literal `${...}` syntax unrelated to
+    // Rume; interpolating them would fail boot on healthy environments.
+    // Process-env values still remain in `vars` as lookup targets so file
+    // variables can reference process-overridden variables.
     for (key, (value, source)) in &merged {
-        let interpolated = interpolate_value(value, &vars)?;
-        if is_secret_key(key) || value_looks_sensitive(&interpolated) {
-            secrets.insert(key.clone(), SecretBox::new(Box::new(interpolated)));
+        let resolved_value = if file_keys.contains(key) {
+            interpolate_value(value, &vars)?
         } else {
-            values.insert(key.clone(), interpolated);
+            value.clone()
+        };
+        if is_secret_key(key) || value_looks_sensitive(&resolved_value) {
+            secrets.insert(key.clone(), SecretBox::new(Box::new(resolved_value)));
+        } else {
+            values.insert(key.clone(), resolved_value);
         }
         sources.insert(key.clone(), source.clone());
     }
@@ -305,14 +312,38 @@ pub(crate) fn is_running_in_test() -> bool {
     false
 }
 
+/// Returns `true` if `env_name` is a safe environment identifier (`^[A-Za-z0-9_-]+$`).
+///
+/// Why: `env_name` is interpolated into `.env.{env_name}` and `config/app.{env_name}.toml`
+/// filenames; disallowing path separators, dots, and whitespace prevents path traversal.
+pub(crate) fn is_valid_env_name(env_name: &str) -> bool {
+    !env_name.is_empty()
+        && env_name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+}
+
+pub(crate) fn validate_env_name(env_name: &str) -> Result<(), EnvError> {
+    if is_valid_env_name(env_name) {
+        Ok(())
+    } else {
+        Err(EnvError::Validation(format!(
+            "invalid environment name '{env_name}': must match ^[A-Za-z0-9_-]+$"
+        )))
+    }
+}
+
 /// Resolve the active environment name.
 ///
 /// Precedence: `RUME_ENV`, then `RAILS_ENV`, then `NODE_ENV`, then
 /// `"test"` if running in test harness, otherwise `"development"`.
+///
+/// Values that fail `^[A-Za-z0-9_-]+$` validation are ignored to prevent path
+/// traversal when callers construct `.env.<name>` or `app.<name>.toml` paths.
 pub fn resolve_env_name() -> String {
     for var in ["RUME_ENV", "RAILS_ENV", "NODE_ENV"] {
         if let Ok(value) = std::env::var(var)
-            && !value.is_empty()
+            && is_valid_env_name(&value)
         {
             return value;
         }
@@ -691,5 +722,24 @@ mod tests {
         let typed: Typed = load_from_resolved(resolved).unwrap();
         assert_eq!(typed.database_url, "postgres://localhost/dev_db");
         assert_eq!(typed.api_token.expose_secret(), "tok-123");
+    }
+
+    #[test]
+    fn invalid_env_name_is_rejected() {
+        let temp = tempfile::tempdir().unwrap();
+        for bad in ["../evil", "a/b", "a\\b", "", "prod.local", "dev space"] {
+            let err = ResolvedEnv::load_for_env_in(temp.path(), bad).unwrap_err();
+            assert!(
+                matches!(err, EnvError::Validation(_)),
+                "expected Validation error for env_name={bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_env_names_are_accepted() {
+        for good in ["development", "test", "prod-1", "staging_eu_2"] {
+            assert!(is_valid_env_name(good));
+        }
     }
 }

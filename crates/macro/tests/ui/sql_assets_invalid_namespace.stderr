@@ -1,0 +1,5 @@
+error: sql_assets!: subdirectory namespace 'bad-dir' (from 'tests/fixtures/invalid_namespace_sql/bad-dir/find.sql') is not a valid Rust identifier
+ --> tests/ui/sql_assets_invalid_namespace.rs:3:13
+  |
+3 | sql_assets!("tests/fixtures/invalid_namespace_sql");
+  |             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

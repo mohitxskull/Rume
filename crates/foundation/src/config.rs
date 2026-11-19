@@ -114,9 +114,15 @@ pub enum ConfigError {
 
 impl From<figment::Error> for ConfigError {
     fn from(err: figment::Error) -> Self {
-        let redacted = crate::env::secrets::redact_diagnostic_text(&err.to_string(), &[]);
+        let redacted =
+            crate::env::error::redact_figment_error(err, &[], &std::collections::BTreeSet::new());
         Self::Validation(redacted)
     }
+}
+
+fn validate_config_env_name(env_name: &str) -> Result<()> {
+    crate::env::loading::validate_env_name(env_name)
+        .map_err(|err| ConfigError::Validation(err.to_string()))
 }
 
 /// Load and validate a typed configuration from the current directory.
@@ -174,6 +180,7 @@ pub fn load_raw_pretty(dir: &Path) -> Result<String> {
 /// Load the configuration source map rooted at `dir`, tracking winning provenance per key.
 pub fn source_map(dir: &Path) -> Result<ConfigSourceMap> {
     let env_name = crate::env::resolve_env_name();
+    validate_config_env_name(&env_name)?;
 
     let candidates = [
         dir.join("config").join("app.toml"),
@@ -230,6 +237,8 @@ fn build_figment(dir: &Path) -> Result<Figment> {
 }
 
 fn build_figment_for_env(dir: &Path, env_name: &str) -> Result<Figment> {
+    validate_config_env_name(env_name)?;
+
     let candidates = [
         dir.join("config").join("app.toml"),
         dir.join("config").join(format!("app.{env_name}.toml")),
@@ -372,6 +381,43 @@ mod tests {
         assert_eq!(
             host_explain.winning_file,
             Some(dir.join("config").join("app.toml"))
+        );
+    }
+
+    #[test]
+    fn invalid_env_name_rejected_by_config_loader() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        fs::create_dir_all(dir.join("config")).ok();
+        write_config(dir, "app.toml", "key = \"value\"\n");
+
+        for bad in ["../evil", "a/b", "a\\b", "", "prod.local"] {
+            let err = load_raw_for_env(dir, bad).unwrap_err();
+            assert!(
+                matches!(err, ConfigError::Validation(_)),
+                "expected Validation error for env_name={bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn config_error_redacts_secret_with_escaped_quote() {
+        #[derive(Debug, Deserialize)]
+        struct BadCfg {
+            #[allow(dead_code)]
+            api_secret: u32,
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path();
+        fs::create_dir_all(dir.join("config")).ok();
+        write_config(dir, "app.toml", "api_secret = 'part1\"secret_tail'\n");
+
+        let err = load_for_env_in::<BadCfg>(dir, "test").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("secret_tail") && !msg.contains("part1"),
+            "secret leaked in ConfigError: {msg}"
         );
     }
 }

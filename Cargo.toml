@@ -44,7 +44,7 @@ rume-app = { path = "crates/app", version = "=0.1.0" }
 rume-testing = { path = "crates/testing", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
-tokio = { version = "=1.54.1", features = ["full", "test-util"] }
+tokio = { version = "=1.54.1", features = ["full"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tracing = "=0.1.44"
 tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
@@ -53,11 +53,11 @@ secrecy = { version = "=0.10.3", features = ["serde"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
 dotenvy = "=0.15.7"
 url = { version = "=2.5.8", features = ["serde"] }
-toml = "1.2.0"
-serde_json = "1.0.154"
+toml = "=1.2.1"
+serde_json = "=1.0.154"
 
 clap = { version = "=4.6.7", features = ["derive"] }
-tempfile = "3.27.0"
+tempfile = "=3.27.0"
 sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
 # SQL parsing and validation used by `rume sql:check` and `rume-data` transaction/placeholder checks.
 # Pinned to an exact version so dialect-aware placeholder, statement, and comment lexing is deterministic.

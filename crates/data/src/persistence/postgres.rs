@@ -463,11 +463,12 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.commit()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.commit()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
     }
@@ -476,11 +477,12 @@ impl DatabaseTransaction for PostgresTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.rollback()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.rollback()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
     }

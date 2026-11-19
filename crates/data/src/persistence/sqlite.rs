@@ -180,6 +180,10 @@ impl DatabaseBackend for SqliteBackend {
         let params_vec = params.to_vec();
         Box::pin(async move {
             if params_vec.is_empty() {
+                // Why: SQLite silently binds unbound `?` / `:name` placeholders to
+                // `NULL` when executed via `raw_sql` without parameters; reject them
+                // up front, matching `SqliteTransaction::execute_params`.
+                reject_unbound_sqlite_placeholders(&statement)?;
                 let res = sqlx::raw_sql(AssertSqlSafe(statement.clone()))
                     .execute(&self.pool)
                     .await
@@ -283,6 +287,25 @@ impl DatabaseBackend for SqliteBackend {
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
         Box::pin(async move {
             let tx = self.pool.begin().await.map_err(map_sqlx_error)?;
+            Ok(SqliteTransaction {
+                tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+            })
+        })
+    }
+
+    fn begin_immediate_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
+        Box::pin(async move {
+            // Why: deferred `BEGIN` followed by a read and then a write fails
+            // immediately with `SQLITE_BUSY_SNAPSHOT` under concurrent writers
+            // regardless of `busy_timeout`. `BEGIN IMMEDIATE` acquires the
+            // RESERVED write lock up front so `busy_timeout` serializes callers.
+            let tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })
@@ -467,11 +490,12 @@ impl DatabaseTransaction for SqliteTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.commit()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.commit()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
     }
@@ -480,11 +504,12 @@ impl DatabaseTransaction for SqliteTransaction {
         let tx_arc = Arc::clone(&self.tx);
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.rollback()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.rollback()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
     }

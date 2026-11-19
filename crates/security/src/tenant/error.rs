@@ -15,9 +15,13 @@ pub enum TenantError {
     #[error("tenant not found: '{0}'")]
     TenantNotFound(String),
 
-    /// The tenant resolver encountered an internal error.
-    #[error("tenant resolver error: {0}")]
-    ResolverError(String),
+    /// The client supplied a malformed tenant identifier or host header.
+    #[error("invalid tenant identifier: {0}")]
+    InvalidIdentifier(String),
+
+    /// The tenant resolver encountered an internal error (redacted in HTTP responses).
+    #[error("tenant resolver internal error: {0}")]
+    Internal(String),
 
     /// A tenant registration conflict occurred (e.g. duplicate slug or ID collision).
     #[error("tenant registration conflict: {0}")]
@@ -40,9 +44,13 @@ impl From<TenantError> for AppError {
                 code: "TENANT_NOT_FOUND",
                 message: format!("Tenant '{slug}' was not found"),
             },
-            TenantError::ResolverError(msg) => AppError::BadRequest {
-                code: "TENANT_RESOLVER_ERROR",
+            TenantError::InvalidIdentifier(msg) => AppError::BadRequest {
+                code: "INVALID_TENANT_IDENTIFIER",
                 message: msg,
+            },
+            TenantError::Internal(msg) => AppError::Internal {
+                source: msg.into(),
+                request_id: None,
             },
             TenantError::Conflict(msg) => AppError::Public {
                 status: axum::http::StatusCode::CONFLICT,

@@ -8,10 +8,6 @@ use rume_enterprise::enterprise::saml::{
 struct AcceptAllVerifier;
 
 impl SamlSignatureVerifier for AcceptAllVerifier {
-    fn verify_signature(&self, _xml: &str) -> Result<(), SamlError> {
-        Ok(())
-    }
-
     fn verify_assertion_signature(
         &self,
         _signed_xml: &str,

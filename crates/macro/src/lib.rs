@@ -108,6 +108,95 @@ fn sanitize_ident(name: &str) -> String {
     }
 }
 
+/// Resolves `raw_rel` inside `manifest_dir`, rejecting path traversal (`..`,
+/// absolute paths, and symlinks that escape the crate root).
+///
+/// Why: proc-macros run at compile time with the caller's `CARGO_MANIFEST_DIR`;
+/// canonicalizing both `manifest_dir` and the target directory guarantees
+/// neither `..` segments nor symlinks can read files outside the crate.
+fn resolve_manifest_subdir(
+    manifest_dir: &str,
+    raw_rel: &str,
+    macro_name: &str,
+    span: proc_macro2::Span,
+) -> Result<(PathBuf, PathBuf, String), syn::Error> {
+    let rel_path = Path::new(raw_rel);
+    if raw_rel.is_empty()
+        || rel_path.is_absolute()
+        || raw_rel.starts_with('/')
+        || raw_rel.starts_with('\\')
+        || rel_path.components().any(|c| {
+            matches!(
+                c,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "{macro_name}: path '{raw_rel}' must be a relative path within CARGO_MANIFEST_DIR without '..' components"
+            ),
+        ));
+    }
+
+    let full_dir = Path::new(manifest_dir).join(rel_path);
+    if !full_dir.exists() {
+        return Err(syn::Error::new(
+            span,
+            format!("{macro_name}: directory '{raw_rel}' not found at {full_dir:?}"),
+        ));
+    }
+
+    let canonical_manifest = fs::canonicalize(manifest_dir).map_err(|e| {
+        syn::Error::new(
+            span,
+            format!(
+                "{macro_name}: failed to canonicalize CARGO_MANIFEST_DIR '{manifest_dir}': {e}"
+            ),
+        )
+    })?;
+    let canonical_dir = fs::canonicalize(&full_dir).map_err(|e| {
+        syn::Error::new(
+            span,
+            format!("{macro_name}: failed to canonicalize directory {full_dir:?}: {e}"),
+        )
+    })?;
+
+    if !canonical_dir.starts_with(&canonical_manifest) {
+        return Err(syn::Error::new(
+            span,
+            format!("{macro_name}: directory '{raw_rel}' resolves outside CARGO_MANIFEST_DIR"),
+        ));
+    }
+
+    let normalized_rel = raw_rel.replace('\\', "/").trim_end_matches('/').to_string();
+    Ok((canonical_manifest, canonical_dir, normalized_rel))
+}
+
+fn verify_file_within_manifest(
+    path: &Path,
+    canonical_manifest: &Path,
+    macro_name: &str,
+    span: proc_macro2::Span,
+) -> Result<(), syn::Error> {
+    let canonical_file = fs::canonicalize(path).map_err(|e| {
+        syn::Error::new(
+            span,
+            format!("{macro_name}: failed to canonicalize SQL file {path:?}: {e}"),
+        )
+    })?;
+    if !canonical_file.starts_with(canonical_manifest) {
+        return Err(syn::Error::new(
+            span,
+            format!("{macro_name}: SQL file {path:?} resolves outside CARGO_MANIFEST_DIR"),
+        ));
+    }
+    Ok(())
+}
+
 /// Discovers, embeds, and registers compile-time SQL query assets.
 ///
 /// # Usage
@@ -120,26 +209,15 @@ fn sanitize_ident(name: &str) -> String {
 pub fn sql_assets(input: TokenStream) -> TokenStream {
     let args = parse_macro_input!(input as SqlAssetsArgs);
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    let sql_dir_rel = args.dir_path.value();
-    let sql_dir_rel = sql_dir_rel.trim_start_matches('/').trim_start_matches('\\');
-    let mut full_sql_dir = Path::new(&manifest_dir).join(sql_dir_rel);
-    if !full_sql_dir.exists() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(sql_dir_rel);
-        if crate_dir.exists() {
-            full_sql_dir = crate_dir;
-        }
-    }
-
-    if !full_sql_dir.exists() {
-        let err_msg = format!(
-            "sql_assets!: directory '{}' not found at {:?}",
-            args.dir_path.value(),
-            full_sql_dir
-        );
-        return syn::Error::new(args.dir_path.span(), err_msg)
-            .to_compile_error()
-            .into();
-    }
+    let (canonical_manifest, full_sql_dir, sql_dir_rel) = match resolve_manifest_subdir(
+        &manifest_dir,
+        &args.dir_path.value(),
+        "sql_assets!",
+        args.dir_path.span(),
+    ) {
+        Ok(res) => res,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let mut sql_paths = Vec::new();
     if let Err(err) = walk_sql_files(&full_sql_dir, args.dir_path.span(), &mut sql_paths) {
@@ -148,6 +226,14 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
     let mut items = Vec::new();
     for path in sql_paths {
+        if let Err(err) = verify_file_within_manifest(
+            &path,
+            &canonical_manifest,
+            "sql_assets!",
+            args.dir_path.span(),
+        ) {
+            return err.to_compile_error().into();
+        }
         if let Ok(rel) = path.strip_prefix(&full_sql_dir) {
             let components: Vec<String> = rel
                 .components()
@@ -159,7 +245,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
             let full_rel_from_manifest = format!(
                 "{}/{}",
-                sql_dir_rel.replace('\\', "/"),
+                sql_dir_rel,
                 rel.to_string_lossy().replace('\\', "/")
             );
 
@@ -193,6 +279,16 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
             } else {
                 "common".to_string()
             };
+            if syn::parse_str::<syn::Ident>(&namespace).is_err() {
+                return syn::Error::new(
+                    args.dir_path.span(),
+                    format!(
+                        "sql_assets!: subdirectory namespace '{namespace}' (from '{full_rel_from_manifest}') is not a valid Rust identifier",
+                    ),
+                )
+                .to_compile_error()
+                .into();
+            }
 
             let logical_name = match &dialect {
                 Some(d) => format!("{d}.{namespace}.{query_name}"),
@@ -265,8 +361,8 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
                 let logical_name = &q.logical_name;
                 let rel_path = &q.relative_path;
                 let dialect_expr = match &q.dialect {
-                    Some(d) => quote! { Some(#d) },
-                    None => quote! { None },
+                    Some(d) => quote! { ::core::option::Option::Some(#d) },
+                    None => quote! { ::core::option::Option::None },
                 };
                 quote! {
                     pub const #const_ident: ::rume::persistence::SqlQuery<'static> =
@@ -274,7 +370,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
                             #logical_name,
                             #rel_path,
                             #dialect_expr,
-                            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #rel_path)),
+                            ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #rel_path)),
                         );
                 }
             });
@@ -299,8 +395,8 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
             let logical_name = &q.logical_name;
             let rel_path = &q.relative_path;
             let dialect_expr = match &q.dialect {
-                Some(d) => quote! { Some(#d) },
-                None => quote! { None },
+                Some(d) => quote! { ::core::option::Option::Some(#d) },
+                None => quote! { ::core::option::Option::None },
             };
             quote! {
                 pub const #const_ident: ::rume::persistence::SqlQuery<'static> =
@@ -308,7 +404,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
                         #logical_name,
                         #rel_path,
                         #dialect_expr,
-                        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #rel_path)),
+                        ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #rel_path)),
                     );
             }
         });
@@ -370,26 +466,15 @@ fn extract_migration_version(id: &str) -> &str {
 pub fn embed_migrations(input: TokenStream) -> TokenStream {
     let dir_lit = parse_macro_input!(input as LitStr);
     let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
-    let dir_rel = dir_lit.value();
-    let dir_rel = dir_rel.trim_start_matches('/').trim_start_matches('\\');
-    let mut full_dir = Path::new(&manifest_dir).join(dir_rel);
-    if !full_dir.exists() {
-        let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(dir_rel);
-        if crate_dir.exists() {
-            full_dir = crate_dir;
-        }
-    }
-
-    if !full_dir.exists() {
-        let err_msg = format!(
-            "embed_migrations!: directory '{}' not found at {:?}",
-            dir_lit.value(),
-            full_dir
-        );
-        return syn::Error::new(dir_lit.span(), err_msg)
-            .to_compile_error()
-            .into();
-    }
+    let (canonical_manifest, full_dir, dir_rel) = match resolve_manifest_subdir(
+        &manifest_dir,
+        &dir_lit.value(),
+        "embed_migrations!",
+        dir_lit.span(),
+    ) {
+        Ok(res) => res,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     let mut up_files: BTreeMap<String, String> = BTreeMap::new();
     let mut down_files: BTreeSet<String> = BTreeSet::new();
@@ -443,6 +528,14 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
         }
 
         if path.extension().is_some_and(|ext| ext == "sql") {
+            if let Err(err) = verify_file_within_manifest(
+                &path,
+                &canonical_manifest,
+                "embed_migrations!",
+                dir_lit.span(),
+            ) {
+                return err.to_compile_error().into();
+            }
             let is_up = file_name.ends_with(".up.sql");
             let is_down = file_name.ends_with(".down.sql");
             if !is_up && !is_down {
@@ -516,9 +609,9 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
                     ::rume::persistence::Migration::from_sql(
                         #id,
                         #desc,
-                        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #up_rel_path)),
+                        ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #up_rel_path)),
                     )
-                    .with_down(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #down_rel_path)))
+                    .with_down(::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #down_rel_path)))
                 );
             }
         } else {
@@ -527,7 +620,7 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
                     ::rume::persistence::Migration::from_sql(
                         #id,
                         #desc,
-                        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/", #up_rel_path)),
+                        ::core::include_str!(::core::concat!(::core::env!("CARGO_MANIFEST_DIR"), "/", #up_rel_path)),
                     )
                 );
             }

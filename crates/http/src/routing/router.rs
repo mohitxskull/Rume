@@ -302,11 +302,18 @@ where
         self.inner = self.inner.nest(path, other.inner);
         let other_routes = other.registry.read().clone();
         for r in other_routes.routes() {
+            let full_path = join_path(path, &r.path);
+            let mut params = crate::routing::registry::extract_path_params(&full_path);
+            for p in &r.params {
+                if !params.contains(p) {
+                    params.push(p.clone());
+                }
+            }
             self.record_route(RouteInfo {
                 method: r.method.clone(),
-                path: join_path(path, &r.path),
+                path: full_path,
                 name: r.name.clone(),
-                params: r.params.clone(),
+                params,
                 matchers: r.matchers.clone(),
                 request_schema: r.request_schema.clone(),
             });

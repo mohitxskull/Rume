@@ -62,8 +62,8 @@ mod saml_tests {
         assert_eq!(assertion.issuer, "https://idp.enterprise.com/saml");
         assert_eq!(assertion.subject, "bob@enterprise.com");
         assert_eq!(
-            assertion.audience.as_deref(),
-            Some("https://sp.myapp.io/saml/metadata")
+            assertion.audiences,
+            vec!["https://sp.myapp.io/saml/metadata".to_string()]
         );
 
         let dept = assertion.attributes.get("department").unwrap();
@@ -132,21 +132,17 @@ mod saml_tests {
         }
 
         impl SamlSignatureVerifier for MockVerifier {
-            fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
+            fn verify_assertion_signature(
+                &self,
+                _raw_xml: &str,
+                _assertion_id: &str,
+                _assertion_xml: &str,
+            ) -> Result<(), SamlError> {
                 if self.should_pass {
                     Ok(())
                 } else {
                     Err(SamlError::InvalidSignature("bad digest".into()))
                 }
-            }
-
-            fn verify_assertion_signature(
-                &self,
-                raw_xml: &str,
-                _assertion_id: &str,
-                _assertion_xml: &str,
-            ) -> Result<(), SamlError> {
-                self.verify_signature(raw_xml)
             }
         }
 
@@ -452,10 +448,6 @@ mod saml_tests {
         }
 
         impl SamlSignatureVerifier for TrustBoundaryVerifier {
-            fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
-                Ok(())
-            }
-
             fn verify_assertion_signature(
                 &self,
                 _raw_xml: &str,
@@ -571,10 +563,6 @@ mod saml_tests {
     fn saml_signed_mode_requires_non_empty_assertion_id_and_matching_reference() {
         struct AlwaysAcceptVerifier;
         impl SamlSignatureVerifier for AlwaysAcceptVerifier {
-            fn verify_signature(&self, _raw_xml: &str) -> Result<(), SamlError> {
-                Ok(())
-            }
-
             fn verify_assertion_signature(
                 &self,
                 _raw_xml: &str,

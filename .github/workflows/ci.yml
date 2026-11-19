@@ -40,6 +40,7 @@ jobs:
       # Clippy MUST check all targets across all features (postgres, mysql, sqlite, redis)
       # to ensure no feature-gated code or platform integrations introduce warnings or unsafe code.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo check -p rume --no-default-features
 
   doc:
     name: doc & doctests

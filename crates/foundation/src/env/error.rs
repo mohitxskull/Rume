@@ -39,26 +39,32 @@ impl EnvError {
         known_secrets: &[&str],
         secret_keys: &std::collections::BTreeSet<String>,
     ) -> Self {
-        let messages: Vec<String> = err
-            .into_iter()
-            .map(|mut sub_err| {
-                let is_secret_field = sub_err.path.iter().any(|segment| {
-                    crate::env::secrets::is_secret_key(segment)
-                        || secret_keys
-                            .iter()
-                            .any(|key| key.eq_ignore_ascii_case(segment))
-                });
-                redact_figment_kind(&mut sub_err.kind, is_secret_field, known_secrets);
-                crate::env::secrets::redact_diagnostic_text(&sub_err.to_string(), known_secrets)
-            })
-            .collect();
-        Self::Validation(messages.join("\n"))
+        Self::Validation(redact_figment_error(err, known_secrets, secret_keys))
     }
+}
 
-    #[allow(dead_code)]
-    pub(crate) fn from_figment(err: figment::Error) -> Self {
-        Self::from_figment_with_secrets(err, &[], &std::collections::BTreeSet::new())
-    }
+/// Structurally redact a `figment::Error` (handling both typed `Kind` payloads
+/// and rendered diagnostic text) so secrets cannot leak even when they contain
+/// escaped quotes or appear in non-string figment error variants.
+pub(crate) fn redact_figment_error(
+    err: figment::Error,
+    known_secrets: &[&str],
+    secret_keys: &std::collections::BTreeSet<String>,
+) -> String {
+    let messages: Vec<String> = err
+        .into_iter()
+        .map(|mut sub_err| {
+            let is_secret_field = sub_err.path.iter().any(|segment| {
+                crate::env::secrets::is_secret_key(segment)
+                    || secret_keys
+                        .iter()
+                        .any(|key| key.eq_ignore_ascii_case(segment))
+            });
+            redact_figment_kind(&mut sub_err.kind, is_secret_field, known_secrets);
+            crate::env::secrets::redact_diagnostic_text(&sub_err.to_string(), known_secrets)
+        })
+        .collect();
+    messages.join("\n")
 }
 
 impl From<figment::Error> for EnvError {
