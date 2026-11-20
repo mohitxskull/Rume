@@ -635,15 +635,32 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
         .expect("destroy session");
     assert!(server_1.load("session_xyz").await.unwrap().is_none());
 
-    // 4. Session TTL expiration: 2s TTL
-    // Why: `Session::new` truncates `expires_at` to integer epoch seconds, so a 1s TTL
-    // can expire immediately if `save` and `load` straddle a wall-clock second boundary.
-    // A 2s TTL guarantees >1s of headroom for the initial load while staying fast.
-    let short_session = Session::new("session_temp", "user_guest", 2);
+    // 4. Session TTL expiration (deterministic — no wall-clock sleep):
+    // Verify `save` applies a positive Redis TTL, then force immediate key expiration
+    // via `PEXPIREAT ... 1` before confirming `load` returns `None`.
+    let short_session = Session::new("session_temp", "user_guest", 60);
     server_1.save(short_session).await.expect("save temp");
     assert!(server_2.load("session_temp").await.unwrap().is_some());
 
-    tokio::time::sleep(Duration::from_millis(2100)).await;
+    {
+        let mut conn = pool.get().await.expect("redis conn");
+        let pttl: i64 = deadpool_redis::redis::cmd("PTTL")
+            .arg("rume:session:session_temp")
+            .query_async(&mut *conn)
+            .await
+            .expect("PTTL");
+        assert!(
+            pttl > 0 && pttl <= 60_000,
+            "expected positive session TTL <= 60_000ms, got {pttl}"
+        );
+        let expired: i64 = deadpool_redis::redis::cmd("PEXPIREAT")
+            .arg("rume:session:session_temp")
+            .arg(1_i64)
+            .query_async(&mut *conn)
+            .await
+            .expect("PEXPIREAT");
+        assert_eq!(expired, 1, "expected session key to be expired immediately");
+    }
     assert!(server_2.load("session_temp").await.unwrap().is_none());
 
     // 5. Session ID regeneration (rotation):

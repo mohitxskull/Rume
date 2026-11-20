@@ -491,12 +491,17 @@ impl SamlParser {
                             })?
                             .into_owned();
                         if is_ns(&attr_ns, XSI_NAMESPACE) && k == "type" {
+                            // Why: XML Schema Part 2 §3.2.18 mandates whitespace collapse for
+                            // `xs:QName` values (e.g. `xsi:type=" saml:AudienceRestrictionType"`),
+                            // whereas `quick_xml::Attribute::normalized_value` preserves leading
+                            // and trailing spaces. Trim XML whitespace before resolving the QName.
+                            let trimmed = v.trim();
                             let (type_ns, type_local) = reader
                                 .resolver()
-                                .resolve_element(quick_xml::name::QName(&v));
+                                .resolve_element(quick_xml::name::QName(trimmed));
                             xsi_type_is_saml_audience_restriction = is_ns(&type_ns, ASSERTION)
                                 && type_local.as_ref() == "AudienceRestrictionType";
-                            xsi_type_raw = Some(v.clone());
+                            xsi_type_raw = Some(trimmed.to_string());
                         }
                         if k == "ID" && !v.is_empty() && !seen_ids.insert(v.clone()) {
                             return Err(SamlError::SignatureWrappingDetected(format!(
@@ -1926,5 +1931,32 @@ mod saml_parser_and_iso8601_proptests {
             ),
             Err(SamlError::InResponseToMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn xsi_type_qname_trims_xml_schema_whitespace_before_namespace_resolution() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="_r_qname_ws">
+            <saml:Assertion ID="_a_qname_ws">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z">
+                    <saml:Condition xsi:type="  saml:AudienceRestrictionType  ">
+                        <saml:Audience>https://sp.example</saml:Audience>
+                    </saml:Condition>
+                </saml:Conditions>
+            </saml:Assertion>
+        </samlp:Response>"#;
+
+        let assertion = SamlParser::parse_unverified(xml)
+            .expect("whitespace-padded xsi:type QName in SAML namespace must be accepted");
+        assert_eq!(
+            assertion.audience_restrictions,
+            vec![vec!["https://sp.example".to_string()]]
+        );
     }
 }
