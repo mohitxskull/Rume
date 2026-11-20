@@ -41,4 +41,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 
 - `Task 01: complete (abf14328..522201d, no review — user constraint)`
 - `Task 01: minor (deferred): `execute_job` marked `pub(super)` + lease-heartbeat spawn extracted into `heartbeat.rs` (both in the plan's scope); rustfmt joined a few now-fitting signatures in `worker/tests.rs` — cosmetic, tests pass.`
-- `Task 02: pending`
+- `Task 02: complete (522201d..9e368aa, no review — user constraint)`
+- `Task 02: minor (deferred): clippy gate — cargo clippy --workspace --all-features -- -D warnings fails with clippy::too_many_arguments (8/7) in crates/messaging/src/jobs/worker/heartbeat.rs (rume-messaging, task-01 code; enterprise crate untouched by task 02). Ruling: parked — out of scope for plan 004; needs a follow-up fix (or targeted allow) before the workspace clippy gate is green.`
+- `Task 03: pending`
