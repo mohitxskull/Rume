@@ -494,8 +494,12 @@ impl SamlParser {
                             // Why: XML Schema Part 2 §3.2.18 mandates whitespace collapse for
                             // `xs:QName` values (e.g. `xsi:type=" saml:AudienceRestrictionType"`),
                             // whereas `quick_xml::Attribute::normalized_value` preserves leading
-                            // and trailing spaces. Trim XML whitespace before resolving the QName.
-                            let trimmed = v.trim();
+                            // and trailing spaces. Trim ONLY the four XML whitespace characters:
+                            // `str::trim()` also strips Unicode whitespace such as U+1680, which is
+                            // a legal XML name character, so it could rewrite a foreign prefix
+                            // (`\u{1680}saml`) into the SAML prefix (`saml`) and bypass the
+                            // namespace guard.
+                            let trimmed = v.trim_matches([' ', '\t', '\r', '\n']);
                             let (type_ns, type_local) = reader
                                 .resolver()
                                 .resolve_element(quick_xml::name::QName(trimmed));
@@ -1957,6 +1961,31 @@ mod saml_parser_and_iso8601_proptests {
         assert_eq!(
             assertion.audience_restrictions,
             vec![vec!["https://sp.example".to_string()]]
+        );
+    }
+
+    #[test]
+    fn xsi_type_unicode_whitespace_prefix_is_not_trimmed_into_saml_prefix() {
+        // U+1680 is a valid XML name character: the prefix `\u{1680}saml` is bound to a foreign
+        // namespace and must NOT be collapsed into the SAML-bound `saml` prefix.
+        let xml = "<samlp:Response xmlns:samlp=\"urn:oasis:names:tc:SAML:2.0:protocol\" xmlns:saml=\"urn:oasis:names:tc:SAML:2.0:assertion\" xmlns:\u{1680}saml=\"urn:example:foreign\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" ID=\"_r_u1680\">\
+            <saml:Assertion ID=\"_a_u1680\">\
+                <saml:Issuer>https://idp.example.com</saml:Issuer>\
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>\
+                <saml:Conditions NotBefore=\"2020-01-01T00:00:00Z\" NotOnOrAfter=\"2030-01-01T00:00:00Z\">\
+                    <saml:Condition xsi:type=\"\u{1680}saml:AudienceRestrictionType\">\
+                        <saml:Audience>https://sp.example</saml:Audience>\
+                    </saml:Condition>\
+                </saml:Conditions>\
+            </saml:Assertion>\
+        </samlp:Response>";
+
+        assert!(
+            matches!(
+                SamlParser::parse_unverified(xml),
+                Err(SamlError::Malformed(_))
+            ),
+            "foreign-namespace type behind a U+1680 prefix must fail closed"
         );
     }
 }
