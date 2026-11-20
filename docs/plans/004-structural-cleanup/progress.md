@@ -39,4 +39,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 
 ## Tasks
 
-(entries appended as tasks complete)
+- `Task 01: complete (abf14328..522201d, no review — user constraint)`
+- `Task 01: minor (deferred): `execute_job` marked `pub(super)` + lease-heartbeat spawn extracted into `heartbeat.rs` (both in the plan's scope); rustfmt joined a few now-fitting signatures in `worker/tests.rs` — cosmetic, tests pass.`
+- `Task 02: pending`
