@@ -1,0 +1,42 @@
+# Plan ledger — plan: docs/plans/004-structural-cleanup/
+
+Execution mode (settled by user): sequential — one implementer subagent per task, one at a time on `main`.
+Commits: none — user approved execution but not commits; repo default (`rules/30-git.md`): no commits without the user explicitly asking. Ledger entries use the `no-commit` form.
+Review agents: none (user: "we won't be using review agents, only implementer subagents") — controller-side adjudication per plan-executor step 3.
+Models: not overridden — implementers inherit the session default (user asked for no specific models).
+
+## Pre-flight scan (run before dispatch 1)
+
+Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
+
+### Task/pair conflicts (files or interfaces shared)
+
+| Pair | Shared file(s) | What one produces vs what the other consumes | Finding |
+|---|---|---|---|
+| 05 → 06 | `crates/data/src/persistence/migration/runner.rs` | 05 creates `migration/{mod,preflight,runner,tests}.rs`; 06's constraint: callers in `migration/runner.rs` keep working unchanged (`crate::persistence::backend::X` paths). | Sequential: 05 then 06. |
+| 06 → 09 | `crates/data/src/persistence/backend/mod.rs` | 06 creates `backend/{mod,validation}.rs` (bridge: `pub(crate) use validation::{...}` at `crate::persistence::backend::X`). 09's "Data-internal include path fixes (tree moved)" rewrite `sql/postgres/audit_insert.sql` → `../../../sql/postgres/audit_insert.sql` in `backend/mod.rs`. | 09 after 06. |
+| 09 → 10 | `crates/data/sql` tree; `crates/messaging` trees | 10's gate: `find crates/data/sql -type d | awk -F/ '{print NF}' | sort -n | tail -1` ≤ 4; `find crates/messaging -name '*.sql'` empty; `grep -rn "persistence::sql::" crates` empty. | Sequential, 10 last. |
+| 11 → 12 | `crates/foundation/src/util/html.rs` | 11 renames `helpers/` → `util/` (html.rs lands at `util/html.rs`); 12's Files touched assume `util/html.rs` exists. | 12 after 11. |
+| 11 → 14 | — | Grep: no refs to `rume_foundation::helpers`/`rume::helpers` in `crates/testing/` (only a doc comment in `crates/testing/src/lib.rs:1`). Task 14 independent of 11. | No dependency — order anyway: 13, 14. |
+| 13 | `./tmp/` (empty dir at rume root) | 13 deletes it; nothing references it. | Independent — any order. |
+
+### Self-agreement spot checks (task files vs tree, spot-checked by conductor)
+
+| Task | Check | Finding |
+|---|---|---|
+| 01 | `crates/messaging/src/jobs/worker.rs` = 3,286 lines; doc: "Background worker runner, handler registry, and graceful drain lifecycle" — agrees with split plan (registry/runner/heartbeat/drain). | Agrees. |
+| 09 | `crates/data/src/persistence/sql{,.rs}` = 50 `.sql` files; README says 50; writer verified `find` counts. | Agrees (re-verify at dispatch: `find crates/data/src/persistence/sql -type f \| wc -l`). |
+| 12 | `crates/foundation/src/helpers/html.rs` mixes `escape_html`/`strip_html_tags` (324) + `excerpt` (text) — writer read the file. | Agrees (verify at dispatch: `grep -n 'fn excerpt\|fn escape_html\|fn strip_html_tags' crates/foundation/src/helpers/html.rs`). |
+
+## Rulings
+
+| # | Ruling | Why |
+|---|---|---|
+| R1 | Commits on branch `rume-004-structural-cleanup` (created now at base `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`); all commits stay on the branch; **no push until the user gives permission** | User: "do all commits there, but don't push until I give permission". Repo default (no-commits-without-asking) overridden by explicit authorization for this branch. |
+| R2 | No review agents | User constraint: "we won't be using review agents, only implementer subagents". Controller adjudicates. |
+| R3 | Sequential execution | User: "Sequential (as written)". |
+| R4 | No model overrides | User asked no specific models; harness forbids setting them unasked. |
+
+## Tasks
+
+(entries appended as tasks complete)
