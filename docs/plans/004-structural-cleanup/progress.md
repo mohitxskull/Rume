@@ -47,4 +47,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 03: minor (deferred): 6 intended `pub(crate)` visibility edits in `app/builder/mod.rs` (`run_inspect_mode`, `build_router_with_resolved`, `collect_and_validate_routes`, `merge_module_router`, `normalize_route_template`, `validate_middleware_config`) — cross-module calls after the split; behavior-preserving (report §Implementation notes).`
 - `Task 04: complete (07c214d..6099528, no review — user constraint)`
 - `Task 04: minor (deferred): public module path `rume::enterprise::saml` moved to `rume::saml` (module now at crate root; `src/enterprise/` now nests only `scim.rs` — the Phase 4 "double enterprise" note); no consumers of the old module path (grep `enterprise::saml` empty); type paths (`rume::enterprise::SamlParser`) still resolve — verified via `cargo test -p rume --features enterprise` green.`
-- `Task 05: pending`
+- `Task 05: complete (6099528..a160a36, no review — user constraint)`
+- `Task 05: minor (deferred): pre-existing warning noted by implementer — `sanitize_non_nested_block_comments` never used (`backend.rs:379`); verified pre-existing on the pristine tree via `git stash` + rerun; out of scope (task 06's bridge re-exports it — reconcile during task 06).`
+- `Task 06: pending`
