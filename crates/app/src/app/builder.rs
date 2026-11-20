@@ -506,11 +506,18 @@ where
         let (axum_router, registry) = router.into().into_parts();
         self.router = self.router.nest(path, axum_router);
         for r in registry.routes() {
+            let full_path = rume_http::routing::registry::join_path(path, &r.path);
+            let mut params = rume_http::routing::registry::extract_path_params(&full_path);
+            for p in &r.params {
+                if !params.contains(p) {
+                    params.push(p.clone());
+                }
+            }
             self.record_route(rume_http::routing::RouteInfo {
                 method: r.method.clone(),
-                path: rume_http::routing::registry::join_path(path, &r.path),
+                path: full_path,
                 name: r.name.clone(),
-                params: r.params.clone(),
+                params,
                 matchers: r.matchers.clone(),
                 request_schema: r.request_schema.clone(),
             });
@@ -901,48 +908,14 @@ where
         }
 
         // --- Step 2: Validation phase (fail closed, before any middleware wraps) ---
-        let mut seen_middleware: HashSet<&str> = HashSet::new();
-        for name in &middleware_order {
-            if !seen_middleware.insert(name.as_str()) {
-                return Err(
-                    MiddlewareConfigError::DuplicateMiddleware { name: name.clone() }.into(),
-                );
-            }
-        }
-
-        let mut seen_groups: HashSet<&str> = HashSet::new();
-        for name in &groups_order {
-            if !seen_groups.insert(name.as_str()) {
-                return Err(MiddlewareConfigError::DuplicateGroup { name: name.clone() }.into());
-            }
-        }
-
-        for name in &applied_middleware {
-            if !middleware.contains_key(name.as_str()) {
-                return Err(MiddlewareConfigError::UnknownMiddleware { name: name.clone() }.into());
-            }
-        }
-
-        for name in &applied_groups {
-            if !groups.contains_key(name.as_str()) {
-                return Err(MiddlewareConfigError::UnknownGroup { name: name.clone() }.into());
-            }
-        }
-
-        for group_name in &applied_groups {
-            let Some(members) = groups.get(group_name.as_str()) else {
-                continue;
-            };
-            for member in members {
-                if !middleware.contains_key(member.as_str()) {
-                    return Err(MiddlewareConfigError::UnknownGroupMember {
-                        group: group_name.clone(),
-                        member: member.clone(),
-                    }
-                    .into());
-                }
-            }
-        }
+        validate_middleware_config(
+            &middleware,
+            &middleware_order,
+            &groups,
+            &groups_order,
+            &applied_middleware,
+            &applied_groups,
+        )?;
 
         // --- Step 3: Application phase: all references are now known valid ---
         //
@@ -1028,10 +1001,18 @@ where
     fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
         // Why: `Inspect` mode skips `on_start`, `on_ready`, and `on_shutdown` hooks so
         // `rume list:routes` and boot checks remain side-effect-free, while still
-        // running `ModuleRegistry` DAG validation, `check_and_record_route`, and the
-        // actual Axum router merge so module cycles and duplicate routes (including
-        // app `.route()` + module collisions) fail closed identically to `build_router`.
+        // running `ModuleRegistry` DAG validation, middleware validation,
+        // `check_and_record_route`, and the actual Axum router merge so module cycles,
+        // misconfigured middleware, and duplicate routes fail closed identically to `build_router`.
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        validate_middleware_config(
+            &self.middleware,
+            &self.middleware_order,
+            &self.groups,
+            &self.groups_order,
+            &self.applied_middleware,
+            &self.applied_groups,
+        )?;
         let app_routes = self
             .route_registry
             .read()
@@ -1158,10 +1139,19 @@ where
         let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
         let sf_task = shutdown_tx.clone();
-        tokio::spawn(async move {
+        let signal_handle = tokio::spawn(async move {
             signal.await;
             let _ = sf_task.send(true);
         });
+        // Why: abort the signal watcher task on any early exit (startup failure,
+        // bind/serve error, or cancellation) so it never leaks as a detached task.
+        struct AbortOnDrop(tokio::task::JoinHandle<()>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _signal_guard = AbortOnDrop(signal_handle);
 
         // --- Step 3–6: Boot, module on_start, application on_ready, and Ready transition ---
         crate::app::lifecycle::run_startup(
@@ -1260,6 +1250,61 @@ fn collect_and_validate_routes(
     }
 
     Ok((module_axum, module_routes))
+}
+
+fn validate_middleware_config<V>(
+    middleware: &BTreeMap<String, V>,
+    middleware_order: &[String],
+    groups: &BTreeMap<String, Vec<String>>,
+    groups_order: &[String],
+    applied_middleware: &BTreeSet<String>,
+    applied_groups: &BTreeSet<String>,
+) -> Result<(), BuildError> {
+    let mut seen_middleware: HashSet<&str> = HashSet::new();
+    for name in middleware_order {
+        if !seen_middleware.insert(name.as_str()) {
+            return Err(MiddlewareConfigError::DuplicateMiddleware { name: name.clone() }.into());
+        }
+    }
+
+    let mut seen_groups: HashSet<&str> = HashSet::new();
+    for name in groups_order {
+        if !seen_groups.insert(name.as_str()) {
+            return Err(MiddlewareConfigError::DuplicateGroup { name: name.clone() }.into());
+        }
+    }
+
+    for name in applied_middleware {
+        if !middleware.contains_key(name.as_str()) {
+            return Err(MiddlewareConfigError::UnknownMiddleware { name: name.clone() }.into());
+        }
+    }
+
+    for name in applied_groups {
+        if !groups.contains_key(name.as_str()) {
+            return Err(MiddlewareConfigError::UnknownGroup { name: name.clone() }.into());
+        }
+    }
+
+    // Why: validate every registered group's members (in declaration order),
+    // not only `applied_groups`, matching the documented contract so unused
+    // misconfigured groups fail closed at build/inspect time.
+    for group_name in groups_order {
+        let Some(members) = groups.get(group_name.as_str()) else {
+            continue;
+        };
+        for member in members {
+            if !middleware.contains_key(member.as_str()) {
+                return Err(MiddlewareConfigError::UnknownGroupMember {
+                    group: group_name.clone(),
+                    member: member.clone(),
+                }
+                .into());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Merge a module router onto a target router, catching Axum's overlapping-route

@@ -202,6 +202,7 @@ async fn test_saga_compensation_failure() {
         SagaStatus::CompensationFailed {
             error,
             compensation_error,
+            ..
         } => {
             assert_eq!(
                 error,
@@ -379,9 +380,10 @@ async fn test_saga_persistence_and_crash_resume() {
         completed_steps: vec!["step_1_reserve".into()],
         compensated_steps: Vec::new(),
         updated_at: 1000,
+        version: 1,
     };
     store
-        .save_record(&crashed_record)
+        .save_record_cas(&crashed_record, 0)
         .await
         .expect("save crashed record");
 
@@ -463,9 +465,10 @@ async fn test_saga_persistence_and_crashed_compensation() {
         completed_steps: vec!["step_1_reserve".into(), "step_2_charge".into()],
         compensated_steps: vec!["step_2_charge".into()],
         updated_at: 2000,
+        version: 1,
     };
     store
-        .save_record(&crashed_record)
+        .save_record_cas(&crashed_record, 0)
         .await
         .expect("save crashed record");
 
@@ -536,7 +539,11 @@ mod rc16_tests {
     }
 
     impl SagaStore for RecordingSagaStore {
-        fn save_record(&self, record: &SagaRecord) -> BoxFuture<'_, Result<(), SagaError>> {
+        fn save_record_cas(
+            &self,
+            record: &SagaRecord,
+            expected_version: u64,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
             let should_fail = self
                 .fail_on
                 .lock()
@@ -552,7 +559,7 @@ mod rc16_tests {
                 });
             }
             self.saved.lock().expect("lock").push(record.clone());
-            self.inner.save_record(record)
+            self.inner.save_record_cas(record, expected_version)
         }
 
         fn load_record(
@@ -684,14 +691,18 @@ mod rc16_tests {
 
         let saga_id = "saga-persist-err-1";
         store
-            .save_record(&SagaRecord {
-                saga_id: saga_id.into(),
-                saga_name: "persist_error_saga".into(),
-                status: SagaStatus::Pending,
-                completed_steps: Vec::new(),
-                compensated_steps: Vec::new(),
-                updated_at: 1000,
-            })
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: saga_id.into(),
+                    saga_name: "persist_error_saga".into(),
+                    status: SagaStatus::Pending,
+                    completed_steps: Vec::new(),
+                    compensated_steps: Vec::new(),
+                    updated_at: 1000,
+                    version: 1,
+                },
+                0,
+            )
             .await
             .expect("seed record");
 
@@ -849,7 +860,8 @@ mod rc16_tests {
             report.status,
             SagaStatus::CompensationFailed {
                 error: expected_err,
-                compensation_error: expected_comp_err,
+                compensation_error: expected_comp_err.clone(),
+                compensation_errors: vec![expected_comp_err],
             }
         );
     }

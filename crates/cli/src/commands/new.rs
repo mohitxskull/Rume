@@ -239,24 +239,33 @@ fn validate_name(name: &str) -> Result<(), NewError> {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return Err(NewError::InvalidName(name.to_string()));
     }
-    let normalized = name.to_ascii_lowercase().replace('-', "_");
-    const RESERVED_KEYWORDS: &[&str] = &[
-        "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "fn",
-        "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub", "ref",
-        "return", "self", "Self", "static", "struct", "super", "trait", "true", "type", "unsafe",
-        "use", "where", "while", "async", "await", "dyn", "abstract", "become", "box", "do",
-        "final", "macro", "override", "priv", "typeof", "unsized", "virtual", "yield", "try",
-    ];
-    if RESERVED_KEYWORDS.contains(&normalized.as_str()) {
+    if !crate::commands::generate::is_valid_identifier(name) {
         return Err(NewError::InvalidName(format!(
-            "project name `{name}` is a reserved Rust keyword"
+            "project name `{name}` is a reserved Rust keyword or invalid identifier"
         )));
     }
     Ok(())
 }
 
+fn render_dev_rume_dependency(rume_dependency: &str) -> String {
+    // Why: `rume`'s default features omit `testing` so production binaries never
+    // pull `rume-testing` / `reqwest`. Generated projects enable `testing` only
+    // in `[dev-dependencies]` for `tests/smoke.rs`.
+    if let Some(prefix) = rume_dependency.strip_suffix(" }") {
+        format!("{prefix}, features = [\"testing\"] }}")
+    } else if let Some(ver) = rume_dependency
+        .strip_prefix("rume = \"")
+        .and_then(|s| s.strip_suffix('"'))
+    {
+        format!("rume = {{ version = \"{ver}\", features = [\"testing\"] }}")
+    } else {
+        rume_dependency.to_string()
+    }
+}
+
 fn render(template: &str, context: &TemplateContext<'_>) -> String {
     let crate_name = context.name.replace('-', "_");
+    let rume_dev_dependency = render_dev_rume_dependency(context.rume_dependency);
     // Why: Keep `sql/items/*.sql` un-dialected (`dialect: None`) while substituting `?` vs
     // `$1`/`$2`/`$3` placeholders per `--dialect` so `sql_assets!` preserves flat
     // `queries::items::*` bindings and `tests/smoke.rs`'s `SqliteTestFixture` continues to pass
@@ -270,6 +279,7 @@ fn render(template: &str, context: &TemplateContext<'_>) -> String {
         .replace("{{name}}", context.name)
         .replace("{{crate_name}}", &crate_name)
         .replace("{{rume_dependency}}", context.rume_dependency)
+        .replace("{{rume_dev_dependency}}", &rume_dev_dependency)
         .replace("{{dialect}}", dialect_name)
         .replace("{{p1}}", p1)
         .replace("{{p2}}", p2)
@@ -303,6 +313,7 @@ mod tests {
         assert!(validate_name("404").is_err());
         assert!(validate_name("type").is_err());
         assert!(validate_name("match").is_err());
+        assert!(validate_name("gen").is_err());
         assert!(validate_name("-app").is_err());
     }
 

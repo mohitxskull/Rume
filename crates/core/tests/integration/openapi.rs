@@ -40,7 +40,7 @@ async fn openapi_generation_from_route_registry() {
       "paths": {
         "/users": {
           "post": {
-            "operation_id": "users.create",
+            "operationId": "users.create",
             "summary": "users.create",
             "responses": {
               "200": {
@@ -57,7 +57,7 @@ async fn openapi_generation_from_route_registry() {
         },
         "/users/{id}": {
           "get": {
-            "operation_id": "users.show",
+            "operationId": "users.show",
             "summary": "users.show",
             "parameters": [
               {

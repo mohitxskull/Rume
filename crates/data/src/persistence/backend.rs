@@ -244,6 +244,14 @@ pub trait DatabaseBackend: Debug + Send + Sync + 'static {
     /// Begins a new transaction.
     fn begin_transaction(&self) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>>;
 
+    /// Begins a write-immediate transaction where the dialect distinguishes
+    /// deferred vs immediate locks (e.g. `BEGIN IMMEDIATE` on SQLite).
+    fn begin_immediate_transaction(
+        &self,
+    ) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
+        self.begin_transaction()
+    }
+
     /// Returns the current number of open physical connections managed by the backend driver.
     fn pool_size(&self) -> u32 {
         0
@@ -1048,10 +1056,6 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
 
     /// Explicitly discards and rolls back all changes made within this transaction.
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>>;
-
-    /// Marks the transaction connection for cancellation-safe session cleanup if dropped
-    /// without explicit resolution (e.g. releasing a MySQL session-level named lock).
-    fn release_mysql_lock_on_drop(&self, _armed: bool) {}
 }
 
 #[cfg(test)]

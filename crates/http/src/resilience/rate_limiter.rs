@@ -151,7 +151,11 @@ impl RateLimiter {
     ) -> Result<RateLimitStatus, ResilienceError> {
         let mut clients = Self::shard_for(shards, key).write();
         let now = Instant::now();
-        let window_start = now.checked_sub(config.window).unwrap_or(now);
+        // Why: never use `now.checked_sub(config.window).unwrap_or(now)` — when
+        // monotonic uptime (or paused Tokio clock) is shorter than `config.window`,
+        // `checked_sub` returns `None` and falling back to `now` makes `t > now`
+        // false for every timestamp, bypassing rate limiting completely.
+        let in_window = |&t: &Instant| now.duration_since(t) < config.window;
 
         let target_key = if clients.contains_key(key) {
             // Active known identity: always enforce its recorded history.
@@ -160,7 +164,7 @@ impl RateLimiter {
             // 1. Prune expired entries inline if shard is at capacity to free up inactive slots.
             if clients.len() >= config.max_entries_per_shard {
                 clients.retain(|_, entry| {
-                    entry.timestamps.retain(|&t| t > window_start);
+                    entry.timestamps.retain(in_window);
                     !entry.timestamps.is_empty()
                 });
             }
@@ -178,7 +182,7 @@ impl RateLimiter {
             // so a client cannot gain a fresh quota mid-window when older entries expire.
             let overflow_active = clients
                 .get(Self::OVERFLOW_KEY)
-                .is_some_and(|e| e.timestamps.iter().any(|&t| t > window_start));
+                .is_some_and(|e| e.timestamps.iter().any(in_window));
             if (clients.len() >= config.max_entries_per_shard || overflow_active)
                 && !clients.contains_key(key)
             {
@@ -190,7 +194,7 @@ impl RateLimiter {
 
         let entry = clients.entry(target_key.to_string()).or_default();
         // Discard timestamps older than the sliding window
-        entry.timestamps.retain(|&t| t > window_start);
+        entry.timestamps.retain(in_window);
 
         if entry.timestamps.len() >= config.max_requests as usize {
             let oldest = entry.timestamps.first().copied().unwrap_or(now);
@@ -253,11 +257,11 @@ impl RateLimiter {
         match &self.backend {
             RateLimiterBackend::InMemory(shards) => {
                 let now = Instant::now();
-                let window_start = now.checked_sub(self.config.window).unwrap_or(now);
+                let window = self.config.window;
                 for shard in shards.iter() {
                     let mut clients = shard.write();
                     clients.retain(|_, entry| {
-                        entry.timestamps.retain(|&t| t > window_start);
+                        entry.timestamps.retain(|&t| now.duration_since(t) < window);
                         !entry.timestamps.is_empty()
                     });
                 }
@@ -349,14 +353,14 @@ where
             .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
             .map(|ci| ci.0.ip());
 
-        let forwarded_header = req
-            .headers()
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok());
-
+        // Why: per RFC 9110 §5.3, multiple `X-Forwarded-For` header lines are
+        // semantically equivalent to joining them in order with `, `. Reading
+        // only `.get("x-forwarded-for")` ignores subsequent header lines appended
+        // by a reverse proxy and lets an attacker spoof the first header line.
+        let folded_xff = fold_forwarded_headers(req.headers());
         let ip_key = resolve_forwarded_client_ip(
             socket_ip,
-            forwarded_header,
+            folded_xff.as_deref(),
             &limiter.config().trusted_proxies,
         );
 
@@ -473,4 +477,63 @@ pub fn resolve_forwarded_client_ip(
     }
 
     format!("ip:{peer}")
+}
+
+fn fold_forwarded_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+    let mut parts = Vec::new();
+    for val in headers.get_all("x-forwarded-for") {
+        if let Ok(s) = val.to_str() {
+            let trimmed = s.trim();
+            if !trimmed.is_empty() {
+                parts.push(trimmed);
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr};
+
+    #[tokio::test(start_paused = true)]
+    async fn rate_limiter_enforces_limit_when_uptime_is_less_than_window() {
+        let window = Duration::MAX;
+        assert!(
+            Instant::now().checked_sub(window).is_none(),
+            "precondition: Instant::now() - window must underflow to exercise the regression"
+        );
+        let limiter = RateLimiter::new(RateLimitConfig {
+            max_requests: 2,
+            window,
+            ..RateLimitConfig::default()
+        });
+        assert!(limiter.check("client-1").is_ok());
+        assert!(limiter.check("client-1").is_ok());
+        let err = limiter.check("client-1").unwrap_err();
+        assert!(matches!(err, ResilienceError::RateLimited { .. }));
+
+        // prune_expired must also retain timestamps when uptime < window.
+        limiter.prune_expired();
+        assert!(matches!(
+            limiter.check("client-1"),
+            Err(ResilienceError::RateLimited { .. })
+        ));
+    }
+
+    #[test]
+    fn fold_forwarded_headers_uses_rightmost_header_line() {
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
+        let folded = fold_forwarded_headers(&headers);
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let ip = resolve_forwarded_client_ip(Some(proxy), folded.as_deref(), &[proxy]);
+        assert_eq!(ip, "ip:203.0.113.99");
+    }
 }

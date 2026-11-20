@@ -117,7 +117,21 @@ impl EventBus {
 
         let run_listeners = async move {
             for listener in listeners {
-                let fut = listener(Arc::clone(&event_arc));
+                // Why: wrap the synchronous closure invocation itself in
+                // `catch_unwind` as well as polling the returned future, so a
+                // listener that panics before returning its `BoxFuture` cannot
+                // unwind `publish_sync` or abort remaining listeners.
+                let fut = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    listener(Arc::clone(&event_arc))
+                })) {
+                    Ok(fut) => fut,
+                    Err(_) => {
+                        return Err(EventError::ListenerError {
+                            event_type: E::TYPE,
+                            message: "event listener panicked".into(),
+                        });
+                    }
+                };
                 match AssertUnwindSafe(fut).catch_unwind().await {
                     Ok(Ok(())) => {}
                     Ok(Err(err)) => return Err(err),
@@ -166,7 +180,17 @@ impl EventBus {
             );
             let run_listeners = async move {
                 for listener in listeners {
-                    let fut = listener(Arc::clone(&event_arc));
+                    let fut = match std::panic::catch_unwind(AssertUnwindSafe(|| {
+                        listener(Arc::clone(&event_arc))
+                    })) {
+                        Ok(fut) => fut,
+                        Err(panic_payload) => {
+                            tracing::error!(
+                                "async event listener panicked synchronously: {panic_payload:?}"
+                            );
+                            continue;
+                        }
+                    };
                     match AssertUnwindSafe(fut).catch_unwind().await {
                         Ok(Ok(())) => {}
                         Ok(Err(err)) => {
@@ -296,5 +320,39 @@ mod tests {
             .clone()
             .expect("listener must observe TraceContext::current() without OTel layer");
         assert_eq!(fallback_tc.trace_id(), parent_trace_id);
+    }
+
+    #[tokio::test]
+    async fn sync_panicking_listener_is_caught_in_publish_sync_and_publish_async() {
+        let bus = EventBus::new();
+        let second_done = Arc::new(tokio::sync::Notify::new());
+        let second_done_clone = Arc::clone(&second_done);
+
+        bus.subscribe_fn::<TestSyncEvent, _, _>(
+            |_evt| -> std::future::Ready<Result<(), EventError>> {
+                panic!("sync panic before returning future");
+            },
+        );
+        bus.subscribe_fn::<TestSyncEvent, _, _>(move |_evt| {
+            let notify = Arc::clone(&second_done_clone);
+            async move {
+                notify.notify_one();
+                Ok(())
+            }
+        });
+
+        let err = bus
+            .publish_sync(&TestSyncEvent { id: "s1".into() })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, EventError::ListenerError { .. }));
+
+        let notified = bus.publish_async(TestSyncEvent { id: "a1".into() });
+        assert_eq!(notified, 2);
+        tokio::time::timeout(std::time::Duration::from_secs(2), second_done.notified())
+            .await
+            .expect(
+                "second healthy listener must still run in publish_async after first listener panics synchronously",
+            );
     }
 }

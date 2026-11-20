@@ -1,6 +1,8 @@
 //! OpenTelemetry subscriber initialization (`SdkTracerProvider`, `SdkMeterProvider`, `SdkLoggerProvider`)
 //! and optional OTLP export (`feature = "otel"`).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
@@ -19,6 +21,7 @@ pub struct ObservabilityGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
+    shut_down: AtomicBool,
 }
 
 impl ObservabilityGuard {
@@ -37,17 +40,70 @@ impl ObservabilityGuard {
         &self.logger_provider
     }
 
-    /// Explicitly shuts down all OpenTelemetry providers.
+    /// Explicitly shuts down all OpenTelemetry providers synchronously.
     pub fn shutdown(&self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _ = self.tracer_provider.shutdown();
         let _ = self.meter_provider.shutdown();
         let _ = self.logger_provider.shutdown();
+    }
+
+    /// Explicitly shuts down all OpenTelemetry providers without blocking the
+    /// calling async runtime thread.
+    pub async fn shutdown_async(&self) {
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let tracer = self.tracer_provider.clone();
+        let meter = self.meter_provider.clone();
+        let logger = self.logger_provider.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = tracer.shutdown();
+            let _ = meter.shutdown();
+            let _ = logger.shutdown();
+        })
+        .await;
     }
 }
 
 impl Drop for ObservabilityGuard {
     fn drop(&mut self) {
-        self.shutdown();
+        if self.shut_down.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        // Why: `Sdk*Provider::shutdown()` performs blocking flushes (and HTTP
+        // OTLP exports when `feature = "otel"` is enabled).
+        // - Outside Tokio: run synchronously.
+        // - Inside a multi-threaded Tokio runtime: use `block_in_place` so
+        //   shutdown completes before process exit without starving worker threads.
+        // - Inside a `current_thread` Tokio runtime: `block_in_place` panics and
+        //   blocking directly can deadlock, so offload to an OS thread; async
+        //   callers on `current_thread` runtimes should await `shutdown_async()`
+        //   before exiting to guarantee all pending telemetry flushes.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    let _ = self.tracer_provider.shutdown();
+                    let _ = self.meter_provider.shutdown();
+                    let _ = self.logger_provider.shutdown();
+                });
+                return;
+            }
+            let tracer = self.tracer_provider.clone();
+            let meter = self.meter_provider.clone();
+            let logger = self.logger_provider.clone();
+            std::thread::spawn(move || {
+                let _ = tracer.shutdown();
+                let _ = meter.shutdown();
+                let _ = logger.shutdown();
+            });
+            return;
+        }
+        let _ = self.tracer_provider.shutdown();
+        let _ = self.meter_provider.shutdown();
+        let _ = self.logger_provider.shutdown();
     }
 }
 
@@ -71,7 +127,9 @@ impl ObservabilityBuilder {
         Self {
             service_name: "rume".to_string(),
             #[cfg(feature = "otel")]
-            otlp_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok(),
+            otlp_endpoint: std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
         }
     }
 
@@ -84,7 +142,12 @@ impl ObservabilityBuilder {
     /// Configures an explicit OTLP HTTP endpoint for traces, metrics, and logs.
     #[cfg(feature = "otel")]
     pub fn with_otlp_endpoint(mut self, endpoint: impl Into<String>) -> Self {
-        self.otlp_endpoint = Some(endpoint.into());
+        let endpoint = endpoint.into();
+        self.otlp_endpoint = if endpoint.trim().is_empty() {
+            None
+        } else {
+            Some(endpoint)
+        };
         self
     }
 
@@ -99,26 +162,45 @@ impl ObservabilityBuilder {
 
         let (tracer_provider, meter_provider, logger_provider) = self.build_providers(resource)?;
 
-        global::set_text_map_propagator(TraceContextPropagator::new());
-        global::set_tracer_provider(tracer_provider.clone());
-        global::set_meter_provider(meter_provider.clone());
-
         let tracer = tracer_provider.tracer("rume");
         let otel_trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider);
         let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-        tracing_subscriber::registry()
+        // Why: install the global `tracing` subscriber BEFORE mutating global
+        // OpenTelemetry propagators/providers. If a subscriber is already
+        // registered, mutating globals first would clobber custom propagators
+        // or providers and violate the "safely ignored" contract of `init_tracing`.
+        if let Err(err) = tracing_subscriber::registry()
             .with(filter)
             .with(tracing_subscriber::fmt::layer())
             .with(otel_trace_layer)
             .with(otel_log_layer)
-            .try_init()?;
+            .try_init()
+        {
+            if tokio::runtime::Handle::try_current().is_ok() {
+                std::thread::spawn(move || {
+                    let _ = tracer_provider.shutdown();
+                    let _ = meter_provider.shutdown();
+                    let _ = logger_provider.shutdown();
+                });
+            } else {
+                let _ = tracer_provider.shutdown();
+                let _ = meter_provider.shutdown();
+                let _ = logger_provider.shutdown();
+            }
+            return Err(err.into());
+        }
+
+        global::set_text_map_propagator(TraceContextPropagator::new());
+        global::set_tracer_provider(tracer_provider.clone());
+        global::set_meter_provider(meter_provider.clone());
 
         Ok(ObservabilityGuard {
             tracer_provider,
             meter_provider,
             logger_provider,
+            shut_down: AtomicBool::new(false),
         })
     }
 
@@ -150,7 +232,12 @@ impl ObservabilityBuilder {
     > {
         use opentelemetry_otlp::{Protocol, WithExportConfig};
 
-        let Some(ref endpoint) = self.otlp_endpoint else {
+        let Some(endpoint) = self
+            .otlp_endpoint
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
             let tracer_provider = SdkTracerProvider::builder()
                 .with_resource(resource.clone())
                 .build();
@@ -235,5 +322,58 @@ mod tests {
         init_tracing();
         let second_try = try_init_tracing();
         assert!(second_try.is_err());
+    }
+
+    #[test]
+    fn failed_reinit_preserves_custom_global_propagator() {
+        use opentelemetry_sdk::propagation::BaggagePropagator;
+
+        let _global_guard = test_global_otel_lock().blocking_lock();
+        init_tracing();
+
+        // Install a custom propagator (BaggagePropagator injects `baggage`, not `traceparent`).
+        global::set_text_map_propagator(BaggagePropagator::new());
+
+        // Calling init_tracing() again must fail to install a subscriber and must NOT overwrite
+        // the global propagator back to TraceContextPropagator.
+        let res = ObservabilityBuilder::new().try_init();
+        assert!(res.is_err());
+
+        let fields: Vec<String> =
+            global::get_text_map_propagator(|p| p.fields().map(str::to_string).collect());
+        assert!(
+            fields.iter().any(|f| f == "baggage"),
+            "custom BaggagePropagator should survive failed try_init, got fields: {fields:?}"
+        );
+
+        // Restore TraceContextPropagator for subsequent tests.
+        global::set_text_map_propagator(TraceContextPropagator::new());
+    }
+
+    #[tokio::test]
+    async fn dropping_observability_guard_in_current_thread_runtime_does_not_deadlock() {
+        let resource = Resource::builder().with_service_name("test").build();
+        let builder = ObservabilityBuilder::new();
+        let (tracer_provider, meter_provider, logger_provider) =
+            builder.build_providers(resource).expect("build providers");
+        let guard = ObservabilityGuard {
+            tracer_provider,
+            meter_provider,
+            logger_provider,
+            shut_down: AtomicBool::new(false),
+        };
+        drop(guard);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn whitespace_otlp_endpoint_is_treated_as_none() {
+        let builder = ObservabilityBuilder::new().with_otlp_endpoint("   ");
+        assert!(builder.otlp_endpoint.is_none());
+        let resource = Resource::builder().with_service_name("test").build();
+        let (t, m, l) = builder.build_providers(resource).expect("build providers");
+        let _ = t.shutdown();
+        let _ = m.shutdown();
+        let _ = l.shutdown();
     }
 }

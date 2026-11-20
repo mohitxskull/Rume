@@ -1392,6 +1392,7 @@ impl Job for LongRunningWorkerJob {
 
 struct LongRunningWorkerHandler {
     completed: Arc<AtomicUsize>,
+    done: Arc<tokio::sync::Notify>,
 }
 
 impl JobHandler<LongRunningWorkerJob> for LongRunningWorkerHandler {
@@ -1403,6 +1404,7 @@ impl JobHandler<LongRunningWorkerJob> for LongRunningWorkerHandler {
         Box::pin(async move {
             tokio::time::sleep(Duration::from_millis(600)).await;
             self.completed.fetch_add(1, Ordering::SeqCst);
+            self.done.notify_one();
             Ok(())
         })
     }
@@ -1420,14 +1422,16 @@ async fn test_postgres_job_worker_heartbeat_renewal_keeps_long_running_job_valid
 
     let mut registry = JobRegistry::new();
     let job_completed = Arc::new(AtomicUsize::new(0));
+    let job_done = Arc::new(tokio::sync::Notify::new());
 
     // Handler runs for 600ms (2x longer than the initial 300ms lease duration!)
     registry.register(LongRunningWorkerHandler {
         completed: Arc::clone(&job_completed),
+        done: Arc::clone(&job_done),
     });
 
     let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry));
-    worker.start();
+    let handle = worker.start();
 
     // Enqueue the long-running job
     queue
@@ -1437,8 +1441,15 @@ async fn test_postgres_job_worker_heartbeat_renewal_keeps_long_running_job_valid
         .await
         .expect("enqueue job");
 
-    // Wait for the worker to finish the 600ms job + give a slight margin
-    tokio::time::sleep(Duration::from_millis(900)).await;
+    // Synchronize deterministically on handler completion + graceful worker drain
+    // instead of a racy wall-clock sleep.
+    tokio::time::timeout(Duration::from_secs(5), job_done.notified())
+        .await
+        .expect("long-running job should finish within timeout");
+    assert!(
+        handle.shutdown(Duration::from_secs(5)).await,
+        "worker should drain and ack cleanly"
+    );
 
     // Verify job handler completed
     assert_eq!(job_completed.load(Ordering::SeqCst), 1);

@@ -43,7 +43,10 @@ const REGENERATE_ID_SCRIPT: &str = r#"
     end
     if exp <= now then
         redis.call('DEL', old_key)
-        return redis.error_reply("EXPIRED")
+        -- Why: Redis 7.2/8.0 prepends `ERR ` to single-word `redis.error_reply("EXPIRED")`,
+        -- which makes `redis-rs` report `err.code() == Some("ERR")` instead of `Some("EXPIRED")`.
+        -- Including a message preserves the `EXPIRED` error code prefix.
+        return redis.error_reply("EXPIRED session expired")
     end
 
     decoded.id = new_id
@@ -62,7 +65,11 @@ const REGENERATE_ID_SCRIPT: &str = r#"
     if ttl > 0 then
         redis.call('SET', new_key, updated, 'PX', ttl)
     else
-        redis.call('SET', new_key, updated)
+        -- Why: if `old_key` was PERSISTed (`PTTL == -1`), writing `SET new_key updated`
+        -- without a TTL would create an immortal session key. Fall back to the session's
+        -- own remaining lifetime (min 1000ms).
+        local fallback_ttl = math.max((exp - now) * 1000, 1000)
+        redis.call('SET', new_key, updated, 'PX', fallback_ttl)
     end
     redis.call('DEL', old_key)
     return updated
@@ -208,7 +215,7 @@ impl SessionStore for RedisSessionStore {
 
             let data = match res {
                 Ok(opt) => opt,
-                Err(err) if err.to_string().contains("EXPIRED") => {
+                Err(err) if err.code() == Some("EXPIRED") => {
                     return Err(AuthError::InvalidCredentials("session expired".into()));
                 }
                 Err(err) => return Err(AuthError::ProviderError(err.to_string())),
@@ -239,7 +246,11 @@ mod tests {
         assert!(
             REGENERATE_ID_SCRIPT.contains("tonumber(decoded.expires_at)")
                 && REGENERATE_ID_SCRIPT.contains("MALFORMED"),
-            "Lua script must validate expires_at before comparing and return MALFORMED"
+            "Lua script must validate expires_at numerically and reject malformed payloads"
+        );
+        assert!(
+            REGENERATE_ID_SCRIPT.contains(r#"redis.error_reply("EXPIRED session expired")"#),
+            "Lua script must emit a two-token EXPIRED error reply so Redis 7.2/8.0 preserves the EXPIRED code"
         );
         assert!(
             !REGENERATE_ID_SCRIPT.contains("string.gsub")

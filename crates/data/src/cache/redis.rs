@@ -108,7 +108,10 @@ impl CacheBackend for RedisCacheBackend {
             let mut cmd = redis::cmd("SET");
             cmd.arg(&k).arg(&value);
             if let Some(ttl) = ttl {
-                cmd.arg("PX").arg(ttl.as_millis() as u64);
+                // Why: Redis `SET ... PX` rejects `0` with `ERR invalid expire time`.
+                // Clamp sub-millisecond and zero durations to 1ms, matching `set_with_tags`.
+                let px_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
+                cmd.arg("PX").arg(px_ms);
             }
 
             cmd.query_async::<()>(&mut *conn)
@@ -275,29 +278,35 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            let keys: Vec<String> = redis::cmd("SMEMBERS")
-                .arg(&tk)
-                .query_async(&mut *conn)
+            // Why: perform `SMEMBERS` + `DEL` of every member + `DEL` of the tag
+            // index and persist marker in a single atomic Lua script. Separate
+            // round-trips allowed concurrent `set_with_tags` writes between
+            // `SMEMBERS` and `DEL` to be permanently orphaned from the tag set,
+            // and previously swallowed per-key `DEL` errors.
+            const INVALIDATE_TAG_SCRIPT: &str = r#"
+                local members = redis.call('SMEMBERS', KEYS[1])
+                local deleted = {}
+                for _, k in ipairs(members) do
+                    if redis.call('DEL', k) > 0 then
+                        table.insert(deleted, k)
+                    end
+                end
+                redis.call('DEL', KEYS[1], KEYS[2])
+                return deleted
+            "#;
+
+            let script = redis::Script::new(INVALIDATE_TAG_SCRIPT);
+            let raw_deleted: Vec<String> = script
+                .key(&tk)
+                .key(&persist_key)
+                .invoke_async(&mut *conn)
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            let mut deleted = Vec::new();
-            for k in &keys {
-                let affected: u64 = redis::cmd("DEL")
-                    .arg(k)
-                    .query_async(&mut *conn)
-                    .await
-                    .unwrap_or(0);
-                if affected > 0 {
-                    let stripped = k.strip_prefix(&prefix).unwrap_or(k).to_string();
-                    deleted.push(stripped);
-                }
-            }
-            let _ = redis::cmd("DEL")
-                .arg(&tk)
-                .arg(&persist_key)
-                .query_async::<()>(&mut *conn)
-                .await;
+            let deleted = raw_deleted
+                .into_iter()
+                .map(|k| k.strip_prefix(&prefix).unwrap_or(&k).to_string())
+                .collect();
 
             Ok(deleted)
         })

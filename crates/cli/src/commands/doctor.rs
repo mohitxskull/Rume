@@ -293,8 +293,17 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
                     ok: false,
                 },
                 (Ok(applied), Ok(())) => {
-                    let applied_count = applied.len();
-                    let pending = total_migrations.saturating_sub(applied_count);
+                    // Why: compute pending migrations by ID set difference rather
+                    // than count subtraction (`total - applied.len()`), so diverging
+                    // applied vs local migration sets cannot report `0 pending`.
+                    let applied_ids: std::collections::BTreeSet<&str> =
+                        applied.iter().map(|(id, _)| id.as_str()).collect();
+                    let local_ids: std::collections::BTreeSet<&str> = migrator
+                        .migrations()
+                        .iter()
+                        .map(|m| m.id.as_str())
+                        .collect();
+                    let pending = local_ids.difference(&applied_ids).count();
                     if pending == 0 {
                         DoctorCheck {
                             label: "pending migrations".to_string(),
@@ -333,10 +342,13 @@ async fn check_database_and_migrations() -> (DoctorCheck, DoctorCheck) {
 }
 
 fn check_redis_connectivity() -> DoctorCheck {
-    let redis_url = std::env::var("REDIS_URL").ok().or_else(|| {
-        let _ = dotenvy::dotenv();
-        std::env::var("REDIS_URL").ok()
-    });
+    // Why: resolve `REDIS_URL` through `ResolvedEnv::load()` (the single source
+    // of truth) so `.env.local` / `.env.{env}` are respected without mutating
+    // process environment via `dotenvy::dotenv()`.
+    let redis_url = rume::env::ResolvedEnv::load()
+        .ok()
+        .and_then(|env| env.get("REDIS_URL").map(str::to_string))
+        .or_else(|| std::env::var("REDIS_URL").ok());
 
     let Some(url) = redis_url else {
         return DoctorCheck {

@@ -17,6 +17,7 @@ deadpool-redis = { workspace = true }
 garde = { workspace = true, features = ["derive", "email", "url"] }
 
 [dev-dependencies]
+rume = { path = "../../crates/core", features = ["testing"] }
 testcontainers-modules = { workspace = true }
 tower = { workspace = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["json"] }

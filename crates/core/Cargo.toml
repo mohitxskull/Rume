@@ -32,7 +32,7 @@ serde.workspace = true
 rume-macros = { path = "../../crates/macro", version = "=0.1.0" }
 
 [features]
-default = ["sqlite", "testing"]
+default = ["sqlite"]
 otel = ["rume-observability/otel"]
 testing = ["dep:rume-testing", "rume-testing/testing"]
 postgres = [
@@ -65,7 +65,7 @@ schemars = ["rume-foundation/schemars"]
 # `[dependencies]` after extracting `rume-crash` to `crates/crash`; Cargo
 # feature unification propagates backend `sqlx/*` drivers from `rume-data`/`rume-messaging`
 # when tests enable `postgres`, `sqlite`, or `mysql`.
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 sqlx.workspace = true
 uuid = { version = "=1.29.2", features = ["v4"] }
 deadpool-redis.workspace = true
@@ -86,10 +86,12 @@ criterion = { version = "=0.8.2", features = ["async_tokio"] }
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+required-features = ["testing"]
 
 [[test]]
 name = "containers"
 path = "tests/containers.rs"
+required-features = ["testing"]
 
 [[bench]]
 name = "hot_path"

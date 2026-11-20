@@ -19,7 +19,6 @@ pub mod group;
 pub mod health;
 pub mod matchers;
 pub mod registry;
-pub mod rejection;
 pub mod resource;
 pub mod router;
 pub mod spec;
@@ -33,7 +32,6 @@ pub use health::{
 };
 pub use matchers::Matcher;
 pub use registry::{RouteInfo, RouteRegistry};
-pub use rejection::Rejection;
 pub use resource::Resource;
 pub use router::Router;
 pub use spec::{ParamValidationLayer, RouteSpec};

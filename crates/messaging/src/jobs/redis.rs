@@ -70,6 +70,7 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
             // Compute expires_at using Redis server TIME to eliminate host clock skew
             let script = redis::Script::new(
                 r#"
+                if redis.replicate_commands then redis.replicate_commands() end
                 local server_time = redis.call('TIME')
                 local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
                 local expires_at = now_ms + tonumber(ARGV[2])
@@ -132,6 +133,7 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
             // Query dead worker IDs with score <= Redis server TIME, remove them atomically, and return list
             let script = redis::Script::new(
                 r#"
+                if redis.replicate_commands then redis.replicate_commands() end
                 local server_time = redis.call('TIME')
                 local now_ms = tonumber(server_time[1]) * 1000 + math.floor(tonumber(server_time[2]) / 1000)
                 local dead = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', now_ms)
@@ -312,7 +314,10 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 val.push_str(&hex_encode(&payload));
             }
 
-            // Retain completed state for 24 hours (86,400,000 ms), but only transition if currently IN_PROGRESS
+            // Retain completed state for 24 hours (86,400,000 ms), but only transition if currently IN_PROGRESS.
+            // Why: an empty token (`ARGV[3] == ''`) may ONLY match an unfenced
+            // bare `'IN_PROGRESS'` lock, never a fenced `'IN_PROGRESS:<token>'`
+            // lock, so an unfenced caller cannot hijack another worker's lease.
             let ttl_ms = 86_400_000_u64;
             let script = redis::Script::new(
                 r#"
@@ -321,8 +326,6 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 if current == 'IN_PROGRESS' then
                     matches = true
                 elseif current and ARGV[3] ~= '' and current == ('IN_PROGRESS:' .. ARGV[3]) then
-                    matches = true
-                elseif current and ARGV[3] == '' and string.sub(current, 1, 12) == 'IN_PROGRESS:' then
                     matches = true
                 end
 
@@ -369,7 +372,8 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            // Evicts key if IN_PROGRESS, IN_PROGRESS:<token>, or COMPLETED, clearing idempotency state
+            // Evicts key if bare IN_PROGRESS, matching IN_PROGRESS:<token>, or COMPLETED (with empty token).
+            // Why: empty token (`ARGV[1] == ''`) must never break a fenced `IN_PROGRESS:<token>` lock.
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
@@ -377,8 +381,6 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 if current == 'IN_PROGRESS' then
                     can_delete = true
                 elseif current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
-                    can_delete = true
-                elseif current and ARGV[1] == '' and string.sub(current, 1, 12) == 'IN_PROGRESS:' then
                     can_delete = true
                 elseif current and ARGV[1] == '' and string.sub(current, 1, 9) == 'COMPLETED' then
                     can_delete = true
@@ -427,13 +429,15 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
+            // Why: empty token (`ARGV[1] == ''`) may only extend an unfenced
+            // bare `'IN_PROGRESS'` lock, never a fenced `'IN_PROGRESS:<token>'` lock.
             let script = redis::Script::new(
                 r#"
                 local current = redis.call('GET', KEYS[1])
                 local matches = false
                 if current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
                     matches = true
-                elseif current and ARGV[1] == '' and (current == 'IN_PROGRESS' or string.sub(current, 1, 12) == 'IN_PROGRESS:') then
+                elseif current and ARGV[1] == '' and current == 'IN_PROGRESS' then
                     matches = true
                 end
 

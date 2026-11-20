@@ -157,8 +157,27 @@ fn replace_quoted_after(mut text: String, prefix: &str) -> String {
     let mut search_from = 0;
     while let Some(pos) = text[search_from..].find(prefix) {
         let start = search_from + pos + prefix.len();
-        if let Some(end) = text[start..].find('"') {
-            text.replace_range(start..start + end, "[redacted]");
+        // Why: Figment/serde debug formatting escapes embedded quotes as `\"`
+        // and backslashes as `\\`. Scanning naively for the first `"` stops
+        // early and leaks the suffix after `\"`.
+        let bytes = text.as_bytes();
+        let mut i = start;
+        let mut escaped = false;
+        let mut closing = None;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                closing = Some(i);
+                break;
+            }
+            i += 1;
+        }
+        if let Some(end) = closing {
+            text.replace_range(start..end, "[redacted]");
             search_from = start + "[redacted]".len();
         } else {
             break;
@@ -297,5 +316,16 @@ mod tests {
         let msg = "port: invalid type: string \"not_a_number\", expected u16";
         let redacted = redact_diagnostic_text(msg, &[]);
         assert_eq!(redacted, msg);
+    }
+
+    #[test]
+    fn redact_diagnostic_text_handles_escaped_quotes_in_secret() {
+        let msg = r#"api_key: invalid type: string "prefix\"leaked_tail", expected u32"#;
+        let redacted = redact_diagnostic_text(msg, &[]);
+        assert_eq!(
+            redacted,
+            "api_key: invalid type: string \"[redacted]\", expected u32"
+        );
+        assert!(!redacted.contains("leaked_tail"));
     }
 }

@@ -41,13 +41,13 @@ impl RetryPolicy {
 
     /// Sets the initial backoff duration.
     pub fn with_initial_backoff(mut self, duration: Duration) -> Self {
-        self.initial_backoff_ms = duration.as_millis() as u64;
+        self.initial_backoff_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
     /// Sets the maximum backoff duration cap.
     pub fn with_max_backoff(mut self, duration: Duration) -> Self {
-        self.max_backoff_ms = duration.as_millis() as u64;
+        self.max_backoff_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         self
     }
 
@@ -71,15 +71,44 @@ impl RetryPolicy {
             2.0
         };
 
-        let exponent = (attempt.saturating_sub(1)) as i32;
+        // Why: saturating `i32::try_from` prevents `attempt > i32::MAX as u32 + 1`
+        // from wrapping negative in `as i32`, which would invert `powi` to ~0ms
+        // instead of saturating at `max_backoff_ms`.
+        let exponent = i32::try_from(attempt.saturating_sub(1)).unwrap_or(i32::MAX);
         let factor_pow = factor.powi(exponent);
         let backoff_ms = if factor_pow.is_finite() {
-            (self.initial_backoff_ms as f64 * factor_pow).round() as u64
+            let scaled = self.initial_backoff_ms as f64 * factor_pow;
+            if scaled.is_finite() && scaled >= 0.0 && scaled < (u64::MAX as f64) {
+                scaled.round() as u64
+            } else {
+                self.max_backoff_ms
+            }
         } else {
             self.max_backoff_ms
         };
         let capped_ms = backoff_ms.min(self.max_backoff_ms);
 
         Some(Duration::from_millis(capped_ms))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn next_backoff_saturates_on_huge_attempt_and_duration() {
+        let policy = RetryPolicy::new()
+            .with_max_attempts(u32::MAX)
+            .with_initial_backoff(Duration::from_millis(100))
+            .with_max_backoff(Duration::from_secs(60));
+        assert_eq!(
+            policy.next_backoff(i32::MAX as u32 + 2),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            policy.next_backoff(u32::MAX - 1),
+            Some(Duration::from_secs(60))
+        );
     }
 }

@@ -1,0 +1,5 @@
+error: embed_migrations!: path '../src' must be a relative path within CARGO_MANIFEST_DIR without '..' components
+ --> tests/ui/embed_migrations_traversal.rs:3:19
+  |
+3 | embed_migrations!("../src");
+  |                   ^^^^^^^^

@@ -60,15 +60,60 @@ pub trait CacheBackend: Debug + Send + Sync + 'static {
 type CacheMap = std::sync::Arc<
     tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<std::time::Instant>)>>,
 >;
-type TagMap = std::sync::Arc<
-    tokio::sync::RwLock<std::collections::HashMap<String, std::collections::HashSet<String>>>,
->;
+
+#[derive(Debug, Default)]
+struct TagIndex {
+    tag_to_keys: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    key_to_tags: std::collections::HashMap<String, std::collections::HashSet<String>>,
+}
+
+impl TagIndex {
+    fn insert(&mut self, tag: String, key: String) {
+        self.key_to_tags
+            .entry(key.clone())
+            .or_default()
+            .insert(tag.clone());
+        self.tag_to_keys.entry(tag).or_default().insert(key);
+    }
+
+    /// Removes `key` from all tag sets it belongs to in O(tags_for_key) time.
+    ///
+    /// Why: scanning every tag set in `tag_to_keys` on every delete or expiry
+    /// eviction would be O(total_tags) under the exclusive write lock.
+    fn remove_key(&mut self, key: &str) {
+        if let Some(tags) = self.key_to_tags.remove(key) {
+            for tag in tags {
+                if let Some(keys) = self.tag_to_keys.get_mut(&tag) {
+                    keys.remove(key);
+                    if keys.is_empty() {
+                        self.tag_to_keys.remove(&tag);
+                    }
+                }
+            }
+        }
+    }
+
+    fn remove_tag(&mut self, tag: &str) -> Option<std::collections::HashSet<String>> {
+        let keys = self.tag_to_keys.remove(tag)?;
+        for key in &keys {
+            self.remove_key(key);
+        }
+        Some(keys)
+    }
+
+    fn clear(&mut self) {
+        self.tag_to_keys.clear();
+        self.key_to_tags.clear();
+    }
+}
+
+type TagIndexLock = std::sync::Arc<tokio::sync::RwLock<TagIndex>>;
 
 /// Thread-safe in-memory cache backend suitable for testing and single-instance deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryCacheBackend {
     entries: CacheMap,
-    tag_map: TagMap,
+    tag_index: TagIndexLock,
 }
 
 impl InMemoryCacheBackend {
@@ -82,17 +127,36 @@ impl CacheBackend for InMemoryCacheBackend {
     fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let map = self.entries.read().await;
-            if let Some((val, expires_at)) = map.get(&key) {
-                if let Some(exp) = expires_at
-                    && std::time::Instant::now() >= *exp
-                {
+            let now = std::time::Instant::now();
+            let expired = {
+                let map = self.entries.read().await;
+                if let Some((val, expires_at)) = map.get(&key) {
+                    if let Some(exp) = expires_at
+                        && now >= *exp
+                    {
+                        true
+                    } else {
+                        return Ok(Some(val.clone()));
+                    }
+                } else {
                     return Ok(None);
                 }
-                Ok(Some(val.clone()))
-            } else {
-                Ok(None)
+            };
+            if expired {
+                // Why: opportunistically evict expired keys on read and prune
+                // `tag_index` (acquiring `tag_index` before `entries` to preserve
+                // global lock order) so expired keys do not accumulate forever.
+                let mut tag_index = self.tag_index.write().await;
+                let mut map = self.entries.write().await;
+                if map
+                    .get(&key)
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                {
+                    map.remove(&key);
+                    tag_index.remove_key(&key);
+                }
             }
+            Ok(None)
         })
     }
 
@@ -104,7 +168,8 @@ impl CacheBackend for InMemoryCacheBackend {
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let expires_at = ttl.map(|t| std::time::Instant::now() + t);
+            let now = std::time::Instant::now();
+            let expires_at = ttl.map(|t| now + t);
             let mut map = self.entries.write().await;
             map.insert(key, (value, expires_at));
             Ok(())
@@ -121,16 +186,16 @@ impl CacheBackend for InMemoryCacheBackend {
         let key = key.to_string();
         let tags_vec: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
         Box::pin(async move {
-            // Why: acquire `tag_map` before `entries` (matching `invalidate_tag_keys` and
+            // Why: acquire `tag_index` before `entries` (matching `invalidate_tag_keys` and
             // `clear` to prevent lock-order inversion) and hold both guards across the
             // synchronous inserts so future cancellation while waiting for a lock can never
             // publish a value without its tag memberships.
-            let mut tag_map = self.tag_map.write().await;
+            let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
             let expires_at = ttl.map(|t| std::time::Instant::now() + t);
             map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
-                tag_map.entry(tag).or_default().insert(key.clone());
+                tag_index.insert(tag, key.clone());
             }
             Ok(())
         })
@@ -139,39 +204,63 @@ impl CacheBackend for InMemoryCacheBackend {
     fn delete(&self, key: &str) -> BoxFuture<'_, Result<bool, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
+            // Why: acquire `tag_index` before `entries` (global lock order) and
+            // prune `key` via the reverse index in O(tags_for_key) so deleted
+            // tagged keys do not leak memory in `tag_index`.
+            let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
-            Ok(map.remove(&key).is_some())
+            let removed = map.remove(&key).is_some();
+            if removed {
+                tag_index.remove_key(&key);
+            }
+            Ok(removed)
         })
     }
 
     fn exists(&self, key: &str) -> BoxFuture<'_, Result<bool, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let map = self.entries.read().await;
-            if let Some((_, expires_at)) = map.get(&key) {
-                if let Some(exp) = expires_at
-                    && std::time::Instant::now() >= *exp
-                {
+            let now = std::time::Instant::now();
+            let expired = {
+                let map = self.entries.read().await;
+                if let Some((_, expires_at)) = map.get(&key) {
+                    if let Some(exp) = expires_at
+                        && now >= *exp
+                    {
+                        true
+                    } else {
+                        return Ok(true);
+                    }
+                } else {
                     return Ok(false);
                 }
-                Ok(true)
-            } else {
-                Ok(false)
+            };
+            if expired {
+                let mut tag_index = self.tag_index.write().await;
+                let mut map = self.entries.write().await;
+                if map
+                    .get(&key)
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                {
+                    map.remove(&key);
+                    tag_index.remove_key(&key);
+                }
             }
+            Ok(false)
         })
     }
 
     fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tag = tag.to_string();
         Box::pin(async move {
-            // Why: take BOTH locks (`tag_map` then `entries`, the order used by `set_with_tags`
+            // Why: take BOTH locks (`tag_index` then `entries`, the order used by `set_with_tags`
             // and `clear`) before removing the tag, with no await between removal and entry
             // deletion. Removing the tag first and then awaiting `entries` let a cancellation
             // in between drop the tag index while leaving its values readable, and a retry
             // would then return zero.
-            let mut tag_map = self.tag_map.write().await;
+            let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
-            let Some(keys) = tag_map.remove(&tag) else {
+            let Some(keys) = tag_index.remove_tag(&tag) else {
                 return Ok(Vec::new());
             };
             let mut deleted = Vec::new();
@@ -199,16 +288,64 @@ impl CacheBackend for InMemoryCacheBackend {
 
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>> {
         Box::pin(async move {
-            // Lock `tag_map` before `entries` to match `set_with_tags` and `invalidate_tag_keys`.
-            let mut tag_map = self.tag_map.write().await;
+            // Lock `tag_index` before `entries` to match `set_with_tags` and `invalidate_tag_keys`.
+            let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
             map.clear();
-            tag_map.clear();
+            tag_index.clear();
             Ok(())
         })
     }
 
     fn ping(&self) -> BoxFuture<'_, Result<(), CacheError>> {
         Box::pin(async move { Ok(()) })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delete_prunes_tag_map_and_expired_get_evicts_entry() {
+        let backend = InMemoryCacheBackend::new();
+        backend
+            .set_with_tags("k1", b"v1".to_vec(), &["tag_a"], None)
+            .await
+            .unwrap();
+        assert_eq!(backend.tag_index.read().await.tag_to_keys.len(), 1);
+        assert_eq!(backend.tag_index.read().await.key_to_tags.len(), 1);
+        assert!(backend.delete("k1").await.unwrap());
+        assert_eq!(
+            backend.tag_index.read().await.tag_to_keys.len(),
+            0,
+            "tag_to_keys should be empty after deleting its last key"
+        );
+        assert_eq!(
+            backend.tag_index.read().await.key_to_tags.len(),
+            0,
+            "key_to_tags should be empty after deleting key"
+        );
+
+        backend
+            .set_with_tags("k2", b"v2".to_vec(), &["tag_b"], Some(Duration::ZERO))
+            .await
+            .unwrap();
+        assert_eq!(backend.get("k2").await.unwrap(), None);
+        assert_eq!(
+            backend.entries.read().await.len(),
+            0,
+            "expired key should be evicted on get"
+        );
+        assert_eq!(
+            backend.tag_index.read().await.tag_to_keys.len(),
+            0,
+            "expired key's tag should be pruned on get"
+        );
+        assert_eq!(
+            backend.tag_index.read().await.key_to_tags.len(),
+            0,
+            "expired key's reverse index entry should be pruned on get"
+        );
     }
 }

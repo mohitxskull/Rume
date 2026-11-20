@@ -144,22 +144,40 @@ impl OutboxRepository for PostgresBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let mut claimed = Vec::with_capacity(rows.len());
-            for row in &rows {
-                let mut msg = parse_postgres_outbox_row(row)?;
-                let token = Uuid::new_v4().to_string();
-                let updated = sqlx::query(PG_OUTBOX_CLAIM_LEASE_SQL)
-                    .bind(&token)
-                    .bind(lease_duration_secs as i64)
-                    .bind(&msg.id)
-                    .fetch_one(&mut *tx)
+            if !rows.is_empty() {
+                let mut ids = Vec::with_capacity(rows.len());
+                let mut tokens = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let mut msg = parse_postgres_outbox_row(row)?;
+                    let token = Uuid::new_v4().to_string();
+                    ids.push(msg.id.clone());
+                    tokens.push(token.clone());
+                    msg.status = OutboxStatus::InFlight;
+                    msg.lease_token = Some(token);
+                    claimed.push(msg);
+                }
+
+                // Why: batch all lease updates in a single `UPDATE ... FROM unnest(...)`
+                // query instead of N per-row round-trips inside the `FOR UPDATE` transaction.
+                let updated_rows = sqlx::query(PG_OUTBOX_CLAIM_LEASE_SQL)
+                    .bind(&ids)
+                    .bind(&tokens)
+                    .bind(i64::try_from(lease_duration_secs).unwrap_or(i64::MAX))
+                    .fetch_all(&mut *tx)
                     .await
                     .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
-                let exp: i64 = updated.try_get(0).unwrap_or(0);
-                msg.status = OutboxStatus::InFlight;
-                msg.lease_token = Some(token);
-                msg.lease_expires_at = Some(exp as u64);
-                claimed.push(msg);
+                let mut exp_by_id = std::collections::HashMap::with_capacity(updated_rows.len());
+                for urow in updated_rows {
+                    let uid: String = urow
+                        .try_get(0)
+                        .map_err(|e| OutboxError::Repository(e.to_string()))?;
+                    let exp: i64 = urow.try_get(1).unwrap_or(0);
+                    exp_by_id.insert(uid, exp.max(0) as u64);
+                }
+                for msg in &mut claimed {
+                    msg.lease_expires_at = exp_by_id.get(&msg.id).copied();
+                }
             }
 
             tx.commit()
@@ -253,13 +271,9 @@ impl OutboxRepository for PostgresBackend {
                 )));
             };
 
-            let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
-            let status = if retry_count >= max_retries as i32 {
-                "failed"
-            } else {
-                "pending"
-            };
-            let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32) as i64;
+            let current_retry: i32 = row.try_get(0).unwrap_or(0);
+            let (retry_count, status, backoff_secs) =
+                crate::outbox::compute_outbox_retry_state(current_retry, max_retries);
 
             let res = sqlx::query(PG_OUTBOX_MARK_FAILED_SQL)
                 .bind(status)
@@ -344,31 +358,8 @@ impl OutboxRepository for PostgresBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let mut messages = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: String = row.try_get("id").unwrap_or_default();
-                let event_type: String = row.try_get("event_type").unwrap_or_default();
-                let payload: Vec<u8> = row.try_get("payload").unwrap_or_default();
-                let retry_count: i32 = row.try_get("retry_count").unwrap_or(0);
-                let created_at: i64 = row.try_get("created_at").unwrap_or(0);
-                let last_error: Option<String> = row.try_get("last_error").ok();
-                let next_retry_at: Option<i64> = row.try_get("next_retry_at").ok();
-                let lease_token: Option<String> = row.try_get("lease_token").ok();
-                let lease_expires_at: Option<i64> = row.try_get("lease_expires_at").ok();
-                let trace_context: Option<String> = row.try_get("trace_context").ok();
-
-                messages.push(OutboxMessage {
-                    id,
-                    event_type,
-                    payload,
-                    status: OutboxStatus::Failed,
-                    retry_count: retry_count as u32,
-                    created_at: created_at as u64,
-                    last_error,
-                    next_retry_at: next_retry_at.map(|v| v as u64),
-                    lease_token,
-                    lease_expires_at: lease_expires_at.map(|v| v as u64),
-                    trace_context,
-                });
+            for row in &rows {
+                messages.push(parse_postgres_outbox_row(row)?);
             }
             Ok(messages)
         })

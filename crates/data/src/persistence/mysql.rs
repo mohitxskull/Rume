@@ -20,7 +20,6 @@ const MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.sql");
 // Why: All MySQL queries (including lock cleanup and lease-expiry lookup) live in
 // `sql/mysql/*.sql` so this module contains no divergent inline SQL literals.
 const MYSQL_PING_SQL: &str = include_str!("sql/common/ping.sql");
-const MYSQL_MIGRATION_UNLOCK_SQL: &str = include_str!("sql/mysql/mysql_migration_unlock.sql");
 const MYSQL_AUDIT_INSERT_SQL: &str = include_str!("sql/mysql/audit_insert.sql");
 
 /// Production MySQL and MariaDB database backend backed by an asynchronous SQLx connection pool.
@@ -272,7 +271,6 @@ impl DatabaseBackend for MysqlBackend {
             let tx = self.pool.begin().await.map_err(map_sqlx_error)?;
             Ok(MysqlTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
-                release_lock_on_drop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             })
         })
     }
@@ -308,30 +306,6 @@ impl DatabaseBackend for MysqlBackend {
 #[derive(Clone)]
 pub struct MysqlTransaction {
     tx: Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::MySql>>>>,
-    release_lock_on_drop: Arc<std::sync::atomic::AtomicBool>,
-}
-
-impl Drop for MysqlTransaction {
-    fn drop(&mut self) {
-        if self
-            .release_lock_on_drop
-            .load(std::sync::atomic::Ordering::SeqCst)
-            && Arc::strong_count(&self.tx) == 1
-            && let Ok(mut guard) = self.tx.try_lock()
-            && let Some(mut tx) = guard.take()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            // Cancellation-safe cleanup: if a migration future is dropped while holding
-            // `rume_migrations_lock`, release the session-bound MySQL named lock before
-            // returning the connection to the pool.
-            handle.spawn(async move {
-                let _ = sqlx::query(MYSQL_MIGRATION_UNLOCK_SQL)
-                    .execute(&mut *tx)
-                    .await;
-                let _ = tx.rollback().await;
-            });
-        }
-    }
 }
 
 impl MysqlTransaction {
@@ -473,37 +447,30 @@ impl DatabaseTransaction for MysqlTransaction {
 
     fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
-        let release_flag = Arc::clone(&self.release_lock_on_drop);
         Box::pin(async move {
-            release_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.commit()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.commit()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
     }
 
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
-        let release_flag = Arc::clone(&self.release_lock_on_drop);
         Box::pin(async move {
-            release_flag.store(false, std::sync::atomic::Ordering::SeqCst);
             let mut guard = tx_arc.lock().await;
-            if let Some(tx) = guard.take() {
-                tx.rollback()
-                    .await
-                    .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
-            }
+            let tx = guard.take().ok_or_else(|| {
+                PersistenceError::TransactionError("transaction already resolved".into())
+            })?;
+            tx.rollback()
+                .await
+                .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
             Ok(())
         })
-    }
-
-    fn release_mysql_lock_on_drop(&self, armed: bool) {
-        self.release_lock_on_drop
-            .store(armed, std::sync::atomic::Ordering::SeqCst);
     }
 }
 

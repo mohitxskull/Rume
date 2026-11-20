@@ -213,7 +213,7 @@ async fn shutdown_hooks_abort_when_exceeding_aggregate_timeout() {
     server_task.await.unwrap();
     let elapsed = start.elapsed();
 
-    // Must terminate around the 80ms timeout, well below the combined 280ms hooks duration
+    // Must terminate around the 40ms timeout, well below the combined 110ms hooks duration
     assert!(
         elapsed < Duration::from_millis(180),
         "shutdown took too long: {:?}",

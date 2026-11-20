@@ -11,7 +11,6 @@
 //! - Graceful TCP server shutdown with active in-flight requests
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use axum::Json;
@@ -150,25 +149,36 @@ async fn test_large_request_and_response_bodies() {
 
 #[tokio::test]
 async fn test_client_disconnect_during_response_streaming() {
-    let client_disconnected = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&client_disconnected);
+    struct StreamDropGuard(Arc<tokio::sync::Notify>);
+    impl Drop for StreamDropGuard {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
+    let stream_dropped = Arc::new(tokio::sync::Notify::new());
+    let stream_dropped_clone = Arc::clone(&stream_dropped);
 
     let app = Rume::new()
         .route(
             "/slow-stream",
             get(move || {
-                let flag = Arc::clone(&flag);
+                let notify = Arc::clone(&stream_dropped_clone);
                 async move {
-                    let stream = stream::unfold((0, flag), |(step, flag)| async move {
-                        if step >= 20 {
-                            return None;
+                    let guard = StreamDropGuard(notify);
+                    let stream = stream::unfold((false, guard), |(sent_first, guard)| async move {
+                        if !sent_first {
+                            return Some((
+                                Ok::<_, std::io::Error>("data-0\n".to_string()),
+                                (true, guard),
+                            ));
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        flag.store(true, Ordering::SeqCst);
-                        Some((
-                            Ok::<_, std::io::Error>(format!("data-{step}\n")),
-                            (step + 1, flag),
-                        ))
+                        // Why: stay pending forever while holding `guard` so normal stream
+                        // exhaustion can never drop `guard`; only client disconnect / server
+                        // cancellation can trigger `stream_dropped`.
+                        std::future::pending::<()>().await;
+                        drop(guard);
+                        None
                     });
                     Body::from_stream(stream).into_response()
                 }
@@ -186,14 +196,20 @@ async fn test_client_disconnect_during_response_streaming() {
             .expect("write request");
 
         let mut buf = [0u8; 256];
-        let n = raw.read(&mut buf).await.expect("read initial chunk");
-        assert!(n > 0);
+        let mut received = String::new();
+        while !received.contains("data-0") {
+            let n = raw.read(&mut buf).await.expect("read initial chunk");
+            assert!(n > 0, "stream closed before delivering initial body chunk");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
         // Abruptly drop socket to simulate client disconnect
         drop(raw);
     }
 
-    // Give server a moment to observe disconnect and clean up task
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    // Deterministically observe server-side stream cancellation instead of sleeping.
+    tokio::time::timeout(Duration::from_secs(2), stream_dropped.notified())
+        .await
+        .expect("server must cancel and drop the response stream after client disconnect");
 
     // Server remains completely healthy and handles subsequent traffic
     let health = server.get("/health").await.expect("health succeeds");

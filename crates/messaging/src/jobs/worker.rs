@@ -157,14 +157,33 @@ pub struct WorkerHandle {
     /// Join handle of the dead worker abandoned job recovery loop, if configured.
     pub recovery_task: Option<tokio::task::JoinHandle<()>>,
     is_stopping: Arc<AtomicBool>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    // Why: `watch::Sender<bool>` latches shutdown and abort states (`false` -> `true`)
+    // so no worker, heartbeat, or recovery loop can lose a wakeup if the signal arrives
+    // while an async operation is in-flight or before `select!` is polled.
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     abort_requested: Arc<AtomicBool>,
-    abort_notify: Arc<tokio::sync::Notify>,
+    abort_tx: Arc<tokio::sync::watch::Sender<bool>>,
     in_flight_count: Arc<AtomicU32>,
     active_tasks: Arc<AtomicU32>,
     worker_result: Option<bool>,
     heartbeat_result: Option<bool>,
     recovery_result: Option<bool>,
+}
+
+/// RAII guard ensuring `active_tasks` is always decremented on task exit, panic, or abort.
+struct ActiveTaskGuard(Arc<AtomicU32>);
+
+impl ActiveTaskGuard {
+    fn acquire(counter: &Arc<AtomicU32>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(Arc::clone(counter))
+    }
+}
+
+impl Drop for ActiveTaskGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl WorkerHandle {
@@ -184,8 +203,8 @@ impl WorkerHandle {
     pub fn abort_all(&self) {
         self.is_stopping.store(true, Ordering::SeqCst);
         self.abort_requested.store(true, Ordering::SeqCst);
-        self.abort_notify.notify_waiters();
-        self.shutdown_notify.notify_waiters();
+        let _ = self.abort_tx.send(true);
+        let _ = self.shutdown_tx.send(true);
         self.worker_task.abort();
         if let Some(h) = &self.heartbeat_task {
             h.abort();
@@ -200,7 +219,7 @@ impl WorkerHandle {
     /// Does not consume `self`, allowing the caller to inspect task status or retry if shutdown times out.
     pub async fn try_shutdown(&mut self, timeout: Duration) -> bool {
         self.is_stopping.store(true, Ordering::SeqCst);
-        self.shutdown_notify.notify_waiters();
+        let _ = self.shutdown_tx.send(true);
         let start = std::time::Instant::now();
 
         // 1. Wait for in-flight job handlers to complete
@@ -288,7 +307,7 @@ impl WorkerHandle {
             // incomplete when `shutdown()` returns; `abort_all()` remains the hard fallback if
             // `run_loop` is blocked inside `dequeue_for`.
             self.abort_requested.store(true, Ordering::SeqCst);
-            self.abort_notify.notify_waiters();
+            let _ = self.abort_tx.send(true);
             if self.worker_result.is_none()
                 && self.in_flight_count.load(Ordering::SeqCst) > 0
                 && tokio::time::timeout(Duration::from_millis(50), &mut self.worker_task)
@@ -352,9 +371,9 @@ pub struct JobWorker<Q: JobQueue> {
     idempotency_store: Option<Arc<dyn IdempotencyStore>>,
     transition_errors: Arc<AtomicU64>,
     lost_leases: Arc<AtomicU64>,
-    shutdown_notify: Arc<tokio::sync::Notify>,
+    shutdown_tx: Arc<tokio::sync::watch::Sender<bool>>,
     abort_requested: Arc<AtomicBool>,
-    abort_notify: Arc<tokio::sync::Notify>,
+    abort_tx: Arc<tokio::sync::watch::Sender<bool>>,
     active_tasks: Arc<AtomicU32>,
     #[cfg(test)]
     join_set_len: Arc<std::sync::atomic::AtomicUsize>,
@@ -377,9 +396,9 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             idempotency_store: self.idempotency_store.clone(),
             transition_errors: Arc::clone(&self.transition_errors),
             lost_leases: Arc::clone(&self.lost_leases),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
             abort_requested: Arc::clone(&self.abort_requested),
-            abort_notify: Arc::clone(&self.abort_notify),
+            abort_tx: Arc::clone(&self.abort_tx),
             active_tasks: Arc::clone(&self.active_tasks),
             #[cfg(test)]
             join_set_len: Arc::clone(&self.join_set_len),
@@ -422,6 +441,8 @@ impl<Q: JobQueue> JobWorker<Q> {
         concurrency_limit: usize,
     ) -> Self {
         let limit = concurrency_limit.max(1);
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (abort_tx, _) = tokio::sync::watch::channel(false);
         Self {
             worker_id: format!("worker-{}", Uuid::new_v4()),
             queue,
@@ -437,9 +458,9 @@ impl<Q: JobQueue> JobWorker<Q> {
             idempotency_store: None,
             transition_errors: Arc::new(AtomicU64::new(0)),
             lost_leases: Arc::new(AtomicU64::new(0)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
             abort_requested: Arc::new(AtomicBool::new(false)),
-            abort_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_tx: Arc::new(abort_tx),
             active_tasks: Arc::new(AtomicU32::new(0)),
             #[cfg(test)]
             join_set_len: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -517,11 +538,11 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Returns a [`WorkerHandle`] providing lifecycle supervision, status queries,
     /// and graceful awaitable shutdown across execution, heartbeat, and recovery tasks.
     pub fn start(&self) -> WorkerHandle {
-        self.active_tasks.fetch_add(1, Ordering::SeqCst);
+        let worker_task_guard = ActiveTaskGuard::acquire(&self.active_tasks);
         let worker = self.clone();
         let worker_task = tokio::spawn(async move {
+            let _guard = worker_task_guard;
             worker.run_loop().await;
-            worker.active_tasks.fetch_sub(1, Ordering::SeqCst);
         });
 
         let mut heartbeat_task = None;
@@ -529,42 +550,41 @@ impl<Q: JobQueue> JobWorker<Q> {
 
         if let Some(heartbeat) = self.heartbeat_registry.clone() {
             let worker_id = self.worker_id.clone();
-            let is_stopping = Arc::clone(&self.is_stopping);
-            let shutdown_notify = Arc::clone(&self.shutdown_notify);
-            let active_tasks = Arc::clone(&self.active_tasks);
+            let mut shutdown_rx = self.shutdown_tx.subscribe();
+            let hb_guard = ActiveTaskGuard::acquire(&self.active_tasks);
             let ttl = self.heartbeat_ttl;
             let interval = self.heartbeat_interval;
             let hb_loop = Arc::clone(&heartbeat);
 
-            active_tasks.fetch_add(1, Ordering::SeqCst);
             heartbeat_task = Some(tokio::spawn(async move {
-                while !is_stopping.load(Ordering::SeqCst) {
+                let _guard = hb_guard;
+                while !*shutdown_rx.borrow() {
                     if let Err(e) = hb_loop.record_heartbeat(&worker_id, ttl).await {
                         tracing::warn!(worker_id = %worker_id, error = %e, "Failed to record worker heartbeat");
                     }
                     tokio::select! {
+                        biased;
+                        _ = shutdown_rx.wait_for(|&stopped| stopped) => { break; }
                         _ = sleep(interval) => {},
-                        _ = shutdown_notify.notified() => { break; }
                     }
                 }
-                active_tasks.fetch_sub(1, Ordering::SeqCst);
             }));
 
             if let Some(recovery_interval) = self.abandoned_recovery_interval {
                 let queue = Arc::clone(&self.queue);
-                let is_stopping = Arc::clone(&self.is_stopping);
-                let shutdown_notify = Arc::clone(&self.shutdown_notify);
-                let active_tasks = Arc::clone(&self.active_tasks);
+                let mut shutdown_rx = self.shutdown_tx.subscribe();
+                let rec_guard = ActiveTaskGuard::acquire(&self.active_tasks);
                 let hb_reap = Arc::clone(&heartbeat);
 
-                active_tasks.fetch_add(1, Ordering::SeqCst);
                 recovery_task = Some(tokio::spawn(async move {
-                    while !is_stopping.load(Ordering::SeqCst) {
+                    let _guard = rec_guard;
+                    while !*shutdown_rx.borrow() {
                         tokio::select! {
+                            biased;
+                            _ = shutdown_rx.wait_for(|&stopped| stopped) => { break; }
                             _ = sleep(recovery_interval) => {},
-                            _ = shutdown_notify.notified() => { break; }
                         }
-                        if is_stopping.load(Ordering::SeqCst) {
+                        if *shutdown_rx.borrow() {
                             break;
                         }
                         match hb_reap.reap_dead_workers().await {
@@ -584,7 +604,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                             }
                         }
                     }
-                    active_tasks.fetch_sub(1, Ordering::SeqCst);
                 }));
             }
         }
@@ -594,9 +613,9 @@ impl<Q: JobQueue> JobWorker<Q> {
             heartbeat_task,
             recovery_task,
             is_stopping: Arc::clone(&self.is_stopping),
-            shutdown_notify: Arc::clone(&self.shutdown_notify),
+            shutdown_tx: Arc::clone(&self.shutdown_tx),
             abort_requested: Arc::clone(&self.abort_requested),
-            abort_notify: Arc::clone(&self.abort_notify),
+            abort_tx: Arc::clone(&self.abort_tx),
             in_flight_count: Arc::clone(&self.in_flight_count),
             active_tasks: Arc::clone(&self.active_tasks),
             worker_result: None,
@@ -629,12 +648,14 @@ impl<Q: JobQueue> JobWorker<Q> {
     ) -> bool {
         let timer = sleep(duration);
         tokio::pin!(timer);
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
-            let shutdown_notified = self.shutdown_notify.notified();
-            if self.is_stopping.load(Ordering::SeqCst) {
+            if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
                 return true;
             }
             tokio::select! {
+                biased;
+                _ = shutdown_rx.wait_for(|&stopped| stopped) => return true,
                 _ = &mut timer => return false,
                 res = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
                     if let Some(outcome) = res {
@@ -642,7 +663,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                     }
                     self.record_join_set_len(in_flight_tasks.len());
                 }
-                _ = shutdown_notified => return true,
             }
         }
     }
@@ -658,6 +678,7 @@ impl<Q: JobQueue> JobWorker<Q> {
         // per-job abort handles.
         let mut in_flight_tasks = tokio::task::JoinSet::<()>::new();
         let mut consecutive_errors: u32 = 0;
+        let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         loop {
             while let Some(outcome) = in_flight_tasks.try_join_next() {
@@ -665,12 +686,13 @@ impl<Q: JobQueue> JobWorker<Q> {
             }
             self.record_join_set_len(in_flight_tasks.len());
 
-            let shutdown_notified = self.shutdown_notify.notified();
-            if self.is_stopping.load(Ordering::SeqCst) {
+            if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
                 break;
             }
 
             let permit = tokio::select! {
+                biased;
+                _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
                 res = self.semaphore.clone().acquire_owned() => match res {
                     Ok(permit) => permit,
                     Err(_) => break,
@@ -682,10 +704,9 @@ impl<Q: JobQueue> JobWorker<Q> {
                     self.record_join_set_len(in_flight_tasks.len());
                     continue;
                 }
-                _ = shutdown_notified => break,
             };
 
-            if self.is_stopping.load(Ordering::SeqCst) {
+            if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
                 drop(permit);
                 break;
             }
@@ -693,11 +714,21 @@ impl<Q: JobQueue> JobWorker<Q> {
             match self.queue.dequeue_for(&self.worker_id).await {
                 Ok(Some(job)) => {
                     consecutive_errors = 0;
-                    if self.is_stopping.load(Ordering::SeqCst) {
+                    if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
                         // Crucial race check: draining started while dequeue was in-flight!
-                        // Guarantee that no new job starts after draining begins.
+                        // Guarantee that no new job starts after draining begins, and use
+                        // `defer` rather than `nack` so the unexecuted job does not burn a
+                        // retry attempt.
+                        let job_id = job.id.clone();
                         let token = job.lease_token.clone().unwrap_or_default();
-                        let _ = self.queue.nack(job, &token, Duration::ZERO).await;
+                        if let Err(err) = self.queue.defer(job, &token, Duration::ZERO).await {
+                            tracing::error!(
+                                job_id = %job_id,
+                                error = %err,
+                                "Failed to defer dequeued job during drain"
+                            );
+                            self.transition_errors.fetch_add(1, Ordering::SeqCst);
+                        }
                         drop(permit);
                         break;
                     }
@@ -768,23 +799,26 @@ impl<Q: JobQueue> JobWorker<Q> {
         }
 
         // Drain all active job tasks on graceful shutdown, or abort immediately if shutdown
-        // timed out and `WorkerHandle::shutdown` signaled `abort_notify`.
+        // timed out and `WorkerHandle::shutdown` signaled `abort_tx`.
+        let mut abort_rx = self.abort_tx.subscribe();
         while !in_flight_tasks.is_empty() {
-            let abort_notified = self.abort_notify.notified();
-            if self.abort_requested.load(Ordering::SeqCst) {
+            if *abort_rx.borrow() || self.abort_requested.load(Ordering::SeqCst) {
                 in_flight_tasks.shutdown().await;
                 break;
             }
-            tokio::select! {
+            let should_abort = tokio::select! {
+                biased;
+                _ = async { let _ = abort_rx.wait_for(|&aborted| aborted).await; } => true,
                 res = in_flight_tasks.join_next() => {
                     if let Some(outcome) = res {
                         Self::log_in_flight_outcome(outcome);
                     }
+                    false
                 }
-                _ = abort_notified => {
-                    in_flight_tasks.shutdown().await;
-                    break;
-                }
+            };
+            if should_abort {
+                in_flight_tasks.shutdown().await;
+                break;
             }
             self.record_join_set_len(in_flight_tasks.len());
         }
@@ -802,13 +836,28 @@ impl<Q: JobQueue> JobWorker<Q> {
         lost_leases: Arc<AtomicU64>,
     ) {
         let job_id = job.id.clone();
-        let token = job.lease_token.clone().unwrap_or_default();
-
         let effective_key = match (&job.tenant_id, &job.idempotency_key) {
             (Some(tenant), Some(key)) => Some(scoped_idempotency_key(tenant, key)),
             (None, Some(key)) => Some(key.clone()),
             _ => None,
         };
+
+        // Why: when an idempotency store is attached and the job carries an
+        // idempotency key, a missing/empty `lease_token` cannot safely fence
+        // Redis/store ownership. Fail closed instead of falling back to `""`.
+        if idempotency_store.is_some()
+            && effective_key.is_some()
+            && job.lease_token.as_deref().is_none_or(str::is_empty)
+        {
+            tracing::error!(
+                job_id = %job_id,
+                "Refusing to execute idempotent job without a fencing lease_token"
+            );
+            transition_errors.fetch_add(1, Ordering::SeqCst);
+            return;
+        }
+
+        let token = job.lease_token.clone().unwrap_or_default();
 
         if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
             match store
@@ -876,6 +925,9 @@ impl<Q: JobQueue> JobWorker<Q> {
         let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
         let lease_lost = Arc::new(AtomicBool::new(false));
         let extend_idempotency = Arc::new(AtomicBool::new(true));
+        let queue_committed = Arc::new(AtomicBool::new(false));
+        let idemp_committed = Arc::new(AtomicBool::new(false));
+        let hb_tick_lock = Arc::new(tokio::sync::Mutex::new(()));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let hb_token = token.clone();
         let hb_queue = Arc::clone(&queue);
@@ -883,6 +935,9 @@ impl<Q: JobQueue> JobWorker<Q> {
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_lease_lost = Arc::clone(&lease_lost);
         let hb_extend_idempotency = Arc::clone(&extend_idempotency);
+        let hb_queue_committed = Arc::clone(&queue_committed);
+        let hb_idemp_committed = Arc::clone(&idemp_committed);
+        let hb_tick_lock_task = Arc::clone(&hb_tick_lock);
         let hb_stopping = Arc::clone(&stopping);
         let hb_lost_leases = Arc::clone(&lost_leases);
         let hb_idemp_store = idempotency_store.clone();
@@ -901,7 +956,29 @@ impl<Q: JobQueue> JobWorker<Q> {
                         }
                     }
                     _ = interval.tick() => {
-                        if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension).await {
+                        let _tick_guard = hb_tick_lock_task.lock().await;
+                        // Why: bound each renewal I/O call so a hung DB/Redis connection cannot
+                        // hold `hb_tick_lock` indefinitely and stall finalization; a timed-out
+                        // renewal is treated as ownership loss (unless the transition already committed).
+                        let renewal_timeout = hb_interval.max(Duration::from_millis(50));
+                        let renew_res = match tokio::time::timeout(
+                            renewal_timeout,
+                            hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension),
+                        )
+                        .await
+                        {
+                            Ok(res) => res,
+                            Err(_) => Err(JobError::Fatal(format!(
+                                "lease renewal timed out after {renewal_timeout:?}"
+                            ))),
+                        };
+                        if let Err(e) = renew_res {
+                            // Why: suppress renewal errors ONLY after the queue transition
+                            // (`ack`/`nack`/`dead_letter`) has actually committed; any failure
+                            // before commit is a genuine ownership loss that must set `lease_lost`.
+                            if hb_queue_committed.load(Ordering::SeqCst) {
+                                break;
+                            }
                             tracing::error!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat; lost lease");
                             hb_cancelled.store(true, Ordering::SeqCst);
                             hb_lease_lost.store(true, Ordering::SeqCst);
@@ -917,18 +994,35 @@ impl<Q: JobQueue> JobWorker<Q> {
                         // break the heartbeat loop, and route the completed job to the dead letter queue (DLQ) without acking.
                         if hb_extend_idempotency.load(Ordering::SeqCst)
                             && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
-                            && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
-                            tracing::error!(
-                                job_id = %hb_jid,
-                                key = %k,
-                                error = %e,
-                                "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
-                            );
-                            hb_cancelled.store(true, Ordering::SeqCst);
-                            hb_lease_lost.store(true, Ordering::SeqCst);
-                            hb_lost_leases.fetch_add(1, Ordering::SeqCst);
-                            break;
+                            let extend_res = match tokio::time::timeout(
+                                renewal_timeout,
+                                store.extend_lock_with_token(k, &hb_token, renew_extension),
+                            )
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => Err(JobError::Fatal(format!(
+                                    "idempotency lock renewal timed out after {renewal_timeout:?}"
+                                ))),
+                            };
+                            if let Err(e) = extend_res {
+                                // Why: suppress idempotency renewal failure only after idempotency
+                                // completion/release has committed, never merely because finalization started.
+                                if hb_idemp_committed.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                tracing::error!(
+                                    job_id = %hb_jid,
+                                    key = %k,
+                                    error = %e,
+                                    "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
+                                );
+                                hb_cancelled.store(true, Ordering::SeqCst);
+                                hb_lease_lost.store(true, Ordering::SeqCst);
+                                hb_lost_leases.fetch_add(1, Ordering::SeqCst);
+                                break;
+                            }
                         }
                     }
                 }
@@ -940,7 +1034,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                 self.0.abort();
             }
         }
-        let _hb_abort_guard = HeartbeatAbortGuard(heartbeat_handle.abort_handle());
+        let hb_abort_guard = HeartbeatAbortGuard(heartbeat_handle.abort_handle());
 
         let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             registry.dispatch_with_cancellation(&job, Some(Arc::clone(&job_cancelled)))
@@ -952,11 +1046,12 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(_) => Err(JobError::Fatal("handler panicked".into())),
         };
 
-        // Why: keep the queue lease heartbeat active until the post-dispatch state transition
-        // (ack / nack / dead_letter) completes, so a slow idempotency release cannot let the
-        // queue lease expire before `queue.nack` records the retry backoff. Stop extending the
-        // idempotency lock once we begin releasing/completing it so release does not trigger
-        // spurious `extend_lock_with_token` errors.
+        // Why: wait for any already-in-flight heartbeat ownership check (`renew_lease` /
+        // `extend_lock_with_token`) to settle before reading `lease_lost` and choosing
+        // between ACK and dead-letter, while keeping subsequent heartbeat ticks eligible
+        // during `ack`/`nack`/`dead_letter` until the state transition actually commits.
+        drop(hb_tick_lock.lock().await);
+
         match dispatch_result {
             Ok(()) => {
                 if lease_lost.load(Ordering::SeqCst) {
@@ -976,6 +1071,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                         // Why: release the deduplication reservation only after `dead_letter`
                         // commits; if dead-lettering fails, preserving the reservation blocks
                         // another worker from re-executing a handler that already succeeded.
@@ -988,6 +1084,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                             "on lease loss",
                         )
                         .await;
+                        idemp_committed.store(true, Ordering::SeqCst);
                     }
                 } else {
                     if let Err(err) = queue.ack(&job_id, &token).await {
@@ -998,6 +1095,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                     extend_idempotency.store(false, Ordering::SeqCst);
                     if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
@@ -1010,6 +1109,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                             "Failed to record idempotency completion"
                         );
                     }
+                    idemp_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(JobError::Fatal(msg))
@@ -1024,6 +1124,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                     "on fatal failure",
                 )
                 .await;
+                idemp_committed.store(true, Ordering::SeqCst);
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
                         job_id = %job_id,
@@ -1032,6 +1133,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                     );
                     transition_errors.fetch_add(1, Ordering::SeqCst);
                     lost_leases.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    queue_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(err) => {
@@ -1052,6 +1155,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "before retryable nack; proceeding with nack",
                     )
                     .await;
+                    idemp_committed.store(true, Ordering::SeqCst);
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -1060,6 +1164,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                 } else {
                     extend_idempotency.store(false, Ordering::SeqCst);
@@ -1071,6 +1177,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "on dead letter",
                     )
                     .await;
+                    idemp_committed.store(true, Ordering::SeqCst);
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
                         tracing::error!(
@@ -1080,19 +1187,22 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                 }
             }
         }
 
         let _ = cancel_tx.send(());
-        heartbeat_handle.abort();
+        drop(hb_abort_guard);
+        let _ = heartbeat_handle.await;
     }
 
     /// Gracefully requests worker shutdown and waits for in-flight jobs and background polling tasks to complete within `timeout`.
     pub async fn drain(&self, timeout: Duration) -> bool {
         self.is_stopping.store(true, Ordering::SeqCst);
-        self.shutdown_notify.notify_waiters();
+        self.shutdown_tx.send_replace(true);
         let start = std::time::Instant::now();
 
         // 1. Wait for in-flight jobs to finish
@@ -1380,7 +1490,8 @@ mod tests {
     #[tokio::test]
     async fn test_worker_handle_shutdown_reports_panic() {
         let is_stopping = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (abort_tx, _) = tokio::sync::watch::channel(false);
         let in_flight_count = Arc::new(AtomicU32::new(0));
         let active_tasks = Arc::new(AtomicU32::new(1));
 
@@ -1393,9 +1504,9 @@ mod tests {
             heartbeat_task: None,
             recovery_task: None,
             is_stopping,
-            shutdown_notify,
+            shutdown_tx: Arc::new(shutdown_tx),
             abort_requested: Arc::new(AtomicBool::new(false)),
-            abort_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_tx: Arc::new(abort_tx),
             in_flight_count,
             active_tasks,
             worker_result: None,
@@ -1413,7 +1524,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn test_worker_handle_timeout_aborts_tasks() {
         let is_stopping = Arc::new(AtomicBool::new(false));
-        let shutdown_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (abort_tx, _) = tokio::sync::watch::channel(false);
         let in_flight_count = Arc::new(AtomicU32::new(0));
         let active_tasks = Arc::new(AtomicU32::new(1));
 
@@ -1428,9 +1540,9 @@ mod tests {
             heartbeat_task: None,
             recovery_task: None,
             is_stopping,
-            shutdown_notify,
+            shutdown_tx: Arc::new(shutdown_tx),
             abort_requested: Arc::new(AtomicBool::new(false)),
-            abort_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_tx: Arc::new(abort_tx),
             in_flight_count,
             active_tasks,
             worker_result: None,
@@ -1465,15 +1577,17 @@ mod tests {
         let heartbeat_task = tokio::spawn(async {
             tokio::time::sleep(Duration::from_millis(60)).await;
         });
+        let (shutdown_tx, _) = tokio::sync::watch::channel(false);
+        let (abort_tx, _) = tokio::sync::watch::channel(false);
 
         let mut handle = WorkerHandle {
             worker_task,
             heartbeat_task: Some(heartbeat_task),
             recovery_task: None,
             is_stopping: Arc::new(AtomicBool::new(false)),
-            shutdown_notify: Arc::new(tokio::sync::Notify::new()),
+            shutdown_tx: Arc::new(shutdown_tx),
             abort_requested: Arc::new(AtomicBool::new(false)),
-            abort_notify: Arc::new(tokio::sync::Notify::new()),
+            abort_tx: Arc::new(abort_tx),
             in_flight_count: Arc::new(AtomicU32::new(0)),
             active_tasks: Arc::new(AtomicU32::new(2)),
             worker_result: None,
@@ -2855,5 +2969,318 @@ mod tests {
         );
         assert_eq!(worker.in_flight_count(), 0);
         assert_eq!(worker.join_set_len.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_idempotency_loss_before_ack_routes_to_dead_letter() {
+        #[derive(Debug)]
+        struct GatedFailExtendStore {
+            extend_entered: Arc<tokio::sync::Notify>,
+            release_extend: Arc<tokio::sync::Notify>,
+        }
+
+        impl IdempotencyStore for GatedFailExtendStore {
+            fn try_acquire_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _ttl: Duration,
+            ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+                Box::pin(async { Ok(IdempotencyStatus::New) })
+            }
+
+            fn complete_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _result: Option<Vec<u8>>,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn release_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn extend_lock_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _ttl: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                let entered = Arc::clone(&self.extend_entered);
+                let release = Arc::clone(&self.release_extend);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Err(JobError::Fatal("idempotency token reassigned".into()))
+                })
+            }
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct GatedIdempJob;
+
+        impl Job for GatedIdempJob {
+            const NAME: &'static str = "gated_idemp_job";
+        }
+
+        #[derive(Debug)]
+        struct GatedHandler {
+            extend_entered: Arc<tokio::sync::Notify>,
+            release_extend: Arc<tokio::sync::Notify>,
+        }
+
+        impl JobHandler<GatedIdempJob> for GatedHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: GatedIdempJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let entered = Arc::clone(&self.extend_entered);
+                let release = Arc::clone(&self.release_extend);
+                Box::pin(async move {
+                    // Wait until the heartbeat task has entered `extend_lock_with_token`.
+                    entered.notified().await;
+                    // Release the failing renewal concurrently with handler completion;
+                    // `execute_job` must wait for the in-flight renewal to settle and
+                    // dead-letter the job instead of suppressing the error and acking.
+                    release.notify_one();
+                    Ok(())
+                })
+            }
+        }
+
+        let extend_entered = Arc::new(tokio::sync::Notify::new());
+        let release_extend = Arc::new(tokio::sync::Notify::new());
+
+        let (enter_tx, _enter_rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let job = QueuedJob {
+            id: "job-gated-idemp".to_string(),
+            name: GatedIdempJob::NAME.to_string(),
+            payload: serde_json::to_vec(&GatedIdempJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-gated".into()),
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-gated".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(60),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(GatedHandler {
+            extend_entered: Arc::clone(&extend_entered),
+            release_extend: Arc::clone(&release_extend),
+        });
+
+        let store: Arc<dyn IdempotencyStore> = Arc::new(GatedFailExtendStore {
+            extend_entered,
+            release_extend,
+        });
+
+        JobWorker::execute_job(
+            queue,
+            Arc::new(registry),
+            job,
+            Some(store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            dlq_count.load(Ordering::SeqCst),
+            1,
+            "job must be dead-lettered when in-flight idempotency renewal fails before ACK"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "job must not be acked when in-flight idempotency renewal fails before ACK"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
+        #[derive(Debug)]
+        struct StalledRenewQueue {
+            renew_entered: Arc<tokio::sync::Notify>,
+            ack_count: Arc<AtomicUsize>,
+            dlq_count: Arc<AtomicUsize>,
+        }
+
+        impl JobQueue for StalledRenewQueue {
+            fn enqueue<J: Job>(&self, _job: J) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async { Ok("id".into()) })
+            }
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                _job: J,
+                _delay: Duration,
+                _trace_context: Option<String>,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async { Ok("id".into()) })
+            }
+            fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn renew_lease(
+                &self,
+                _job_id: &str,
+                _lease_token: &str,
+                _extension: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                let entered = Arc::clone(&self.renew_entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    // Simulate a hung DB connection that never responds.
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            }
+            fn ack(
+                &self,
+                _job_id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                self.ack_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _reason: String,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                self.dlq_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+            fn defer(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(self.dlq_count.load(Ordering::SeqCst)) })
+            }
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct StalledRenewJob;
+        impl Job for StalledRenewJob {
+            const NAME: &'static str = "stalled_renew_job";
+        }
+
+        #[derive(Debug)]
+        struct WaitForRenewHandler(Arc<tokio::sync::Notify>);
+        impl JobHandler<StalledRenewJob> for WaitForRenewHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: StalledRenewJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let entered = Arc::clone(&self.0);
+                Box::pin(async move {
+                    entered.notified().await;
+                    Ok(())
+                })
+            }
+        }
+
+        let renew_entered = Arc::new(tokio::sync::Notify::new());
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(StalledRenewQueue {
+            renew_entered: Arc::clone(&renew_entered),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(WaitForRenewHandler(renew_entered));
+
+        let job = QueuedJob {
+            id: "job-stalled-renew".to_string(),
+            name: StalledRenewJob::NAME.to_string(),
+            payload: serde_json::to_vec(&StalledRenewJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-stalled".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(60),
+            trace_context: None,
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            JobWorker::execute_job(
+                queue,
+                Arc::new(registry),
+                job,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        )
+        .await
+        .expect("stalled heartbeat renewal must time out instead of hanging finalization");
+
+        assert_eq!(dlq_count.load(Ordering::SeqCst), 1);
+        assert_eq!(ack_count.load(Ordering::SeqCst), 0);
     }
 }

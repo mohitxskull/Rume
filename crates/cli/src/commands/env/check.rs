@@ -29,13 +29,9 @@ pub fn run(all: bool, unredacted: bool, format: &str) {
             };
 
             // Collect all file-sourced keys (both values and secrets).
-            let mut file_keys: BTreeSet<String> = BTreeSet::new();
-            for key in &resolved.file_keys {
-                file_keys.insert(key.clone());
-            }
-            for key in resolved.secrets.keys() {
-                file_keys.insert(key.clone());
-            }
+            // Why: do not insert `resolved.secrets.keys()` unconditionally; process-only
+            // secrets belong under `--all` (`process`) and `hidden_count`, not `resolved`.
+            let file_keys: BTreeSet<String> = resolved.file_keys.iter().cloned().collect();
 
             for key in file_keys {
                 let value = resolved.get(&key).unwrap_or("");

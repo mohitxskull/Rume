@@ -458,6 +458,11 @@ mod tests {
         });
 
         assert!(!cleanup_ran.load(std::sync::atomic::Ordering::SeqCst));
+        drop(_app);
+        assert!(
+            cleanup_ran.load(std::sync::atomic::Ordering::SeqCst),
+            "cleanup hook must run when TestApp is dropped"
+        );
     }
 
     #[test]

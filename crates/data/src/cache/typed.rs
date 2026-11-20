@@ -16,8 +16,10 @@ use crate::cache::error::CacheError;
 use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
 
 struct SingleflightState {
-    notify: Arc<tokio::sync::Notify>,
-    succeeded: AtomicBool,
+    // Why: `tokio::sync::watch` latches completion state (`None` -> `Some(succeeded)`),
+    // eliminating the lost-wakeup race of `Notify::notified_owned()` which is not
+    // registered on the waiter list until first poll or `Pin::enable()`.
+    tx: tokio::sync::watch::Sender<Option<bool>>,
 }
 
 /// Why: `std::sync::Mutex` is used (and never held across `.await`) instead of
@@ -31,11 +33,12 @@ struct SingleflightLeaderGuard {
     singleflight: SingleflightMap,
     key: String,
     state: Arc<SingleflightState>,
+    succeeded: bool,
 }
 
 impl SingleflightLeaderGuard {
-    fn mark_succeeded(&self) {
-        self.state.succeeded.store(true, Ordering::Release);
+    fn mark_succeeded(&mut self) {
+        self.succeeded = true;
     }
 }
 
@@ -55,13 +58,13 @@ impl Drop for SingleflightLeaderGuard {
                 flights.remove(&self.key);
             }
         }
-        self.state.notify.notify_waiters();
+        let _ = self.state.tx.send(Some(self.succeeded));
     }
 }
 
 enum FlightSlot {
     Leader(SingleflightLeaderGuard),
-    Follower(Arc<SingleflightState>, tokio::sync::futures::OwnedNotified),
+    Follower(tokio::sync::watch::Receiver<Option<bool>>),
 }
 
 /// High-level typed cache interface providing JSON serialization, cache-aside patterns, and tag invalidation.
@@ -221,35 +224,32 @@ impl<B: CacheBackend> Cache<B> {
         // Stampede protection: contend for singleflight leadership in a loop so followers woken
         // after a failed, panicked, or cancelled leader re-contend instead of falling through to
         // execute `f` unguarded.
-        let leader_guard = loop {
+        let mut leader_guard = loop {
             let slot = {
                 let mut flights = self
                     .singleflight
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 if let Some(existing) = flights.get(&full_key) {
-                    // Register `OwnedNotified` while holding `flights` so `SingleflightLeaderGuard`
-                    // cannot call `notify_waiters()` between lookup and registration.
-                    FlightSlot::Follower(
-                        Arc::clone(existing),
-                        Arc::clone(&existing.notify).notified_owned(),
-                    )
+                    // Subscribe to the latched `watch` channel while holding `flights`; even if
+                    // `SingleflightLeaderGuard` drops before the follower first polls, `watch`
+                    // retains `Some(succeeded)` so the follower can never deadlock.
+                    FlightSlot::Follower(existing.tx.subscribe())
                 } else {
-                    let state = Arc::new(SingleflightState {
-                        notify: Arc::new(tokio::sync::Notify::new()),
-                        succeeded: AtomicBool::new(false),
-                    });
+                    let (tx, _rx) = tokio::sync::watch::channel(None);
+                    let state = Arc::new(SingleflightState { tx });
                     flights.insert(full_key.clone(), Arc::clone(&state));
                     FlightSlot::Leader(SingleflightLeaderGuard {
                         singleflight: Arc::clone(&self.singleflight),
                         key: full_key.clone(),
                         state,
+                        succeeded: false,
                     })
                 }
             };
 
             match slot {
-                FlightSlot::Leader(guard) => {
+                FlightSlot::Leader(mut guard) => {
                     // Why: always re-check the cache after acquiring leadership so a caller that
                     // saw a miss and paused before locking `singleflight` does not overwrite a
                     // value populated in the meantime.
@@ -259,15 +259,18 @@ impl<B: CacheBackend> Cache<B> {
                     }
                     break guard;
                 }
-                FlightSlot::Follower(state, notified) => {
-                    notified.await;
+                FlightSlot::Follower(mut rx) => {
+                    let succeeded = rx
+                        .wait_for(|v| v.is_some())
+                        .await
+                        .ok()
+                        .and_then(|v| *v)
+                        .unwrap_or(false);
                     // Why: only read the backend from followers when the leader actually
                     // published a value. On leader failure/cancellation, skip the follower read
                     // and re-contend so only the next single leader queries the backend instead
                     // of O(N^2) backend reads across failing followers.
-                    if state.succeeded.load(Ordering::Acquire)
-                        && let Some(cached) = self.get_json::<T>(key).await?
-                    {
+                    if succeeded && let Some(cached) = self.get_json::<T>(key).await? {
                         return Ok(cached);
                     }
                 }
@@ -534,7 +537,7 @@ mod tests {
                     let flights = cache.singleflight.lock().unwrap();
                     flights
                         .get(&full_key)
-                        .is_some_and(|state| Arc::strong_count(&state.notify) > 1)
+                        .is_some_and(|state| state.tx.receiver_count() > 0)
                 };
                 if joined {
                     return;
@@ -931,5 +934,41 @@ mod tests {
             None,
             "key must be absent after tag invalidation"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn singleflight_follower_wakes_even_if_leader_completes_before_first_poll() {
+        let cache = Cache::new(
+            InMemoryCacheBackend::new(),
+            CacheConfig::new("memory://watch-test"),
+        );
+        // Simulate a leader creating a slot, a follower subscribing while the slot
+        // is active, and the leader completing BEFORE the follower ever polls `wait_for`.
+        let (tx, _rx) = tokio::sync::watch::channel(None);
+        let state = Arc::new(SingleflightState { tx });
+        let mut follower_rx = state.tx.subscribe();
+        let mut guard = SingleflightLeaderGuard {
+            singleflight: Arc::clone(&cache.singleflight),
+            key: "k".to_string(),
+            state: Arc::clone(&state),
+            succeeded: false,
+        };
+        cache
+            .singleflight
+            .lock()
+            .unwrap()
+            .insert("k".to_string(), state);
+        guard.mark_succeeded();
+        drop(guard);
+
+        // Follower polls AFTER leader already dropped — must return immediately, never deadlock.
+        let val = tokio::time::timeout(
+            Duration::from_millis(50),
+            follower_rx.wait_for(|v| v.is_some()),
+        )
+        .await
+        .expect("watch follower must not deadlock when leader finishes before first poll")
+        .expect("sender value latched");
+        assert_eq!(*val, Some(true));
     }
 }

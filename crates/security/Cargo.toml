@@ -22,6 +22,9 @@ hmac = "=0.13.0"
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 redis = ["rume-data/redis", "dep:deadpool-redis", "dep:redis"]

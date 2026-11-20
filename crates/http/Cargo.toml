@@ -23,6 +23,9 @@ uuid = { version = "=1.29.2", features = ["v4"] }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
 [features]
 default = []
 redis = ["rume-security/redis", "dep:deadpool-redis", "dep:redis"]

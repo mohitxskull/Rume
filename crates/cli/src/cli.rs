@@ -14,9 +14,6 @@ pub struct Cli {
     /// Disable colored output.
     #[arg(long, global = true)]
     pub no_color: bool,
-    /// Enable verbose output.
-    #[arg(long, global = true)]
-    pub verbose: bool,
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -153,13 +150,10 @@ pub enum EnvCommands {
         #[arg(long)]
         json: bool,
     },
-    /// Explain how a single environment variable was resolved.
+    /// Explain how a single environment variable was resolved (secret values are always redacted).
     Explain {
         /// Environment variable name to explain.
         key: String,
-        /// Show secret values in plaintext without redaction.
-        #[arg(long)]
-        unredacted: bool,
         /// Output as JSON.
         #[arg(long)]
         json: bool,

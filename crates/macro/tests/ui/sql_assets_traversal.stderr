@@ -1,0 +1,5 @@
+error: sql_assets!: path '../src' must be a relative path within CARGO_MANIFEST_DIR without '..' components
+ --> tests/ui/sql_assets_traversal.rs:3:13
+  |
+3 | sql_assets!("../src");
+  |             ^^^^^^^^

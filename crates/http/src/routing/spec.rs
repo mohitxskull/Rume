@@ -182,10 +182,12 @@ impl RouteSpec {
     /// Building a route without mounting it therefore never pollutes any
     /// registry.
     pub fn build(self) -> (String, Method, Vec<(String, Matcher)>, Option<String>) {
-        let declared_params = self.param_names();
+        // Why: validate against path-extracted parameters directly, NOT `self.param_names()`,
+        // because `param_names()` seeds from `self.params` and would make the check a tautology.
+        let path_params = crate::routing::registry::extract_path_params(&self.path);
         for (name, _) in &self.params {
             assert!(
-                declared_params.contains(name),
+                path_params.contains(name),
                 "RouteSpec: parameter '{name}' declared in where_param does not exist in path '{}'",
                 self.path
             );
@@ -196,8 +198,8 @@ impl RouteSpec {
     /// Converts this route spec directly into a [`crate::routing::RouteInfo`].
     pub fn into_route_info(self) -> crate::routing::RouteInfo {
         let req_schema = self.request_schema.clone();
+        let param_names = self.param_names();
         let (path, method, params, name) = self.build();
-        let param_names = params.iter().map(|(p, _)| p.clone()).collect();
         let mut info =
             crate::routing::RouteInfo::new(method, path, name, param_names).with_matchers(params);
         if let Some(schema) = req_schema {
@@ -342,5 +344,37 @@ where
             let req = Request::from_parts(parts, body);
             inner.call(req).await
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "does not exist in path")]
+    fn route_spec_build_panics_on_unknown_where_param() {
+        let _ = RouteSpec::get("/users/{id}")
+            .where_param("user_id", Matcher::Number)
+            .build();
+    }
+
+    #[test]
+    fn into_route_info_preserves_unmatched_path_params() {
+        let info = RouteSpec::get("/orgs/{org_id}/users/{id}")
+            .where_param("id", Matcher::Number)
+            .into_route_info();
+        assert!(info.params.contains(&"org_id".to_string()));
+        assert!(info.params.contains(&"id".to_string()));
+    }
+
+    #[test]
+    fn into_route_info_normalizes_wildcard_capture_name() {
+        let info = RouteSpec::get("/files/{*rest}")
+            .where_param("rest", Matcher::Number)
+            .into_route_info();
+        assert_eq!(info.params, vec!["rest".to_string()]);
+        assert_eq!(info.matchers.len(), 1);
+        assert_eq!(info.matchers[0].0, "rest");
     }
 }

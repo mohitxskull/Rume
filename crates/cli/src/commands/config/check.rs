@@ -17,31 +17,58 @@ fn toml_value_as_string(value: &toml::Value) -> Option<String> {
 /// Recursively redact secret-looking values in a toml::Value AST before serialization.
 ///
 /// Operating on the structured AST eliminates multi-line string leakage (CLI C1),
-/// ensuring multi-line RSA and PEM private keys and certificates are redacted
-/// in both human-readable and JSON modes.
+/// ensuring multi-line RSA and PEM private keys, certificates, secret-keyed arrays,
+/// and credential URLs inside arrays are redacted in both human-readable and JSON modes.
 pub fn redact_toml_value(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
-            let keys: Vec<String> = table.keys().cloned().collect();
-            for key in keys {
-                let redacted = table
-                    .get(&key)
-                    .and_then(toml_value_as_string)
-                    .map(|v| redact_value(&key, &v) == "[redacted]")
+            for (key, val) in table.iter_mut() {
+                let key_is_secret = rume::env::is_secret_key(key);
+                let scalar_redacted = toml_value_as_string(val)
+                    .map(|v| redact_value(key, &v) == "[redacted]")
                     .unwrap_or(false);
-                if redacted {
-                    table.insert(key, toml::Value::String("[redacted]".to_string()));
+                if scalar_redacted {
+                    *val = toml::Value::String("[redacted]".to_string());
+                } else if key_is_secret {
+                    // Why: a secret-named key holding an array (e.g. `api_keys = ["sk_live_..."]`)
+                    // or table must redact every nested scalar element rather than bypassing
+                    // redaction because `toml_value_as_string` returns `None` for containers.
+                    redact_all_scalars(val);
                 } else {
-                    redact_toml_value(table.get_mut(&key).unwrap());
+                    redact_toml_value(val);
                 }
             }
         }
         toml::Value::Array(items) => {
             for item in items.iter_mut() {
-                redact_toml_value(item);
+                if let Some(s) = toml_value_as_string(item)
+                    && redact_value("", &s) == "[redacted]"
+                {
+                    *item = toml::Value::String("[redacted]".to_string());
+                } else {
+                    redact_toml_value(item);
+                }
             }
         }
         _ => {}
+    }
+}
+
+fn redact_all_scalars(value: &mut toml::Value) {
+    match value {
+        toml::Value::Table(table) => {
+            for (_, v) in table.iter_mut() {
+                redact_all_scalars(v);
+            }
+        }
+        toml::Value::Array(items) => {
+            for item in items.iter_mut() {
+                redact_all_scalars(item);
+            }
+        }
+        _ => {
+            *value = toml::Value::String("[redacted]".to_string());
+        }
     }
 }
 

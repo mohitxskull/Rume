@@ -36,13 +36,13 @@ pub struct CsrfConfig {
     /// Explicit opt-in to allow unauthenticated double-submit tokens when `secret` is None.
     /// Default is `false` (fail-closed) to protect against subdomain cookie-tossing in production.
     pub allow_unauthenticated: bool,
-    /// Whether to automatically generate and inject the CSRF cookie on safe GET/HEAD requests.
+    /// Whether to automatically generate and inject the CSRF cookie on safe requests (`GET`, `HEAD`, `OPTIONS`, `TRACE`).
     pub auto_inject_cookie: bool,
     /// Cookie path (default: `/`).
     pub cookie_path: String,
     /// Cookie SameSite policy (default: `Strict`).
     pub cookie_same_site: String,
-    /// Cookie Secure flag (default: `false` for development/testing flexibility; recommended `true` in production).
+    /// Cookie Secure flag (default: `true`; set to `false` only for local non-TLS development/testing).
     pub cookie_secure: bool,
     /// Cookie HttpOnly flag (default: `false` so client-side JavaScript can read it for double-submit headers).
     pub cookie_http_only: bool,
@@ -123,13 +123,7 @@ impl CsrfConfig {
         self
     }
 
-    /// Convenience helper for mock testing: enables unauthenticated double-submit tokens.
-    pub fn insecure_without_secret_for_testing(mut self) -> Self {
-        self.allow_unauthenticated = true;
-        self
-    }
-
-    /// Enables or disables automatic cookie injection on safe GET/HEAD requests.
+    /// Enables or disables automatic cookie injection on safe requests (`GET`, `HEAD`, `OPTIONS`, `TRACE`).
     pub fn with_auto_inject_cookie(mut self, auto_inject: bool) -> Self {
         self.auto_inject_cookie = auto_inject;
         self

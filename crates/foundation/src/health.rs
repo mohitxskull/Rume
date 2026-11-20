@@ -165,17 +165,28 @@ impl HealthChecks {
         self
     }
 
+    /// Add a health check by mutable reference, returning an error if a check
+    /// with the same name is already registered.
+    pub fn try_add(&mut self, check: impl HealthCheck + 'static) -> Result<(), String> {
+        let name = check.name().to_string();
+        if !self.names.insert(name.clone()) {
+            return Err(format!(
+                "health check '{name}' is registered more than once"
+            ));
+        }
+        self.checks.push(Arc::new(check));
+        Ok(())
+    }
+
     /// Add a health check by mutable reference.
     ///
     /// # Panics
     ///
     /// Panics if a check with the same name is already registered.
     pub fn add(&mut self, check: impl HealthCheck + 'static) {
-        let name = check.name().to_string();
-        if !self.names.insert(name.clone()) {
-            panic!("health check '{name}' is registered more than once");
+        if let Err(msg) = self.try_add(check) {
+            panic!("{msg}");
         }
-        self.checks.push(Arc::new(check));
     }
 
     /// Set the per-check timeout. A check that does not complete within this
@@ -333,7 +344,16 @@ impl HealthChecks {
                 if let Some(mut rx) = waiter {
                     if rx.wait_for(|val| val.is_some()).await.is_err() {
                         let mut sf = self.singleflight.lock().await;
-                        *sf = None;
+                        // Why: only clear the slot if it still points to the
+                        // cancelled leader's channel. Otherwise a second waking
+                        // follower would wipe a newly elected Leader L2's slot,
+                        // breaking stampede suppression.
+                        if sf
+                            .as_ref()
+                            .is_some_and(|existing| existing.same_channel(&rx))
+                        {
+                            *sf = None;
+                        }
                         continue;
                     }
                     if let Some(report) = self.get_cached_report(ttl) {
@@ -580,5 +600,126 @@ mod tests {
         let expired = short_ttl.run().await;
         assert!(!expired.checks[0].cached);
         assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn singleflight_cancelled_leader_does_not_wipe_new_leader_slot() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        #[derive(Debug)]
+        struct ControlledCheck {
+            runs: Arc<AtomicUsize>,
+            first_started: Arc<Notify>,
+            second_started: Arc<Notify>,
+            release_second: Arc<Notify>,
+        }
+
+        impl HealthCheck for ControlledCheck {
+            fn name(&self) -> &str {
+                "controlled"
+            }
+
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                let runs = Arc::clone(&self.runs);
+                let first_started = Arc::clone(&self.first_started);
+                let second_started = Arc::clone(&self.second_started);
+                let release_second = Arc::clone(&self.release_second);
+                Box::pin(async move {
+                    let run_idx = runs.fetch_add(1, Ordering::SeqCst);
+                    if run_idx == 0 {
+                        first_started.notify_one();
+                        // Hang forever until cancelled
+                        std::future::pending::<()>().await;
+                    } else if run_idx == 1 {
+                        second_started.notify_one();
+                        release_second.notified().await;
+                    }
+                    HealthCheckResult {
+                        name: "controlled".to_string(),
+                        status: HealthStatus::Ok,
+                        message: "ok".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                        duration_ms: None,
+                    }
+                })
+            }
+        }
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let first_started = Arc::new(Notify::new());
+        let second_started = Arc::new(Notify::new());
+        let release_second = Arc::new(Notify::new());
+
+        let checks = Arc::new(
+            HealthChecks::new()
+                .cache_ttl(Some(Duration::from_secs(60)))
+                .register(ControlledCheck {
+                    runs: Arc::clone(&runs),
+                    first_started: Arc::clone(&first_started),
+                    second_started: Arc::clone(&second_started),
+                    release_second: Arc::clone(&release_second),
+                }),
+        );
+
+        // Deterministically drive L1, F1, and F2 with explicit single-step polls so both
+        // followers are guaranteed to attach to L1 before L1 is cancelled, and F2 is
+        // guaranteed to process L1's closure while L2 is still running.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        let mut l1 = Box::pin(checks.run());
+        assert!(l1.as_mut().poll(&mut cx).is_pending());
+        first_started.notified().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+        let mut f1 = Box::pin(checks.run());
+        assert!(f1.as_mut().poll(&mut cx).is_pending());
+        let mut f2 = Box::pin(checks.run());
+        assert!(f2.as_mut().poll(&mut cx).is_pending());
+
+        // Cancel L1; F1 becomes L2 and stays blocked on `release_second`.
+        drop(l1);
+        assert!(f1.as_mut().poll(&mut cx).is_pending());
+        second_started.notified().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        // Now poll stale follower F2 while L2 is still active; with the `same_channel`
+        // guard, F2 must NOT wipe L2's slot and must attach to L2 instead of starting L3.
+        assert!(f2.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        release_second.notify_waiters();
+        let _ = f1.await;
+        let _ = f2.await;
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn try_add_rejects_duplicate_health_check() {
+        #[derive(Debug)]
+        struct DummyCheck(&'static str);
+        impl HealthCheck for DummyCheck {
+            fn name(&self) -> &str {
+                self.0
+            }
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                let name = self.0.to_string();
+                Box::pin(async move {
+                    HealthCheckResult {
+                        name,
+                        status: HealthStatus::Ok,
+                        message: "ok".to_string(),
+                        meta: BTreeMap::new(),
+                        cached: false,
+                        duration_ms: None,
+                    }
+                })
+            }
+        }
+
+        let mut checks = HealthChecks::new();
+        assert!(checks.try_add(DummyCheck("db")).is_ok());
+        assert!(checks.try_add(DummyCheck("db")).is_err());
     }
 }

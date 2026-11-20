@@ -270,19 +270,15 @@ impl OutboxRepository for MysqlBackend {
                 )));
             };
 
-            let retry_count: i32 = row.try_get(0).unwrap_or(0) + 1;
-            let status = if retry_count >= max_retries as i32 {
-                "failed"
-            } else {
-                "pending"
-            };
-            let backoff_secs = 2u64.pow(retry_count.saturating_sub(1) as u32);
+            let current_retry: i32 = row.try_get(0).unwrap_or(0);
+            let (retry_count, status, backoff_secs) =
+                crate::outbox::compute_outbox_retry_state(current_retry, max_retries);
 
             let res = sqlx::query(MYSQL_OUTBOX_MARK_FAILED_SQL)
                 .bind(status)
                 .bind(retry_count)
                 .bind(&error)
-                .bind(backoff_secs as i64)
+                .bind(backoff_secs)
                 .bind(&id_str)
                 .bind(&token_str)
                 .execute(self.pool())
@@ -361,31 +357,8 @@ impl OutboxRepository for MysqlBackend {
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
 
             let mut messages = Vec::with_capacity(rows.len());
-            for row in rows {
-                let id: String = row.try_get("id").unwrap_or_default();
-                let event_type: String = row.try_get("event_type").unwrap_or_default();
-                let payload: Vec<u8> = row.try_get("payload").unwrap_or_default();
-                let retry_count: i32 = row.try_get("retry_count").unwrap_or(0);
-                let created_at: u64 = row.try_get("created_at").unwrap_or(0);
-                let last_error: Option<String> = row.try_get("last_error").ok();
-                let next_retry_at: Option<u64> = row.try_get("next_retry_at").ok();
-                let lease_token: Option<String> = row.try_get("lease_token").ok();
-                let lease_expires_at: Option<u64> = row.try_get("lease_expires_at").ok();
-                let trace_context: Option<String> = row.try_get("trace_context").ok();
-
-                messages.push(OutboxMessage {
-                    id,
-                    event_type,
-                    payload,
-                    status: OutboxStatus::Failed,
-                    retry_count: retry_count as u32,
-                    created_at,
-                    last_error,
-                    next_retry_at,
-                    lease_token,
-                    lease_expires_at,
-                    trace_context,
-                });
+            for row in &rows {
+                messages.push(parse_mysql_outbox_row(row)?);
             }
             Ok(messages)
         })

@@ -48,12 +48,48 @@ pub async fn run(
     let mut db_handle = None;
     if db_dry_run {
         match crate::commands::db::resolve_db_url() {
-            Ok(Some(url)) => {
-                if let Ok((handle, dialect)) = crate::commands::db::connect_backend(&url).await {
+            Ok(Some(url)) => match crate::commands::db::connect_backend(&url).await {
+                Ok((handle, dialect)) => {
+                    // Why: Postgres and MySQL backends use `connect_lazy`, so establishing
+                    // the pool alone does not verify connectivity. Ping up front so `--db`
+                    // fails closed on an unreachable database even when every `.sql` file
+                    // is parameterized and skips `EXPLAIN`.
+                    use rume::persistence::DatabaseBackend;
+                    let ping_res = match &handle {
+                        crate::commands::db::BackendHandle::Postgres(b) => b.ping().await,
+                        crate::commands::db::BackendHandle::Sqlite(b) => b.ping().await,
+                        crate::commands::db::BackendHandle::Mysql(b) => b.ping().await,
+                    };
+                    if let Err(err) = ping_res {
+                        eprintln!(
+                            "{}",
+                            style(format!("error: database unreachable for --db check: {err}"))
+                                .red()
+                        );
+                        std::process::exit(1);
+                    }
                     db_handle = Some((handle, dialect));
                 }
+                Err(err) => {
+                    // Why: `--db` explicitly requests live-DB verification; fail closed
+                    // instead of silently skipping when the database is unreachable.
+                    eprintln!(
+                        "{}",
+                        style(format!(
+                            "error: failed to connect to database for --db check: {err}"
+                        ))
+                        .red()
+                    );
+                    std::process::exit(1);
+                }
+            },
+            Ok(None) => {
+                eprintln!(
+                    "{}",
+                    style("error: --db requires DATABASE_URL to be configured").red()
+                );
+                std::process::exit(1);
             }
-            Ok(None) => {}
             Err(err) => {
                 eprintln!("{}", style(format!("error: {err}")).red());
                 std::process::exit(1);
@@ -69,42 +105,29 @@ pub async fn run(
         let display_path = file_path.display().to_string();
         let val_res = validate_sql_file(file_path, target_dialect);
         let final_res = match val_res {
-            Ok(()) => {
-                if let Some((handle, _dialect)) = &db_handle {
-                    if let Ok(content) = fs::read_to_string(file_path) {
-                        let trimmed = content.trim();
-                        // Dry-run with EXPLAIN if it's a DML statement.
-                        // Why: zero-parameter DML statements can be EXPLAINed against a live
-                        // connection to confirm they are executable; this is a best-effort
-                        // validation that never modifies data.
-                        let first_word = trimmed
-                            .split_whitespace()
-                            .next()
-                            .unwrap_or("")
-                            .to_ascii_uppercase();
-                        if matches!(
-                            first_word.as_str(),
-                            "SELECT" | "INSERT" | "UPDATE" | "DELETE"
-                        ) {
-                            let explain_sql = format!("EXPLAIN {trimmed}");
-                            use rume::persistence::DatabaseBackend;
-                            let explain_res = match handle {
-                                crate::commands::db::BackendHandle::Postgres(b) => {
-                                    b.execute(&explain_sql).await
-                                }
-                                crate::commands::db::BackendHandle::Sqlite(b) => {
-                                    b.execute(&explain_sql).await
-                                }
-                                crate::commands::db::BackendHandle::Mysql(b) => {
-                                    b.execute(&explain_sql).await
-                                }
-                            };
-                            match explain_res {
-                                Ok(_) => Ok(()),
-                                Err(e) => Err(format!("live DB dry-run failed: {e}")),
+            Ok((statements, _tokens, _effective_dialect)) => {
+                if let Some((handle, _db_dialect)) = &db_handle {
+                    // Why: inspect the parsed `sqlparser` AST instead of raw string
+                    // `first_word`. This both handles leading comments (`--` / `/* */`)
+                    // and guarantees multi-statement SQL (e.g. `SELECT 1; DROP TABLE ...`)
+                    // or parameterized queries are never sent to `EXPLAIN`.
+                    if is_safe_explainable_dml(&statements) {
+                        let explain_sql = format!("EXPLAIN {}", statements[0]);
+                        use rume::persistence::DatabaseBackend;
+                        let explain_res = match handle {
+                            crate::commands::db::BackendHandle::Postgres(b) => {
+                                b.execute(&explain_sql).await
                             }
-                        } else {
-                            Ok(())
+                            crate::commands::db::BackendHandle::Sqlite(b) => {
+                                b.execute(&explain_sql).await
+                            }
+                            crate::commands::db::BackendHandle::Mysql(b) => {
+                                b.execute(&explain_sql).await
+                            }
+                        };
+                        match explain_res {
+                            Ok(_) => Ok(()),
+                            Err(e) => Err(format!("live DB dry-run failed: {e}")),
                         }
                     } else {
                         Ok(())
@@ -222,12 +245,58 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
+/// Returns `true` only when `statements` contains exactly one zero-parameter
+/// `SELECT`/`INSERT`/`UPDATE`/`DELETE` statement safe to wrap in `EXPLAIN`.
+fn is_safe_explainable_dml(statements: &[sqlparser::ast::Statement]) -> bool {
+    if statements.len() != 1 {
+        return false;
+    }
+    // Why: use `Visitor::pre_visit_value` rather than `visit_expressions` or token
+    // scanning so placeholders stored outside `Expr::Value` (such as MySQL
+    // `MatchAgainst.match_value` in `MATCH(body) AGAINST (?)`) and SQLite named
+    // parameters (`SELECT :id;`) are all excluded from `EXPLAIN`, while PostgreSQL
+    // JSONB operators (`payload ? 'active'`, parsed as a binary op) remain eligible.
+    struct PlaceholderVisitor;
+    impl sqlparser::ast::Visitor for PlaceholderVisitor {
+        type Break = ();
+
+        fn pre_visit_value(
+            &mut self,
+            value: &sqlparser::ast::ValueWithSpan,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            if matches!(value.value, sqlparser::ast::Value::Placeholder(_)) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
+        }
+    }
+
+    let has_placeholder =
+        sqlparser::ast::Visit::visit(&statements[0], &mut PlaceholderVisitor).is_break();
+    if has_placeholder {
+        return false;
+    }
+    matches!(
+        statements[0],
+        sqlparser::ast::Statement::Query(_)
+            | sqlparser::ast::Statement::Insert(_)
+            | sqlparser::ast::Statement::Update { .. }
+            | sqlparser::ast::Statement::Delete(_)
+    )
+}
+
+type ValidatedSql<'a> = (Vec<sqlparser::ast::Statement>, Vec<Token>, Option<&'a str>);
+
 /// Validate a single SQL file using `sqlparser-rs`.
 ///
 /// Performs comment-aware syntax parsing, an emptiness check, and dialect-aware placeholder
 /// validation. Comments (`--`, `#`, `/* */`) are tokenized as [`Token::Whitespace`] variants by
 /// `sqlparser-rs`, so placeholders appearing inside comments are never flagged.
-fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), String> {
+fn validate_sql_file<'a>(
+    path: &Path,
+    target_dialect: Option<&'a str>,
+) -> Result<ValidatedSql<'a>, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
 
     // Resolve the effective dialect: an explicit `--dialect` flag wins, otherwise infer from the
@@ -252,9 +321,8 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
     validate_placeholders(&tokens, effective_dialect)?;
 
     // Comment-aware scanning + syntax validation: `sqlparser-rs` tokenizes and parses the SQL.
-    // Why: sqlparser 0.53.0's `MySqlDialect::parse_infix` calls `.unwrap()` on `parse_expr()` for
-    // `DIV` (e.g. `SELECT 1 DIV ;`), so we guard `Parser::parse_sql` with `catch_unwind` to turn
-    // any parser panic into a diagnostic error rather than aborting `sql:check`.
+    // Why: guard `Parser::parse_sql` (sqlparser 0.64.0) with `catch_unwind` so any unexpected
+    // parser panic on malformed SQL turns into a diagnostic error rather than aborting `sql:check`.
     let parse_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         Parser::parse_sql(dialect.as_ref(), &content)
     }));
@@ -293,7 +361,7 @@ fn validate_sql_file(path: &Path, target_dialect: Option<&str>) -> Result<(), St
         return Err("SQL file is empty (contains no query statements)".to_string());
     }
 
-    Ok(())
+    Ok((statements, tokens, effective_dialect))
 }
 
 /// Enforce the per-dialect placeholder rule over already-tokenized SQL.
@@ -436,7 +504,36 @@ mod tests {
     #[test]
     fn sql_check_accepts_postgres_jsonb_question_operators() {
         let q = write_temp("SELECT payload ? 'active' FROM events;");
-        assert!(validate_sql_file(q.path(), Some("postgres")).is_ok());
+        let (stmts, _tokens, _dialect) =
+            validate_sql_file(q.path(), Some("postgres")).expect("jsonb ? parses");
+        assert!(
+            is_safe_explainable_dml(&stmts),
+            "PostgreSQL JSONB `?` operator must remain eligible for live EXPLAIN"
+        );
+
+        let q_param = write_temp("SELECT payload ? 'active' FROM events WHERE id = $1;");
+        let (stmts_p, _tokens_p, _dialect_p) =
+            validate_sql_file(q_param.path(), Some("postgres")).expect("parameterized jsonb");
+        assert!(
+            !is_safe_explainable_dml(&stmts_p),
+            "parameterized PostgreSQL query must be skipped from EXPLAIN"
+        );
+
+        let q_sqlite_named = write_temp("-- lookup\nSELECT :id;");
+        let (stmts_named, _, _) =
+            validate_sql_file(q_sqlite_named.path(), Some("sqlite")).expect("sqlite named param");
+        assert!(
+            !is_safe_explainable_dml(&stmts_named),
+            "SQLite named placeholder `:id` must be excluded from EXPLAIN"
+        );
+
+        let q_mysql_match = write_temp("SELECT MATCH(body) AGAINST (?) FROM articles;");
+        let (stmts_match, _, _) =
+            validate_sql_file(q_mysql_match.path(), Some("mysql")).expect("mysql match against");
+        assert!(
+            !is_safe_explainable_dml(&stmts_match),
+            "MySQL MATCH ... AGAINST (?) placeholder must be excluded from EXPLAIN"
+        );
 
         let q_pipe = write_temp("SELECT payload ?| array['a', 'b'] FROM events;");
         assert!(validate_sql_file(q_pipe.path(), Some("postgres")).is_ok());
