@@ -22,23 +22,20 @@ fn toml_value_as_string(value: &toml::Value) -> Option<String> {
 pub fn redact_toml_value(value: &mut toml::Value) {
     match value {
         toml::Value::Table(table) => {
-            let keys: Vec<String> = table.keys().cloned().collect();
-            for key in keys {
-                let key_is_secret = rume::env::is_secret_key(&key);
-                let scalar_redacted = table
-                    .get(&key)
-                    .and_then(toml_value_as_string)
-                    .map(|v| redact_value(&key, &v) == "[redacted]")
+            for (key, val) in table.iter_mut() {
+                let key_is_secret = rume::env::is_secret_key(key);
+                let scalar_redacted = toml_value_as_string(val)
+                    .map(|v| redact_value(key, &v) == "[redacted]")
                     .unwrap_or(false);
                 if scalar_redacted {
-                    table.insert(key, toml::Value::String("[redacted]".to_string()));
+                    *val = toml::Value::String("[redacted]".to_string());
                 } else if key_is_secret {
                     // Why: a secret-named key holding an array (e.g. `api_keys = ["sk_live_..."]`)
                     // or table must redact every nested scalar element rather than bypassing
                     // redaction because `toml_value_as_string` returns `None` for containers.
-                    redact_all_scalars(table.get_mut(&key).unwrap());
+                    redact_all_scalars(val);
                 } else {
-                    redact_toml_value(table.get_mut(&key).unwrap());
+                    redact_toml_value(val);
                 }
             }
         }

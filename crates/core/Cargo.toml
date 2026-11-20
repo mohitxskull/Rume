@@ -86,10 +86,12 @@ criterion = { version = "=0.8.2", features = ["async_tokio"] }
 [[test]]
 name = "integration"
 path = "tests/integration.rs"
+required-features = ["testing"]
 
 [[test]]
 name = "containers"
 path = "tests/containers.rs"
+required-features = ["testing"]
 
 [[bench]]
 name = "hot_path"

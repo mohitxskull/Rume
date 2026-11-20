@@ -1,6 +1,38 @@
 use rume::config;
 use rume::env::{is_secret_key, redact_value};
 
+fn redact_explained_value(key: &str, val: &mut toml::Value) {
+    let leaf_key = key.rsplit('.').next().unwrap_or(key);
+    // Why: a descendant query like `key.primary` under `[key]` must inherit secret
+    // classification from any ancestor path segment, not just the full dotted key or leaf.
+    let is_secret = is_secret_key(key) || key.split('.').any(is_secret_key);
+    match val {
+        toml::Value::Table(_) | toml::Value::Array(_) => {
+            if is_secret {
+                *val = toml::Value::String("[redacted]".to_string());
+            } else {
+                // Why: explaining a non-secret table/array (e.g. `rume config explain database`)
+                // must recursively redact nested secret keys (`database.url`, `database.password`)
+                // and sensitive array elements.
+                crate::commands::config::check::redact_toml_value(val);
+            }
+        }
+        _ => {
+            let str_val = match val {
+                toml::Value::String(s) => Some(s.as_str()),
+                _ => None,
+            };
+            let should_redact = is_secret
+                || str_val
+                    .map(|s| redact_value(leaf_key, s) == "[redacted]")
+                    .unwrap_or(false);
+            if should_redact {
+                *val = toml::Value::String("[redacted]".to_string());
+            }
+        }
+    }
+}
+
 pub fn run(key: &str, unredacted: bool, json: bool) {
     let source_map = match config::source_map(std::path::Path::new(".")) {
         Ok(sm) => sm,
@@ -20,33 +52,7 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
 
     let mut explanation = source_map.explain(key);
     if !unredacted && let Some(ref mut val) = explanation.value {
-        let leaf_key = key.rsplit('.').next().unwrap_or(key);
-        let is_secret = is_secret_key(key) || is_secret_key(leaf_key);
-        match val {
-            toml::Value::Table(_) | toml::Value::Array(_) => {
-                if is_secret {
-                    *val = toml::Value::String("[redacted]".to_string());
-                } else {
-                    // Why: explaining a non-secret table/array (e.g. `rume config explain database`)
-                    // must recursively redact nested secret keys (`database.url`, `database.password`)
-                    // and sensitive array elements.
-                    crate::commands::config::check::redact_toml_value(val);
-                }
-            }
-            _ => {
-                let str_val = match val {
-                    toml::Value::String(s) => Some(s.as_str()),
-                    _ => None,
-                };
-                let should_redact = is_secret
-                    || str_val
-                        .map(|s| redact_value(leaf_key, s) == "[redacted]")
-                        .unwrap_or(false);
-                if should_redact {
-                    *val = toml::Value::String("[redacted]".to_string());
-                }
-            }
-        }
+        redact_explained_value(key, val);
     }
 
     match &explanation.value {
@@ -86,5 +92,21 @@ pub fn run(key: &str, unredacted: bool, json: bool) {
             }
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explain_redacts_descendant_of_secret_table() {
+        let mut val = toml::Value::String("sk_live_x".to_string());
+        redact_explained_value("key.primary", &mut val);
+        assert_eq!(val, toml::Value::String("[redacted]".to_string()));
+
+        let mut host = toml::Value::String("localhost".to_string());
+        redact_explained_value("database.host", &mut host);
+        assert_eq!(host, toml::Value::String("localhost".to_string()));
     }
 }

@@ -297,15 +297,21 @@ impl DatabaseBackend for SqliteBackend {
         &self,
     ) -> BoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
         Box::pin(async move {
-            // Why: deferred `BEGIN` followed by a read and then a write fails
-            // immediately with `SQLITE_BUSY_SNAPSHOT` under concurrent writers
-            // regardless of `busy_timeout`. `BEGIN IMMEDIATE` acquires the
-            // RESERVED write lock up front so `busy_timeout` serializes callers.
-            let tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
+            // Why: configure `PRAGMA busy_timeout = 60000` on the acquired connection
+            // BEFORE `BEGIN IMMEDIATE` so the write-lock acquisition itself uses the
+            // 60-second migration busy timeout instead of the pool's 5-second default.
+            // Deferred `BEGIN` followed by a read and then a write fails immediately
+            // with `SQLITE_BUSY_SNAPSHOT` regardless of `busy_timeout`; `BEGIN IMMEDIATE`
+            // acquires the RESERVED write lock up front so `busy_timeout` serializes callers.
+            let mut conn = self.pool.acquire().await.map_err(map_sqlx_error)?;
+            sqlx::query("PRAGMA busy_timeout = 60000")
+                .execute(&mut *conn)
                 .await
                 .map_err(map_sqlx_error)?;
+            let tx =
+                sqlx::Transaction::begin(conn, Some(sqlx::SqlStr::from_static("BEGIN IMMEDIATE")))
+                    .await
+                    .map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
             })

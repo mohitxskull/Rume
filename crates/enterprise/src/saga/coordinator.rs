@@ -107,12 +107,34 @@ pub trait SagaStore: Send + Sync + 'static {
 
     /// Lists all incomplete (non-terminal) saga executions for recovery.
     fn list_incomplete(&self) -> BoxFuture<'_, Result<Vec<SagaRecord>, SagaError>>;
+
+    /// Acquires an exclusive execution claim for `saga_id`, held across forward step
+    /// and compensation callbacks so two concurrent workers cannot interleave between
+    /// individual CAS writes.
+    ///
+    /// Returns an opaque claim token on success, or [`SagaError::Storage`] if another
+    /// worker currently owns execution for `saga_id`.
+    fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>> {
+        let _ = saga_id;
+        Box::pin(async { Ok(String::new()) })
+    }
+
+    /// Releases a previously acquired execution claim for `saga_id`.
+    fn release_execution(
+        &self,
+        saga_id: &str,
+        claim_token: &str,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
+        let _ = (saga_id, claim_token);
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Thread-safe in-memory saga storage suitable for testing and single-instance deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemorySagaStore {
     records: Arc<RwLock<HashMap<String, SagaRecord>>>,
+    active_claims: Arc<std::sync::Mutex<HashMap<String, String>>>,
     max_retained_terminal: Option<usize>,
 }
 
@@ -205,6 +227,74 @@ impl SagaStore for InMemorySagaStore {
             Ok(list)
         })
     }
+
+    fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>> {
+        let id = saga_id.to_string();
+        let active_claims = Arc::clone(&self.active_claims);
+        Box::pin(async move {
+            let mut claims = active_claims.lock().map_err(|_| SagaError::Storage {
+                saga_id: Some(id.clone()),
+                message: "saga claim lock poisoned".into(),
+            })?;
+            if claims.contains_key(&id) {
+                return Err(SagaError::Storage {
+                    saga_id: Some(id),
+                    message: "saga execution already claimed by another worker".into(),
+                });
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            claims.insert(id, token.clone());
+            Ok(token)
+        })
+    }
+
+    fn release_execution(
+        &self,
+        saga_id: &str,
+        claim_token: &str,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
+        let id = saga_id.to_string();
+        let token = claim_token.to_string();
+        let active_claims = Arc::clone(&self.active_claims);
+        Box::pin(async move {
+            if let Ok(mut claims) = active_claims.lock()
+                && claims.get(&id).is_some_and(|t| t == &token)
+            {
+                claims.remove(&id);
+            }
+            Ok(())
+        })
+    }
+}
+
+/// RAII guard that holds an exclusive per-saga execution claim across step and
+/// compensation callbacks, releasing it on normal completion or task cancellation.
+struct ExecutionClaimGuard {
+    store: Option<Arc<dyn SagaStore>>,
+    saga_id: String,
+    token: String,
+}
+
+impl ExecutionClaimGuard {
+    async fn release(mut self) {
+        if let Some(store) = self.store.take() {
+            let _ = store.release_execution(&self.saga_id, &self.token).await;
+        }
+    }
+}
+
+impl Drop for ExecutionClaimGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            let saga_id = self.saga_id.clone();
+            let token = self.token.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = store.release_execution(&saga_id, &token).await;
+                });
+            }
+        }
+    }
 }
 
 /// Builds a deterministic forward-execution idempotency key for a `(saga_id, step_name)` pair.
@@ -262,6 +352,8 @@ pub enum SagaRecoveryPhase {
 pub struct SagaRecoveryHandle<Ctx> {
     /// Identifier of the saga instance.
     pub saga_id: String,
+    /// Workflow name owning this saga instance (validated on [`Saga::resume_from_handle`]).
+    pub saga_name: String,
     /// Mutated context preserved at the point of failure.
     pub context: Ctx,
     /// Phase the saga was in when the error occurred.
@@ -278,9 +370,11 @@ impl<Ctx> Debug for SagaRecoveryHandle<Ctx> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SagaRecoveryHandle")
             .field("saga_id", &self.saga_id)
+            .field("saga_name", &self.saga_name)
             .field("phase", &self.phase)
             .field("completed_steps", &self.completed_steps)
             .field("compensated_steps", &self.compensated_steps)
+            .field("version", &self.version)
             .finish_non_exhaustive()
     }
 }
@@ -434,6 +528,24 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self.name
     }
 
+    async fn acquire_execution_claim(
+        &self,
+        saga_id: &str,
+    ) -> Result<Option<ExecutionClaimGuard>, SagaError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let token = store
+            .try_acquire_execution(saga_id)
+            .await
+            .map_err(|err| attach_saga_id(err, saga_id))?;
+        Ok(Some(ExecutionClaimGuard {
+            store: Some(Arc::clone(store)),
+            saga_id: saga_id.to_string(),
+            token,
+        }))
+    }
+
     async fn persist_state(
         &self,
         saga_id: &str,
@@ -454,9 +566,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 updated_at: current_timestamp(),
                 version: next_version,
             };
-            // Why: Propagate `save_record_cas` errors (annotated with `saga_id`) instead of
-            // logging and continuing, so a persistence failure or CAS conflict aborts the
-            // transition rather than leaving the store stale or interleaving two workers.
+            // Why: CAS (`save_record_cas`) protects individual state transitions against
+            // stale writes, while `acquire_execution_claim` holds an exclusive per-saga
+            // claim across step and compensation callbacks so two workers cannot interleave.
             store
                 .save_record_cas(&record, expected_version)
                 .await
@@ -509,15 +621,37 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
+        let claim = match self.acquire_execution_claim(saga_id).await {
+            Ok(c) => c,
+            Err(error) => {
+                return Err(SagaRecoveryError::new(
+                    error,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Forward,
+                        completed_steps: Vec::new(),
+                        compensated_steps: Vec::new(),
+                        version: 0,
+                    },
+                ));
+            }
+        };
+
         let mut version = 0u64;
         if let Err(error) = self
             .persist_state(saga_id, &mut version, SagaStatus::Pending, &[], &[])
             .await
         {
+            if let Some(c) = claim {
+                c.release().await;
+            }
             return Err(SagaRecoveryError::new(
                 error,
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: self.name.clone(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: Vec::new(),
@@ -527,16 +661,21 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             ));
         }
 
-        self.execute_forward_from_recoverable(
-            saga_id,
-            version,
-            ctx,
-            0,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .await
+        let res = self
+            .execute_forward_from_recoverable(
+                saga_id,
+                version,
+                ctx,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .await;
+        if let Some(c) = claim {
+            c.release().await;
+        }
+        res
     }
 
     /// Resumes an incomplete or crashed saga from its persisted state record.
@@ -576,6 +715,25 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     },
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Forward,
+                        completed_steps: Vec::new(),
+                        compensated_steps: Vec::new(),
+                        version: 0,
+                    },
+                ));
+            }
+        };
+
+        let claim = match self.acquire_execution_claim(saga_id).await {
+            Ok(c) => c,
+            Err(error) => {
+                return Err(SagaRecoveryError::new(
+                    error,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
@@ -589,6 +747,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let record = match store.load_record(saga_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
+                if let Some(c) = claim {
+                    c.release().await;
+                }
                 return Err(SagaRecoveryError::new(
                     SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
@@ -596,6 +757,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     },
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
@@ -605,10 +767,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 ));
             }
             Err(err) => {
+                if let Some(c) = claim {
+                    c.release().await;
+                }
                 return Err(SagaRecoveryError::new(
                     attach_saga_id(err, saga_id),
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: Vec::new(),
@@ -620,6 +786,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         };
 
         if record.saga_name != self.name {
+            if let Some(c) = claim {
+                c.release().await;
+            }
             return Err(SagaRecoveryError::new(
                 SagaError::Aborted {
                     saga: self.name.clone(),
@@ -630,6 +799,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 },
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: record.saga_name,
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: record.completed_steps,
@@ -639,7 +809,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             ));
         }
 
-        match record.status {
+        let res = match record.status {
             SagaStatus::Success
             | SagaStatus::Compensated { .. }
             | SagaStatus::CompensationFailed { .. } => Ok(SagaReport {
@@ -655,7 +825,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             SagaStatus::Pending | SagaStatus::Running { .. } => {
                 self.resume_forward_recoverable(saga_id, record, ctx).await
             }
+        };
+        if let Some(c) = claim {
+            c.release().await;
         }
+        res
     }
 
     /// Resumes an in-process saga from a [`SagaRecoveryHandle`] returned by a previous
@@ -665,11 +839,30 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         handle: SagaRecoveryHandle<Ctx>,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
+        // Why: reject handles originating from a different workflow even when step names
+        // match, preventing cross-workflow hijacking and `saga_name` overwrites via CAS.
+        if handle.saga_name != self.name {
+            let reason = format!(
+                "saga recovery handle '{}' belongs to '{}', not '{}'",
+                handle.saga_id, handle.saga_name, self.name
+            );
+            return Err(SagaRecoveryError::new(
+                SagaError::Aborted {
+                    saga: self.name.clone(),
+                    reason,
+                },
+                handle,
+            ));
+        }
         let completed_indices = match self.resolve_completed_indices(&handle.completed_steps) {
             Ok(indices) => indices,
             Err(err) => return Err(SagaRecoveryError::new(err, handle)),
         };
-        match handle.phase {
+        let claim = match self.acquire_execution_claim(&handle.saga_id).await {
+            Ok(c) => c,
+            Err(err) => return Err(SagaRecoveryError::new(err, handle)),
+        };
+        let res = match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
                 self.execute_forward_from_recoverable(
@@ -699,7 +892,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 )
                 .await
             }
+        };
+        if let Some(c) = claim {
+            c.release().await;
         }
+        res
     }
 
     fn resolve_completed_indices(
@@ -760,6 +957,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     error,
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: completed_names,
@@ -821,6 +1019,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                             error,
                             SagaRecoveryHandle {
                                 saga_id: saga_id.to_string(),
+                                saga_name: self.name.clone(),
                                 context: ctx,
                                 phase: SagaRecoveryPhase::Forward,
                                 completed_steps: completed_names,
@@ -861,6 +1060,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 error,
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: self.name.clone(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: completed_names,
@@ -914,6 +1114,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     error,
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: original_error,
@@ -980,6 +1181,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                             error,
                             SagaRecoveryHandle {
                                 saga_id: saga_id.to_string(),
+                                saga_name: self.name.clone(),
                                 context: ctx,
                                 phase: SagaRecoveryPhase::Compensating {
                                     error: original_error,
@@ -1039,6 +1241,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 error,
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: self.name.clone(),
                     context: ctx,
                     phase: SagaRecoveryPhase::Compensating {
                         error: Some(resolved_error),
@@ -1072,6 +1275,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     err,
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: record.saga_name,
                         context: ctx,
                         phase: SagaRecoveryPhase::Forward,
                         completed_steps: record.completed_steps,
@@ -1112,6 +1316,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     err,
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: record.saga_name,
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: original_error,
@@ -1167,6 +1372,28 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     },
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Compensating {
+                            error: None,
+                            compensation_errors: Vec::new(),
+                        },
+                        completed_steps: Vec::new(),
+                        compensated_steps: Vec::new(),
+                        version: 0,
+                    },
+                ));
+            }
+        };
+
+        let claim = match self.acquire_execution_claim(saga_id).await {
+            Ok(c) => c,
+            Err(error) => {
+                return Err(SagaRecoveryError::new(
+                    error,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
@@ -1183,6 +1410,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         let record = match store.load_record(saga_id).await {
             Ok(Some(record)) => record,
             Ok(None) => {
+                if let Some(c) = claim {
+                    c.release().await;
+                }
                 return Err(SagaRecoveryError::new(
                     SagaError::Storage {
                         saga_id: Some(saga_id.to_string()),
@@ -1190,6 +1420,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     },
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
@@ -1202,10 +1433,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 ));
             }
             Err(err) => {
+                if let Some(c) = claim {
+                    c.release().await;
+                }
                 return Err(SagaRecoveryError::new(
                     attach_saga_id(err, saga_id),
                     SagaRecoveryHandle {
                         saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
                         context: ctx,
                         phase: SagaRecoveryPhase::Compensating {
                             error: None,
@@ -1220,6 +1455,9 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         };
 
         if record.saga_name != self.name {
+            if let Some(c) = claim {
+                c.release().await;
+            }
             return Err(SagaRecoveryError::new(
                 SagaError::Aborted {
                     saga: self.name.clone(),
@@ -1230,6 +1468,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 },
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: record.saga_name,
                     context: ctx,
                     phase: SagaRecoveryPhase::Compensating {
                         error: None,
@@ -1245,7 +1484,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         // Why: terminal sagas must never be rolled back or overwritten. A `Success`
         // saga already committed; already-`Compensated` / `CompensationFailed`
         // sagas are returned intact to preserve their original error record.
-        match record.status {
+        let res = match record.status {
             SagaStatus::Success => Err(SagaRecoveryError::new(
                 SagaError::Aborted {
                     saga: self.name.clone(),
@@ -1253,6 +1492,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 },
                 SagaRecoveryHandle {
                     saga_id: saga_id.to_string(),
+                    saga_name: record.saga_name,
                     context: ctx,
                     phase: SagaRecoveryPhase::Forward,
                     completed_steps: record.completed_steps,
@@ -1272,7 +1512,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 self.resume_compensation_recoverable(saga_id, record, ctx)
                     .await
             }
+        };
+        if let Some(c) = claim {
+            c.release().await;
         }
+        res
     }
 }
 
@@ -1789,5 +2033,116 @@ mod tests {
         // Second terminal saga triggers max_retained_terminal(1) pruning.
         let _ = saga.run_with_id("s-dual-2", ()).await.unwrap();
         assert_eq!(store.records.read().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn overlapping_resume_is_blocked_by_exclusive_execution_claim() {
+        let store = Arc::new(InMemorySagaStore::new());
+        store
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: "s-overlap".into(),
+                    saga_name: "overlap_saga".into(),
+                    status: SagaStatus::Running {
+                        current_step: "step_2".into(),
+                    },
+                    completed_steps: vec!["step_1".into()],
+                    compensated_steps: vec![],
+                    updated_at: 1,
+                    version: 1,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let step2_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let e_clone = Arc::clone(&entered);
+        let r_clone = Arc::clone(&release);
+        let runs_clone = Arc::clone(&step2_runs);
+
+        let saga = Arc::new(
+            Saga::<()>::new("overlap_saga")
+                .with_store(store.clone())
+                .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) })
+                .step(
+                    "step_2",
+                    move |_| {
+                        let entered = Arc::clone(&e_clone);
+                        let release = Arc::clone(&r_clone);
+                        let runs = Arc::clone(&runs_clone);
+                        async move {
+                            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            entered.notify_one();
+                            release.notified().await;
+                            Ok(())
+                        }
+                    },
+                    |_| async { Ok(()) },
+                ),
+        );
+
+        let worker_a_saga = Arc::clone(&saga);
+        let worker_a = tokio::spawn(async move { worker_a_saga.resume("s-overlap", ()).await });
+        entered.notified().await;
+
+        // While Worker A is paused inside `step_2`, Worker B must be rejected before entering the step.
+        let worker_b_err = saga.resume("s-overlap", ()).await.err().unwrap();
+        assert!(matches!(worker_b_err, SagaError::Storage { .. }));
+        assert_eq!(step2_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        release.notify_one();
+        let report = worker_a.await.unwrap().expect("worker A succeeds");
+        assert_eq!(report.status, SagaStatus::Success);
+        assert_eq!(step2_runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn resume_from_handle_rejects_mismatched_saga_name_handle() {
+        let store = Arc::new(InMemorySagaStore::new());
+        store
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: "s-cross".into(),
+                    saga_name: "workflow_a".into(),
+                    status: SagaStatus::Running {
+                        current_step: "step_2".into(),
+                    },
+                    completed_steps: vec!["step_1".into()],
+                    compensated_steps: vec![],
+                    updated_at: 1,
+                    version: 1,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        let workflow_b = Saga::<()>::new("workflow_b")
+            .with_store(store.clone())
+            .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) })
+            .step("step_2", |_| async { Ok(()) }, |_| async { Ok(()) });
+
+        let err = workflow_b
+            .resume_recoverable("s-cross", ())
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err.error, SagaError::Aborted { .. }));
+
+        // Passing the rejected handle back into `workflow_b.resume_from_handle` must also fail
+        // and must NOT overwrite `workflow_a`'s stored record.
+        let err2 = workflow_b
+            .resume_from_handle(*err.handle)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err2.error, SagaError::Aborted { .. }));
+        let stored = store.load_record("s-cross").await.unwrap().unwrap();
+        assert_eq!(stored.saga_name, "workflow_a");
+        assert_eq!(stored.version, 1);
     }
 }

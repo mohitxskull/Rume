@@ -87,13 +87,14 @@ pub async fn run(
         let display_path = file_path.display().to_string();
         let val_res = validate_sql_file(file_path, target_dialect);
         let final_res = match val_res {
-            Ok((statements, tokens)) => {
-                if let Some((handle, _dialect)) = &db_handle {
+            Ok((statements, tokens, effective_dialect)) => {
+                if let Some((handle, db_dialect)) = &db_handle {
                     // Why: inspect the parsed `sqlparser` AST instead of raw string
                     // `first_word`. This both handles leading comments (`--` / `/* */`)
                     // and guarantees multi-statement SQL (e.g. `SELECT 1; DROP TABLE ...`)
                     // or parameterized queries are never sent to `EXPLAIN`.
-                    if is_safe_explainable_dml(&statements, &tokens) {
+                    let dialect_for_explain = effective_dialect.or(Some(*db_dialect));
+                    if is_safe_explainable_dml(&statements, &tokens, dialect_for_explain) {
                         let explain_sql = format!("EXPLAIN {}", statements[0]);
                         use rume::persistence::DatabaseBackend;
                         let explain_res = match handle {
@@ -229,14 +230,22 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 /// Returns `true` only when `statements` contains exactly one zero-parameter
 /// `SELECT`/`INSERT`/`UPDATE`/`DELETE` statement safe to wrap in `EXPLAIN`.
-fn is_safe_explainable_dml(statements: &[sqlparser::ast::Statement], tokens: &[Token]) -> bool {
+fn is_safe_explainable_dml(
+    statements: &[sqlparser::ast::Statement],
+    tokens: &[Token],
+    dialect: Option<&str>,
+) -> bool {
     if statements.len() != 1 {
         return false;
     }
-    if tokens
-        .iter()
-        .any(|t| matches!(t, Token::Placeholder(_) | Token::Question))
-    {
+    // Why: on PostgreSQL, `Token::Question` is the JSONB existence operator (`payload ? 'active'`),
+    // not a bind placeholder (parameterized `?` is already rejected during parsing).
+    let has_placeholder = tokens.iter().any(|t| match t {
+        Token::Placeholder(_) => true,
+        Token::Question => dialect != Some("postgres"),
+        _ => false,
+    });
+    if has_placeholder {
         return false;
     }
     matches!(
@@ -248,15 +257,17 @@ fn is_safe_explainable_dml(statements: &[sqlparser::ast::Statement], tokens: &[T
     )
 }
 
+type ValidatedSql<'a> = (Vec<sqlparser::ast::Statement>, Vec<Token>, Option<&'a str>);
+
 /// Validate a single SQL file using `sqlparser-rs`.
 ///
 /// Performs comment-aware syntax parsing, an emptiness check, and dialect-aware placeholder
 /// validation. Comments (`--`, `#`, `/* */`) are tokenized as [`Token::Whitespace`] variants by
 /// `sqlparser-rs`, so placeholders appearing inside comments are never flagged.
-fn validate_sql_file(
+fn validate_sql_file<'a>(
     path: &Path,
-    target_dialect: Option<&str>,
-) -> Result<(Vec<sqlparser::ast::Statement>, Vec<Token>), String> {
+    target_dialect: Option<&'a str>,
+) -> Result<ValidatedSql<'a>, String> {
     let content = fs::read_to_string(path).map_err(|e| format!("cannot read file: {e}"))?;
 
     // Resolve the effective dialect: an explicit `--dialect` flag wins, otherwise infer from the
@@ -321,7 +332,7 @@ fn validate_sql_file(
         return Err("SQL file is empty (contains no query statements)".to_string());
     }
 
-    Ok((statements, tokens))
+    Ok((statements, tokens, effective_dialect))
 }
 
 /// Enforce the per-dialect placeholder rule over already-tokenized SQL.
@@ -464,7 +475,20 @@ mod tests {
     #[test]
     fn sql_check_accepts_postgres_jsonb_question_operators() {
         let q = write_temp("SELECT payload ? 'active' FROM events;");
-        assert!(validate_sql_file(q.path(), Some("postgres")).is_ok());
+        let (stmts, tokens, dialect) =
+            validate_sql_file(q.path(), Some("postgres")).expect("jsonb ? parses");
+        assert!(
+            is_safe_explainable_dml(&stmts, &tokens, dialect),
+            "PostgreSQL JSONB `?` operator must remain eligible for live EXPLAIN"
+        );
+
+        let q_param = write_temp("SELECT payload ? 'active' FROM events WHERE id = $1;");
+        let (stmts_p, tokens_p, dialect_p) =
+            validate_sql_file(q_param.path(), Some("postgres")).expect("parameterized jsonb");
+        assert!(
+            !is_safe_explainable_dml(&stmts_p, &tokens_p, dialect_p),
+            "parameterized PostgreSQL query must be skipped from EXPLAIN"
+        );
 
         let q_pipe = write_temp("SELECT payload ?| array['a', 'b'] FROM events;");
         assert!(validate_sql_file(q_pipe.path(), Some("postgres")).is_ok());

@@ -120,6 +120,16 @@ fn resolve_manifest_subdir(
     macro_name: &str,
     span: proc_macro2::Span,
 ) -> Result<(PathBuf, PathBuf, String), syn::Error> {
+    // Why: on Unix, `\` is a literal filename character rather than a path separator.
+    // Rejecting backslashes on Unix prevents `Path::join` from validating a directory
+    // literally named `sql\archive` while `normalized_rel` emits `sql/archive`.
+    if cfg!(unix) && raw_rel.contains('\\') {
+        return Err(syn::Error::new(
+            span,
+            format!("{macro_name}: path '{raw_rel}' must use '/' separators on Unix"),
+        ));
+    }
+
     let rel_path = Path::new(raw_rel);
     if raw_rel.is_empty()
         || rel_path.is_absolute()
@@ -640,7 +650,7 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_migration_version;
+    use super::{extract_migration_version, resolve_manifest_subdir};
 
     #[test]
     fn extract_migration_version_requires_all_digit_segments() {
@@ -654,5 +664,31 @@ mod tests {
         assert_ne!(extract_migration_version("001a_add_users"), "001a");
         assert_eq!(extract_migration_version("001a_add_users"), "");
         assert_eq!(extract_migration_version("_add_users"), "");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_manifest_subdir_rejects_backslash_on_unix() {
+        let dir =
+            std::env::temp_dir().join(format!("rume_macro_backslash_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sql/archive")).unwrap();
+        std::fs::create_dir_all(dir.join(r"sql\archive")).unwrap();
+        std::fs::write(dir.join("sql/archive/q.sql"), "SELECT 1;").unwrap();
+        std::fs::write(dir.join(r"sql\archive/q.sql"), "SELECT 2;").unwrap();
+
+        let err = resolve_manifest_subdir(
+            dir.to_str().unwrap(),
+            r"sql\archive",
+            "sql_assets!",
+            proc_macro2::Span::call_site(),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("must use '/' separators on Unix"),
+            "unexpected error: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

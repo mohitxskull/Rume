@@ -76,15 +76,36 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
     while i < chars.len() {
         let ch = chars[i];
         if ch == '<' {
-            // Why: an HTML/XML tag starts with `<` followed by an ASCII letter,
-            // `/`, `!`, or `?`, and ends at the first unquoted `>` before any
-            // nested unquoted `<`. Scanning ahead with these rules prevents
-            // premature termination on `>` inside quoted attributes (e.g.
+            // Why: HTML/XML comments (`<!-- ... -->`) terminate at `-->` and do not
+            // obey attribute quoting rules (an apostrophe like `<!-- don't show -->`
+            // must not open a quote state and swallow the rest of the input).
+            if chars.get(i..i + 4) == Some(&['<', '!', '-', '-']) {
+                let mut j = i + 4;
+                let mut found_comment_end = false;
+                while j + 2 < chars.len() {
+                    if chars[j] == '-' && chars[j + 1] == '-' && chars[j + 2] == '>' {
+                        found_comment_end = true;
+                        j += 3;
+                        break;
+                    }
+                    j += 1;
+                }
+                if found_comment_end {
+                    pending_separator = true;
+                    i = j;
+                    continue;
+                }
+            }
+
+            // Why: an HTML/XML tag starts with `<` followed by a valid XML name-start
+            // character (Unicode alphabetic, `_`, `:`) or `/`, `!`, `?`, and ends at the
+            // first unquoted `>` before any nested unquoted `<`. Scanning ahead with these
+            // rules prevents premature termination on `>` inside quoted attributes (e.g.
             // `<a title="a > b">`) and preserves literal `<` in prose (e.g.
             // `"Price < 100 USD"` or `"<p>Price < 100 USD</p>"`).
             let looks_like_tag = chars
                 .get(i + 1)
-                .is_some_and(|c| c.is_ascii_alphabetic() || matches!(c, '/' | '!' | '?'));
+                .is_some_and(|c| c.is_alphabetic() || matches!(c, '_' | ':' | '/' | '!' | '?'));
             let mut j = i + 1;
             let mut quote: Option<char> = None;
             let mut found_close = false;
@@ -286,5 +307,9 @@ mod tests {
         assert_eq!(strip_html_tags("<a title='x > y'>Link</a>"), "Link");
         assert_eq!(strip_html_tags("Price < 100 USD"), "Price < 100 USD");
         assert_eq!(strip_html_tags("<p>Price < 100 USD</p>"), "Price < 100 USD");
+        assert_eq!(strip_html_tags("<_item>x</_item>"), "x");
+        assert_eq!(strip_html_tags("<é>x</é>"), "x");
+        assert_eq!(strip_html_tags("<!-- don't show -->Visible"), "Visible");
+        assert_eq!(excerpt("<!-- don't show -->Visible", 20), "Visible");
     }
 }

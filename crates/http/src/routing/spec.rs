@@ -367,4 +367,14 @@ mod tests {
         assert!(info.params.contains(&"org_id".to_string()));
         assert!(info.params.contains(&"id".to_string()));
     }
+
+    #[test]
+    fn into_route_info_normalizes_wildcard_capture_name() {
+        let info = RouteSpec::get("/files/{*rest}")
+            .where_param("rest", Matcher::Number)
+            .into_route_info();
+        assert_eq!(info.params, vec!["rest".to_string()]);
+        assert_eq!(info.matchers.len(), 1);
+        assert_eq!(info.matchers[0].0, "rest");
+    }
 }

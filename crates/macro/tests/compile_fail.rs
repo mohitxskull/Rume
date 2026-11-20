@@ -15,16 +15,32 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
+fn resolve_target_directory() -> PathBuf {
+    let output = std::process::Command::new(env!("CARGO"))
+        .args(["metadata", "--format-version", "1", "--no-deps"])
+        .output()
+        .expect("run cargo metadata");
+    assert!(
+        output.status.success(),
+        "cargo metadata failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse cargo metadata JSON");
+    PathBuf::from(
+        metadata["target_directory"]
+            .as_str()
+            .expect("cargo metadata target_directory"),
+    )
+}
+
 #[test]
 fn compile_fail_ui_tests() {
-    // Why: trybuild compiles UI test crates inside `target/tests/trybuild/rume-macros`
-    // with that directory as `CARGO_MANIFEST_DIR`. Copying `tests/fixtures` into
-    // trybuild's manifest dir keeps the proc-macro strictly confined to
-    // `CARGO_MANIFEST_DIR` without any unsafe fallback or escaping symlinks.
+    // Why: trybuild compiles UI test crates inside `<target_directory>/tests/trybuild/rume-macros`
+    // with that directory as `CARGO_MANIFEST_DIR`. Resolving `target_directory` via `cargo metadata`
+    // matches trybuild 1.0.125 even when `build.target-dir` is configured in `.cargo/config.toml`.
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let workspace_target = std::env::var_os("CARGO_TARGET_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| manifest_dir.join("../../target"));
+    let workspace_target = resolve_target_directory();
     let trybuild_fixtures = workspace_target.join("tests/trybuild/rume-macros/tests/fixtures");
     let _ = fs::remove_dir_all(&trybuild_fixtures);
     copy_dir_recursive(&manifest_dir.join("tests/fixtures"), &trybuild_fixtures);

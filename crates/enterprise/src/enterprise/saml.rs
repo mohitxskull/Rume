@@ -52,6 +52,7 @@ enum XmlNs {
 struct AssertionFields {
     subject: Option<String>,
     audiences: Vec<String>,
+    audience_restrictions: Vec<Vec<String>>,
     attributes: BTreeMap<String, Vec<String>>,
 }
 
@@ -242,14 +243,18 @@ pub struct SamlAssertion {
     pub issuer: String,
     /// Authenticated subject (e.g. NameID email).
     pub subject: String,
-    /// Audience restriction URIs (SAML 2.0 Core §2.5.1.4 OR-semantics).
+    /// Flattened audience URIs across all `<AudienceRestriction>` elements.
     pub audiences: Vec<String>,
+    /// Grouped `<AudienceRestriction>` elements (SAML 2.0 Core §2.5.1.4:
+    /// OR within each restriction group, AND across all restriction groups).
+    pub audience_restrictions: Vec<Vec<String>>,
     /// Destination endpoint URI.
     pub destination: Option<String>,
     /// Outer `<samlp:Response InResponseTo="...">` attribute, if present.
     pub response_in_response_to: Option<String>,
-    /// Parsed `<saml:SubjectConfirmationData>` attributes, if present.
-    pub subject_confirmation_data: Option<SamlSubjectConfirmationData>,
+    /// Parsed bearer `<saml:SubjectConfirmationData>` alternatives (SAML 2.0 Web Browser SSO
+    /// permits multiple bearer confirmations and succeeds if at least one satisfies all checks).
+    pub subject_confirmations: Vec<SamlSubjectConfirmationData>,
     /// NotBefore epoch seconds condition.
     pub not_before: Option<u64>,
     /// NotOnOrAfter epoch seconds condition.
@@ -367,7 +372,9 @@ impl SamlParser {
         let mut response_id: Option<String> = None;
         let mut destination: Option<String> = None;
         let mut response_in_response_to: Option<String> = None;
-        let mut subject_confirmation_data: Option<SamlSubjectConfirmationData> = None;
+        let mut subject_confirmations: Vec<SamlSubjectConfirmationData> = Vec::new();
+        let mut current_sc_is_bearer: Option<bool> = None;
+        let mut current_audience_group: Option<usize> = None;
         let mut seen_ids: BTreeSet<String> = BTreeSet::new();
 
         let mut assertion_issuer: Option<String> = None;
@@ -443,7 +450,17 @@ impl SamlParser {
                             SamlError::Malformed(format!("malformed XML attribute: {err}"))
                         })?;
                         let k = attr.key.local_name().as_ref().to_string();
-                        let v = attr.value.as_ref().to_string();
+                        // Why: `Attribute.value` retains raw XML character/entity escapes
+                        // (e.g. `&amp;` in URLs like `Recipient="https://sp/acs?a=1&amp;b=2"`).
+                        // `normalized_value()` decodes escapes and fails closed on invalid refs.
+                        let v = attr
+                            .normalized_value(quick_xml::XmlVersion::Implicit1_0)
+                            .map_err(|err| {
+                                SamlError::Malformed(format!(
+                                    "malformed XML attribute value: {err}"
+                                ))
+                            })?
+                            .into_owned();
                         if k == "ID" && !v.is_empty() && !seen_ids.insert(v.clone()) {
                             return Err(SamlError::SignatureWrappingDetected(format!(
                                 "duplicate ID attribute '{v}' detected; possible XML signature wrapping attack"
@@ -548,22 +565,45 @@ impl SamlParser {
                                     not_on_or_after = Some(parse_iso8601_strict(v)?);
                                 }
                             }
+                        } else if local_name == "AudienceRestriction"
+                            && matches!(parent, Some(("Conditions", XmlNs::Assertion)))
+                            && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
+                        {
+                            fields.audience_restrictions.push(Vec::new());
+                            current_audience_group = Some(fields.audience_restrictions.len() - 1);
+                        } else if local_name == "SubjectConfirmation"
+                            && matches!(parent, Some(("Subject", XmlNs::Assertion)))
+                            && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
+                        {
+                            let method = parsed_attrs
+                                .iter()
+                                .find(|(k, _)| k == "Method")
+                                .map(|(_, v)| v.as_str());
+                            // Why: Web Browser SSO validates bearer confirmations (`cm:bearer`);
+                            // treat omitted `Method` as bearer for minimal fixtures, and ignore
+                            // non-bearer methods (e.g. holder-of-key) for bearer confirmation checks.
+                            current_sc_is_bearer = Some(
+                                method.is_none()
+                                    || method == Some("urn:oasis:names:tc:SAML:2.0:cm:bearer"),
+                            );
                         } else if local_name == "SubjectConfirmationData"
                             && matches!(parent, Some(("SubjectConfirmation", XmlNs::Assertion)))
                             && matches!(grandparent, Some(("Subject", XmlNs::Assertion)))
                             && matches!(great_grandparent, Some(("Assertion", XmlNs::Assertion)))
                         {
-                            let mut scd = SamlSubjectConfirmationData::default();
-                            for (k, v) in &parsed_attrs {
-                                if k == "Recipient" {
-                                    scd.recipient = Some(v.clone());
-                                } else if k == "NotOnOrAfter" {
-                                    scd.not_on_or_after = Some(parse_iso8601_strict(v)?);
-                                } else if k == "InResponseTo" {
-                                    scd.in_response_to = Some(v.clone());
+                            if current_sc_is_bearer.unwrap_or(true) {
+                                let mut scd = SamlSubjectConfirmationData::default();
+                                for (k, v) in &parsed_attrs {
+                                    if k == "Recipient" {
+                                        scd.recipient = Some(v.clone());
+                                    } else if k == "NotOnOrAfter" {
+                                        scd.not_on_or_after = Some(parse_iso8601_strict(v)?);
+                                    } else if k == "InResponseTo" {
+                                        scd.in_response_to = Some(v.clone());
+                                    }
                                 }
+                                subject_confirmations.push(scd);
                             }
-                            subject_confirmation_data = Some(scd);
                         } else if local_name == "Attribute"
                             && matches!(parent, Some(("AttributeStatement", XmlNs::Assertion)))
                             && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
@@ -666,6 +706,14 @@ impl SamlParser {
                                     }
                                 }
                                 TextTarget::Audience => {
+                                    if let Some(group_idx) = current_audience_group
+                                        && let Some(group) =
+                                            fields.audience_restrictions.get_mut(group_idx)
+                                    {
+                                        group.push(text.clone());
+                                    } else {
+                                        fields.audience_restrictions.push(vec![text.clone()]);
+                                    }
                                     fields.audiences.push(text);
                                 }
                                 TextTarget::AttributeValue => {
@@ -680,6 +728,10 @@ impl SamlParser {
                     if local_name == "Assertion" && is_ns(&res, ASSERTION) {
                         assertion_end_offset = Some(reader.buffer_position() as usize);
                         in_assertion = false;
+                    } else if local_name == "AudienceRestriction" && is_ns(&res, ASSERTION) {
+                        current_audience_group = None;
+                    } else if local_name == "SubjectConfirmation" && is_ns(&res, ASSERTION) {
+                        current_sc_is_bearer = None;
                     } else if local_name == "Attribute"
                         && is_ns(&res, ASSERTION)
                         && element_stack.len() == current_attr_depth
@@ -834,9 +886,10 @@ impl SamlParser {
             issuer,
             subject,
             audiences: fields.audiences,
+            audience_restrictions: fields.audience_restrictions,
             destination,
             response_in_response_to,
-            subject_confirmation_data,
+            subject_confirmations,
             not_before,
             not_on_or_after,
             attributes: fields.attributes,
@@ -909,28 +962,25 @@ impl SamlParser {
             });
         }
 
-        if let Some(scd) = &assertion.subject_confirmation_data
-            && let Some(scd_exp) = scd.not_on_or_after
-            && current_epoch_sec >= scd_exp.saturating_add(skew)
-        {
-            return Err(SamlError::Expired {
-                not_on_or_after: scd_exp,
-                current: current_epoch_sec,
-            });
-        }
-
-        if let Some(expected) = config.expected_audience
-            && !assertion.audiences.iter().any(|a| a == expected)
-        {
-            let received = if assertion.audiences.is_empty() {
-                "<none>".to_string()
-            } else {
-                assertion.audiences.join(", ")
-            };
-            return Err(SamlError::AudienceMismatch {
-                expected: expected.to_string(),
-                received,
-            });
+        if let Some(expected) = config.expected_audience {
+            // Why: SAML 2.0 Core §2.5.1.4 requires OR within each `<AudienceRestriction>`
+            // and AND across multiple `<AudienceRestriction>` elements.
+            let matched = !assertion.audience_restrictions.is_empty()
+                && assertion
+                    .audience_restrictions
+                    .iter()
+                    .all(|group| group.iter().any(|a| a == expected));
+            if !matched {
+                let received = if assertion.audiences.is_empty() {
+                    "<none>".to_string()
+                } else {
+                    assertion.audiences.join(", ")
+                };
+                return Err(SamlError::AudienceMismatch {
+                    expected: expected.to_string(),
+                    received,
+                });
+            }
         }
 
         if let Some(expected) = config.expected_issuer
@@ -960,61 +1010,101 @@ impl SamlParser {
             }
         }
 
-        if let Some(expected) = config.expected_recipient {
-            let received = assertion
-                .subject_confirmation_data
-                .as_ref()
-                .and_then(|scd| scd.recipient.as_deref());
-            match received {
-                Some(r) if r == expected => {}
-                Some(r) => {
-                    return Err(SamlError::RecipientMismatch {
-                        expected: expected.to_string(),
-                        received: r.to_string(),
-                    });
-                }
-                None => {
-                    return Err(SamlError::RecipientMismatch {
-                        expected: expected.to_string(),
-                        received: "<none>".to_string(),
-                    });
-                }
-            }
+        if let Some(expected) = config.expected_in_response_to
+            && let Some(r) = assertion.response_in_response_to.as_deref()
+            && r != expected
+        {
+            return Err(SamlError::InResponseToMismatch {
+                expected: expected.to_string(),
+                received: r.to_string(),
+            });
         }
 
-        if let Some(expected) = config.expected_in_response_to {
-            let scd_irt = assertion
-                .subject_confirmation_data
-                .as_ref()
-                .and_then(|scd| scd.in_response_to.as_deref());
-            let resp_irt = assertion.response_in_response_to.as_deref();
-            if let Some(r) = resp_irt
-                && r != expected
-            {
-                return Err(SamlError::InResponseToMismatch {
+        // Why: Web Browser SSO permits multiple bearer `<SubjectConfirmation>` alternatives
+        // and succeeds if at least one confirmation satisfies `NotOnOrAfter`, `Recipient`,
+        // and `InResponseTo` together. When `expected_in_response_to` is configured, never
+        // fall back to the unsigned outer `Response/@InResponseTo` — require correlation
+        // from the signed bearer `<SubjectConfirmationData>`.
+        if !assertion.subject_confirmations.is_empty() {
+            let mut last_err: Option<SamlError> = None;
+            let mut any_valid = false;
+            for scd in &assertion.subject_confirmations {
+                if let Some(scd_exp) = scd.not_on_or_after
+                    && current_epoch_sec >= scd_exp.saturating_add(skew)
+                {
+                    last_err = Some(SamlError::Expired {
+                        not_on_or_after: scd_exp,
+                        current: current_epoch_sec,
+                    });
+                    continue;
+                }
+                if let Some(expected) = config.expected_recipient {
+                    match scd.recipient.as_deref() {
+                        Some(r) if r == expected => {}
+                        Some(r) => {
+                            last_err = Some(SamlError::RecipientMismatch {
+                                expected: expected.to_string(),
+                                received: r.to_string(),
+                            });
+                            continue;
+                        }
+                        None => {
+                            last_err = Some(SamlError::RecipientMismatch {
+                                expected: expected.to_string(),
+                                received: "<none>".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                if let Some(expected) = config.expected_in_response_to {
+                    match scd.in_response_to.as_deref() {
+                        Some(r) if r == expected => {}
+                        Some(r) => {
+                            last_err = Some(SamlError::InResponseToMismatch {
+                                expected: expected.to_string(),
+                                received: r.to_string(),
+                            });
+                            continue;
+                        }
+                        None => {
+                            last_err = Some(SamlError::InResponseToMismatch {
+                                expected: expected.to_string(),
+                                received: "<none>".to_string(),
+                            });
+                            continue;
+                        }
+                    }
+                }
+                any_valid = true;
+                break;
+            }
+            if !any_valid {
+                return Err(last_err.unwrap_or_else(|| {
+                    SamlError::Malformed("no valid bearer SubjectConfirmationData".into())
+                }));
+            }
+        } else {
+            if let Some(expected) = config.expected_recipient {
+                return Err(SamlError::RecipientMismatch {
                     expected: expected.to_string(),
-                    received: r.to_string(),
+                    received: "<none>".to_string(),
                 });
             }
-            match scd_irt.or(resp_irt) {
-                Some(r) if r == expected => {}
-                Some(r) => {
-                    return Err(SamlError::InResponseToMismatch {
-                        expected: expected.to_string(),
-                        received: r.to_string(),
-                    });
-                }
-                None => {
-                    return Err(SamlError::InResponseToMismatch {
-                        expected: expected.to_string(),
-                        received: "<none>".to_string(),
-                    });
-                }
+            if let Some(expected) = config.expected_in_response_to {
+                return Err(SamlError::InResponseToMismatch {
+                    expected: expected.to_string(),
+                    received: "<none>".to_string(),
+                });
             }
         }
 
         if let Some(cache) = config.replay_cache {
-            let fresh = cache.record_if_absent(&assertion.id, not_on_or_after)?;
+            // Why: retain the replay record through the full skew-adjusted validity
+            // window (`not_on_or_after + clock_skew_secs`) so pruning at `not_on_or_after`
+            // cannot allow a replay while validation would still accept the assertion.
+            let replay_expires_at = not_on_or_after.saturating_add(skew);
+            let fresh = cache.record_if_absent(&assertion.id, replay_expires_at)?;
             if !fresh {
                 return Err(SamlError::AssertionReplayed(assertion.id.clone()));
             }
@@ -1433,5 +1523,157 @@ mod saml_parser_and_iso8601_proptests {
         )
         .unwrap_err();
         assert!(matches!(bad_irt, SamlError::InResponseToMismatch { .. }));
+    }
+
+    #[test]
+    fn normalized_attribute_unescapes_recipient_entities() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_esc">
+            <saml:Assertion ID="_a_esc">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs?a=1&amp;b=2" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("valid escaped recipient");
+        let now = parse_iso8601_strict("2025-06-01T00:00:00Z").unwrap();
+        SamlParser::validate_with_config(
+            &assertion,
+            now,
+            &SamlValidationConfig {
+                expected_recipient: Some("https://sp.example/acs?a=1&b=2"),
+                ..Default::default()
+            },
+        )
+        .expect("normalized &amp; in Recipient must match unescaped URL");
+    }
+
+    #[test]
+    fn multiple_bearer_subject_confirmations_succeed_when_first_is_valid_and_second_is_invalid() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_sc">
+            <saml:Assertion ID="_a_sc">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="2030-01-01T00:00:00Z" InResponseTo="_req_ok"/>
+                    </saml:SubjectConfirmation>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://other-sp.example/acs" NotOnOrAfter="2020-01-01T00:00:00Z" InResponseTo="_req_other"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion");
+        assert_eq!(assertion.subject_confirmations.len(), 2);
+        let now = parse_iso8601_strict("2025-06-01T00:00:00Z").unwrap();
+        SamlParser::validate_with_config(
+            &assertion,
+            now,
+            &SamlValidationConfig {
+                expected_recipient: Some("https://sp.example/acs"),
+                expected_in_response_to: Some("_req_ok"),
+                ..Default::default()
+            },
+        )
+        .expect("valid first bearer SubjectConfirmation must not be overwritten by second");
+    }
+
+    #[test]
+    fn multiple_audience_restriction_groups_require_and_across_groups() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_aud">
+            <saml:Assertion ID="_a_aud">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z">
+                    <saml:AudienceRestriction>
+                        <saml:Audience>https://other-sp.example.com</saml:Audience>
+                    </saml:AudienceRestriction>
+                    <saml:AudienceRestriction>
+                        <saml:Audience>https://this-sp.example.com</saml:Audience>
+                    </saml:AudienceRestriction>
+                </saml:Conditions>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion");
+        let now = parse_iso8601_strict("2025-06-01T00:00:00Z").unwrap();
+        let err = SamlParser::validate_with_config(
+            &assertion,
+            now,
+            &SamlValidationConfig {
+                expected_audience: Some("https://this-sp.example.com"),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SamlError::AudienceMismatch { .. }),
+            "separate <AudienceRestriction> groups require AND semantics"
+        );
+    }
+
+    #[test]
+    fn expected_in_response_to_does_not_fall_back_to_unsigned_response_attribute() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_irt" InResponseTo="_req_forged">
+            <saml:Assertion ID="_a_irt">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion");
+        let now = parse_iso8601_strict("2025-06-01T00:00:00Z").unwrap();
+        let err = SamlParser::validate_with_config(
+            &assertion,
+            now,
+            &SamlValidationConfig {
+                expected_in_response_to: Some("_req_forged"),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, SamlError::InResponseToMismatch { .. }),
+            "must not accept unsigned Response/@InResponseTo when SubjectConfirmationData omits InResponseTo"
+        );
+    }
+
+    #[test]
+    fn replay_cache_retains_entry_through_clock_skew_window() {
+        let xml = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_skew">
+            <saml:Assertion ID="_a_skew">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("valid assertion");
+        assert_eq!(assertion.not_on_or_after, Some(1000));
+
+        let cache = InMemorySamlReplayCache::new();
+        let cfg = SamlValidationConfig {
+            clock_skew_secs: 30,
+            replay_cache: Some(&cache),
+            ..Default::default()
+        };
+        SamlParser::validate_with_config(&assertion, 999, &cfg).expect("initial validation ok");
+
+        // Prune at exact NotOnOrAfter (1000): the entry must survive through 1000 + 30 = 1030.
+        cache.prune_expired(1000);
+        let err = SamlParser::validate_with_config(&assertion, 1001, &cfg).unwrap_err();
+        assert!(
+            matches!(err, SamlError::AssertionReplayed(_)),
+            "replay within skew window must still be rejected after pruning at not_on_or_after"
+        );
     }
 }

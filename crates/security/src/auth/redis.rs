@@ -43,7 +43,10 @@ const REGENERATE_ID_SCRIPT: &str = r#"
     end
     if exp <= now then
         redis.call('DEL', old_key)
-        return redis.error_reply("EXPIRED")
+        -- Why: Redis 7.2/8.0 prepends `ERR ` to single-word `redis.error_reply("EXPIRED")`,
+        -- which makes `redis-rs` report `err.code() == Some("ERR")` instead of `Some("EXPIRED")`.
+        -- Including a message preserves the `EXPIRED` error code prefix.
+        return redis.error_reply("EXPIRED session expired")
     end
 
     decoded.id = new_id
@@ -243,7 +246,11 @@ mod tests {
         assert!(
             REGENERATE_ID_SCRIPT.contains("tonumber(decoded.expires_at)")
                 && REGENERATE_ID_SCRIPT.contains("MALFORMED"),
-            "Lua script must validate expires_at before comparing and return MALFORMED"
+            "Lua script must validate expires_at numerically and reject malformed payloads"
+        );
+        assert!(
+            REGENERATE_ID_SCRIPT.contains(r#"redis.error_reply("EXPIRED session expired")"#),
+            "Lua script must emit a two-token EXPIRED error reply so Redis 7.2/8.0 preserves the EXPIRED code"
         );
         assert!(
             !REGENERATE_ID_SCRIPT.contains("string.gsub")

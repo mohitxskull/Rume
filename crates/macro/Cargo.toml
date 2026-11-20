@@ -14,4 +14,5 @@ quote = "=1.0.47"
 syn = { version = "=3.0.10", features = ["full", "extra-traits"] }
 
 [dev-dependencies]
+serde_json.workspace = true
 trybuild = "=1.0.125"

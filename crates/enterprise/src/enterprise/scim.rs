@@ -35,7 +35,8 @@ pub struct ScimEmail {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ScimRole {
-    pub value: String,
+    #[serde(default)]
+    pub value: Option<String>,
     #[serde(default)]
     pub display: Option<String>,
     #[serde(rename = "type", default)]
@@ -47,7 +48,7 @@ pub struct ScimRole {
 impl From<&str> for ScimRole {
     fn from(value: &str) -> Self {
         Self {
-            value: value.to_string(),
+            value: Some(value.to_string()),
             ..Self::default()
         }
     }
@@ -56,7 +57,7 @@ impl From<&str> for ScimRole {
 impl From<String> for ScimRole {
     fn from(value: String) -> Self {
         Self {
-            value,
+            value: Some(value),
             ..Self::default()
         }
     }
@@ -89,7 +90,6 @@ impl ScimMeta {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ScimUser {
-    #[serde(default)]
     pub schemas: Vec<String>,
     #[serde(default)]
     pub id: String,
@@ -223,5 +223,37 @@ impl ScimErrorResponse {
             scim_type: scim_type.map(str::to_string),
             detail: detail.map(str::to_string),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scim_role_accepts_display_only_and_string_conversions() {
+        let role: ScimRole = serde_json::from_str(r#"{"display":"Administrator"}"#)
+            .expect("RFC 7643 display-only role must deserialize");
+        assert_eq!(role.value, None);
+        assert_eq!(role.display.as_deref(), Some("Administrator"));
+
+        let from_str: ScimRole = "admin".into();
+        assert_eq!(from_str.value.as_deref(), Some("admin"));
+    }
+
+    #[test]
+    fn scim_user_requires_schemas_field() {
+        let missing = serde_json::from_str::<ScimUser>(r#"{"id":"u1","userName":"alice"}"#);
+        assert!(
+            missing.is_err(),
+            "RFC 7643 requires `schemas` on ScimUser deserialization"
+        );
+
+        let valid = serde_json::from_str::<ScimUser>(
+            r#"{"schemas":["urn:ietf:params:scim:schemas:core:2.0:User"],"userName":"alice"}"#,
+        )
+        .expect("schema-bearing ScimUser must deserialize");
+        assert_eq!(valid.schemas, vec![SCIM_USER_SCHEMA.to_string()]);
+        assert_eq!(valid.user_name, "alice");
     }
 }

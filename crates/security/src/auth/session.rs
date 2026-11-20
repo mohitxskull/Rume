@@ -110,10 +110,50 @@ pub trait SessionStore: Send + Sync + 'static {
     fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>>;
 }
 
+#[derive(Debug, Default)]
+struct InMemorySessionMap {
+    sessions: std::collections::HashMap<String, Session>,
+    /// Ordered `(expires_at, session_id)` index for O(k log N) expiry pruning.
+    ///
+    /// Why: scanning all live sessions on every `save`/`regenerate_id` is O(N)
+    /// under the exclusive write lock; indexing by expiration lets mutations
+    /// evict only already-expired entries in O(k log N) (O(1) when nothing is expired).
+    expiry_index: std::collections::BTreeSet<(u64, String)>,
+}
+
+impl InMemorySessionMap {
+    fn insert(&mut self, session: Session) {
+        if let Some(prev) = self.sessions.insert(session.id.clone(), session.clone()) {
+            self.expiry_index.remove(&(prev.expires_at, prev.id));
+        }
+        self.expiry_index.insert((session.expires_at, session.id));
+    }
+
+    fn remove(&mut self, id: &str) -> Option<Session> {
+        let removed = self.sessions.remove(id)?;
+        self.expiry_index
+            .remove(&(removed.expires_at, removed.id.clone()));
+        Some(removed)
+    }
+
+    fn prune_expired(&mut self, now: u64) {
+        while let Some((exp, _)) = self.expiry_index.first() {
+            if *exp > now {
+                break;
+            }
+            if let Some((_, id)) = self.expiry_index.pop_first()
+                && self.sessions.get(&id).is_some_and(|s| s.expires_at <= now)
+            {
+                self.sessions.remove(&id);
+            }
+        }
+    }
+}
+
 /// Thread-safe in-memory session store suitable for testing and single-instance deployments.
 #[derive(Debug, Clone, Default)]
 pub struct InMemorySessionStore {
-    sessions: std::sync::Arc<tokio::sync::RwLock<std::collections::HashMap<String, Session>>>,
+    inner: std::sync::Arc<tokio::sync::RwLock<InMemorySessionMap>>,
 }
 
 impl InMemorySessionStore {
@@ -128,8 +168,8 @@ impl SessionStore for InMemorySessionStore {
         let id = id.to_string();
         Box::pin(async move {
             let expired = {
-                let map = self.sessions.read().await;
-                if let Some(session) = map.get(&id) {
+                let state = self.inner.read().await;
+                if let Some(session) = state.sessions.get(&id) {
                     if session.is_expired() {
                         true
                     } else {
@@ -140,9 +180,9 @@ impl SessionStore for InMemorySessionStore {
                 }
             };
             if expired {
-                let mut map = self.sessions.write().await;
-                if map.get(&id).is_some_and(Session::is_expired) {
-                    map.remove(&id);
+                let mut state = self.inner.write().await;
+                if state.sessions.get(&id).is_some_and(Session::is_expired) {
+                    state.remove(&id);
                 }
             }
             Ok(None)
@@ -151,9 +191,10 @@ impl SessionStore for InMemorySessionStore {
 
     fn save(&self, session: Session) -> BoxFuture<'_, Result<(), AuthError>> {
         Box::pin(async move {
-            let mut map = self.sessions.write().await;
-            map.retain(|_, s| !s.is_expired());
-            map.insert(session.id.clone(), session);
+            let now = current_timestamp();
+            let mut state = self.inner.write().await;
+            state.prune_expired(now);
+            state.insert(session);
             Ok(())
         })
     }
@@ -161,8 +202,8 @@ impl SessionStore for InMemorySessionStore {
     fn destroy(&self, id: &str) -> BoxFuture<'_, Result<(), AuthError>> {
         let id = id.to_string();
         Box::pin(async move {
-            let mut map = self.sessions.write().await;
-            map.remove(&id);
+            let mut state = self.inner.write().await;
+            state.remove(&id);
             Ok(())
         })
     }
@@ -173,21 +214,22 @@ impl SessionStore for InMemorySessionStore {
     fn regenerate_id<'a>(&'a self, old_id: &'a str) -> BoxFuture<'a, Result<Session, AuthError>> {
         let old_id = old_id.to_string();
         Box::pin(async move {
-            let mut map = self.sessions.write().await;
-            let Some(existing) = map.get(&old_id).cloned() else {
+            let now = current_timestamp();
+            let mut state = self.inner.write().await;
+            let Some(existing) = state.sessions.get(&old_id).cloned() else {
                 return Err(AuthError::InvalidCredentials(
                     "cannot regenerate nonexistent session".into(),
                 ));
             };
 
             if existing.is_expired() {
-                map.remove(&old_id);
+                state.remove(&old_id);
                 return Err(AuthError::InvalidCredentials(
                     "cannot regenerate expired session".into(),
                 ));
             }
 
-            map.retain(|_, s| !s.is_expired());
+            state.prune_expired(now);
 
             let new_session = Session {
                 id: uuid::Uuid::new_v4().to_string(),
@@ -198,8 +240,8 @@ impl SessionStore for InMemorySessionStore {
                 data: existing.data,
                 expires_at: existing.expires_at,
             };
-            map.insert(new_session.id.clone(), new_session.clone());
-            map.remove(&old_id);
+            state.insert(new_session.clone());
+            state.remove(&old_id);
             Ok(new_session)
         })
     }
@@ -216,7 +258,9 @@ mod tests {
         expired.expires_at = 0;
         store.save(expired).await.unwrap();
         assert!(store.load("s-old").await.unwrap().is_none());
-        assert_eq!(store.sessions.read().await.len(), 0);
+        let state = store.inner.read().await;
+        assert_eq!(state.sessions.len(), 0);
+        assert_eq!(state.expiry_index.len(), 0);
     }
 
     #[test]

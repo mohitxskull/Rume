@@ -663,28 +663,35 @@ mod tests {
                 }),
         );
 
-        // Start leader L1 and wait until it is executing.
-        let c1 = Arc::clone(&checks);
-        let l1 = tokio::spawn(async move { c1.run().await });
+        // Deterministically drive L1, F1, and F2 with explicit single-step polls so both
+        // followers are guaranteed to attach to L1 before L1 is cancelled, and F2 is
+        // guaranteed to process L1's closure while L2 is still running.
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+
+        let mut l1 = Box::pin(checks.run());
+        assert!(l1.as_mut().poll(&mut cx).is_pending());
         first_started.notified().await;
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
 
-        // Start two followers F1 and F2 that attach to L1's watch channel.
-        let c2 = Arc::clone(&checks);
-        let f1 = tokio::spawn(async move { c2.run().await });
-        let c3 = Arc::clone(&checks);
-        let f2 = tokio::spawn(async move { c3.run().await });
-        tokio::task::yield_now().await;
+        let mut f1 = Box::pin(checks.run());
+        assert!(f1.as_mut().poll(&mut cx).is_pending());
+        let mut f2 = Box::pin(checks.run());
+        assert!(f2.as_mut().poll(&mut cx).is_pending());
 
-        // Cancel L1; one follower becomes L2 and the other must follow L2 rather
-        // than wiping L2's slot and spawning a 3rd execution.
-        l1.abort();
-        let _ = l1.await;
+        // Cancel L1; F1 becomes L2 and stays blocked on `release_second`.
+        drop(l1);
+        assert!(f1.as_mut().poll(&mut cx).is_pending());
         second_started.notified().await;
-        tokio::task::yield_now().await;
-        release_second.notify_waiters();
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
 
-        let _ = f1.await.unwrap();
-        let _ = f2.await.unwrap();
+        // Now poll stale follower F2 while L2 is still active; with the `same_channel`
+        // guard, F2 must NOT wipe L2's slot and must attach to L2 instead of starting L3.
+        assert!(f2.as_mut().poll(&mut cx).is_pending());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+
+        release_second.notify_waiters();
+        let _ = f1.await;
+        let _ = f2.await;
         assert_eq!(runs.load(Ordering::SeqCst), 2);
     }
 

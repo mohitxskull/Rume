@@ -38,19 +38,55 @@ pub fn workspace_root() -> Result<PathBuf, Box<dyn std::error::Error>> {
     Err("Failed to discover Rume workspace root".into())
 }
 
+fn is_executable_file(path: &std::path::Path) -> bool {
+    let Ok(meta) = fs::metadata(path) else {
+        return false;
+    };
+    if !meta.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 /// Check whether an external command-line tool is available in `PATH`.
 ///
 /// Why: probe `PATH` entries directly via `std::env::split_paths` instead of
-/// shelling out to POSIX-only `which`, so `xtask` remains portable and avoids
-/// spawning an extra subprocess.
+/// shelling out to POSIX-only `which`, and verify executable permissions on Unix
+/// (or `PATHEXT` extensions on Windows) so a non-executable regular file does not
+/// falsely report a tool as installed.
 #[must_use]
 pub fn is_tool_available(name: &str) -> bool {
     let Some(path_var) = env::var_os("PATH") else {
         return false;
     };
-    env::split_paths(&path_var).any(|dir| {
-        let candidate = dir.join(name);
-        candidate.is_file() || (cfg!(windows) && dir.join(format!("{name}.exe")).is_file())
+    is_tool_available_in_path(name, &path_var)
+}
+
+fn is_tool_available_in_path(name: &str, path_var: &std::ffi::OsStr) -> bool {
+    env::split_paths(path_var).any(|dir| {
+        if is_executable_file(&dir.join(name)) {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+            pathext
+                .split(';')
+                .filter(|ext| !ext.is_empty())
+                .any(|ext| is_executable_file(&dir.join(format!("{name}{ext}"))))
+        }
+        #[cfg(not(windows))]
+        {
+            false
+        }
     })
 }
 
@@ -70,4 +106,37 @@ pub fn run(program: &str, args: &[&str]) -> Result<(), Box<dyn std::error::Error
         .into());
     }
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::is_tool_available_in_path;
+    use std::ffi::OsStr;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn is_tool_available_requires_execute_bit_on_unix() {
+        let dir = std::env::temp_dir().join(format!("rume_xtask_path_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let non_exec = dir.join("fake-nonexec-tool");
+        fs::write(&non_exec, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&non_exec, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(!is_tool_available_in_path(
+            "fake-nonexec-tool",
+            OsStr::new(&dir)
+        ));
+
+        let exec = dir.join("fake-exec-tool");
+        fs::write(&exec, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&exec, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(is_tool_available_in_path(
+            "fake-exec-tool",
+            OsStr::new(&dir)
+        ));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

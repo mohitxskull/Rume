@@ -180,13 +180,18 @@ impl crate::openapi::OpenApiRouteSource for RouteRegistry {
     }
 }
 
-/// Extract path parameter names from a route template string (e.g. `/{id}` or `/:id`).
+/// Extract path parameter names from a route template string (e.g. `/{id}`, `/{*rest}`, or `/:id`).
 pub fn extract_path_params(path: &str) -> Vec<String> {
     let mut params = Vec::new();
     for segment in path.split('/') {
         let segment = segment.trim();
         if segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2 {
-            params.push(segment[1..segment.len() - 1].to_string());
+            let inner = &segment[1..segment.len() - 1];
+            // Why: Axum 0.8 wildcard captures (`/{*rest}`) expose the capture name without `*`.
+            let name = inner.strip_prefix('*').unwrap_or(inner);
+            if !name.is_empty() {
+                params.push(name.to_string());
+            }
         } else if let Some(stripped) = segment.strip_prefix(':').filter(|s| !s.is_empty()) {
             params.push(stripped.to_string());
         }

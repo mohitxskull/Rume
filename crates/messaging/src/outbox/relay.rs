@@ -549,7 +549,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     /// checking pending count or dispatching messages.
     pub async fn try_drain(&self, timeout: Duration) -> Result<bool, OutboxError> {
         self.is_stopping.store(true, Ordering::SeqCst);
-        let _ = self.shutdown_tx.send(true);
+        // Why: `send_replace(true)` retains the shutdown flag even when no background loop
+        // has subscribed yet, whereas `send(true)` drops the value when `receiver_count() == 0`.
+        self.shutdown_tx.send_replace(true);
         let start = std::time::Instant::now();
         let deadline = start + timeout;
 
@@ -740,5 +742,81 @@ impl<R: OutboxRepository> HealthCheck for RelayHealthCheck<R> {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::outbox::BoxFuture;
+
+    #[derive(Debug)]
+    struct NoopOutboxRepo;
+
+    impl OutboxRepository for NoopOutboxRepo {
+        fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn fetch_pending(
+            &self,
+            _limit: usize,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn claim_pending_with_lease(
+            &self,
+            _limit: usize,
+            _lease_duration_secs: u64,
+        ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+            Box::pin(async { Ok(vec![]) })
+        }
+
+        fn mark_published(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn mark_failed_with_max_retries(
+            &self,
+            _id: &str,
+            _lease_token: &str,
+            _error: String,
+            _max_retries: u32,
+        ) -> BoxFuture<'_, Result<(), OutboxError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    #[tokio::test]
+    async fn try_drain_before_start_retains_shutdown_signal() {
+        let repo = Arc::new(NoopOutboxRepo);
+        let relay = OutboxRelay::new(repo, |_msg| async { Ok(()) });
+
+        assert!(relay.try_drain(Duration::from_secs(1)).await.unwrap());
+
+        let handle = relay.start_with_config();
+        tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("relay loop started after try_drain must exit immediately")
+            .expect("relay task must not panic");
+
+        let sweeper = relay.start_sweeper(OutboxSweeperConfig::default());
+        tokio::time::timeout(Duration::from_secs(2), sweeper)
+            .await
+            .expect("sweeper started after try_drain must exit immediately")
+            .expect("sweeper task must not panic");
     }
 }

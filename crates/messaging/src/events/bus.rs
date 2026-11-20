@@ -325,8 +325,8 @@ mod tests {
     #[tokio::test]
     async fn sync_panicking_listener_is_caught_in_publish_sync_and_publish_async() {
         let bus = EventBus::new();
-        let second_called = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let second_called_clone = Arc::clone(&second_called);
+        let second_done = Arc::new(tokio::sync::Notify::new());
+        let second_done_clone = Arc::clone(&second_done);
 
         bus.subscribe_fn::<TestSyncEvent, _, _>(
             |_evt| -> std::future::Ready<Result<(), EventError>> {
@@ -334,8 +334,11 @@ mod tests {
             },
         );
         bus.subscribe_fn::<TestSyncEvent, _, _>(move |_evt| {
-            second_called_clone.store(true, std::sync::atomic::Ordering::SeqCst);
-            async { Ok(()) }
+            let notify = Arc::clone(&second_done_clone);
+            async move {
+                notify.notify_one();
+                Ok(())
+            }
         });
 
         let err = bus
@@ -346,16 +349,10 @@ mod tests {
 
         let notified = bus.publish_async(TestSyncEvent { id: "a1".into() });
         assert_eq!(notified, 2);
-        // Yield so spawned async task runs the second healthy listener despite the first panicking synchronously.
-        for _ in 0..10 {
-            if second_called.load(std::sync::atomic::Ordering::SeqCst) {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(
-            second_called.load(std::sync::atomic::Ordering::SeqCst),
-            "second healthy listener must still run in publish_async after first listener panics synchronously"
-        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), second_done.notified())
+            .await
+            .expect(
+                "second healthy listener must still run in publish_async after first listener panics synchronously",
+            );
     }
 }

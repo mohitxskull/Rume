@@ -74,11 +74,23 @@ impl Drop for ObservabilityGuard {
             return;
         }
         // Why: `Sdk*Provider::shutdown()` performs blocking flushes (and HTTP
-        // OTLP exports when `feature = "otel"` is enabled). Calling it directly
-        // on a Tokio worker thread can deadlock a `current_thread` runtime;
-        // offload to a dedicated OS thread when inside a Tokio runtime, matching
-        // `MetricsRegistry::Inner::drop`.
-        if tokio::runtime::Handle::try_current().is_ok() {
+        // OTLP exports when `feature = "otel"` is enabled).
+        // - Outside Tokio: run synchronously.
+        // - Inside a multi-threaded Tokio runtime: use `block_in_place` so
+        //   shutdown completes before process exit without starving worker threads.
+        // - Inside a `current_thread` Tokio runtime: `block_in_place` panics and
+        //   blocking directly can deadlock, so offload to an OS thread; async
+        //   callers on `current_thread` runtimes should await `shutdown_async()`
+        //   before exiting to guarantee all pending telemetry flushes.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+                tokio::task::block_in_place(|| {
+                    let _ = self.tracer_provider.shutdown();
+                    let _ = self.meter_provider.shutdown();
+                    let _ = self.logger_provider.shutdown();
+                });
+                return;
+            }
             let tracer = self.tracer_provider.clone();
             let meter = self.meter_provider.clone();
             let logger = self.logger_provider.clone();

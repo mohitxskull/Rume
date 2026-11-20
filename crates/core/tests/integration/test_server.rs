@@ -166,15 +166,19 @@ async fn test_client_disconnect_during_response_streaming() {
                 let notify = Arc::clone(&stream_dropped_clone);
                 async move {
                     let guard = StreamDropGuard(notify);
-                    let stream = stream::unfold((0, guard), |(step, guard)| async move {
-                        if step >= 20 {
-                            return None;
+                    let stream = stream::unfold((false, guard), |(sent_first, guard)| async move {
+                        if !sent_first {
+                            return Some((
+                                Ok::<_, std::io::Error>("data-0\n".to_string()),
+                                (true, guard),
+                            ));
                         }
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        Some((
-                            Ok::<_, std::io::Error>(format!("data-{step}\n")),
-                            (step + 1, guard),
-                        ))
+                        // Why: stay pending forever while holding `guard` so normal stream
+                        // exhaustion can never drop `guard`; only client disconnect / server
+                        // cancellation can trigger `stream_dropped`.
+                        std::future::pending::<()>().await;
+                        drop(guard);
+                        None
                     });
                     Body::from_stream(stream).into_response()
                 }
@@ -192,8 +196,12 @@ async fn test_client_disconnect_during_response_streaming() {
             .expect("write request");
 
         let mut buf = [0u8; 256];
-        let n = raw.read(&mut buf).await.expect("read initial chunk");
-        assert!(n > 0);
+        let mut received = String::new();
+        while !received.contains("data-0") {
+            let n = raw.read(&mut buf).await.expect("read initial chunk");
+            assert!(n > 0, "stream closed before delivering initial body chunk");
+            received.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
         // Abruptly drop socket to simulate client disconnect
         drop(raw);
     }

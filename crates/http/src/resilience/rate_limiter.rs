@@ -503,9 +503,14 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn rate_limiter_enforces_limit_when_uptime_is_less_than_window() {
+        let window = Duration::MAX;
+        assert!(
+            Instant::now().checked_sub(window).is_none(),
+            "precondition: Instant::now() - window must underflow to exercise the regression"
+        );
         let limiter = RateLimiter::new(RateLimitConfig {
             max_requests: 2,
-            window: Duration::from_secs(3600),
+            window,
             ..RateLimitConfig::default()
         });
         assert!(limiter.check("client-1").is_ok());

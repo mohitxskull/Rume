@@ -331,14 +331,25 @@ impl<B: DatabaseBackend> DatabasePool<B> {
     pub fn close(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
         self.semaphore.close();
-        // Why: guard with `Handle::try_current()` so calling `close()` outside
-        // a Tokio runtime (e.g. from synchronous teardown or non-async tests)
-        // never panics.
+        let backend = Arc::clone(&self.backend);
+        // Why: when inside a Tokio runtime, schedule async teardown on that handle;
+        // when called outside any Tokio runtime (e.g. synchronous teardown), drive
+        // `backend.close()` on a short-lived helper thread with a current-thread
+        // runtime so underlying driver connections are still closed without panicking.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let backend = Arc::clone(&self.backend);
             handle.spawn(async move {
                 backend.close().await;
             });
+        } else {
+            let _ = std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(backend.close());
+                }
+            })
+            .join();
         }
     }
 

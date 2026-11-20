@@ -296,7 +296,11 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         let _tenant_guard = self.tenant_lock(tenant_id).read().await;
         let _key_lock = KeyLockGuard::acquire(&self.key_locks, &full_key).await;
         let deleted = self.cache.delete(&full_key).await?;
-        if deleted && let Some(ref quota) = self.quota_store {
+        if let Some(ref quota) = self.quota_store {
+            // Why: release the quota reservation unconditionally (even when `deleted == false`),
+            // because `remove_key` is a no-op for absent keys and a retry after a prior
+            // `quota.remove_key` failure would otherwise observe `deleted == false` and leave
+            // the reservation stranded until TTL expiry.
             quota.remove_key(tenant_id, key).await?;
         }
         Ok(deleted)
@@ -313,10 +317,16 @@ impl<B: CacheBackend> TenantScopedCache<B> {
         let count = deleted_keys.len();
         if let Some(ref quota) = self.quota_store {
             let prefix = format!("tenant:{}:{}:", tenant_id.len(), tenant_id);
+            let mut first_err = None;
             for k in &deleted_keys {
-                if let Some(raw_key) = k.strip_prefix(&prefix) {
-                    quota.remove_key(tenant_id, raw_key).await?;
+                if let Some(raw_key) = k.strip_prefix(&prefix)
+                    && let Err(err) = quota.remove_key(tenant_id, raw_key).await
+                {
+                    first_err.get_or_insert(err);
                 }
+            }
+            if let Some(err) = first_err {
+                return Err(err);
             }
         }
         Ok(count)

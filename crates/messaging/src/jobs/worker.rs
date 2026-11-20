@@ -925,6 +925,7 @@ impl<Q: JobQueue> JobWorker<Q> {
         let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
         let lease_lost = Arc::new(AtomicBool::new(false));
         let extend_idempotency = Arc::new(AtomicBool::new(true));
+        let finalizing = Arc::new(AtomicBool::new(false));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let hb_token = token.clone();
         let hb_queue = Arc::clone(&queue);
@@ -932,6 +933,7 @@ impl<Q: JobQueue> JobWorker<Q> {
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_lease_lost = Arc::clone(&lease_lost);
         let hb_extend_idempotency = Arc::clone(&extend_idempotency);
+        let hb_finalizing = Arc::clone(&finalizing);
         let hb_stopping = Arc::clone(&stopping);
         let hb_lost_leases = Arc::clone(&lost_leases);
         let hb_idemp_store = idempotency_store.clone();
@@ -951,6 +953,13 @@ impl<Q: JobQueue> JobWorker<Q> {
                     }
                     _ = interval.tick() => {
                         if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension).await {
+                            // Why: keep lease renewal active while `ack`/`nack`/`dead_letter` is
+                            // in flight so a slow DB commit cannot expire the lease; once
+                            // `hb_finalizing` is set, an expected post-commit renewal failure
+                            // exits quietly instead of falsely incrementing `lost_leases`.
+                            if hb_finalizing.load(Ordering::SeqCst) {
+                                break;
+                            }
                             tracing::error!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat; lost lease");
                             hb_cancelled.store(true, Ordering::SeqCst);
                             hb_lease_lost.store(true, Ordering::SeqCst);
@@ -968,6 +977,9 @@ impl<Q: JobQueue> JobWorker<Q> {
                             && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
                             && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
+                            if hb_finalizing.load(Ordering::SeqCst) {
+                                break;
+                            }
                             tracing::error!(
                                 job_id = %hb_jid,
                                 key = %k,
@@ -989,7 +1001,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                 self.0.abort();
             }
         }
-        let _hb_abort_guard = HeartbeatAbortGuard(heartbeat_handle.abort_handle());
+        let hb_abort_guard = HeartbeatAbortGuard(heartbeat_handle.abort_handle());
 
         let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             registry.dispatch_with_cancellation(&job, Some(Arc::clone(&job_cancelled)))
@@ -1001,22 +1013,16 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(_) => Err(JobError::Fatal("handler panicked".into())),
         };
 
-        // Why: stop the lease-renewal heartbeat BEFORE `queue.ack`/`nack`/`dead_letter`
-        // so a concurrent `renew_lease` tick cannot race with finalization and falsely
-        // increment `lost_leases`. On error paths, keep the queue heartbeat alive during
-        // `release_idempotency_token` if needed, then stop it immediately before finalizing.
-        let mut cancel_tx = Some(cancel_tx);
-        let stop_heartbeat = |tx: &mut Option<tokio::sync::oneshot::Sender<()>>| {
-            if let Some(tx) = tx.take() {
-                let _ = tx.send(());
-            }
-            heartbeat_handle.abort();
-        };
+        // Why: keep lease renewal alive until `ack`/`nack`/`dead_letter` commits so a
+        // stalled DB connection cannot let the lease expire before finalization. Setting
+        // `finalizing` suppresses expected post-commit renewal failures from incrementing
+        // `lost_leases`, and awaiting `heartbeat_handle` at the end guarantees the task
+        // has fully exited before returning.
+        finalizing.store(true, Ordering::SeqCst);
 
         match dispatch_result {
             Ok(()) => {
                 if lease_lost.load(Ordering::SeqCst) {
-                    stop_heartbeat(&mut cancel_tx);
                     tracing::warn!(
                         job_id = %job_id,
                         "Job execution completed after lease was lost; routing to dead letter queue"
@@ -1047,7 +1053,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                         .await;
                     }
                 } else {
-                    stop_heartbeat(&mut cancel_tx);
                     if let Err(err) = queue.ack(&job_id, &token).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -1082,7 +1087,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                     "on fatal failure",
                 )
                 .await;
-                stop_heartbeat(&mut cancel_tx);
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
                         job_id = %job_id,
@@ -1111,7 +1115,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "before retryable nack; proceeding with nack",
                     )
                     .await;
-                    stop_heartbeat(&mut cancel_tx);
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -1131,7 +1134,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "on dead letter",
                     )
                     .await;
-                    stop_heartbeat(&mut cancel_tx);
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
                         tracing::error!(
@@ -1146,13 +1148,15 @@ impl<Q: JobQueue> JobWorker<Q> {
             }
         }
 
-        stop_heartbeat(&mut cancel_tx);
+        let _ = cancel_tx.send(());
+        drop(hb_abort_guard);
+        let _ = heartbeat_handle.await;
     }
 
     /// Gracefully requests worker shutdown and waits for in-flight jobs and background polling tasks to complete within `timeout`.
     pub async fn drain(&self, timeout: Duration) -> bool {
         self.is_stopping.store(true, Ordering::SeqCst);
-        let _ = self.shutdown_tx.send(true);
+        self.shutdown_tx.send_replace(true);
         let start = std::time::Instant::now();
 
         // 1. Wait for in-flight jobs to finish
