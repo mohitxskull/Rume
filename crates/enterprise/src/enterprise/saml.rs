@@ -463,16 +463,22 @@ impl SamlParser {
                         .iter()
                         .any(|(n, el_ns)| n == "Signature" && *el_ns == XmlNs::Dsig);
 
+                    const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
+
                     // Why: parse every attribute strictly (failing closed on malformed
-                    // attributes instead of `.flatten()`) and reject duplicate `ID`
+                    // attributes instead of `.flatten()`), reject duplicate `ID`
                     // attributes anywhere in the document to defeat XSW ID-collision
-                    // attacks where a second element shares the signed element's ID.
+                    // attacks, and resolve `xsi:type` by both attribute namespace (`XSI`)
+                    // and QName prefix against the element's in-scope namespace map.
                     let mut parsed_attrs: Vec<(String, String)> = Vec::new();
+                    let mut xsi_type_raw: Option<String> = None;
+                    let mut xsi_type_is_saml_audience_restriction = false;
                     for attr_res in e.attributes() {
                         let attr = attr_res.map_err(|err| {
                             SamlError::Malformed(format!("malformed XML attribute: {err}"))
                         })?;
-                        let k = attr.key.local_name().as_ref().to_string();
+                        let (attr_ns, attr_local) = reader.resolver().resolve_attribute(attr.key);
+                        let k = attr_local.as_ref().to_string();
                         // Why: `Attribute.value` retains raw XML character/entity escapes
                         // (e.g. `&amp;` in URLs like `Recipient="https://sp/acs?a=1&amp;b=2"`).
                         // `normalized_value()` decodes escapes and fails closed on invalid refs.
@@ -484,6 +490,14 @@ impl SamlParser {
                                 ))
                             })?
                             .into_owned();
+                        if is_ns(&attr_ns, XSI_NAMESPACE) && k == "type" {
+                            let (type_ns, type_local) = reader
+                                .resolver()
+                                .resolve_element(quick_xml::name::QName(&v));
+                            xsi_type_is_saml_audience_restriction = is_ns(&type_ns, ASSERTION)
+                                && type_local.as_ref() == "AudienceRestrictionType";
+                            xsi_type_raw = Some(v.clone());
+                        }
                         if k == "ID" && !v.is_empty() && !seen_ids.insert(v.clone()) {
                             return Err(SamlError::SignatureWrappingDetected(format!(
                                 "duplicate ID attribute '{v}' detected; possible XML signature wrapping attack"
@@ -600,22 +614,16 @@ impl SamlParser {
                             && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
                         {
                             // Why: SAML Core §2.5.1 allows `<Condition xsi:type="...:AudienceRestrictionType">`
-                            // as an equivalent audience restriction; ignoring it would bypass audience
-                            // enforcement, and ignoring any unrecognized `<Condition>` violates SAML's
-                            // fail-closed condition semantics.
-                            let xsi_type = parsed_attrs
-                                .iter()
-                                .find(|(k, _)| k == "type")
-                                .map(|(_, v)| v.as_str());
-                            let local_type =
-                                xsi_type.map(|t| t.rsplit_once(':').map_or(t, |(_, local)| local));
-                            if local_type == Some("AudienceRestrictionType") {
+                            // as an equivalent audience restriction ONLY when `xsi:type` is in the
+                            // XMLSchema-instance namespace AND its QName resolves to `AudienceRestrictionType`
+                            // in the SAML 2.0 assertion namespace; any other condition must fail closed.
+                            if xsi_type_is_saml_audience_restriction {
                                 fields.audience_restrictions.push(Vec::new());
                                 current_audience_group =
                                     Some(fields.audience_restrictions.len() - 1);
                             } else {
                                 return Err(SamlError::Malformed(format!(
-                                    "unsupported SAML Condition element (xsi:type={xsi_type:?})"
+                                    "unsupported SAML Condition element (xsi:type={xsi_type_raw:?})"
                                 )));
                             }
                         } else if local_name == "SubjectConfirmation"
@@ -1812,6 +1820,22 @@ mod saml_parser_and_iso8601_proptests {
         </samlp:Response>"#;
         let err_unknown = SamlParser::parse_unverified(xml_unknown).unwrap_err();
         assert!(matches!(err_unknown, SamlError::Malformed(_)));
+
+        // A foreign namespace prefix bound to `AudienceRestrictionType` must NOT be
+        // treated as SAML's built-in AudienceRestrictionType; it must fail closed.
+        let xml_foreign_ns = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" ID="_r_fns">
+            <saml:Assertion ID="_a_fns">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z">
+                    <saml:Condition xmlns:ext="urn:example:ext" xsi:type="ext:AudienceRestrictionType">
+                        <saml:Audience>https://this-sp.example.com</saml:Audience>
+                    </saml:Condition>
+                </saml:Conditions>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let err_foreign = SamlParser::parse_unverified(xml_foreign_ns).unwrap_err();
+        assert!(matches!(err_foreign, SamlError::Malformed(_)));
     }
 
     #[test]

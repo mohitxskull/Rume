@@ -635,12 +635,15 @@ async fn test_redis_session_store_save_load_ttl_and_destroy() {
         .expect("destroy session");
     assert!(server_1.load("session_xyz").await.unwrap().is_none());
 
-    // 4. Session TTL expiration: 1s TTL
-    let short_session = Session::new("session_temp", "user_guest", 1);
+    // 4. Session TTL expiration: 2s TTL
+    // Why: `Session::new` truncates `expires_at` to integer epoch seconds, so a 1s TTL
+    // can expire immediately if `save` and `load` straddle a wall-clock second boundary.
+    // A 2s TTL guarantees >1s of headroom for the initial load while staying fast.
+    let short_session = Session::new("session_temp", "user_guest", 2);
     server_1.save(short_session).await.expect("save temp");
     assert!(server_2.load("session_temp").await.unwrap().is_some());
 
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    tokio::time::sleep(Duration::from_millis(2100)).await;
     assert!(server_2.load("session_temp").await.unwrap().is_none());
 
     // 5. Session ID regeneration (rotation):

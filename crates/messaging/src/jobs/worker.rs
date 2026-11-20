@@ -957,7 +957,22 @@ impl<Q: JobQueue> JobWorker<Q> {
                     }
                     _ = interval.tick() => {
                         let _tick_guard = hb_tick_lock_task.lock().await;
-                        if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension).await {
+                        // Why: bound each renewal I/O call so a hung DB/Redis connection cannot
+                        // hold `hb_tick_lock` indefinitely and stall finalization; a timed-out
+                        // renewal is treated as ownership loss (unless the transition already committed).
+                        let renewal_timeout = hb_interval.max(Duration::from_millis(50));
+                        let renew_res = match tokio::time::timeout(
+                            renewal_timeout,
+                            hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension),
+                        )
+                        .await
+                        {
+                            Ok(res) => res,
+                            Err(_) => Err(JobError::Fatal(format!(
+                                "lease renewal timed out after {renewal_timeout:?}"
+                            ))),
+                        };
+                        if let Err(e) = renew_res {
                             // Why: suppress renewal errors ONLY after the queue transition
                             // (`ack`/`nack`/`dead_letter`) has actually committed; any failure
                             // before commit is a genuine ownership loss that must set `lease_lost`.
@@ -979,23 +994,35 @@ impl<Q: JobQueue> JobWorker<Q> {
                         // break the heartbeat loop, and route the completed job to the dead letter queue (DLQ) without acking.
                         if hb_extend_idempotency.load(Ordering::SeqCst)
                             && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
-                            && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
-                            // Why: suppress idempotency renewal failure only after idempotency
-                            // completion/release has committed, never merely because finalization started.
-                            if hb_idemp_committed.load(Ordering::SeqCst) {
+                            let extend_res = match tokio::time::timeout(
+                                renewal_timeout,
+                                store.extend_lock_with_token(k, &hb_token, renew_extension),
+                            )
+                            .await
+                            {
+                                Ok(res) => res,
+                                Err(_) => Err(JobError::Fatal(format!(
+                                    "idempotency lock renewal timed out after {renewal_timeout:?}"
+                                ))),
+                            };
+                            if let Err(e) = extend_res {
+                                // Why: suppress idempotency renewal failure only after idempotency
+                                // completion/release has committed, never merely because finalization started.
+                                if hb_idemp_committed.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                tracing::error!(
+                                    job_id = %hb_jid,
+                                    key = %k,
+                                    error = %e,
+                                    "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
+                                );
+                                hb_cancelled.store(true, Ordering::SeqCst);
+                                hb_lease_lost.store(true, Ordering::SeqCst);
+                                hb_lost_leases.fetch_add(1, Ordering::SeqCst);
                                 break;
                             }
-                            tracing::error!(
-                                job_id = %hb_jid,
-                                key = %k,
-                                error = %e,
-                                "Failed to extend idempotency lock heartbeat; lost idempotency ownership"
-                            );
-                            hb_cancelled.store(true, Ordering::SeqCst);
-                            hb_lease_lost.store(true, Ordering::SeqCst);
-                            hb_lost_leases.fetch_add(1, Ordering::SeqCst);
-                            break;
                         }
                     }
                 }
@@ -3095,5 +3122,165 @@ mod tests {
             0,
             "job must not be acked when in-flight idempotency renewal fails before ACK"
         );
+    }
+
+    #[tokio::test]
+    async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
+        #[derive(Debug)]
+        struct StalledRenewQueue {
+            renew_entered: Arc<tokio::sync::Notify>,
+            ack_count: Arc<AtomicUsize>,
+            dlq_count: Arc<AtomicUsize>,
+        }
+
+        impl JobQueue for StalledRenewQueue {
+            fn enqueue<J: Job>(&self, _job: J) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async { Ok("id".into()) })
+            }
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                _job: J,
+                _delay: Duration,
+                _trace_context: Option<String>,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async { Ok("id".into()) })
+            }
+            fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn renew_lease(
+                &self,
+                _job_id: &str,
+                _lease_token: &str,
+                _extension: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                let entered = Arc::clone(&self.renew_entered);
+                Box::pin(async move {
+                    entered.notify_one();
+                    // Simulate a hung DB connection that never responds.
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            }
+            fn ack(
+                &self,
+                _job_id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                self.ack_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _reason: String,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                self.dlq_count.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+            fn defer(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(self.dlq_count.load(Ordering::SeqCst)) })
+            }
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct StalledRenewJob;
+        impl Job for StalledRenewJob {
+            const NAME: &'static str = "stalled_renew_job";
+        }
+
+        #[derive(Debug)]
+        struct WaitForRenewHandler(Arc<tokio::sync::Notify>);
+        impl JobHandler<StalledRenewJob> for WaitForRenewHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: StalledRenewJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let entered = Arc::clone(&self.0);
+                Box::pin(async move {
+                    entered.notified().await;
+                    Ok(())
+                })
+            }
+        }
+
+        let renew_entered = Arc::new(tokio::sync::Notify::new());
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+        let queue = Arc::new(StalledRenewQueue {
+            renew_entered: Arc::clone(&renew_entered),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(WaitForRenewHandler(renew_entered));
+
+        let job = QueuedJob {
+            id: "job-stalled-renew".to_string(),
+            name: StalledRenewJob::NAME.to_string(),
+            payload: serde_json::to_vec(&StalledRenewJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-stalled".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(60),
+            trace_context: None,
+        };
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            JobWorker::execute_job(
+                queue,
+                Arc::new(registry),
+                job,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Arc::new(AtomicU64::new(0)),
+                Arc::new(AtomicU64::new(0)),
+            ),
+        )
+        .await
+        .expect("stalled heartbeat renewal must time out instead of hanging finalization");
+
+        assert_eq!(dlq_count.load(Ordering::SeqCst), 1);
+        assert_eq!(ack_count.load(Ordering::SeqCst), 0);
     }
 }

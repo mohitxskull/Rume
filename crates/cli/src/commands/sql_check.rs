@@ -251,24 +251,29 @@ fn is_safe_explainable_dml(statements: &[sqlparser::ast::Statement]) -> bool {
     if statements.len() != 1 {
         return false;
     }
-    // Why: inspect parsed AST expressions for `Value::Placeholder(_)` rather than raw
-    // tokens so SQLite named parameters (`SELECT :id;`, tokenized as `Colon` + `Word`)
-    // are excluded from `EXPLAIN` while PostgreSQL JSONB operators (`payload ? 'active'`,
-    // parsed as a binary operator) remain eligible.
-    let has_placeholder = sqlparser::ast::visit_expressions(&statements[0], |expr| {
-        if matches!(
-            expr,
-            sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
-                value: sqlparser::ast::Value::Placeholder(_),
-                ..
-            })
-        ) {
-            std::ops::ControlFlow::Break(())
-        } else {
-            std::ops::ControlFlow::Continue(())
+    // Why: use `Visitor::pre_visit_value` rather than `visit_expressions` or token
+    // scanning so placeholders stored outside `Expr::Value` (such as MySQL
+    // `MatchAgainst.match_value` in `MATCH(body) AGAINST (?)`) and SQLite named
+    // parameters (`SELECT :id;`) are all excluded from `EXPLAIN`, while PostgreSQL
+    // JSONB operators (`payload ? 'active'`, parsed as a binary op) remain eligible.
+    struct PlaceholderVisitor;
+    impl sqlparser::ast::Visitor for PlaceholderVisitor {
+        type Break = ();
+
+        fn pre_visit_value(
+            &mut self,
+            value: &sqlparser::ast::ValueWithSpan,
+        ) -> std::ops::ControlFlow<Self::Break> {
+            if matches!(value.value, sqlparser::ast::Value::Placeholder(_)) {
+                std::ops::ControlFlow::Break(())
+            } else {
+                std::ops::ControlFlow::Continue(())
+            }
         }
-    })
-    .is_break();
+    }
+
+    let has_placeholder =
+        sqlparser::ast::Visit::visit(&statements[0], &mut PlaceholderVisitor).is_break();
     if has_placeholder {
         return false;
     }
@@ -520,6 +525,14 @@ mod tests {
         assert!(
             !is_safe_explainable_dml(&stmts_named),
             "SQLite named placeholder `:id` must be excluded from EXPLAIN"
+        );
+
+        let q_mysql_match = write_temp("SELECT MATCH(body) AGAINST (?) FROM articles;");
+        let (stmts_match, _, _) =
+            validate_sql_file(q_mysql_match.path(), Some("mysql")).expect("mysql match against");
+        assert!(
+            !is_safe_explainable_dml(&stmts_match),
+            "MySQL MATCH ... AGAINST (?) placeholder must be excluded from EXPLAIN"
         );
 
         let q_pipe = write_temp("SELECT payload ?| array['a', 'b'] FROM events;");

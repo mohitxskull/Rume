@@ -937,9 +937,28 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 compensated_steps: record.compensated_steps,
                             });
                         }
-                        SagaStatus::Pending
-                        | SagaStatus::Running { .. }
-                        | SagaStatus::Compensating { .. } => {}
+                        SagaStatus::Compensating { .. } => {
+                            // Why: once a saga has persisted `Compensating`, a `Forward` recovery
+                            // handle (e.g. from a cross-workflow `resume_recoverable` mismatch)
+                            // must never resume forward execution after steps may already be undone.
+                            if matches!(handle.phase, SagaRecoveryPhase::Forward) {
+                                if let Some(c) = claim {
+                                    c.release().await;
+                                }
+                                let reason = format!(
+                                    "cannot resume forward execution for compensating saga '{}'",
+                                    handle.saga_id
+                                );
+                                return Err(SagaRecoveryError::new(
+                                    SagaError::Aborted {
+                                        saga: self.name.clone(),
+                                        reason,
+                                    },
+                                    handle,
+                                ));
+                            }
+                        }
+                        SagaStatus::Pending | SagaStatus::Running { .. } => {}
                     }
                 }
                 Ok(None) => {}
@@ -2323,5 +2342,70 @@ mod tests {
         assert_eq!(comp_runs.load(std::sync::atomic::Ordering::SeqCst), 0);
         let stored = store.load_record("s-succeeded").await.unwrap().unwrap();
         assert_eq!(stored.status, SagaStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn resume_from_handle_rejects_forward_handle_for_persisted_compensating_saga() {
+        let store = Arc::new(InMemorySagaStore::new());
+        store
+            .save_record_cas(
+                &SagaRecord {
+                    saga_id: "s-comp".into(),
+                    saga_name: "workflow_a".into(),
+                    status: SagaStatus::Compensating {
+                        current_step: "step_1".into(),
+                        error: Some(SagaError::ActionFailed {
+                            step: "step_2".into(),
+                            message: "boom".into(),
+                        }),
+                    },
+                    completed_steps: vec!["step_1".into()],
+                    compensated_steps: vec![],
+                    updated_at: 1,
+                    version: 3,
+                },
+                0,
+            )
+            .await
+            .unwrap();
+
+        let step2_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let runs_clone = Arc::clone(&step2_runs);
+        let workflow_a = Saga::<()>::new("workflow_a")
+            .with_store(store.clone())
+            .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) })
+            .step(
+                "step_2",
+                move |_| {
+                    runs_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        // Workflow B calls `resume_recoverable`, yielding an ownership-mismatch handle
+        // carrying workflow A's name, current version, and `Forward` phase.
+        let workflow_b = Saga::<()>::new("workflow_b")
+            .with_store(store.clone())
+            .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) });
+        let mismatch_err = workflow_b
+            .resume_recoverable("s-comp", ())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(mismatch_err.handle.saga_name, "workflow_a");
+        assert!(matches!(
+            mismatch_err.handle.phase,
+            SagaRecoveryPhase::Forward
+        ));
+
+        // Workflow A must reject resuming forward execution on a persisted `Compensating` saga.
+        let err = workflow_a
+            .resume_from_handle(*mismatch_err.handle)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err.error, SagaError::Aborted { .. }));
+        assert_eq!(step2_runs.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
