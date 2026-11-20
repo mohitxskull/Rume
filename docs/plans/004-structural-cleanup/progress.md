@@ -45,4 +45,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 02: minor (deferred): clippy gate — cargo clippy --workspace --all-features -- -D warnings fails with clippy::too_many_arguments (8/7) in crates/messaging/src/jobs/worker/heartbeat.rs (rume-messaging, task-01 code; enterprise crate untouched by task 02). Ruling: parked — out of scope for plan 004; needs a follow-up fix (or targeted allow) before the workspace clippy gate is green.`
 - `Task 03: complete (9e368aa..1424c0f, no review — user constraint)`
 - `Task 03: minor (deferred): 6 intended `pub(crate)` visibility edits in `app/builder/mod.rs` (`run_inspect_mode`, `build_router_with_resolved`, `collect_and_validate_routes`, `merge_module_router`, `normalize_route_template`, `validate_middleware_config`) — cross-module calls after the split; behavior-preserving (report §Implementation notes).`
-- `Task 04: pending`
+- `Task 04: complete (07c214d..6099528, no review — user constraint)`
+- `Task 04: minor (deferred): public module path `rume::enterprise::saml` moved to `rume::saml` (module now at crate root; `src/enterprise/` now nests only `scim.rs` — the Phase 4 "double enterprise" note); no consumers of the old module path (grep `enterprise::saml` empty); type paths (`rume::enterprise::SamlParser`) still resolve — verified via `cargo test -p rume --features enterprise` green.`
+- `Task 05: pending`
