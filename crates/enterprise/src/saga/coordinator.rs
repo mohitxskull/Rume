@@ -128,6 +128,16 @@ pub trait SagaStore: Send + Sync + 'static {
         let _ = (saga_id, claim_token);
         Box::pin(async { Ok(()) })
     }
+
+    /// Synchronously releases a previously acquired execution claim if the store
+    /// supports lock-free / non-async teardown (e.g. in-memory stores).
+    ///
+    /// Returns `true` if the claim was released synchronously; `false` instructs
+    /// `ExecutionClaimGuard::drop` to fall back to spawning [`Self::release_execution`].
+    fn release_execution_sync(&self, saga_id: &str, claim_token: &str) -> bool {
+        let _ = (saga_id, claim_token);
+        false
+    }
 }
 
 /// Thread-safe in-memory saga storage suitable for testing and single-instance deployments.
@@ -253,17 +263,17 @@ impl SagaStore for InMemorySagaStore {
         saga_id: &str,
         claim_token: &str,
     ) -> BoxFuture<'_, Result<(), SagaError>> {
-        let id = saga_id.to_string();
-        let token = claim_token.to_string();
-        let active_claims = Arc::clone(&self.active_claims);
-        Box::pin(async move {
-            if let Ok(mut claims) = active_claims.lock()
-                && claims.get(&id).is_some_and(|t| t == &token)
-            {
-                claims.remove(&id);
-            }
-            Ok(())
-        })
+        self.release_execution_sync(saga_id, claim_token);
+        Box::pin(async { Ok(()) })
+    }
+
+    fn release_execution_sync(&self, saga_id: &str, claim_token: &str) -> bool {
+        if let Ok(mut claims) = self.active_claims.lock()
+            && claims.get(saga_id).is_some_and(|t| t == claim_token)
+        {
+            claims.remove(saga_id);
+        }
+        true
     }
 }
 
@@ -286,6 +296,12 @@ impl ExecutionClaimGuard {
 impl Drop for ExecutionClaimGuard {
     fn drop(&mut self) {
         if let Some(store) = self.store.take() {
+            // Why: release synchronously when supported (e.g. `InMemorySagaStore`) so
+            // dropping a pending saga future outside a Tokio runtime context cannot leak
+            // the exclusive claim and permanently lock out recovery.
+            if store.release_execution_sync(&self.saga_id, &self.token) {
+                return;
+            }
             let saga_id = self.saga_id.clone();
             let token = self.token.clone();
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -862,6 +878,84 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             Ok(c) => c,
             Err(err) => return Err(SagaRecoveryError::new(err, handle)),
         };
+
+        // Why: validate the persisted record under the execution claim before dispatching
+        // a recovery handle so a `Compensating` handle cannot roll back an already-`Success`
+        // saga or overwrite an existing terminal outcome (`Compensated`/`CompensationFailed`).
+        if let Some(store) = &self.store {
+            match store.load_record(&handle.saga_id).await {
+                Ok(Some(record)) => {
+                    if record.saga_name != self.name {
+                        if let Some(c) = claim {
+                            c.release().await;
+                        }
+                        let reason = format!(
+                            "saga record '{}' belongs to '{}', not '{}'",
+                            handle.saga_id, record.saga_name, self.name
+                        );
+                        return Err(SagaRecoveryError::new(
+                            SagaError::Aborted {
+                                saga: self.name.clone(),
+                                reason,
+                            },
+                            handle,
+                        ));
+                    }
+                    match record.status {
+                        SagaStatus::Success => {
+                            if let Some(c) = claim {
+                                c.release().await;
+                            }
+                            if matches!(handle.phase, SagaRecoveryPhase::Compensating { .. }) {
+                                let reason = format!(
+                                    "cannot compensate already succeeded saga '{}'",
+                                    handle.saga_id
+                                );
+                                return Err(SagaRecoveryError::new(
+                                    SagaError::Aborted {
+                                        saga: self.name.clone(),
+                                        reason,
+                                    },
+                                    handle,
+                                ));
+                            }
+                            return Ok(SagaReport {
+                                context: handle.context,
+                                status: record.status,
+                                completed_steps: record.completed_steps,
+                                compensated_steps: record.compensated_steps,
+                            });
+                        }
+                        SagaStatus::Compensated { .. } | SagaStatus::CompensationFailed { .. } => {
+                            if let Some(c) = claim {
+                                c.release().await;
+                            }
+                            return Ok(SagaReport {
+                                context: handle.context,
+                                status: record.status,
+                                completed_steps: record.completed_steps,
+                                compensated_steps: record.compensated_steps,
+                            });
+                        }
+                        SagaStatus::Pending
+                        | SagaStatus::Running { .. }
+                        | SagaStatus::Compensating { .. } => {}
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if let Some(c) = claim {
+                        c.release().await;
+                    }
+                    let saga_id = handle.saga_id.clone();
+                    return Err(SagaRecoveryError::new(
+                        attach_saga_id(err, &saga_id),
+                        handle,
+                    ));
+                }
+            }
+        }
+
         let res = match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
@@ -2144,5 +2238,90 @@ mod tests {
         let stored = store.load_record("s-cross").await.unwrap().unwrap();
         assert_eq!(stored.saga_name, "workflow_a");
         assert_eq!(stored.version, 1);
+    }
+
+    #[test]
+    fn dropping_pending_saga_future_outside_runtime_releases_in_memory_claim() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let store = Arc::new(InMemorySagaStore::new());
+        let saga = Saga::<()>::new("drop_outside_rt")
+            .with_store(store.clone())
+            .step(
+                "s1",
+                |_| async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                },
+                |_| async { Ok(()) },
+            );
+
+        // Poll the saga future inside the runtime context so it acquires the execution claim
+        // and parks inside `s1`, then leave the runtime context before dropping the future.
+        let mut fut = Box::pin(saga.run_with_id("s-drop-sync", ()));
+        {
+            let _enter = rt.enter();
+            let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+            assert!(fut.as_mut().poll(&mut cx).is_pending());
+        }
+        // Drop outside any Tokio runtime context; synchronous release must clear the claim.
+        drop(fut);
+
+        // A subsequent recovery on the same saga_id must succeed without a stuck claim error.
+        let saga_fast = Saga::<()>::new("drop_outside_rt").with_store(store).step(
+            "s1",
+            |_| async { Ok(()) },
+            |_| async { Ok(()) },
+        );
+        let report = rt
+            .block_on(saga_fast.resume("s-drop-sync", ()))
+            .expect("claim must be released when future is dropped outside runtime");
+        assert_eq!(report.status, SagaStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn resume_from_handle_rejects_compensating_already_succeeded_saga() {
+        let store = Arc::new(InMemorySagaStore::new());
+        let comp_runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let comp_clone = Arc::clone(&comp_runs);
+        let workflow_a = Saga::<()>::new("workflow_a")
+            .with_store(store.clone())
+            .step(
+                "step_1",
+                |_| async { Ok(()) },
+                move |_| {
+                    comp_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    async { Ok(()) }
+                },
+            );
+
+        let report = workflow_a.run_with_id("s-succeeded", ()).await.unwrap();
+        assert_eq!(report.status, SagaStatus::Success);
+
+        // Workflow B calls `compensate_crashed_recoverable` on workflow A's succeeded saga,
+        // yielding a handle carrying workflow A's name, current version, and Compensating phase.
+        let workflow_b = Saga::<()>::new("workflow_b")
+            .with_store(store.clone())
+            .step("step_1", |_| async { Ok(()) }, |_| async { Ok(()) });
+        let mismatch_err = workflow_b
+            .compensate_crashed_recoverable("s-succeeded", ())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(mismatch_err.handle.saga_name, "workflow_a");
+
+        // Passing that handle to workflow A's `resume_from_handle` must reject compensation
+        // and preserve `SagaStatus::Success`.
+        let err = workflow_a
+            .resume_from_handle(*mismatch_err.handle)
+            .await
+            .err()
+            .unwrap();
+        assert!(matches!(err.error, SagaError::Aborted { .. }));
+        assert_eq!(comp_runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let stored = store.load_record("s-succeeded").await.unwrap().unwrap();
+        assert_eq!(stored.status, SagaStatus::Success);
     }
 }

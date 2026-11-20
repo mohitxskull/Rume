@@ -72,6 +72,10 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
     let mut pending_separator = false;
 
     let chars: Vec<char> = input.chars().collect();
+    // Why: once a forward scan for `-->` reaches EOF without finding one, no later
+    // `<!--` opener in the remaining suffix can have a terminator either; caching
+    // `has_comment_end = false` prevents O(N²) rescans on repeated unterminated `<!--`.
+    let mut has_comment_end = true;
     let mut i = 0;
     while i < chars.len() {
         let ch = chars[i];
@@ -79,7 +83,7 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
             // Why: HTML/XML comments (`<!-- ... -->`) terminate at `-->` and do not
             // obey attribute quoting rules (an apostrophe like `<!-- don't show -->`
             // must not open a quote state and swallow the rest of the input).
-            if chars.get(i..i + 4) == Some(&['<', '!', '-', '-']) {
+            if has_comment_end && chars.get(i..i + 4) == Some(&['<', '!', '-', '-']) {
                 let mut j = i + 4;
                 let mut found_comment_end = false;
                 while j + 2 < chars.len() {
@@ -95,6 +99,7 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
                     i = j;
                     continue;
                 }
+                has_comment_end = false;
             }
 
             // Why: an HTML/XML tag starts with `<` followed by a valid XML name-start
@@ -311,5 +316,9 @@ mod tests {
         assert_eq!(strip_html_tags("<é>x</é>"), "x");
         assert_eq!(strip_html_tags("<!-- don't show -->Visible"), "Visible");
         assert_eq!(excerpt("<!-- don't show -->Visible", 20), "Visible");
+
+        // Repeated unterminated comment openers must complete in linear time.
+        let repeated = "<!--x".repeat(20_000);
+        assert_eq!(strip_html_tags(&repeated), repeated);
     }
 }

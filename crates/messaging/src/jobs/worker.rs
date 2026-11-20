@@ -925,7 +925,9 @@ impl<Q: JobQueue> JobWorker<Q> {
         let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
         let lease_lost = Arc::new(AtomicBool::new(false));
         let extend_idempotency = Arc::new(AtomicBool::new(true));
-        let finalizing = Arc::new(AtomicBool::new(false));
+        let queue_committed = Arc::new(AtomicBool::new(false));
+        let idemp_committed = Arc::new(AtomicBool::new(false));
+        let hb_tick_lock = Arc::new(tokio::sync::Mutex::new(()));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
         let hb_token = token.clone();
         let hb_queue = Arc::clone(&queue);
@@ -933,7 +935,9 @@ impl<Q: JobQueue> JobWorker<Q> {
         let hb_cancelled = Arc::clone(&job_cancelled);
         let hb_lease_lost = Arc::clone(&lease_lost);
         let hb_extend_idempotency = Arc::clone(&extend_idempotency);
-        let hb_finalizing = Arc::clone(&finalizing);
+        let hb_queue_committed = Arc::clone(&queue_committed);
+        let hb_idemp_committed = Arc::clone(&idemp_committed);
+        let hb_tick_lock_task = Arc::clone(&hb_tick_lock);
         let hb_stopping = Arc::clone(&stopping);
         let hb_lost_leases = Arc::clone(&lost_leases);
         let hb_idemp_store = idempotency_store.clone();
@@ -952,12 +956,12 @@ impl<Q: JobQueue> JobWorker<Q> {
                         }
                     }
                     _ = interval.tick() => {
+                        let _tick_guard = hb_tick_lock_task.lock().await;
                         if let Err(e) = hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension).await {
-                            // Why: keep lease renewal active while `ack`/`nack`/`dead_letter` is
-                            // in flight so a slow DB commit cannot expire the lease; once
-                            // `hb_finalizing` is set, an expected post-commit renewal failure
-                            // exits quietly instead of falsely incrementing `lost_leases`.
-                            if hb_finalizing.load(Ordering::SeqCst) {
+                            // Why: suppress renewal errors ONLY after the queue transition
+                            // (`ack`/`nack`/`dead_letter`) has actually committed; any failure
+                            // before commit is a genuine ownership loss that must set `lease_lost`.
+                            if hb_queue_committed.load(Ordering::SeqCst) {
                                 break;
                             }
                             tracing::error!(job_id = %hb_jid, error = %e, "Failed to renew job lease heartbeat; lost lease");
@@ -977,7 +981,9 @@ impl<Q: JobQueue> JobWorker<Q> {
                             && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
                             && let Err(e) = store.extend_lock_with_token(k, &hb_token, renew_extension).await
                         {
-                            if hb_finalizing.load(Ordering::SeqCst) {
+                            // Why: suppress idempotency renewal failure only after idempotency
+                            // completion/release has committed, never merely because finalization started.
+                            if hb_idemp_committed.load(Ordering::SeqCst) {
                                 break;
                             }
                             tracing::error!(
@@ -1013,12 +1019,11 @@ impl<Q: JobQueue> JobWorker<Q> {
             Err(_) => Err(JobError::Fatal("handler panicked".into())),
         };
 
-        // Why: keep lease renewal alive until `ack`/`nack`/`dead_letter` commits so a
-        // stalled DB connection cannot let the lease expire before finalization. Setting
-        // `finalizing` suppresses expected post-commit renewal failures from incrementing
-        // `lost_leases`, and awaiting `heartbeat_handle` at the end guarantees the task
-        // has fully exited before returning.
-        finalizing.store(true, Ordering::SeqCst);
+        // Why: wait for any already-in-flight heartbeat ownership check (`renew_lease` /
+        // `extend_lock_with_token`) to settle before reading `lease_lost` and choosing
+        // between ACK and dead-letter, while keeping subsequent heartbeat ticks eligible
+        // during `ack`/`nack`/`dead_letter` until the state transition actually commits.
+        drop(hb_tick_lock.lock().await);
 
         match dispatch_result {
             Ok(()) => {
@@ -1039,6 +1044,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                         // Why: release the deduplication reservation only after `dead_letter`
                         // commits; if dead-lettering fails, preserving the reservation blocks
                         // another worker from re-executing a handler that already succeeded.
@@ -1051,6 +1057,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                             "on lease loss",
                         )
                         .await;
+                        idemp_committed.store(true, Ordering::SeqCst);
                     }
                 } else {
                     if let Err(err) = queue.ack(&job_id, &token).await {
@@ -1061,6 +1068,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                     extend_idempotency.store(false, Ordering::SeqCst);
                     if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
@@ -1073,6 +1082,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                             "Failed to record idempotency completion"
                         );
                     }
+                    idemp_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(JobError::Fatal(msg))
@@ -1087,6 +1097,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                     "on fatal failure",
                 )
                 .await;
+                idemp_committed.store(true, Ordering::SeqCst);
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
                         job_id = %job_id,
@@ -1095,6 +1106,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                     );
                     transition_errors.fetch_add(1, Ordering::SeqCst);
                     lost_leases.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    queue_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(err) => {
@@ -1115,6 +1128,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "before retryable nack; proceeding with nack",
                     )
                     .await;
+                    idemp_committed.store(true, Ordering::SeqCst);
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -1123,6 +1137,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                 } else {
                     extend_idempotency.store(false, Ordering::SeqCst);
@@ -1134,6 +1150,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                         "on dead letter",
                     )
                     .await;
+                    idemp_committed.store(true, Ordering::SeqCst);
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
                         tracing::error!(
@@ -1143,6 +1160,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
+                    } else {
+                        queue_committed.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -2923,5 +2942,158 @@ mod tests {
         );
         assert_eq!(worker.in_flight_count(), 0);
         assert_eq!(worker.join_set_len.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn in_flight_idempotency_loss_before_ack_routes_to_dead_letter() {
+        #[derive(Debug)]
+        struct GatedFailExtendStore {
+            extend_entered: Arc<tokio::sync::Notify>,
+            release_extend: Arc<tokio::sync::Notify>,
+        }
+
+        impl IdempotencyStore for GatedFailExtendStore {
+            fn try_acquire_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _ttl: Duration,
+            ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
+                Box::pin(async { Ok(IdempotencyStatus::New) })
+            }
+
+            fn complete_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _result: Option<Vec<u8>>,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn release_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn extend_lock_with_token(
+                &self,
+                _key: &str,
+                _token: &str,
+                _ttl: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                let entered = Arc::clone(&self.extend_entered);
+                let release = Arc::clone(&self.release_extend);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Err(JobError::Fatal("idempotency token reassigned".into()))
+                })
+            }
+        }
+
+        #[derive(Debug, serde::Serialize, serde::Deserialize)]
+        struct GatedIdempJob;
+
+        impl Job for GatedIdempJob {
+            const NAME: &'static str = "gated_idemp_job";
+        }
+
+        #[derive(Debug)]
+        struct GatedHandler {
+            extend_entered: Arc<tokio::sync::Notify>,
+            release_extend: Arc<tokio::sync::Notify>,
+        }
+
+        impl JobHandler<GatedIdempJob> for GatedHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: GatedIdempJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let entered = Arc::clone(&self.extend_entered);
+                let release = Arc::clone(&self.release_extend);
+                Box::pin(async move {
+                    // Wait until the heartbeat task has entered `extend_lock_with_token`.
+                    entered.notified().await;
+                    // Release the failing renewal concurrently with handler completion;
+                    // `execute_job` must wait for the in-flight renewal to settle and
+                    // dead-letter the job instead of suppressing the error and acking.
+                    release.notify_one();
+                    Ok(())
+                })
+            }
+        }
+
+        let extend_entered = Arc::new(tokio::sync::Notify::new());
+        let release_extend = Arc::new(tokio::sync::Notify::new());
+
+        let (enter_tx, _enter_rx) = mpsc::channel(1);
+        let (_release_tx, release_rx) = mpsc::channel(1);
+        let nack_count = Arc::new(AtomicUsize::new(0));
+        let ack_count = Arc::new(AtomicUsize::new(0));
+        let dlq_count = Arc::new(AtomicUsize::new(0));
+
+        let job = QueuedJob {
+            id: "job-gated-idemp".to_string(),
+            name: GatedIdempJob::NAME.to_string(),
+            payload: serde_json::to_vec(&GatedIdempJob).unwrap(),
+            attempt: 1,
+            retry_policy: RetryPolicy::new(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: Some("k-gated".into()),
+            tenant_id: None,
+            assigned_worker: Some("worker-1".into()),
+            lease_token: Some("token-gated".into()),
+            available_at: Instant::now(),
+            lease_duration: Duration::from_millis(60),
+            trace_context: None,
+        };
+
+        let queue = Arc::new(BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        });
+
+        let mut registry = JobRegistry::new();
+        registry.register(GatedHandler {
+            extend_entered: Arc::clone(&extend_entered),
+            release_extend: Arc::clone(&release_extend),
+        });
+
+        let store: Arc<dyn IdempotencyStore> = Arc::new(GatedFailExtendStore {
+            extend_entered,
+            release_extend,
+        });
+
+        JobWorker::execute_job(
+            queue,
+            Arc::new(registry),
+            job,
+            Some(store),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(0)),
+            Arc::new(AtomicU64::new(0)),
+        )
+        .await;
+
+        assert_eq!(
+            dlq_count.load(Ordering::SeqCst),
+            1,
+            "job must be dead-lettered when in-flight idempotency renewal fails before ACK"
+        );
+        assert_eq!(
+            ack_count.load(Ordering::SeqCst),
+            0,
+            "job must not be acked when in-flight idempotency renewal fails before ACK"
+        );
     }
 }

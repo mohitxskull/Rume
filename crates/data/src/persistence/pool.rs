@@ -327,29 +327,35 @@ impl<B: DatabaseBackend> DatabasePool<B> {
         R::from_row(&row)
     }
 
-    /// Gracefully closes the connection pool, refusing new leases and draining connections.
+    /// Gracefully closes the connection pool, refusing new leases and scheduling
+    /// driver connection teardown.
+    ///
+    /// Callers that need to await full connection draining should use
+    /// [`Self::close_async`] or [`Self::close_and_drain`].
     pub fn close(&self) {
         self.is_closed.store(true, Ordering::SeqCst);
         self.semaphore.close();
         let backend = Arc::clone(&self.backend);
         // Why: when inside a Tokio runtime, schedule async teardown on that handle;
-        // when called outside any Tokio runtime (e.g. synchronous teardown), drive
-        // `backend.close()` on a short-lived helper thread with a current-thread
-        // runtime so underlying driver connections are still closed without panicking.
+        // when called outside any Tokio runtime, spawn a detached helper thread with a
+        // current-thread runtime instead of `.join()`ing it — SQLx's `Pool::close()`
+        // waits for checked-out connections, so joining while the caller still holds a
+        // transaction outside the runtime would deadlock.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 backend.close().await;
             });
         } else {
-            let _ = std::thread::spawn(move || {
-                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    rt.block_on(backend.close());
-                }
-            })
-            .join();
+            let _ = std::thread::Builder::new()
+                .name("rume-db-pool-close".into())
+                .spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        rt.block_on(backend.close());
+                    }
+                });
         }
     }
 

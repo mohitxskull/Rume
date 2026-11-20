@@ -72,11 +72,11 @@ pub fn is_tool_available(name: &str) -> bool {
 
 fn is_tool_available_in_path(name: &str, path_var: &std::ffi::OsStr) -> bool {
     env::split_paths(path_var).any(|dir| {
-        if is_executable_file(&dir.join(name)) {
-            return true;
-        }
         #[cfg(windows)]
         {
+            if is_executable_file(&dir.join(name)) {
+                return true;
+            }
             let pathext = env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
             pathext
                 .split(';')
@@ -85,7 +85,7 @@ fn is_tool_available_in_path(name: &str, path_var: &std::ffi::OsStr) -> bool {
         }
         #[cfg(not(windows))]
         {
-            false
+            is_executable_file(&dir.join(name))
         }
     })
 }

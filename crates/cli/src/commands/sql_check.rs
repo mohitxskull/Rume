@@ -50,6 +50,24 @@ pub async fn run(
         match crate::commands::db::resolve_db_url() {
             Ok(Some(url)) => match crate::commands::db::connect_backend(&url).await {
                 Ok((handle, dialect)) => {
+                    // Why: Postgres and MySQL backends use `connect_lazy`, so establishing
+                    // the pool alone does not verify connectivity. Ping up front so `--db`
+                    // fails closed on an unreachable database even when every `.sql` file
+                    // is parameterized and skips `EXPLAIN`.
+                    use rume::persistence::DatabaseBackend;
+                    let ping_res = match &handle {
+                        crate::commands::db::BackendHandle::Postgres(b) => b.ping().await,
+                        crate::commands::db::BackendHandle::Sqlite(b) => b.ping().await,
+                        crate::commands::db::BackendHandle::Mysql(b) => b.ping().await,
+                    };
+                    if let Err(err) = ping_res {
+                        eprintln!(
+                            "{}",
+                            style(format!("error: database unreachable for --db check: {err}"))
+                                .red()
+                        );
+                        std::process::exit(1);
+                    }
                     db_handle = Some((handle, dialect));
                 }
                 Err(err) => {
@@ -87,14 +105,13 @@ pub async fn run(
         let display_path = file_path.display().to_string();
         let val_res = validate_sql_file(file_path, target_dialect);
         let final_res = match val_res {
-            Ok((statements, tokens, effective_dialect)) => {
-                if let Some((handle, db_dialect)) = &db_handle {
+            Ok((statements, _tokens, _effective_dialect)) => {
+                if let Some((handle, _db_dialect)) = &db_handle {
                     // Why: inspect the parsed `sqlparser` AST instead of raw string
                     // `first_word`. This both handles leading comments (`--` / `/* */`)
                     // and guarantees multi-statement SQL (e.g. `SELECT 1; DROP TABLE ...`)
                     // or parameterized queries are never sent to `EXPLAIN`.
-                    let dialect_for_explain = effective_dialect.or(Some(*db_dialect));
-                    if is_safe_explainable_dml(&statements, &tokens, dialect_for_explain) {
+                    if is_safe_explainable_dml(&statements) {
                         let explain_sql = format!("EXPLAIN {}", statements[0]);
                         use rume::persistence::DatabaseBackend;
                         let explain_res = match handle {
@@ -230,21 +247,28 @@ fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
 
 /// Returns `true` only when `statements` contains exactly one zero-parameter
 /// `SELECT`/`INSERT`/`UPDATE`/`DELETE` statement safe to wrap in `EXPLAIN`.
-fn is_safe_explainable_dml(
-    statements: &[sqlparser::ast::Statement],
-    tokens: &[Token],
-    dialect: Option<&str>,
-) -> bool {
+fn is_safe_explainable_dml(statements: &[sqlparser::ast::Statement]) -> bool {
     if statements.len() != 1 {
         return false;
     }
-    // Why: on PostgreSQL, `Token::Question` is the JSONB existence operator (`payload ? 'active'`),
-    // not a bind placeholder (parameterized `?` is already rejected during parsing).
-    let has_placeholder = tokens.iter().any(|t| match t {
-        Token::Placeholder(_) => true,
-        Token::Question => dialect != Some("postgres"),
-        _ => false,
-    });
+    // Why: inspect parsed AST expressions for `Value::Placeholder(_)` rather than raw
+    // tokens so SQLite named parameters (`SELECT :id;`, tokenized as `Colon` + `Word`)
+    // are excluded from `EXPLAIN` while PostgreSQL JSONB operators (`payload ? 'active'`,
+    // parsed as a binary operator) remain eligible.
+    let has_placeholder = sqlparser::ast::visit_expressions(&statements[0], |expr| {
+        if matches!(
+            expr,
+            sqlparser::ast::Expr::Value(sqlparser::ast::ValueWithSpan {
+                value: sqlparser::ast::Value::Placeholder(_),
+                ..
+            })
+        ) {
+            std::ops::ControlFlow::Break(())
+        } else {
+            std::ops::ControlFlow::Continue(())
+        }
+    })
+    .is_break();
     if has_placeholder {
         return false;
     }
@@ -475,19 +499,27 @@ mod tests {
     #[test]
     fn sql_check_accepts_postgres_jsonb_question_operators() {
         let q = write_temp("SELECT payload ? 'active' FROM events;");
-        let (stmts, tokens, dialect) =
+        let (stmts, _tokens, _dialect) =
             validate_sql_file(q.path(), Some("postgres")).expect("jsonb ? parses");
         assert!(
-            is_safe_explainable_dml(&stmts, &tokens, dialect),
+            is_safe_explainable_dml(&stmts),
             "PostgreSQL JSONB `?` operator must remain eligible for live EXPLAIN"
         );
 
         let q_param = write_temp("SELECT payload ? 'active' FROM events WHERE id = $1;");
-        let (stmts_p, tokens_p, dialect_p) =
+        let (stmts_p, _tokens_p, _dialect_p) =
             validate_sql_file(q_param.path(), Some("postgres")).expect("parameterized jsonb");
         assert!(
-            !is_safe_explainable_dml(&stmts_p, &tokens_p, dialect_p),
+            !is_safe_explainable_dml(&stmts_p),
             "parameterized PostgreSQL query must be skipped from EXPLAIN"
+        );
+
+        let q_sqlite_named = write_temp("-- lookup\nSELECT :id;");
+        let (stmts_named, _, _) =
+            validate_sql_file(q_sqlite_named.path(), Some("sqlite")).expect("sqlite named param");
+        assert!(
+            !is_safe_explainable_dml(&stmts_named),
+            "SQLite named placeholder `:id` must be excluded from EXPLAIN"
         );
 
         let q_pipe = write_temp("SELECT payload ?| array['a', 'b'] FROM events;");
