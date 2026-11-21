@@ -1326,6 +1326,15 @@ async fn test_postgres_job_queue_superseded_worker_cannot_ack_after_peer_claims(
     assert_eq!(job_b.id, job_id);
     assert_ne!(token_a, token_b);
 
+    // Give worker B a comfortable lease via the public API so its ack does not
+    // race with the 300ms lease expiring under loaded DB round trips. Renewal is
+    // token-fenced, so this succeeds deterministically; worker A's stale token
+    // is still rejected below.
+    queue
+        .renew_lease(&job_id, &token_b, Duration::from_secs(60))
+        .await
+        .expect("worker B lease renewal must succeed");
+
     // Worker A attempts to ack -> rejected
     let ack_a = queue.ack(&job_id, &token_a).await;
     assert!(
