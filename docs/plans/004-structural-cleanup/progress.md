@@ -55,4 +55,9 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 05: minor (deferred): `cargo fmt --all --check` reports diffs in `crates/data/src/persistence/migration/preflight.rs` (long `include_str!` consts after the path rewrite; task-05 file) — task-06 implementer flagged a related fmt issue in `tests.rs`; actual diffs are in `preflight.rs`. Fix at end of plan.`
 - `Task 07: complete (0b4552f..eed0115, no review — user constraint)`
 - `Task 08: complete (4e9412d..3d7d0b3, no review — user constraint)`
-- `Task 09: pending`
+- `Task 09: complete (485b6fa..693d3cd, no review — user constraint; DONE_WITH_CONCERNS — 4 concerns adjudicated)`
+- `Ruling: plan text says 64 consts but enumerates 65 — implemented all 65 enumerated consts; dropping one would break a listed consumer. Cost if wrong: one extra const in `rume_data::sql`.`
+- `Ruling: plan's `-p rume-core` is an invalid package ID — the core package is `rume`; gate run with `-p rume` green. Cost: none (command spelling only).`
+- `Task 09: minor (deferred): pre-existing flaky `containers` suite under `--all-features` — 1 failure per full run, a different test each time; both pass in isolation; not caused by the pure refactor (SQL bytes verified 100% renames).`
+- `Task 05: minor (deferred): fmt diffs also in `crates/data/src/persistence/migration/{runner.rs,tests.rs}` (task-05 files; beyond the `preflight.rs` note) — fix with `preflight.rs` at end of plan.`
+- `Task 10: pending`
