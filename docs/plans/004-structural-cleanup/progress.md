@@ -60,4 +60,5 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Ruling: plan's `-p rume-core` is an invalid package ID — the core package is `rume`; gate run with `-p rume` green. Cost: none (command spelling only).`
 - `Task 09: minor (deferred): pre-existing flaky `containers` suite under `--all-features` — 1 failure per full run, a different test each time; both pass in isolation; not caused by the pure refactor (SQL bytes verified 100% renames).`
 - `Task 05: minor (deferred): fmt diffs also in `crates/data/src/persistence/migration/{runner.rs,tests.rs}` (task-05 files; beyond the `preflight.rs` note) — fix with `preflight.rs` at end of plan.`
-- `Task 10: pending`
+- `Task 10: complete (verification only — no code changes, no commit; Phase 2 gate green — build 0, tests 40+26/0, depth 4, 109 SQL files, no messaging SQL, zero stale `persistence::sql::` refs)`
+- `Task 11: pending`
