@@ -13,24 +13,22 @@ use crate::coordination::lock::{
 };
 use crate::persistence::postgres::PostgresBackend;
 
-const LOCKS_SCHEMA: &str = include_str!("../persistence/sql/postgres/locks_schema.sql");
-const LEADER_SCHEMA: &str = include_str!("../persistence/sql/postgres/leader_schema.sql");
-const LOCK_ACQUIRE_SQL: &str = include_str!("../persistence/sql/postgres/lock_acquire.sql");
-const LOCK_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/lock_renew.sql");
-const LEADER_ACQUIRE_SQL: &str = include_str!("../persistence/sql/postgres/leader_acquire.sql");
-const LEADER_RENEW_SQL: &str = include_str!("../persistence/sql/postgres/leader_renew.sql");
+const LOCKS_SCHEMA: &str = include_str!("../../sql/postgres/locks_schema.sql");
+const LEADER_SCHEMA: &str = include_str!("../../sql/postgres/leader_schema.sql");
+const LOCK_ACQUIRE_SQL: &str = include_str!("../../sql/postgres/lock_acquire.sql");
+const LOCK_RENEW_SQL: &str = include_str!("../../sql/postgres/lock_renew.sql");
+const LEADER_ACQUIRE_SQL: &str = include_str!("../../sql/postgres/leader_acquire.sql");
+const LEADER_RENEW_SQL: &str = include_str!("../../sql/postgres/leader_renew.sql");
 
 // Per-operation coordination SQL, externalized from inline string literals.
-const COORD_PRUNE_LOCKS_SQL: &str =
-    include_str!("../persistence/sql/postgres/coordination_prune_locks.sql");
+const COORD_PRUNE_LOCKS_SQL: &str = include_str!("../../sql/postgres/coordination_prune_locks.sql");
 const COORD_RELEASE_LOCK_SQL: &str =
-    include_str!("../persistence/sql/postgres/coordination_release_lock.sql");
+    include_str!("../../sql/postgres/coordination_release_lock.sql");
 const COORD_PRUNE_LEADERS_SQL: &str =
-    include_str!("../persistence/sql/postgres/coordination_prune_leaders.sql");
-const COORD_GET_LEADER_SQL: &str =
-    include_str!("../persistence/sql/postgres/coordination_get_leader.sql");
+    include_str!("../../sql/postgres/coordination_prune_leaders.sql");
+const COORD_GET_LEADER_SQL: &str = include_str!("../../sql/postgres/coordination_get_leader.sql");
 const COORD_RESIGN_LEADER_SQL: &str =
-    include_str!("../persistence/sql/postgres/coordination_resign_leader.sql");
+    include_str!("../../sql/postgres/coordination_resign_leader.sql");
 
 /// PostgreSQL-backed implementation of [`DistributedLock`].
 #[derive(Clone)]

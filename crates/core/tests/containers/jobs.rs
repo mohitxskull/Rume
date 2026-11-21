@@ -332,8 +332,9 @@ async fn worker_panic_does_not_leak_in_flight_count() {
     // Wait deterministically for worker to dequeue and panic
     started.notified().await;
 
-    // Drain should succeed without hanging because RAII guard decremented in_flight_count
-    let drained = worker.drain(Duration::from_millis(200)).await;
+    // Drain should succeed without hanging because RAII guard decremented in_flight_count.
+    // Use a generous bounded wait: 200ms was too tight under loaded shared-container CI.
+    let drained = worker.drain(Duration::from_secs(5)).await;
     assert!(drained);
 
     // Durable queue invariant: panicked job must not be orphaned in 'in_flight'

@@ -11,24 +11,20 @@ use crate::outbox::{
     TransactionalOutbox,
 };
 
-const OUTBOX_CLAIM_SQL: &str = include_str!("sql/sqlite/outbox_claim.sql");
-const INSERT_OUTBOX_SQL: &str = include_str!("sql/sqlite/outbox_insert.sql");
-const OUTBOX_RECOVER_SQL: &str = include_str!("sql/sqlite/outbox_recover.sql");
-const SQLITE_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_claim_lease.sql");
-const SQLITE_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/sqlite/outbox_renew_lease.sql");
-const SQLITE_OUTBOX_MARK_PUBLISHED_SQL: &str = include_str!("sql/sqlite/outbox_mark_published.sql");
-const SQLITE_OUTBOX_SELECT_RETRY_COUNT_SQL: &str =
-    include_str!("sql/sqlite/outbox_select_retry_count.sql");
-const SQLITE_OUTBOX_MARK_FAILED_SQL: &str = include_str!("sql/sqlite/outbox_mark_failed.sql");
-const SQLITE_OUTBOX_PENDING_COUNT_SQL: &str = include_str!("sql/sqlite/outbox_pending_count.sql");
-const SQLITE_OUTBOX_PUBLISHED_COUNT_SQL: &str =
-    include_str!("sql/sqlite/outbox_published_count.sql");
-const SQLITE_OUTBOX_FAILED_COUNT_SQL: &str = include_str!("sql/sqlite/outbox_failed_count.sql");
-const SQLITE_OUTBOX_FETCH_FAILED_SQL: &str = include_str!("sql/sqlite/outbox_fetch_failed.sql");
-const SQLITE_OUTBOX_REPROCESS_FAILED_SQL: &str =
-    include_str!("sql/sqlite/outbox_reprocess_failed.sql");
-const SQLITE_OUTBOX_PURGE_PUBLISHED_SQL: &str =
-    include_str!("sql/sqlite/outbox_purge_published.sql");
+const OUTBOX_CLAIM_SQL: &str = rume_data::sql::SQLITE_OUTBOX_CLAIM;
+const INSERT_OUTBOX_SQL: &str = rume_data::sql::SQLITE_OUTBOX_INSERT;
+const OUTBOX_RECOVER_SQL: &str = rume_data::sql::SQLITE_OUTBOX_RECOVER;
+const SQLITE_OUTBOX_CLAIM_LEASE_SQL: &str = rume_data::sql::SQLITE_OUTBOX_CLAIM_LEASE;
+const SQLITE_OUTBOX_RENEW_LEASE_SQL: &str = rume_data::sql::SQLITE_OUTBOX_RENEW_LEASE;
+const SQLITE_OUTBOX_MARK_PUBLISHED_SQL: &str = rume_data::sql::SQLITE_OUTBOX_MARK_PUBLISHED;
+const SQLITE_OUTBOX_SELECT_RETRY_COUNT_SQL: &str = rume_data::sql::SQLITE_OUTBOX_SELECT_RETRY_COUNT;
+const SQLITE_OUTBOX_MARK_FAILED_SQL: &str = rume_data::sql::SQLITE_OUTBOX_MARK_FAILED;
+const SQLITE_OUTBOX_PENDING_COUNT_SQL: &str = rume_data::sql::SQLITE_OUTBOX_PENDING_COUNT;
+const SQLITE_OUTBOX_PUBLISHED_COUNT_SQL: &str = rume_data::sql::SQLITE_OUTBOX_PUBLISHED_COUNT;
+const SQLITE_OUTBOX_FAILED_COUNT_SQL: &str = rume_data::sql::SQLITE_OUTBOX_FAILED_COUNT;
+const SQLITE_OUTBOX_FETCH_FAILED_SQL: &str = rume_data::sql::SQLITE_OUTBOX_FETCH_FAILED;
+const SQLITE_OUTBOX_REPROCESS_FAILED_SQL: &str = rume_data::sql::SQLITE_OUTBOX_REPROCESS_FAILED;
+const SQLITE_OUTBOX_PURGE_PUBLISHED_SQL: &str = rume_data::sql::SQLITE_OUTBOX_PURGE_PUBLISHED;
 
 fn parse_sqlite_outbox_row(row: &SqliteRow) -> Result<OutboxMessage, OutboxError> {
     let id: String = row

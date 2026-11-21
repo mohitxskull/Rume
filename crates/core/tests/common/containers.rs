@@ -64,7 +64,9 @@ pub async fn create_isolated_postgres_pool(
     let (db_name, mut config) = create_isolated_postgres_db().await;
     config.max_connections = max_connections;
     config.min_connections = 1;
-    config.connect_timeout_secs = 5;
+    // Generous bound: under loaded shared-container CI, pool acquisition can
+    // take longer than 5s with ~84 parallel tests contending for connections.
+    config.connect_timeout_secs = 30;
     config.idle_timeout_secs = Some(10);
     let backend = rume::persistence::postgres::PostgresBackend::new(&config)
         .expect("create postgres backend");

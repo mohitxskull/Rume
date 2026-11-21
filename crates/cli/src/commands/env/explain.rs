@@ -74,7 +74,7 @@ pub fn run(key: &str, json: bool) {
     println!(
         "  {}: {}  ({})",
         source,
-        rume::helpers::truncate(&display_value, 60),
+        rume::util::truncate(&display_value, 60),
         source_type
     );
     if !from_file {

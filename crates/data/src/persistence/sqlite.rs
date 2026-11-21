@@ -15,12 +15,12 @@ use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 use crate::persistence::row::DbRow;
 
-const OUTBOX_SCHEMA: &str = include_str!("sql/sqlite/outbox_schema.sql");
-const MIGRATIONS_SCHEMA: &str = include_str!("sql/sqlite/migrations_schema.sql");
+const OUTBOX_SCHEMA: &str = include_str!("../../sql/sqlite/outbox_schema.sql");
+const MIGRATIONS_SCHEMA: &str = include_str!("../../sql/sqlite/migrations_schema.sql");
 
 // Per-operation SQLite SQL, externalized from inline string literals.
-const SQLITE_PING_SQL: &str = include_str!("sql/common/ping.sql");
-const SQLITE_AUDIT_INSERT_SQL: &str = include_str!("sql/sqlite/audit_insert.sql");
+const SQLITE_PING_SQL: &str = include_str!("../../sql/common/ping.sql");
+const SQLITE_AUDIT_INSERT_SQL: &str = include_str!("../../sql/sqlite/audit_insert.sql");
 
 /// Embedded SQLite database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]

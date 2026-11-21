@@ -621,7 +621,7 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
     // plus an already-applied app migration before upgrading to with_rume_core (#13 & #17).
     let upgrade_backend = SqliteBackend::in_memory().await.expect("sqlite in memory");
     upgrade_backend
-        .execute(rume::persistence::sql::SQLITE_AUDIT_SCHEMA)
+        .execute(rume::sql::SQLITE_AUDIT_SCHEMA)
         .await
         .expect("pre-create rume_audit_log");
     upgrade_backend
