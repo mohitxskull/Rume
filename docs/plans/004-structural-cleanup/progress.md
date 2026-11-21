@@ -63,4 +63,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 10: complete (verification only — no code changes, no commit; Phase 2 gate green — build 0, tests 40+26/0, depth 4, 109 SQL files, no messaging SQL, zero stale `persistence::sql::` refs)`
 - `Task 11: complete (e1cc583..95dc2aa, no review — user constraint)`
 - `Task 11: note: public path `rume::helpers` → `rume::util` (planned); 0 stale refs; `crates/foundation/src/helpers/` gone.`
-- `Task 12: pending`
+- `Task 12: complete (1c7e754..90bc5fd, no review — user constraint)`
+- `Task 12: minor (deferred): added a dedicated `excerpt_strips_html_comments` test (assertion moved out of an existing test body); original named tests retained — no behavior change.`
+- `Task 13: pending`
