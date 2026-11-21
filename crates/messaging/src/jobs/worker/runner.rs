@@ -16,7 +16,7 @@ use crate::jobs::reliability::{
 };
 
 use super::WorkerHandle;
-use super::heartbeat::{release_idempotency_token, spawn_lease_heartbeat};
+use super::heartbeat::{LeaseHeartbeatParams, release_idempotency_token, spawn_lease_heartbeat};
 use super::registry::{InFlightGuard, JobRegistry};
 
 /// Runtime status summary of a background job worker.
@@ -613,16 +613,16 @@ impl<Q: JobQueue> JobWorker<Q> {
         // ownership loss (`lease_lost`): a job that finishes cleanly during graceful shutdown while
         // its leases are still valid MUST be acked normally rather than dead-lettered.
         let lease_duration = job.lease_duration;
-        let hb = spawn_lease_heartbeat(
-            Arc::clone(&queue),
-            &job_id,
-            &token,
+        let hb = spawn_lease_heartbeat(LeaseHeartbeatParams {
+            queue: Arc::clone(&queue),
+            job_id: job_id.clone(),
+            token: token.clone(),
             stopping,
-            Arc::clone(&lost_leases),
-            idempotency_store.clone(),
-            effective_key.clone(),
+            lost_leases: Arc::clone(&lost_leases),
+            idempotency_store: idempotency_store.clone(),
+            effective_key: effective_key.clone(),
             lease_duration,
-        );
+        });
 
         let dispatch_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             registry.dispatch_with_cancellation(&job, Some(Arc::clone(&hb.job_cancelled)))

@@ -51,18 +51,35 @@ impl LeaseHeartbeat {
     }
 }
 
+/// Inputs captured from `JobWorker::execute_job` when the inline heartbeat block was
+/// extracted. Grouped into a single struct so the spawn function stays within
+/// `clippy::too_many_arguments` without an `#[allow]`.
+pub(super) struct LeaseHeartbeatParams<Q: JobQueue> {
+    pub(super) queue: Arc<Q>,
+    pub(super) job_id: String,
+    pub(super) token: String,
+    pub(super) stopping: Arc<AtomicBool>,
+    pub(super) lost_leases: Arc<AtomicU64>,
+    pub(super) idempotency_store: Option<Arc<dyn IdempotencyStore>>,
+    pub(super) effective_key: Option<String>,
+    pub(super) lease_duration: Duration,
+}
+
 /// Spawns the per-job lease-heartbeat task while the job executes (moved from
 /// `JobWorker::execute_job`).
 pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
-    queue: Arc<Q>,
-    job_id: &str,
-    token: &str,
-    stopping: Arc<AtomicBool>,
-    lost_leases: Arc<AtomicU64>,
-    idempotency_store: Option<Arc<dyn IdempotencyStore>>,
-    effective_key: Option<String>,
-    lease_duration: Duration,
+    params: LeaseHeartbeatParams<Q>,
 ) -> LeaseHeartbeat {
+    let LeaseHeartbeatParams {
+        queue,
+        job_id,
+        token,
+        stopping,
+        lost_leases,
+        idempotency_store,
+        effective_key,
+        lease_duration,
+    } = params;
     let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
     let lease_lost = Arc::new(AtomicBool::new(false));
     let extend_idempotency = Arc::new(AtomicBool::new(true));
