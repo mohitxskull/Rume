@@ -17,7 +17,7 @@ use subtle::ConstantTimeEq;
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::safe_equal;
+/// use rume_foundation::util::safe_equal;
 ///
 /// assert!(safe_equal("secret_token", "secret_token"));
 /// assert!(!safe_equal("secret_token", "wrong_token"));

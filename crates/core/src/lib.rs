@@ -9,7 +9,7 @@
 //!
 //! Rume categorizes its subsystem APIs into explicit stability tiers with concrete pre-1.0 contracts:
 //!
-//! - **Stable (Tier 1)**: Core HTTP shell, application lifecycle, typed configuration, RFC 9457 error contracts, and module composition (`app`, `config`, `env`, `error`, `module`, `routing`, `helpers`).
+//! - **Stable (Tier 1)**: Core HTTP shell, application lifecycle, typed configuration, RFC 9457 error contracts, and module composition (`app`, `config`, `env`, `error`, `module`, `routing`, `util`).
 //!   *Contract:* Frozen API contracts. Breaking changes require major or exceptional minor transitions with explicit migration pathways.
 //! - **Evolving (Tier 2)**: Persistence, caching, resilience, background jobs, transactional outbox, and security headers (`persistence`, `cache`, `resilience`, `jobs`, `outbox`, `security`, `auth`).
 //!   *Contract:* Controlled evolution. Backwards-compatible across minor iterations with deprecation notices before API retirement.
@@ -28,7 +28,7 @@ pub use rume_enterprise::saga;
 pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
-pub use rume_foundation::helpers;
+pub use rume_foundation::util;
 pub use rume_http::openapi;
 pub use rume_http::resilience;
 pub use rume_http::validation;

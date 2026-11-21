@@ -4,7 +4,7 @@ pub fn run(name: &str) {
     super::validate_identifier(name, "resource");
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
-    let struct_name = rume::helpers::pascal_case(&module_name);
+    let struct_name = rume::util::pascal_case(&module_name);
 
     let handler_path = format!("src/handlers/{module_name}.rs");
     if std::path::Path::new(&handler_path).exists() {
@@ -227,7 +227,7 @@ mod tests {
         ];
         for (input, expected_module, expected_struct) in cases {
             let module_name = input.to_ascii_lowercase().replace('-', "_");
-            let struct_name = rume::helpers::pascal_case(&module_name);
+            let struct_name = rume::util::pascal_case(&module_name);
             assert_eq!(module_name, expected_module);
             assert_eq!(struct_name, expected_struct);
         }

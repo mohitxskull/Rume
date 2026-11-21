@@ -33,7 +33,7 @@ pub enum ParseBytesError {
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::format_bytes;
+/// use rume_foundation::util::format_bytes;
 ///
 /// assert_eq!(format_bytes(512), "512 B");
 /// assert_eq!(format_bytes(1024), "1 KiB");
@@ -70,7 +70,7 @@ pub fn format_bytes(bytes: u64) -> String {
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::parse_bytes;
+/// use rume_foundation::util::parse_bytes;
 ///
 /// assert_eq!(parse_bytes("1024").unwrap(), 1024);
 /// assert_eq!(parse_bytes("500 B").unwrap(), 500);

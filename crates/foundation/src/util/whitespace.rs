@@ -9,7 +9,7 @@ use std::borrow::Cow;
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::condense_whitespace;
+/// use rume_foundation::util::condense_whitespace;
 ///
 /// assert_eq!(condense_whitespace("hello   world"), "hello world");
 /// assert_eq!(condense_whitespace("\n\t  hello \n world \t "), "hello world");

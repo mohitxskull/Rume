@@ -11,7 +11,7 @@ use axum::response::IntoResponse;
 use tower::{Layer, Service};
 
 use rume_foundation::error::AppError;
-use rume_foundation::helpers::safe_equal;
+use rume_foundation::util::safe_equal;
 
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);

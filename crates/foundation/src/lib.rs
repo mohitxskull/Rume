@@ -6,10 +6,10 @@ pub mod config;
 pub mod env;
 pub mod error;
 pub mod health;
-pub mod helpers;
 pub mod paths;
 pub mod state;
 pub mod telemetry;
+pub mod util;
 
 pub use error::{AppError, ValidationErrorDetail};
 pub use health::{

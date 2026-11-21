@@ -13,7 +13,7 @@ use super::whitespace::condense_whitespace;
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::escape_html;
+/// use rume_foundation::util::escape_html;
 ///
 /// assert_eq!(escape_html("Hello World"), "Hello World");
 /// assert_eq!(
@@ -55,7 +55,7 @@ pub fn escape_html(input: &str) -> Cow<'_, str> {
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::strip_html_tags;
+/// use rume_foundation::util::strip_html_tags;
 ///
 /// assert_eq!(
 ///     strip_html_tags("<p>Hello <strong>World</strong>!</p>"),
@@ -244,7 +244,7 @@ pub fn strip_html_tags(input: &str) -> Cow<'_, str> {
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::excerpt;
+/// use rume_foundation::util::excerpt;
 ///
 /// let html = "<p>Rume is an <strong>explicit</strong> application shell for Axum.</p>";
 /// assert_eq!(excerpt(html, 25), "Rume is an explicit ap...");

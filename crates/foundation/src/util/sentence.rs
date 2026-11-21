@@ -7,7 +7,7 @@
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::to_sentence;
+/// use rume_foundation::util::to_sentence;
 ///
 /// assert_eq!(to_sentence(&["apple"]), "apple");
 /// assert_eq!(to_sentence(&["apple", "banana"]), "apple and banana");
@@ -22,7 +22,7 @@ pub fn to_sentence<T: AsRef<str>>(items: &[T]) -> String {
 /// # Examples
 ///
 /// ```
-/// use rume_foundation::helpers::to_sentence_with;
+/// use rume_foundation::util::to_sentence_with;
 ///
 /// let items = &["red", "green", "blue"];
 /// assert_eq!(to_sentence_with(items, ", ", ", or "), "red, green, or blue");
