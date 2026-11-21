@@ -1,3 +1,4 @@
+use super::heartbeat::{LeaseHeartbeatParams, spawn_lease_heartbeat};
 use super::*;
 use crate::jobs::job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
 use crate::jobs::retry::RetryPolicy;
@@ -1969,4 +1970,99 @@ async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
 
     assert_eq!(dlq_count.load(Ordering::SeqCst), 1);
     assert_eq!(ack_count.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
+    #[derive(Debug)]
+    struct SlowRenewQueue;
+
+    impl JobQueue for SlowRenewQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async { Ok("id".into()) })
+        }
+        fn dequeue_for(
+            &self,
+            _worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn renew_lease(
+            &self,
+            _job_id: &str,
+            _lease_token: &str,
+            _extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async {
+                // Simulate a busy queue backend under load: the renewal completes
+                // successfully, but takes longer than one heartbeat tick interval.
+                tokio::time::sleep(Duration::from_millis(350)).await;
+                Ok(())
+            })
+        }
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    let lost_leases = Arc::new(AtomicU64::new(0));
+    let hb = spawn_lease_heartbeat(LeaseHeartbeatParams {
+        queue: Arc::new(SlowRenewQueue),
+        job_id: "job-slow-renew".to_string(),
+        token: "token-slow-renew".to_string(),
+        stopping: Arc::new(AtomicBool::new(false)),
+        lost_leases: Arc::clone(&lost_leases),
+        idempotency_store: None,
+        effective_key: None,
+        lease_duration: Duration::from_millis(600),
+    });
+
+    // The 350ms renewal outlasts the ~200ms tick interval but completes well within
+    // the 600ms lease. It must not be classified as an ownership loss.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        !hb.lease_lost.load(Ordering::SeqCst),
+        "a renewal that completes within the lease must not be reported as lease loss"
+    );
+    assert_eq!(
+        lost_leases.load(Ordering::SeqCst),
+        0,
+        "a renewal that completes within the lease must not increment lost_leases"
+    );
+
+    hb.finish().await;
 }

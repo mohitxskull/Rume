@@ -366,8 +366,11 @@ impl JobQueue for PostgresJobQueue {
         let jid = job_id.to_string();
         let token = lease_token.to_string();
         Box::pin(async move {
-            // Both the new expiry and the validity check use clock_timestamp() so all
-            // lease decisions are made by the database clock, not the worker clock.
+            // The new expiry uses clock_timestamp() so lease timing is decided by the
+            // database clock, not the worker clock. Ownership is fenced by the lease
+            // token and in_flight status only: a reclaim changes the token, so a stale
+            // worker cannot renew a job that no longer belongs to it even if its lease
+            // timestamp has passed.
             let extension_ms = i64::try_from(extension.as_millis()).unwrap_or(i64::MAX);
 
             let res = sqlx::query(JOBS_RENEW_LEASE_SQL)
@@ -380,7 +383,7 @@ impl JobQueue for PostgresJobQueue {
 
             if res.rows_affected() == 0 {
                 return Err(JobError::Fatal(format!(
-                    "cannot renew lease for job {jid}: lease expired or invalid token"
+                    "cannot renew lease for job {jid}: invalid lease token or job no longer in flight"
                 )));
             }
 

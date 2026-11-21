@@ -103,6 +103,11 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
     let hb_interval = (lease_duration / 3)
         .max(Duration::from_millis(20))
         .min(Duration::from_secs(20));
+    // Why: bound each renewal I/O call by one lease duration (the actual ownership
+    // horizon) so a hung DB/Redis connection cannot hold `hb_tick_lock` indefinitely
+    // and stall finalization. A renewal that completes within the lease is not a
+    // failure, even when it outlasts one heartbeat tick interval.
+    let renewal_timeout = lease_duration.max(Duration::from_millis(50));
     let renew_extension = lease_duration.max(Duration::from_secs(60));
 
     let heartbeat_handle = tokio::spawn(async move {
@@ -119,10 +124,6 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
                 }
                 _ = interval.tick() => {
                     let _tick_guard = hb_tick_lock_task.lock().await;
-                    // Why: bound each renewal I/O call so a hung DB/Redis connection cannot
-                    // hold `hb_tick_lock` indefinitely and stall finalization; a timed-out
-                    // renewal is treated as ownership loss (unless the transition already committed).
-                    let renewal_timeout = hb_interval.max(Duration::from_millis(50));
                     let renew_res = match tokio::time::timeout(
                         renewal_timeout,
                         hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension),
