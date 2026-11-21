@@ -50,4 +50,7 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 05: complete (6099528..a160a36, no review — user constraint)`
 - `Task 05: minor (deferred): pre-existing warning noted by implementer — `sanitize_non_nested_block_comments` never used (`backend.rs:379`); verified pre-existing on the pristine tree via `git stash` + rerun; out of scope (task 06's bridge re-exports it — reconcile during task 06).`
 - `Task 06: attempt failed (ses_e070a3a46ffet9FTQT7bEzw6MJ): implementer errored with "Free usage limit reached" (environmental, not code/plan). On-disk partial work: `backend.rs` deleted, `backend/{mod.rs (463), validation.rs (1025)}` untracked, no report. Ruling: re-dispatch a fresh implementer to inspect, finish, verify, and report; no rollback (files present, plausible sizes).`
-- `Task 06: pending (re-dispatched)`
+- `Task 06: complete (a160a36..6c762a4, no review — user constraint; retry after environmental failure)`
+- `Task 06: minor (deferred): 3 latent fixes by retry implementer — cfg-gated `PersistenceError` import, trait imports in moved tests, rustfmt bridge; 4 cfg-gated `pub(crate) use` statements instead of one grouped import (required by per-function cfgs); verified via `-D warnings` build, all-features clippy + tests 40/0.`
+- `Task 05: minor (deferred): `cargo fmt --all --check` reports diffs in `crates/data/src/persistence/migration/preflight.rs` (long `include_str!` consts after the path rewrite; task-05 file) — task-06 implementer flagged a related fmt issue in `tests.rs`; actual diffs are in `preflight.rs`. Fix at end of plan.`
+- `Task 07: pending`
