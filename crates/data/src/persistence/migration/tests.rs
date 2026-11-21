@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
-use super::*;
 use super::preflight::{
-    MYSQL_CORE_DOWN, MYSQL_MIGRATION_DELETE, MYSQL_MIGRATION_FIND_CHECKSUM,
-    MYSQL_MIGRATION_FIND_ID, MYSQL_MIGRATION_INSERT, MYSQL_CLOCK, NEXT_APPLIED_ORDER_SQL,
-    PG_CORE_DOWN, select_rollback_target, SQLITE_CORE_DOWN, SQLITE_MIGRATION_FIND_CHECKSUM,
-    SQLITE_MIGRATION_INSERT,
+    MYSQL_CLOCK, MYSQL_CORE_DOWN, MYSQL_MIGRATION_DELETE, MYSQL_MIGRATION_FIND_CHECKSUM,
+    MYSQL_MIGRATION_FIND_ID, MYSQL_MIGRATION_INSERT, NEXT_APPLIED_ORDER_SQL, PG_CORE_DOWN,
+    SQLITE_CORE_DOWN, SQLITE_MIGRATION_FIND_CHECKSUM, SQLITE_MIGRATION_INSERT,
+    select_rollback_target,
 };
+use super::*;
 use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::error::PersistenceError;
 use crate::persistence::row::DbRow;
@@ -470,8 +470,7 @@ async fn generic_backend_fallback_ensures_applied_order_column_before_insert() {
     let alter_idx = log
         .iter()
         .position(|s| {
-            s.starts_with("ALTER TABLE rume_migrations ADD COLUMN")
-                && s.contains("applied_order")
+            s.starts_with("ALTER TABLE rume_migrations ADD COLUMN") && s.contains("applied_order")
         })
         .expect("ALTER TABLE ... ADD COLUMN applied_order must run on legacy ledger");
     let max_order_idx = log

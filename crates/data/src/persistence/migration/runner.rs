@@ -2,18 +2,18 @@
 //! loops over the dialect-specific backends and the MySQL session-locking helpers.
 
 use super::preflight::{
-    delete_migration_query, ensure_applied_order_column_backend, ensure_applied_order_column_tx,
+    LIST_APPLIED_MIGRATIONS_SQL, MYSQL_AUDIT, MYSQL_CORE_DOWN, MYSQL_OUTBOX, PG_ADVISORY_LOCK,
+    PG_AUDIT, PG_CLOCK, PG_CORE_DOWN, PG_JOBS, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT,
+    SQLITE_BUSY_TIMEOUT, SQLITE_CLOCK, SQLITE_CORE_DOWN, SQLITE_OUTBOX, delete_migration_query,
+    ensure_applied_order_column_backend, ensure_applied_order_column_tx,
     fetch_applied_order_rows_tx, find_checksum_query, find_migration_id_query,
-    insert_migration_query, LIST_APPLIED_MIGRATIONS_SQL, migrations_schema_ddl,
-    next_applied_order_tx, parse_clock_or_now, select_rollback_target, PG_ADVISORY_LOCK, PG_CLOCK,
-    PG_OUTBOX, PG_JOBS, PG_LOCKS, PG_LEADER, PG_AUDIT, PG_CORE_DOWN, MYSQL_OUTBOX, MYSQL_AUDIT,
-    MYSQL_CORE_DOWN, SQLITE_OUTBOX, SQLITE_AUDIT, SQLITE_CORE_DOWN, SQLITE_BUSY_TIMEOUT,
-    SQLITE_CLOCK,
+    insert_migration_query, migrations_schema_ddl, next_applied_order_tx, parse_clock_or_now,
+    select_rollback_target,
 };
 #[cfg(feature = "mysql")]
 use super::preflight::{
-    ensure_applied_order_column_mysql, fetch_applied_order_rows_mysql, MYSQL_CLOCK,
-    MYSQL_MIGRATION_LOCK, MYSQL_MIGRATION_UNLOCK, next_applied_order_mysql,
+    MYSQL_CLOCK, MYSQL_MIGRATION_LOCK, MYSQL_MIGRATION_UNLOCK, ensure_applied_order_column_mysql,
+    fetch_applied_order_rows_mysql, next_applied_order_mysql,
 };
 use crate::persistence::backend::{DatabaseBackend, DatabaseTransaction, DbValue};
 use crate::persistence::error::PersistenceError;
