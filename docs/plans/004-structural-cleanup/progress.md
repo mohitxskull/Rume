@@ -49,4 +49,5 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 04: minor (deferred): public module path `rume::enterprise::saml` moved to `rume::saml` (module now at crate root; `src/enterprise/` now nests only `scim.rs` — the Phase 4 "double enterprise" note); no consumers of the old module path (grep `enterprise::saml` empty); type paths (`rume::enterprise::SamlParser`) still resolve — verified via `cargo test -p rume --features enterprise` green.`
 - `Task 05: complete (6099528..a160a36, no review — user constraint)`
 - `Task 05: minor (deferred): pre-existing warning noted by implementer — `sanitize_non_nested_block_comments` never used (`backend.rs:379`); verified pre-existing on the pristine tree via `git stash` + rerun; out of scope (task 06's bridge re-exports it — reconcile during task 06).`
-- `Task 06: pending`
+- `Task 06: attempt failed (ses_e070a3a46ffet9FTQT7bEzw6MJ): implementer errored with "Free usage limit reached" (environmental, not code/plan). On-disk partial work: `backend.rs` deleted, `backend/{mod.rs (463), validation.rs (1025)}` untracked, no report. Ruling: re-dispatch a fresh implementer to inspect, finish, verify, and report; no rollback (files present, plausible sizes).`
+- `Task 06: pending (re-dispatched)`
