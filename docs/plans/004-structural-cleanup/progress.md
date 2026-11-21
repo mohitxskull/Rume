@@ -66,4 +66,6 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 12: complete (1c7e754..90bc5fd, no review — user constraint)`
 - `Task 12: minor (deferred): added a dedicated `excerpt_strips_html_comments` test (assertion moved out of an existing test body); original named tests retained — no behavior change.`
 - `Task 13: complete (verification only — empty `./tmp/` removed with `rmdir`; no git diff, no commit; no stale refs)`
-- `Task 14: pending`
+- `Task 14: complete (ba7d81d..5255689, no review — user constraint)`
+- `Task 14: minor (deferred): task's `with_pending_rollouts` → `with_pending_rollbacks` rename was already at HEAD; only `pub(super)` visibility change needed — verified, no behavior change.`
+- `All 14 tasks complete — proceeding to deferred-minor cleanup (rustfmt on task-05 migration files) before final report.`
