@@ -70,3 +70,4 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 14: minor (deferred): task's `with_pending_rollouts` → `with_pending_rollbacks` rename was already at HEAD; only `pub(super)` visibility change needed — verified, no behavior change.`
 - `All 14 tasks complete — proceeding to deferred-minor cleanup (rustfmt on task-05 migration files) before final report.`
 - `Cleanup: rustfmt applied to `crates/data/src/persistence/migration/{runner.rs,tests.rs}` — `cargo fmt --all --check` clean, `cargo build` 0, `cargo test -p rume-data` 31/0. Resolves the Task 05 deferred-minor fmt finding.`
+- `Follow-up 1 (dead_code): root cause — stale `test` arm on the wrapper cfg (`validation.rs:45`) while its only consumer bridge (`backend/mod.rs:349`) is sqlite-gated; fixed by narrowing to `#[cfg(feature = "sqlite")]`. Verified independently: default `cargo test -p rume-data` 31/0 with no warning, `--features sqlite` 40/0, clippy/build/fmt green.`

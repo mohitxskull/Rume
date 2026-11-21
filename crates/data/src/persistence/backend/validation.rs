@@ -42,7 +42,7 @@ fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), Persistence
 /// the first `*/` guarantees C-style non-nested closing semantics across SQLite/MySQL without
 /// relying on dialect flag defaults). Returns `Result` so callers propagate any validation
 /// failure without `expect()` in production code.
-#[cfg(any(feature = "sqlite", test))]
+#[cfg(feature = "sqlite")]
 pub(crate) fn sanitize_non_nested_block_comments<'a>(
     statement: &'a str,
     dialect: &dyn sqlparser::dialect::Dialect,
