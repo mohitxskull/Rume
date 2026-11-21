@@ -54,4 +54,5 @@ Base: `abf14328ec1b023f5b1334f01d5ebc0ad4b7c428`
 - `Task 06: minor (deferred): 3 latent fixes by retry implementer — cfg-gated `PersistenceError` import, trait imports in moved tests, rustfmt bridge; 4 cfg-gated `pub(crate) use` statements instead of one grouped import (required by per-function cfgs); verified via `-D warnings` build, all-features clippy + tests 40/0.`
 - `Task 05: minor (deferred): `cargo fmt --all --check` reports diffs in `crates/data/src/persistence/migration/preflight.rs` (long `include_str!` consts after the path rewrite; task-05 file) — task-06 implementer flagged a related fmt issue in `tests.rs`; actual diffs are in `preflight.rs`. Fix at end of plan.`
 - `Task 07: complete (0b4552f..eed0115, no review — user constraint)`
-- `Task 08: pending`
+- `Task 08: complete (4e9412d..3d7d0b3, no review — user constraint)`
+- `Task 09: pending`
