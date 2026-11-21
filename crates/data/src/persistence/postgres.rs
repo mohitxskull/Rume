@@ -13,12 +13,12 @@ use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 use crate::persistence::row::DbRow;
 
-pub const OUTBOX_TABLE_SCHEMA: &str = include_str!("sql/postgres/outbox_schema.sql");
-const MIGRATIONS_SCHEMA: &str = include_str!("sql/postgres/migrations_schema.sql");
+pub const OUTBOX_TABLE_SCHEMA: &str = include_str!("../../sql/postgres/outbox_schema.sql");
+const MIGRATIONS_SCHEMA: &str = include_str!("../../sql/postgres/migrations_schema.sql");
 
 // Per-operation PostgreSQL SQL, externalized from inline string literals.
-const PG_PING_SQL: &str = include_str!("sql/common/ping.sql");
-const PG_AUDIT_INSERT_SQL: &str = include_str!("sql/postgres/audit_insert.sql");
+const PG_PING_SQL: &str = include_str!("../../sql/common/ping.sql");
+const PG_AUDIT_INSERT_SQL: &str = include_str!("../../sql/postgres/audit_insert.sql");
 
 /// Untyped SQL `NULL` bind parameter for PostgreSQL.
 ///

@@ -11,27 +11,25 @@ use crate::outbox::{
     TransactionalOutbox,
 };
 
-const OUTBOX_CLAIM_SQL: &str = include_str!("sql/postgres/outbox_claim.sql");
+const OUTBOX_CLAIM_SQL: &str = rume_data::sql::PG_OUTBOX_CLAIM;
 // Why: `fetch_pending` is a non-claiming read inspection path, whereas
 // `claim_pending_with_lease` owns `FOR UPDATE SKIP LOCKED`. Using a plain
 // `SELECT` keeps `fetch_pending` from acquiring row locks in autocommit or
 // skipping rows currently locked by in-flight claim transactions.
-const OUTBOX_FETCH_PENDING_SQL: &str = include_str!("sql/postgres/outbox_fetch_pending.sql");
-const INSERT_OUTBOX_SQL: &str = include_str!("sql/postgres/outbox_insert.sql");
-const OUTBOX_RECOVER_SQL: &str = include_str!("sql/postgres/outbox_recover.sql");
-const PG_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/postgres/outbox_claim_lease.sql");
-const PG_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/postgres/outbox_renew_lease.sql");
-const PG_OUTBOX_MARK_PUBLISHED_SQL: &str = include_str!("sql/postgres/outbox_mark_published.sql");
-const PG_OUTBOX_SELECT_RETRY_COUNT_SQL: &str =
-    include_str!("sql/postgres/outbox_select_retry_count.sql");
-const PG_OUTBOX_MARK_FAILED_SQL: &str = include_str!("sql/postgres/outbox_mark_failed.sql");
-const PG_OUTBOX_PENDING_COUNT_SQL: &str = include_str!("sql/postgres/outbox_pending_count.sql");
-const PG_OUTBOX_PUBLISHED_COUNT_SQL: &str = include_str!("sql/postgres/outbox_published_count.sql");
-const PG_OUTBOX_FAILED_COUNT_SQL: &str = include_str!("sql/postgres/outbox_failed_count.sql");
-const PG_OUTBOX_FETCH_FAILED_SQL: &str = include_str!("sql/postgres/outbox_fetch_failed.sql");
-const PG_OUTBOX_REPROCESS_FAILED_SQL: &str =
-    include_str!("sql/postgres/outbox_reprocess_failed.sql");
-const PG_OUTBOX_PURGE_PUBLISHED_SQL: &str = include_str!("sql/postgres/outbox_purge_published.sql");
+const OUTBOX_FETCH_PENDING_SQL: &str = rume_data::sql::PG_OUTBOX_FETCH_PENDING;
+const INSERT_OUTBOX_SQL: &str = rume_data::sql::PG_OUTBOX_INSERT;
+const OUTBOX_RECOVER_SQL: &str = rume_data::sql::PG_OUTBOX_RECOVER;
+const PG_OUTBOX_CLAIM_LEASE_SQL: &str = rume_data::sql::PG_OUTBOX_CLAIM_LEASE;
+const PG_OUTBOX_RENEW_LEASE_SQL: &str = rume_data::sql::PG_OUTBOX_RENEW_LEASE;
+const PG_OUTBOX_MARK_PUBLISHED_SQL: &str = rume_data::sql::PG_OUTBOX_MARK_PUBLISHED;
+const PG_OUTBOX_SELECT_RETRY_COUNT_SQL: &str = rume_data::sql::PG_OUTBOX_SELECT_RETRY_COUNT;
+const PG_OUTBOX_MARK_FAILED_SQL: &str = rume_data::sql::PG_OUTBOX_MARK_FAILED;
+const PG_OUTBOX_PENDING_COUNT_SQL: &str = rume_data::sql::PG_OUTBOX_PENDING_COUNT;
+const PG_OUTBOX_PUBLISHED_COUNT_SQL: &str = rume_data::sql::PG_OUTBOX_PUBLISHED_COUNT;
+const PG_OUTBOX_FAILED_COUNT_SQL: &str = rume_data::sql::PG_OUTBOX_FAILED_COUNT;
+const PG_OUTBOX_FETCH_FAILED_SQL: &str = rume_data::sql::PG_OUTBOX_FETCH_FAILED;
+const PG_OUTBOX_REPROCESS_FAILED_SQL: &str = rume_data::sql::PG_OUTBOX_REPROCESS_FAILED;
+const PG_OUTBOX_PURGE_PUBLISHED_SQL: &str = rume_data::sql::PG_OUTBOX_PURGE_PUBLISHED;
 
 fn parse_postgres_outbox_row(row: &PgRow) -> Result<OutboxMessage, OutboxError> {
     let id: String = row

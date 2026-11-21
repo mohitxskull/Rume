@@ -20,23 +20,23 @@ fn current_epoch_millis() -> i64 {
         .as_millis() as i64
 }
 
-const JOBS_SCHEMA: &str = rume_data::persistence::sql::PG_JOBS_SCHEMA;
-const JOBS_CLAIM_SQL: &str = include_str!("sql/postgres/jobs_claim.sql");
-const INSERT_JOB_SQL: &str = include_str!("sql/postgres/jobs_insert.sql");
-const JOBS_REAP_SQL: &str = include_str!("sql/postgres/jobs_reap.sql");
+const JOBS_SCHEMA: &str = rume_data::sql::PG_JOBS_SCHEMA;
+const JOBS_CLAIM_SQL: &str = rume_data::sql::PG_JOBS_CLAIM;
+const INSERT_JOB_SQL: &str = rume_data::sql::PG_JOBS_INSERT;
+const JOBS_REAP_SQL: &str = rume_data::sql::PG_JOBS_REAP;
 
 // Per-operation jobs SQL, externalized from inline string literals.
-const JOBS_PENDING_COUNT_SQL: &str = include_str!("sql/postgres/jobs_pending_count.sql");
-const JOBS_DEAD_LETTER_COUNT_SQL: &str = include_str!("sql/postgres/jobs_dead_letter_count.sql");
-const JOBS_IDEMPOTENCY_CHECK_SQL: &str = include_str!("sql/postgres/jobs_idempotency_check.sql");
-const JOBS_ACK_SQL: &str = include_str!("sql/postgres/jobs_ack.sql");
-const JOBS_NACK_SQL: &str = include_str!("sql/postgres/jobs_nack.sql");
-const JOBS_DEFER_SQL: &str = include_str!("sql/postgres/jobs_defer.sql");
-const JOBS_DEAD_LETTER_SQL: &str = include_str!("sql/postgres/jobs_dead_letter.sql");
-const JOBS_RENEW_LEASE_SQL: &str = include_str!("sql/postgres/jobs_renew_lease.sql");
-const JOBS_LIST_DEAD_LETTERS_SQL: &str = include_str!("sql/postgres/jobs_list_dead_letters.sql");
-const JOBS_REPLAY_DEAD_LETTER_SQL: &str = include_str!("sql/postgres/jobs_replay_dead_letter.sql");
-const JOBS_PURGE_SQL: &str = include_str!("sql/postgres/jobs_purge.sql");
+const JOBS_PENDING_COUNT_SQL: &str = rume_data::sql::PG_JOBS_PENDING_COUNT;
+const JOBS_DEAD_LETTER_COUNT_SQL: &str = rume_data::sql::PG_JOBS_DEAD_LETTER_COUNT;
+const JOBS_IDEMPOTENCY_CHECK_SQL: &str = rume_data::sql::PG_JOBS_IDEMPOTENCY_CHECK;
+const JOBS_ACK_SQL: &str = rume_data::sql::PG_JOBS_ACK;
+const JOBS_NACK_SQL: &str = rume_data::sql::PG_JOBS_NACK;
+const JOBS_DEFER_SQL: &str = rume_data::sql::PG_JOBS_DEFER;
+const JOBS_DEAD_LETTER_SQL: &str = rume_data::sql::PG_JOBS_DEAD_LETTER;
+const JOBS_RENEW_LEASE_SQL: &str = rume_data::sql::PG_JOBS_RENEW_LEASE;
+const JOBS_LIST_DEAD_LETTERS_SQL: &str = rume_data::sql::PG_JOBS_LIST_DEAD_LETTERS;
+const JOBS_REPLAY_DEAD_LETTER_SQL: &str = rume_data::sql::PG_JOBS_REPLAY_DEAD_LETTER;
+const JOBS_PURGE_SQL: &str = rume_data::sql::PG_JOBS_PURGE;
 
 /// Production PostgreSQL-backed implementation of [`JobQueue`].
 #[derive(Clone)]

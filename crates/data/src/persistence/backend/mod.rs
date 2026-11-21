@@ -13,11 +13,11 @@ use crate::persistence::row::DbRow;
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 /// Default audit log insert SQL for PostgreSQL backend.
-const BACKEND_AUDIT_INSERT_POSTGRES: &str = include_str!("../sql/postgres/audit_insert.sql");
+const BACKEND_AUDIT_INSERT_POSTGRES: &str = include_str!("../../../sql/postgres/audit_insert.sql");
 /// Default audit log insert SQL for MySQL backend.
-const BACKEND_AUDIT_INSERT_MYSQL: &str = include_str!("../sql/mysql/audit_insert.sql");
+const BACKEND_AUDIT_INSERT_MYSQL: &str = include_str!("../../../sql/mysql/audit_insert.sql");
 /// Default audit log insert SQL for SQLite backend.
-const BACKEND_AUDIT_INSERT_SQLITE: &str = include_str!("../sql/sqlite/audit_insert.sql");
+const BACKEND_AUDIT_INSERT_SQLITE: &str = include_str!("../../../sql/sqlite/audit_insert.sql");
 
 /// A portable SQL parameter value supported across database backends.
 #[derive(Debug, Clone, PartialEq)]

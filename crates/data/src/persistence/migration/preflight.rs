@@ -9,24 +9,27 @@ use crate::persistence::error::PersistenceError;
 #[cfg(feature = "mysql")]
 use super::runner::{mysql_conn_execute_raw, mysql_conn_query_scalar_params};
 
-pub(super) const PG_OUTBOX: &str = include_str!("../sql/postgres/outbox_schema.sql");
-pub(super) const PG_JOBS: &str = include_str!("../sql/postgres/jobs_schema.sql");
-pub(super) const PG_LOCKS: &str = include_str!("../sql/postgres/locks_schema.sql");
-pub(super) const PG_LEADER: &str = include_str!("../sql/postgres/leader_schema.sql");
-pub(super) const PG_AUDIT: &str = include_str!("../sql/postgres/audit_schema.sql");
-pub(super) const PG_CORE_DOWN: &str = include_str!("../sql/postgres/core_down.sql");
+pub(super) const PG_OUTBOX: &str = include_str!("../../../sql/postgres/outbox_schema.sql");
+pub(super) const PG_JOBS: &str = include_str!("../../../sql/postgres/jobs_schema.sql");
+pub(super) const PG_LOCKS: &str = include_str!("../../../sql/postgres/locks_schema.sql");
+pub(super) const PG_LEADER: &str = include_str!("../../../sql/postgres/leader_schema.sql");
+pub(super) const PG_AUDIT: &str = include_str!("../../../sql/postgres/audit_schema.sql");
+pub(super) const PG_CORE_DOWN: &str = include_str!("../../../sql/postgres/core_down.sql");
 
-pub(super) const MYSQL_OUTBOX: &str = include_str!("../sql/mysql/outbox_schema.sql");
-pub(super) const MYSQL_AUDIT: &str = include_str!("../sql/mysql/audit_schema.sql");
-pub(super) const MYSQL_CORE_DOWN: &str = include_str!("../sql/mysql/core_down.sql");
+pub(super) const MYSQL_OUTBOX: &str = include_str!("../../../sql/mysql/outbox_schema.sql");
+pub(super) const MYSQL_AUDIT: &str = include_str!("../../../sql/mysql/audit_schema.sql");
+pub(super) const MYSQL_CORE_DOWN: &str = include_str!("../../../sql/mysql/core_down.sql");
 
-pub(super) const SQLITE_OUTBOX: &str = include_str!("../sql/sqlite/outbox_schema.sql");
-pub(super) const SQLITE_AUDIT: &str = include_str!("../sql/sqlite/audit_schema.sql");
-pub(super) const SQLITE_CORE_DOWN: &str = include_str!("../sql/sqlite/core_down.sql");
+pub(super) const SQLITE_OUTBOX: &str = include_str!("../../../sql/sqlite/outbox_schema.sql");
+pub(super) const SQLITE_AUDIT: &str = include_str!("../../../sql/sqlite/audit_schema.sql");
+pub(super) const SQLITE_CORE_DOWN: &str = include_str!("../../../sql/sqlite/core_down.sql");
 
-pub(super) const PG_MIGRATIONS_SCHEMA: &str = include_str!("../sql/postgres/migrations_schema.sql");
-pub(super) const MYSQL_MIGRATIONS_SCHEMA: &str = include_str!("../sql/mysql/migrations_schema.sql");
-pub(super) const SQLITE_MIGRATIONS_SCHEMA: &str = include_str!("../sql/sqlite/migrations_schema.sql");
+pub(super) const PG_MIGRATIONS_SCHEMA: &str =
+    include_str!("../../../sql/postgres/migrations_schema.sql");
+pub(super) const MYSQL_MIGRATIONS_SCHEMA: &str =
+    include_str!("../../../sql/mysql/migrations_schema.sql");
+pub(super) const SQLITE_MIGRATIONS_SCHEMA: &str =
+    include_str!("../../../sql/sqlite/migrations_schema.sql");
 
 /// Canonical DDL for the migration tracking ledger table across all database backends.
 pub(super) const CREATE_MIGRATIONS_TABLE_DDL: &str = PG_MIGRATIONS_SCHEMA;
@@ -42,31 +45,48 @@ pub(super) fn migrations_schema_ddl(dialect: &str) -> &'static str {
 }
 
 // Per-dialect migration query SQL, externalized from inline string literals.
-pub(super) const PG_MIGRATION_FIND_CHECKSUM: &str = include_str!("../sql/postgres/migration_find_checksum.sql");
-pub(super) const PG_MIGRATION_INSERT: &str = include_str!("../sql/postgres/migration_insert.sql");
-pub(super) const PG_MIGRATION_DELETE: &str = include_str!("../sql/postgres/migration_delete.sql");
-pub(super) const PG_MIGRATION_FIND_ID: &str = include_str!("../sql/postgres/migration_find_id.sql");
-pub(super) const PG_MIGRATION_LIST_APPLIED: &str = include_str!("../sql/common/migration_list_applied.sql");
-pub(super) const PG_ADVISORY_LOCK: &str = include_str!("../sql/postgres/pg_advisory_lock.sql");
-pub(super) const PG_CLOCK: &str = include_str!("../sql/postgres/pg_clock.sql");
+pub(super) const PG_MIGRATION_FIND_CHECKSUM: &str =
+    include_str!("../../../sql/postgres/migration_find_checksum.sql");
+pub(super) const PG_MIGRATION_INSERT: &str =
+    include_str!("../../../sql/postgres/migration_insert.sql");
+pub(super) const PG_MIGRATION_DELETE: &str =
+    include_str!("../../../sql/postgres/migration_delete.sql");
+pub(super) const PG_MIGRATION_FIND_ID: &str =
+    include_str!("../../../sql/postgres/migration_find_id.sql");
+pub(super) const PG_MIGRATION_LIST_APPLIED: &str =
+    include_str!("../../../sql/common/migration_list_applied.sql");
+pub(super) const PG_ADVISORY_LOCK: &str =
+    include_str!("../../../sql/postgres/pg_advisory_lock.sql");
+pub(super) const PG_CLOCK: &str = include_str!("../../../sql/postgres/pg_clock.sql");
 
-pub(super) const MYSQL_MIGRATION_FIND_CHECKSUM: &str = include_str!("../sql/mysql/migration_find_checksum.sql");
-pub(super) const MYSQL_MIGRATION_INSERT: &str = include_str!("../sql/mysql/migration_insert.sql");
-pub(super) const MYSQL_MIGRATION_DELETE: &str = include_str!("../sql/mysql/migration_delete.sql");
-pub(super) const MYSQL_MIGRATION_FIND_ID: &str = include_str!("../sql/mysql/migration_find_id.sql");
+pub(super) const MYSQL_MIGRATION_FIND_CHECKSUM: &str =
+    include_str!("../../../sql/mysql/migration_find_checksum.sql");
+pub(super) const MYSQL_MIGRATION_INSERT: &str =
+    include_str!("../../../sql/mysql/migration_insert.sql");
+pub(super) const MYSQL_MIGRATION_DELETE: &str =
+    include_str!("../../../sql/mysql/migration_delete.sql");
+pub(super) const MYSQL_MIGRATION_FIND_ID: &str =
+    include_str!("../../../sql/mysql/migration_find_id.sql");
 #[cfg(any(feature = "mysql", test))]
-pub(super) const MYSQL_CLOCK: &str = include_str!("../sql/mysql/mysql_clock.sql");
+pub(super) const MYSQL_CLOCK: &str = include_str!("../../../sql/mysql/mysql_clock.sql");
 #[cfg(feature = "mysql")]
-pub(super) const MYSQL_MIGRATION_LOCK: &str = include_str!("../sql/mysql/mysql_migration_lock.sql");
+pub(super) const MYSQL_MIGRATION_LOCK: &str =
+    include_str!("../../../sql/mysql/mysql_migration_lock.sql");
 #[cfg(feature = "mysql")]
-pub(super) const MYSQL_MIGRATION_UNLOCK: &str = include_str!("../sql/mysql/mysql_migration_unlock.sql");
+pub(super) const MYSQL_MIGRATION_UNLOCK: &str =
+    include_str!("../../../sql/mysql/mysql_migration_unlock.sql");
 
-pub(super) const SQLITE_MIGRATION_FIND_CHECKSUM: &str = include_str!("../sql/sqlite/migration_find_checksum.sql");
-pub(super) const SQLITE_MIGRATION_INSERT: &str = include_str!("../sql/sqlite/migration_insert.sql");
-pub(super) const SQLITE_MIGRATION_DELETE: &str = include_str!("../sql/sqlite/migration_delete.sql");
-pub(super) const SQLITE_MIGRATION_FIND_ID: &str = include_str!("../sql/sqlite/migration_find_id.sql");
-pub(super) const SQLITE_CLOCK: &str = include_str!("../sql/sqlite/sqlite_clock.sql");
-pub(super) const SQLITE_BUSY_TIMEOUT: &str = include_str!("../sql/sqlite/sqlite_busy_timeout.sql");
+pub(super) const SQLITE_MIGRATION_FIND_CHECKSUM: &str =
+    include_str!("../../../sql/sqlite/migration_find_checksum.sql");
+pub(super) const SQLITE_MIGRATION_INSERT: &str =
+    include_str!("../../../sql/sqlite/migration_insert.sql");
+pub(super) const SQLITE_MIGRATION_DELETE: &str =
+    include_str!("../../../sql/sqlite/migration_delete.sql");
+pub(super) const SQLITE_MIGRATION_FIND_ID: &str =
+    include_str!("../../../sql/sqlite/migration_find_id.sql");
+pub(super) const SQLITE_CLOCK: &str = include_str!("../../../sql/sqlite/sqlite_clock.sql");
+pub(super) const SQLITE_BUSY_TIMEOUT: &str =
+    include_str!("../../../sql/sqlite/sqlite_busy_timeout.sql");
 
 pub(super) fn find_checksum_query(dialect: &str) -> &'static str {
     match dialect {
@@ -249,7 +269,9 @@ pub(super) async fn ensure_applied_order_column_backend<B: DatabaseBackend>(
     Ok(())
 }
 
-pub(super) async fn next_applied_order_tx<T: DatabaseTransaction>(tx: &T) -> Result<i64, PersistenceError> {
+pub(super) async fn next_applied_order_tx<T: DatabaseTransaction>(
+    tx: &T,
+) -> Result<i64, PersistenceError> {
     let raw = tx.query_scalar(NEXT_APPLIED_ORDER_SQL).await?;
     Ok(raw
         .as_deref()

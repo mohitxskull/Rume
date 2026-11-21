@@ -22,6 +22,7 @@ pub use rume_app::app;
 pub use rume_data::cache;
 pub use rume_data::coordination;
 pub use rume_data::persistence;
+pub use rume_data::sql;
 pub use rume_enterprise::enterprise;
 pub use rume_enterprise::saga;
 pub use rume_foundation::config;

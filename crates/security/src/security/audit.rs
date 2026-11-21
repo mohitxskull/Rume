@@ -122,14 +122,14 @@ pub struct SqlAuditLogger<B: DatabaseBackend> {
 
 impl<B: DatabaseBackend> SqlAuditLogger<B> {
     /// Schema DDL for audit log table in PostgreSQL.
-    pub const POSTGRES_SCHEMA: &'static str = rume_data::persistence::sql::PG_AUDIT_SCHEMA;
+    pub const POSTGRES_SCHEMA: &'static str = rume_data::sql::PG_AUDIT_SCHEMA;
     /// Schema DDL for audit log table in MySQL.
-    pub const MYSQL_SCHEMA: &'static str = rume_data::persistence::sql::MYSQL_AUDIT_SCHEMA;
+    pub const MYSQL_SCHEMA: &'static str = rume_data::sql::MYSQL_AUDIT_SCHEMA;
     /// Schema DDL for audit log table in SQLite.
-    pub const SQLITE_SCHEMA: &'static str = rume_data::persistence::sql::SQLITE_AUDIT_SCHEMA;
+    pub const SQLITE_SCHEMA: &'static str = rume_data::sql::SQLITE_AUDIT_SCHEMA;
 
     /// Count query for total recorded audit logs.
-    pub const AUDIT_COUNT_SQL: &'static str = rume_data::persistence::sql::AUDIT_COUNT_SQL;
+    pub const AUDIT_COUNT_SQL: &'static str = rume_data::sql::AUDIT_COUNT_SQL;
 
     /// Returns the schema DDL for the specified dialect.
     // Why: Removed the unused generic `SCHEMA` alias because audit table DDL is

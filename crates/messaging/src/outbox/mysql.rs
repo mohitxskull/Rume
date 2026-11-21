@@ -11,30 +11,28 @@ use crate::outbox::{
     TransactionalOutbox,
 };
 
-const MYSQL_SET_ISOLATION_LEVEL_SQL: &str = rume_data::persistence::sql::MYSQL_SET_ISOLATION_LEVEL;
-const OUTBOX_CLAIM_SQL: &str = include_str!("sql/mysql/outbox_claim.sql");
+const MYSQL_SET_ISOLATION_LEVEL_SQL: &str = rume_data::sql::MYSQL_SET_ISOLATION_LEVEL;
+const OUTBOX_CLAIM_SQL: &str = rume_data::sql::MYSQL_OUTBOX_CLAIM;
 // Why: `fetch_pending` is a non-claiming read inspection path, whereas
 // `claim_pending_with_lease` owns `FOR UPDATE SKIP LOCKED`. Using a plain
 // `SELECT` keeps `fetch_pending` from acquiring row locks or skipping rows
 // currently locked by concurrent claim transactions.
-const OUTBOX_FETCH_PENDING_SQL: &str = include_str!("sql/mysql/outbox_fetch_pending.sql");
-const INSERT_OUTBOX_SQL: &str = include_str!("sql/mysql/outbox_insert.sql");
-const OUTBOX_RECOVER_SQL: &str = include_str!("sql/mysql/outbox_recover.sql");
-const MYSQL_OUTBOX_CLAIM_LEASE_SQL: &str = include_str!("sql/mysql/outbox_claim_lease.sql");
+const OUTBOX_FETCH_PENDING_SQL: &str = rume_data::sql::MYSQL_OUTBOX_FETCH_PENDING;
+const INSERT_OUTBOX_SQL: &str = rume_data::sql::MYSQL_OUTBOX_INSERT;
+const OUTBOX_RECOVER_SQL: &str = rume_data::sql::MYSQL_OUTBOX_RECOVER;
+const MYSQL_OUTBOX_CLAIM_LEASE_SQL: &str = rume_data::sql::MYSQL_OUTBOX_CLAIM_LEASE;
 const MYSQL_OUTBOX_SELECT_LEASE_EXPIRES_AT_SQL: &str =
-    include_str!("sql/mysql/outbox_select_lease_expires_at.sql");
-const MYSQL_OUTBOX_RENEW_LEASE_SQL: &str = include_str!("sql/mysql/outbox_renew_lease.sql");
-const MYSQL_OUTBOX_MARK_PUBLISHED_SQL: &str = include_str!("sql/mysql/outbox_mark_published.sql");
-const MYSQL_OUTBOX_SELECT_RETRY_COUNT_SQL: &str =
-    include_str!("sql/mysql/outbox_select_retry_count.sql");
-const MYSQL_OUTBOX_MARK_FAILED_SQL: &str = include_str!("sql/mysql/outbox_mark_failed.sql");
-const MYSQL_OUTBOX_PENDING_COUNT_SQL: &str = include_str!("sql/mysql/outbox_pending_count.sql");
-const MYSQL_OUTBOX_PUBLISHED_COUNT_SQL: &str = include_str!("sql/mysql/outbox_published_count.sql");
-const MYSQL_OUTBOX_FAILED_COUNT_SQL: &str = include_str!("sql/mysql/outbox_failed_count.sql");
-const MYSQL_OUTBOX_FETCH_FAILED_SQL: &str = include_str!("sql/mysql/outbox_fetch_failed.sql");
-const MYSQL_OUTBOX_REPROCESS_FAILED_SQL: &str =
-    include_str!("sql/mysql/outbox_reprocess_failed.sql");
-const MYSQL_OUTBOX_PURGE_PUBLISHED_SQL: &str = include_str!("sql/mysql/outbox_purge_published.sql");
+    rume_data::sql::MYSQL_OUTBOX_SELECT_LEASE_EXPIRES_AT;
+const MYSQL_OUTBOX_RENEW_LEASE_SQL: &str = rume_data::sql::MYSQL_OUTBOX_RENEW_LEASE;
+const MYSQL_OUTBOX_MARK_PUBLISHED_SQL: &str = rume_data::sql::MYSQL_OUTBOX_MARK_PUBLISHED;
+const MYSQL_OUTBOX_SELECT_RETRY_COUNT_SQL: &str = rume_data::sql::MYSQL_OUTBOX_SELECT_RETRY_COUNT;
+const MYSQL_OUTBOX_MARK_FAILED_SQL: &str = rume_data::sql::MYSQL_OUTBOX_MARK_FAILED;
+const MYSQL_OUTBOX_PENDING_COUNT_SQL: &str = rume_data::sql::MYSQL_OUTBOX_PENDING_COUNT;
+const MYSQL_OUTBOX_PUBLISHED_COUNT_SQL: &str = rume_data::sql::MYSQL_OUTBOX_PUBLISHED_COUNT;
+const MYSQL_OUTBOX_FAILED_COUNT_SQL: &str = rume_data::sql::MYSQL_OUTBOX_FAILED_COUNT;
+const MYSQL_OUTBOX_FETCH_FAILED_SQL: &str = rume_data::sql::MYSQL_OUTBOX_FETCH_FAILED;
+const MYSQL_OUTBOX_REPROCESS_FAILED_SQL: &str = rume_data::sql::MYSQL_OUTBOX_REPROCESS_FAILED;
+const MYSQL_OUTBOX_PURGE_PUBLISHED_SQL: &str = rume_data::sql::MYSQL_OUTBOX_PURGE_PUBLISHED;
 
 fn parse_mysql_outbox_row(row: &MySqlRow) -> Result<OutboxMessage, OutboxError> {
     let id: String = row
