@@ -59,10 +59,60 @@ pub(super) struct LeaseHeartbeatParams<Q: JobQueue> {
     pub(super) job_id: String,
     pub(super) token: String,
     pub(super) stopping: Arc<AtomicBool>,
+    pub(super) shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
     pub(super) lost_leases: Arc<AtomicU64>,
     pub(super) idempotency_store: Option<Arc<dyn IdempotencyStore>>,
     pub(super) effective_key: Option<String>,
     pub(super) lease_duration: Duration,
+}
+
+/// Awaits a renewal future while independently observing graceful shutdown signals so a
+/// slow renewal I/O call never delays setting `job_cancelled` for cooperative handlers.
+async fn await_while_propagating_stop<F, T>(
+    fut: F,
+    stopping: &AtomicBool,
+    job_cancelled: &AtomicBool,
+    shutdown_rx: &mut Option<tokio::sync::watch::Receiver<bool>>,
+) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::pin!(fut);
+    let mut stop_poll = tokio::time::interval(Duration::from_millis(20));
+    loop {
+        if job_cancelled.load(Ordering::Relaxed)
+            || stopping.load(Ordering::Relaxed)
+            || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
+        {
+            if stopping.load(Ordering::Relaxed)
+                || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
+            {
+                job_cancelled.store(true, Ordering::SeqCst);
+            }
+            // Why: once shutdown cancellation has been delivered to the handler, keep
+            // awaiting the in-flight renewal so the lease stays valid while the handler
+            // exits cooperatively.
+            return fut.await;
+        }
+        tokio::select! {
+            biased;
+            res = &mut fut => return res,
+            _ = async {
+                if let Some(rx) = shutdown_rx.as_mut() {
+                    let _ = rx.wait_for(|&stopped| stopped).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                job_cancelled.store(true, Ordering::SeqCst);
+            }
+            _ = stop_poll.tick() => {
+                if stopping.load(Ordering::Relaxed) {
+                    job_cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    }
 }
 
 /// Spawns the per-job lease-heartbeat task while the job executes (moved from
@@ -75,12 +125,15 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
         job_id,
         token,
         stopping,
+        mut shutdown_rx,
         lost_leases,
         idempotency_store,
         effective_key,
         lease_duration,
     } = params;
-    let job_cancelled = Arc::new(AtomicBool::new(stopping.load(Ordering::Relaxed)));
+    let initial_stopped =
+        stopping.load(Ordering::Relaxed) || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow());
+    let job_cancelled = Arc::new(AtomicBool::new(initial_stopped));
     let lease_lost = Arc::new(AtomicBool::new(false));
     let extend_idempotency = Arc::new(AtomicBool::new(true));
     let queue_committed = Arc::new(AtomicBool::new(false));
@@ -115,18 +168,33 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
         interval.tick().await; // tick immediately
         let mut stop_check = tokio::time::interval(Duration::from_millis(50));
         loop {
+            let not_yet_cancelled = !hb_cancelled.load(Ordering::Relaxed);
             tokio::select! {
                 _ = &mut cancel_rx => break,
-                _ = stop_check.tick() => {
+                _ = async {
+                    if let Some(rx) = shutdown_rx.as_mut() {
+                        let _ = rx.wait_for(|&stopped| stopped).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if not_yet_cancelled => {
+                    hb_cancelled.store(true, Ordering::SeqCst);
+                }
+                _ = stop_check.tick(), if not_yet_cancelled => {
                     if hb_stopping.load(Ordering::Relaxed) {
                         hb_cancelled.store(true, Ordering::SeqCst);
                     }
                 }
                 _ = interval.tick() => {
                     let _tick_guard = hb_tick_lock_task.lock().await;
-                    let renew_res = match tokio::time::timeout(
-                        renewal_timeout,
-                        hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension),
+                    let renew_res = match await_while_propagating_stop(
+                        tokio::time::timeout(
+                            renewal_timeout,
+                            hb_queue.renew_lease(&hb_jid, &hb_token, renew_extension),
+                        ),
+                        &hb_stopping,
+                        &hb_cancelled,
+                        &mut shutdown_rx,
                     )
                     .await
                     {
@@ -158,9 +226,14 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
                     if hb_extend_idempotency.load(Ordering::SeqCst)
                         && let (Some(store), Some(k)) = (&hb_idemp_store, &hb_idemp_key)
                     {
-                        let extend_res = match tokio::time::timeout(
-                            renewal_timeout,
-                            store.extend_lock_with_token(k, &hb_token, renew_extension),
+                        let extend_res = match await_while_propagating_stop(
+                            tokio::time::timeout(
+                                renewal_timeout,
+                                store.extend_lock_with_token(k, &hb_token, renew_extension),
+                            ),
+                            &hb_stopping,
+                            &hb_cancelled,
+                            &mut shutdown_rx,
                         )
                         .await
                         {
@@ -208,17 +281,21 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
 
 /// Releases an idempotency token with a bounded wait so a stalled store cannot
 /// indefinitely block worker state transitions.
+///
+/// Returns `true` if no token needed releasing or if the store confirmed release;
+/// returns `false` on store error or timeout so callers only mark `idemp_committed`
+/// after confirmed store success.
 pub(super) async fn release_idempotency_token(
     store: &Option<Arc<dyn IdempotencyStore>>,
     key: &Option<String>,
     job_id: &str,
     token: &str,
     context: &str,
-) {
+) -> bool {
     const RELEASE_TIMEOUT: Duration = Duration::from_secs(5);
     if let (Some(store), Some(key)) = (store, key) {
         match tokio::time::timeout(RELEASE_TIMEOUT, store.release_with_token(key, token)).await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => true,
             Ok(Err(err)) => {
                 tracing::error!(
                     job_id = %job_id,
@@ -226,6 +303,7 @@ pub(super) async fn release_idempotency_token(
                     error = %err,
                     "Failed to release idempotency token {context}"
                 );
+                false
             }
             Err(_) => {
                 tracing::error!(
@@ -233,7 +311,10 @@ pub(super) async fn release_idempotency_token(
                     key = %key,
                     "Timed out releasing idempotency token {context}"
                 );
+                false
             }
         }
+    } else {
+        true
     }
 }

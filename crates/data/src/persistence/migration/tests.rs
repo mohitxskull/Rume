@@ -189,7 +189,25 @@ fn core_down_scripts_never_drop_ledger_or_audit_tables() {
 
 #[test]
 fn with_rume_core_registers_core_and_audit_ahead_of_app_migrations() {
-    for dialect in ["postgres", "mysql", "sqlite"] {
+    // Pin the exact SHA-256 checksums of `20261104_001_rume_core_schemas` per dialect so any
+    // accidental SQL edit that would trigger `MigrationChecksumMismatch` on deployed databases
+    // fails this test immediately.
+    let expected_core_checksums = [
+        (
+            "postgres",
+            "cd9cef147434fa0efa944539bf0b33445546de6d78208bad2176804bd0bdb1c3",
+        ),
+        (
+            "mysql",
+            "ec8511c2d5c7dd2ca4b9e68b5f0a3f7da639bc86e04617854820959cc2f88d16",
+        ),
+        (
+            "sqlite",
+            "089cf2a10e1a27763d7af263900ff224e3951655d6fa029e11fc6471d5573d84",
+        ),
+    ];
+
+    for (dialect, expected_checksum) in expected_core_checksums {
         let migrator = Migrator::new()
             .add_migration(Migration::from_sql(
                 "20261105_001_app",
@@ -205,6 +223,11 @@ fn with_rume_core_registers_core_and_audit_ahead_of_app_migrations() {
             "{dialect} must register 2 core migrations before app migrations"
         );
         assert_eq!(migrations[0].id, RUME_CORE_MIGRATION_ID);
+        assert_eq!(
+            migrations[0].checksum(),
+            expected_checksum,
+            "{dialect} {RUME_CORE_MIGRATION_ID} checksum must remain immutable for existing databases"
+        );
         assert_eq!(migrations[1].id, RUME_AUDIT_MIGRATION_ID);
         assert!(
             migrations[1].down_sql.is_none(),

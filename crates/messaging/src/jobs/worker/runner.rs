@@ -55,9 +55,12 @@ impl Drop for ActiveTaskGuard {
 /// Background worker managing queue polling, retries, and graceful shutdown drain.
 pub struct JobWorker<Q: JobQueue> {
     worker_id: String,
+    active_claim_id: Arc<std::sync::RwLock<String>>,
     queue: Arc<Q>,
     registry: Arc<JobRegistry>,
     pub(super) is_stopping: Arc<AtomicBool>,
+    admission_lock: Arc<std::sync::Mutex<()>>,
+    drain_dirty: Arc<AtomicBool>,
     in_flight_count: Arc<AtomicU32>,
     concurrency_limit: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
@@ -80,9 +83,12 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
     fn clone(&self) -> Self {
         Self {
             worker_id: self.worker_id.clone(),
+            active_claim_id: Arc::clone(&self.active_claim_id),
             queue: Arc::clone(&self.queue),
             registry: Arc::clone(&self.registry),
             is_stopping: Arc::clone(&self.is_stopping),
+            admission_lock: Arc::clone(&self.admission_lock),
+            drain_dirty: Arc::clone(&self.drain_dirty),
             in_flight_count: Arc::clone(&self.in_flight_count),
             concurrency_limit: self.concurrency_limit,
             semaphore: Arc::clone(&self.semaphore),
@@ -140,11 +146,15 @@ impl<Q: JobQueue> JobWorker<Q> {
         let limit = concurrency_limit.max(1);
         let (shutdown_tx, _) = tokio::sync::watch::channel(false);
         let (abort_tx, _) = tokio::sync::watch::channel(false);
+        let worker_id = format!("worker-{}", Uuid::new_v4());
         Self {
-            worker_id: format!("worker-{}", Uuid::new_v4()),
+            active_claim_id: Arc::new(std::sync::RwLock::new(worker_id.clone())),
+            worker_id,
             queue,
             registry,
             is_stopping: Arc::new(AtomicBool::new(false)),
+            admission_lock: Arc::new(std::sync::Mutex::new(())),
+            drain_dirty: Arc::new(AtomicBool::new(false)),
             in_flight_count: Arc::new(AtomicU32::new(0)),
             concurrency_limit: limit,
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
@@ -174,7 +184,12 @@ impl<Q: JobQueue> JobWorker<Q> {
 
     /// Sets a custom unique worker identifier.
     pub fn with_worker_id(mut self, id: impl Into<String>) -> Self {
-        self.worker_id = id.into();
+        let id = id.into();
+        *self
+            .active_claim_id
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = id.clone();
+        self.worker_id = id;
         self
     }
 
@@ -235,18 +250,25 @@ impl<Q: JobQueue> JobWorker<Q> {
     /// Returns a [`WorkerHandle`] providing lifecycle supervision, status queries,
     /// and graceful awaitable shutdown across execution, heartbeat, and recovery tasks.
     pub fn start(&self) -> WorkerHandle {
-        let worker_task_guard = ActiveTaskGuard::acquire(&self.active_tasks);
-        let worker = self.clone();
-        let worker_task = tokio::spawn(async move {
-            let _guard = worker_task_guard;
-            worker.run_loop().await;
-        });
-
         let mut heartbeat_task = None;
         let mut recovery_task = None;
 
         if let Some(heartbeat) = self.heartbeat_registry.clone() {
-            let worker_id = self.worker_id.clone();
+            // Why: bind each heartbeat-tracked worker run to a unique instance epoch and
+            // rotate its generation suffix whenever a heartbeat fails or its TTL could have
+            // elapsed before the next heartbeat. If Redis reaps an expired generation while
+            // this worker was stalled and the worker later resumes, new claims carry a fresh
+            // generation ID so delayed `reclaim_abandoned_jobs` for the old generation can
+            // never clear jobs claimed after resumption.
+            let instance_epoch = Uuid::new_v4().simple().to_string();
+            let base_worker_id = self.worker_id.clone();
+            let initial_claim_id = format!("{base_worker_id}#{instance_epoch}:0");
+            *self
+                .active_claim_id
+                .write()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = initial_claim_id.clone();
+
+            let active_claim_id = Arc::clone(&self.active_claim_id);
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             let hb_guard = ActiveTaskGuard::acquire(&self.active_tasks);
             let ttl = self.heartbeat_ttl;
@@ -255,9 +277,34 @@ impl<Q: JobQueue> JobWorker<Q> {
 
             heartbeat_task = Some(tokio::spawn(async move {
                 let _guard = hb_guard;
+                let mut generation: u64 = 0;
+                let mut current_claim_id = initial_claim_id;
+                let mut last_hb_started: Option<tokio::time::Instant> = None;
+                let mut prev_failed = false;
+
                 while !*shutdown_rx.borrow() {
-                    if let Err(e) = hb_loop.record_heartbeat(&worker_id, ttl).await {
-                        tracing::warn!(worker_id = %worker_id, error = %e, "Failed to record worker heartbeat");
+                    if prev_failed
+                        || last_hb_started.is_some_and(|started| started.elapsed() >= ttl)
+                    {
+                        generation = generation.saturating_add(1);
+                        current_claim_id =
+                            format!("{base_worker_id}#{instance_epoch}:{generation}");
+                        *active_claim_id
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            current_claim_id.clone();
+                    }
+                    let attempt_started = tokio::time::Instant::now();
+                    if let Err(e) = hb_loop.record_heartbeat(&current_claim_id, ttl).await {
+                        tracing::warn!(
+                            worker_id = %current_claim_id,
+                            error = %e,
+                            "Failed to record worker heartbeat"
+                        );
+                        prev_failed = true;
+                    } else {
+                        last_hb_started = Some(attempt_started);
+                        prev_failed = false;
                     }
                     tokio::select! {
                         biased;
@@ -275,6 +322,11 @@ impl<Q: JobQueue> JobWorker<Q> {
 
                 recovery_task = Some(tokio::spawn(async move {
                     let _guard = rec_guard;
+                    // Why: `reap_dead_workers` removes expired worker IDs from Redis before
+                    // returning them. Retain unacknowledged IDs in `pending_dead` across ticks
+                    // until `queue.reclaim_abandoned_jobs` succeeds so a transient DB error
+                    // never drops a dead-worker batch.
+                    let mut pending_dead: Vec<String> = Vec::new();
                     while !*shutdown_rx.borrow() {
                         tokio::select! {
                             biased;
@@ -286,18 +338,26 @@ impl<Q: JobQueue> JobWorker<Q> {
                         }
                         match hb_reap.reap_dead_workers().await {
                             Ok(dead) => {
-                                if !dead.is_empty()
-                                    && let Err(e) = queue.reclaim_abandoned_jobs(&dead).await
-                                {
-                                    tracing::error!(
-                                        error = %e,
-                                        dead_workers = ?dead,
-                                        "Failed to reclaim abandoned jobs"
-                                    );
+                                for wid in dead {
+                                    if !pending_dead.contains(&wid) {
+                                        pending_dead.push(wid);
+                                    }
                                 }
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "Failed to reap dead workers during recovery");
+                            }
+                        }
+                        if !pending_dead.is_empty() {
+                            match queue.reclaim_abandoned_jobs(&pending_dead).await {
+                                Ok(_) => pending_dead.clear(),
+                                Err(e) => {
+                                    tracing::error!(
+                                        error = %e,
+                                        dead_workers = ?pending_dead,
+                                        "Failed to reclaim abandoned jobs; retaining batch for retry"
+                                    );
+                                }
                             }
                         }
                     }
@@ -305,11 +365,20 @@ impl<Q: JobQueue> JobWorker<Q> {
             }
         }
 
+        let worker_task_guard = ActiveTaskGuard::acquire(&self.active_tasks);
+        let worker = self.clone();
+        let worker_task = tokio::spawn(async move {
+            let _guard = worker_task_guard;
+            worker.run_loop().await;
+        });
+
         WorkerHandle {
             worker_task,
             heartbeat_task,
             recovery_task,
             is_stopping: Arc::clone(&self.is_stopping),
+            admission_lock: Arc::clone(&self.admission_lock),
+            drain_dirty: Arc::clone(&self.drain_dirty),
             shutdown_tx: Arc::clone(&self.shutdown_tx),
             abort_requested: Arc::clone(&self.abort_requested),
             abort_tx: Arc::clone(&self.abort_tx),
@@ -408,34 +477,91 @@ impl<Q: JobQueue> JobWorker<Q> {
                 break;
             }
 
-            match self.queue.dequeue_for(&self.worker_id).await {
+            let claim_id = self
+                .active_claim_id
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+
+            match self.queue.dequeue_for(&claim_id).await {
                 Ok(Some(job)) => {
                     consecutive_errors = 0;
-                    if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
-                        // Crucial race check: draining started while dequeue was in-flight!
-                        // Guarantee that no new job starts after draining begins, and use
-                        // `defer` rather than `nack` so the unexecuted job does not burn a
-                        // retry attempt.
+                    let generation_stale = {
+                        let current = self
+                            .active_claim_id
+                            .read()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        *current != claim_id
+                    };
+
+                    // Why: serialize job admission with the `is_stopping` transition under
+                    // `admission_lock` so no new job can start after draining begins, and
+                    // construct `InFlightGuard` before `in_flight_tasks.spawn` so cancelling
+                    // an unpolled child task still decrements `in_flight_count`.
+                    let (admitted_guard, stopping_now) = {
+                        let _guard = self
+                            .admission_lock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let stopping =
+                            *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst);
+                        if stopping || generation_stale {
+                            (None, stopping)
+                        } else {
+                            self.in_flight_count.fetch_add(1, Ordering::SeqCst);
+                            (
+                                Some(InFlightGuard(Arc::clone(&self.in_flight_count))),
+                                false,
+                            )
+                        }
+                    };
+
+                    let Some(in_flight_guard) = admitted_guard else {
+                        // Crucial race check: draining started (or worker generation rotated)
+                        // while dequeue was in-flight! Defer the unexecuted job without burning
+                        // a retry attempt, retrying transient defer errors briefly and marking
+                        // the drain dirty if deferral still fails.
                         let job_id = job.id.clone();
                         let token = job.lease_token.clone().unwrap_or_default();
-                        if let Err(err) = self.queue.defer(job, &token, Duration::ZERO).await {
-                            tracing::error!(
-                                job_id = %job_id,
-                                error = %err,
-                                "Failed to defer dequeued job during drain"
-                            );
+                        let mut deferred = false;
+                        for attempt in 0..3u32 {
+                            match self.queue.defer(job.clone(), &token, Duration::ZERO).await {
+                                Ok(()) => {
+                                    deferred = true;
+                                    break;
+                                }
+                                Err(err) => {
+                                    tracing::error!(
+                                        job_id = %job_id,
+                                        attempt = attempt + 1,
+                                        error = %err,
+                                        "Failed to defer dequeued job during drain"
+                                    );
+                                    if self.abort_requested.load(Ordering::SeqCst) || attempt == 2 {
+                                        break;
+                                    }
+                                    sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
+                                }
+                            }
+                        }
+                        if !deferred {
                             self.transition_errors.fetch_add(1, Ordering::SeqCst);
+                            if stopping_now {
+                                self.drain_dirty.store(true, Ordering::SeqCst);
+                            }
                         }
                         drop(permit);
-                        break;
-                    }
+                        if stopping_now {
+                            break;
+                        }
+                        continue;
+                    };
 
-                    self.in_flight_count.fetch_add(1, Ordering::SeqCst);
                     let queue = Arc::clone(&self.queue);
                     let registry = Arc::clone(&self.registry);
-                    let in_flight = Arc::clone(&self.in_flight_count);
                     let idempotency = self.idempotency_store.clone();
                     let stopping = Arc::clone(&self.is_stopping);
+                    let job_shutdown_rx = self.shutdown_tx.subscribe();
                     let transition_errors = Arc::clone(&self.transition_errors);
                     let lost_leases = Arc::clone(&self.lost_leases);
 
@@ -449,13 +575,14 @@ impl<Q: JobQueue> JobWorker<Q> {
                     in_flight_tasks.spawn(
                         async move {
                             let _permit = permit;
-                            let _guard = InFlightGuard(in_flight);
-                            Self::execute_job(
+                            let _guard = in_flight_guard;
+                            Self::execute_job_with_shutdown(
                                 queue,
                                 registry,
                                 job,
                                 idempotency,
                                 stopping,
+                                Some(job_shutdown_rx),
                                 transition_errors,
                                 lost_leases,
                             )
@@ -523,12 +650,37 @@ impl<Q: JobQueue> JobWorker<Q> {
     }
 
     /// Executes a single dequeued job, handling acknowledgments, retries, and dead-lettering.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) async fn execute_job(
         queue: Arc<Q>,
         registry: Arc<JobRegistry>,
         job: QueuedJob,
         idempotency_store: Option<Arc<dyn IdempotencyStore>>,
         stopping: Arc<AtomicBool>,
+        transition_errors: Arc<AtomicU64>,
+        lost_leases: Arc<AtomicU64>,
+    ) {
+        Self::execute_job_with_shutdown(
+            queue,
+            registry,
+            job,
+            idempotency_store,
+            stopping,
+            None,
+            transition_errors,
+            lost_leases,
+        )
+        .await;
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_job_with_shutdown(
+        queue: Arc<Q>,
+        registry: Arc<JobRegistry>,
+        job: QueuedJob,
+        idempotency_store: Option<Arc<dyn IdempotencyStore>>,
+        stopping: Arc<AtomicBool>,
+        shutdown_rx: Option<tokio::sync::watch::Receiver<bool>>,
         transition_errors: Arc<AtomicU64>,
         lost_leases: Arc<AtomicU64>,
     ) {
@@ -618,6 +770,7 @@ impl<Q: JobQueue> JobWorker<Q> {
             job_id: job_id.clone(),
             token: token.clone(),
             stopping,
+            shutdown_rx,
             lost_leases: Arc::clone(&lost_leases),
             idempotency_store: idempotency_store.clone(),
             effective_key: effective_key.clone(),
@@ -637,7 +790,7 @@ impl<Q: JobQueue> JobWorker<Q> {
         // Why: wait for any already-in-flight heartbeat ownership check (`renew_lease` /
         // `extend_lock_with_token`) to settle before reading `lease_lost` and choosing
         // between ACK and dead-letter, while keeping subsequent heartbeat ticks eligible
-        // during `ack`/`nack`/`dead_letter` until the state transition actually commits.
+        // during finalization until the state transition actually commits.
         drop(hb.tick_lock.lock().await);
 
         match dispatch_result {
@@ -664,55 +817,117 @@ impl<Q: JobQueue> JobWorker<Q> {
                         // commits; if dead-lettering fails, preserving the reservation blocks
                         // another worker from re-executing a handler that already succeeded.
                         hb.extend_idempotency.store(false, Ordering::SeqCst);
-                        release_idempotency_token(
+                        if release_idempotency_token(
                             &idempotency_store,
                             &effective_key,
                             &job_id,
                             &token,
                             "on lease loss",
                         )
-                        .await;
-                        hb.idemp_committed.store(true, Ordering::SeqCst);
+                        .await
+                        {
+                            hb.idemp_committed.store(true, Ordering::SeqCst);
+                        }
                     }
-                } else {
-                    if let Err(err) = queue.ack(&job_id, &token).await {
-                        tracing::error!(
-                            job_id = %job_id,
-                            error = %err,
-                            "Failed to ack job; lease may have expired or state mismatch"
-                        );
-                        transition_errors.fetch_add(1, Ordering::SeqCst);
-                        lost_leases.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        hb.queue_committed.store(true, Ordering::SeqCst);
-                    }
-                    hb.extend_idempotency.store(false, Ordering::SeqCst);
-                    if let (Some(store), Some(key)) = (&idempotency_store, &effective_key)
-                        && let Err(err) = store.complete_with_token(key, &token, None).await
+                } else if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
+                    // Why: on keyed jobs, finalize token-validated idempotency completion BEFORE
+                    // `queue.ack` while keeping the queue lease renewed. If Redis rejects the
+                    // fencing token during finalization, PostgreSQL must not record a false ACK;
+                    // conversely, if `complete_with_token` succeeds and `queue.ack` later fails,
+                    // the completed idempotency record stays intact so the next retry observes
+                    // `IdempotencyStatus::Completed` and ACKs without re-running the handler.
+                    // Bound the wait so a hung Redis call never permanently holds the semaphore
+                    // permit or in-flight slot.
+                    const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
+                    match tokio::time::timeout(
+                        COMPLETE_TIMEOUT,
+                        store.complete_with_token(key, &token, None),
+                    )
+                    .await
                     {
-                        tracing::error!(
-                            job_id = %job_id,
-                            key = %key,
-                            error = %err,
-                            "Failed to record idempotency completion"
-                        );
+                        Ok(Ok(())) => {
+                            hb.extend_idempotency.store(false, Ordering::SeqCst);
+                            hb.idemp_committed.store(true, Ordering::SeqCst);
+                            if let Err(err) = queue.ack(&job_id, &token).await {
+                                tracing::error!(
+                                    job_id = %job_id,
+                                    error = %err,
+                                    "Failed to ack job after idempotency completion; completed record preserved for retry"
+                                );
+                                transition_errors.fetch_add(1, Ordering::SeqCst);
+                                lost_leases.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                hb.queue_committed.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Ok(Err(err)) => {
+                            tracing::error!(
+                                job_id = %job_id,
+                                key = %key,
+                                error = %err,
+                                "Idempotency completion rejected or failed; refusing to ACK and routing to DLQ"
+                            );
+                            transition_errors.fetch_add(1, Ordering::SeqCst);
+                            lost_leases.fetch_add(1, Ordering::SeqCst);
+                            if let Err(dl_err) = queue
+                                .dead_letter(
+                                    job,
+                                    &token,
+                                    format!("idempotency completion failed: {err}"),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    job_id = %job_id,
+                                    error = %dl_err,
+                                    "Failed to dead-letter job after idempotency completion failure"
+                                );
+                                transition_errors.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                hb.queue_committed.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        Err(_) => {
+                            // Why: a timeout leaves the Redis commit outcome unknown, so do NOT
+                            // mark `idemp_committed`, do NOT ACK, and do NOT release the token;
+                            // releasing the worker slot lets lease expiry drive safe recovery
+                            // (a subsequent worker will see `Completed` if Redis committed).
+                            tracing::error!(
+                                job_id = %job_id,
+                                key = %key,
+                                "Timed out recording idempotency completion; skipping ACK to preserve recovery path"
+                            );
+                            transition_errors.fetch_add(1, Ordering::SeqCst);
+                            lost_leases.fetch_add(1, Ordering::SeqCst);
+                        }
                     }
-                    hb.idemp_committed.store(true, Ordering::SeqCst);
+                } else if let Err(err) = queue.ack(&job_id, &token).await {
+                    tracing::error!(
+                        job_id = %job_id,
+                        error = %err,
+                        "Failed to ack job; lease may have expired or state mismatch"
+                    );
+                    transition_errors.fetch_add(1, Ordering::SeqCst);
+                    lost_leases.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    hb.queue_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(JobError::Fatal(msg))
             | Err(JobError::UnknownJob(msg))
             | Err(JobError::Serialization(msg)) => {
                 hb.extend_idempotency.store(false, Ordering::SeqCst);
-                release_idempotency_token(
+                if release_idempotency_token(
                     &idempotency_store,
                     &effective_key,
                     &job_id,
                     &token,
                     "on fatal failure",
                 )
-                .await;
-                hb.idemp_committed.store(true, Ordering::SeqCst);
+                .await
+                {
+                    hb.idemp_committed.store(true, Ordering::SeqCst);
+                }
                 if let Err(err) = queue.dead_letter(job, &token, msg).await {
                     tracing::error!(
                         job_id = %job_id,
@@ -735,15 +950,17 @@ impl<Q: JobQueue> JobWorker<Q> {
                 // never by `job.id`.
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
                     hb.extend_idempotency.store(false, Ordering::SeqCst);
-                    release_idempotency_token(
+                    if release_idempotency_token(
                         &idempotency_store,
                         &effective_key,
                         &job_id,
                         &token,
                         "before retryable nack; proceeding with nack",
                     )
-                    .await;
-                    hb.idemp_committed.store(true, Ordering::SeqCst);
+                    .await
+                    {
+                        hb.idemp_committed.store(true, Ordering::SeqCst);
+                    }
                     if let Err(nack_err) = queue.nack(job, &token, backoff).await {
                         tracing::error!(
                             job_id = %job_id,
@@ -757,15 +974,17 @@ impl<Q: JobQueue> JobWorker<Q> {
                     }
                 } else {
                     hb.extend_idempotency.store(false, Ordering::SeqCst);
-                    release_idempotency_token(
+                    if release_idempotency_token(
                         &idempotency_store,
                         &effective_key,
                         &job_id,
                         &token,
                         "on dead letter",
                     )
-                    .await;
-                    hb.idemp_committed.store(true, Ordering::SeqCst);
+                    .await
+                    {
+                        hb.idemp_committed.store(true, Ordering::SeqCst);
+                    }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
                     if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
                         tracing::error!(
@@ -787,27 +1006,37 @@ impl<Q: JobQueue> JobWorker<Q> {
 
     /// Gracefully requests worker shutdown and waits for in-flight jobs and background polling tasks to complete within `timeout`.
     pub async fn drain(&self, timeout: Duration) -> bool {
-        self.is_stopping.store(true, Ordering::SeqCst);
-        self.shutdown_tx.send_replace(true);
-        let start = std::time::Instant::now();
+        {
+            let _guard = self
+                .admission_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            self.is_stopping.store(true, Ordering::SeqCst);
+            self.shutdown_tx.send_replace(true);
+        }
+        // Why: use `tokio::time::Instant` so drain deadlines stay consistent with
+        // Tokio sleeps under paused virtual time as well as wall-clock time.
+        let deadline = tokio::time::Instant::now() + timeout;
 
         // 1. Wait for in-flight jobs to finish
         while self.in_flight_count.load(Ordering::SeqCst) > 0 {
-            if start.elapsed() >= timeout {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
-            sleep(Duration::from_millis(10)).await;
+            sleep(remaining.min(Duration::from_millis(10))).await;
         }
 
         // 2. Wait for polling, heartbeat, and recovery loops to exit
         while self.active_tasks.load(Ordering::SeqCst) > 0 {
-            if start.elapsed() >= timeout {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
                 return false;
             }
-            sleep(Duration::from_millis(10)).await;
+            sleep(remaining.min(Duration::from_millis(10))).await;
         }
 
-        true
+        !self.drain_dirty.load(Ordering::SeqCst)
     }
 
     /// Returns the number of currently executing jobs.

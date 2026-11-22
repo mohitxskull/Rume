@@ -268,6 +268,16 @@ mod saml_parser_and_iso8601_proptests {
             Some(&vec!["member".to_string()]),
             "Attribute values injected inside ds:Signature/ds:Object must be ignored"
         );
+        assert_eq!(
+            assertion.not_before,
+            Some(parse_iso8601_strict("2026-11-02T11:00:00Z").unwrap()),
+            "NotBefore must come from the outer Conditions, not ds:Signature/ds:Object"
+        );
+        assert_eq!(
+            assertion.not_on_or_after,
+            Some(parse_iso8601_strict("2026-11-02T13:00:00Z").unwrap()),
+            "NotOnOrAfter must come from the outer Conditions, not ds:Signature/ds:Object"
+        );
     }
 
     #[test]
@@ -770,5 +780,189 @@ mod saml_parser_and_iso8601_proptests {
             ),
             "foreign-namespace type behind a U+1680 prefix must fail closed"
         );
+    }
+
+    #[test]
+    fn fractional_second_validity_bounds_are_not_truncated() {
+        let xml = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a_frac">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@example.org</saml:NameID>
+                <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                    <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40.900Z"/>
+                </saml:SubjectConfirmation>
+            </saml:Subject>
+            <saml:Conditions NotBefore="1970-01-01T00:16:40.900Z" NotOnOrAfter="1970-01-01T00:16:41.900Z"/>
+        </saml:Assertion>"#;
+        let assertion = SamlParser::parse_unverified(xml).expect("parses fractional seconds");
+        // At 1000.000s, NotBefore=1000.900s is still in the future.
+        assert!(matches!(
+            SamlParser::validate_with_config(&assertion, 1000, &SamlValidationConfig::default()),
+            Err(SamlError::NotYetValid { .. })
+        ));
+        // At 1001.000s, SCD NotOnOrAfter=1000.900s has passed.
+        assert!(matches!(
+            SamlParser::validate_with_config(&assertion, 1001, &SamlValidationConfig::default()),
+            Err(SamlError::Expired { .. })
+        ));
+
+        // Conditions NotOnOrAfter=1000.900s must still be valid at 1000.000s (not expired early).
+        let xml2 = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a_frac2">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@example.org</saml:NameID>
+                <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                    <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40.900Z"/>
+                </saml:SubjectConfirmation>
+            </saml:Subject>
+            <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40.900Z"/>
+        </saml:Assertion>"#;
+        let assertion2 = SamlParser::parse_unverified(xml2).expect("parses");
+        SamlParser::validate_with_config(&assertion2, 1000, &SamlValidationConfig::default())
+            .expect("1000.000s is before 1000.900s");
+        assert!(matches!(
+            SamlParser::validate_with_config(&assertion2, 1001, &SamlValidationConfig::default()),
+            Err(SamlError::Expired { .. })
+        ));
+    }
+
+    #[test]
+    fn qualified_foreign_attributes_and_nested_response_are_ignored_and_truncated_eof_rejected() {
+        // Qualified `ext:Method` must not trigger bearer confirmation.
+        let xml_ext_method = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ext="urn:example:ext" ID="_a_ext">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject>
+                <saml:NameID>alice@example.org</saml:NameID>
+                <saml:SubjectConfirmation ext:Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                    <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+                </saml:SubjectConfirmation>
+            </saml:Subject>
+            <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+        </saml:Assertion>"#;
+        let a_ext = SamlParser::parse_unverified(xml_ext_method).expect("parses");
+        assert!(a_ext.subject_confirmations.is_empty());
+
+        // Nested `<samlp:Response>` inside Advice must not overwrite root Response/@Destination.
+        let xml_nested_resp = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_root" Destination="https://sp.example/acs">
+            <saml:Assertion ID="_a_nr">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+                <saml:Advice>
+                    <samlp:Response ID="_r_nested" Destination="https://evil.example/acs"/>
+                </saml:Advice>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let a_nr = SamlParser::parse_unverified(xml_nested_resp).expect("parses");
+        assert_eq!(a_nr.destination.as_deref(), Some("https://sp.example/acs"));
+
+        // Truncated Assertion omitting `</saml:Assertion>` must fail closed at EOF.
+        let xml_truncated = r#"<saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a_trunc">
+            <saml:Issuer>https://idp.example.com</saml:Issuer>
+            <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>"#;
+        assert!(matches!(
+            SamlParser::parse_unverified(xml_truncated),
+            Err(SamlError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn parse_entity_id_requires_metadata_ns_unqualified_attr_and_decodes_entities() {
+        let valid = r#"<md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" xmlns:ext="urn:example:ext" ext:entityID="https://wrong.example/" entityID="https://idp.example/?a=1&amp;b=2"/>"#;
+        assert_eq!(
+            SamlParser::parse_entity_id(valid).expect("valid metadata"),
+            "https://idp.example/?a=1&b=2"
+        );
+
+        let foreign =
+            r#"<EntityDescriptor xmlns="urn:example:foreign" entityID="https://idp.example/"/>"#;
+        assert!(matches!(
+            SamlParser::parse_entity_id(foreign),
+            Err(SamlError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn validate_browser_sso_enforces_authn_statement_recipient_and_replay_cache_atomically() {
+        let xml_no_authn = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_sso1">
+            <saml:Assertion ID="_a_sso1">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let no_authn = SamlParser::parse_unverified(xml_no_authn).expect("parses");
+        let cache = InMemorySamlReplayCache::new();
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &no_authn,
+                500,
+                &SamlValidationConfig {
+                    expected_recipient: Some("https://sp.example/acs"),
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+
+        let xml_full = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_sso2">
+            <saml:Assertion ID="_a_sso2">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let full = SamlParser::parse_unverified(xml_full).expect("parses");
+        // Missing recipient fails closed.
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                500,
+                &SamlValidationConfig {
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+        // Missing replay cache fails closed.
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                500,
+                &SamlValidationConfig {
+                    expected_recipient: Some("https://sp.example/acs"),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+        // Full valid config succeeds.
+        let cfg = SamlValidationConfig {
+            expected_recipient: Some("https://sp.example/acs"),
+            clock_skew_secs: 30,
+            replay_cache: Some(&cache),
+            ..Default::default()
+        };
+        SamlParser::validate_browser_sso(&full, 999, &cfg).expect("full SSO succeeds");
+
+        // Atomic expiry-vs-pruning check: after pruning at 1030, a late validation at 1029
+        // must be rejected as Expired instead of re-inserting `_a_sso2`.
+        cache.prune_expired(1030);
+        assert!(matches!(
+            SamlParser::validate_browser_sso(&full, 1029, &cfg),
+            Err(SamlError::Expired { .. })
+        ));
     }
 }

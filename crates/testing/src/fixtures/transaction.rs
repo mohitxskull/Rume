@@ -10,8 +10,6 @@ use super::*;
 pub struct TestTransactionFixture<T: DatabaseTransaction + 'static> {
     tx: Option<T>,
     committed: bool,
-    #[cfg(feature = "postgres")]
-    pending_rollbacks: Option<Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>>,
 }
 
 impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
@@ -20,20 +18,6 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
         Self {
             tx: Some(tx),
             committed: false,
-            #[cfg(feature = "postgres")]
-            pending_rollbacks: None,
-        }
-    }
-
-    #[cfg(feature = "postgres")]
-    pub(super) fn with_pending_rollbacks(
-        tx: T,
-        pending_rollbacks: Arc<std::sync::Mutex<Vec<tokio::task::AbortHandle>>>,
-    ) -> Self {
-        Self {
-            tx: Some(tx),
-            committed: false,
-            pending_rollbacks: Some(pending_rollbacks),
         }
     }
 
@@ -114,30 +98,15 @@ impl<T: DatabaseTransaction + 'static> Drop for TestTransactionFixture<T> {
                     })
                     .join();
                 }
-                Ok(handle) => {
-                    // Why: Outer-reactor TCP sockets (`postgres`, `mysql`) on a `current_thread`
-                    // runtime cannot be driven by a joined helper thread because blocking the sole
-                    // test thread halts `epoll_wait` and deadlocks. Spawn the rollback on `handle`
-                    // and record its `AbortHandle` on any owning `PostgresSchemaFixture` so that if
-                    // the fixture is dropped immediately (`drop(tx); drop(fixture);` without an
-                    // intervening `.await`), `PostgresSchemaFixture::drop` aborts the unpolled task
-                    // and terminates the backend session on the server before synchronously
-                    // executing `DROP SCHEMA ... CASCADE`.
-                    let jh = handle.spawn(async move {
-                        let _ = tx.rollback().await;
-                    });
-                    #[cfg(feature = "postgres")]
-                    if let Some(ref pending) = self.pending_rollbacks
-                        && let Ok(mut list) = pending.lock()
-                    {
-                        list.push(jh.abort_handle());
-                    }
-                    #[cfg(not(feature = "postgres"))]
-                    drop(jh);
-                }
-                Err(_) => {
-                    // Outside any Tokio runtime, TCP sockets have no active reactor to drive
-                    // `rollback().await`; dropping `tx` falls back to SQLx's connection cleanup.
+                _ => {
+                    // Why: Do not spawn a detached async rollback task on `current_thread`
+                    // runtimes (which can stay unpolled after `Drop` returns). TCP-backed
+                    // transactions (`postgres`, `mysql`) on `current_thread` require explicit
+                    // `.rollback().await` / `.close().await` (or `multi_thread` runtime) for
+                    // a synchronous rollback barrier; otherwise dropping `tx` falls back to
+                    // SQLx's connection cleanup (and `PostgresSchemaFixture::drop` terminates
+                    // any lingering backends synchronously before dropping the schema).
+                    drop(tx);
                 }
             }
         }

@@ -19,8 +19,10 @@ pub fn excerpt(input: &str, limit: usize) -> Cow<'_, str> {
     let stripped = strip_html_tags(input);
     let condensed = condense_whitespace(&stripped);
     match truncate(&condensed, limit) {
-        Cow::Borrowed(_)
-            if matches!(stripped, Cow::Borrowed(_)) && matches!(condensed, Cow::Borrowed(_)) =>
+        Cow::Borrowed(result)
+            if matches!(stripped, Cow::Borrowed(_))
+                && matches!(condensed, Cow::Borrowed(_))
+                && result.len() == input.len() =>
         {
             Cow::Borrowed(input)
         }
@@ -41,5 +43,15 @@ mod tests {
     #[test]
     fn excerpt_strips_html_comments() {
         assert_eq!(excerpt("<!-- don't show -->Visible", 20), "Visible");
+    }
+
+    #[test]
+    fn excerpt_whitespace_only_returns_empty() {
+        assert_eq!(excerpt(" \t ", 20), "");
+    }
+
+    #[test]
+    fn excerpt_short_borrowed_truncation_respects_limit() {
+        assert_eq!(excerpt("hello", 2), "he");
     }
 }

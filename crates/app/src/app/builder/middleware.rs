@@ -88,6 +88,16 @@ where
         self
     }
 
+    /// Define a named middleware group by listing registered middleware aliases.
+    ///
+    /// Defining a group does not apply it yet: call [`use_group`](Self::use_group)
+    /// to activate it on the router. On request entry, the group's members execute
+    /// in the order listed in `members` (and in reverse order on response exit),
+    /// so place middleware that produces request context before members that
+    /// consume it.
+    ///
+    /// Duplicate group names or references to unknown member aliases fail closed
+    /// when the router is built via [`build_router`](Self::build_router).
     pub fn group(mut self, name: &str, members: &[&str]) -> Self {
         self.groups_order.push(name.to_string());
         self.groups.insert(

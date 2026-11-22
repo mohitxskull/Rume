@@ -99,20 +99,14 @@ pub trait SagaStore: Send + Sync + 'static {
     ///
     /// Returns an opaque claim token on success, or [`SagaError::Storage`] if another
     /// worker currently owns execution for `saga_id`.
-    fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>> {
-        let _ = saga_id;
-        Box::pin(async { Ok(String::new()) })
-    }
+    fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>>;
 
     /// Releases a previously acquired execution claim for `saga_id`.
     fn release_execution(
         &self,
         saga_id: &str,
         claim_token: &str,
-    ) -> BoxFuture<'_, Result<(), SagaError>> {
-        let _ = (saga_id, claim_token);
-        Box::pin(async { Ok(()) })
-    }
+    ) -> BoxFuture<'_, Result<(), SagaError>>;
 
     /// Synchronously releases a previously acquired execution claim if the store
     /// supports lock-free / non-async teardown (e.g. in-memory stores).
@@ -272,8 +266,12 @@ pub(super) struct ExecutionClaimGuard {
 
 impl ExecutionClaimGuard {
     pub(super) async fn release(mut self) {
-        if let Some(store) = self.store.take() {
+        // Why: keep `self.store` populated until `release_execution` completes so if
+        // this future is cancelled mid-await, `Drop` still holds the store and releases
+        // the execution claim instead of leaking it.
+        if let Some(store) = self.store.as_ref() {
             let _ = store.release_execution(&self.saga_id, &self.token).await;
+            self.store = None;
         }
     }
 }

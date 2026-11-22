@@ -65,6 +65,8 @@ pub struct SamlSubjectConfirmationData {
     pub recipient: Option<String>,
     /// Confirmation expiration timestamp (`NotOnOrAfter` attribute, epoch seconds).
     pub not_on_or_after: Option<u64>,
+    /// Subsecond nanoseconds (`0..1_000_000_000`) for `not_on_or_after`.
+    pub not_on_or_after_subsec_nanos: u32,
     /// Correlated AuthnRequest ID (`InResponseTo` attribute).
     pub in_response_to: Option<String>,
 }
@@ -88,30 +90,33 @@ pub struct SamlAssertion {
     pub has_response_envelope: bool,
     /// Outer `<samlp:Response InResponseTo="...">` attribute, if present.
     pub response_in_response_to: Option<String>,
+    /// Whether the assertion contains a direct `<saml:AuthnStatement>` child
+    /// (required by SAML 2.0 Web Browser SSO profile).
+    pub has_authn_statement: bool,
     /// Parsed bearer `<saml:SubjectConfirmationData>` alternatives (SAML 2.0 Web Browser SSO
     /// permits multiple bearer confirmations and succeeds if at least one satisfies all checks).
     pub subject_confirmations: Vec<SamlSubjectConfirmationData>,
     /// NotBefore epoch seconds condition.
     pub not_before: Option<u64>,
+    /// Subsecond nanoseconds (`0..1_000_000_000`) for `not_before`.
+    pub not_before_subsec_nanos: u32,
     /// NotOnOrAfter epoch seconds condition.
     pub not_on_or_after: Option<u64>,
+    /// Subsecond nanoseconds (`0..1_000_000_000`) for `not_on_or_after`.
+    pub not_on_or_after_subsec_nanos: u32,
     /// Extracted user claims and attributes.
     pub attributes: BTreeMap<String, Vec<String>>,
 }
-/// Parses an ISO 8601 / RFC 3339 timestamp strictly, including UTC `'Z'`, fractional seconds,
-/// and explicit colon-separated timezone offsets (`±HH:MM`).
-///
-/// An explicit timezone (`'Z'` or `±HH:MM`) and a `'T'`/`'t'` date-time separator are mandatory:
-/// raw epoch integers, space-separated RFC 3339 timestamps, naive wall-clock strings without a
-/// timezone, and pre-Unix-epoch instants are rejected fail-closed.
-pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
+/// Parses an ISO 8601 / RFC 3339 timestamp strictly, returning `(epoch_secs, subsec_nanos)`.
+pub(crate) fn parse_iso8601_strict_parts(s: &str) -> Result<(u64, u32), SamlError> {
     let trimmed = s.trim();
 
     // Why: delegate calendar, leap-year, and `-23:59..=+23:59` offset validation to
     // `chrono::DateTime::parse_from_rfc3339` (already pinned in `Cargo.lock`) instead of
     // hand-rolled date math and UTF-8 byte slicing that can panic on multi-byte inputs; check
-    // byte index 10 for `'T'`/`'t'` to reject RFC 3339 space separators and use `u64::try_from`
-    // so pre-1970 instants fail closed instead of wrapping.
+    // byte index 10 for `'T'`/`'t'` to reject RFC 3339 space separators, use `u64::try_from`
+    // so pre-1970 instants fail closed instead of wrapping, and retain `timestamp_subsec_nanos()`
+    // so subsecond validity boundaries are never truncated early/late.
     if !matches!(trimmed.as_bytes().get(10), Some(b'T' | b't')) {
         return Err(SamlError::Malformed(format!(
             "invalid ISO 8601 timestamp '{trimmed}': missing 'T' separator"
@@ -122,9 +127,20 @@ pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
         SamlError::Malformed(format!("invalid ISO 8601 timestamp '{trimmed}': {err}"))
     })?;
 
-    u64::try_from(dt.timestamp()).map_err(|_| {
+    let secs = u64::try_from(dt.timestamp()).map_err(|_| {
         SamlError::Malformed(format!("timestamp '{trimmed}' resolves before Unix epoch"))
-    })
+    })?;
+    Ok((secs, dt.timestamp_subsec_nanos()))
+}
+
+/// Parses an ISO 8601 / RFC 3339 timestamp strictly, including UTC `'Z'`, fractional seconds,
+/// and explicit colon-separated timezone offsets (`±HH:MM`).
+///
+/// An explicit timezone (`'Z'` or `±HH:MM`) and a `'T'`/`'t'` date-time separator are mandatory:
+/// raw epoch integers, space-separated RFC 3339 timestamps, naive wall-clock strings without a
+/// timezone, and pre-Unix-epoch instants are rejected fail-closed.
+pub fn parse_iso8601_strict(s: &str) -> Result<u64, SamlError> {
+    parse_iso8601_strict_parts(s).map(|(secs, _)| secs)
 }
 /// Parser and validator for SAML 2.0 assertions.
 pub struct SamlParser;
@@ -183,14 +199,19 @@ impl SamlParser {
         let mut active_capture: Option<ActiveTextCapture> = None;
         let mut fields = AssertionFields::default();
         let mut not_before: Option<u64> = None;
+        let mut not_before_subsec_nanos: u32 = 0;
         let mut not_on_or_after: Option<u64> = None;
+        let mut not_on_or_after_subsec_nanos: u32 = 0;
+        let mut has_authn_statement = false;
 
         let mut assertion_start_offset: Option<usize> = None;
         let mut assertion_end_offset: Option<usize> = None;
 
         let mut signature_references: Vec<String> = Vec::new();
 
-        let mut element_stack: Vec<(String, XmlNs)> = Vec::new();
+        // Each stack frame carries `(local_name, ns, in_signature_subtree)` for O(1)
+        // `<ds:Signature>` ancestor checks on every start event.
+        let mut element_stack: Vec<(String, XmlNs, bool)> = Vec::new();
         let mut in_assertion = false;
         let mut current_attr_name: Option<String> = None;
         let mut current_attr_depth: usize = 0;
@@ -220,34 +241,35 @@ impl SamlParser {
                         XmlNs::Other
                     };
                     let new_depth = element_stack.len() + 1;
-                    let parent = element_stack.last().map(|(n, pns)| (n.as_str(), *pns));
+                    let parent = element_stack.last().map(|(n, pns, _)| (n.as_str(), *pns));
                     let grandparent = element_stack
                         .len()
                         .checked_sub(2)
                         .and_then(|idx| element_stack.get(idx))
-                        .map(|(n, pns)| (n.as_str(), *pns));
+                        .map(|(n, pns, _)| (n.as_str(), *pns));
                     let great_grandparent = element_stack
                         .len()
                         .checked_sub(3)
                         .and_then(|idx| element_stack.get(idx))
-                        .map(|(n, pns)| (n.as_str(), *pns));
+                        .map(|(n, pns, _)| (n.as_str(), *pns));
                     // Why: XML-DSig enveloped-signature transforms strip the entire `<ds:Signature>`
                     // subtree before computing the digest. An attacker who holds any validly signed
                     // assertion can inject `<saml:Subject>`, `<saml:Conditions>`, `<saml:Audience>`,
                     // or `<saml:Attribute>` inside `<ds:Signature>` (e.g. `<ds:Object>` or
                     // `<ds:KeyInfo>`) without invalidating the signature. Never extract any SAML
-                    // claims while a `<ds:Signature>` element is on the ancestor stack.
-                    let in_signature = element_stack
-                        .iter()
-                        .any(|(n, el_ns)| n == "Signature" && *el_ns == XmlNs::Dsig);
+                    // claims while a `<ds:Signature>` element is on the ancestor stack. Carrying the
+                    // flag on each stack frame keeps this check O(1) regardless of XML nesting depth.
+                    let in_signature = element_stack.last().is_some_and(|(_, _, in_sig)| *in_sig);
 
                     const XSI_NAMESPACE: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
                     // Why: parse every attribute strictly (failing closed on malformed
                     // attributes instead of `.flatten()`), reject duplicate `ID`
                     // attributes anywhere in the document to defeat XSW ID-collision
-                    // attacks, and resolve `xsi:type` by both attribute namespace (`XSI`)
-                    // and QName prefix against the element's in-scope namespace map.
+                    // attacks, preserve attribute qualification so only unqualified
+                    // attributes populate standard SAML fields (preventing e.g.
+                    // `ext:Method` from entering bearer confirmation), and resolve
+                    // `xsi:type` by both attribute namespace (`XSI`) and QName prefix.
                     let mut parsed_attrs: Vec<(String, String)> = Vec::new();
                     let mut xsi_type_raw: Option<String> = None;
                     let mut xsi_type_is_saml_audience_restriction = false;
@@ -256,6 +278,7 @@ impl SamlParser {
                             SamlError::Malformed(format!("malformed XML attribute: {err}"))
                         })?;
                         let (attr_ns, attr_local) = reader.resolver().resolve_attribute(attr.key);
+                        let is_unqualified = matches!(attr_ns, ResolveResult::Unbound);
                         let k = attr_local.as_ref().to_string();
                         // Why: `Attribute.value` retains raw XML character/entity escapes
                         // (e.g. `&amp;` in URLs like `Recipient="https://sp/acs?a=1&amp;b=2"`).
@@ -285,12 +308,14 @@ impl SamlParser {
                                 && type_local.as_ref() == "AudienceRestrictionType";
                             xsi_type_raw = Some(trimmed.to_string());
                         }
-                        if k == "ID" && !v.is_empty() && !seen_ids.insert(v.clone()) {
-                            return Err(SamlError::SignatureWrappingDetected(format!(
-                                "duplicate ID attribute '{v}' detected; possible XML signature wrapping attack"
-                            )));
+                        if is_unqualified {
+                            if k == "ID" && !v.is_empty() && !seen_ids.insert(v.clone()) {
+                                return Err(SamlError::SignatureWrappingDetected(format!(
+                                    "duplicate ID attribute '{v}' detected; possible XML signature wrapping attack"
+                                )));
+                            }
+                            parsed_attrs.push((k, v));
                         }
-                        parsed_attrs.push((k, v));
                     }
 
                     if local_name == "Assertion" {
@@ -313,7 +338,11 @@ impl SamlParser {
                                 assertion_id = Some(v.clone());
                             }
                         }
-                    } else if local_name == "Response" && is_protocol_ns {
+                    } else if local_name == "Response" && is_protocol_ns && element_stack.is_empty()
+                    {
+                        // Why: bind envelope fields only to the root enclosing `<samlp:Response>`
+                        // so a nested `<samlp:Response>` inside extension content cannot overwrite
+                        // `Destination`, `InResponseTo`, or `response_id`.
                         has_response_envelope = true;
                         for (k, v) in &parsed_attrs {
                             if k == "ID" {
@@ -353,8 +382,8 @@ impl SamlParser {
                         && active_capture.is_none()
                     {
                         // Why: anchor `<Issuer>` text accumulation to direct children of
-                        // `<Assertion>` or `<Response>` and bind the capture to its opening
-                        // stack depth so nested markup or comments cannot corrupt or drop it.
+                        // `<Assertion>` or the root `<Response>` and bind the capture to its
+                        // opening stack depth so nested markup or comments cannot corrupt it.
                         match parent {
                             Some(("Assertion", XmlNs::Assertion)) => {
                                 active_capture = Some(ActiveTextCapture {
@@ -364,7 +393,7 @@ impl SamlParser {
                                     attr_name: None,
                                 });
                             }
-                            Some(("Response", XmlNs::Protocol)) => {
+                            Some(("Response", XmlNs::Protocol)) if element_stack.len() == 1 => {
                                 active_capture = Some(ActiveTextCapture {
                                     target: TextTarget::ResponseIssuer,
                                     depth: new_depth,
@@ -376,18 +405,26 @@ impl SamlParser {
                         }
                     } else if in_assertion && !in_signature && is_saml_ns {
                         // Why: in addition to excluding `<ds:Signature>` subtrees, anchor SAML
-                        // claims (`Conditions`, `Subject`/`NameID`, `SubjectConfirmationData`,
-                        // `Audience`, `Attribute`, `AttributeValue`) to their schema positions
-                        // under `<Assertion>` so extension containers such as `<Advice>` cannot
-                        // inject forged claims.
-                        if local_name == "Conditions"
+                        // claims (`Conditions`, `AuthnStatement`, `Subject`/`NameID`,
+                        // `SubjectConfirmationData`, `Audience`, `Attribute`, `AttributeValue`)
+                        // to their schema positions under `<Assertion>` so extension containers
+                        // such as `<Advice>` cannot inject forged claims.
+                        if local_name == "AuthnStatement"
+                            && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
+                        {
+                            has_authn_statement = true;
+                        } else if local_name == "Conditions"
                             && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
                         {
                             for (k, v) in &parsed_attrs {
                                 if k == "NotBefore" {
-                                    not_before = Some(parse_iso8601_strict(v)?);
+                                    let (secs, nanos) = parse_iso8601_strict_parts(v)?;
+                                    not_before = Some(secs);
+                                    not_before_subsec_nanos = nanos;
                                 } else if k == "NotOnOrAfter" {
-                                    not_on_or_after = Some(parse_iso8601_strict(v)?);
+                                    let (secs, nanos) = parse_iso8601_strict_parts(v)?;
+                                    not_on_or_after = Some(secs);
+                                    not_on_or_after_subsec_nanos = nanos;
                                 }
                             }
                         } else if local_name == "AudienceRestriction"
@@ -436,7 +473,9 @@ impl SamlParser {
                                     if k == "Recipient" {
                                         scd.recipient = Some(v.clone());
                                     } else if k == "NotOnOrAfter" {
-                                        scd.not_on_or_after = Some(parse_iso8601_strict(v)?);
+                                        let (secs, nanos) = parse_iso8601_strict_parts(v)?;
+                                        scd.not_on_or_after = Some(secs);
+                                        scd.not_on_or_after_subsec_nanos = nanos;
                                     } else if k == "InResponseTo" {
                                         scd.in_response_to = Some(v.clone());
                                     }
@@ -510,7 +549,9 @@ impl SamlParser {
                         }
                     }
 
-                    element_stack.push((local_name.to_string(), ns));
+                    let enters_signature =
+                        in_signature || (local_name == "Signature" && is_dsig_ns);
+                    element_stack.push((local_name.to_string(), ns, enters_signature));
                 }
                 Ok((res, Event::End(ref e))) => {
                     let local = e.local_name();
@@ -605,7 +646,14 @@ impl SamlParser {
                         capture.buf.push_str(&resolved);
                     }
                 }
-                Ok((_res, Event::Eof)) => break,
+                Ok((_res, Event::Eof)) => {
+                    if !element_stack.is_empty() {
+                        return Err(SamlError::Malformed(
+                            "unexpected EOF with unclosed XML elements".into(),
+                        ));
+                    }
+                    break;
+                }
                 Err(err) => {
                     return Err(SamlError::Malformed(format!("XML parser error: {err}")));
                 }
@@ -731,9 +779,12 @@ impl SamlParser {
             destination,
             has_response_envelope,
             response_in_response_to,
+            has_authn_statement,
             subject_confirmations,
             not_before,
+            not_before_subsec_nanos,
             not_on_or_after,
+            not_on_or_after_subsec_nanos,
             attributes: fields.attributes,
         })
     }

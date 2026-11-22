@@ -32,10 +32,10 @@ pub(super) const SQLITE_MIGRATIONS_SCHEMA: &str =
     include_str!("../../../sql/sqlite/migrations_schema.sql");
 
 /// Canonical DDL for the migration tracking ledger table across all database backends.
-pub(super) const CREATE_MIGRATIONS_TABLE_DDL: &str = PG_MIGRATIONS_SCHEMA;
+pub const CREATE_MIGRATIONS_TABLE_DDL: &str = PG_MIGRATIONS_SCHEMA;
 
 /// Returns the dialect-specific DDL for creating the `rume_migrations` table.
-pub(super) fn migrations_schema_ddl(dialect: &str) -> &'static str {
+pub fn migrations_schema_ddl(dialect: &str) -> &'static str {
     match dialect {
         "postgres" => PG_MIGRATIONS_SCHEMA,
         "mysql" => MYSQL_MIGRATIONS_SCHEMA,

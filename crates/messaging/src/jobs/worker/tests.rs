@@ -39,6 +39,7 @@ struct BlockingTestQueue {
     job: Mutex<Option<QueuedJob>>,
     enter_tx: mpsc::Sender<()>,
     release_rx: Mutex<mpsc::Receiver<()>>,
+    defer_count: Arc<AtomicUsize>,
     nack_count: Arc<AtomicUsize>,
     ack_count: Arc<AtomicUsize>,
     dlq_count: Arc<AtomicUsize>,
@@ -66,6 +67,7 @@ impl JobQueue for BlockingTestQueue {
             let _ = self.release_rx.lock().await.recv().await;
             let mut guard = self.job.lock().await;
             if let Some(mut j) = guard.take() {
+                j.attempt += 1;
                 j.assigned_worker = Some(worker_id);
                 j.lease_token = Some("test-token".to_string());
                 Ok(Some(j))
@@ -99,6 +101,19 @@ impl JobQueue for BlockingTestQueue {
         Box::pin(async move { Ok(()) })
     }
 
+    fn defer(
+        &self,
+        mut job: QueuedJob,
+        _lease_token: &str,
+        _delay: Duration,
+    ) -> BoxFuture<'_, Result<(), JobError>> {
+        self.defer_count.fetch_add(1, Ordering::SeqCst);
+        job.attempt = job.attempt.saturating_sub(1);
+        let mut guard = self.job.try_lock().unwrap();
+        *guard = Some(job);
+        Box::pin(async move { Ok(()) })
+    }
+
     fn dead_letter(
         &self,
         _job: QueuedJob,
@@ -122,10 +137,6 @@ impl JobQueue for BlockingTestQueue {
         }
     }
 
-    fn purge_completed(&self, _retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
-        Box::pin(async { Ok(5) })
-    }
-
     fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
         Box::pin(async move { Ok(0) })
     }
@@ -136,9 +147,11 @@ impl JobQueue for BlockingTestQueue {
 }
 
 #[tokio::test]
-async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_nacks_immediately() {
-    let (enter_tx, mut enter_rx) = mpsc::channel(1);
-    let (release_tx, release_rx) = mpsc::channel(1);
+async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_defers_without_burning_attempt()
+{
+    let (enter_tx, mut enter_rx) = mpsc::channel(2);
+    let (release_tx, release_rx) = mpsc::channel(2);
+    let defer_count = Arc::new(AtomicUsize::new(0));
     let nack_count = Arc::new(AtomicUsize::new(0));
 
     let payload_bytes = serde_json::to_vec(&BlockTestJob {
@@ -150,7 +163,7 @@ async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_nacks_immedia
         id: "job-123".to_string(),
         name: BlockTestJob::NAME.to_string(),
         payload: payload_bytes,
-        attempt: 1,
+        attempt: 0,
         retry_policy: RetryPolicy::new(),
         timeout: Some(Duration::from_secs(10)),
         idempotency_key: None,
@@ -166,6 +179,7 @@ async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_nacks_immedia
         job: Mutex::new(Some(job)),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::clone(&defer_count),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::new(AtomicUsize::new(0)),
         dlq_count: Arc::new(AtomicUsize::new(0)),
@@ -210,11 +224,26 @@ async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_nacks_immedia
         "job must not execute after drain requested"
     );
 
-    // 7. Verify the returned job was immediately nack'd back to queue
+    // 7. Verify the returned job was immediately deferred (not nack'd) and keeps attempt == 1
+    assert_eq!(
+        defer_count.load(Ordering::SeqCst),
+        1,
+        "unstarted job must be deferred immediately"
+    );
     assert_eq!(
         nack_count.load(Ordering::SeqCst),
-        1,
-        "unstarted job must be nack'd immediately"
+        0,
+        "draining must call defer, not nack"
+    );
+    release_tx.send(()).await.expect("allow next dequeue");
+    let next_claim = queue
+        .dequeue_for("worker-next")
+        .await
+        .expect("dequeue after defer")
+        .expect("deferred job must be available");
+    assert_eq!(
+        next_claim.attempt, 1,
+        "deferring an unstarted job must not consume a retry attempt"
     );
 }
 
@@ -235,6 +264,8 @@ async fn test_worker_handle_shutdown_reports_panic() {
         heartbeat_task: None,
         recovery_task: None,
         is_stopping,
+        admission_lock: Arc::new(std::sync::Mutex::new(())),
+        drain_dirty: Arc::new(AtomicBool::new(false)),
         shutdown_tx: Arc::new(shutdown_tx),
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
@@ -254,14 +285,27 @@ async fn test_worker_handle_shutdown_reports_panic() {
 
 #[tokio::test(start_paused = true)]
 async fn test_worker_handle_timeout_aborts_tasks() {
+    struct NotifyOnDrop(Arc<tokio::sync::Notify>);
+    impl Drop for NotifyOnDrop {
+        fn drop(&mut self) {
+            self.0.notify_one();
+        }
+    }
+
     let is_stopping = Arc::new(AtomicBool::new(false));
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let (abort_tx, _) = tokio::sync::watch::channel(false);
     let in_flight_count = Arc::new(AtomicU32::new(0));
     let active_tasks = Arc::new(AtomicU32::new(1));
+    let task_dropped = Arc::new(tokio::sync::Notify::new());
+    let dropped_wait = task_dropped.notified();
+    tokio::pin!(dropped_wait);
+    dropped_wait.as_mut().enable();
 
     // Long-running task that would suspend forever unless aborted
-    let long_task = tokio::spawn(async {
+    let drop_notify = Arc::clone(&task_dropped);
+    let long_task = tokio::spawn(async move {
+        let _guard = NotifyOnDrop(drop_notify);
         std::future::pending::<()>().await;
     });
     let abort_handle = long_task.abort_handle();
@@ -271,6 +315,8 @@ async fn test_worker_handle_timeout_aborts_tasks() {
         heartbeat_task: None,
         recovery_task: None,
         is_stopping,
+        admission_lock: Arc::new(std::sync::Mutex::new(())),
+        drain_dirty: Arc::new(AtomicBool::new(false)),
         shutdown_tx: Arc::new(shutdown_tx),
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
@@ -289,13 +335,13 @@ async fn test_worker_handle_timeout_aborts_tasks() {
         "task should still be running after try_shutdown"
     );
 
-    // 2. consuming shutdown aborts remaining tasks on timeout
+    // 2. consuming shutdown aborts remaining tasks on timeout and awaits cancellation
     let success = handle.shutdown(Duration::from_millis(50)).await;
     assert!(!success, "shutdown must return false on timeout");
 
-    // Brief yield to allow the abort to process
-    tokio::task::yield_now().await;
-    // The worker task must have been aborted
+    tokio::time::timeout(Duration::from_secs(1), dropped_wait)
+        .await
+        .expect("aborted task drop guard must fire deterministically");
     assert!(
         abort_handle.is_finished(),
         "task must be aborted on shutdown timeout"
@@ -316,6 +362,8 @@ async fn test_worker_handle_try_shutdown_retry_after_heartbeat_timeout() {
         heartbeat_task: Some(heartbeat_task),
         recovery_task: None,
         is_stopping: Arc::new(AtomicBool::new(false)),
+        admission_lock: Arc::new(std::sync::Mutex::new(())),
+        drain_dirty: Arc::new(AtomicBool::new(false)),
         shutdown_tx: Arc::new(shutdown_tx),
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
@@ -333,24 +381,27 @@ async fn test_worker_handle_try_shutdown_retry_after_heartbeat_timeout() {
 }
 
 #[tokio::test]
-async fn test_purge_completed_queue_api() {
+async fn test_purge_completed_default_implementation_returns_zero() {
     let (enter_tx, _) = mpsc::channel(1);
     let (_, release_rx) = mpsc::channel(1);
     let queue = BlockingTestQueue {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::new(AtomicUsize::new(0)),
         ack_count: Arc::new(AtomicUsize::new(0)),
         dlq_count: Arc::new(AtomicUsize::new(0)),
         fail_renew: false,
     };
 
+    // Exercises the default `JobQueue::purge_completed` implementation (real retention
+    // purging is tested against PostgreSQL in `containers/postgres.rs`).
     let purged = queue
         .purge_completed(Duration::from_secs(3600))
         .await
         .unwrap();
-    assert_eq!(purged, 5);
+    assert_eq!(purged, 0);
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -402,6 +453,7 @@ async fn test_worker_heartbeat_loss_routes_to_dlq() {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::clone(&ack_count),
         dlq_count: Arc::clone(&dlq_count),
@@ -490,6 +542,7 @@ async fn test_idempotency_store_acquisition_failure_fails_closed_and_nacks() {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::clone(&ack_count),
         dlq_count: Arc::clone(&dlq_count),
@@ -525,7 +578,9 @@ async fn test_idempotency_store_acquisition_failure_fails_closed_and_nacks() {
 }
 
 #[derive(Debug)]
-struct FailingRenewalIdempotencyStore;
+struct FailingRenewalIdempotencyStore {
+    renewal_attempted: Arc<tokio::sync::Notify>,
+}
 
 impl IdempotencyStore for FailingRenewalIdempotencyStore {
     fn try_acquire_with_token(
@@ -556,7 +611,9 @@ impl IdempotencyStore for FailingRenewalIdempotencyStore {
         _token: &str,
         _extension: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
+        let attempted = Arc::clone(&self.renewal_attempted);
         Box::pin(async move {
+            attempted.notify_one();
             Err(JobError::Fatal(
                 "failed to extend idempotency key: token mismatch or lease expired".into(),
             ))
@@ -564,13 +621,39 @@ impl IdempotencyStore for FailingRenewalIdempotencyStore {
     }
 }
 
-#[tokio::test]
+struct RenewalGatedHandler {
+    gate: Arc<tokio::sync::Notify>,
+}
+
+impl JobHandler<SlowTestJob> for RenewalGatedHandler {
+    fn handle<'a>(
+        &'a self,
+        ctx: &'a JobContext,
+        _job: SlowTestJob,
+    ) -> BoxFuture<'a, Result<(), JobError>> {
+        let gate = Arc::clone(&self.gate);
+        Box::pin(async move {
+            tokio::select! {
+                _ = gate.notified() => {}
+                _ = async {
+                    while !ctx.is_cancelled() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                } => {}
+            }
+            Ok(())
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
     let (enter_tx, _enter_rx) = mpsc::channel(1);
     let (_release_tx, release_rx) = mpsc::channel(1);
     let nack_count = Arc::new(AtomicUsize::new(0));
     let ack_count = Arc::new(AtomicUsize::new(0));
     let dlq_count = Arc::new(AtomicUsize::new(0));
+    let renewal_attempted = Arc::new(tokio::sync::Notify::new());
 
     let payload_bytes = serde_json::to_vec(&SlowTestJob).unwrap();
     let job = QueuedJob {
@@ -593,6 +676,7 @@ async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::clone(&ack_count),
         dlq_count: Arc::clone(&dlq_count),
@@ -600,9 +684,11 @@ async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
     });
 
     let mut registry = JobRegistry::new();
-    registry.register(SlowTestHandler);
+    registry.register(RenewalGatedHandler {
+        gate: Arc::clone(&renewal_attempted),
+    });
 
-    let failing_store = Arc::new(FailingRenewalIdempotencyStore);
+    let failing_store = Arc::new(FailingRenewalIdempotencyStore { renewal_attempted });
 
     JobWorker::execute_job(
         Arc::clone(&queue),
@@ -654,7 +740,7 @@ impl IdempotencyStore for DefaultUnsupportedStore {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
     let (enter_tx, _enter_rx) = mpsc::channel(1);
     let (_release_tx, release_rx) = mpsc::channel(1);
@@ -683,6 +769,7 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::clone(&ack_count),
         dlq_count: Arc::clone(&dlq_count),
@@ -690,7 +777,9 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
     });
 
     let mut registry = JobRegistry::new();
-    registry.register(SlowTestHandler);
+    registry.register(RenewalGatedHandler {
+        gate: Arc::new(tokio::sync::Notify::new()),
+    });
 
     let unsupported_store = Arc::new(DefaultUnsupportedStore);
 
@@ -1776,6 +1865,7 @@ async fn in_flight_idempotency_loss_before_ack_routes_to_dead_letter() {
         job: Mutex::new(None),
         enter_tx,
         release_rx: Mutex::new(release_rx),
+        defer_count: Arc::new(AtomicUsize::new(0)),
         nack_count: Arc::clone(&nack_count),
         ack_count: Arc::clone(&ack_count),
         dlq_count: Arc::clone(&dlq_count),
@@ -1972,10 +2062,15 @@ async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
     assert_eq!(ack_count.load(Ordering::SeqCst), 0);
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
     #[derive(Debug)]
-    struct SlowRenewQueue;
+    struct SlowRenewQueue {
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        completed: Arc<tokio::sync::Notify>,
+        ok_count: Arc<AtomicUsize>,
+    }
 
     impl JobQueue for SlowRenewQueue {
         fn enqueue_delayed_with_trace<J: Job>(
@@ -2004,10 +2099,17 @@ async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
             _lease_token: &str,
             _extension: Duration,
         ) -> BoxFuture<'_, Result<(), JobError>> {
-            Box::pin(async {
-                // Simulate a busy queue backend under load: the renewal completes
-                // successfully, but takes longer than one heartbeat tick interval.
-                tokio::time::sleep(Duration::from_millis(350)).await;
+            let entered = Arc::clone(&self.entered);
+            let release = Arc::clone(&self.release);
+            let completed = Arc::clone(&self.completed);
+            let ok_count = Arc::clone(&self.ok_count);
+            Box::pin(async move {
+                if ok_count.load(Ordering::SeqCst) == 0 {
+                    entered.notify_one();
+                    release.notified().await;
+                }
+                ok_count.fetch_add(1, Ordering::SeqCst);
+                completed.notify_one();
                 Ok(())
             })
         }
@@ -2038,22 +2140,54 @@ async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
         }
     }
 
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(tokio::sync::Notify::new());
+    let ok_count = Arc::new(AtomicUsize::new(0));
+
+    let entered_wait = entered.notified();
+    tokio::pin!(entered_wait);
+    entered_wait.as_mut().enable();
+
+    let completed_wait = completed.notified();
+    tokio::pin!(completed_wait);
+    completed_wait.as_mut().enable();
+
     let lost_leases = Arc::new(AtomicU64::new(0));
     let hb = spawn_lease_heartbeat(LeaseHeartbeatParams {
-        queue: Arc::new(SlowRenewQueue),
+        queue: Arc::new(SlowRenewQueue {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+            completed: Arc::clone(&completed),
+            ok_count: Arc::clone(&ok_count),
+        }),
         job_id: "job-slow-renew".to_string(),
         token: "token-slow-renew".to_string(),
         stopping: Arc::new(AtomicBool::new(false)),
+        shutdown_rx: None,
         lost_leases: Arc::clone(&lost_leases),
         idempotency_store: None,
         effective_key: None,
         lease_duration: Duration::from_millis(600),
     });
 
-    // The 350ms renewal outlasts the ~200ms tick interval but completes well within
-    // the 600ms lease. It must not be classified as an ownership loss.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Wait for renewal entry, advance beyond one ~200ms tick interval but less than
+    // the 600ms lease duration, then release the renewal and prove completion before
+    // checking loss indicators.
+    tokio::time::timeout(Duration::from_secs(1), entered_wait)
+        .await
+        .expect("renewal must enter");
+    tokio::time::advance(Duration::from_millis(350)).await;
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), completed_wait)
+        .await
+        .expect("slow renewal must complete");
+    drop(hb.tick_lock.lock().await);
 
+    assert!(
+        ok_count.load(Ordering::SeqCst) >= 1,
+        "slow renewal must have completed"
+    );
     assert!(
         !hb.lease_lost.load(Ordering::SeqCst),
         "a renewal that completes within the lease must not be reported as lease loss"

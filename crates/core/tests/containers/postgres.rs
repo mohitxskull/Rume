@@ -1418,9 +1418,15 @@ async fn expired_but_unclaimed_job_lease_can_be_renewed_with_same_token() {
     assert_eq!(job.id, job_id);
     let token = job.lease_token.clone().unwrap();
 
-    // Sleep well past the 100ms lease expiry with NO worker or reaper running,
-    // so ownership has not actually transferred to anyone.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Move `lease_expires_at` into the past using the database clock with NO worker or
+    // reaper running, so ownership has not actually transferred to anyone.
+    pool.backend()
+        .execute_params(
+            "UPDATE rume_jobs SET lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT - 1000 WHERE id = $1",
+            &[DbValue::Text(job_id.clone())],
+        )
+        .await
+        .expect("backdate lease_expires_at");
 
     // The renewal executes after the lease expired on the clock but before any
     // reclaim: the token still fences ownership, so renewal must succeed.
@@ -1441,6 +1447,77 @@ async fn expired_but_unclaimed_job_lease_can_be_renewed_with_same_token() {
         .ack(&job_id, &token)
         .await
         .expect("ack with the owning token after renewal must succeed");
+}
+
+#[tokio::test]
+async fn postgres_job_queue_purge_completed_respects_retention_window() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+    let queue = PostgresJobQueue::from_backend(pool.backend());
+    queue.init_schema().await.expect("init job schema failed");
+
+    let old_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-old".into(),
+            amount: 100,
+        })
+        .await
+        .expect("enqueue old job");
+    let new_id = queue
+        .enqueue(SendInvoiceJob {
+            invoice_id: "inv-new".into(),
+            amount: 200,
+        })
+        .await
+        .expect("enqueue new job");
+
+    for _ in 0..2 {
+        let claimed = queue
+            .dequeue_for("worker-purge")
+            .await
+            .expect("dequeue")
+            .expect("job");
+        queue
+            .ack(&claimed.id, claimed.lease_token.as_deref().unwrap())
+            .await
+            .expect("ack");
+    }
+
+    // Backdate only `old_id` by 2 hours using the database clock.
+    pool.backend()
+        .execute_params(
+            "UPDATE rume_jobs SET completed_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT - 7200000 WHERE id = $1",
+            &[DbValue::Text(old_id.clone())],
+        )
+        .await
+        .expect("backdate old completed_at");
+
+    let purged = queue
+        .purge_completed(Duration::from_secs(3600))
+        .await
+        .expect("purge_completed");
+    assert_eq!(
+        purged, 1,
+        "only the job older than 1h retention should purge"
+    );
+
+    let old_status = pool
+        .backend()
+        .query_scalar_params(
+            "SELECT status FROM rume_jobs WHERE id = $1",
+            &[DbValue::Text(old_id)],
+        )
+        .await
+        .expect("query old status");
+    let new_status = pool
+        .backend()
+        .query_scalar_params(
+            "SELECT status FROM rume_jobs WHERE id = $1",
+            &[DbValue::Text(new_id)],
+        )
+        .await
+        .expect("query new status");
+    assert_eq!(old_status.as_deref(), Some("purged"));
+    assert_eq!(new_status.as_deref(), Some("completed"));
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

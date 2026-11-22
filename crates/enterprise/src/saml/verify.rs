@@ -60,14 +60,31 @@ pub enum SamlError {
 }
 /// Replay-protection cache for consumed SAML assertion IDs.
 pub trait SamlReplayCache: Send + Sync {
-    /// Records `assertion_id` with expiration `expires_at` (epoch seconds).
+    /// Atomically checks expiry and records `assertion_id` with acceptance deadline `expires_at`
+    /// (epoch seconds) at `now_epoch_sec` (epoch seconds).
+    ///
+    /// Implementations must enforce expiry under the same synchronization and time basis as
+    /// pruning: if `now_epoch_sec >= expires_at` (or the cache has already pruned past
+    /// `expires_at`), return `Err(SamlError::Expired { .. })` instead of inserting a stale ID.
     /// Returns `Ok(true)` if fresh (newly recorded), or `Ok(false)` if already seen.
-    fn record_if_absent(&self, assertion_id: &str, expires_at: u64) -> Result<bool, SamlError>;
+    fn record_if_absent(
+        &self,
+        assertion_id: &str,
+        expires_at: u64,
+        now_epoch_sec: u64,
+    ) -> Result<bool, SamlError>;
 }
+
+#[derive(Debug, Default)]
+struct ReplayCacheState {
+    entries: HashMap<String, u64>,
+    last_pruned_at: u64,
+}
+
 /// Thread-safe in-memory [`SamlReplayCache`] suitable for single-instance deployments and tests.
 #[derive(Debug, Default)]
 pub struct InMemorySamlReplayCache {
-    seen: Mutex<HashMap<String, u64>>,
+    state: Mutex<ReplayCacheState>,
 }
 
 impl InMemorySamlReplayCache {
@@ -76,24 +93,42 @@ impl InMemorySamlReplayCache {
         Self::default()
     }
 
-    /// Evicts entries whose expiration is `<= now_epoch_sec`.
+    /// Evicts entries whose expiration is `<= now_epoch_sec` and advances the pruning
+    /// watermark so concurrent late validations cannot re-insert an already-pruned ID.
     pub fn prune_expired(&self, now_epoch_sec: u64) {
-        if let Ok(mut guard) = self.seen.lock() {
-            guard.retain(|_, exp| *exp > now_epoch_sec);
+        if let Ok(mut guard) = self.state.lock() {
+            guard.last_pruned_at = guard.last_pruned_at.max(now_epoch_sec);
+            let cutoff = guard.last_pruned_at;
+            guard.entries.retain(|_, exp| *exp > cutoff);
         }
     }
 }
 
 impl SamlReplayCache for InMemorySamlReplayCache {
-    fn record_if_absent(&self, assertion_id: &str, expires_at: u64) -> Result<bool, SamlError> {
+    fn record_if_absent(
+        &self,
+        assertion_id: &str,
+        expires_at: u64,
+        now_epoch_sec: u64,
+    ) -> Result<bool, SamlError> {
         let mut guard = self
-            .seen
+            .state
             .lock()
             .map_err(|e| SamlError::Malformed(format!("replay cache lock poisoned: {e}")))?;
-        if guard.contains_key(assertion_id) {
+        // Why: enforce the acceptance deadline under the same mutex and monotonic watermark
+        // as `prune_expired` so a validation that passed the earlier time check right before
+        // expiry cannot race with pruning and re-insert an evicted assertion ID.
+        let effective_now = now_epoch_sec.max(guard.last_pruned_at);
+        if effective_now >= expires_at {
+            return Err(SamlError::Expired {
+                not_on_or_after: expires_at,
+                current: effective_now,
+            });
+        }
+        if guard.entries.contains_key(assertion_id) {
             return Ok(false);
         }
-        guard.insert(assertion_id.to_string(), expires_at);
+        guard.entries.insert(assertion_id.to_string(), expires_at);
         Ok(true)
     }
 }
@@ -198,9 +233,50 @@ impl SamlParser {
         )
     }
 
-    /// Validates a SAML assertion against full SAML 2.0 Web Browser SSO constraints,
-    /// including clock skew, multi-audience OR-semantics, `SubjectConfirmationData`
-    /// (`Recipient`, `NotOnOrAfter`, `InResponseTo`), and replay protection.
+    /// Validates a SAML assertion against the full SAML 2.0 HTTP POST Web Browser SSO profile.
+    ///
+    /// In addition to every check performed by [`Self::validate_with_config`], this entry point
+    /// mandates:
+    /// - an `<AuthnStatement>` inside the assertion (`assertion.has_authn_statement`),
+    /// - bearer `<SubjectConfirmation>` enforcement (`require_bearer_confirmation: true`),
+    /// - a configured ACS URL (`config.expected_recipient.is_some()`), and
+    /// - a replay-protection cache (`config.replay_cache.is_some()`).
+    pub fn validate_browser_sso(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        config: &SamlValidationConfig<'_>,
+    ) -> Result<(), SamlError> {
+        if !assertion.has_authn_statement {
+            return Err(SamlError::Malformed(
+                "missing required AuthnStatement for SAML Web Browser SSO".into(),
+            ));
+        }
+        if config.expected_recipient.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_recipient (ACS URL) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
+        if config.replay_cache.is_none() {
+            return Err(SamlError::Malformed(
+                "replay_cache is required for HTTP POST SAML Web Browser SSO validation".into(),
+            ));
+        }
+        let enforced = SamlValidationConfig {
+            require_bearer_confirmation: true,
+            ..*config
+        };
+        Self::validate_with_config(assertion, current_epoch_sec, &enforced)
+    }
+
+    /// Validates configured SAML assertion fields (time conditions with subsecond precision
+    /// and clock skew, multi-audience restrictions, optional issuer/destination/recipient/
+    /// `InResponseTo`, bearer `SubjectConfirmationData` when `require_bearer_confirmation` is
+    /// `true`, and optional replay protection).
+    ///
+    /// Note: this method checks only the fields configured in `config` and does **not** require
+    /// `<AuthnStatement>`, `expected_recipient`, or `replay_cache` unless configured. For full
+    /// SAML 2.0 HTTP POST Web Browser SSO enforcement, call [`Self::validate_browser_sso`].
     pub fn validate_with_config(
         assertion: &SamlAssertion,
         current_epoch_sec: u64,
@@ -209,7 +285,8 @@ impl SamlParser {
         let skew = config.clock_skew_secs;
 
         if let Some(not_before) = assertion.not_before
-            && current_epoch_sec.saturating_add(skew) < not_before
+            && (current_epoch_sec.saturating_add(skew), 0u32)
+                < (not_before, assertion.not_before_subsec_nanos)
         {
             return Err(SamlError::NotYetValid {
                 not_before,
@@ -221,7 +298,12 @@ impl SamlParser {
             .not_on_or_after
             .ok_or(SamlError::MissingExpirationCondition)?;
 
-        if current_epoch_sec >= not_on_or_after.saturating_add(skew) {
+        if (current_epoch_sec, 0u32)
+            >= (
+                not_on_or_after.saturating_add(skew),
+                assertion.not_on_or_after_subsec_nanos,
+            )
+        {
             return Err(SamlError::Expired {
                 not_on_or_after,
                 current: current_epoch_sec,
@@ -319,7 +401,12 @@ impl SamlParser {
                     last_err = Some(SamlError::MissingExpirationCondition);
                     continue;
                 };
-                if current_epoch_sec >= scd_exp.saturating_add(skew) {
+                if (current_epoch_sec, 0u32)
+                    >= (
+                        scd_exp.saturating_add(skew),
+                        scd.not_on_or_after_subsec_nanos,
+                    )
+                {
                     last_err = Some(SamlError::Expired {
                         not_on_or_after: scd_exp,
                         current: current_epoch_sec,
@@ -394,10 +481,14 @@ impl SamlParser {
 
         if let Some(cache) = config.replay_cache {
             // Why: retain the replay record through the full skew-adjusted validity
-            // window (`not_on_or_after + clock_skew_secs`) so pruning at `not_on_or_after`
-            // cannot allow a replay while validation would still accept the assertion.
-            let replay_expires_at = not_on_or_after.saturating_add(skew);
-            let fresh = cache.record_if_absent(&assertion.id, replay_expires_at)?;
+            // window (rounding up fractional nanoseconds) and pass `current_epoch_sec`
+            // so the cache rejects insertions atomically if the deadline has passed or
+            // pruning has already advanced past it.
+            let replay_expires_at = not_on_or_after
+                .saturating_add(skew)
+                .saturating_add(u64::from(assertion.not_on_or_after_subsec_nanos > 0));
+            let fresh =
+                cache.record_if_absent(&assertion.id, replay_expires_at, current_epoch_sec)?;
             if !fresh {
                 return Err(SamlError::AssertionReplayed(assertion.id.clone()));
             }

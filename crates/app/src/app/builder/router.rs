@@ -296,6 +296,13 @@ where
         })
     }
 
+    /// Build the Axum [`Router`] with all module routes, middleware, and
+    /// observability layers applied.
+    ///
+    /// The explicit `ctx` argument is bound as the Axum state for all mounted
+    /// handlers (rather than `self.ctx`). If you mutated builder state via
+    /// `.state(...)` and pass a separate retained `AppContext` here, mounted
+    /// handlers will observe the `ctx` passed to `build_router`.
     pub fn build_router(
         self,
         ctx: AppContext<E, C, S>,
@@ -406,9 +413,18 @@ where
         // 1. Apply group middleware (innermost middleware layers)
         for name in groups_order.iter().rev() {
             if applied_groups.contains(name) {
-                let members = groups.get(name).expect("group validated above");
+                let members = groups.get(name).ok_or_else(|| {
+                    BuildError::from(super::MiddlewareConfigError::UnknownGroup {
+                        name: name.clone(),
+                    })
+                })?;
                 for member in members.iter().rev() {
-                    let mw = middleware.get(member).expect("member validated above");
+                    let mw = middleware.get(member).ok_or_else(|| {
+                        BuildError::from(super::MiddlewareConfigError::UnknownGroupMember {
+                            group: name.clone(),
+                            member: member.clone(),
+                        })
+                    })?;
                     router = mw(router);
                 }
             }

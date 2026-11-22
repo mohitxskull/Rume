@@ -53,20 +53,24 @@ impl SqliteTestFixture {
         self.closed = true;
         // 1. Drain and close connection pool
         self.pool.close_async().await;
-        // 2. Remove files deterministically
+        // 2. Remove database and WAL/SHM sidecar files deterministically, propagating
+        //    any error other than `NotFound`.
+        let remove_if_present = |file: &Path| -> Result<(), PersistenceError> {
+            match std::fs::remove_file(file) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(PersistenceError::ConnectionFailed(format!(
+                    "failed to remove {}: {e}",
+                    file.display()
+                ))),
+            }
+        };
         let path = self.path.clone();
         let wal = PathBuf::from(format!("{}-wal", path.display()));
         let shm = PathBuf::from(format!("{}-shm", path.display()));
-        if wal.exists() {
-            let _ = std::fs::remove_file(wal);
-        }
-        if shm.exists() {
-            let _ = std::fs::remove_file(shm);
-        }
-        if path.exists() {
-            std::fs::remove_file(&path)
-                .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
-        }
+        remove_if_present(&wal)?;
+        remove_if_present(&shm)?;
+        remove_if_present(&path)?;
         Ok(())
     }
 }

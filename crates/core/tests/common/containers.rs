@@ -12,6 +12,36 @@ use testcontainers_modules::testcontainers::{ContainerAsync, runners::AsyncRunne
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
 use tokio::sync::OnceCell;
 
+/// Spawns a detached OS process that removes `container_id` as soon as this test binary exits.
+///
+/// Why: `POSTGRES_NODE`, `MYSQL_NODE`, and `REDIS_NODE` live in `static OnceCell`s, and Rust never
+/// runs `Drop` on `static` items at process exit. Without an out-of-process reaper, every run of
+/// `cargo test -p rume --test containers` permanently leaks a running Docker container (even on
+/// normal exit, panic, or `SIGKILL`), eventually exhausting host RAM and swap.
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
+fn spawn_container_reaper(container_id: &str) {
+    let pid = std::process::id();
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("sh")
+            .args([
+                "-c",
+                "while kill -0 \"$1\" 2>/dev/null; do sleep 1; done; docker rm -f \"$2\" >/dev/null 2>&1",
+                "rume-container-reaper",
+                &pid.to_string(),
+                container_id,
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (pid, container_id);
+    }
+}
+
 // ─── PostgreSQL Shared Container & Isolation ─────────────────────────────────
 
 #[cfg(feature = "postgres")]
@@ -24,11 +54,13 @@ static POSTGRES_NODE: OnceCell<ContainerAsync<Postgres>> = OnceCell::const_new()
 pub async fn shared_postgres() -> &'static ContainerAsync<Postgres> {
     POSTGRES_NODE
         .get_or_init(|| async {
-            Postgres::default()
+            let container = Postgres::default()
                 .with_tag("16-alpine")
                 .start()
                 .await
-                .expect("start shared postgres container")
+                .expect("start shared postgres container");
+            spawn_container_reaper(container.id());
+            container
         })
         .await
 }
@@ -86,10 +118,12 @@ static MYSQL_NODE: OnceCell<ContainerAsync<Mysql>> = OnceCell::const_new();
 pub async fn shared_mysql() -> &'static ContainerAsync<Mysql> {
     MYSQL_NODE
         .get_or_init(|| async {
-            Mysql::default()
+            let container = Mysql::default()
                 .start()
                 .await
-                .expect("start shared mysql container")
+                .expect("start shared mysql container");
+            spawn_container_reaper(container.id());
+            container
         })
         .await
 }
@@ -143,11 +177,13 @@ static REDIS_NODE: OnceCell<ContainerAsync<Redis>> = OnceCell::const_new();
 pub async fn shared_redis() -> &'static ContainerAsync<Redis> {
     REDIS_NODE
         .get_or_init(|| async {
-            Redis::default()
+            let container = Redis::default()
                 .with_tag("alpine")
                 .start()
                 .await
-                .expect("start shared redis container")
+                .expect("start shared redis container");
+            spawn_container_reaper(container.id());
+            container
         })
         .await
 }

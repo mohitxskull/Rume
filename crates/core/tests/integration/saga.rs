@@ -572,6 +572,22 @@ mod rc16_tests {
         fn list_incomplete(&self) -> BoxFuture<'_, Result<Vec<SagaRecord>, SagaError>> {
             self.inner.list_incomplete()
         }
+
+        fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>> {
+            self.inner.try_acquire_execution(saga_id)
+        }
+
+        fn release_execution(
+            &self,
+            saga_id: &str,
+            claim_token: &str,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
+            self.inner.release_execution(saga_id, claim_token)
+        }
+
+        fn release_execution_sync(&self, saga_id: &str, claim_token: &str) -> bool {
+            self.inner.release_execution_sync(saga_id, claim_token)
+        }
     }
 
     #[test]

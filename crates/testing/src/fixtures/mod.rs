@@ -7,7 +7,7 @@ use rume_data::persistence::{DatabaseBackend, DatabasePool};
 use rume_data::persistence::{DatabaseTransaction, PersistenceError};
 #[cfg(feature = "sqlite")]
 use std::path::{Path, PathBuf};
-#[cfg(any(feature = "postgres", all(test, feature = "sqlite")))]
+#[cfg(all(test, feature = "sqlite"))]
 use std::sync::Arc;
 
 #[cfg(feature = "postgres")]

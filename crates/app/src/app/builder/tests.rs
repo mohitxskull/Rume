@@ -269,6 +269,7 @@ async fn fallible_startup_hook_failure_triggers_cleanup_hooks() {
     let lifecycle = ctx.lifecycle.clone();
 
     let builder = RumeBuilder::new(ctx)
+        .bind("127.0.0.1:0")
         .on_ready(|_| async move {
             Err::<(), _>(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
