@@ -78,37 +78,45 @@ where
     F: std::future::Future<Output = T>,
 {
     tokio::pin!(fut);
-    let mut stop_poll = tokio::time::interval(Duration::from_millis(20));
-    loop {
-        if job_cancelled.load(Ordering::Relaxed)
-            || stopping.load(Ordering::Relaxed)
-            || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
-        {
-            if stopping.load(Ordering::Relaxed)
-                || shutdown_rx.as_ref().is_some_and(|rx| *rx.borrow())
+    if let Some(rx) = shutdown_rx.as_mut() {
+        // Why: production job tasks supply `shutdown_rx`, so awaiting `rx.wait_for` wakes
+        // immediately on shutdown without spawning periodic 20ms timer wakeups per in-flight job.
+        loop {
+            if job_cancelled.load(Ordering::Relaxed)
+                || stopping.load(Ordering::Relaxed)
+                || *rx.borrow()
             {
-                job_cancelled.store(true, Ordering::SeqCst);
-            }
-            // Why: once shutdown cancellation has been delivered to the handler, keep
-            // awaiting the in-flight renewal so the lease stays valid while the handler
-            // exits cooperatively.
-            return fut.await;
-        }
-        tokio::select! {
-            biased;
-            res = &mut fut => return res,
-            _ = async {
-                if let Some(rx) = shutdown_rx.as_mut() {
-                    let _ = rx.wait_for(|&stopped| stopped).await;
-                } else {
-                    std::future::pending::<()>().await;
+                if stopping.load(Ordering::Relaxed) || *rx.borrow() {
+                    job_cancelled.store(true, Ordering::SeqCst);
                 }
-            } => {
-                job_cancelled.store(true, Ordering::SeqCst);
+                return fut.await;
             }
-            _ = stop_poll.tick() => {
+            tokio::select! {
+                biased;
+                res = &mut fut => return res,
+                _ = rx.wait_for(|&stopped| stopped) => {
+                    job_cancelled.store(true, Ordering::SeqCst);
+                }
+            }
+        }
+    } else {
+        // Fallback polling path only for receiver-free callers (e.g. unit tests calling
+        // `spawn_lease_heartbeat` directly without a `watch::Receiver`).
+        let mut stop_poll = tokio::time::interval(Duration::from_millis(20));
+        loop {
+            if job_cancelled.load(Ordering::Relaxed) || stopping.load(Ordering::Relaxed) {
                 if stopping.load(Ordering::Relaxed) {
                     job_cancelled.store(true, Ordering::SeqCst);
+                }
+                return fut.await;
+            }
+            tokio::select! {
+                biased;
+                res = &mut fut => return res,
+                _ = stop_poll.tick() => {
+                    if stopping.load(Ordering::Relaxed) {
+                        job_cancelled.store(true, Ordering::SeqCst);
+                    }
                 }
             }
         }

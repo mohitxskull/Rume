@@ -32,4 +32,9 @@ pub enum JobError {
     /// The requested operation is not supported by this queue backend.
     #[error("operation not supported by this queue backend: {0}")]
     Unsupported(String),
+
+    /// The distributed idempotency store explicitly rejected the caller's fencing token
+    /// (ownership was lost or the lease expired).
+    #[error("idempotency lock ownership lost: {0}")]
+    IdempotencyLockLost(String),
 }

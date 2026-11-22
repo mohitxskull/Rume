@@ -65,6 +65,19 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         dead_workers: &[String],
     ) -> BoxFuture<'_, Result<usize, JobError>>;
 
+    /// Returns `true` if any `in_flight` job is still assigned to one of `worker_ids`
+    /// (including rows locked by concurrent transactions that `FOR UPDATE SKIP LOCKED`
+    /// could not reclaim yet).
+    ///
+    /// Defaults to `Ok(false)` for queues whose `reclaim_abandoned_jobs` does not skip
+    /// locked rows.
+    fn has_in_flight_jobs_for_workers(
+        &self,
+        _worker_ids: &[String],
+    ) -> BoxFuture<'_, Result<bool, JobError>> {
+        Box::pin(async { Ok(false) })
+    }
+
     /// Acknowledges successful execution, transitioning the job to completed status.
     fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>>;
 

@@ -60,6 +60,16 @@ pub enum SamlError {
 }
 /// Replay-protection cache for consumed SAML assertion IDs.
 pub trait SamlReplayCache: Send + Sync {
+    /// Maximum clock skew (in seconds) that validators sharing this cache may configure.
+    ///
+    /// Why: when multiple validators share one replay cache with different `clock_skew_secs`,
+    /// every record must be retained for at least `not_on_or_after + max_clock_skew_secs()` so
+    /// a validator with smaller skew cannot cause premature eviction before a validator with
+    /// larger skew stops accepting the assertion.
+    fn max_clock_skew_secs(&self) -> u64 {
+        300
+    }
+
     /// Atomically checks expiry and records `assertion_id` with acceptance deadline `expires_at`
     /// (epoch seconds) at `now_epoch_sec` (epoch seconds).
     ///
@@ -82,15 +92,34 @@ struct ReplayCacheState {
 }
 
 /// Thread-safe in-memory [`SamlReplayCache`] suitable for single-instance deployments and tests.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct InMemorySamlReplayCache {
     state: Mutex<ReplayCacheState>,
+    max_clock_skew_secs: u64,
+}
+
+impl Default for InMemorySamlReplayCache {
+    fn default() -> Self {
+        Self {
+            state: Mutex::new(ReplayCacheState::default()),
+            max_clock_skew_secs: 300,
+        }
+    }
 }
 
 impl InMemorySamlReplayCache {
-    /// Creates a new empty replay cache.
+    /// Creates a new empty replay cache with the default maximum clock skew (300 seconds).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Creates a new empty replay cache enforcing `max_clock_skew_secs` across all validators
+    /// sharing this cache.
+    pub fn with_max_clock_skew(max_clock_skew_secs: u64) -> Self {
+        Self {
+            state: Mutex::new(ReplayCacheState::default()),
+            max_clock_skew_secs,
+        }
     }
 
     /// Evicts entries whose expiration is `<= now_epoch_sec` and advances the pruning
@@ -105,6 +134,10 @@ impl InMemorySamlReplayCache {
 }
 
 impl SamlReplayCache for InMemorySamlReplayCache {
+    fn max_clock_skew_secs(&self) -> u64 {
+        self.max_clock_skew_secs
+    }
+
     fn record_if_absent(
         &self,
         assertion_id: &str,
@@ -237,8 +270,10 @@ impl SamlParser {
     ///
     /// In addition to every check performed by [`Self::validate_with_config`], this entry point
     /// mandates:
-    /// - an `<AuthnStatement>` inside the assertion (`assertion.has_authn_statement`),
+    /// - cryptographic signature verification (`assertion.is_signature_verified()`),
+    /// - a valid `<AuthnStatement>` with `AuthnInstant` and `<AuthnContext>` (`assertion.has_authn_statement`),
     /// - bearer `<SubjectConfirmation>` enforcement (`require_bearer_confirmation: true`),
+    /// - a configured SP audience (`config.expected_audience.is_some()`),
     /// - a configured ACS URL (`config.expected_recipient.is_some()`), and
     /// - a replay-protection cache (`config.replay_cache.is_some()`).
     pub fn validate_browser_sso(
@@ -246,9 +281,19 @@ impl SamlParser {
         current_epoch_sec: u64,
         config: &SamlValidationConfig<'_>,
     ) -> Result<(), SamlError> {
+        if !assertion.is_signature_verified() {
+            return Err(SamlError::MissingSignatureVerifier);
+        }
         if !assertion.has_authn_statement {
             return Err(SamlError::Malformed(
-                "missing required AuthnStatement for SAML Web Browser SSO".into(),
+                "missing required AuthnStatement (with AuthnInstant and AuthnContext) for SAML Web Browser SSO"
+                    .into(),
+            ));
+        }
+        if config.expected_audience.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_audience (SP entity ID) is required for SAML Web Browser SSO validation"
+                    .into(),
             ));
         }
         if config.expected_recipient.is_none() {
@@ -480,12 +525,19 @@ impl SamlParser {
         }
 
         if let Some(cache) = config.replay_cache {
-            // Why: retain the replay record through the full skew-adjusted validity
-            // window (rounding up fractional nanoseconds) and pass `current_epoch_sec`
-            // so the cache rejects insertions atomically if the deadline has passed or
-            // pruning has already advanced past it.
+            let max_skew = cache.max_clock_skew_secs();
+            if skew > max_skew {
+                return Err(SamlError::Malformed(format!(
+                    "validator clock_skew_secs ({skew}) exceeds replay cache max_clock_skew_secs ({max_skew})"
+                )));
+            }
+            // Why: retain the replay record through the cache's full `max_clock_skew_secs`
+            // window (rounding up fractional nanoseconds) and pass `current_epoch_sec` so a
+            // validator with smaller skew cannot cause premature eviction before a peer
+            // validator with larger skew stops accepting the assertion, and pruning stays
+            // atomic with acceptance.
             let replay_expires_at = not_on_or_after
-                .saturating_add(skew)
+                .saturating_add(max_skew)
                 .saturating_add(u64::from(assertion.not_on_or_after_subsec_nanos > 0));
             let fresh =
                 cache.record_if_absent(&assertion.id, replay_expires_at, current_epoch_sec)?;

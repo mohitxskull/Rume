@@ -59,6 +59,7 @@ pub struct WorkerHandle {
     abort_requested: Arc<AtomicBool>,
     abort_tx: Arc<tokio::sync::watch::Sender<bool>>,
     in_flight_count: Arc<AtomicU32>,
+    in_flight_zero: Arc<tokio::sync::Notify>,
     active_tasks: Arc<AtomicU32>,
     worker_result: Option<bool>,
     heartbeat_result: Option<bool>,
@@ -236,6 +237,25 @@ impl WorkerHandle {
             {
                 let rem = cleanup_deadline.saturating_duration_since(tokio::time::Instant::now());
                 let _ = tokio::time::timeout(rem, rec).await;
+            }
+            // Why: when `worker_task` is hard-aborted while blocked in `dequeue_for`, joining
+            // `worker_task` only confirms its `JoinSet` was dropped, not that spawned job tasks
+            // finished cancelling. Wait for `in_flight_count` to hit zero within the remaining
+            // cleanup budget so aborted job tasks drop before callers tear down resources.
+            while self.in_flight_count.load(Ordering::SeqCst) > 0 {
+                let rem = cleanup_deadline.saturating_duration_since(tokio::time::Instant::now());
+                if rem.is_zero() {
+                    break;
+                }
+                let notified = self.in_flight_zero.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                if self.in_flight_count.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                if tokio::time::timeout(rem, notified).await.is_err() {
+                    break;
+                }
             }
         }
         clean

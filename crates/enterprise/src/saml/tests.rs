@@ -882,26 +882,55 @@ mod saml_parser_and_iso8601_proptests {
     }
 
     #[test]
-    fn validate_browser_sso_enforces_authn_statement_recipient_and_replay_cache_atomically() {
-        let xml_no_authn = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_sso1">
-            <saml:Assertion ID="_a_sso1">
+    fn leap_second_timestamps_are_rejected_fail_closed() {
+        assert!(matches!(
+            parse_iso8601_strict("2016-12-31T23:59:60.500Z"),
+            Err(SamlError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn validate_browser_sso_enforces_signature_authn_context_audience_recipient_and_shared_skew_replay_cache()
+     {
+        struct AcceptVerifier;
+        impl SamlSignatureVerifier for AcceptVerifier {
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                Ok(())
+            }
+        }
+
+        let cache = InMemorySamlReplayCache::with_max_clock_skew(30);
+
+        // 1. AuthnStatement missing `<AuthnContext>` is rejected (SAML Core §2.7.2).
+        let xml_no_context = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_r_sso_nc">
+            <saml:Assertion ID="_a_sso_nc">
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <ds:Signature><ds:SignedInfo><ds:Reference URI="#_a_sso_nc"/></ds:SignedInfo></ds:Signature>
                 <saml:Subject>
                     <saml:NameID>alice@example.org</saml:NameID>
                     <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
                         <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
                     </saml:SubjectConfirmation>
                 </saml:Subject>
-                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z">
+                    <saml:AudienceRestriction><saml:Audience>https://sp.example</saml:Audience></saml:AudienceRestriction>
+                </saml:Conditions>
+                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z"/>
             </saml:Assertion>
-        </samlp:Response>"#;
-        let no_authn = SamlParser::parse_unverified(xml_no_authn).expect("parses");
-        let cache = InMemorySamlReplayCache::new();
+        </samlp:Response>"##;
+        let no_ctx = SamlParser::parse_signed(xml_no_context, &AcceptVerifier).expect("parses");
+        assert!(!no_ctx.has_authn_statement);
         assert!(matches!(
             SamlParser::validate_browser_sso(
-                &no_authn,
+                &no_ctx,
                 500,
                 &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
                     expected_recipient: Some("https://sp.example/acs"),
                     replay_cache: Some(&cache),
                     ..Default::default()
@@ -910,58 +939,132 @@ mod saml_parser_and_iso8601_proptests {
             Err(SamlError::Malformed(_))
         ));
 
-        let xml_full = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_sso2">
+        let xml_full = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_r_sso2">
             <saml:Assertion ID="_a_sso2">
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <ds:Signature><ds:SignedInfo><ds:Reference URI="#_a_sso2"/></ds:SignedInfo></ds:Signature>
                 <saml:Subject>
                     <saml:NameID>alice@example.org</saml:NameID>
                     <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
                         <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
                     </saml:SubjectConfirmation>
                 </saml:Subject>
-                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
-                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z"/>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z">
+                    <saml:AudienceRestriction><saml:Audience>https://sp.example</saml:Audience></saml:AudienceRestriction>
+                </saml:Conditions>
+                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z">
+                    <saml:AuthnContext>
+                        <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef>
+                    </saml:AuthnContext>
+                </saml:AuthnStatement>
             </saml:Assertion>
-        </samlp:Response>"#;
-        let full = SamlParser::parse_unverified(xml_full).expect("parses");
-        // Missing recipient fails closed.
+        </samlp:Response>"##;
+
+        // 2. Unverified assertion must be rejected by `validate_browser_sso`.
+        let unverified = SamlParser::parse_unverified(xml_full).expect("parses unverified");
+        assert!(unverified.has_authn_statement);
         assert!(matches!(
             SamlParser::validate_browser_sso(
-                &full,
+                &unverified,
                 500,
                 &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
+                    expected_recipient: Some("https://sp.example/acs"),
                     replay_cache: Some(&cache),
                     ..Default::default()
                 },
             ),
-            Err(SamlError::Malformed(_))
+            Err(SamlError::MissingSignatureVerifier)
         ));
-        // Missing replay cache fails closed.
+
+        let full = SamlParser::parse_signed(xml_full, &AcceptVerifier).expect("parses signed");
+        assert!(full.has_authn_statement);
+
+        // 3. Missing audience fails closed.
         assert!(matches!(
             SamlParser::validate_browser_sso(
                 &full,
                 500,
                 &SamlValidationConfig {
                     expected_recipient: Some("https://sp.example/acs"),
+                    replay_cache: Some(&cache),
                     ..Default::default()
                 },
             ),
             Err(SamlError::Malformed(_))
         ));
-        // Full valid config succeeds.
-        let cfg = SamlValidationConfig {
+        // 4. Missing recipient fails closed.
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                500,
+                &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+        // 5. Missing replay cache fails closed.
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                500,
+                &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
+                    expected_recipient: Some("https://sp.example/acs"),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+
+        // 6. Mixed-skew shared replay cache: Validator A (skew 0) validates at 999,
+        // `prune_expired(1000)` runs, then Validator B (skew 30) attempts replay at 1001
+        // and must still be rejected as `AssertionReplayed`.
+        let cfg_skew_0 = SamlValidationConfig {
+            expected_audience: Some("https://sp.example"),
+            expected_recipient: Some("https://sp.example/acs"),
+            clock_skew_secs: 0,
+            replay_cache: Some(&cache),
+            ..Default::default()
+        };
+        let cfg_skew_30 = SamlValidationConfig {
+            expected_audience: Some("https://sp.example"),
             expected_recipient: Some("https://sp.example/acs"),
             clock_skew_secs: 30,
             replay_cache: Some(&cache),
             ..Default::default()
         };
-        SamlParser::validate_browser_sso(&full, 999, &cfg).expect("full SSO succeeds");
+        SamlParser::validate_browser_sso(&full, 999, &cfg_skew_0).expect("validator A succeeds");
+        cache.prune_expired(1000);
+        assert!(matches!(
+            SamlParser::validate_browser_sso(&full, 1001, &cfg_skew_30),
+            Err(SamlError::AssertionReplayed(_))
+        ));
 
-        // Atomic expiry-vs-pruning check: after pruning at 1030, a late validation at 1029
+        // 7. Validator skew exceeding cache `max_clock_skew_secs` fails closed.
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                999,
+                &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
+                    expected_recipient: Some("https://sp.example/acs"),
+                    clock_skew_secs: 60,
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+
+        // 8. Atomic expiry-vs-pruning check: after pruning at 1030, a late validation at 1029
         // must be rejected as Expired instead of re-inserting `_a_sso2`.
         cache.prune_expired(1030);
         assert!(matches!(
-            SamlParser::validate_browser_sso(&full, 1029, &cfg),
+            SamlParser::validate_browser_sso(&full, 1029, &cfg_skew_30),
             Err(SamlError::Expired { .. })
         ));
     }

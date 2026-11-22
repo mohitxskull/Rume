@@ -270,6 +270,7 @@ async fn test_worker_handle_shutdown_reports_panic() {
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
         in_flight_count,
+        in_flight_zero: Arc::new(tokio::sync::Notify::new()),
         active_tasks,
         worker_result: None,
         heartbeat_result: None,
@@ -321,6 +322,7 @@ async fn test_worker_handle_timeout_aborts_tasks() {
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
         in_flight_count,
+        in_flight_zero: Arc::new(tokio::sync::Notify::new()),
         active_tasks,
         worker_result: None,
         heartbeat_result: None,
@@ -338,14 +340,14 @@ async fn test_worker_handle_timeout_aborts_tasks() {
     // 2. consuming shutdown aborts remaining tasks on timeout and awaits cancellation
     let success = handle.shutdown(Duration::from_millis(50)).await;
     assert!(!success, "shutdown must return false on timeout");
+    assert!(
+        abort_handle.is_finished(),
+        "shutdown() must wait for aborted task cancellation before returning"
+    );
 
     tokio::time::timeout(Duration::from_secs(1), dropped_wait)
         .await
-        .expect("aborted task drop guard must fire deterministically");
-    assert!(
-        abort_handle.is_finished(),
-        "task must be aborted on shutdown timeout"
-    );
+        .expect("aborted task drop guard must have fired");
 }
 
 #[tokio::test(start_paused = true)]
@@ -368,6 +370,7 @@ async fn test_worker_handle_try_shutdown_retry_after_heartbeat_timeout() {
         abort_requested: Arc::new(AtomicBool::new(false)),
         abort_tx: Arc::new(abort_tx),
         in_flight_count: Arc::new(AtomicU32::new(0)),
+        in_flight_zero: Arc::new(tokio::sync::Notify::new()),
         active_tasks: Arc::new(AtomicU32::new(2)),
         worker_result: None,
         heartbeat_result: None,
@@ -628,19 +631,15 @@ struct RenewalGatedHandler {
 impl JobHandler<SlowTestJob> for RenewalGatedHandler {
     fn handle<'a>(
         &'a self,
-        ctx: &'a JobContext,
+        _ctx: &'a JobContext,
         _job: SlowTestJob,
     ) -> BoxFuture<'a, Result<(), JobError>> {
         let gate = Arc::clone(&self.gate);
         Box::pin(async move {
-            tokio::select! {
-                _ = gate.notified() => {}
-                _ = async {
-                    while !ctx.is_cancelled() {
-                        tokio::time::sleep(Duration::from_millis(5)).await;
-                    }
-                } => {}
-            }
+            gate.notified().await;
+            // Yield once so the heartbeat task's synchronous failure handling
+            // (setting `lease_lost` and `job_cancelled`) finishes before handler exit.
+            tokio::task::yield_now().await;
             Ok(())
         })
     }
@@ -765,20 +764,94 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
         trace_context: None,
     };
 
-    let queue = Arc::new(BlockingTestQueue {
-        job: Mutex::new(None),
-        enter_tx,
-        release_rx: Mutex::new(release_rx),
-        defer_count: Arc::new(AtomicUsize::new(0)),
-        nack_count: Arc::clone(&nack_count),
-        ack_count: Arc::clone(&ack_count),
-        dlq_count: Arc::clone(&dlq_count),
-        fail_renew: false,
+    let renewal_attempted = Arc::new(tokio::sync::Notify::new());
+
+    #[derive(Debug)]
+    struct NotifyOnRenewQueue {
+        inner: BlockingTestQueue,
+        on_renew: Arc<tokio::sync::Notify>,
+    }
+
+    impl JobQueue for NotifyOnRenewQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            job: J,
+            delay: Duration,
+            trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            self.inner
+                .enqueue_delayed_with_trace(job, delay, trace_context)
+        }
+        fn dequeue_for(
+            &self,
+            worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.inner.dequeue_for(worker_id)
+        }
+        fn reclaim_abandoned_jobs(
+            &self,
+            dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            self.inner.reclaim_abandoned_jobs(dead_workers)
+        }
+        fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            self.inner.ack(job_id, lease_token)
+        }
+        fn nack(
+            &self,
+            job: QueuedJob,
+            lease_token: &str,
+            delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.inner.nack(job, lease_token, delay)
+        }
+        fn dead_letter(
+            &self,
+            job: QueuedJob,
+            lease_token: &str,
+            reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            self.inner.dead_letter(job, lease_token, reason)
+        }
+        fn renew_lease(
+            &self,
+            job_id: &str,
+            lease_token: &str,
+            extension: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            let on_renew = Arc::clone(&self.on_renew);
+            let fut = self.inner.renew_lease(job_id, lease_token, extension);
+            Box::pin(async move {
+                let res = fut.await;
+                on_renew.notify_one();
+                res
+            })
+        }
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            self.inner.pending_count()
+        }
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            self.inner.dead_letter_count()
+        }
+    }
+
+    let queue = Arc::new(NotifyOnRenewQueue {
+        inner: BlockingTestQueue {
+            job: Mutex::new(None),
+            enter_tx,
+            release_rx: Mutex::new(release_rx),
+            defer_count: Arc::new(AtomicUsize::new(0)),
+            nack_count: Arc::clone(&nack_count),
+            ack_count: Arc::clone(&ack_count),
+            dlq_count: Arc::clone(&dlq_count),
+            fail_renew: false,
+        },
+        on_renew: Arc::clone(&renewal_attempted),
     });
 
     let mut registry = JobRegistry::new();
     registry.register(RenewalGatedHandler {
-        gate: Arc::new(tokio::sync::Notify::new()),
+        gate: renewal_attempted,
     });
 
     let unsupported_store = Arc::new(DefaultUnsupportedStore);

@@ -106,6 +106,19 @@ pub struct SamlAssertion {
     pub not_on_or_after_subsec_nanos: u32,
     /// Extracted user claims and attributes.
     pub attributes: BTreeMap<String, Vec<String>>,
+    /// Whether this assertion was produced after cryptographic signature verification.
+    ///
+    /// Kept private so callers cannot forge verified status on an assertion parsed via
+    /// [`SamlParser::parse_unverified`].
+    signature_verified: bool,
+}
+
+impl SamlAssertion {
+    /// Returns `true` if this assertion was produced by a signature-verified parse
+    /// ([`SamlParser::parse_signed`] or [`SamlParser::parse_with_verifier`]).
+    pub fn is_signature_verified(&self) -> bool {
+        self.signature_verified
+    }
 }
 /// Parses an ISO 8601 / RFC 3339 timestamp strictly, returning `(epoch_secs, subsec_nanos)`.
 pub(crate) fn parse_iso8601_strict_parts(s: &str) -> Result<(u64, u32), SamlError> {
@@ -115,8 +128,8 @@ pub(crate) fn parse_iso8601_strict_parts(s: &str) -> Result<(u64, u32), SamlErro
     // `chrono::DateTime::parse_from_rfc3339` (already pinned in `Cargo.lock`) instead of
     // hand-rolled date math and UTF-8 byte slicing that can panic on multi-byte inputs; check
     // byte index 10 for `'T'`/`'t'` to reject RFC 3339 space separators, use `u64::try_from`
-    // so pre-1970 instants fail closed instead of wrapping, and retain `timestamp_subsec_nanos()`
-    // so subsecond validity boundaries are never truncated early/late.
+    // so pre-1970 instants fail closed instead of wrapping, and reject leap-second fractions
+    // (`subsec_nanos >= 1_000_000_000`) so the public `0..1_000_000_000` invariant always holds.
     if !matches!(trimmed.as_bytes().get(10), Some(b'T' | b't')) {
         return Err(SamlError::Malformed(format!(
             "invalid ISO 8601 timestamp '{trimmed}': missing 'T' separator"
@@ -130,7 +143,13 @@ pub(crate) fn parse_iso8601_strict_parts(s: &str) -> Result<(u64, u32), SamlErro
     let secs = u64::try_from(dt.timestamp()).map_err(|_| {
         SamlError::Malformed(format!("timestamp '{trimmed}' resolves before Unix epoch"))
     })?;
-    Ok((secs, dt.timestamp_subsec_nanos()))
+    let nanos = dt.timestamp_subsec_nanos();
+    if nanos >= 1_000_000_000 {
+        return Err(SamlError::Malformed(format!(
+            "leap-second timestamp '{trimmed}' is not supported"
+        )));
+    }
+    Ok((secs, nanos))
 }
 
 /// Parses an ISO 8601 / RFC 3339 timestamp strictly, including UTC `'Z'`, fractional seconds,
@@ -203,6 +222,7 @@ impl SamlParser {
         let mut not_on_or_after: Option<u64> = None;
         let mut not_on_or_after_subsec_nanos: u32 = 0;
         let mut has_authn_statement = false;
+        let mut current_authn_stmt_has_instant = false;
 
         let mut assertion_start_offset: Option<usize> = None;
         let mut assertion_end_offset: Option<usize> = None;
@@ -412,7 +432,23 @@ impl SamlParser {
                         if local_name == "AuthnStatement"
                             && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
                         {
-                            has_authn_statement = true;
+                            // Why: SAML 2.0 Core §2.7.2 requires both an `AuthnInstant`
+                            // attribute and a child `<AuthnContext>` element before an
+                            // `<AuthnStatement>` counts as valid authentication evidence.
+                            current_authn_stmt_has_instant = false;
+                            for (k, v) in &parsed_attrs {
+                                if k == "AuthnInstant" {
+                                    let _ = parse_iso8601_strict_parts(v)?;
+                                    current_authn_stmt_has_instant = true;
+                                }
+                            }
+                        } else if local_name == "AuthnContext"
+                            && matches!(parent, Some(("AuthnStatement", XmlNs::Assertion)))
+                            && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
+                        {
+                            if current_authn_stmt_has_instant {
+                                has_authn_statement = true;
+                            }
                         } else if local_name == "Conditions"
                             && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
                         {
@@ -614,6 +650,8 @@ impl SamlParser {
                         current_audience_group = None;
                     } else if local_name == "SubjectConfirmation" && is_ns(&res, ASSERTION) {
                         current_sc_is_bearer = None;
+                    } else if local_name == "AuthnStatement" && is_ns(&res, ASSERTION) {
+                        current_authn_stmt_has_instant = false;
                     } else if local_name == "Attribute"
                         && is_ns(&res, ASSERTION)
                         && element_stack.len() == current_attr_depth
@@ -786,6 +824,7 @@ impl SamlParser {
             not_on_or_after,
             not_on_or_after_subsec_nanos,
             attributes: fields.attributes,
+            signature_verified: signed_mode,
         })
     }
 }

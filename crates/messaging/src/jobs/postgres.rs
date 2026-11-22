@@ -407,6 +407,25 @@ impl JobQueue for PostgresJobQueue {
         })
     }
 
+    fn has_in_flight_jobs_for_workers(
+        &self,
+        worker_ids: &[String],
+    ) -> BoxFuture<'_, Result<bool, JobError>> {
+        let workers = worker_ids.to_vec();
+        Box::pin(async move {
+            let row = sqlx::query(
+                "SELECT EXISTS(SELECT 1 FROM rume_jobs WHERE status = 'in_flight' AND assigned_worker = ANY($1))",
+            )
+            .bind(&workers)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let exists: bool = row.try_get(0).unwrap_or(false);
+            Ok(exists)
+        })
+    }
+
     fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
         Box::pin(async move {
             let row = sqlx::query(JOBS_PENDING_COUNT_SQL)

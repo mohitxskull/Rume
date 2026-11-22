@@ -201,7 +201,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res == 0 {
-                return Err(JobError::Fatal(format!(
+                return Err(JobError::IdempotencyLockLost(format!(
                     "failed to complete idempotency key '{key}': token mismatch or lease expired"
                 )));
             }
@@ -256,7 +256,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res == 0 {
-                return Err(JobError::Fatal(format!(
+                return Err(JobError::IdempotencyLockLost(format!(
                     "failed to release idempotency key '{key}': token mismatch or lease expired"
                 )));
             }
@@ -312,7 +312,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             if res == 0 {
-                return Err(JobError::Fatal(format!(
+                return Err(JobError::IdempotencyLockLost(format!(
                     "failed to extend idempotency key '{key}': token mismatch or lease expired"
                 )));
             }

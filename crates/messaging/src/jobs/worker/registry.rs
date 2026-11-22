@@ -107,11 +107,17 @@ impl JobRegistry {
     }
 }
 
-/// RAII drop guard ensuring in-flight job counter is decremented even if the worker panics.
-pub(super) struct InFlightGuard(pub(super) Arc<AtomicU32>);
+/// RAII drop guard ensuring in-flight job counter is decremented even if the worker panics,
+/// and notifying waiters when the last in-flight job finishes or cancels.
+pub(super) struct InFlightGuard {
+    pub(super) count: Arc<AtomicU32>,
+    pub(super) zero_notify: Arc<tokio::sync::Notify>,
+}
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        if self.count.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.zero_notify.notify_waiters();
+        }
     }
 }
