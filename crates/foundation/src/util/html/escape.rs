@@ -1,6 +1,11 @@
 use std::borrow::Cow;
 
-/// Escapes HTML special characters (`&`, `<`, `>`, `"`, `'`) for safe embedding.
+/// Escapes HTML special characters (`&`, `<`, `>`, `"`, `'`) for safe embedding
+/// in HTML text nodes and double-quoted attribute values.
+///
+/// This is **not** a general-purpose encoder for unquoted HTML attributes, `<script>` /
+/// JavaScript blocks, CSS, or `javascript:` URLs; those contexts require context-specific
+/// encoding or validation.
 ///
 /// Features a fast-path scan: if no special characters are found (the common case
 /// for clean inputs), it returns `Cow::Borrowed` with zero allocations.

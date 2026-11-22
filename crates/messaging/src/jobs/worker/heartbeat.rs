@@ -174,7 +174,9 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
     let heartbeat_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(hb_interval);
         interval.tick().await; // tick immediately
-        let mut stop_check = tokio::time::interval(Duration::from_millis(50));
+        let mut stop_check = shutdown_rx
+            .is_none()
+            .then(|| tokio::time::interval(Duration::from_millis(50)));
         loop {
             let not_yet_cancelled = !hb_cancelled.load(Ordering::Relaxed);
             tokio::select! {
@@ -185,10 +187,16 @@ pub(super) fn spawn_lease_heartbeat<Q: JobQueue>(
                     } else {
                         std::future::pending::<()>().await;
                     }
-                }, if not_yet_cancelled => {
+                }, if not_yet_cancelled && shutdown_rx.is_some() => {
                     hb_cancelled.store(true, Ordering::SeqCst);
                 }
-                _ = stop_check.tick(), if not_yet_cancelled => {
+                _ = async {
+                    if let Some(timer) = stop_check.as_mut() {
+                        timer.tick().await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                }, if not_yet_cancelled && stop_check.is_some() => {
                     if hb_stopping.load(Ordering::Relaxed) {
                         hb_cancelled.store(true, Ordering::SeqCst);
                     }

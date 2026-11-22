@@ -616,7 +616,7 @@ mod saml_parser_and_iso8601_proptests {
                 <saml:Issuer>https://idp.example.com</saml:Issuer>
                 <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
                 <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z">
-                    <saml:Condition xsi:type="custom:CustomConditionType"/>
+                    <saml:Condition xmlns:custom="urn:example:custom" xsi:type="custom:CustomConditionType"/>
                 </saml:Conditions>
             </saml:Assertion>
         </samlp:Response>"#;
@@ -702,6 +702,32 @@ mod saml_parser_and_iso8601_proptests {
             SamlParser::validate_with_config(&a_no_exp, now, &SamlValidationConfig::default()),
             Err(SamlError::MissingExpirationCondition)
         ));
+
+        let xml_second_valid = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_ne2">
+            <saml:Assertion ID="_a_ne2">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs"/>
+                    </saml:SubjectConfirmation>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="2020-01-01T00:00:00Z" NotOnOrAfter="2030-01-01T00:00:00Z"/>
+            </saml:Assertion>
+        </samlp:Response>"#;
+        let a_second_valid = SamlParser::parse_unverified(xml_second_valid).expect("parses");
+        SamlParser::validate_with_config(
+            &a_second_valid,
+            now,
+            &SamlValidationConfig {
+                expected_recipient: Some("https://sp.example/acs"),
+                ..Default::default()
+            },
+        )
+        .expect("a second valid bearer SubjectConfirmation must succeed when the first lacks NotOnOrAfter");
 
         // Solicited Response omitting outer Response/@InResponseTo must fail closed even if SCD has it.
         let xml_missing_outer_irt = r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_r_mo">
@@ -928,6 +954,42 @@ mod saml_parser_and_iso8601_proptests {
         assert!(matches!(
             SamlParser::validate_browser_sso(
                 &no_ctx,
+                500,
+                &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
+                    expected_recipient: Some("https://sp.example/acs"),
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+
+        // 1b. Empty `<AuthnContext/>` with no class/decl ref is also rejected (SAML Core §2.7.2.2).
+        let xml_empty_context = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_r_sso_ec">
+            <saml:Assertion ID="_a_sso_ec">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <ds:Signature><ds:SignedInfo><ds:Reference URI="#_a_sso_ec"/></ds:SignedInfo></ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z">
+                    <saml:AudienceRestriction><saml:Audience>https://sp.example</saml:Audience></saml:AudienceRestriction>
+                </saml:Conditions>
+                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z">
+                    <saml:AuthnContext/>
+                </saml:AuthnStatement>
+            </saml:Assertion>
+        </samlp:Response>"##;
+        let empty_ctx =
+            SamlParser::parse_signed(xml_empty_context, &AcceptVerifier).expect("parses");
+        assert!(!empty_ctx.has_authn_statement);
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &empty_ctx,
                 500,
                 &SamlValidationConfig {
                     expected_audience: Some("https://sp.example"),

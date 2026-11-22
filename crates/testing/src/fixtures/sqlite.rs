@@ -5,7 +5,7 @@ use super::*;
 #[cfg(feature = "sqlite")]
 pub struct SqliteTestFixture {
     path: PathBuf,
-    pool: DatabasePool<rume_data::persistence::SqliteBackend>,
+    pool: Option<DatabasePool<rume_data::persistence::SqliteBackend>>,
     closed: bool,
 }
 
@@ -24,14 +24,14 @@ impl SqliteTestFixture {
 
         Ok(Self {
             path,
-            pool,
+            pool: Some(pool),
             closed: false,
         })
     }
 
     /// Returns a reference to the database pool.
     pub fn pool(&self) -> &DatabasePool<rume_data::persistence::SqliteBackend> {
-        &self.pool
+        self.pool.as_ref().expect("sqlite test pool active")
     }
 
     /// Returns the file path of the temporary SQLite database.
@@ -44,15 +44,16 @@ impl SqliteTestFixture {
         &self,
     ) -> Result<TestTransactionFixture<rume_data::persistence::SqliteTransaction>, PersistenceError>
     {
-        let tx = self.pool.backend().begin_transaction().await?;
+        let tx = self.pool().backend().begin_transaction().await?;
         Ok(TestTransactionFixture::new(tx))
     }
 
     /// Explicitly drains the pool and deletes temporary files, returning any errors to the test runner.
     pub async fn close(mut self) -> Result<(), PersistenceError> {
-        self.closed = true;
-        // 1. Drain and close connection pool
-        self.pool.close_async().await;
+        // 1. Drain and close connection pool before unlinking files.
+        if let Some(pool) = self.pool.as_ref() {
+            pool.close_async().await;
+        }
         // 2. Remove database and WAL/SHM sidecar files deterministically, propagating
         //    any error other than `NotFound`.
         let remove_if_present = |file: &Path| -> Result<(), PersistenceError> {
@@ -71,6 +72,10 @@ impl SqliteTestFixture {
         remove_if_present(&wal)?;
         remove_if_present(&shm)?;
         remove_if_present(&path)?;
+        // Why: mark closed only after pool shutdown and file removal succeed so
+        // cancelling `close()` mid-await still lets `Drop` clean up the temp files.
+        self.closed = true;
+        self.pool = None;
         Ok(())
     }
 }
@@ -79,7 +84,7 @@ impl SqliteTestFixture {
 impl std::ops::Deref for SqliteTestFixture {
     type Target = DatabasePool<rume_data::persistence::SqliteBackend>;
     fn deref(&self) -> &Self::Target {
-        &self.pool
+        self.pool()
     }
 }
 
@@ -96,6 +101,8 @@ impl std::fmt::Debug for SqliteTestFixture {
 #[cfg(feature = "sqlite")]
 impl Drop for SqliteTestFixture {
     fn drop(&mut self) {
+        // Why: drop the pool before unlinking so SQLite file handles are released first.
+        drop(self.pool.take());
         if !self.closed {
             let path = self.path.clone();
             let _ = std::fs::remove_file(format!("{}-wal", path.display()));

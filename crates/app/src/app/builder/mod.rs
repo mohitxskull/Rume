@@ -101,7 +101,11 @@ impl IntoBindAddr for String {
 
 impl IntoBindAddr for (&str, u16) {
     fn into_bind_string(self) -> String {
-        format!("{}:{}", self.0, self.1)
+        if self.0.contains(':') && !(self.0.starts_with('[') && self.0.ends_with(']')) {
+            format!("[{}]:{}", self.0, self.1)
+        } else {
+            format!("{}:{}", self.0, self.1)
+        }
     }
 }
 
@@ -416,8 +420,11 @@ where
     }
 
     fn effective_mode(&self) -> ApplicationMode {
-        if std::env::var("RUME_INSPECT").is_ok()
-            || std::env::args().any(|a| a == "--inspect" || a == "--rume-inspect-routes")
+        if std::env::var_os("RUME_INSPECT").is_some()
+            || std::env::args_os().any(|a| {
+                a.as_os_str() == std::ffi::OsStr::new("--inspect")
+                    || a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes")
+            })
         {
             ApplicationMode::Inspect
         } else {

@@ -28,17 +28,23 @@ impl<T: DatabaseTransaction + 'static> TestTransactionFixture<T> {
 
     /// Atomically commits the transaction, consuming the fixture and preventing rollback on Drop.
     pub async fn commit(mut self) -> Result<(), PersistenceError> {
-        if let Some(tx) = self.tx.take() {
-            self.committed = true;
+        // Why: keep `self.tx` intact until `commit()` completes so cancelling this
+        // future mid-await still leaves `Drop` able to run the rollback barrier.
+        if let Some(tx) = self.tx.as_ref() {
             tx.commit().await?;
+            self.committed = true;
+            self.tx = None;
         }
         Ok(())
     }
 
     /// Discards and rolls back the transaction explicitly, awaiting completion.
     pub async fn rollback(mut self) -> Result<(), PersistenceError> {
-        if let Some(tx) = self.tx.take() {
+        // Why: keep `self.tx` intact until `rollback()` completes so cancelling this
+        // future mid-await still leaves `Drop` able to run the rollback barrier.
+        if let Some(tx) = self.tx.as_ref() {
             tx.rollback().await?;
+            self.tx = None;
         }
         Ok(())
     }

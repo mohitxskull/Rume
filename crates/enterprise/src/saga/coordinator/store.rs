@@ -266,11 +266,15 @@ pub(super) struct ExecutionClaimGuard {
 
 impl ExecutionClaimGuard {
     pub(super) async fn release(mut self) {
-        // Why: keep `self.store` populated until `release_execution` completes so if
-        // this future is cancelled mid-await, `Drop` still holds the store and releases
-        // the execution claim instead of leaking it.
-        if let Some(store) = self.store.as_ref() {
-            let _ = store.release_execution(&self.saga_id, &self.token).await;
+        // Why: keep `self.store` populated until `release_execution` returns `Ok(())` so if
+        // this future is cancelled mid-await or the backend returns a transient error, `Drop`
+        // still holds the store and runs fallback cleanup instead of stranding the claim.
+        if let Some(store) = self.store.as_ref()
+            && store
+                .release_execution(&self.saga_id, &self.token)
+                .await
+                .is_ok()
+        {
             self.store = None;
         }
     }
@@ -290,6 +294,25 @@ impl Drop for ExecutionClaimGuard {
             if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 handle.spawn(async move {
                     let _ = store.release_execution(&saga_id, &token).await;
+                });
+            } else {
+                // Why: async-only `SagaStore` implementations dropped outside a Tokio
+                // runtime have no `Handle::try_current()`; run a bounded release on a
+                // detached helper thread with its own current-thread runtime so the claim
+                // is not permanently leaked.
+                let _ = std::thread::spawn(move || {
+                    if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        rt.block_on(async move {
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                store.release_execution(&saga_id, &token),
+                            )
+                            .await;
+                        });
+                    }
                 });
             }
         }

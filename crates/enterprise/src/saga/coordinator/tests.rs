@@ -467,7 +467,7 @@ async fn resume_rejects_mismatched_saga_name_and_unknown_step() {
 }
 
 #[tokio::test]
-async fn concurrent_resume_cas_allows_single_winner_and_retains_all_comp_errors() {
+async fn compensation_retains_all_errors_and_prunes_terminal_records() {
     let store = Arc::new(InMemorySagaStore::new().with_max_retained_terminal(1));
     let saga = Arc::new(
         Saga::<()>::new("dual_comp")

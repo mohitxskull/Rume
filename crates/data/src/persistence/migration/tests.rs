@@ -257,6 +257,11 @@ async fn mysql_dialect_without_migration_lock_capability_fails_closed_before_mut
         backend.executed_sql.lock().unwrap().is_empty(),
         "no SQL must execute before acquiring MySQL migration lock"
     );
+    assert_eq!(
+        *backend.begin_tx_calls.lock().unwrap(),
+        0,
+        "run_pending_backend must fail before opening a transaction"
+    );
     assert!(backend.ledger.lock().unwrap().is_empty());
 
     let rb_err = migrator
@@ -267,6 +272,11 @@ async fn mysql_dialect_without_migration_lock_capability_fails_closed_before_mut
     assert!(
         backend.executed_sql.lock().unwrap().is_empty(),
         "no SQL must execute during unlocked MySQL rollback"
+    );
+    assert_eq!(
+        *backend.begin_tx_calls.lock().unwrap(),
+        0,
+        "rollback_last_backend must fail before opening a transaction"
     );
 }
 

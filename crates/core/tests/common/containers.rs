@@ -26,7 +26,9 @@ fn spawn_container_reaper(container_id: &str) {
         let _ = std::process::Command::new("sh")
             .args([
                 "-c",
-                "while kill -0 \"$1\" 2>/dev/null; do sleep 1; done; docker rm -f \"$2\" >/dev/null 2>&1",
+                // Why: trap INT/TERM/HUP so Ctrl-C or process-group termination cannot kill
+                // the reaper before it removes the container after the test binary exits.
+                "trap '' INT TERM HUP; while kill -0 \"$1\" 2>/dev/null; do sleep 1; done; docker rm -f \"$2\" >/dev/null 2>&1",
                 "rume-container-reaper",
                 &pid.to_string(),
                 container_id,

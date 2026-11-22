@@ -169,7 +169,18 @@ impl PostgresSchemaFixture {
 
     /// Explicitly drains the pool and drops the schema, returning any cleanup errors to the test runner.
     pub async fn close(mut self) -> Result<(), PersistenceError> {
-        self.pool.close_async().await;
+        // Why: SQLx `Pool::close()` waits indefinitely if a transaction returned by
+        // `begin_test_tx()` is still alive. Bound the drain so `close()` returns a timeout
+        // error instead of hanging, leaving `self.closed == false` so `Drop` still terminates
+        // lingering server backends and drops the schema.
+        tokio::time::timeout(std::time::Duration::from_secs(5), self.pool.close_async())
+            .await
+            .map_err(|_| {
+                PersistenceError::ConnectionFailed(format!(
+                    "timed out draining pool for schema '{}' (is a transaction still open?)",
+                    self.schema_name
+                ))
+            })?;
         if let Some(admin) = self.admin_pool.as_ref() {
             admin
                 .backend()

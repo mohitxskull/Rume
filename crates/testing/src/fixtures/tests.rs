@@ -272,7 +272,12 @@ async fn test_transaction_fixture_multi_thread_sync_rollback() {
         drop_returned_clone.store(true, Ordering::SeqCst);
     });
 
-    entered_notified.await;
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        entered_notified.as_mut(),
+    )
+    .await
+    .expect("rollback starts");
     assert!(
         !drop_returned.load(Ordering::SeqCst),
         "drop() must remain blocked until rollback() is released"

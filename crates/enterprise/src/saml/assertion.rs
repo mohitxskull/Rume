@@ -442,10 +442,17 @@ impl SamlParser {
                                     current_authn_stmt_has_instant = true;
                                 }
                             }
-                        } else if local_name == "AuthnContext"
-                            && matches!(parent, Some(("AuthnStatement", XmlNs::Assertion)))
-                            && matches!(grandparent, Some(("Assertion", XmlNs::Assertion)))
+                        } else if matches!(
+                            local_name,
+                            "AuthnContextClassRef" | "AuthnContextDecl" | "AuthnContextDeclRef"
+                        ) && matches!(parent, Some(("AuthnContext", XmlNs::Assertion)))
+                            && matches!(grandparent, Some(("AuthnStatement", XmlNs::Assertion)))
+                            && matches!(great_grandparent, Some(("Assertion", XmlNs::Assertion)))
                         {
+                            // Why: SAML Core §2.7.2.2 requires `<AuthnContext>` to carry at least
+                            // one of `AuthnContextClassRef`, `AuthnContextDecl`, or
+                            // `AuthnContextDeclRef`; an empty `<AuthnContext/>` is not valid
+                            // authentication context evidence.
                             if current_authn_stmt_has_instant {
                                 has_authn_statement = true;
                             }
