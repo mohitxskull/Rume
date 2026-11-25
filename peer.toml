@@ -1,0 +1,39 @@
+# peer.toml — Repository configuration for peer (Agent-First Rust PR Reviewer)
+# Loaded from the PR base branch (never weakened by untrusted PR head commits).
+
+# Review strictness: "quiet" | "chill" | "assertive"
+profile = "assertive"
+
+[tools]
+# Core analyzers (enabled by default)
+clippy = true
+audit = true
+
+# Optional Cargo analyzers (also toggleable via --tools)
+deny = true       # supply-chain, license & duplicate-crate policy via deny.toml
+geiger = true     # unsafe-code surface audit
+semver = true     # breaking public API check (recommended for published library crates)
+coverage = false   # changed-line test coverage via cargo-llvm-cov
+miri = false       # AST-gated UB check (runs only when diff touches unsafe)
+
+[detectors]
+# Built-in Tree-sitter AST detectors: "error" (Major) | "warn" (Minor) | "off"
+unsafe = "error"
+panic = "warn"
+
+[timeouts]
+analyzer_secs = 600  # timeout per Cargo analyzer
+verifier_secs = 120  # timeout per suggestion cargo check
+
+[diff]
+# Extra glob patterns to exclude from review (in addition to docs/, .github/, *.md, *.lock)
+ignore = []
+
+[publish]
+# Default mode for `peer publish`: "draft" (PENDING) | "comment" (submitted)
+mode = "draft"
+
+# Optional version-controlled repository rules (merged with .peer/learnings.json)
+# [[rules]]
+# scope = "src/**"
+# rule = "Never hold std::sync::Mutex across .await; use parking_lot::Mutex."
