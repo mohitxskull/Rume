@@ -321,3 +321,34 @@ async fn test_transaction_fixture_multi_thread_sync_rollback() {
 
     fixture.close().await.expect("fixture close");
 }
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn sqlite_fixture_close_times_out_when_tx_open_and_unlinks_on_drop() {
+    let fixture = SqliteTestFixture::create().await.expect("fixture creates");
+    let db_path = fixture.path().to_path_buf();
+    assert!(
+        db_path.exists(),
+        "sqlite fixture file must exist before close"
+    );
+
+    // Hold a live transaction checked out from the SQLx pool while calling `close()`.
+    let _live_tx = fixture.begin_test_tx().await.expect("begin tx");
+
+    // Pause Tokio clock AFTER SQLite connection setup so the 5s close() timeout
+    // fires deterministically without waiting 5s of wall-clock time.
+    tokio::time::pause();
+
+    let err = fixture
+        .close()
+        .await
+        .expect_err("close() must time out when a transaction is still checked out");
+    assert!(
+        matches!(err, PersistenceError::ConnectionFailed(ref msg) if msg.contains("timed out draining sqlite pool")),
+        "expected timeout error, got: {err:?}"
+    );
+    assert!(
+        !db_path.exists(),
+        "Drop on the failed close() path must still unlink the temporary sqlite file"
+    );
+}

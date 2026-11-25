@@ -471,8 +471,9 @@ where
         self.ctx.lifecycle.set(LifecycleState::Booted);
         self.ctx.availability.set(AvailabilityState::Live);
 
-        if std::env::var("RUME_INSPECT").as_deref() == Ok("routes")
-            || std::env::args().any(|a| a == "--rume-inspect-routes")
+        if std::env::var_os("RUME_INSPECT").as_deref() == Some(std::ffi::OsStr::new("routes"))
+            || std::env::args_os()
+                .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes"))
         {
             let json = serde_json::to_string(self.ctx.route_registry.routes())
                 .unwrap_or_else(|_| "[]".to_string());

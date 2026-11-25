@@ -51,8 +51,19 @@ impl SqliteTestFixture {
     /// Explicitly drains the pool and deletes temporary files, returning any errors to the test runner.
     pub async fn close(mut self) -> Result<(), PersistenceError> {
         // 1. Drain and close connection pool before unlinking files.
+        // Why: SQLx `Pool::close()` waits indefinitely if a transaction returned by
+        // `begin_test_tx()` is still alive. Bound the drain so `close()` returns a timeout
+        // error instead of hanging, leaving `self.closed == false` so `Drop` still unlinks
+        // the temporary database and sidecar files.
         if let Some(pool) = self.pool.as_ref() {
-            pool.close_async().await;
+            tokio::time::timeout(std::time::Duration::from_secs(5), pool.close_async())
+                .await
+                .map_err(|_| {
+                    PersistenceError::ConnectionFailed(format!(
+                        "timed out draining sqlite pool for '{}' (is a transaction still open?)",
+                        self.path.display()
+                    ))
+                })?;
         }
         // 2. Remove database and WAL/SHM sidecar files deterministically, propagating
         //    any error other than `NotFound`.
