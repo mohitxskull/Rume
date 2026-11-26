@@ -33,9 +33,10 @@ tokio-rustls = { workspace = true, optional = true }
 rustls = { workspace = true, optional = true }
 rustls-pki-types = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
-hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "tokio"], optional = true }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "service", "tokio"], optional = true }
 rustls-acme = { workspace = true, optional = true }
 rust-embed = { workspace = true, optional = true }
+futures-util = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -52,6 +53,6 @@ tls = [
     "dep:rustls-pemfile",
     "dep:hyper-util",
 ]
-acme = ["tls", "dep:rustls-acme"]
+acme = ["tls", "dep:rustls-acme", "dep:futures-util"]
 static-embed = ["dep:rust-embed"]
 scim = ["dep:rume-enterprise"]

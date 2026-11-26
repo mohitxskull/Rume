@@ -293,6 +293,9 @@ where
     compression: Option<rume_http::transport::CompressionConfig>,
     /// Optional HTTP header & JSON PII redaction configuration for `ObservabilityLayer`.
     redaction: Option<rume_observability::RedactionConfig>,
+    /// Optional native TLS configuration (feature-gated under `tls`).
+    #[cfg(feature = "tls")]
+    tls: Option<rume_http::tls::TlsConfig>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -323,6 +326,8 @@ where
             cors: None,
             compression: None,
             redaction: None,
+            #[cfg(feature = "tls")]
+            tls: None,
         }
     }
 
@@ -470,6 +475,13 @@ where
         self
     }
 
+    /// Enable native TLS (HTTP/1.1 + HTTP/2 ALPN, and optional ACME) with the given [`rume_http::tls::TlsConfig`].
+    #[cfg(feature = "tls")]
+    pub fn tls(mut self, config: rume_http::tls::TlsConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
         if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
@@ -543,6 +555,8 @@ where
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
+        #[cfg(feature = "tls")]
+        let tls = self.tls.take();
         let ctx = self.ctx.clone();
 
         let (router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
@@ -555,6 +569,8 @@ where
             on_ready,
             on_shutdown,
             shutdown_timeout,
+            #[cfg(feature = "tls")]
+            tls,
         })
     }
 
@@ -617,6 +633,8 @@ where
             on_ready,
             mut on_shutdown,
             shutdown_timeout,
+            #[cfg(feature = "tls")]
+            tls,
         } = prepared;
 
         let addr = listener.local_addr()?;
@@ -654,8 +672,6 @@ where
         )
         .await?;
 
-        println!("listening on http://{addr}");
-
         // --- Step 7: Serve traffic with immediate lifecycle & availability transition on shutdown ---
         let shutdown_lifecycle = serve_ctx.lifecycle.clone();
         let shutdown_availability = serve_ctx.availability.clone();
@@ -669,14 +685,44 @@ where
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
         };
 
-        let result = axum::serve(
-            listener,
-            router
-                .with_state(serve_ctx.clone())
-                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(graceful_signal)
-        .await;
+        let result = {
+            #[cfg(feature = "tls")]
+            {
+                if let Some(tls_config) = tls {
+                    println!("listening on https://{addr}");
+                    rume_http::tls::serve_tls_listener(
+                        listener,
+                        router.with_state(serve_ctx.clone()),
+                        &tls_config,
+                        graceful_signal,
+                        shutdown_timeout,
+                    )
+                    .await
+                } else {
+                    println!("listening on http://{addr}");
+                    axum::serve(
+                        listener,
+                        router
+                            .with_state(serve_ctx.clone())
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(graceful_signal)
+                    .await
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                println!("listening on http://{addr}");
+                axum::serve(
+                    listener,
+                    router
+                        .with_state(serve_ctx.clone())
+                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                )
+                .with_graceful_shutdown(graceful_signal)
+                .await
+            }
+        };
 
         // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
         crate::app::lifecycle::run_shutdown(
@@ -706,6 +752,8 @@ where
     on_ready: Vec<ReadyHook<E, C, S>>,
     on_shutdown: Vec<ShutdownHook<E, C, S>>,
     shutdown_timeout: Duration,
+    #[cfg(feature = "tls")]
+    tls: Option<rume_http::tls::TlsConfig>,
 }
 
 #[cfg(test)]

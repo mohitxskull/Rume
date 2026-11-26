@@ -974,3 +974,116 @@ async fn inspect_mode_fails_closed_on_invalid_cors_config() {
         "expected CORS error message, got: {err}"
     );
 }
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn rume_builder_tls_serves_https_and_drains_gracefully_on_shutdown() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_CERT_PEM: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBwDCCAWWgAwIBAgIUIi3+ZI/tJFK4wTVlTFPD6QkG8XAwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNjEyMTYwMloYDzIxMDAxMDI5
+MTIxNjAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAATIw5glQvkynffHCd5iEclrqe+juD6xFx8A1F43+PqLjpra4wZ3non1
+Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrryo4GSMIGPMB0GA1UdDgQWBBQQ8rRAB+Bs
++SsH4WcR+cJEbH+hTzAfBgNVHSMEGDAWgBQQ8rRAB+Bs+SsH4WcR+cJEbH+hTzAM
+BgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcD
+ATAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDSQAwRgIh
+APyYGMmbXQV05SjOkoWARBTijDUQ9v3rvdTvfFFJ8HXSAiEA/rJYP8/AcQalmlJL
+MOAtrICgSzS3UyLAhl16728zqGc=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo2otzH6WgCrTvKb8
+Mad8NskKE+yg2Tqk/S0mX41X1AGhRANCAATIw5glQvkynffHCd5iEclrqe+juD6x
+Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
+-----END PRIVATE KEY-----
+";
+
+    let tls_config = rume_http::tls::TlsConfig::from_pem_bytes(TEST_CERT_PEM, TEST_KEY_PEM)
+        .expect("valid PEM cert and key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_flag = shutdown_hook_ran.clone();
+
+    let app = Rume::new()
+        .tls(tls_config)
+        .get(
+            "/tls-ping",
+            |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                format!("pong:{peer}")
+            },
+        )
+        .on_shutdown(move |ctx| async move {
+            assert_eq!(ctx.lifecycle.state(), LifecycleState::Terminating);
+            assert_eq!(ctx.availability.state(), AvailabilityState::RefusingTraffic);
+            hook_flag.store(true, Ordering::SeqCst);
+        });
+
+    let lifecycle = app.lifecycle();
+    let availability = app.availability();
+
+    let mut server = tokio::spawn(async move {
+        app.run_with_listener_and_signal(listener, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
+    for cert in rustls_pemfile::certs(&mut cert_reader) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    tls_stream
+        .write_all(b"GET /tls-ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tls_stream.read_to_string(&mut response).await.unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected HTTP/1.1 200 OK over TLS, got: {response}"
+    );
+    assert!(
+        response.contains("pong:127.0.0.1:"),
+        "expected ConnectInfo peer address in body, got: {response}"
+    );
+
+    let _ = shutdown_tx.send(());
+    let server_res = server.await.expect("server task panicked");
+    assert!(
+        server_res.is_ok(),
+        "server exited with error: {server_res:?}"
+    );
+    assert_eq!(lifecycle.state(), LifecycleState::Terminated);
+    assert_eq!(availability.state(), AvailabilityState::Unknown);
+    assert!(
+        shutdown_hook_ran.load(Ordering::SeqCst),
+        "on_shutdown hook must run after TLS drain"
+    );
+}
