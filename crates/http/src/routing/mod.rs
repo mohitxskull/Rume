@@ -39,3 +39,6 @@ pub use resource::Resource;
 pub use router::Router;
 pub use spec::{ParamValidationLayer, RouteSpec};
 pub use validated_param::ValidatedParam;
+pub use versioning::{
+    ApiVersion, ApiVersionExtractor, DeprecationLayer, VersionHeaderLayer, versioned_group,
+};

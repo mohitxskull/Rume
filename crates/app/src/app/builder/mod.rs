@@ -491,6 +491,37 @@ where
         self
     }
 
+    /// Serve static files from disk (with optional SPA fallback) as the router fallback.
+    pub fn static_files(mut self, config: rume_http::static_files::StaticFilesConfig) -> Self {
+        self.router = self
+            .router
+            .fallback_service(rume_http::static_files::static_files_router(config));
+        self
+    }
+
+    /// Serve compile-time embedded assets via `rust-embed` as the router fallback.
+    #[cfg(feature = "static-embed")]
+    pub fn embedded_assets<A>(
+        mut self,
+        config: rume_http::static_files::EmbeddedAssetsConfig,
+    ) -> Self
+    where
+        A: rume_http::static_files::RustEmbed + Send + Sync + 'static,
+    {
+        self.router =
+            self.router
+                .fallback_service(rume_http::static_files::embedded_assets_router::<A, _>(
+                    config,
+                ));
+        self
+    }
+
+    /// Apply an [`rume_http::http_cache::HttpCacheLayer`] to the application router.
+    pub fn http_cache(mut self, layer: rume_http::http_cache::HttpCacheLayer) -> Self {
+        self.router = self.router.layer(layer);
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
         if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
