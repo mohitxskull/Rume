@@ -24,6 +24,42 @@ pub type CancellableMessageDispatcher = Arc<
         + 'static,
 >;
 
+/// Builds a dispatcher closure that publishes [`OutboxMessage`]s to any [`BrokerPublisher`]
+/// with `message_id`, `event_type`, and W3C `traceparent`/`tracestate` headers.
+pub fn broker_dispatcher(
+    broker: Arc<dyn crate::broker::BrokerPublisher>,
+) -> impl Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static
+{
+    move |msg: &OutboxMessage| {
+        let broker = Arc::clone(&broker);
+        let mut headers = BTreeMap::new();
+        headers.insert("message_id".to_string(), msg.id.clone());
+        headers.insert("event_type".to_string(), msg.event_type.clone());
+        let trace_ctx = rume_observability::TraceContext::current().or_else(|| {
+            msg.trace_context
+                .as_deref()
+                .and_then(rume_observability::TraceContext::parse_serialized)
+        });
+        if let Some(tc) = trace_ctx {
+            headers.insert("traceparent".to_string(), tc.traceparent);
+            if let Some(ts) = tc.tracestate {
+                headers.insert("tracestate".to_string(), ts);
+            }
+        }
+        let broker_msg = crate::broker::BrokerMessage {
+            topic: msg.event_type.clone(),
+            payload: msg.payload.clone(),
+            headers,
+        };
+        Box::pin(async move {
+            broker
+                .publish(broker_msg)
+                .await
+                .map_err(|e| OutboxError::Dispatch(e.to_string()))
+        })
+    }
+}
+
 /// Result of an outbox relay polling pass, reporting counts for published messages,
 /// retry-scheduled messages, and failed state transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -231,6 +267,14 @@ impl<R: OutboxRepository> OutboxRelay<R> {
     pub fn with_config(mut self, config: OutboxRelayConfig) -> Self {
         self.config = config;
         self
+    }
+
+    /// Creates a new outbox relay that publishes claimed outbox messages to `broker`.
+    pub fn with_broker(
+        repository: Arc<R>,
+        broker: Arc<dyn crate::broker::BrokerPublisher>,
+    ) -> Self {
+        Self::new(repository, broker_dispatcher(broker))
     }
 
     /// Claims pending messages atomically and dispatches them in order.
@@ -818,5 +862,50 @@ mod tests {
             .await
             .expect("sweeper started after try_drain must exit immediately")
             .expect("sweeper task must not panic");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn outbox_relay_publishes_to_message_broker() {
+        use crate::broker::{InMemoryBroker, MessageBroker};
+        use rume_observability::TraceContext;
+
+        let backend = Arc::new(
+            rume_data::persistence::SqliteBackend::in_memory()
+                .await
+                .expect("sqlite in-memory"),
+        );
+        backend
+            .init_outbox_table()
+            .await
+            .expect("init outbox table");
+
+        let trace_ctx = TraceContext::generate();
+        let msg = OutboxMessage::new("msg-broker-1", "order.created", br#"{"id":1}"#.to_vec())
+            .with_trace_context(trace_ctx.to_string());
+        backend.save(msg).await.expect("save outbox");
+
+        let broker = Arc::new(InMemoryBroker::new());
+        let mut consumer = broker.subscribe("order.created").await.expect("subscribe");
+
+        let relay = OutboxRelay::with_broker(Arc::clone(&backend), broker);
+        let poll = relay
+            .poll_and_dispatch(10)
+            .await
+            .expect("poll_and_dispatch");
+        assert_eq!(poll.published, 1);
+
+        let delivered = consumer
+            .next_message()
+            .await
+            .expect("next_message")
+            .expect("delivered message");
+        assert_eq!(delivered.topic, "order.created");
+        assert_eq!(delivered.payload, br#"{"id":1}"#);
+        let tp = delivered
+            .headers
+            .get("traceparent")
+            .expect("traceparent header");
+        assert!(tp.contains(trace_ctx.trace_id()));
     }
 }
