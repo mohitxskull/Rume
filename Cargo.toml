@@ -70,11 +70,27 @@ chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
 redis = { version = "=1.8.2", default-features = false, features = ["tokio-comp", "script"] }
-# SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
-# `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
-# XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
-# XML-DSig verification is delegated to the pluggable `SamlSignatureVerifier` boundary.
-saml-rs = "=0.8.0"
+# SAML 2.0 namespace URNs (used by `crates/enterprise/src/saml/` under the `saml` feature).
+# Why: `default-features = false` disables `saml-rs`'s default XML-DSig/legacy-algorithm
+# feature pull-through so Cargo feature unification cannot silently re-enable
+# `bergshamra/legacy-algorithms` (SHA-1).
+saml-rs = { version = "=0.8.0", default-features = false }
+# Milestone B security, crypto, JWT/JWKS, OAuth2/OIDC, and XML-DSig dependencies.
+argon2 = "=0.6.0"
+base64 = "=0.23.1"
+hex = "=0.4.3"
+sha1 = "=0.11.0"
+sha2 = "=0.11.1"
+hmac = "=0.13.0"
+rand = "=0.10.3"
+rsa = { version = "=0.10.0", features = ["pkcs1v15"] }
+p256 = "=0.14.0"
+p384 = "=0.14.0"
+ecdsa = "=0.17.0"
+signature = "=3.0.0"
+zeroize = "=1.9.1"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "http2"] }
+bergshamra = { version = "=0.12.0", default-features = false, features = ["rustcrypto"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
 garde = { version = "=0.23.0", features = ["derive", "email", "url"] }

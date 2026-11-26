@@ -420,6 +420,30 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
 
     /// Explicitly discards and rolls back all changes made within this transaction.
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>>;
+
+    /// Sets the transaction-local PostgreSQL tenant context (`app.current_tenant`) for RLS.
+    #[allow(unused_variables)]
+    fn set_tenant_context(&self, tenant_id: &str) -> BoxFuture<'_, Result<(), PersistenceError>> {
+        todo!("implemented in Task 05")
+    }
+
+    /// Sets the transaction-local PostgreSQL `search_path` for schema-per-tenant isolation.
+    #[allow(unused_variables)]
+    fn set_tenant_search_path(&self, schema: &str) -> BoxFuture<'_, Result<(), PersistenceError>> {
+        todo!("implemented in Task 05")
+    }
+}
+
+/// Validates a tenant identifier for safe persistence and RLS context binding.
+#[allow(unused_variables)]
+pub fn validate_tenant_id(tenant_id: &str) -> Result<(), PersistenceError> {
+    todo!("implemented in Task 05")
+}
+
+/// Validates a SQL identifier against PostgreSQL's `NAMEDATALEN - 1` rules.
+#[allow(unused_variables)]
+pub fn validate_sql_identifier(ident: &str) -> Result<(), PersistenceError> {
+    todo!("implemented in Task 05")
 }
 
 #[cfg(test)]

@@ -16,8 +16,12 @@ pub mod query;
 pub mod row;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
+pub mod tenancy;
 
-pub use backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue};
+pub use backend::{
+    BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue, validate_sql_identifier,
+    validate_tenant_id,
+};
 pub use config::DatabaseConfig;
 pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator};
@@ -32,3 +36,4 @@ pub use query::SqlQuery;
 pub use row::{DbRow, FromDbValue, FromRow};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteTransaction};
+pub use tenancy::{TenantIsolationStrategy, TenantPoolManager};

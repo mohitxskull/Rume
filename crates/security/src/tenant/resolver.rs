@@ -282,6 +282,190 @@ impl TenantResolver for SubdomainTenantResolver {
     }
 }
 
+/// Async storage interface for persisted tenant records.
+pub trait TenantStore: Debug + Send + Sync + 'static {
+    /// Finds an active tenant by ID.
+    fn find_by_id<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>>;
+
+    /// Finds an active tenant by slug.
+    fn find_by_slug<'a>(
+        &'a self,
+        slug: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>>;
+
+    /// Inserts or updates a tenant record.
+    fn upsert<'a>(&'a self, tenant: &'a Tenant) -> BoxFuture<'a, Result<(), TenantError>>;
+
+    /// Deactivates a tenant by ID.
+    fn deactivate<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, TenantError>>;
+}
+
+/// SQL-backed [`TenantStore`] using `rume-data` queries.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct SqlTenantStore<B: rume_data::persistence::DatabaseBackend> {
+    backend: Arc<B>,
+}
+
+impl<B: rume_data::persistence::DatabaseBackend> SqlTenantStore<B> {
+    /// Creates a new [`SqlTenantStore`] backed by `backend`.
+    pub fn new(backend: Arc<B>) -> Self {
+        Self { backend }
+    }
+}
+
+impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<B> {
+    #[allow(unused_variables)]
+    fn find_by_id<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
+        todo!("implemented in Task 05")
+    }
+
+    #[allow(unused_variables)]
+    fn find_by_slug<'a>(
+        &'a self,
+        slug: &'a str,
+    ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
+        todo!("implemented in Task 05")
+    }
+
+    #[allow(unused_variables)]
+    fn upsert<'a>(&'a self, tenant: &'a Tenant) -> BoxFuture<'a, Result<(), TenantError>> {
+        todo!("implemented in Task 05")
+    }
+
+    #[allow(unused_variables)]
+    fn deactivate<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, TenantError>> {
+        todo!("implemented in Task 05")
+    }
+}
+
+/// Resolves tenant from a URL path prefix (e.g. `/t/{slug}/...`).
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct PathPrefixTenantResolver {
+    prefix: String,
+    tenants: Arc<RwLock<BTreeMap<String, Tenant>>>,
+    store: Option<Arc<dyn TenantStore>>,
+}
+
+impl PathPrefixTenantResolver {
+    /// Creates a new path-prefix resolver with default prefix `"/t/"`.
+    pub fn new() -> Self {
+        Self {
+            prefix: "/t/".to_string(),
+            tenants: Arc::new(RwLock::new(BTreeMap::new())),
+            store: None,
+        }
+    }
+
+    /// Sets a custom path prefix.
+    #[allow(unused_variables)]
+    pub fn with_prefix(self, prefix: impl Into<String>) -> Self {
+        todo!("implemented in Task 05")
+    }
+
+    /// Backs this resolver with a [`TenantStore`].
+    pub fn with_store<S: TenantStore>(mut self, store: Arc<S>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// Attempts to register a tenant by slug, returning an error on conflict.
+    #[allow(unused_variables)]
+    pub fn try_add_tenant(&self, tenant: Tenant) -> Result<(), TenantError> {
+        todo!("implemented in Task 05")
+    }
+
+    /// Registers a tenant by slug.
+    pub fn add_tenant(self, tenant: Tenant) -> Self {
+        if let Err(e) = self.try_add_tenant(tenant) {
+            tracing::warn!("Failed to add tenant: {e}");
+        }
+        self
+    }
+}
+
+impl Default for PathPrefixTenantResolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TenantResolver for PathPrefixTenantResolver {
+    #[allow(unused_variables)]
+    fn resolve<'a>(
+        &'a self,
+        parts: &'a Parts,
+    ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
+        todo!("implemented in Task 05")
+    }
+}
+
+/// Strategy used by [`CachedDbTenantResolver`] to extract a tenant key from requests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TenantKeyExtractor {
+    /// Extract tenant ID or slug from a request header.
+    Header(String),
+    /// Extract tenant slug from a subdomain of the given base domain.
+    Subdomain(String),
+    /// Extract tenant slug from a URL path prefix.
+    PathPrefix(String),
+}
+
+/// DB-backed [`TenantResolver`] with positive/negative caching and explicit invalidation.
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct CachedDbTenantResolver<S: TenantStore, C: rume_data::cache::CacheBackend> {
+    store: Arc<S>,
+    cache: Arc<C>,
+    extractor: TenantKeyExtractor,
+    positive_ttl: std::time::Duration,
+    negative_ttl: std::time::Duration,
+}
+
+impl<S: TenantStore, C: rume_data::cache::CacheBackend> CachedDbTenantResolver<S, C> {
+    /// Creates a new [`CachedDbTenantResolver`] with default TTLs (300s positive, 30s negative).
+    pub fn new(store: Arc<S>, cache: Arc<C>, extractor: TenantKeyExtractor) -> Self {
+        Self {
+            store,
+            cache,
+            extractor,
+            positive_ttl: std::time::Duration::from_secs(300),
+            negative_ttl: std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// Sets the positive cache TTL.
+    pub fn with_positive_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.positive_ttl = ttl;
+        self
+    }
+
+    /// Sets the negative cache TTL.
+    pub fn with_negative_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.negative_ttl = ttl;
+        self
+    }
+
+    /// Invalidates cached entries for `tenant_id` and `slug`.
+    #[allow(unused_variables)]
+    pub async fn invalidate(&self, tenant_id: &str, slug: &str) -> Result<(), TenantError> {
+        todo!("implemented in Task 05")
+    }
+}
+
+impl<S: TenantStore, C: rume_data::cache::CacheBackend + 'static> TenantResolver
+    for CachedDbTenantResolver<S, C>
+{
+    #[allow(unused_variables)]
+    fn resolve<'a>(
+        &'a self,
+        parts: &'a Parts,
+    ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
+        todo!("implemented in Task 05")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

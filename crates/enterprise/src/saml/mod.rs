@@ -27,13 +27,19 @@
 
 mod assertion;
 mod discovery;
+pub mod redis_replay;
 mod verify;
+pub mod xmldsig;
 
 pub use assertion::{SamlAssertion, SamlParser, SamlSubjectConfirmationData, parse_iso8601_strict};
+#[cfg(feature = "redis")]
+pub use redis_replay::RedisSamlReplayCache;
+pub use redis_replay::{AsyncSamlReplayCache, SyncReplayCacheAdapter};
 pub use verify::{
     InMemorySamlReplayCache, SamlError, SamlReplayCache, SamlSignatureVerifier,
     SamlValidationConfig,
 };
+pub use xmldsig::XmlDsigSamlVerifier;
 
 #[cfg(test)]
 mod tests;

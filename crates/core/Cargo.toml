@@ -45,7 +45,9 @@ redis = [
     "rume-messaging/redis",
     "rume-security/redis",
     "rume-http/redis",
+    "rume-enterprise/redis",
 ]
+http-client = ["rume-security/http-client"]
 sqlite = [
     "rume-data/sqlite",
     "rume-messaging/sqlite",

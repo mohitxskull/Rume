@@ -17,8 +17,23 @@ serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 uuid = { version = "=1.29.2", features = ["v4"] }
-sha2 = "=0.11.1"
-hmac = "=0.13.0"
+argon2.workspace = true
+base64.workspace = true
+hex.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+rsa.workspace = true
+p256.workspace = true
+p384.workspace = true
+ecdsa.workspace = true
+signature.workspace = true
+subtle.workspace = true
+secrecy.workspace = true
+zeroize.workspace = true
+url.workspace = true
+reqwest = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
@@ -28,3 +43,4 @@ tokio = { workspace = true, features = ["test-util"] }
 [features]
 default = []
 redis = ["rume-data/redis", "dep:deadpool-redis", "dep:redis"]
+http-client = ["dep:reqwest"]

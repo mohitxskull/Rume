@@ -175,3 +175,213 @@ pub const SQLITE_OUTBOX_REPROCESS_FAILED: &str =
 /// Purge published messages.
 pub const SQLITE_OUTBOX_PURGE_PUBLISHED: &str =
     include_str!("../sql/sqlite/outbox_purge_published.sql");
+
+// Multi-tenancy & RLS (PostgreSQL).
+
+/// Sets transaction-local `app.current_tenant` for PostgreSQL Row-Level Security.
+pub const PG_SET_TENANT_CONTEXT: &str = include_str!("../sql/postgres/pg_set_tenant_context.sql");
+/// Sets transaction-local `search_path` for PostgreSQL schema-per-tenant isolation.
+pub const PG_SET_TENANT_SEARCH_PATH: &str =
+    include_str!("../sql/postgres/pg_set_tenant_search_path.sql");
+
+// Auth & Multi-Tenancy (PostgreSQL).
+
+/// Schema DDL for auth and multi-tenancy tables in PostgreSQL.
+pub const PG_AUTH_SCHEMA: &str = include_str!("../sql/postgres/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in PostgreSQL.
+pub const PG_AUTH_DOWN: &str = include_str!("../sql/postgres/auth_down.sql");
+/// Load a session by ID in PostgreSQL.
+pub const PG_AUTH_SESSION_LOAD: &str = include_str!("../sql/postgres/auth_session_load.sql");
+/// Upsert a session in PostgreSQL.
+pub const PG_AUTH_SESSION_UPSERT: &str = include_str!("../sql/postgres/auth_session_upsert.sql");
+/// Delete a session by ID in PostgreSQL.
+pub const PG_AUTH_SESSION_DELETE: &str = include_str!("../sql/postgres/auth_session_delete.sql");
+/// Prune expired sessions in PostgreSQL.
+pub const PG_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/postgres/auth_session_prune_expired.sql");
+/// Insert an API key record in PostgreSQL.
+pub const PG_AUTH_API_KEY_INSERT: &str = include_str!("../sql/postgres/auth_api_key_insert.sql");
+/// Find an API key by ID in PostgreSQL.
+pub const PG_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/postgres/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in PostgreSQL.
+pub const PG_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/postgres/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in PostgreSQL.
+pub const PG_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/postgres/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in PostgreSQL.
+pub const PG_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/postgres/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in PostgreSQL.
+pub const PG_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/postgres/auth_api_key_touch_last_used.sql");
+/// Insert a role in PostgreSQL.
+pub const PG_AUTH_ROLE_INSERT: &str = include_str!("../sql/postgres/auth_role_insert.sql");
+/// Delete a role in PostgreSQL.
+pub const PG_AUTH_ROLE_DELETE: &str = include_str!("../sql/postgres/auth_role_delete.sql");
+/// Grant a permission to a role in PostgreSQL.
+pub const PG_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/postgres/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in PostgreSQL.
+pub const PG_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/postgres/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in PostgreSQL.
+pub const PG_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/postgres/auth_role_permissions_list.sql");
+/// Assign a role to a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/postgres/auth_user_role_assign.sql");
+/// Unassign a role from a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/postgres/auth_user_role_unassign.sql");
+/// List roles assigned to a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/postgres/auth_user_roles_list.sql");
+/// List effective permissions for a user in PostgreSQL.
+pub const PG_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/postgres/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in PostgreSQL.
+pub const PG_AUTH_TENANT_UPSERT: &str = include_str!("../sql/postgres/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in PostgreSQL.
+pub const PG_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/postgres/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in PostgreSQL.
+pub const PG_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/postgres/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in PostgreSQL.
+pub const PG_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/postgres/auth_tenant_deactivate.sql");
+
+// Auth & Multi-Tenancy (MySQL).
+
+/// Schema DDL for auth and multi-tenancy tables in MySQL.
+pub const MYSQL_AUTH_SCHEMA: &str = include_str!("../sql/mysql/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in MySQL.
+pub const MYSQL_AUTH_DOWN: &str = include_str!("../sql/mysql/auth_down.sql");
+/// Load a session by ID in MySQL.
+pub const MYSQL_AUTH_SESSION_LOAD: &str = include_str!("../sql/mysql/auth_session_load.sql");
+/// Upsert a session in MySQL.
+pub const MYSQL_AUTH_SESSION_UPSERT: &str = include_str!("../sql/mysql/auth_session_upsert.sql");
+/// Delete a session by ID in MySQL.
+pub const MYSQL_AUTH_SESSION_DELETE: &str = include_str!("../sql/mysql/auth_session_delete.sql");
+/// Prune expired sessions in MySQL.
+pub const MYSQL_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/mysql/auth_session_prune_expired.sql");
+/// Insert an API key record in MySQL.
+pub const MYSQL_AUTH_API_KEY_INSERT: &str = include_str!("../sql/mysql/auth_api_key_insert.sql");
+/// Find an API key by ID in MySQL.
+pub const MYSQL_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/mysql/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in MySQL.
+pub const MYSQL_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/mysql/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in MySQL.
+pub const MYSQL_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/mysql/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in MySQL.
+pub const MYSQL_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/mysql/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in MySQL.
+pub const MYSQL_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/mysql/auth_api_key_touch_last_used.sql");
+/// Insert a role in MySQL.
+pub const MYSQL_AUTH_ROLE_INSERT: &str = include_str!("../sql/mysql/auth_role_insert.sql");
+/// Delete a role in MySQL.
+pub const MYSQL_AUTH_ROLE_DELETE: &str = include_str!("../sql/mysql/auth_role_delete.sql");
+/// Grant a permission to a role in MySQL.
+pub const MYSQL_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/mysql/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in MySQL.
+pub const MYSQL_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/mysql/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in MySQL.
+pub const MYSQL_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/mysql/auth_role_permissions_list.sql");
+/// Assign a role to a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/mysql/auth_user_role_assign.sql");
+/// Unassign a role from a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/mysql/auth_user_role_unassign.sql");
+/// List roles assigned to a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/mysql/auth_user_roles_list.sql");
+/// List effective permissions for a user in MySQL.
+pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/mysql/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in MySQL.
+pub const MYSQL_AUTH_TENANT_UPSERT: &str = include_str!("../sql/mysql/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/mysql/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/mysql/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in MySQL.
+pub const MYSQL_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/mysql/auth_tenant_deactivate.sql");
+
+// Auth & Multi-Tenancy (SQLite).
+
+/// Schema DDL for auth and multi-tenancy tables in SQLite.
+pub const SQLITE_AUTH_SCHEMA: &str = include_str!("../sql/sqlite/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in SQLite.
+pub const SQLITE_AUTH_DOWN: &str = include_str!("../sql/sqlite/auth_down.sql");
+/// Load a session by ID in SQLite.
+pub const SQLITE_AUTH_SESSION_LOAD: &str = include_str!("../sql/sqlite/auth_session_load.sql");
+/// Upsert a session in SQLite.
+pub const SQLITE_AUTH_SESSION_UPSERT: &str = include_str!("../sql/sqlite/auth_session_upsert.sql");
+/// Delete a session by ID in SQLite.
+pub const SQLITE_AUTH_SESSION_DELETE: &str = include_str!("../sql/sqlite/auth_session_delete.sql");
+/// Prune expired sessions in SQLite.
+pub const SQLITE_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/sqlite/auth_session_prune_expired.sql");
+/// Insert an API key record in SQLite.
+pub const SQLITE_AUTH_API_KEY_INSERT: &str = include_str!("../sql/sqlite/auth_api_key_insert.sql");
+/// Find an API key by ID in SQLite.
+pub const SQLITE_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/sqlite/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in SQLite.
+pub const SQLITE_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/sqlite/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in SQLite.
+pub const SQLITE_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/sqlite/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in SQLite.
+pub const SQLITE_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/sqlite/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in SQLite.
+pub const SQLITE_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/sqlite/auth_api_key_touch_last_used.sql");
+/// Insert a role in SQLite.
+pub const SQLITE_AUTH_ROLE_INSERT: &str = include_str!("../sql/sqlite/auth_role_insert.sql");
+/// Delete a role in SQLite.
+pub const SQLITE_AUTH_ROLE_DELETE: &str = include_str!("../sql/sqlite/auth_role_delete.sql");
+/// Grant a permission to a role in SQLite.
+pub const SQLITE_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/sqlite/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in SQLite.
+pub const SQLITE_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/sqlite/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in SQLite.
+pub const SQLITE_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/sqlite/auth_role_permissions_list.sql");
+/// Assign a role to a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/sqlite/auth_user_role_assign.sql");
+/// Unassign a role from a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/sqlite/auth_user_role_unassign.sql");
+/// List roles assigned to a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLES_LIST: &str =
+    include_str!("../sql/sqlite/auth_user_roles_list.sql");
+/// List effective permissions for a user in SQLite.
+pub const SQLITE_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/sqlite/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in SQLite.
+pub const SQLITE_AUTH_TENANT_UPSERT: &str = include_str!("../sql/sqlite/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in SQLite.
+pub const SQLITE_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/sqlite/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in SQLite.
+pub const SQLITE_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/sqlite/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in SQLite.
+pub const SQLITE_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/sqlite/auth_tenant_deactivate.sql");
