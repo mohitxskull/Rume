@@ -85,6 +85,10 @@ pub async fn run(cli: Cli) {
             require_rume_project();
             db::run(crate::cli::DbCommands::Rollback).await;
         }
+        Some(Commands::DbSeed { path, only }) => {
+            require_rume_project();
+            db::run(crate::cli::DbCommands::Seed { path, only }).await;
+        }
         Some(Commands::SqlCheck {
             path,
             dialect,

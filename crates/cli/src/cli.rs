@@ -102,6 +102,16 @@ pub enum Commands {
     /// Shortcut for `rume db rollback`.
     #[command(name = "db:rollback", alias = "db-rollback", hide = true)]
     DbRollback,
+    /// Shortcut for `rume db seed`.
+    #[command(name = "db:seed", alias = "db-seed", hide = true)]
+    DbSeed {
+        /// Directory containing `.sql` seed files (defaults to `seeds`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Comma-separated list of seed names to run.
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+    },
     /// Validate SQL files in the project for syntax and non-empty queries.
     #[command(name = "sql:check", alias = "sql-check")]
     SqlCheck {
@@ -132,7 +142,14 @@ pub enum DbCommands {
     /// Rollback the most recently applied migration.
     Rollback,
     /// Execute database seed scripts.
-    Seed,
+    Seed {
+        /// Directory containing `.sql` seed files (defaults to `seeds`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Comma-separated list of seed names to run.
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+    },
 }
 
 #[derive(Subcommand)]

@@ -8,22 +8,171 @@ use comfy_table::Color;
 use console::style;
 use rume::persistence::config::DatabaseConfig;
 use rume::persistence::migration::{Migration, Migrator};
-use rume::persistence::{MysqlBackend, PostgresBackend, SqliteBackend};
+use rume::persistence::seed::{SeedRegistry, SeedReport, SqlFileSeeder};
+use rume::persistence::{
+    DatabaseBackend, DatabasePool, MysqlBackend, PersistenceError, PostgresBackend, SqliteBackend,
+};
 
 use crate::cli::DbCommands;
 use crate::ui::table::TableBuilder;
+
+async fn run_registry<B: DatabaseBackend>(
+    backend: B,
+    config: DatabaseConfig,
+    registry: &SeedRegistry,
+    only: Option<&[&str]>,
+) -> Result<SeedReport, PersistenceError> {
+    let pool = DatabasePool::new(backend, config);
+    match only {
+        Some(names) => registry.run_only(&pool, names).await,
+        None => registry.run_all(&pool).await,
+    }
+}
 
 pub async fn run(cmd: DbCommands) {
     match cmd {
         DbCommands::Status => status().await,
         DbCommands::Migrate => migrate().await,
         DbCommands::Rollback => rollback().await,
-        DbCommands::Seed => seed().await,
+        DbCommands::Seed { path, only } => seed(path, only).await,
     }
 }
 
-pub async fn seed() {
-    todo!("rume db seed is implemented in Task 05")
+pub async fn seed(path: Option<String>, only: Option<Vec<String>>) {
+    let explicit_path = path.is_some();
+    let seeds_dir_str = path.unwrap_or_else(|| "seeds".to_string());
+    let seeds_dir = Path::new(&seeds_dir_str);
+
+    if !seeds_dir.exists() {
+        if explicit_path {
+            eprintln!(
+                "{}",
+                style(format!(
+                    "error: seeds directory '{}' does not exist",
+                    seeds_dir.display()
+                ))
+                .red()
+            );
+            std::process::exit(1);
+        }
+        println!("No seeds found in {}/ directory.", seeds_dir.display());
+        return;
+    }
+
+    let mut sql_files: BTreeMap<String, String> = BTreeMap::new();
+    let entries = match fs::read_dir(seeds_dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            eprintln!(
+                "{}",
+                style(format!(
+                    "error: failed to read seeds directory '{}': {e}",
+                    seeds_dir.display()
+                ))
+                .red()
+            );
+            std::process::exit(1);
+        }
+    };
+
+    for entry in entries.filter_map(Result::ok) {
+        let file_path = entry.path();
+        if !file_path.is_file() {
+            continue;
+        }
+        if file_path.extension().and_then(|ext| ext.to_str()) != Some("sql") {
+            continue;
+        }
+        let Some(stem) = file_path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let content = match fs::read_to_string(&file_path) {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!(
+                    "{}",
+                    style(format!(
+                        "error: failed to read seed file '{}': {e}",
+                        file_path.display()
+                    ))
+                    .red()
+                );
+                std::process::exit(1);
+            }
+        };
+        sql_files.insert(stem.to_string(), content);
+    }
+
+    if sql_files.is_empty() {
+        println!(
+            "No .sql seed files found in {}/ directory.",
+            seeds_dir.display()
+        );
+        return;
+    }
+
+    let mut registry = SeedRegistry::new();
+    for (name, sql) in sql_files {
+        registry.register(SqlFileSeeder::new(name, sql));
+    }
+
+    let db_url = match resolve_db_url() {
+        Ok(Some(url)) => url,
+        Ok(None) => {
+            eprintln!(
+                "{}",
+                style("error: DATABASE_URL is not set and database.url was not found in config/app.toml").red()
+            );
+            std::process::exit(1);
+        }
+        Err(err) => {
+            eprintln!("{}", style(format!("error: {err}")).red());
+            std::process::exit(1);
+        }
+    };
+
+    let (handle, _dialect) = match connect_backend(&db_url).await {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("{}", style(err).red());
+            std::process::exit(1);
+        }
+    };
+
+    let config = DatabaseConfig::new(&db_url);
+    let only_refs: Option<Vec<&str>> = only
+        .as_ref()
+        .map(|names| names.iter().map(String::as_str).collect());
+
+    let report_res: Result<SeedReport, PersistenceError> = match handle {
+        BackendHandle::Postgres(b) => {
+            run_registry(b, config, &registry, only_refs.as_deref()).await
+        }
+        BackendHandle::Sqlite(b) => run_registry(b, config, &registry, only_refs.as_deref()).await,
+        BackendHandle::Mysql(b) => run_registry(b, config, &registry, only_refs.as_deref()).await,
+    };
+
+    match report_res {
+        Ok(report) => {
+            let mut builder = TableBuilder::new();
+            builder.head(&["Seed", "Status"]);
+            for name in &report.applied {
+                builder.row_colored(&[(name, None), ("Applied", Some(Color::Green))]);
+            }
+            for name in &report.skipped {
+                builder.row_colored(&[(name, None), ("Skipped", Some(Color::Yellow))]);
+            }
+            if report.applied.is_empty() && report.skipped.is_empty() {
+                println!("No seeds executed.");
+            } else {
+                builder.render();
+            }
+        }
+        Err(e) => {
+            eprintln!("{}", style(format!("error: seeding failed: {e}")).red());
+            std::process::exit(1);
+        }
+    }
 }
 
 pub fn make_migration(name: Option<String>) {
@@ -795,6 +944,43 @@ mod tests {
                 escape_err.contains("path escapes workspace directory"),
                 "unexpected error: {escape_err}"
             );
+        }
+    }
+
+    #[test]
+    fn cli_parses_db_seed_and_alias() {
+        use crate::cli::{Cli, Commands, DbCommands};
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from([
+            "rume",
+            "db",
+            "seed",
+            "--path",
+            "custom/seeds",
+            "--only",
+            "users,roles",
+        ])
+        .expect("rume db seed should parse --path and --only");
+        match parsed.command {
+            Some(Commands::Db {
+                command: DbCommands::Seed { path, only },
+            }) => {
+                assert_eq!(path.as_deref(), Some("custom/seeds"));
+                assert_eq!(only, Some(vec!["users".to_string(), "roles".to_string()]));
+            }
+            _ => panic!("expected DbCommands::Seed"),
+        }
+
+        let alias_parsed =
+            Cli::try_parse_from(["rume", "db:seed", "--path", "seeds", "--only", "users"])
+                .expect("rume db:seed alias should parse --path and --only");
+        match alias_parsed.command {
+            Some(Commands::DbSeed { path, only }) => {
+                assert_eq!(path.as_deref(), Some("seeds"));
+                assert_eq!(only, Some(vec!["users".to_string()]));
+            }
+            _ => panic!("expected Commands::DbSeed"),
         }
     }
 }

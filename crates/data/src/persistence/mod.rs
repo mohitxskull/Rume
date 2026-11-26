@@ -48,6 +48,7 @@ pub use postgres::{PostgresBackend, PostgresTransaction};
 pub use query::SqlQuery;
 pub use read_write::{ReadWriteConfig, ReadWriteHealthCheck, ReadWritePool, ReadWritePoolStatus};
 pub use row::{DbRow, FromDbValue, FromRow};
+pub use seed::{SeedRegistry, SeedReport, Seeder, SqlFileSeeder};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteTransaction};
 pub use tenancy::{TenantIsolationStrategy, TenantPoolManager};
