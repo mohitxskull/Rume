@@ -63,12 +63,75 @@ impl RedisCacheBackend {
     }
 
     fn prefixed_key(&self, key: &str) -> String {
-        format!("{}{}", self.prefix, key)
+        // Why: separate value keys (`{prefix}val:{key}`) and tag set keys
+        // (`{prefix}tag:{tag}`) into disjoint subspaces so a user key like
+        // `"tag:users"` can never collide with tag set `"users"` (`RC-06`).
+        format!("{}val:{}", self.prefix, key)
     }
 
     fn tag_set_key(&self, tag: &str) -> String {
         format!("{}tag:{}", self.prefix, tag)
     }
+
+    fn clear_pattern(&self) -> String {
+        format!("{}*", escape_redis_glob(&self.prefix))
+    }
+
+    fn clear_prefix_patterns(&self, prefix: &str) -> [String; 2] {
+        let escaped_base = escape_redis_glob(&self.prefix);
+        let escaped_ns = escape_redis_glob(prefix);
+        [
+            format!("{escaped_base}val:{escaped_ns}*"),
+            format!("{escaped_base}tag:{escaped_ns}*"),
+        ]
+    }
+
+    async fn scan_and_delete(
+        conn: &mut deadpool_redis::Connection,
+        pattern: &str,
+    ) -> Result<(), CacheError> {
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut **conn)
+                .await
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
+
+            if !keys.is_empty() {
+                let mut del_cmd = redis::cmd("DEL");
+                for k in &keys {
+                    del_cmd.arg(k);
+                }
+                del_cmd
+                    .query_async::<()>(&mut **conn)
+                    .await
+                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+            }
+
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Escapes Redis `SCAN MATCH` glob metacharacters (`*`, `?`, `[`, `]`, `\`).
+fn escape_redis_glob(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 impl CacheBackend for RedisCacheBackend {
@@ -270,7 +333,7 @@ impl CacheBackend for RedisCacheBackend {
     fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tk = self.tag_set_key(tag);
         let persist_key = format!("{tk}:persist");
-        let prefix = self.prefix.clone();
+        let val_prefix = format!("{}val:", self.prefix);
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -305,7 +368,7 @@ impl CacheBackend for RedisCacheBackend {
 
             let deleted = raw_deleted
                 .into_iter()
-                .map(|k| k.strip_prefix(&prefix).unwrap_or(&k).to_string())
+                .map(|k| k.strip_prefix(&val_prefix).unwrap_or(&k).to_string())
                 .collect();
 
             Ok(deleted)
@@ -321,7 +384,7 @@ impl CacheBackend for RedisCacheBackend {
     }
 
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>> {
-        let pattern = format!("{}*", self.prefix);
+        let pattern = self.clear_pattern();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -329,35 +392,22 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            let mut cursor: u64 = 0;
-            loop {
-                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .arg("COUNT")
-                    .arg(100)
-                    .query_async(&mut *conn)
-                    .await
-                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+            Self::scan_and_delete(&mut conn, &pattern).await
+        })
+    }
 
-                if !keys.is_empty() {
-                    let mut del_cmd = redis::cmd("DEL");
-                    for k in &keys {
-                        del_cmd.arg(k);
-                    }
-                    del_cmd
-                        .query_async::<()>(&mut *conn)
-                        .await
-                        .map_err(|e| CacheError::Backend(e.to_string()))?;
-                }
+    fn clear_prefix(&self, prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        let patterns = self.clear_prefix_patterns(prefix);
+        Box::pin(async move {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
+            for pattern in &patterns {
+                Self::scan_and_delete(&mut conn, pattern).await?;
             }
-
             Ok(())
         })
     }
@@ -377,5 +427,44 @@ impl CacheBackend for RedisCacheBackend {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_and_tag_keys_are_disjoint() {
+        let backend = RedisCacheBackend::new("redis://127.0.0.1:6379")
+            .expect("pool")
+            .with_prefix("rume:cache:");
+        assert_ne!(
+            backend.prefixed_key("tag:users"),
+            backend.tag_set_key("users"),
+            "value key `tag:users` must never collide with tag set key `users`"
+        );
+        assert_eq!(
+            backend.prefixed_key("tag:users"),
+            "rume:cache:val:tag:users"
+        );
+        assert_eq!(backend.tag_set_key("users"), "rume:cache:tag:users");
+    }
+
+    #[test]
+    fn glob_metacharacters_are_escaped_in_scan_patterns() {
+        assert_eq!(escape_redis_glob(r"a*b?c[0]d\e"), r"a\*b\?c\[0\]d\\e");
+
+        let backend = RedisCacheBackend::new("redis://127.0.0.1:6379")
+            .expect("pool")
+            .with_prefix("app[1]*:");
+        assert_eq!(backend.clear_pattern(), r"app\[1\]\*:*");
+        assert_eq!(
+            backend.clear_prefix_patterns(r"t?a[0]\b:"),
+            [
+                r"app\[1\]\*:val:t\?a\[0\]\\b:*".to_string(),
+                r"app\[1\]\*:tag:t\?a\[0\]\\b:*".to_string(),
+            ]
+        );
     }
 }

@@ -53,6 +53,13 @@ pub trait CacheBackend: Debug + Send + Sync + 'static {
     /// Evicts all entries from the cache.
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>>;
 
+    /// Evicts all entries whose keys (and associated tag indexes) start with `prefix`.
+    ///
+    /// Backends that do not support prefix-scoped clearing fall back to [`CacheBackend::clear`].
+    fn clear_prefix(&self, _prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        self.clear()
+    }
+
     /// Verifies cache connectivity.
     fn ping(&self) -> BoxFuture<'_, Result<(), CacheError>>;
 }
@@ -293,6 +300,34 @@ impl CacheBackend for InMemoryCacheBackend {
             let mut map = self.entries.write().await;
             map.clear();
             tag_index.clear();
+            Ok(())
+        })
+    }
+
+    fn clear_prefix(&self, prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        let prefix = prefix.to_string();
+        Box::pin(async move {
+            // Lock `tag_index` before `entries` to match `set_with_tags` and `invalidate_tag_keys`.
+            let mut tag_index = self.tag_index.write().await;
+            let mut map = self.entries.write().await;
+            let keys_to_remove: Vec<String> = map
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                map.remove(&key);
+                tag_index.remove_key(&key);
+            }
+            let tags_to_remove: Vec<String> = tag_index
+                .tag_to_keys
+                .keys()
+                .filter(|t| t.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for tag in tags_to_remove {
+                tag_index.remove_tag(&tag);
+            }
             Ok(())
         })
     }

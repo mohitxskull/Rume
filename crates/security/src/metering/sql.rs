@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use rume_data::persistence::{DatabaseBackend, DbValue};
+use rume_data::persistence::{DatabaseBackend, DatabaseTransaction, DbValue};
 use rume_data::sql;
 
 use super::meter::{
@@ -11,6 +11,7 @@ use super::meter::{
 
 const CURRENT_WINDOW: &str = "current";
 const CURRENT_PERIOD_START: &str = "1970-01-01T00:00:00Z";
+const MYSQL_CURRENT_PERIOD_START: &str = "1970-01-01 00:00:00";
 
 fn select_sql(
     dialect: &str,
@@ -25,20 +26,40 @@ fn select_sql(
     }
 }
 
+fn period_start_for_dialect(dialect: &str) -> &'static str {
+    // Why: MySQL 8.0+ strict mode rejects RFC 3339 `T`/`Z` literals in `DATETIME(6)`
+    // columns (`RC-15`), so MySQL receives `"YYYY-MM-DD HH:MM:SS"` while Postgres/SQLite
+    // keep the ISO-8601 UTC timestamp.
+    match dialect {
+        "mysql" => MYSQL_CURRENT_PERIOD_START,
+        _ => CURRENT_PERIOD_START,
+    }
+}
+
 fn counter_id(tenant_id: &str, metric: &str) -> String {
-    format!("{tenant_id}:{metric}:{CURRENT_WINDOW}")
+    // Why: length-prefixed framing (`<tlen>:<tid>:<mlen>:<metric>:<window>`)
+    // prevents colon-split collisions such as `("a:b", "c")` vs `("a", "b:c")` (`RC-06`).
+    format!(
+        "{}:{tenant_id}:{}:{metric}:{CURRENT_WINDOW}",
+        tenant_id.len(),
+        metric.len()
+    )
 }
 
 /// Persistent SQL [`UsageMeter`] across SQLite, PostgreSQL, and MySQL.
 #[derive(Debug, Clone)]
 pub struct SqlUsageMeter<B: DatabaseBackend> {
     backend: Arc<B>,
+    flush_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<B: DatabaseBackend> SqlUsageMeter<B> {
     /// Creates a new [`SqlUsageMeter`] backed by `backend`.
     pub fn new(backend: Arc<B>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
+        }
     }
 
     /// Ensures the `rume_usage_counters` schema exists on the underlying backend.
@@ -83,7 +104,7 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                 DbValue::from(metric),
                 DbValue::from(CURRENT_WINDOW),
                 DbValue::from(qty_i64),
-                DbValue::from(CURRENT_PERIOD_START),
+                DbValue::from(period_start_for_dialect(self.backend.dialect())),
             ];
             self.backend
                 .execute_params(stmt, &params)
@@ -128,6 +149,10 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
         sink: &'a dyn BillingSink,
     ) -> BoxFuture<'a, Result<usize, MeteringError>> {
         Box::pin(async move {
+            // Why: serialize concurrent `flush()` calls on the same meter so two
+            // tasks cannot snapshot and export the same un-decremented rows (`RC-15`).
+            let _flush_guard = self.flush_lock.lock().await;
+
             let list_stmt = select_sql(
                 self.backend.dialect(),
                 sql::PG_USAGE_METERING_LIST_NONZERO,
@@ -188,19 +213,78 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                 sql::MYSQL_USAGE_METERING_DECREMENT,
                 sql::SQLITE_USAGE_METERING_DECREMENT,
             );
+            // Why: execute all checkpoint decrements atomically in a single transaction so
+            // a partial failure mid-loop rolls back instead of leaving half-checkpointed
+            // counters that would be partially double-billed on retry (`RC-15`).
+            let tx = self
+                .backend
+                .begin_transaction()
+                .await
+                .map_err(|e| MeteringError::Store(e.to_string()))?;
             for (id, count, _) in &ids_and_records {
                 let params = [
                     DbValue::from(*count),
                     DbValue::from(*count),
                     DbValue::from(id.as_str()),
                 ];
-                self.backend
-                    .execute_params(dec_stmt, &params)
-                    .await
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
+                if let Err(err) = tx.execute_params(dec_stmt, &params).await {
+                    let _ = tx.rollback().await;
+                    return Err(MeteringError::Store(err.to_string()));
+                }
             }
+            tx.commit()
+                .await
+                .map_err(|e| MeteringError::Store(e.to_string()))?;
 
             Ok(records.len())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn counter_id_is_disjoint_for_colon_splits() {
+        let left = counter_id("a:b", "c");
+        let right = counter_id("a", "b:c");
+        assert_ne!(
+            left, right,
+            "colon-containing tenant_id and metric splits must not collide"
+        );
+        assert_eq!(left, "3:a:b:1:c:current");
+        assert_eq!(right, "1:a:3:b:c:current");
+    }
+
+    #[test]
+    fn mysql_usage_metering_and_flags_sql_quote_window_and_widen_tenant_id() {
+        assert!(
+            sql::MYSQL_USAGE_METERING_SCHEMA.contains("`window`"),
+            "MySQL usage_metering_schema.sql must backtick-quote reserved keyword `window`"
+        );
+        assert!(
+            !sql::MYSQL_USAGE_METERING_SCHEMA.contains("VARCHAR(36)"),
+            "MySQL usage_metering_schema.sql must widen tenant_id from VARCHAR(36) to VARCHAR(128)"
+        );
+        assert!(
+            sql::MYSQL_USAGE_METERING_SCHEMA.contains("VARCHAR(128)"),
+            "MySQL usage_metering_schema.sql must use VARCHAR(128) for tenant_id"
+        );
+        assert!(
+            sql::MYSQL_USAGE_METERING_INCREMENT.contains("`window`"),
+            "MySQL usage_metering_increment.sql must backtick-quote reserved keyword `window`"
+        );
+        assert!(
+            !sql::MYSQL_FEATURE_FLAGS_SCHEMA.contains("VARCHAR(36)"),
+            "MySQL feature_flags_schema.sql must widen tenant_id from VARCHAR(36) to VARCHAR(128)"
+        );
+        assert!(
+            sql::MYSQL_FEATURE_FLAGS_SCHEMA.contains("VARCHAR(128)"),
+            "MySQL feature_flags_schema.sql must use VARCHAR(128) for tenant_id"
+        );
+        assert_eq!(period_start_for_dialect("mysql"), "1970-01-01 00:00:00");
+        assert_eq!(period_start_for_dialect("postgres"), "1970-01-01T00:00:00Z");
+        assert_eq!(period_start_for_dialect("sqlite"), "1970-01-01T00:00:00Z");
     }
 }

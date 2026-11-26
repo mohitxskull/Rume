@@ -24,12 +24,13 @@ fn select_sql(
 }
 
 fn composite_id(tenant_id: Option<&str>, key: &str) -> String {
-    // Why: SQL UNIQUE indexes treat NULLs as distinct, so global flags
-    // (`tenant_id IS NULL`) use a deterministic `"__global__:<key>"` primary
-    // key to guarantee idempotent upserts across SQLite, Postgres, and MySQL.
+    // Why: SQL UNIQUE indexes treat NULLs as distinct, so global flags (`None`)
+    // and tenant-scoped flags (`Some(tid)`) use disjoint length-prefixed framing
+    // (`g:<key>` vs `t:<len>:<tid>:<key>`) to guarantee idempotent upserts across
+    // SQLite, Postgres, and MySQL without sentinel or colon-split collisions (`RC-06`).
     match tenant_id {
-        Some(tid) => format!("{tid}:{key}"),
-        None => format!("__global__:{key}"),
+        Some(tid) => format!("t:{}:{tid}:{key}", tid.len()),
+        None => format!("g:{key}"),
     }
 }
 
@@ -208,5 +209,31 @@ impl<B: DatabaseBackend> FeatureFlagStore for SqlFeatureFlags<B> {
             }
             Ok(false)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn composite_id_is_disjoint_for_global_sentinel_and_colon_splits() {
+        let global_id = composite_id(None, "billing");
+        let sentinel_tenant_id = composite_id(Some("__global__"), "billing");
+        assert_ne!(
+            global_id, sentinel_tenant_id,
+            "tenant named `__global__` must not collide with global flags"
+        );
+        assert_eq!(global_id, "g:billing");
+        assert_eq!(sentinel_tenant_id, "t:10:__global__:billing");
+
+        let left = composite_id(Some("a:b"), "c");
+        let right = composite_id(Some("a"), "b:c");
+        assert_ne!(
+            left, right,
+            "colon-containing tenant_id and key splits must not collide"
+        );
+        assert_eq!(left, "t:3:a:b:c");
+        assert_eq!(right, "t:1:a:b:c");
     }
 }

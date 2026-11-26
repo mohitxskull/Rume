@@ -334,12 +334,16 @@ impl<B: CacheBackend> Cache<B> {
         Ok(stripped)
     }
 
-    /// Clears all entries from the cache.
+    /// Clears all entries from the cache (scoped to this cache's configured prefix when set).
     pub async fn clear(&self) -> Result<(), CacheError> {
         if self.is_closed.load(Ordering::SeqCst) {
             return Err(CacheError::Closed);
         }
-        self.backend.clear().await
+        if let Some(prefix) = &self.config.prefix {
+            self.backend.clear_prefix(prefix).await
+        } else {
+            self.backend.clear().await
+        }
     }
 
     /// Closes the cache interface.
@@ -516,6 +520,10 @@ mod tests {
 
         fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>> {
             self.inner.clear()
+        }
+
+        fn clear_prefix(&self, prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+            self.inner.clear_prefix(prefix)
         }
 
         fn ping(&self) -> BoxFuture<'_, Result<(), CacheError>> {
@@ -970,5 +978,40 @@ mod tests {
         .expect("watch follower must not deadlock when leader finishes before first poll")
         .expect("sender value latched");
         assert_eq!(*val, Some(true));
+    }
+
+    #[tokio::test]
+    async fn namespaced_cache_clear_does_not_wipe_sibling_namespace() {
+        let shared_backend = InMemoryCacheBackend::new();
+        let cache_a = Cache::new(
+            shared_backend.clone(),
+            CacheConfig::new("memory://shared").with_prefix("ns_a:"),
+        );
+        let cache_b = Cache::new(
+            shared_backend,
+            CacheConfig::new("memory://shared").with_prefix("ns_b:"),
+        );
+
+        cache_a
+            .set_json_with_tags("k1", &"val_a", &["users"], None)
+            .await
+            .expect("set a");
+        cache_b
+            .set_json_with_tags("k1", &"val_b", &["users"], None)
+            .await
+            .expect("set b");
+
+        cache_a.clear().await.expect("clear a");
+
+        assert_eq!(
+            cache_a.get_json::<String>("k1").await.expect("get a"),
+            None,
+            "cleared namespace must be empty"
+        );
+        assert_eq!(
+            cache_b.get_json::<String>("k1").await.expect("get b"),
+            Some("val_b".to_string()),
+            "clearing ns_a must not wipe sibling namespace ns_b"
+        );
     }
 }

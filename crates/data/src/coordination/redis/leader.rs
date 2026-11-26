@@ -53,12 +53,28 @@ impl RedisLeaderElector {
         self
     }
 
+    fn key_base(&self, role: &str) -> String {
+        // Why: length-prefixing both `prefix` and `role` inside a shared `{...}`
+        // hash tag prevents cross-prefix/role collisions (e.g. `app:` + `r` vs
+        // `app:term:` + `r`), guarantees a non-empty hash tag even when `role == ""`
+        // (preventing Redis Cluster `CROSSSLOT` errors), and keeps each leader/term
+        // pair on the same hash slot (`RC-06`). Distinct `:leader` / `:term` suffixes
+        // ensure leader keys and term counters can never alias.
+        format!(
+            "{{{}:{}:{}:{}}}",
+            self.prefix.len(),
+            self.prefix,
+            role.len(),
+            role
+        )
+    }
+
     fn leader_key(&self, role: &str) -> String {
-        format!("{}{{{}}}", self.prefix, role)
+        format!("{}:leader", self.key_base(role))
     }
 
     fn term_key(&self, role: &str) -> String {
-        format!("{}term:{{{}}}", self.prefix, role)
+        format!("{}:term", self.key_base(role))
     }
 }
 
@@ -262,5 +278,63 @@ impl LeaderElector for RedisLeaderElector {
 
             Ok(result == 1)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_hash_tag(key: &str) -> Option<&str> {
+        let start = key.find('{')?;
+        let rest = &key[start + 1..];
+        let end = rest.find('}')?;
+        (end > 0).then_some(&rest[..end])
+    }
+
+    #[test]
+    fn leader_and_term_keys_are_disjoint_across_prefixes_and_non_empty_hash_tag() {
+        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let pool = cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool");
+        let app = RedisLeaderElector::new(pool.clone()).with_prefix("app:");
+        let app_term = RedisLeaderElector::new(pool).with_prefix("app:term:");
+
+        assert_ne!(
+            app.term_key("r"),
+            app_term.leader_key("r"),
+            "app: term_key must never collide with app:term: leader_key"
+        );
+
+        let keys = [
+            app.leader_key("r"),
+            app.term_key("r"),
+            app_term.leader_key("r"),
+            app_term.term_key("r"),
+        ];
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "keys must never collide: {keys:?}");
+            }
+        }
+        assert_eq!(
+            extract_hash_tag(&keys[0]),
+            extract_hash_tag(&keys[1]),
+            "leader and term keys must share a Redis Cluster hash tag"
+        );
+
+        let empty_leader = app.leader_key("");
+        let empty_term = app.term_key("");
+        let tag_l = extract_hash_tag(&empty_leader);
+        let tag_t = extract_hash_tag(&empty_term);
+        assert!(
+            tag_l.is_some(),
+            "empty role must still produce a non-empty hash tag: {empty_leader}"
+        );
+        assert_eq!(
+            tag_l, tag_t,
+            "empty role leader and term keys must share the same non-empty hash tag"
+        );
     }
 }

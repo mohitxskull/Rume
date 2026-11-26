@@ -82,6 +82,7 @@ pub(crate) fn current_epoch_secs() -> u64 {
 #[derive(Debug, Default)]
 pub struct InMemoryUsageMeter {
     counters: Mutex<BTreeMap<(String, String), u64>>,
+    flush_lock: tokio::sync::Mutex<()>,
 }
 
 impl InMemoryUsageMeter {
@@ -136,6 +137,11 @@ impl UsageMeter for InMemoryUsageMeter {
         sink: &'a dyn BillingSink,
     ) -> BoxFuture<'a, Result<usize, MeteringError>> {
         Box::pin(async move {
+            // Why: serialize concurrent `flush()` calls so two tasks cannot
+            // snapshot and export the same counters or double-subtract newly
+            // arrived events (`RC-15`).
+            let _flush_guard = self.flush_lock.lock().await;
+
             let now = current_epoch_secs();
             let records: Vec<UsageRecord> = {
                 let guard = self
@@ -177,5 +183,89 @@ impl UsageMeter for InMemoryUsageMeter {
 
             Ok(records.len())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use super::*;
+
+    struct SlowRecordingSink {
+        total_exported: AtomicU64,
+    }
+
+    impl SlowRecordingSink {
+        fn new() -> Self {
+            Self {
+                total_exported: AtomicU64::new(0),
+            }
+        }
+    }
+
+    impl BillingSink for SlowRecordingSink {
+        fn export_batch<'a>(
+            &'a self,
+            records: &'a [UsageRecord],
+        ) -> BoxFuture<'a, Result<(), MeteringError>> {
+            let sum: u64 = records.iter().map(|r| r.quantity).sum();
+            Box::pin(async move {
+                // Yield so an unguarded concurrent flush overlaps export_batch before checkpointing.
+                tokio::task::yield_now().await;
+                self.total_exported.fetch_add(sum, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_flushes_are_serialized_and_do_not_double_bill() {
+        let meter = Arc::new(InMemoryUsageMeter::new());
+        meter
+            .record_usage("tenant-1", "api_requests", 42)
+            .await
+            .expect("record_usage");
+
+        let sink = Arc::new(SlowRecordingSink::new());
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        let m1 = Arc::clone(&meter);
+        let s1 = Arc::clone(&sink);
+        let b1 = Arc::clone(&barrier);
+        let t1 = tokio::spawn(async move {
+            b1.wait().await;
+            m1.flush(s1.as_ref()).await
+        });
+
+        let m2 = Arc::clone(&meter);
+        let s2 = Arc::clone(&sink);
+        let b2 = Arc::clone(&barrier);
+        let t2 = tokio::spawn(async move {
+            b2.wait().await;
+            m2.flush(s2.as_ref()).await
+        });
+
+        let r1 = t1.await.expect("task 1").expect("flush 1");
+        let r2 = t2.await.expect("task 2").expect("flush 2");
+
+        assert_eq!(
+            r1 + r2,
+            1,
+            "exactly one flush should export the single counter record"
+        );
+        assert_eq!(
+            sink.total_exported.load(Ordering::SeqCst),
+            42,
+            "concurrent flushes must not double-bill recorded usage"
+        );
+        assert_eq!(
+            meter
+                .get_usage("tenant-1", "api_requests")
+                .await
+                .expect("get_usage"),
+            0
+        );
     }
 }
