@@ -24,7 +24,7 @@ pub use backend::{
 };
 pub use config::DatabaseConfig;
 pub use error::PersistenceError;
-pub use migration::{Migration, MigrationSummary, Migrator};
+pub use migration::{Migration, MigrationSummary, Migrator, RUME_AUTH_MIGRATION_ID};
 #[cfg(feature = "mysql")]
 pub use mysql::{MariadbBackend, MariadbTransaction, MysqlBackend, MysqlTransaction};
 pub use pool::{

@@ -87,6 +87,13 @@ wiremock = "=0.6.5"
 ureq = "=3.5.2"
 proptest.workspace = true
 criterion = { version = "=0.8.2", features = ["async_tokio"] }
+base64.workspace = true
+bergshamra.workspace = true
+rand.workspace = true
+rsa.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+signature.workspace = true
 
 [[test]]
 name = "integration"

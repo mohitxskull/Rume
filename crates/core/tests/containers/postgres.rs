@@ -2068,3 +2068,103 @@ async fn postgres_schema_fixture_drop_cleans_up_on_current_thread_runtime() {
 
     admin_pool.close_async().await;
 }
+
+#[tokio::test]
+async fn container_postgres_rls_enforces_tenant_isolation_via_set_tenant_context() {
+    let (_container, pool) = setup_postgres_pool(4).await;
+
+    pool.execute(
+        "CREATE TABLE rls_tenant_items (
+            id TEXT PRIMARY KEY,
+            tenant_id TEXT NOT NULL,
+            payload TEXT NOT NULL
+        )",
+    )
+    .await
+    .expect("create rls_tenant_items");
+
+    pool.execute(
+        "DO $$ BEGIN
+            IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rume_rls_tester') THEN
+                CREATE ROLE rume_rls_tester NOSUPERUSER NOBYPASSRLS NOLOGIN;
+            END IF;
+        END $$",
+    )
+    .await
+    .expect("create non-superuser role");
+
+    pool.execute("GRANT SELECT, INSERT ON rls_tenant_items TO rume_rls_tester")
+        .await
+        .expect("grant table permissions");
+
+    pool.execute("ALTER TABLE rls_tenant_items ENABLE ROW LEVEL SECURITY")
+        .await
+        .expect("enable RLS");
+
+    pool.execute(
+        "CREATE POLICY rls_tenant_isolation ON rls_tenant_items
+         USING (tenant_id = current_setting('app.current_tenant', true))",
+    )
+    .await
+    .expect("create RLS policy");
+
+    pool.execute_params(
+        "INSERT INTO rls_tenant_items (id, tenant_id, payload) VALUES ($1, $2, $3)",
+        &[
+            DbValue::Text("row-a1".into()),
+            DbValue::Text("tenant-a".into()),
+            DbValue::Text("secret-a".into()),
+        ],
+    )
+    .await
+    .expect("insert tenant-a row");
+
+    pool.execute_params(
+        "INSERT INTO rls_tenant_items (id, tenant_id, payload) VALUES ($1, $2, $3)",
+        &[
+            DbValue::Text("row-b1".into()),
+            DbValue::Text("tenant-b".into()),
+            DbValue::Text("secret-b".into()),
+        ],
+    )
+    .await
+    .expect("insert tenant-b row");
+
+    // Transaction 1: set_tenant_context("tenant-a") sees only tenant-a rows.
+    let tx1 = pool.backend().begin_transaction().await.expect("begin tx1");
+    tx1.execute("SET LOCAL ROLE rume_rls_tester")
+        .await
+        .expect("switch to non-superuser role in tx1");
+    tx1.set_tenant_context("tenant-a")
+        .await
+        .expect("set_tenant_context tenant-a");
+    let rows_a = tx1
+        .fetch_all(
+            "SELECT id, tenant_id FROM rls_tenant_items ORDER BY id",
+            &[],
+        )
+        .await
+        .expect("query rls_tenant_items in tx1");
+    assert_eq!(rows_a.len(), 1);
+    assert_eq!(rows_a[0].get::<String>("id").unwrap(), "row-a1");
+    assert_eq!(rows_a[0].get::<String>("tenant_id").unwrap(), "tenant-a");
+    tx1.commit().await.expect("commit tx1");
+
+    // Transaction 2: without set_tenant_context, transaction-local GUC is reset -> 0 rows visible.
+    let tx2 = pool.backend().begin_transaction().await.expect("begin tx2");
+    tx2.execute("SET LOCAL ROLE rume_rls_tester")
+        .await
+        .expect("switch to non-superuser role in tx2");
+    let rows_none = tx2
+        .fetch_all("SELECT id FROM rls_tenant_items", &[])
+        .await
+        .expect("query rls_tenant_items in tx2");
+    assert_eq!(
+        rows_none.len(),
+        0,
+        "transaction-local tenant context must reset after commit"
+    );
+    tx2.commit().await.expect("commit tx2");
+
+    pool.close_async().await;
+}

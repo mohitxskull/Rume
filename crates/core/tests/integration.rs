@@ -52,6 +52,10 @@ pub mod lifecycle;
 #[path = "integration/metrics.rs"]
 pub mod metrics;
 
+#[path = "integration/milestone_b_e2e.rs"]
+#[cfg(feature = "sqlite")]
+pub mod milestone_b_e2e;
+
 #[path = "integration/openapi.rs"]
 pub mod openapi;
 
