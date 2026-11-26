@@ -19,7 +19,7 @@ tracing.workspace = true
 thiserror.workspace = true
 garde.workspace = true
 parking_lot.workspace = true
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 

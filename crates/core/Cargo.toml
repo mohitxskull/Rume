@@ -67,7 +67,7 @@ schemars = ["rume-foundation/schemars"]
 # when tests enable `postgres`, `sqlite`, or `mysql`.
 tokio = { workspace = true, features = ["test-util"] }
 sqlx.workspace = true
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 deadpool-redis.workspace = true
 futures-util.workspace = true
 garde = { workspace = true, features = ["derive", "email", "url"] }
