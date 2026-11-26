@@ -3,9 +3,11 @@
 #![forbid(unsafe_code)]
 
 pub mod openapi;
+pub mod pagination;
 pub mod resilience;
 pub mod routing;
 pub mod transport;
+pub mod upload;
 pub mod validation;
 
 #[cfg(test)]

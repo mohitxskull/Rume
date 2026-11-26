@@ -144,6 +144,9 @@ pub enum AppError {
     #[error("validation failed")]
     Validation { details: Vec<ValidationErrorDetail> },
 
+    #[error("conflict: {message}")]
+    Conflict { code: &'static str, message: String },
+
     #[error("internal server error")]
     Internal {
         source: InternalSource,
@@ -184,6 +187,14 @@ impl AppError {
         }
     }
 
+    /// Creates a 409 Conflict error with a custom message.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::Conflict {
+            code: "CONFLICT",
+            message: msg.into(),
+        }
+    }
+
     /// The HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -192,6 +203,7 @@ impl AppError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Public { status, .. } => *status,
         }
@@ -298,6 +310,10 @@ impl AppError {
                     None,
                     Some(details),
                 ),
+            ),
+            Self::Conflict { code, message } => problem_details_response(
+                status,
+                &problem(status, "Conflict", message, code, None, None),
             ),
             Self::Internal { source, request_id } => {
                 if let Some(ref bt) = source.backtrace {
@@ -639,5 +655,23 @@ mod tests {
                 .unwrap_or_default()
                 .contains("db password leaked")
         );
+    }
+
+    #[tokio::test]
+    async fn conflict_error_maps_to_409_problem_details() {
+        let resp = AppError::conflict("version mismatch").into_response();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            resp.headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(value["status"].as_u64(), Some(409));
+        assert_eq!(value["title"].as_str(), Some("Conflict"));
+        assert_eq!(value["code"].as_str(), Some("CONFLICT"));
+        assert_eq!(value["detail"].as_str(), Some("version mismatch"));
     }
 }

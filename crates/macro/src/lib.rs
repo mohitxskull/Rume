@@ -11,6 +11,7 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Token, Visibility, parse_macro_input};
 
+mod from_row;
 mod openapi_schema;
 
 struct SqlAssetsArgs {
@@ -655,6 +656,12 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
 #[proc_macro_derive(HasOpenApiSchema, attributes(openapi, serde, garde))]
 pub fn derive_has_openapi_schema(input: TokenStream) -> TokenStream {
     openapi_schema::expand(input)
+}
+
+/// Derives `FromRow` for a struct with named fields.
+#[proc_macro_derive(FromRow, attributes(from_row))]
+pub fn derive_from_row(input: TokenStream) -> TokenStream {
+    from_row::expand(input)
 }
 
 #[cfg(test)]

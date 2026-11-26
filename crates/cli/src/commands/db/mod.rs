@@ -18,7 +18,12 @@ pub async fn run(cmd: DbCommands) {
         DbCommands::Status => status().await,
         DbCommands::Migrate => migrate().await,
         DbCommands::Rollback => rollback().await,
+        DbCommands::Seed => seed().await,
     }
+}
+
+pub async fn seed() {
+    todo!("rume db seed is implemented in Task 05")
 }
 
 pub fn make_migration(name: Option<String>) {

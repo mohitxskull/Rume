@@ -70,4 +70,48 @@ pub enum PersistenceError {
     /// A column or value could not be decoded into the requested Rust type.
     #[error("failed to decode column '{column}': {message}")]
     DecodeError { column: String, message: String },
+
+    /// Optimistic lock version conflict detected during update or delete.
+    #[error(
+        "optimistic lock version conflict on '{entity}': expected {expected}, actual {actual:?}"
+    )]
+    VersionConflict {
+        entity: String,
+        expected: i64,
+        actual: Option<i64>,
+    },
+}
+
+impl From<PersistenceError> for rume_foundation::error::AppError {
+    fn from(err: PersistenceError) -> Self {
+        match err {
+            PersistenceError::VersionConflict { .. } => {
+                Self::conflict("The resource was modified by another request. Please retry.")
+            }
+            other => Self::internal(other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_conflict_converts_to_app_error_conflict() {
+        let err = PersistenceError::VersionConflict {
+            entity: "users".to_string(),
+            expected: 2,
+            actual: Some(3),
+        };
+        let app_err: rume_foundation::error::AppError = err.into();
+        assert_eq!(app_err.status_code().as_u16(), 409);
+        assert!(matches!(
+            app_err,
+            rume_foundation::error::AppError::Conflict {
+                code: "CONFLICT",
+                ..
+            }
+        ));
+    }
 }

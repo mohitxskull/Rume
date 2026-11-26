@@ -131,6 +131,8 @@ pub enum DbCommands {
     Migrate,
     /// Rollback the most recently applied migration.
     Rollback,
+    /// Execute database seed scripts.
+    Seed,
 }
 
 #[derive(Subcommand)]

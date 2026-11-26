@@ -6,5 +6,6 @@ pub mod cache;
 pub mod coordination;
 pub mod persistence;
 pub mod sql;
+pub mod storage;
 
 pub use persistence::MetricsRegistryPoolExt;

@@ -355,6 +355,7 @@ dependencies = [
  "matchit",
  "memchr",
  "mime",
+ "multer",
  "percent-encoding",
  "pin-project-lite",
  "serde_core",
@@ -1894,6 +1895,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
 
 [[package]]
+name = "encoding_rs"
+version = "0.8.44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "89253175e704ab869b04f9db224d38630e0211a53841a79181deae0889e169f5"
+dependencies = [
+ "cfg-if",
+ "core_detect",
+ "multiversion_no_op",
+ "rustversion",
+ "scopeguard",
+ "simdutf8",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3197,6 +3212,29 @@ dependencies = [
  "num-traits",
  "zeroize",
 ]
+
+[[package]]
+name = "multer"
+version = "3.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "83e87776546dc87511aa5ee218730c92b666d7264ab6ed41f9d215af9cd5224b"
+dependencies = [
+ "bytes",
+ "encoding_rs",
+ "futures-util",
+ "http",
+ "httparse",
+ "memchr",
+ "mime",
+ "spin",
+ "version_check",
+]
+
+[[package]]
+name = "multiversion_no_op"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "743fb55ba31b18fb1ecef6bdc9aa2743314978ac084044301a7eee33fb99a20d"
 
 [[package]]
 name = "nu-ansi-term"
@@ -4510,19 +4548,27 @@ dependencies = [
 name = "rume-data"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "chrono",
  "deadpool-redis",
+ "hex",
+ "hmac 0.13.0",
  "proptest",
  "redis",
+ "reqwest",
  "rume-foundation",
  "rume-observability",
+ "sea-query",
  "serde",
  "serde_json",
  "sha2 0.11.2",
  "sqlparser",
  "sqlx",
+ "subtle",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
  "uuid",
 ]
 
@@ -4583,6 +4629,7 @@ dependencies = [
  "garde",
  "parking_lot 0.13.0",
  "redis",
+ "rume-data",
  "rume-foundation",
  "rume-observability",
  "rume-security",
@@ -4602,6 +4649,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
+ "rume-data",
  "serde_json",
  "syn 3.0.10",
  "trybuild",
@@ -4930,6 +4978,12 @@ dependencies = [
  "salsa20",
  "sha2 0.10.9",
 ]
+
+[[package]]
+name = "sea-query"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "546040c653a705e60ec65ecd3191a809603734bebbc225775916dea9ae409b31"
 
 [[package]]
 name = "sec1"

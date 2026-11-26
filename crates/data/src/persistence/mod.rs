@@ -4,16 +4,21 @@
 //! health checks, and database migrations.
 
 pub mod backend;
+pub mod builder;
 pub mod config;
+pub mod conventions;
 pub mod error;
 pub mod migration;
 #[cfg(feature = "mysql")]
 pub mod mysql;
+pub mod pagination;
 pub mod pool;
 #[cfg(feature = "postgres")]
 pub mod postgres;
 pub mod query;
+pub mod read_write;
 pub mod row;
+pub mod seed;
 #[cfg(feature = "sqlite")]
 pub mod sqlite;
 pub mod tenancy;
