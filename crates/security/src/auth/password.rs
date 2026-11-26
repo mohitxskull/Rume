@@ -1,8 +1,10 @@
 //! Argon2id password hashing and verification.
 
-#![allow(dead_code, unused_variables)]
-
-use secrecy::SecretString;
+use argon2::{
+    ARGON2ID_IDENT, Algorithm, Argon2, Params, PasswordHasher as _, PasswordVerifier as _, Version,
+    password_hash::phc::{Decimal, PasswordHash},
+};
+use secrecy::{ExposeSecret, SecretString};
 
 use crate::auth::error::AuthError;
 
@@ -10,6 +12,8 @@ use crate::auth::error::AuthError;
 #[derive(Clone)]
 pub struct PasswordHasherConfig {
     /// Memory cost in KiB (OWASP 2024 default: `19_456`).
+    // Why: OWASP Password Storage Cheat Sheet minimum recommended Argon2id
+    // configuration is 19 MiB (19_456 KiB), 2 iterations, 1 thread.
     pub m_cost: u32,
     /// Time cost / iterations (OWASP 2024 default: `2`).
     pub t_cost: u32,
@@ -70,9 +74,34 @@ impl PasswordHasher {
         Self { config }
     }
 
+    fn build_argon2(&self) -> Result<Argon2<'_>, AuthError> {
+        let params = Params::new(
+            self.config.m_cost,
+            self.config.t_cost,
+            self.config.p_cost,
+            Some(self.config.output_len),
+        )
+        .map_err(|e| AuthError::ProviderError(format!("invalid argon2id parameters: {e}")))?;
+
+        match &self.config.pepper {
+            Some(pepper) => Argon2::new_with_secret(
+                pepper.expose_secret().as_bytes(),
+                Algorithm::Argon2id,
+                Version::V0x13,
+                params,
+            )
+            .map_err(|e| AuthError::ProviderError(format!("invalid argon2id pepper: {e}"))),
+            None => Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params)),
+        }
+    }
+
     /// Hashes a password into a PHC string using Argon2id and a fresh CSPRNG salt.
     pub fn hash_password(&self, password: &SecretString) -> Result<String, AuthError> {
-        todo!("implemented in Task 02")
+        let argon2 = self.build_argon2()?;
+        argon2
+            .hash_password(password.expose_secret().as_bytes())
+            .map(|hash| hash.to_string())
+            .map_err(|e| AuthError::ProviderError(format!("argon2id hash failed: {e}")))
     }
 
     /// Verifies a password against a PHC string in constant time.
@@ -81,17 +110,60 @@ impl PasswordHasher {
         password: &SecretString,
         phc_hash: &str,
     ) -> Result<bool, AuthError> {
-        todo!("implemented in Task 02")
+        let parsed = PasswordHash::new(phc_hash)
+            .map_err(|_| AuthError::InvalidCredentials("malformed password hash".to_owned()))?;
+
+        if parsed.algorithm != ARGON2ID_IDENT {
+            return Err(AuthError::InvalidCredentials(
+                "unsupported password hash algorithm".to_owned(),
+            ));
+        }
+
+        let argon2 = self.build_argon2()?;
+        match argon2.verify_password(password.expose_secret().as_bytes(), &parsed) {
+            Ok(()) => Ok(true),
+            Err(argon2::password_hash::Error::PasswordInvalid) => Ok(false),
+            Err(e) => Err(AuthError::InvalidCredentials(format!(
+                "password verification failed: {e}"
+            ))),
+        }
     }
 
     /// Returns `true` if `phc_hash` uses parameters weaker than or different from `self.config`.
     pub fn needs_rehash(&self, phc_hash: &str) -> bool {
-        todo!("implemented in Task 02")
+        let Ok(parsed) = PasswordHash::new(phc_hash) else {
+            return true;
+        };
+
+        if parsed.algorithm != ARGON2ID_IDENT {
+            return true;
+        }
+
+        if parsed.version != Some(Decimal::from(Version::V0x13 as u32)) {
+            return true;
+        }
+
+        let Ok(params) = Params::try_from(&parsed) else {
+            return true;
+        };
+
+        let hash_len_matches = parsed
+            .hash
+            .as_ref()
+            .is_some_and(|output| output.len() == self.config.output_len);
+
+        params.m_cost() != self.config.m_cost
+            || params.t_cost() != self.config.t_cost
+            || params.p_cost() != self.config.p_cost
+            || !hash_len_matches
     }
 
     /// Async wrapper executing [`Self::hash_password`] on Tokio's blocking pool.
     pub async fn hash_password_async(&self, password: SecretString) -> Result<String, AuthError> {
-        todo!("implemented in Task 02")
+        let hasher = self.clone();
+        tokio::task::spawn_blocking(move || hasher.hash_password(&password))
+            .await
+            .map_err(|e| AuthError::ProviderError(format!("password hash task failed: {e}")))?
     }
 
     /// Async wrapper executing [`Self::verify_password`] on Tokio's blocking pool.
@@ -100,6 +172,95 @@ impl PasswordHasher {
         password: SecretString,
         phc_hash: String,
     ) -> Result<bool, AuthError> {
-        todo!("implemented in Task 02")
+        let hasher = self.clone();
+        tokio::task::spawn_blocking(move || hasher.verify_password(&password, &phc_hash))
+            .await
+            .map_err(|e| AuthError::ProviderError(format!("password verify task failed: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn argon2id_hash_and_verify_roundtrip_and_rejects_wrong_password() {
+        let hasher = PasswordHasher::new(PasswordHasherConfig::low_cost_for_tests());
+        let password = SecretString::from("correct-horse-battery-staple");
+        let wrong = SecretString::from("wrong-password");
+
+        let phc = hasher
+            .hash_password(&password)
+            .expect("hashing should succeed");
+        assert!(phc.starts_with("$argon2id$v=19$"));
+        assert!(
+            hasher
+                .verify_password(&password, &phc)
+                .expect("verify should succeed")
+        );
+        assert!(
+            !hasher
+                .verify_password(&wrong, &phc)
+                .expect("verify wrong password should return Ok(false)")
+        );
+        // Non-Argon2id PHC strings must be rejected.
+        let non_argon2id = phc.replacen("$argon2id$", "$argon2i$", 1);
+        assert!(hasher.verify_password(&password, &non_argon2id).is_err());
+
+        // Debug must redact pepper.
+        let mut cfg = PasswordHasherConfig::low_cost_for_tests();
+        cfg.pepper = Some(SecretString::from("super-secret-pepper"));
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("super-secret-pepper"));
+        assert!(dbg.contains("[REDACTED]"));
+    }
+
+    #[test]
+    fn argon2id_uses_unique_salts_and_detects_needs_rehash_on_param_upgrade() {
+        let low = PasswordHasher::new(PasswordHasherConfig::low_cost_for_tests());
+        let password = SecretString::from("same-password");
+
+        let h1 = low.hash_password(&password).expect("hash 1");
+        let h2 = low.hash_password(&password).expect("hash 2");
+        assert_ne!(h1, h2, "unique salts must produce distinct PHC hashes");
+
+        assert!(!low.needs_rehash(&h1));
+
+        let upgraded = PasswordHasher::new(PasswordHasherConfig {
+            m_cost: 2048,
+            t_cost: 1,
+            p_cost: 1,
+            output_len: 32,
+            pepper: None,
+        });
+        assert!(upgraded.needs_rehash(&h1));
+        assert!(upgraded.needs_rehash("not-a-valid-phc-string"));
+    }
+
+    #[tokio::test]
+    async fn argon2id_async_helpers_execute_on_blocking_pool_and_preserve_pepper() {
+        let mut cfg = PasswordHasherConfig::low_cost_for_tests();
+        cfg.pepper = Some(SecretString::from("app-wide-pepper"));
+        let pep_hasher = PasswordHasher::new(cfg);
+
+        let no_pep_hasher = PasswordHasher::new(PasswordHasherConfig::low_cost_for_tests());
+        let password = SecretString::from("async-secret-pw");
+
+        let phc = pep_hasher
+            .hash_password_async(password.clone())
+            .await
+            .expect("async hash");
+        assert!(
+            pep_hasher
+                .verify_password_async(password.clone(), phc.clone())
+                .await
+                .expect("async verify with pepper")
+        );
+        assert!(
+            !no_pep_hasher
+                .verify_password_async(password, phc)
+                .await
+                .expect("async verify without pepper returns false")
+        );
     }
 }
