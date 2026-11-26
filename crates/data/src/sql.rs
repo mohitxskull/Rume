@@ -580,6 +580,47 @@ pub const PG_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/postgres/feature_
 /// Schema DDL for `rume_feature_flags` in MySQL.
 pub const MYSQL_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/mysql/feature_flags_schema.sql");
 
+/// Upsert a feature flag in SQLite.
+pub const SQLITE_FEATURE_FLAGS_UPSERT: &str =
+    include_str!("../sql/sqlite/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in SQLite.
+pub const SQLITE_FEATURE_FLAGS_GET: &str = include_str!("../sql/sqlite/feature_flags_get.sql");
+/// List tenant-scoped feature flags in SQLite.
+pub const SQLITE_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/sqlite/feature_flags_list_tenant.sql");
+/// List global feature flags in SQLite.
+pub const SQLITE_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/sqlite/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in SQLite.
+pub const SQLITE_FEATURE_FLAGS_DELETE: &str =
+    include_str!("../sql/sqlite/feature_flags_delete.sql");
+
+/// Upsert a feature flag in PostgreSQL.
+pub const PG_FEATURE_FLAGS_UPSERT: &str = include_str!("../sql/postgres/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in PostgreSQL.
+pub const PG_FEATURE_FLAGS_GET: &str = include_str!("../sql/postgres/feature_flags_get.sql");
+/// List tenant-scoped feature flags in PostgreSQL.
+pub const PG_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/postgres/feature_flags_list_tenant.sql");
+/// List global feature flags in PostgreSQL.
+pub const PG_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/postgres/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in PostgreSQL.
+pub const PG_FEATURE_FLAGS_DELETE: &str = include_str!("../sql/postgres/feature_flags_delete.sql");
+
+/// Upsert a feature flag in MySQL.
+pub const MYSQL_FEATURE_FLAGS_UPSERT: &str = include_str!("../sql/mysql/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in MySQL.
+pub const MYSQL_FEATURE_FLAGS_GET: &str = include_str!("../sql/mysql/feature_flags_get.sql");
+/// List tenant-scoped feature flags in MySQL.
+pub const MYSQL_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/mysql/feature_flags_list_tenant.sql");
+/// List global feature flags in MySQL.
+pub const MYSQL_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/mysql/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in MySQL.
+pub const MYSQL_FEATURE_FLAGS_DELETE: &str = include_str!("../sql/mysql/feature_flags_delete.sql");
+
 // Milestone E: Usage metering (SQLite, PostgreSQL, MySQL).
 
 /// Schema DDL for `rume_usage_counters` in SQLite.
@@ -593,6 +634,42 @@ pub const PG_USAGE_METERING_SCHEMA: &str =
 /// Schema DDL for `rume_usage_counters` in MySQL.
 pub const MYSQL_USAGE_METERING_SCHEMA: &str =
     include_str!("../sql/mysql/usage_metering_schema.sql");
+
+/// Increment a usage counter in SQLite.
+pub const SQLITE_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/sqlite/usage_metering_increment.sql");
+/// Fetch a usage counter in SQLite.
+pub const SQLITE_USAGE_METERING_GET: &str = include_str!("../sql/sqlite/usage_metering_get.sql");
+/// List non-zero usage counters in SQLite.
+pub const SQLITE_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/sqlite/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in SQLite.
+pub const SQLITE_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/sqlite/usage_metering_decrement.sql");
+
+/// Increment a usage counter in PostgreSQL.
+pub const PG_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/postgres/usage_metering_increment.sql");
+/// Fetch a usage counter in PostgreSQL.
+pub const PG_USAGE_METERING_GET: &str = include_str!("../sql/postgres/usage_metering_get.sql");
+/// List non-zero usage counters in PostgreSQL.
+pub const PG_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/postgres/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in PostgreSQL.
+pub const PG_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/postgres/usage_metering_decrement.sql");
+
+/// Increment a usage counter in MySQL.
+pub const MYSQL_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/mysql/usage_metering_increment.sql");
+/// Fetch a usage counter in MySQL.
+pub const MYSQL_USAGE_METERING_GET: &str = include_str!("../sql/mysql/usage_metering_get.sql");
+/// List non-zero usage counters in MySQL.
+pub const MYSQL_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/mysql/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in MySQL.
+pub const MYSQL_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/mysql/usage_metering_decrement.sql");
 
 // Milestone E: Webhook deliveries (SQLite, PostgreSQL, MySQL).
 
