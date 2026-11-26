@@ -1131,3 +1131,451 @@ mod saml_parser_and_iso8601_proptests {
         ));
     }
 }
+
+#[cfg(test)]
+mod xmldsig_and_async_replay_tests {
+    use super::super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::Arc;
+
+    struct TempKeyDir {
+        path: PathBuf,
+    }
+
+    impl TempKeyDir {
+        fn new(label: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!(
+                "rume-saml-test-{label}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp key dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempKeyDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn generate_self_signed_rsa_pem() -> (String, String) {
+        let dir = TempKeyDir::new("rsa");
+        let key_path = dir.path.join("key.pem");
+        let cert_path = dir.path.join("cert.pem");
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-subj",
+                "/CN=idp.example.test",
+                "-days",
+                "30",
+                "-keyout",
+            ])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .output()
+            .expect("openssl must run");
+        assert!(
+            status.status.success(),
+            "openssl rsa cert gen failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        (
+            std::fs::read_to_string(&key_path).expect("read key"),
+            std::fs::read_to_string(&cert_path).expect("read cert"),
+        )
+    }
+
+    fn generate_self_signed_ec_p256_pem() -> (String, String) {
+        let dir = TempKeyDir::new("ec256");
+        let key_path = dir.path.join("key.pem");
+        let cert_path = dir.path.join("cert.pem");
+        let status = Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "ec",
+                "-pkeyopt",
+                "ec_paramgen_curve:prime256v1",
+                "-nodes",
+                "-subj",
+                "/CN=idp-ec.example.test",
+                "-days",
+                "30",
+                "-keyout",
+            ])
+            .arg(&key_path)
+            .arg("-out")
+            .arg(&cert_path)
+            .output()
+            .expect("openssl must run");
+        assert!(
+            status.status.success(),
+            "openssl ec cert gen failed: {}",
+            String::from_utf8_lossy(&status.stderr)
+        );
+        (
+            std::fs::read_to_string(&key_path).expect("read key"),
+            std::fs::read_to_string(&cert_path).expect("read cert"),
+        )
+    }
+
+    fn pem_cert_body(cert_pem: &str) -> String {
+        cert_pem
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
+    fn build_signed_saml_response(
+        assertion_id: &str,
+        subject: &str,
+        sig_method_uri: &str,
+        key_pem: &str,
+        embedded_cert_pem: Option<&str>,
+    ) -> String {
+        let key_info = match embedded_cert_pem {
+            Some(cert_pem) => format!(
+                "<ds:KeyInfo><ds:X509Data><ds:X509Certificate>{}</ds:X509Certificate></ds:X509Data></ds:KeyInfo>",
+                pem_cert_body(cert_pem)
+            ),
+            None => String::new(),
+        };
+
+        let template = format!(
+            r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_resp_1" Version="2.0" IssueInstant="1970-01-01T00:05:00Z" Destination="https://sp.example/acs" InResponseTo="_req_1">
+  <saml:Issuer>https://idp.example</saml:Issuer>
+  <saml:Assertion ID="{assertion_id}" Version="2.0" IssueInstant="1970-01-01T00:05:00Z">
+    <saml:Issuer>https://idp.example</saml:Issuer>
+    <ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#">
+      <ds:SignedInfo>
+        <ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+        <ds:SignatureMethod Algorithm="{sig_method_uri}"/>
+        <ds:Reference URI="#{assertion_id}">
+          <ds:Transforms>
+            <ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/>
+            <ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/>
+          </ds:Transforms>
+          <ds:DigestMethod Algorithm="http://www.w3.org/2001/04/xmlenc#sha256"/>
+          <ds:DigestValue/>
+        </ds:Reference>
+      </ds:SignedInfo>
+      <ds:SignatureValue/>
+      {key_info}
+    </ds:Signature>
+    <saml:Subject>
+      <saml:NameID>{subject}</saml:NameID>
+      <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+        <saml:SubjectConfirmationData NotOnOrAfter="1970-01-01T00:16:40Z" Recipient="https://sp.example/acs" InResponseTo="_req_1"/>
+      </saml:SubjectConfirmation>
+    </saml:Subject>
+    <saml:Conditions NotBefore="1970-01-01T00:01:40Z" NotOnOrAfter="1970-01-01T00:16:40Z">
+      <saml:AudienceRestriction>
+        <saml:Audience>https://sp.example</saml:Audience>
+      </saml:AudienceRestriction>
+    </saml:Conditions>
+    <saml:AuthnStatement AuthnInstant="1970-01-01T00:05:00Z">
+      <saml:AuthnContext>
+        <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef>
+      </saml:AuthnContext>
+    </saml:AuthnStatement>
+    <saml:AttributeStatement>
+      <saml:Attribute Name="role">
+        <saml:AttributeValue>member</saml:AttributeValue>
+      </saml:Attribute>
+    </saml:AttributeStatement>
+  </saml:Assertion>
+</samlp:Response>"##
+        );
+
+        let key = bergshamra::keys::loader::load_pem_auto(key_pem.as_bytes(), None)
+            .expect("load signing private key");
+        let mut km = bergshamra::KeysManager::new();
+        km.add_key(key);
+        let ctx = bergshamra::DsigContext::new_permissive(km);
+        bergshamra::sign(&ctx, &template).expect("bergshamra sign template")
+    }
+
+    #[test]
+    fn xmldsig_verifier_accepts_valid_rsa_sha256_enveloped_assertion() {
+        let (key_pem, cert_pem) = generate_self_signed_rsa_pem();
+        let signed_xml = build_signed_saml_response(
+            "_a_rsa_1",
+            "alice@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &key_pem,
+            Some(&cert_pem),
+        );
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted RSA cert");
+        let assertion =
+            SamlParser::parse_signed(&signed_xml, &verifier).expect("RSA-SHA256 assertion valid");
+        assert!(assertion.is_signature_verified());
+        assert_eq!(assertion.id, "_a_rsa_1");
+        assert_eq!(assertion.subject, "alice@example.com");
+    }
+
+    #[test]
+    fn xmldsig_verifier_accepts_valid_ecdsa_sha256_enveloped_assertion() {
+        let (key_pem, cert_pem) = generate_self_signed_ec_p256_pem();
+        let signed_xml = build_signed_saml_response(
+            "_a_ec_1",
+            "bob@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#ecdsa-sha256",
+            &key_pem,
+            Some(&cert_pem),
+        );
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted ECDSA cert");
+        let assertion =
+            SamlParser::parse_signed(&signed_xml, &verifier).expect("ECDSA-SHA256 assertion valid");
+        assert!(assertion.is_signature_verified());
+        assert_eq!(assertion.id, "_a_ec_1");
+        assert_eq!(assertion.subject, "bob@example.com");
+    }
+
+    #[test]
+    fn xmldsig_verifier_rejects_tampered_subject_or_attributes() {
+        let (key_pem, cert_pem) = generate_self_signed_rsa_pem();
+        let signed_xml = build_signed_saml_response(
+            "_a_tamper",
+            "alice@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &key_pem,
+            Some(&cert_pem),
+        );
+        let tampered_xml = signed_xml.replace("alice@example.com", "admin@example.com");
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted RSA cert");
+        let err = SamlParser::parse_signed(&tampered_xml, &verifier)
+            .expect_err("tampered subject must fail verification");
+        assert!(
+            matches!(err, SamlError::InvalidSignature(_)),
+            "expected InvalidSignature, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn xmldsig_verifier_rejects_untrusted_embedded_certificate() {
+        let (_trusted_key_pem, trusted_cert_pem) = generate_self_signed_rsa_pem();
+        let (attacker_key_pem, attacker_cert_pem) = generate_self_signed_rsa_pem();
+        let attacker_signed_xml = build_signed_saml_response(
+            "_a_evil_cert",
+            "attacker@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &attacker_key_pem,
+            Some(&attacker_cert_pem),
+        );
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&trusted_cert_pem).expect("load trusted RSA cert");
+        let err = SamlParser::parse_signed(&attacker_signed_xml, &verifier)
+            .expect_err("untrusted embedded cert must be rejected");
+        assert!(
+            matches!(err, SamlError::InvalidSignature(_)),
+            "expected InvalidSignature, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn xmldsig_verifier_rejects_sha1_signature_or_digest_algorithm() {
+        let (key_pem, cert_pem) = generate_self_signed_rsa_pem();
+        let signed_xml = build_signed_saml_response(
+            "_a_sha1",
+            "alice@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &key_pem,
+            None,
+        );
+        let sha1_sig_xml = signed_xml.replace(
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            "http://www.w3.org/2000/09/xmldsig#rsa-sha1",
+        );
+        let sha1_digest_xml = signed_xml.replace(
+            "http://www.w3.org/2001/04/xmlenc#sha256",
+            "http://www.w3.org/2000/09/xmldsig#sha1",
+        );
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted RSA cert");
+
+        assert!(matches!(
+            SamlParser::parse_signed(&sha1_sig_xml, &verifier),
+            Err(SamlError::InvalidSignature(_))
+        ));
+        assert!(matches!(
+            SamlParser::parse_signed(&sha1_digest_xml, &verifier),
+            Err(SamlError::InvalidSignature(_))
+        ));
+    }
+
+    #[test]
+    fn xmldsig_verifier_rejects_xsw_signed_decoy_assertion_wrapping_attack() {
+        let (key_pem, cert_pem) = generate_self_signed_rsa_pem();
+        let decoy_signed_resp = build_signed_saml_response(
+            "_decoy_signed",
+            "legit@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &key_pem,
+            None,
+        );
+        // Extract the signed `<saml:Assertion ...>...</saml:Assertion>` block and wrap it
+        // after an unsigned `<saml:Assertion ID="_evil_unsigned">` so `SamlParser` extracts
+        // `_evil_unsigned` while a valid signature for `_decoy_signed` sits in the document.
+        let start = decoy_signed_resp
+            .find("<saml:Assertion ")
+            .expect("decoy assertion start");
+        let end = decoy_signed_resp
+            .rfind("</saml:Assertion>")
+            .expect("decoy assertion end")
+            + "</saml:Assertion>".len();
+        let signed_decoy_assertion = &decoy_signed_resp[start..end];
+
+        let xsw_xml = format!(
+            r#"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_resp_xsw" Version="2.0" IssueInstant="1970-01-01T00:05:00Z">
+  <saml:Issuer>https://idp.example</saml:Issuer>
+  <saml:Assertion ID="_evil_unsigned" Version="2.0" IssueInstant="1970-01-01T00:05:00Z">
+    <saml:Issuer>https://idp.example</saml:Issuer>
+    <saml:Subject><saml:NameID>admin@example.com</saml:NameID></saml:Subject>
+    <saml:Conditions NotBefore="1970-01-01T00:01:40Z" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+  </saml:Assertion>
+  <samlp:Extensions>{signed_decoy_assertion}</samlp:Extensions>
+</samlp:Response>"#
+        );
+
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted RSA cert");
+        let err = SamlParser::parse_signed(&xsw_xml, &verifier)
+            .expect_err("XSW wrapped decoy assertion must be rejected");
+        assert!(
+            matches!(err, SamlError::SignatureWrappingDetected(_)),
+            "expected SignatureWrappingDetected, got {err:?}"
+        );
+
+        // Also reject duplicate ID attributes across the document.
+        let dup_id_xml = decoy_signed_resp.replace(
+            "<saml:Issuer>https://idp.example</saml:Issuer>\n  <saml:Assertion",
+            "<saml:Issuer ID=\"_decoy_signed\">https://idp.example</saml:Issuer>\n  <saml:Assertion",
+        );
+        let dup_err = SamlParser::parse_signed(&dup_id_xml, &verifier)
+            .expect_err("duplicate ID attribute must be rejected");
+        assert!(
+            matches!(dup_err, SamlError::SignatureWrappingDetected(_)),
+            "expected SignatureWrappingDetected for duplicate ID, got {dup_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn validate_browser_sso_async_enforces_replay_and_clock_skew_via_async_cache() {
+        let (key_pem, cert_pem) = generate_self_signed_rsa_pem();
+        let signed_xml = build_signed_saml_response(
+            "_a_async_sso",
+            "alice@example.com",
+            "http://www.w3.org/2001/04/xmldsig-more#rsa-sha256",
+            &key_pem,
+            None,
+        );
+        let verifier =
+            XmlDsigSamlVerifier::from_pem_cert(&cert_pem).expect("load trusted RSA cert");
+        let assertion = SamlParser::parse_signed(&signed_xml, &verifier).expect("signed assertion");
+
+        let sync_cache = Arc::new(InMemorySamlReplayCache::with_max_clock_skew(30));
+        let async_cache = SyncReplayCacheAdapter::new(sync_cache);
+
+        let cfg = SamlValidationConfig {
+            expected_audience: Some("https://sp.example"),
+            expected_issuer: Some("https://idp.example"),
+            expected_destination: Some("https://sp.example/acs"),
+            expected_recipient: Some("https://sp.example/acs"),
+            expected_in_response_to: Some("_req_1"),
+            clock_skew_secs: 10,
+            ..Default::default()
+        };
+
+        SamlParser::validate_browser_sso_async(&assertion, 500, &cfg, &async_cache)
+            .await
+            .expect("first async browser SSO validation succeeds");
+
+        // Replay must be rejected.
+        let replay_err =
+            SamlParser::validate_browser_sso_async(&assertion, 501, &cfg, &async_cache)
+                .await
+                .expect_err("replayed assertion must be rejected");
+        assert!(matches!(replay_err, SamlError::AssertionReplayed(ref id) if id == "_a_async_sso"));
+
+        // Validator skew exceeding cache max_clock_skew_secs must fail closed.
+        let excessive_skew_cfg = SamlValidationConfig {
+            clock_skew_secs: 60,
+            ..cfg
+        };
+        let skew_err = SamlParser::validate_browser_sso_async(
+            &assertion,
+            502,
+            &excessive_skew_cfg,
+            &async_cache,
+        )
+        .await
+        .expect_err("excessive clock skew must fail closed");
+        assert!(matches!(skew_err, SamlError::Malformed(_)));
+    }
+
+    #[cfg(feature = "redis")]
+    #[tokio::test]
+    async fn redis_saml_replay_cache_key_formatting_and_expired_assertion_rejection() {
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:6399")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("create deadpool redis pool");
+        let default_cache = RedisSamlReplayCache::new(pool.clone());
+        assert_eq!(default_cache.format_key("_a1"), "rume:saml:replay:_a1");
+        assert_eq!(default_cache.max_clock_skew_secs(), 300);
+
+        let custom_cache = RedisSamlReplayCache::new(pool)
+            .with_key_prefix("custom:saml:")
+            .with_max_clock_skew_secs(120);
+        assert_eq!(custom_cache.format_key("_a1"), "custom:saml:_a1");
+        assert_eq!(custom_cache.max_clock_skew_secs(), 120);
+
+        // Expired assertion (now >= expires_at) must return Expired before touching Redis.
+        let eq_err = custom_cache
+            .record_if_absent_async("_a1", 1000, 1000)
+            .await
+            .expect_err("now == expires_at must be rejected");
+        assert!(matches!(
+            eq_err,
+            SamlError::Expired {
+                not_on_or_after: 1000,
+                current: 1000
+            }
+        ));
+
+        let past_err = custom_cache
+            .record_if_absent_async("_a1", 1000, 1005)
+            .await
+            .expect_err("now > expires_at must be rejected");
+        assert!(matches!(
+            past_err,
+            SamlError::Expired {
+                not_on_or_after: 1000,
+                current: 1005
+            }
+        ));
+
+        // Unreachable Redis must fail closed with Malformed, never silently returning Ok(true).
+        let infra_err = custom_cache
+            .record_if_absent_async("_a1", 2000, 1000)
+            .await
+            .expect_err("unreachable Redis must fail closed");
+        assert!(matches!(infra_err, SamlError::Malformed(_)));
+    }
+}

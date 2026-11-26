@@ -1,4 +1,5 @@
 use super::assertion::{SamlAssertion, SamlParser};
+use super::redis_replay::AsyncSamlReplayCache;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use thiserror::Error;
@@ -547,5 +548,76 @@ impl SamlParser {
         }
 
         Ok(())
+    }
+
+    /// Validates a SAML assertion using an asynchronous replay-protection cache.
+    pub async fn validate_with_async_replay(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        config: &SamlValidationConfig<'_>,
+        cache: &dyn AsyncSamlReplayCache,
+    ) -> Result<(), SamlError> {
+        let sync_cfg = SamlValidationConfig {
+            replay_cache: None,
+            ..*config
+        };
+        Self::validate_with_config(assertion, current_epoch_sec, &sync_cfg)?;
+
+        let not_on_or_after = assertion
+            .not_on_or_after
+            .ok_or(SamlError::MissingExpirationCondition)?;
+        let max_skew = cache.max_clock_skew_secs();
+        if config.clock_skew_secs > max_skew {
+            return Err(SamlError::Malformed(format!(
+                "validator clock_skew_secs ({}) exceeds replay cache max_clock_skew_secs ({max_skew})",
+                config.clock_skew_secs
+            )));
+        }
+        let replay_expires_at = not_on_or_after
+            .saturating_add(max_skew)
+            .saturating_add(u64::from(assertion.not_on_or_after_subsec_nanos > 0));
+        let fresh = cache
+            .record_if_absent_async(&assertion.id, replay_expires_at, current_epoch_sec)
+            .await?;
+        if !fresh {
+            return Err(SamlError::AssertionReplayed(assertion.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Validates a SAML assertion against the full SAML 2.0 HTTP POST Web Browser SSO profile
+    /// using an asynchronous replay-protection cache (e.g. [`super::RedisSamlReplayCache`]).
+    pub async fn validate_browser_sso_async(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        config: &SamlValidationConfig<'_>,
+        cache: &dyn AsyncSamlReplayCache,
+    ) -> Result<(), SamlError> {
+        if !assertion.is_signature_verified() {
+            return Err(SamlError::MissingSignatureVerifier);
+        }
+        if !assertion.has_authn_statement {
+            return Err(SamlError::Malformed(
+                "missing required AuthnStatement (with AuthnInstant and AuthnContext) for SAML Web Browser SSO"
+                    .into(),
+            ));
+        }
+        if config.expected_audience.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_audience (SP entity ID) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
+        if config.expected_recipient.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_recipient (ACS URL) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
+        let enforced = SamlValidationConfig {
+            require_bearer_confirmation: true,
+            ..*config
+        };
+        Self::validate_with_async_replay(assertion, current_epoch_sec, &enforced, cache).await
     }
 }

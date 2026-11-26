@@ -1,7 +1,5 @@
 //! Async and Redis-backed SAML 2.0 assertion replay protection.
 
-#![allow(dead_code, unused_variables)]
-
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -89,7 +87,7 @@ impl RedisSamlReplayCache {
 
     /// Formats the Redis key for `assertion_id`.
     pub fn format_key(&self, assertion_id: &str) -> String {
-        todo!("implemented in Task 06")
+        format!("{}{}", self.key_prefix, assertion_id)
     }
 }
 
@@ -105,6 +103,33 @@ impl AsyncSamlReplayCache for RedisSamlReplayCache {
         expires_at: u64,
         now_epoch_sec: u64,
     ) -> Pin<Box<dyn Future<Output = Result<bool, SamlError>> + Send + 'a>> {
-        todo!("implemented in Task 06")
+        Box::pin(async move {
+            if now_epoch_sec >= expires_at {
+                return Err(SamlError::Expired {
+                    not_on_or_after: expires_at,
+                    current: now_epoch_sec,
+                });
+            }
+
+            let ttl_secs = (expires_at - now_epoch_sec).max(1);
+            let key = self.format_key(assertion_id);
+            let mut conn = self.pool.get().await.map_err(|e| {
+                SamlError::Malformed(format!("redis replay cache connection failed: {e}"))
+            })?;
+
+            let res: Option<String> = deadpool_redis::redis::cmd("SET")
+                .arg(&key)
+                .arg("1")
+                .arg("NX")
+                .arg("EX")
+                .arg(ttl_secs)
+                .query_async(&mut conn)
+                .await
+                .map_err(|e| {
+                    SamlError::Malformed(format!("redis replay cache SET NX EX failed: {e}"))
+                })?;
+
+            Ok(res.is_some())
+        })
     }
 }
