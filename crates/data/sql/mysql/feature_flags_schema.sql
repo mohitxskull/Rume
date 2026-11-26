@@ -1,6 +1,6 @@
 -- Schema DDL for rume_feature_flags in MySQL.
 CREATE TABLE IF NOT EXISTS rume_feature_flags (
-    id          VARCHAR(36)  NOT NULL PRIMARY KEY,
+    id          VARCHAR(255) NOT NULL PRIMARY KEY,
     tenant_id   VARCHAR(36),
     flag_key    VARCHAR(255) NOT NULL,
     enabled     TINYINT(1)   NOT NULL DEFAULT 0,

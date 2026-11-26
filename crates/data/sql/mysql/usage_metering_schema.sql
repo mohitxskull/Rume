@@ -1,6 +1,6 @@
 -- Schema DDL for rume_usage_counters in MySQL.
 CREATE TABLE IF NOT EXISTS rume_usage_counters (
-    id           VARCHAR(36)  NOT NULL PRIMARY KEY,
+    id           VARCHAR(255) NOT NULL PRIMARY KEY,
     tenant_id    VARCHAR(36)  NOT NULL,
     metric       VARCHAR(255) NOT NULL,
     window       VARCHAR(64)  NOT NULL,

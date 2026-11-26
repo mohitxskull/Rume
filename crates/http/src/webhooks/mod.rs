@@ -168,6 +168,7 @@ where
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
         let mut inner = self.inner.clone();
+        std::mem::swap(&mut self.inner, &mut inner);
         let config = self.config.clone();
 
         Box::pin(async move {

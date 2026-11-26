@@ -91,8 +91,12 @@ where
     let Some(cc) = cache_control else {
         return router;
     };
-    let Ok(header_val) = HeaderValue::from_str(&cc) else {
-        return router;
+    let header_val = match HeaderValue::from_str(&cc) {
+        Ok(val) => val,
+        Err(err) => {
+            tracing::warn!(cache_control = %cc, error = %err, "ignoring invalid Cache-Control header value");
+            return router;
+        }
     };
 
     router.layer(middleware::from_fn(move |req: Request, next: Next| {
@@ -159,7 +163,13 @@ where
     let spa_fallback = config.spa_fallback;
     let cache_control = config
         .cache_control
-        .and_then(|cc| HeaderValue::from_str(&cc).ok());
+        .and_then(|cc| match HeaderValue::from_str(&cc) {
+            Ok(val) => Some(val),
+            Err(err) => {
+                tracing::warn!(cache_control = %cc, error = %err, "ignoring invalid Cache-Control header value");
+                None
+            }
+        });
 
     Router::new().fallback(move |req: Request| {
         let spa_fallback = spa_fallback.clone();

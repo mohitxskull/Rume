@@ -314,24 +314,31 @@ impl DeprecationLayer {
     }
 }
 
+fn parse_header_value(header_name: &'static str, raw: Option<&str>) -> Option<HeaderValue> {
+    let val = raw?;
+    match HeaderValue::from_str(val) {
+        Ok(parsed) => Some(parsed),
+        Err(err) => {
+            tracing::warn!(
+                header = header_name,
+                value = %val,
+                error = %err,
+                "ignoring invalid header value in DeprecationLayer"
+            );
+            None
+        }
+    }
+}
+
 impl<S> Layer<S> for DeprecationLayer {
     type Service = DeprecationService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
         DeprecationService {
             inner,
-            deprecation: self
-                .deprecation
-                .as_deref()
-                .and_then(|v| HeaderValue::from_str(v).ok()),
-            sunset: self
-                .sunset
-                .as_deref()
-                .and_then(|v| HeaderValue::from_str(v).ok()),
-            sunset_link: self
-                .sunset_link
-                .as_deref()
-                .and_then(|v| HeaderValue::from_str(v).ok()),
+            deprecation: parse_header_value("deprecation", self.deprecation.as_deref()),
+            sunset: parse_header_value("sunset", self.sunset.as_deref()),
+            sunset_link: parse_header_value("link", self.sunset_link.as_deref()),
         }
     }
 }

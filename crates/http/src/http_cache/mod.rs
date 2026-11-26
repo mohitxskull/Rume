@@ -192,20 +192,24 @@ where
                 }
                 apply_cache_headers(&mut parts.headers, &config);
 
-                let serialized_headers = parts
-                    .headers
-                    .iter()
-                    .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
-                    .collect();
+                // Why: HEAD responses carry an empty body, so caching a HEAD miss
+                // would poison the shared GET cache entry with an empty body and ETag.
+                if method == Method::GET {
+                    let serialized_headers = parts
+                        .headers
+                        .iter()
+                        .map(|(k, v)| (k.as_str().to_string(), v.as_bytes().to_vec()))
+                        .collect();
 
-                let cached = CachedHttpResponse {
-                    status: parts.status.as_u16(),
-                    headers: serialized_headers,
-                    body: bytes.to_vec(),
-                    etag: etag.clone(),
-                };
-                if let Ok(encoded) = serde_json::to_vec(&cached) {
-                    let _ = backend.set(&cache_key, encoded, Some(config.ttl)).await;
+                    let cached = CachedHttpResponse {
+                        status: parts.status.as_u16(),
+                        headers: serialized_headers,
+                        body: bytes.to_vec(),
+                        etag: etag.clone(),
+                    };
+                    if let Ok(encoded) = serde_json::to_vec(&cached) {
+                        let _ = backend.set(&cache_key, encoded, Some(config.ttl)).await;
+                    }
                 }
 
                 if let Some(ref inm) = if_none_match
@@ -612,5 +616,87 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ok_put.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn head_miss_does_not_poison_subsequent_get_cache() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/items",
+                get(move || {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        "hello-cache"
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(
+                backend,
+                HttpCacheConfig::new().with_ttl(Duration::from_secs(60)),
+            ));
+
+        // 1. Cold HEAD request: returns 200 with empty body, must NOT write to cache.
+        let head_miss = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_miss.status(), StatusCode::OK);
+        let head_miss_body = to_bytes(head_miss.into_body(), usize::MAX).await.unwrap();
+        assert!(head_miss_body.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // 2. Subsequent GET request: cache miss, populates cache with full body and correct ETag.
+        let get_res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get_res.status(), StatusCode::OK);
+        let expected_etag = compute_etag(b"hello-cache", false);
+        assert_eq!(
+            get_res.headers().get(header::ETAG).unwrap(),
+            expected_etag.as_str()
+        );
+        let get_body = to_bytes(get_res.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&get_body[..], b"hello-cache");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+
+        // 3. Subsequent HEAD request (cache hit): serves empty body with the GET ETag.
+        let head_hit = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(head_hit.status(), StatusCode::OK);
+        assert_eq!(
+            head_hit.headers().get(header::ETAG).unwrap(),
+            expected_etag.as_str()
+        );
+        let head_hit_body = to_bytes(head_hit.into_body(), usize::MAX).await.unwrap();
+        assert!(head_hit_body.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }
