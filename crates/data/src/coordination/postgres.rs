@@ -9,7 +9,8 @@ use uuid::Uuid;
 use crate::coordination::error::CoordinationError;
 use crate::coordination::leader::{LeaderElector, LeaderLease};
 use crate::coordination::lock::{
-    CoordinationFuture, DistributedLock, LockGuard, conservative_lease_deadline,
+    CoordinationFuture, DistributedLock, LockGuard, checked_lease_deadline,
+    conservative_lease_deadline,
 };
 use crate::persistence::postgres::PostgresBackend;
 
@@ -276,11 +277,12 @@ impl LeaderElector for PostgresLeaderElector {
                     .try_get(1)
                     .map_err(|e| CoordinationError::Backend(e.to_string()))?;
                 let effective_ms = u64::try_from(remaining_ms.max(1)).unwrap_or(u64::MAX);
+                let deadline = checked_lease_deadline(pre_rtt, Duration::from_millis(effective_ms));
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: cid,
                     term: term as u64,
-                    expires_at: Some(pre_rtt + Duration::from_millis(effective_ms)),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)

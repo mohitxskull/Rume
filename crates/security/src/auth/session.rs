@@ -150,16 +150,34 @@ impl InMemorySessionMap {
     }
 }
 
+const DEFAULT_MAX_SESSION_ENTRIES: usize = 100_000;
+
 /// Thread-safe in-memory session store suitable for testing and single-instance deployments.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemorySessionStore {
     inner: std::sync::Arc<tokio::sync::RwLock<InMemorySessionMap>>,
+    max_entries: usize,
+}
+
+impl Default for InMemorySessionStore {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Arc::new(tokio::sync::RwLock::new(InMemorySessionMap::default())),
+            max_entries: DEFAULT_MAX_SESSION_ENTRIES,
+        }
+    }
 }
 
 impl InMemorySessionStore {
-    /// Creates a new in-memory session store.
+    /// Creates a new in-memory session store with default capacity (100,000 entries).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configures the maximum number of active sessions retained before rejecting new saves.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self
     }
 }
 
@@ -194,6 +212,13 @@ impl SessionStore for InMemorySessionStore {
             let now = current_timestamp();
             let mut state = self.inner.write().await;
             state.prune_expired(now);
+            if !state.sessions.contains_key(&session.id) && state.sessions.len() >= self.max_entries
+            {
+                return Err(AuthError::ProviderError(format!(
+                    "in-memory session store capacity ({}) exceeded",
+                    self.max_entries
+                )));
+            }
             state.insert(session);
             Ok(())
         })
@@ -267,5 +292,22 @@ mod tests {
     fn session_new_saturates_expiry_on_overflow() {
         let s = Session::new("s1", "u1", u64::MAX);
         assert_eq!(s.expires_at, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn in_memory_session_store_enforces_max_entries_and_prunes_expired() {
+        let store = InMemorySessionStore::new().with_max_entries(2);
+        store.save(Session::new("s1", "u1", 300)).await.unwrap();
+        store.save(Session::new("s2", "u2", 300)).await.unwrap();
+
+        let err = store.save(Session::new("s3", "u3", 300)).await.unwrap_err();
+        assert!(matches!(err, AuthError::ProviderError(ref m) if m.contains("capacity")));
+
+        // Mark s1 expired; next save prunes expired entries and admits s3.
+        let mut expired_s1 = Session::new("s1", "u1", 0);
+        expired_s1.expires_at = 0;
+        store.save(expired_s1).await.unwrap();
+        store.save(Session::new("s3", "u3", 300)).await.unwrap();
+        assert!(store.load("s3").await.unwrap().is_some());
     }
 }

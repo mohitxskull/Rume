@@ -163,12 +163,24 @@ pub struct CursorPage<T> {
 
 /// Encodes and decodes pagination cursors as URL-safe base64url JSON payloads,
 /// optionally authenticated with HMAC-SHA256.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum CursorCodec {
     /// Unsigned URL-safe base64url JSON payload.
     Opaque,
     /// HMAC-SHA256 signed URL-safe base64url JSON payload (`<payload_b64>.<sig_b64>`).
     HmacSha256 { key: Vec<u8> },
+}
+
+impl std::fmt::Debug for CursorCodec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opaque => f.write_str("Opaque"),
+            Self::HmacSha256 { .. } => f
+                .debug_struct("HmacSha256")
+                .field("key", &"[REDACTED]")
+                .finish(),
+        }
+    }
 }
 
 impl CursorCodec {
@@ -473,5 +485,15 @@ mod tests {
         let next_tok = first_cursor_page.next_cursor.expect("next_cursor");
         let decoded: TestCursor = codec.decode(&next_tok).expect("decode next_cursor");
         assert_eq!(decoded.id, 3);
+    }
+
+    #[test]
+    fn cursor_codec_debug_redacts_hmac_key() {
+        let codec = CursorCodec::hmac_sha256(b"top-secret-cursor-key".to_vec());
+        let dbg = format!("{codec:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("top-secret"));
+        assert!(!dbg.contains("116, 111, 112"));
+        assert_eq!(format!("{:?}", CursorCodec::opaque()), "Opaque");
     }
 }

@@ -311,10 +311,18 @@ impl AppError {
                     Some(details),
                 ),
             ),
-            Self::Conflict { code, message } => problem_details_response(
-                status,
-                &problem(status, "Conflict", message, code, None, None),
-            ),
+            Self::Conflict { code, message } => {
+                warn!("conflict: {}", message);
+                let detail = if env.in_development() {
+                    message
+                } else {
+                    "The request conflicts with the current state of the resource.".to_string()
+                };
+                problem_details_response(
+                    status,
+                    &problem(status, "Conflict", detail, code, None, None),
+                )
+            }
             Self::Internal { source, request_id } => {
                 if let Some(ref bt) = source.backtrace {
                     error!(%source.message, span_context = ?source.span_context, backtrace = %bt, "internal server error");
@@ -659,19 +667,43 @@ mod tests {
 
     #[tokio::test]
     async fn conflict_error_maps_to_409_problem_details() {
-        let resp = AppError::conflict("version mismatch").into_response();
-        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let prod_env = crate::state::Environment::new("production");
+        let dev_env = crate::state::Environment::new("development");
+
+        let prod_resp =
+            AppError::conflict("version mismatch on secret_entity").into_response_in_env(&prod_env);
+        assert_eq!(prod_resp.status(), StatusCode::CONFLICT);
         assert_eq!(
-            resp.headers()
+            prod_resp
+                .headers()
                 .get(axum::http::header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok()),
             Some("application/problem+json")
         );
-        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["status"].as_u64(), Some(409));
-        assert_eq!(value["title"].as_str(), Some("Conflict"));
-        assert_eq!(value["code"].as_str(), Some("CONFLICT"));
-        assert_eq!(value["detail"].as_str(), Some("version mismatch"));
+        let prod_bytes = to_bytes(prod_resp.into_body(), usize::MAX).await.unwrap();
+        let prod_value: serde_json::Value = serde_json::from_slice(&prod_bytes).unwrap();
+        assert_eq!(prod_value["status"].as_u64(), Some(409));
+        assert_eq!(prod_value["title"].as_str(), Some("Conflict"));
+        assert_eq!(prod_value["code"].as_str(), Some("CONFLICT"));
+        assert_eq!(
+            prod_value["detail"].as_str(),
+            Some("The request conflicts with the current state of the resource.")
+        );
+        assert!(
+            !prod_value["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("version mismatch")
+        );
+
+        let dev_resp =
+            AppError::conflict("version mismatch on secret_entity").into_response_in_env(&dev_env);
+        assert_eq!(dev_resp.status(), StatusCode::CONFLICT);
+        let dev_bytes = to_bytes(dev_resp.into_body(), usize::MAX).await.unwrap();
+        let dev_value: serde_json::Value = serde_json::from_slice(&dev_bytes).unwrap();
+        assert_eq!(
+            dev_value["detail"].as_str(),
+            Some("version mismatch on secret_entity")
+        );
     }
 }

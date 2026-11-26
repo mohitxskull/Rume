@@ -16,7 +16,7 @@ fn default_connect_timeout_secs() -> u64 {
 }
 
 /// Configuration settings for database connection pools and migrations.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseConfig {
     /// Connection URL or connection string.
     pub url: String,
@@ -40,6 +40,20 @@ pub struct DatabaseConfig {
     /// Whether to automatically execute pending migrations on application boot.
     #[serde(default)]
     pub auto_migrate: bool,
+}
+
+impl std::fmt::Debug for DatabaseConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_url = rume_foundation::env::secrets::redact_credential_urls_in_text(&self.url);
+        f.debug_struct("DatabaseConfig")
+            .field("url", &redacted_url)
+            .field("min_connections", &self.min_connections)
+            .field("max_connections", &self.max_connections)
+            .field("connect_timeout_secs", &self.connect_timeout_secs)
+            .field("idle_timeout_secs", &self.idle_timeout_secs)
+            .field("auto_migrate", &self.auto_migrate)
+            .finish()
+    }
 }
 
 impl Default for DatabaseConfig {
@@ -96,5 +110,18 @@ impl DatabaseConfig {
     /// Return idle timeout as an optional `Duration`.
     pub fn idle_timeout(&self) -> Option<Duration> {
         self.idle_timeout_secs.map(Duration::from_secs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_config_debug_redacts_url_credentials() {
+        let cfg = DatabaseConfig::new("postgres://admin:super_secret_pw@db.internal:5432/app");
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("[redacted]"));
+        assert!(!dbg.contains("super_secret_pw"));
     }
 }

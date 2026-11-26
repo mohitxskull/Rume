@@ -56,6 +56,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// Backoff duration after non-connection `accept()` errors (e.g. `EMFILE`/`ENFILE`)
+/// to prevent 100% CPU spin-loops under file-descriptor exhaustion.
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+fn is_connection_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+    )
+}
+
 /// Serve an Axum router over TLS on a pre-bound [`TcpListener`] with graceful shutdown drain.
 pub async fn serve_tls_listener<F>(
     listener: TcpListener,
@@ -88,7 +101,21 @@ where
                 let (tcp_stream, peer_addr) = match accept_res {
                     Ok(pair) => pair,
                     Err(err) => {
-                        tracing::warn!(error = %err, "TLS TCP accept error");
+                        if is_connection_error(&err) {
+                            tracing::debug!(error = %err, "TLS TCP connection accept error");
+                        } else {
+                            // Why: non-connection accept errors (`EMFILE`, `ENFILE`, etc.) repeat
+                            // immediately on every loop iteration; back off briefly (while still
+                            // honoring `shutdown_signal`) to avoid a 100% CPU spin-loop.
+                            tracing::warn!(error = %err, "TLS TCP accept error; backing off");
+                            tokio::select! {
+                                biased;
+                                () = &mut shutdown_signal => {
+                                    break;
+                                }
+                                () = tokio::time::sleep(ACCEPT_ERROR_BACKOFF) => {}
+                            }
+                        }
                         continue;
                     }
                 };
@@ -140,4 +167,28 @@ where
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_connection_vs_resource_accept_errors() {
+        assert!(is_connection_error(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "reset"
+        )));
+        assert!(is_connection_error(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionAborted,
+            "aborted"
+        )));
+        assert!(is_connection_error(&std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "refused"
+        )));
+        assert!(!is_connection_error(&std::io::Error::other(
+            "too many open files"
+        )));
+    }
 }

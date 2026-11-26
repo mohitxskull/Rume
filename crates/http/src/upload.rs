@@ -13,12 +13,18 @@ use rume_foundation::AppError;
 
 const DEFAULT_MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_MAX_FILES: usize = 10;
+const DEFAULT_MAX_TOTAL_BYTES: usize = 100 * 1024 * 1024;
+const DEFAULT_MAX_FIELDS: usize = 64;
 
 /// Configuration governing [`ValidatedMultipart`] and [`extract_multipart_files`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MultipartUploadConfig {
     pub max_file_size_bytes: usize,
     pub max_files: usize,
+    /// Maximum cumulative bytes accepted across all multipart fields (file and non-file).
+    pub max_total_bytes: usize,
+    /// Maximum number of multipart fields (both file and non-file) accepted per request.
+    pub max_fields: usize,
     pub allowed_mime_types: Vec<String>,
     pub allowed_extensions: Vec<String>,
 }
@@ -28,6 +34,8 @@ impl Default for MultipartUploadConfig {
         Self {
             max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
             max_files: DEFAULT_MAX_FILES,
+            max_total_bytes: DEFAULT_MAX_TOTAL_BYTES,
+            max_fields: DEFAULT_MAX_FIELDS,
             allowed_mime_types: Vec::new(),
             allowed_extensions: Vec::new(),
         }
@@ -103,6 +111,8 @@ pub async fn extract_multipart_files(
     config: &MultipartUploadConfig,
 ) -> Result<Vec<UploadedFile>, AppError> {
     let mut files = Vec::new();
+    let mut total_fields: usize = 0;
+    let mut total_bytes: usize = 0;
 
     while let Some(mut field) = multipart
         .next_field()
@@ -112,7 +122,33 @@ pub async fn extract_multipart_files(
             message: format!("failed to read multipart field: {e}"),
         })?
     {
+        // Why: bound both field count and total bytes across ALL fields (file and non-file)
+        // so an attacker cannot exhaust CPU/RAM with unbounded non-file form fields.
+        total_fields = total_fields.saturating_add(1);
+        if total_fields > config.max_fields {
+            return Err(AppError::BadRequest {
+                code: "TOO_MANY_FIELDS",
+                message: format!("maximum of {} multipart fields exceeded", config.max_fields),
+            });
+        }
+
         let Some(raw_file_name) = field.file_name().map(ToString::to_string) else {
+            while let Some(chunk) = field.chunk().await.map_err(|e| AppError::BadRequest {
+                code: "INVALID_MULTIPART",
+                message: format!("failed to read multipart chunk: {e}"),
+            })? {
+                if total_bytes.saturating_add(chunk.len()) > config.max_total_bytes {
+                    return Err(AppError::Public {
+                        status: StatusCode::PAYLOAD_TOO_LARGE,
+                        code: "PAYLOAD_TOO_LARGE",
+                        message: format!(
+                            "multipart payload exceeds maximum total size of {} bytes",
+                            config.max_total_bytes
+                        ),
+                    });
+                }
+                total_bytes = total_bytes.saturating_add(chunk.len());
+            }
             continue;
         };
 
@@ -145,6 +181,17 @@ pub async fn extract_multipart_files(
                     ),
                 });
             }
+            if total_bytes.saturating_add(chunk.len()) > config.max_total_bytes {
+                return Err(AppError::Public {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "PAYLOAD_TOO_LARGE",
+                    message: format!(
+                        "multipart payload exceeds maximum total size of {} bytes",
+                        config.max_total_bytes
+                    ),
+                });
+            }
+            total_bytes = total_bytes.saturating_add(chunk.len());
             bytes.extend_from_slice(&chunk);
         }
 
@@ -258,6 +305,7 @@ mod tests {
             max_files: 2,
             allowed_mime_types: vec!["text/plain".to_string()],
             allowed_extensions: vec!["txt".to_string()],
+            ..Default::default()
         };
 
         let app = Router::new()
@@ -365,6 +413,7 @@ mod tests {
             max_files: 1,
             allowed_mime_types: vec![],
             allowed_extensions: vec![],
+            ..Default::default()
         };
 
         let app = Router::new()
@@ -401,5 +450,82 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multipart_extractor_enforces_max_fields_and_max_total_bytes_on_non_file_fields() {
+        let config = MultipartUploadConfig {
+            max_file_size_bytes: 64,
+            max_files: 4,
+            max_total_bytes: 32,
+            max_fields: 3,
+            allowed_mime_types: vec![],
+            allowed_extensions: vec![],
+        };
+
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(config));
+
+        let boundary = "----rume-bounds-boundary";
+
+        // 4 non-file fields exceeds max_fields = 3 -> 400 Bad Request
+        let mut too_many_fields = Vec::new();
+        for i in 0..4 {
+            too_many_fields.extend_from_slice(
+                format!(
+                    "--{boundary}\r\nContent-Disposition: form-data; name=\"f{i}\"\r\n\r\nhi\r\n"
+                )
+                .as_bytes(),
+            );
+        }
+        too_many_fields.extend_from_slice(format!("--{boundary}--\r\n").as_bytes());
+
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(too_many_fields))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Single non-file field of 40 bytes exceeds max_total_bytes = 32 -> 413
+        let mut oversized_non_file = Vec::new();
+        oversized_non_file.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"note\"\r\n\r\n")
+                .as_bytes(),
+        );
+        oversized_non_file.extend_from_slice(&[b'x'; 40]);
+        oversized_non_file.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(oversized_non_file))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 }

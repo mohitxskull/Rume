@@ -16,7 +16,7 @@ use crate::storage::{
 type HmacSha256 = Hmac<Sha256>;
 
 /// Configuration for [`S3ObjectStore`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
@@ -25,6 +25,23 @@ pub struct S3Config {
     pub secret_access_key: String,
     pub session_token: Option<String>,
     pub path_style: bool,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket", &self.bucket)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_access_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("path_style", &self.path_style)
+            .finish()
+    }
 }
 
 struct SigningRequest<'a> {
@@ -849,5 +866,22 @@ mod tests {
             decode_xml_entities("&lt;tag attr=&quot;1&quot; o=&apos;2&apos;&gt;&amp;"),
             "<tag attr=\"1\" o='2'>&"
         );
+    }
+
+    #[test]
+    fn s3_config_debug_redacts_secret_access_key_and_session_token() {
+        let cfg = S3Config {
+            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "my-bucket".to_string(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "super_secret_aws_key".to_string(),
+            session_token: Some("super_secret_session_token".to_string()),
+            path_style: false,
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("super_secret_aws_key"));
+        assert!(!dbg.contains("super_secret_session_token"));
     }
 }

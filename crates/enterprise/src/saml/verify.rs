@@ -92,11 +92,14 @@ struct ReplayCacheState {
     last_pruned_at: u64,
 }
 
+const DEFAULT_MAX_REPLAY_ENTRIES: usize = 100_000;
+
 /// Thread-safe in-memory [`SamlReplayCache`] suitable for single-instance deployments and tests.
 #[derive(Debug)]
 pub struct InMemorySamlReplayCache {
     state: Mutex<ReplayCacheState>,
     max_clock_skew_secs: u64,
+    max_entries: usize,
 }
 
 impl Default for InMemorySamlReplayCache {
@@ -104,6 +107,7 @@ impl Default for InMemorySamlReplayCache {
         Self {
             state: Mutex::new(ReplayCacheState::default()),
             max_clock_skew_secs: 300,
+            max_entries: DEFAULT_MAX_REPLAY_ENTRIES,
         }
     }
 }
@@ -120,7 +124,14 @@ impl InMemorySamlReplayCache {
         Self {
             state: Mutex::new(ReplayCacheState::default()),
             max_clock_skew_secs,
+            max_entries: DEFAULT_MAX_REPLAY_ENTRIES,
         }
+    }
+
+    /// Configures the maximum number of active assertion IDs retained before failing closed.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self
     }
 
     /// Evicts entries whose expiration is `<= now_epoch_sec` and advances the pruning
@@ -159,8 +170,17 @@ impl SamlReplayCache for InMemorySamlReplayCache {
                 current: effective_now,
             });
         }
+        // Why: prune expired entries inline and fail closed at `max_entries` (never evicting
+        // active unexpired IDs) so unbounded traffic cannot OOM the process or evict replay state.
+        guard.entries.retain(|_, exp| *exp > effective_now);
         if guard.entries.contains_key(assertion_id) {
             return Ok(false);
+        }
+        if guard.entries.len() >= self.max_entries {
+            return Err(SamlError::Malformed(format!(
+                "SAML replay cache capacity ({}) exceeded",
+                self.max_entries
+            )));
         }
         guard.entries.insert(assertion_id.to_string(), expires_at);
         Ok(true)
@@ -619,5 +639,28 @@ impl SamlParser {
             ..*config
         };
         Self::validate_with_async_replay(assertion, current_epoch_sec, &enforced, cache).await
+    }
+}
+
+#[cfg(test)]
+mod replay_cache_tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_replay_cache_prunes_expired_inline_and_enforces_max_entries() {
+        let cache = InMemorySamlReplayCache::new().with_max_entries(2);
+        assert!(cache.record_if_absent("id-1", 100, 50).unwrap());
+        assert!(cache.record_if_absent("id-2", 200, 50).unwrap());
+
+        // At capacity (2 active entries): existing replay still returns Ok(false).
+        assert!(!cache.record_if_absent("id-1", 100, 60).unwrap());
+        // New unexpired entry fails closed when full.
+        assert!(matches!(
+            cache.record_if_absent("id-3", 200, 60),
+            Err(SamlError::Malformed(ref msg)) if msg.contains("capacity")
+        ));
+
+        // Once id-1 expires (now >= 100), inline pruning frees its slot for id-3.
+        assert!(cache.record_if_absent("id-3", 250, 100).unwrap());
     }
 }

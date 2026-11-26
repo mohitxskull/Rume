@@ -176,7 +176,9 @@ impl CacheBackend for InMemoryCacheBackend {
         let key = key.to_string();
         Box::pin(async move {
             let now = std::time::Instant::now();
-            let expires_at = ttl.map(|t| now + t);
+            // Why: use `checked_add` so huge TTLs (e.g. `Duration::MAX`) never panic
+            // on `Instant` overflow; an unrepresentably distant expiry is treated as no TTL.
+            let expires_at = ttl.and_then(|t| now.checked_add(t));
             let mut map = self.entries.write().await;
             map.insert(key, (value, expires_at));
             Ok(())
@@ -199,7 +201,8 @@ impl CacheBackend for InMemoryCacheBackend {
             // publish a value without its tag memberships.
             let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
-            let expires_at = ttl.map(|t| std::time::Instant::now() + t);
+            let now = std::time::Instant::now();
+            let expires_at = ttl.and_then(|t| now.checked_add(t));
             map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
                 tag_index.insert(tag, key.clone());
@@ -381,6 +384,25 @@ mod tests {
             backend.tag_index.read().await.key_to_tags.len(),
             0,
             "expired key's reverse index entry should be pruned on get"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_with_duration_max_does_not_panic_on_instant_overflow() {
+        let backend = InMemoryCacheBackend::new();
+        backend
+            .set("k_max", b"v1".to_vec(), Some(Duration::MAX))
+            .await
+            .unwrap();
+        assert_eq!(backend.get("k_max").await.unwrap(), Some(b"v1".to_vec()));
+
+        backend
+            .set_with_tags("k_tag_max", b"v2".to_vec(), &["t1"], Some(Duration::MAX))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get("k_tag_max").await.unwrap(),
+            Some(b"v2".to_vec())
         );
     }
 }

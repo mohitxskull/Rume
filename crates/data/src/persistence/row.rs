@@ -108,7 +108,10 @@ impl FromDbValue for u64 {
                 message: format!("failed to parse '{s}' as u64: {e}"),
             }),
             DbValue::Float(f) => {
-                if *f < 0.0 || *f > u64::MAX as f64 || f.is_nan() {
+                // Why: `u64::MAX as f64` rounds up to `2^64` (`18_446_744_073_709_551_616.0`),
+                // so `*f > u64::MAX as f64` allows `2^64` to silently saturate to `u64::MAX`.
+                // Reject non-finite values, negatives, and `*f >= 2^64` explicitly (`RC-23`).
+                if !f.is_finite() || *f < 0.0 || *f >= 18_446_744_073_709_551_616.0 {
                     return Err(PersistenceError::DecodeError {
                         column: "<numeric>".into(),
                         message: format!("float value {f} out of range for u64"),
@@ -513,5 +516,25 @@ mod tests {
         }
         assert_eq!(i64::from_db_value(&DbValue::Float(42.0)).unwrap(), 42);
         assert_eq!(i64::from_db_value(&DbValue::Float(-42.0)).unwrap(), -42);
+    }
+
+    #[test]
+    fn u64_rejects_non_finite_negative_and_two_pow_64_floats() {
+        for bad in [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            1e30,
+            18_446_744_073_709_551_616.0, // 2^64 (u64::MAX as f64)
+        ] {
+            let err = u64::from_db_value(&DbValue::Float(bad));
+            assert!(
+                matches!(err, Err(PersistenceError::DecodeError { .. })),
+                "expected DecodeError for float {bad}, got {err:?}"
+            );
+        }
+        assert_eq!(u64::from_db_value(&DbValue::Float(0.0)).unwrap(), 0);
+        assert_eq!(u64::from_db_value(&DbValue::Float(42.0)).unwrap(), 42);
     }
 }

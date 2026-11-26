@@ -8,7 +8,9 @@ use deadpool_redis::Pool;
 use crate::cache::redis::RedisCacheBackend;
 use crate::coordination::error::CoordinationError;
 use crate::coordination::leader::{LeaderElector, LeaderLease};
-use crate::coordination::lock::{CoordinationFuture, conservative_lease_deadline};
+use crate::coordination::lock::{
+    CoordinationFuture, checked_lease_deadline, conservative_lease_deadline,
+};
 
 /// Redis-backed implementation of [`LeaderElector`].
 ///
@@ -195,11 +197,12 @@ impl LeaderElector for RedisLeaderElector {
 
             if let Some((term, effective_ttl_ms)) = result {
                 let effective_ms = u64::try_from(effective_ttl_ms.max(1)).unwrap_or(u64::MAX);
+                let deadline = checked_lease_deadline(pre_rtt, Duration::from_millis(effective_ms));
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
-                    expires_at: Some(pre_rtt + Duration::from_millis(effective_ms)),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)

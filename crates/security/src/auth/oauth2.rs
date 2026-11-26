@@ -308,16 +308,34 @@ impl InMemoryStateMap {
     }
 }
 
+const DEFAULT_MAX_OAUTH2_STATE_ENTRIES: usize = 100_000;
+
 /// Thread-safe in-memory [`OAuth2StateStore`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemoryOAuth2StateStore {
     inner: Arc<RwLock<InMemoryStateMap>>,
+    max_entries: usize,
+}
+
+impl Default for InMemoryOAuth2StateStore {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(InMemoryStateMap::default())),
+            max_entries: DEFAULT_MAX_OAUTH2_STATE_ENTRIES,
+        }
+    }
 }
 
 impl InMemoryOAuth2StateStore {
-    /// Creates an empty in-memory OAuth2 state store.
+    /// Creates an empty in-memory OAuth2 state store with default capacity (100,000 entries).
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Configures the maximum number of active entries retained before rejecting new saves.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self
     }
 }
 
@@ -327,6 +345,12 @@ impl OAuth2StateStore for InMemoryOAuth2StateStore {
             let now = current_epoch_secs();
             let mut map = self.inner.write().await;
             map.prune_expired(now);
+            if !map.entries.contains_key(&state.state) && map.entries.len() >= self.max_entries {
+                return Err(AuthError::ProviderError(format!(
+                    "OAuth2 state store capacity ({}) exceeded",
+                    self.max_entries
+                )));
+            }
             map.insert(state);
             Ok(())
         })
@@ -799,5 +823,27 @@ mod tests {
             .expect_err("expected 302 redirect to be rejected");
         assert!(matches!(err, AuthError::ProviderError(ref msg) if msg.contains("redirect")));
         assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn in_memory_oauth2_state_store_enforces_max_entries_and_prunes_expired() {
+        let store = InMemoryOAuth2StateStore::new().with_max_entries(2);
+        let now = current_epoch_secs();
+        let make = |state: &str, expires_at: u64| OAuth2AuthState {
+            state: state.to_owned(),
+            nonce: "n".to_owned(),
+            pkce_verifier: SecretString::from("v".to_owned()),
+            redirect_to: None,
+            expires_at,
+        };
+
+        store.save(make("s1", now + 300)).await.unwrap();
+        store.save(make("s2", now + 300)).await.unwrap();
+        let err = store.save(make("s3", now + 300)).await.unwrap_err();
+        assert!(matches!(err, AuthError::ProviderError(ref m) if m.contains("capacity")));
+
+        // Updating an existing key to expired and saving a new key prunes s1 and admits s3.
+        store.save(make("s1", now.saturating_sub(1))).await.unwrap();
+        store.save(make("s3", now + 300)).await.unwrap();
     }
 }

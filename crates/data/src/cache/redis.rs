@@ -122,6 +122,28 @@ impl RedisCacheBackend {
     }
 }
 
+/// Upper bound on millisecond TTLs sent to Redis (`i64::MAX / 2` ≈ 146 million years).
+///
+/// Why: clamping before casting to `i64` guarantees `val_ttl_arg` and `tag_ttl_arg`
+/// stay strictly positive for any `Some(Duration)` and never wrap negative to trigger
+/// the Lua `if tag_ttl < 0 then PERSIST` branch (`RC-23`).
+const MAX_REDIS_TTL_MS: i64 = i64::MAX / 2;
+
+fn clamp_redis_ttl_ms(ttl: Duration) -> i64 {
+    ttl.as_millis().clamp(1, MAX_REDIS_TTL_MS as u128) as i64
+}
+
+fn redis_ttl_args(ttl: Option<Duration>) -> (i64, i64) {
+    match ttl {
+        Some(t) => {
+            let val_ms = clamp_redis_ttl_ms(t);
+            let tag_ms = val_ms.saturating_add(3_600_000).min(MAX_REDIS_TTL_MS);
+            (val_ms, tag_ms)
+        }
+        None => (-1, -1),
+    }
+}
+
 /// Escapes Redis `SCAN MATCH` glob metacharacters (`*`, `?`, `[`, `]`, `\`).
 fn escape_redis_glob(input: &str) -> String {
     let mut escaped = String::with_capacity(input.len());
@@ -172,8 +194,9 @@ impl CacheBackend for RedisCacheBackend {
             cmd.arg(&k).arg(&value);
             if let Some(ttl) = ttl {
                 // Why: Redis `SET ... PX` rejects `0` with `ERR invalid expire time`.
-                // Clamp sub-millisecond and zero durations to 1ms, matching `set_with_tags`.
-                let px_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
+                // Clamp sub-millisecond and zero durations to 1ms and extreme values to
+                // `MAX_REDIS_TTL_MS`, matching `set_with_tags`.
+                let px_ms = clamp_redis_ttl_ms(ttl);
                 cmd.arg("PX").arg(px_ms);
             }
 
@@ -205,7 +228,7 @@ impl CacheBackend for RedisCacheBackend {
                 let mut cmd = redis::cmd("SET");
                 cmd.arg(&k).arg(&value);
                 if let Some(ttl) = ttl {
-                    cmd.arg("PX").arg(ttl.as_millis().max(1) as u64);
+                    cmd.arg("PX").arg(clamp_redis_ttl_ms(ttl));
                 }
                 cmd.query_async::<()>(&mut *conn)
                     .await
@@ -264,14 +287,7 @@ impl CacheBackend for RedisCacheBackend {
                 return 1
             "#;
 
-            let val_ttl_arg: i64 = match ttl {
-                Some(t) => i64::try_from(t.as_millis().max(1)).unwrap_or(i64::MAX),
-                None => -1,
-            };
-            let tag_ttl_arg: i64 = match ttl {
-                Some(t) => (t.as_millis().max(1) as i64).saturating_add(3_600_000),
-                None => -1,
-            };
+            let (val_ttl_arg, tag_ttl_arg) = redis_ttl_args(ttl);
 
             let script = redis::Script::new(SET_WITH_TAGS_SCRIPT);
             let mut invocation = script.prepare_invoke();
@@ -466,5 +482,22 @@ mod tests {
                 r"app\[1\]\*:tag:t\?a\[0\]\\b:*".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn redis_ttl_args_clamps_large_durations_without_negative_wrap() {
+        let (val_ms, tag_ms) = redis_ttl_args(Some(Duration::MAX));
+        assert_eq!(val_ms, MAX_REDIS_TTL_MS);
+        assert_eq!(tag_ms, MAX_REDIS_TTL_MS);
+        assert!(val_ms > 0);
+        assert!(tag_ms > 0);
+
+        // Duration just above i64::MAX ms previously wrapped negative on `as i64`
+        let over_i64_max = Duration::from_millis((i64::MAX as u64) + 1);
+        let (val2, tag2) = redis_ttl_args(Some(over_i64_max));
+        assert!(val2 > 0 && val2 <= MAX_REDIS_TTL_MS);
+        assert!(tag2 > 0 && tag2 <= MAX_REDIS_TTL_MS);
+
+        assert_eq!(redis_ttl_args(None), (-1, -1));
     }
 }

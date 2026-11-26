@@ -9,6 +9,7 @@ use axum::http::header::{COOKIE, SET_COOKIE};
 use axum::http::{HeaderValue, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use tower::{Layer, Service};
+use zeroize::Zeroizing;
 
 use rume_foundation::error::AppError;
 use rume_foundation::util::safe_equal;
@@ -23,7 +24,7 @@ fn to_hex(bytes: &[u8]) -> String {
 }
 
 /// CSRF protection configuration.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct CsrfConfig {
     /// Header name to read the client token from (default: `x-csrf-token`).
     pub header_name: String,
@@ -32,7 +33,7 @@ pub struct CsrfConfig {
     /// Set of URL path prefixes exempt from CSRF validation.
     pub exempt_prefixes: BTreeSet<String>,
     /// Optional secret key for HMAC-signing tokens to defeat subdomain cookie tossing.
-    pub secret: Option<Vec<u8>>,
+    pub secret: Option<Zeroizing<Vec<u8>>>,
     /// Explicit opt-in to allow unauthenticated double-submit tokens when `secret` is None.
     /// Default is `false` (fail-closed) to protect against subdomain cookie-tossing in production.
     pub allow_unauthenticated: bool,
@@ -46,6 +47,23 @@ pub struct CsrfConfig {
     pub cookie_secure: bool,
     /// Cookie HttpOnly flag (default: `false` so client-side JavaScript can read it for double-submit headers).
     pub cookie_http_only: bool,
+}
+
+impl std::fmt::Debug for CsrfConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CsrfConfig")
+            .field("header_name", &self.header_name)
+            .field("cookie_name", &self.cookie_name)
+            .field("exempt_prefixes", &self.exempt_prefixes)
+            .field("secret", &self.secret.as_ref().map(|_| "[REDACTED]"))
+            .field("allow_unauthenticated", &self.allow_unauthenticated)
+            .field("auto_inject_cookie", &self.auto_inject_cookie)
+            .field("cookie_path", &self.cookie_path)
+            .field("cookie_same_site", &self.cookie_same_site)
+            .field("cookie_secure", &self.cookie_secure)
+            .field("cookie_http_only", &self.cookie_http_only)
+            .finish()
+    }
 }
 
 impl Default for CsrfConfig {
@@ -103,7 +121,7 @@ impl CsrfConfig {
             !secret.is_empty(),
             "CSRF HMAC secret must not be empty; supply a high-entropy shared key or use with_random_secret()"
         );
-        self.secret = Some(secret);
+        self.secret = Some(Zeroizing::new(secret));
         self
     }
 
@@ -112,7 +130,7 @@ impl CsrfConfig {
         let mut secret = Vec::with_capacity(32);
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
         secret.extend_from_slice(uuid::Uuid::new_v4().as_bytes());
-        self.secret = Some(secret);
+        self.secret = Some(Zeroizing::new(secret));
         self
     }
 
@@ -256,7 +274,7 @@ impl CsrfLayer {
     /// Panics if `config.secret` is `Some` with an empty byte slice.
     pub fn with_config(config: CsrfConfig) -> Self {
         assert!(
-            !matches!(config.secret.as_deref(), Some([])),
+            !config.secret.as_ref().is_some_and(|s| s.is_empty()),
             "CSRF HMAC secret must not be empty; supply a high-entropy shared key or use CsrfLayer::with_random_secret()"
         );
         if config.secret.is_none() && !config.allow_unauthenticated {
@@ -463,7 +481,7 @@ mod tests {
     #[should_panic(expected = "CSRF HMAC secret must not be empty")]
     fn test_csrf_layer_with_config_rejects_empty_secret() {
         let config = CsrfConfig {
-            secret: Some(Vec::new()),
+            secret: Some(Zeroizing::new(Vec::new())),
             ..Default::default()
         };
         let _ = CsrfLayer::with_config(config);
@@ -476,9 +494,13 @@ mod tests {
         let token = config.generate_token();
         assert!(config.verify_token(&token));
 
+        let dbg = format!("{config:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("high-entropy"));
+
         let _layer = CsrfLayer::with_random_secret();
         let empty_struct = CsrfConfig {
-            secret: Some(Vec::new()),
+            secret: Some(Zeroizing::new(Vec::new())),
             ..Default::default()
         };
         assert!(!empty_struct.verify_token("anything.deadbeef"));

@@ -252,15 +252,23 @@ impl<S: SessionStore> SessionScheme<S> {
     }
 }
 
+/// Maximum number of matching session cookie candidates queried against the store per request.
+///
+/// Why: bounds per-request store lookups against cookie-flooding DoS while still tolerating
+/// legitimate stale/tossed duplicate cookies.
+const MAX_SESSION_COOKIE_CANDIDATES: usize = 8;
+
 impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
     fn authenticate<'a>(
         &'a self,
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<AuthUser>, AuthError>> {
         Box::pin(async move {
-            // Security M2: Iterate through all Cookie headers and all matching cookie pairs.
+            // Security M2: Iterate through all Cookie headers and all matching cookie pairs,
+            // capped at `MAX_SESSION_COOKIE_CANDIDATES` store lookups per request.
             // Continuing past invalid/stale cookies defeats subdomain cookie-tossing DoS,
             // where an attacker sets a bogus parent-domain cookie with the same name.
+            let mut candidates_checked = 0usize;
             for cookie_header in parts.headers.get_all(COOKIE) {
                 let Ok(cookie_str) = cookie_header.to_str() else {
                     continue;
@@ -270,6 +278,10 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
                     if let Some((name, val)) = cookie.trim().split_once('=')
                         && name == self.cookie_name
                     {
+                        if candidates_checked >= MAX_SESSION_COOKIE_CANDIDATES {
+                            return Ok(None);
+                        }
+                        candidates_checked += 1;
                         match self.store.load(val).await {
                             Ok(Some(session)) => {
                                 let mut user = AuthUser::new(session.user_id)
@@ -434,5 +446,54 @@ mod tests {
             std::str::from_utf8(&bytes).unwrap(),
             "svc-user:Some(\"tenant-xyz\"):billing:read,invoices:write"
         );
+    }
+
+    #[tokio::test]
+    async fn session_scheme_caps_cookie_candidate_store_lookups() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::auth::session::Session;
+
+        struct CountingStore {
+            loads: Arc<AtomicUsize>,
+        }
+
+        impl SessionStore for CountingStore {
+            fn load(&self, _id: &str) -> BoxFuture<'_, Result<Option<Session>, AuthError>> {
+                self.loads.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(None) })
+            }
+            fn save(&self, _session: Session) -> BoxFuture<'_, Result<(), AuthError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn destroy(&self, _id: &str) -> BoxFuture<'_, Result<(), AuthError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn regenerate_id<'a>(
+                &'a self,
+                _old_id: &'a str,
+            ) -> BoxFuture<'a, Result<Session, AuthError>> {
+                Box::pin(async { Err(AuthError::InvalidCredentials("unused".into())) })
+            }
+        }
+
+        let loads = Arc::new(AtomicUsize::new(0));
+        let scheme = SessionScheme::new(CountingStore {
+            loads: Arc::clone(&loads),
+        });
+
+        let cookie_header = (0..25)
+            .map(|i| format!("rume_session=bogus-{i}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let req = Request::builder()
+            .header(COOKIE, cookie_header)
+            .body(())
+            .unwrap();
+        let (parts, ()) = req.into_parts();
+
+        let res = scheme.authenticate(&parts).await.unwrap();
+        assert!(res.is_none());
+        assert_eq!(loads.load(Ordering::SeqCst), MAX_SESSION_COOKIE_CANDIDATES);
     }
 }
