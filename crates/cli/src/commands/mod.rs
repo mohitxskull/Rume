@@ -1,6 +1,7 @@
 mod codegen;
 mod config;
 mod db;
+mod dev;
 mod doctor;
 mod env;
 mod generate;
@@ -107,6 +108,15 @@ pub async fn run(cli: Cli) {
         }
         Some(Commands::Openapi { command }) => {
             openapi::run(command);
+        }
+        Some(Commands::Dev {
+            bin,
+            watch,
+            no_migrate,
+            debounce_ms,
+        }) => {
+            require_rume_project();
+            dev::run(bin, watch, no_migrate, debounce_ms).await;
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

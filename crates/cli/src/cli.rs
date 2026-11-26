@@ -141,6 +141,21 @@ pub enum Commands {
         #[command(subcommand)]
         command: OpenapiCommands,
     },
+    /// Run the application in live-reload development mode.
+    Dev {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Paths to watch for changes (repeatable; defaults to src, config, migrations, sql, Cargo.toml).
+        #[arg(long)]
+        watch: Vec<std::path::PathBuf>,
+        /// Skip running `db migrate` before initial server boot.
+        #[arg(long)]
+        no_migrate: bool,
+        /// Debounce window in milliseconds before restarting on changes.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
