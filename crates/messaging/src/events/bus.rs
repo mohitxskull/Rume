@@ -218,7 +218,7 @@ impl EventBus {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::SdkTracerProvider;
@@ -235,7 +235,8 @@ mod tests {
         const TYPE: &'static str = "test.sync_event";
     }
 
-    static SUBSCRIBER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    pub(crate) static SUBSCRIBER_TEST_LOCK: tokio::sync::Mutex<()> =
+        tokio::sync::Mutex::const_new(());
 
     #[tokio::test]
     async fn event_bus_publish_sync_creates_span_and_propagates_trace_context() {
