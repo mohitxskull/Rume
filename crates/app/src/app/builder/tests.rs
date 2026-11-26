@@ -954,3 +954,23 @@ async fn wait_for_ready(
         tokio::task::yield_now().await;
     }
 }
+
+#[tokio::test]
+async fn inspect_mode_fails_closed_on_invalid_cors_config() {
+    let invalid_cors = rume_http::transport::CorsConfig::new()
+        .allow_any_origin()
+        .allow_credentials(true);
+
+    let err = RumeBuilder::new(test_ctx())
+        .mode(ApplicationMode::Inspect)
+        .cors(invalid_cors)
+        .get("/ping", || async { "pong" })
+        .run()
+        .await
+        .expect_err("inspect mode must fail closed on invalid CORS config");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("allow_credentials"),
+        "expected CORS error message, got: {err}"
+    );
+}

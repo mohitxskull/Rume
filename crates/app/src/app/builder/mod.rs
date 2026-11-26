@@ -32,6 +32,8 @@ pub use self::middleware::MiddlewareConfigError;
 pub enum BuildError {
     /// Middleware configuration error.
     Middleware(MiddlewareConfigError),
+    /// CORS configuration error.
+    Cors(rume_http::transport::CorsConfigError),
     /// Module registration or dependency error.
     Module(crate::module::ModuleError),
     /// Application or module startup hook failure.
@@ -46,6 +48,7 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Middleware(err) => write!(f, "{err}"),
+            Self::Cors(err) => write!(f, "{err}"),
             Self::Module(err) => write!(f, "{err}"),
             Self::Startup(msg) => write!(f, "startup failure: {msg}"),
             Self::DuplicateRoute { method, path } => {
@@ -61,6 +64,12 @@ impl std::error::Error for BuildError {}
 impl From<MiddlewareConfigError> for BuildError {
     fn from(err: MiddlewareConfigError) -> Self {
         Self::Middleware(err)
+    }
+}
+
+impl From<rume_http::transport::CorsConfigError> for BuildError {
+    fn from(err: rume_http::transport::CorsConfigError) -> Self {
+        Self::Cors(err)
     }
 }
 
@@ -276,6 +285,14 @@ where
     applied_groups: BTreeSet<String>,
     /// Maximum time to wait for all shutdown hooks before force-terminating.
     shutdown_timeout: Duration,
+    /// Transport-level maximum request body size in bytes (default: 2 MiB; `None` disables the cap).
+    body_limit: Option<usize>,
+    /// Optional fail-closed CORS configuration (opt-in; `None` by default).
+    cors: Option<rume_http::transport::CorsConfig>,
+    /// Optional HTTP response compression configuration (opt-in; `None` by default).
+    compression: Option<rume_http::transport::CompressionConfig>,
+    /// Optional HTTP header & JSON PII redaction configuration for `ObservabilityLayer`.
+    redaction: Option<rume_observability::RedactionConfig>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -302,6 +319,10 @@ where
             applied_middleware: BTreeSet::new(),
             applied_groups: BTreeSet::new(),
             shutdown_timeout: Duration::from_secs(30),
+            body_limit: Some(rume_http::transport::DEFAULT_BODY_LIMIT_BYTES),
+            cors: None,
+            compression: None,
+            redaction: None,
         }
     }
 
@@ -419,6 +440,36 @@ where
         self
     }
 
+    /// Set the transport-level maximum request body size in bytes (default: 2 MiB).
+    pub fn body_limit(mut self, max_bytes: usize) -> Self {
+        self.body_limit = Some(max_bytes);
+        self
+    }
+
+    /// Disable the transport-level request body size limit.
+    pub fn without_body_limit(mut self) -> Self {
+        self.body_limit = None;
+        self
+    }
+
+    /// Enable fail-closed CORS middleware with the given [`rume_http::transport::CorsConfig`].
+    pub fn cors(mut self, config: rume_http::transport::CorsConfig) -> Self {
+        self.cors = Some(config);
+        self
+    }
+
+    /// Enable HTTP response compression (gzip, brotli, zstd) with the given [`rume_http::transport::CompressionConfig`].
+    pub fn compression(mut self, config: rume_http::transport::CompressionConfig) -> Self {
+        self.compression = Some(config);
+        self
+    }
+
+    /// Configure structured PII redaction on the framework [`ObservabilityLayer`](crate::app::observability::ObservabilityLayer).
+    pub fn redaction(mut self, config: rume_observability::RedactionConfig) -> Self {
+        self.redaction = Some(config);
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
         if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
@@ -450,6 +501,9 @@ where
             &self.applied_middleware,
             &self.applied_groups,
         )?;
+        if let Some(ref cors_cfg) = self.cors {
+            let _ = cors_cfg.build_layer().map_err(BuildError::from)?;
+        }
         let app_routes = self
             .route_registry
             .read()

@@ -40,6 +40,9 @@ pub mod events;
 #[path = "integration/health.rs"]
 pub mod health;
 
+#[path = "integration/http_baseline.rs"]
+pub mod http_baseline;
+
 #[path = "integration/http_smoke.rs"]
 pub mod http_smoke;
 

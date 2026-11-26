@@ -59,15 +59,15 @@ Default features: `sqlite`, `testing`.
 |---|---|
 | `crates/core/` | `rume` — umbrella facade crate and integration/container test suites |
 | `crates/foundation/` | `rume-foundation` — errors, config, env, secrets, health, helpers |
-| `crates/observability/` | `rume-observability` — OpenTelemetry traces, W3C context, metrics |
+| `crates/observability/` | `rume-observability` — OpenTelemetry traces, W3C context, Prometheus/OpenMetrics exposition, PII redaction |
 | `crates/data/` | `rume-data` — persistence backends, migrations, typed/singleflight cache, locks & leader election |
 | `crates/messaging/` | `rume-messaging` — event bus, transactional outbox, job queue & worker |
 | `crates/security/` | `rume-security` — auth, CSRF, headers, multi-tenancy & tenant-scoped cache/quotas |
-| `crates/http/` | `rume-http` — routing, route registry, OpenAPI, validation, circuit breaker & rate limiter |
+| `crates/http/` | `rume-http` — routing, route registry, transport middleware (CORS/compression/body limits), OpenAPI & Docs UI, validation, circuit breaker & rate limiter |
 | `crates/enterprise/` | `rume-enterprise` — SAML, SCIM, and Saga workflows |
 | `crates/app/` | `rume-app` — `Rume` builder, lifecycle, and module composition |
 | `crates/testing/` | `rume-testing` — test harnesses and fixtures |
-| `crates/macro/` | `rume-macros` — procedural macros (`embed_migrations!`, `sql_assets!`, etc.) |
+| `crates/macro/` | `rume-macros` — procedural macros (`embed_migrations!`, `sql_assets!`, `#[derive(HasOpenApiSchema)]`) |
 | `crates/cli/` | `rume-cli` — `rume` CLI (`new`, `doctor`, `sql:check`, `list:routes`, `db`, `config`, `make:migration`, `generate`, `codegen`) |
 | `crates/crash/` | `rume-crash` — internal crash-recovery test harness (`publish = false`) |
 | `crates/xtask/` | `xtask` — workspace automation tasks |

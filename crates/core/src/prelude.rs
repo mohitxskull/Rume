@@ -1,5 +1,6 @@
 //! Convenience re-exports for standard Rume applications.
 
+pub use crate::HasOpenApiSchema;
 pub use crate::app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
     IntoBindAddr, Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder,

@@ -29,13 +29,15 @@ pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::util;
-pub use rume_http::openapi;
 pub use rume_http::resilience;
+pub use rume_http::transport;
 pub use rume_http::validation;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
 pub use rume_messaging::outbox;
 pub use rume_observability::metrics;
+pub use rume_observability::prometheus;
+pub use rume_observability::redaction;
 pub use rume_security::auth;
 pub use rume_security::security;
 pub use rume_security::tenant;
@@ -43,6 +45,12 @@ pub use rume_security::tenant;
 pub use rume_testing as testing;
 
 pub mod prelude;
+
+/// OpenAPI v3.1 specification, docs UI, and `HasOpenApiSchema` derive.
+pub mod openapi {
+    pub use rume_http::openapi::*;
+    pub use rume_macros::HasOpenApiSchema;
+}
 
 /// First-class application modules (re-exported from `rume-app` and `rume-testing`).
 pub mod module {
@@ -76,4 +84,4 @@ pub use events::{Event, EventBus};
 pub use module::{Module, ModuleContext};
 pub use routing::Router;
 pub use rume_data::{MetricsRegistryPoolExt, params};
-pub use rume_macros::{embed_migrations, sql_assets};
+pub use rume_macros::{HasOpenApiSchema, embed_migrations, sql_assets};
