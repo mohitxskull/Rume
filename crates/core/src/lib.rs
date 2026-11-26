@@ -30,9 +30,20 @@ pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::util;
+#[cfg(feature = "graphql")]
+pub use rume_graphql as graphql;
+#[cfg(feature = "grpc")]
+pub use rume_grpc as grpc;
 pub use rume_http::client;
+pub use rume_http::http_cache;
 pub use rume_http::pagination;
+pub use rume_http::realtime;
 pub use rume_http::resilience;
+#[cfg(feature = "scim")]
+pub use rume_http::scim;
+pub use rume_http::static_files;
+#[cfg(feature = "tls")]
+pub use rume_http::tls;
 pub use rume_http::transport;
 pub use rume_http::upload;
 pub use rume_http::validation;
@@ -40,12 +51,15 @@ pub use rume_messaging::broker;
 pub use rume_messaging::cron;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
+pub use rume_messaging::mailer;
 pub use rume_messaging::outbox;
 pub use rume_messaging::pubsub;
 pub use rume_observability::metrics;
 pub use rume_observability::prometheus;
 pub use rume_observability::redaction;
 pub use rume_security::auth;
+pub use rume_security::flags;
+pub use rume_security::metering;
 pub use rume_security::security;
 pub use rume_security::tenant;
 #[cfg(feature = "testing")]
@@ -64,6 +78,12 @@ pub mod module {
     pub use rume_app::module::*;
     #[cfg(feature = "testing")]
     pub use rume_testing::{ModuleHarness, ModuleTestHarness};
+}
+
+/// Outbound webhook dispatching/signing and inbound HMAC-SHA256 verification.
+pub mod webhooks {
+    pub use rume_http::webhooks::*;
+    pub use rume_messaging::webhooks::*;
 }
 
 /// Routing re-exports from `rume-http` with `AppContext`-typed `health_routes`.

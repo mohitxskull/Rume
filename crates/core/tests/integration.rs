@@ -64,6 +64,16 @@ pub mod milestone_c_e2e;
 #[cfg(feature = "sqlite")]
 pub mod milestone_d_e2e;
 
+#[path = "integration/milestone_e_e2e.rs"]
+#[cfg(all(
+    feature = "sqlite",
+    feature = "tls",
+    feature = "scim",
+    feature = "grpc",
+    feature = "graphql"
+))]
+pub mod milestone_e_e2e;
+
 #[path = "integration/openapi.rs"]
 pub mod openapi;
 

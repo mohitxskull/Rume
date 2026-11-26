@@ -67,6 +67,7 @@ sqlite = [
 mysql = [
     "rume-data/mysql",
     "rume-messaging/mysql",
+    "rume-security/mysql",
     "rume-enterprise/mysql",
     "rume-testing?/mysql",
 ]
@@ -115,6 +116,12 @@ secrecy.workspace = true
 sha2.workspace = true
 signature.workspace = true
 sea-query.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+tonic.workspace = true
+async-graphql.workspace = true
 
 [[test]]
 name = "integration"
