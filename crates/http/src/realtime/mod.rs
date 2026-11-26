@@ -430,6 +430,30 @@ mod tests {
             Err(RealtimeError::InvalidIdentifier { kind: "room", .. })
         ));
 
+        let signer = RealtimeTicketSigner::new(TEST_SECRET).expect("signer");
+        assert!(matches!(
+            signer.issue("user-1", "acme\nbad", None, 60),
+            Err(RealtimeError::InvalidIdentifier {
+                kind: "tenant_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            signer.issue("user-1", "acme", Some("room\x00bad".to_string()), 60),
+            Err(RealtimeError::InvalidIdentifier { kind: "room", .. })
+        ));
+        assert!(matches!(
+            signer.issue("user-1", "", None, 60),
+            Err(RealtimeError::InvalidIdentifier {
+                kind: "tenant_id",
+                ..
+            })
+        ));
+        assert!(matches!(
+            signer.issue("user-1", "acme", Some("a:b".to_string()), 60),
+            Err(RealtimeError::InvalidIdentifier { kind: "room", .. })
+        ));
+
         let mut sub = hub.subscribe("acme", "fast").await.expect("subscribe");
         for i in 0..5 {
             hub.publish(

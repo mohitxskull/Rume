@@ -283,7 +283,7 @@ impl RealtimeHub {
         }
     }
 
-    fn validate_segment(kind: &'static str, value: &str) -> Result<(), RealtimeError> {
+    pub(crate) fn validate_segment(kind: &'static str, value: &str) -> Result<(), RealtimeError> {
         if value.is_empty() || value.contains(':') || value.chars().any(char::is_control) {
             return Err(RealtimeError::InvalidIdentifier {
                 kind,
@@ -430,9 +430,9 @@ impl RealtimeHub {
         })
     }
 
-    /// Signals graceful shutdown to all active WebSocket and SSE streams and waits
-    /// up to `shutdown_drain_timeout` for them to close.
-    pub async fn shutdown(&self) {
+    /// Broadcasts the shutdown signal to all active WebSocket and SSE streams and
+    /// aborts background pub/sub pump tasks without waiting for connections to drain.
+    pub fn initiate_shutdown(&self) {
         self.inner.shutdown_tx.send_replace(true);
         let handles: Vec<_> = {
             let mut tasks = self.inner.pubsub_tasks.lock();
@@ -441,7 +441,11 @@ impl RealtimeHub {
         for handle in handles {
             handle.abort();
         }
+    }
 
+    /// Waits up to `shutdown_drain_timeout` for all active WebSocket and SSE
+    /// connections to close.
+    pub async fn wait_drained(&self) {
         if self.inner.active_connections.load(Ordering::Acquire) == 0 {
             return;
         }
@@ -456,5 +460,12 @@ impl RealtimeHub {
                 break;
             }
         }
+    }
+
+    /// Signals graceful shutdown to all active WebSocket and SSE streams and waits
+    /// up to `shutdown_drain_timeout` for them to close.
+    pub async fn shutdown(&self) {
+        self.initiate_shutdown();
+        self.wait_drained().await;
     }
 }

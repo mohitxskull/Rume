@@ -93,7 +93,14 @@ impl AcmeConfig {
             .map_err(|err| TlsError::Rustls(err.to_string()))?
             .with_no_client_auth()
             .with_cert_resolver(state.resolver());
-        server_config.alpn_protocols = alpn_protocols.to_vec();
+        server_config.alpn_protocols = {
+            let mut alpn = alpn_protocols.to_vec();
+            let acme_alpn = rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec();
+            if !alpn.contains(&acme_alpn) {
+                alpn.push(acme_alpn);
+            }
+            alpn
+        };
 
         let driver = tokio::spawn(async move {
             while let Some(event) = state.next().await {
@@ -116,5 +123,27 @@ fn normalize_contact(email: String) -> String {
         email
     } else {
         format!("mailto:{email}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn acme_build_acceptor_includes_acme_tls_alpn() {
+        let cfg = AcmeConfig::new(["example.com"]).contact(["ops@example.com"]);
+        let alpn = [b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (acceptor, driver) = cfg
+            .build_acceptor(&alpn)
+            .expect("AcmeConfig::build_acceptor should succeed");
+        let server_alpn = &acceptor.config().alpn_protocols;
+        assert!(
+            server_alpn.contains(&rustls_acme::acme::ACME_TLS_ALPN_NAME.to_vec()),
+            "ACME acceptor must advertise acme-tls/1 ALPN, got: {server_alpn:?}"
+        );
+        assert!(server_alpn.contains(&b"h2".to_vec()));
+        assert!(server_alpn.contains(&b"http/1.1".to_vec()));
+        driver.abort();
     }
 }

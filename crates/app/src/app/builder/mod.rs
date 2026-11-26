@@ -687,6 +687,8 @@ where
         // --- Step 7: Serve traffic with immediate lifecycle & availability transition on shutdown ---
         let shutdown_lifecycle = serve_ctx.lifecycle.clone();
         let shutdown_availability = serve_ctx.availability.clone();
+        let shutdown_realtime = realtime.clone();
+        let drain_check_rx = shutdown_rx.clone();
 
         let graceful_signal = async move {
             let _ = shutdown_rx.wait_for(|&shutting_down| shutting_down).await;
@@ -695,8 +697,10 @@ where
             );
             shutdown_lifecycle.set(LifecycleState::Terminating);
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
-            if let Some(hub) = realtime {
-                hub.shutdown().await;
+            // Why: initiate_shutdown only broadcasts the shutdown signal so the HTTP/TLS
+            // accept loop exits immediately instead of blocking on connection drain.
+            if let Some(hub) = shutdown_realtime {
+                hub.initiate_shutdown();
             }
         };
 
@@ -738,6 +742,14 @@ where
                 .await
             }
         };
+
+        if let Some(hub) = realtime {
+            if *drain_check_rx.borrow() {
+                hub.wait_drained().await;
+            } else {
+                hub.shutdown().await;
+            }
+        }
 
         // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
         crate::app::lifecycle::run_shutdown(

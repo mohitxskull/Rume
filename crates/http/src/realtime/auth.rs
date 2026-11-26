@@ -9,7 +9,7 @@ use axum::http::request::Parts;
 use rume_security::auth::{AuthUser, Session, SignedTokenClaims, TokenSigner};
 use rume_security::tenant::Tenant;
 
-use crate::realtime::hub::RealtimeError;
+use crate::realtime::hub::{RealtimeError, RealtimeHub};
 
 const REALTIME_TICKET_PURPOSE: &str = "realtime";
 
@@ -56,22 +56,12 @@ impl RealtimeTicketSigner {
         ttl_secs: u64,
     ) -> Result<String, RealtimeError> {
         let tenant_id = tenant_id.into();
-        if tenant_id.is_empty() || tenant_id.contains(':') {
-            return Err(RealtimeError::InvalidIdentifier {
-                kind: "tenant_id",
-                value: tenant_id,
-            });
-        }
+        RealtimeHub::validate_segment("tenant_id", &tenant_id)?;
         let now = now_epoch_secs();
         let mut metadata = BTreeMap::new();
         metadata.insert("tenant_id".to_string(), tenant_id);
         if let Some(r) = room {
-            if r.is_empty() || r.contains(':') {
-                return Err(RealtimeError::InvalidIdentifier {
-                    kind: "room",
-                    value: r,
-                });
-            }
+            RealtimeHub::validate_segment("room", &r)?;
             metadata.insert("room".to_string(), r);
         }
 

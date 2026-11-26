@@ -1088,6 +1088,86 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
     );
 }
 
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn rume_builder_tls_negotiates_h2_alpn() {
+    use std::sync::Arc;
+
+    const TEST_CERT_PEM: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBwDCCAWWgAwIBAgIUIi3+ZI/tJFK4wTVlTFPD6QkG8XAwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNjEyMTYwMloYDzIxMDAxMDI5
+MTIxNjAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAATIw5glQvkynffHCd5iEclrqe+juD6xFx8A1F43+PqLjpra4wZ3non1
+Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrryo4GSMIGPMB0GA1UdDgQWBBQQ8rRAB+Bs
++SsH4WcR+cJEbH+hTzAfBgNVHSMEGDAWgBQQ8rRAB+Bs+SsH4WcR+cJEbH+hTzAM
+BgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcD
+ATAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDSQAwRgIh
+APyYGMmbXQV05SjOkoWARBTijDUQ9v3rvdTvfFFJ8HXSAiEA/rJYP8/AcQalmlJL
+MOAtrICgSzS3UyLAhl16728zqGc=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo2otzH6WgCrTvKb8
+Mad8NskKE+yg2Tqk/S0mX41X1AGhRANCAATIw5glQvkynffHCd5iEclrqe+juD6x
+Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
+-----END PRIVATE KEY-----
+";
+
+    let tls_config = rume_http::tls::TlsConfig::from_pem_bytes(TEST_CERT_PEM, TEST_KEY_PEM)
+        .expect("valid PEM cert and key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Rume::new()
+        .tls(tls_config)
+        .get("/h2-ping", || async { "ok" });
+    let lifecycle = app.lifecycle();
+
+    let mut server = tokio::spawn(async move {
+        app.run_with_listener_and_signal(listener, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
+    for cert in rustls_pemfile::certs(&mut cert_reader) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    assert_eq!(
+        tls_stream.get_ref().1.alpn_protocol(),
+        Some(b"h2".as_slice()),
+        "server must negotiate h2 ALPN over TLS"
+    );
+    drop(tls_stream);
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn rume_builder_realtime_attaches_hub_and_drains_on_shutdown() {
     let hub = rume_http::realtime::RealtimeHub::new(
