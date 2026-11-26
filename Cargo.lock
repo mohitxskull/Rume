@@ -4478,6 +4478,7 @@ dependencies = [
  "rume-observability",
  "rume-security",
  "rume-testing",
+ "sea-query",
  "secrecy",
  "serde",
  "serde_json",

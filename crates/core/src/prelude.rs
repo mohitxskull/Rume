@@ -1,5 +1,6 @@
 //! Convenience re-exports for standard Rume applications.
 
+pub use crate::FromRow;
 pub use crate::HasOpenApiSchema;
 pub use crate::app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
@@ -7,12 +8,17 @@ pub use crate::app::{
 };
 pub use crate::error::AppError;
 pub use crate::module::{Module, ModuleContext};
+pub use crate::persistence::{
+    CursorPage, DynamicSelect, OffsetPage, OptimisticLock, ReadWritePool, SoftDeletable,
+};
 pub use crate::routing::{
     HealthCheck, HealthChecks, HealthReport, HealthStatus, Matcher, RouteGroup, RouteInfo,
     RouteRegistry, RouteSpec, Router,
 };
+pub use crate::storage::ObjectStore;
 #[cfg(feature = "testing")]
 pub use crate::testing::{RumeTestingExt, TestApp, TestAppBuilder};
+pub use crate::upload::ValidatedMultipart;
 pub use crate::validation::{
     Validated, ValidatedForm, ValidatedJson, ValidatedPath, ValidatedQuery,
 };

@@ -61,6 +61,7 @@ mysql = [
 saml = ["rume-enterprise/saml"]
 enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]
+s3 = ["rume-data/s3"]
 
 [dev-dependencies]
 # Why: `tokio`, `sqlx`, and `uuid` belong in `[dev-dependencies]` rather than runtime
@@ -94,6 +95,7 @@ rsa.workspace = true
 secrecy.workspace = true
 sha2.workspace = true
 signature.workspace = true
+sea-query.workspace = true
 
 [[test]]
 name = "integration"
