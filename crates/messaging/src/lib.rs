@@ -6,7 +6,6 @@ pub mod broker;
 pub mod cron;
 pub mod events;
 pub mod jobs;
-#[cfg(feature = "mailer")]
 pub mod mailer;
 pub mod outbox;
 pub mod pubsub;

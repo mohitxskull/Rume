@@ -23,6 +23,7 @@ hmac.workspace = true
 sha2.workspace = true
 hex.workspace = true
 secrecy.workspace = true
+reqwest.workspace = true
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }

@@ -685,6 +685,45 @@ pub const PG_WEBHOOK_DELIVERIES_SCHEMA: &str =
 pub const MYSQL_WEBHOOK_DELIVERIES_SCHEMA: &str =
     include_str!("../sql/mysql/webhook_deliveries_schema.sql");
 
+/// Upsert a webhook delivery record in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_list_due.sql");
+
+/// Upsert a webhook delivery record in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/postgres/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/postgres/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/postgres/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/postgres/webhook_deliveries_list_due.sql");
+
+/// Upsert a webhook delivery record in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/mysql/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/mysql/webhook_deliveries_list_due.sql");
+
 #[cfg(test)]
 mod tests {
     use super::*;

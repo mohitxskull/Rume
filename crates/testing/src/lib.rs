@@ -22,6 +22,7 @@ pub use fixtures::PostgresSchemaFixture;
 pub use fixtures::SqliteTestFixture;
 pub use fixtures::TestTransactionFixture;
 pub use jobs::TestJobQueue;
+pub use mailer::TestMailer;
 pub use module_harness::{ModuleHarness, ModuleTestHarness};
 #[cfg(feature = "testing")]
 pub use server::TestServer;
