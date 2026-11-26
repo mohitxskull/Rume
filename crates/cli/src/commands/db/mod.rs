@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use comfy_table::Color;
 use console::style;
@@ -343,215 +343,36 @@ pub(crate) fn resolve_db_url_for_env_with_vars<I>(
 where
     I: IntoIterator<Item = (String, String)>,
 {
-    // Why: parse `.env` files raw (without `dotenvy`'s eager per-file `${VAR}`
-    // expansion) and run `rume::env::interpolate_value` only after all `.env*`
-    // layers and process env are merged, so overrides in `.env.{env}` /
-    // `.env.local` drive `${VAR}` expansion inside `DATABASE_URL`.
-    // Also fail closed on any `.env` load/parse/interpolation error instead of
-    // silently falling back to `config/app*.toml`.
-    let mut merged: BTreeMap<String, String> = BTreeMap::new();
+    // Why: delegate `.env*` layering, `file:` resolution, and post-merge interpolation
+    // to `rume::env::ResolvedEnv::load_for_env_with_vars` (single source of truth).
+    // Process-only `DATABASE_URL` values are not interpolated by `ResolvedEnv`, preserving
+    // literal `${...}` sequences in passwords, and `.env` parse/interpolation errors fail
+    // closed instead of silently falling back to `config/app*.toml`.
+    let resolved = rume::env::ResolvedEnv::load_for_env_with_vars(dir, env_name, process_vars)
+        .map_err(|e| format!("failed to resolve environment: {e}"))?;
 
-    for path in dotenv_candidates(dir, env_name) {
-        if !path.is_file() {
-            continue;
-        }
-        let content = fs::read_to_string(&path)
-            .map_err(|e| format!("failed to read environment file {}: {e}", path.display()))?;
-        for (key, raw_value) in parse_dotenv(&content, &path)? {
-            let value = resolve_file_value(raw_value, dir, &path)?;
-            merged.insert(key, value);
-        }
-    }
-
-    for (key, value) in process_vars {
-        merged.insert(key, value);
-    }
-
-    if let Some(raw_url) = merged.get("DATABASE_URL") {
-        let resolved = rume::env::interpolate_value(raw_url, &merged)
-            .map_err(|e| format!("failed to resolve DATABASE_URL: {e}"))?;
-        let trimmed = resolved.trim();
+    if let Some(url) = resolved.get("DATABASE_URL") {
+        let trimmed = url.trim();
         if !trimmed.is_empty() {
             return Ok(Some(trimmed.to_string()));
         }
     }
 
-    let Some(cfg) = rume::config::load_in::<DatabaseFileConfig>(dir).ok() else {
-        return Ok(None);
-    };
-    let Some(url) = cfg.database.and_then(|d| d.url) else {
-        return Ok(None);
-    };
-    let trimmed = url.trim();
-    if !trimmed.is_empty() {
-        Ok(Some(trimmed.to_string()))
-    } else {
-        Ok(None)
-    }
-}
-
-fn dotenv_candidates(dir: &Path, env_name: &str) -> Vec<PathBuf> {
-    let is_test = env_name == "test" || env_name == "testing";
-    let mut candidates = vec![dir.join(".env"), dir.join(format!(".env.{env_name}"))];
-    if !is_test {
-        candidates.push(dir.join(".env.local"));
-    }
-    candidates.push(dir.join(format!(".env.{env_name}.local")));
-    candidates
-}
-
-fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>, String> {
-    let mut entries = Vec::new();
-    for (idx, raw_line) in content.lines().enumerate() {
-        let line_no = idx + 1;
-        let trimmed = raw_line.trim_start();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-
-        let after_export = trimmed
-            .strip_prefix("export ")
-            .or_else(|| trimmed.strip_prefix("export\t"))
-            .map(str::trim_start)
-            .unwrap_or(trimmed);
-
-        let Some((raw_key, raw_val)) = after_export.split_once('=') else {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: missing '='",
-                path.display()
-            ));
-        };
-
-        let key = raw_key.trim();
-        if key.is_empty() || key.chars().any(char::is_whitespace) {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: invalid variable name",
-                path.display()
-            ));
-        }
-
-        let value = parse_dotenv_value(raw_val, path, line_no)?;
-        entries.push((key.to_string(), value));
-    }
-    Ok(entries)
-}
-
-fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<String, String> {
-    let val = raw_val.trim_start();
-    if let Some(rest) = val.strip_prefix('"') {
-        let mut out = String::new();
-        let mut chars = rest.chars();
-        let mut closed = false;
-        while let Some(ch) = chars.next() {
-            match ch {
-                '"' => {
-                    closed = true;
-                    break;
-                }
-                '\\' => match chars.next() {
-                    Some('n') => out.push('\n'),
-                    Some('r') => out.push('\r'),
-                    Some('t') => out.push('\t'),
-                    Some('"') => out.push('"'),
-                    Some('\\') => out.push('\\'),
-                    Some(other) => {
-                        out.push('\\');
-                        out.push(other);
-                    }
-                    None => break,
-                },
-                other => out.push(other),
+    match rume::config::load_for_env_in::<DatabaseFileConfig>(dir, env_name) {
+        Ok(cfg) => {
+            let Some(url) = cfg.database.and_then(|d| d.url) else {
+                return Ok(None);
+            };
+            let trimmed = url.trim();
+            if !trimmed.is_empty() {
+                Ok(Some(trimmed.to_string()))
+            } else {
+                Ok(None)
             }
         }
-        if !closed {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: unclosed double quote",
-                path.display()
-            ));
-        }
-        let trailing = chars.as_str().trim_start();
-        if !trailing.is_empty() && !trailing.starts_with('#') {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: unexpected trailing characters",
-                path.display()
-            ));
-        }
-        Ok(out)
-    } else if let Some(rest) = val.strip_prefix('\'') {
-        let Some((inner, trailing)) = rest.split_once('\'') else {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: unclosed single quote",
-                path.display()
-            ));
-        };
-        let trailing = trailing.trim_start();
-        if !trailing.is_empty() && !trailing.starts_with('#') {
-            return Err(format!(
-                "failed to parse environment file {} at line {line_no}: unexpected trailing characters",
-                path.display()
-            ));
-        }
-        Ok(inner.to_string())
-    } else {
-        // Strip inline `# comment` only when preceded by whitespace.
-        let mut end = val.len();
-        let mut prev_ws = false;
-        for (i, ch) in val.char_indices() {
-            if ch == '#' && prev_ws {
-                end = i;
-                break;
-            }
-            prev_ws = ch.is_whitespace();
-        }
-        Ok(val[..end].trim_end().to_string())
+        Err(rume::config::ConfigError::NotFound { .. }) => Ok(None),
+        Err(err) => Err(format!("failed to load database configuration: {err}")),
     }
-}
-
-fn resolve_file_value(value: String, dir: &Path, source_path: &Path) -> Result<String, String> {
-    if let Some(rest) = value.strip_prefix("file\\:") {
-        return Ok(format!("file:{rest}"));
-    }
-    let Some(rel_or_abs) = value.strip_prefix("file:") else {
-        return Ok(value);
-    };
-
-    let full = if Path::new(rel_or_abs).is_absolute() {
-        PathBuf::from(rel_or_abs)
-    } else {
-        dir.join(rel_or_abs)
-    };
-    // Why: fail closed on `fs::canonicalize` errors rather than falling back to raw paths, and
-    // read `&canonical_full` instead of `&full` so dangling targets or symlink escapes cannot
-    // bypass workspace containment.
-    let canonical_dir = fs::canonicalize(dir).map_err(|e| {
-        format!(
-            "failed to canonicalize workspace directory for file: reference in {}: {e}",
-            source_path.display()
-        )
-    })?;
-    let canonical_full = fs::canonicalize(&full).map_err(|e| {
-        format!(
-            "failed to canonicalize file: reference in {}: {e}",
-            source_path.display()
-        )
-    })?;
-    if !canonical_full.starts_with(&canonical_dir) {
-        return Err(format!(
-            "failed to resolve file: reference in {}: path escapes workspace directory",
-            source_path.display()
-        ));
-    }
-
-    let contents = fs::read_to_string(&canonical_full).map_err(|e| {
-        format!(
-            "failed to read file: reference in {}: {e}",
-            source_path.display()
-        )
-    })?;
-    Ok(contents
-        .trim_end_matches('\n')
-        .trim_end_matches('\r')
-        .to_string())
 }
 
 pub(crate) enum BackendHandle {
@@ -780,8 +601,7 @@ pub async fn rollback() {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackendHandle, connect_backend, resolve_db_url_for_env_in,
-        resolve_db_url_for_env_with_vars, resolve_file_value,
+        BackendHandle, connect_backend, resolve_db_url_for_env_in, resolve_db_url_for_env_with_vars,
     };
     use std::path::Path;
 
@@ -911,37 +731,31 @@ mod tests {
     #[test]
     fn file_value_nonexistent_and_symlink_escape_fail_closed() {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join(".env");
+        std::fs::write(dir.path().join(".env"), "DATABASE_URL=file:missing.key\n").unwrap();
 
-        let missing_err = resolve_file_value("file:missing.key".to_string(), dir.path(), &source)
-            .expect_err("missing file: target must fail closed during canonicalization");
+        let missing_err =
+            resolve_db_url_for_env_with_vars(dir.path(), "development", std::iter::empty())
+                .expect_err("missing file: target must fail closed");
         assert!(
-            missing_err.contains("failed to canonicalize"),
-            "expected canonicalization error, got: {missing_err}"
-        );
-
-        let missing_dir = dir.path().join("missing_dir");
-        let missing_dir_err =
-            resolve_file_value("file:secret.key".to_string(), &missing_dir, &source)
-                .expect_err("nonexistent workspace dir must fail closed during canonicalization");
-        assert!(
-            missing_dir_err.contains("failed to canonicalize"),
-            "expected canonicalization error, got: {missing_dir_err}"
+            missing_err.contains("failed to resolve environment"),
+            "unexpected error: {missing_err}"
         );
 
         #[cfg(unix)]
         {
             let outside_dir = tempfile::tempdir().unwrap();
             let outside_secret = outside_dir.path().join("outside.key");
-            std::fs::write(&outside_secret, "secret").unwrap();
+            std::fs::write(&outside_secret, "sqlite::memory:").unwrap();
 
             let escape_link = dir.path().join("escape.key");
             std::os::unix::fs::symlink(&outside_secret, &escape_link).unwrap();
+            std::fs::write(dir.path().join(".env"), "DATABASE_URL=file:escape.key\n").unwrap();
 
-            let escape_err = resolve_file_value("file:escape.key".to_string(), dir.path(), &source)
-                .expect_err("symlink pointing outside workspace must be rejected");
+            let escape_err =
+                resolve_db_url_for_env_with_vars(dir.path(), "development", std::iter::empty())
+                    .expect_err("symlink pointing outside workspace must be rejected");
             assert!(
-                escape_err.contains("path escapes workspace directory"),
+                escape_err.contains("escapes directory"),
                 "unexpected error: {escape_err}"
             );
         }
@@ -982,5 +796,35 @@ mod tests {
             }
             _ => panic!("expected Commands::DbSeed"),
         }
+    }
+
+    #[test]
+    fn resolve_db_url_preserves_literal_interpolation_in_process_only_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let url = "postgres://app:p${secret}w@db.internal:5432/rume";
+        let resolved = resolve_db_url_for_env_with_vars(
+            dir.path(),
+            "production",
+            vec![("DATABASE_URL".to_string(), url.to_string())],
+        );
+        assert_eq!(resolved, Ok(Some(url.to_string())));
+    }
+
+    #[test]
+    fn resolve_db_url_surfaces_toml_parse_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("config")).unwrap();
+        std::fs::write(
+            dir.path().join("config/app.toml"),
+            "[database\nurl = \"sqlite://broken.db\"\n",
+        )
+        .unwrap();
+
+        let err = resolve_db_url_for_env_with_vars(dir.path(), "development", std::iter::empty())
+            .expect_err("malformed config/app.toml must return an error instead of Ok(None)");
+        assert!(
+            err.contains("database configuration") || err.contains("configuration"),
+            "unexpected error: {err}"
+        );
     }
 }

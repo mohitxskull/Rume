@@ -29,7 +29,8 @@ pub mod secrets;
 pub use error::EnvError;
 pub use interpolation::interpolate_value;
 pub use loading::{
-    ResolvedEnv, load, load_for_env, load_for_env_in, load_in, load_merged_map, resolve_env_name,
+    ResolvedEnv, load, load_for_env, load_for_env_in, load_for_env_with_vars, load_in,
+    load_merged_map, resolve_env_name,
 };
 pub use secret_provider::{
     CachedSecretProvider, EnvSecretProvider, ExternalSecretBackend, KmsSecretProvider,

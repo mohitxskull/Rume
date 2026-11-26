@@ -5624,6 +5624,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
@@ -5727,7 +5728,6 @@ name = "rume-foundation"
 version = "0.1.0"
 dependencies = [
  "axum",
- "dotenvy",
  "figment",
  "parking_lot 0.13.0",
  "proptest",

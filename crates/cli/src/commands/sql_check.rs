@@ -37,13 +37,14 @@ pub async fn run(
     target_dialect: Option<&str>,
     db_dry_run: bool,
 ) {
-    let target_dir = Path::new(path_str);
-    let mut files = Vec::new();
-    if target_dir.exists() {
-        collect_sql_files(target_dir, &mut files);
-    }
-
-    files.sort();
+    let target_path = Path::new(path_str);
+    let files = match collect_target_sql_files(target_path) {
+        Ok(files) => files,
+        Err(err) => {
+            eprintln!("{}", style(format!("error: {err}")).red());
+            std::process::exit(1);
+        }
+    };
 
     let mut db_handle = None;
     if db_dry_run {
@@ -101,9 +102,12 @@ pub async fn run(
     let mut all_ok = true;
     let mut valid_count = 0;
 
+    let effective_target_dialect =
+        resolve_target_dialect(target_dialect, db_handle.as_ref().map(|(_, d)| *d));
+
     for file_path in &files {
         let display_path = file_path.display().to_string();
-        let val_res = validate_sql_file(file_path, target_dialect);
+        let val_res = validate_sql_file(file_path, effective_target_dialect);
         let final_res = match val_res {
             Ok((statements, _tokens, _effective_dialect)) => {
                 if let Some((handle, _db_dialect)) = &db_handle {
@@ -230,6 +234,29 @@ pub async fn run(
         );
         std::process::exit(1);
     }
+}
+
+fn resolve_target_dialect<'a>(
+    cli_dialect: Option<&'a str>,
+    db_dialect: Option<&'a str>,
+) -> Option<&'a str> {
+    cli_dialect.or(db_dialect)
+}
+
+fn collect_target_sql_files(target: &Path) -> Result<Vec<PathBuf>, String> {
+    if !target.exists() {
+        return Err(format!(
+            "SQL target path '{}' does not exist",
+            target.display()
+        ));
+    }
+    if target.is_file() {
+        return Ok(vec![target.to_path_buf()]);
+    }
+    let mut files = Vec::new();
+    collect_sql_files(target, &mut files);
+    files.sort();
+    Ok(files)
 }
 
 fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
@@ -574,5 +601,50 @@ mod tests {
     fn sql_check_rejects_unrecognized_statement() {
         let temp = write_temp("FOOBAR something");
         assert!(validate_sql_file(temp.path(), None).is_err());
+    }
+
+    #[test]
+    fn sql_check_errors_on_nonexistent_target_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does_not_exist.sql");
+        let err = collect_target_sql_files(&missing)
+            .expect_err("nonexistent target path must return an error");
+        assert!(
+            err.contains("does not exist"),
+            "unexpected error message: {err}"
+        );
+    }
+
+    #[test]
+    fn sql_check_accepts_single_sql_file_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let single = dir.path().join("users.sql");
+        fs::write(&single, "SELECT * FROM users WHERE id = $1;").unwrap();
+
+        let files = collect_target_sql_files(&single)
+            .expect("single .sql file path should be collected directly");
+        assert_eq!(files, vec![single.clone()]);
+        assert!(validate_sql_file(&files[0], Some("postgres")).is_ok());
+    }
+
+    #[test]
+    fn sql_check_honors_db_dialect_when_cli_dialect_is_absent() {
+        assert_eq!(
+            resolve_target_dialect(None, Some("postgres")),
+            Some("postgres")
+        );
+        assert_eq!(
+            resolve_target_dialect(Some("mysql"), Some("postgres")),
+            Some("mysql")
+        );
+        assert_eq!(resolve_target_dialect(None, None), None);
+
+        // Verify that honoring the db dialect catches dialect-mismatched placeholders.
+        let temp = write_temp("SELECT * FROM users WHERE id = ?;");
+        let effective = resolve_target_dialect(None, Some("postgres"));
+        assert!(
+            validate_sql_file(temp.path(), effective).is_err(),
+            "postgres db dialect should reject '?' placeholder when --dialect is omitted"
+        );
     }
 }

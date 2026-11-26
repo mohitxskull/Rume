@@ -11,6 +11,54 @@ use crate::env::error::EnvError;
 /// against infinitely recursive or circular references.
 const MAX_INTERPOLATION_DEPTH: usize = 10;
 
+/// Maximum total number of `${VAR}` expansions permitted across a single
+/// [`interpolate_value`] call, preventing exponential DAG blowup.
+const MAX_INTERPOLATION_EXPANSIONS: usize = 1024;
+
+/// Maximum total output size in bytes permitted for a single
+/// [`interpolate_value`] call, preventing memory exhaustion.
+const MAX_INTERPOLATION_OUTPUT_BYTES: usize = 64 * 1024;
+
+struct InterpolationBudget {
+    remaining_expansions: usize,
+    remaining_output_bytes: usize,
+}
+
+impl InterpolationBudget {
+    fn new() -> Self {
+        Self {
+            remaining_expansions: MAX_INTERPOLATION_EXPANSIONS,
+            remaining_output_bytes: MAX_INTERPOLATION_OUTPUT_BYTES,
+        }
+    }
+
+    fn consume_expansion(&mut self, variable: &str) -> Result<(), EnvError> {
+        if self.remaining_expansions == 0 {
+            return Err(EnvError::BudgetExceeded {
+                variable: variable.to_string(),
+                reason: format!(
+                    "maximum expansion count ({MAX_INTERPOLATION_EXPANSIONS}) exceeded"
+                ),
+            });
+        }
+        self.remaining_expansions -= 1;
+        Ok(())
+    }
+
+    fn consume_bytes(&mut self, bytes: usize, current_var: Option<&str>) -> Result<(), EnvError> {
+        if bytes > self.remaining_output_bytes {
+            return Err(EnvError::BudgetExceeded {
+                variable: current_var.unwrap_or("<root>").to_string(),
+                reason: format!(
+                    "maximum output size ({MAX_INTERPOLATION_OUTPUT_BYTES} bytes) exceeded"
+                ),
+            });
+        }
+        self.remaining_output_bytes -= bytes;
+        Ok(())
+    }
+}
+
 /// Interpolate `${VAR}` references in `value` using the merged variable map.
 ///
 /// - `\${VAR}` is escaped to a literal `${VAR}` (no substitution).
@@ -19,8 +67,10 @@ const MAX_INTERPOLATION_DEPTH: usize = 10;
 /// - Missing variables return [`EnvError::Interpolation`].
 /// - Circular references return [`EnvError::CircularReference`].
 /// - Exceeding maximum recursion depth returns [`EnvError::MaxDepthExceeded`].
+/// - Exceeding expansion count or output byte budgets returns [`EnvError::BudgetExceeded`].
 pub fn interpolate_value(value: &str, vars: &BTreeMap<String, String>) -> Result<String, EnvError> {
-    interpolate_recursive(value, vars, &mut HashSet::new(), 0, None)
+    let mut budget = InterpolationBudget::new();
+    interpolate_recursive(value, vars, &mut HashSet::new(), 0, None, &mut budget)
 }
 
 fn interpolate_recursive(
@@ -29,6 +79,7 @@ fn interpolate_recursive(
     visiting: &mut HashSet<String>,
     depth: usize,
     current_var: Option<&str>,
+    budget: &mut InterpolationBudget,
 ) -> Result<String, EnvError> {
     if depth > MAX_INTERPOLATION_DEPTH {
         return Err(EnvError::MaxDepthExceeded {
@@ -44,12 +95,14 @@ fn interpolate_recursive(
         if chars[i] == '\\' && i + 1 < chars.len() && chars[i + 1] == '$' {
             // Escaped substitution: \${VAR} -> literal ${VAR}
             if let Some((end, var)) = read_substitution(&chars[i + 1..]) {
+                budget.consume_bytes(3 + var.len(), current_var)?;
                 out.push_str("${");
                 out.push_str(&var);
                 out.push('}');
                 i += 1 + end;
                 continue;
             }
+            budget.consume_bytes(1, current_var)?;
             out.push('\\');
             i += 1;
             continue;
@@ -73,14 +126,26 @@ fn interpolate_recursive(
                     });
                 }
             };
+            // Why: check depth before consuming expansion budget so linear chains deeper than
+            // `MAX_INTERPOLATION_DEPTH` report `MaxDepthExceeded`, while wide DAGs within depth
+            // are stopped by `BudgetExceeded` before exponential work occurs.
+            if depth + 1 > MAX_INTERPOLATION_DEPTH {
+                return Err(EnvError::MaxDepthExceeded {
+                    variable: var,
+                    depth: MAX_INTERPOLATION_DEPTH,
+                });
+            }
+            budget.consume_expansion(&var)?;
             visiting.insert(var.clone());
-            let expanded = interpolate_recursive(resolved, vars, visiting, depth + 1, Some(&var));
+            let expanded =
+                interpolate_recursive(resolved, vars, visiting, depth + 1, Some(&var), budget);
             visiting.remove(&var);
             out.push_str(&expanded?);
             i += end;
             continue;
         }
 
+        budget.consume_bytes(chars[i].len_utf8(), current_var)?;
         out.push(chars[i]);
         i += 1;
     }
@@ -203,6 +268,44 @@ mod tests {
             interpolate_value("${not-valid}", &vars).unwrap(),
             "${not-valid}"
         );
+    }
+
+    #[test]
+    fn diamond_dag_exceeding_expansion_budget_errors_quickly() {
+        let mut vars = BTreeMap::new();
+        // 10-level (depth 1..=10) 4-way diamond DAG: L0 -> 4x L1 -> ... -> L8 -> 4x L9
+        // (4^9 = 262,144 leaves, all within MAX_INTERPOLATION_DEPTH = 10).
+        for level in 0..9 {
+            let next = level + 1;
+            vars.insert(
+                format!("L{level}"),
+                format!("${{L{next}}}${{L{next}}}${{L{next}}}${{L{next}}}"),
+            );
+        }
+        vars.insert("L9".to_string(), "x".to_string());
+
+        let err = interpolate_value("${L0}", &vars)
+            .expect_err("10-level 4-way diamond DAG must fail on expansion budget");
+        assert!(
+            matches!(err, EnvError::BudgetExceeded { .. }),
+            "expected BudgetExceeded, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn output_byte_budget_prevents_memory_blowup() {
+        let chunk = "a".repeat(2048);
+        let mut vars = BTreeMap::new();
+        vars.insert("CHUNK".to_string(), chunk);
+        // 40 * 2048 = 81,920 bytes > 64 KiB, with only 40 expansions (< 1024).
+        let template = "${CHUNK}".repeat(40);
+        let err = interpolate_value(&template, &vars)
+            .expect_err("output exceeding MAX_INTERPOLATION_OUTPUT_BYTES must fail");
+        assert!(
+            matches!(err, EnvError::BudgetExceeded { .. }),
+            "expected BudgetExceeded, got: {err:?}"
+        );
+        assert!(err.to_string().contains("output size"));
     }
 }
 

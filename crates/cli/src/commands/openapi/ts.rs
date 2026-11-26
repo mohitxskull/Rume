@@ -258,9 +258,10 @@ fn emit_operation_method(
     let request_body = extract_request_body(op);
     let return_type = extract_response_type(op);
 
-    let mut sig_params = Vec::new();
+    let mut required_params = Vec::new();
+    let mut optional_params = Vec::new();
     for p in &path_params {
-        sig_params.push(format!("{}: {}", p.ts_name, p.ts_type));
+        required_params.push(format!("{}: {}", p.ts_name, p.ts_type));
     }
 
     if !query_params.is_empty() {
@@ -273,13 +274,28 @@ fn emit_operation_method(
                 format!("{}{}: {};", format_prop_key(&q.name), opt, q.ts_type)
             })
             .collect();
-        sig_params.push(format!("query{q_opt}: {{ {} }}", q_fields.join(" ")));
+        let param = format!("query{q_opt}: {{ {} }}", q_fields.join(" "));
+        if any_required {
+            required_params.push(param);
+        } else {
+            optional_params.push(param);
+        }
     }
 
     if let Some((required, body_ts)) = &request_body {
         let opt = if *required { "" } else { "?" };
-        sig_params.push(format!("body{opt}: {body_ts}"));
+        let param = format!("body{opt}: {body_ts}");
+        if *required {
+            required_params.push(param);
+        } else {
+            optional_params.push(param);
+        }
     }
+
+    // Why: TypeScript rejects a required parameter after an optional parameter (TS1016),
+    // so emit all required parameters (path, required query, required body) before optional ones.
+    let mut sig_params = required_params;
+    sig_params.extend(optional_params);
 
     let _ = writeln!(
         out,
@@ -461,10 +477,25 @@ fn build_url_template(path: &str, path_params: &[ParamSpec]) -> String {
                 .unwrap_or(name);
             let _ = write!(rendered, "${{encodeURIComponent(String({ts_name}))}}");
         } else {
-            rendered.push_str(seg);
+            rendered.push_str(&escape_ts_template_literal(seg));
         }
     }
     rendered
+}
+
+/// Escape characters that have special meaning inside a JavaScript/TypeScript template literal.
+fn escape_ts_template_literal(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut chars = segment.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '`' => out.push_str("\\`"),
+            '$' if chars.peek() == Some(&'{') => out.push_str("\\$"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn sanitize_camel_ident(raw: &str) -> String {
@@ -807,6 +838,75 @@ mod tests {
         assert!(
             ts.contains("async deleteV1UserProfilesProfileId("),
             "missing deterministic fallback method name:\n{ts}"
+        );
+    }
+
+    #[test]
+    fn orders_required_body_before_optional_query() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Order Test", "version": "1.0.0" },
+            "paths": {
+                "/users/{id}": {
+                    "patch": {
+                        "operationId": "updateUser",
+                        "parameters": [
+                            { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                            { "name": "dry_run", "in": "query", "required": false, "schema": { "type": "boolean" } }
+                        ],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "$ref": "#/components/schemas/UpdateUser" }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                }
+            },
+            "components": {
+                "schemas": {
+                    "UpdateUser": {
+                        "type": "object",
+                        "properties": { "name": { "type": "string" } }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        assert!(
+            ts.contains("async updateUser(id: number, body: UpdateUser, query?: { dry_run?: boolean; }): Promise<void>"),
+            "required body must precede optional query (TS1016):\n{ts}"
+        );
+    }
+
+    #[test]
+    fn escapes_backticks_and_template_expressions_in_url_literals() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Escape Test", "version": "1.0.0" },
+            "paths": {
+                "/items/`raw`/${injected}/{id}": {
+                    "get": {
+                        "operationId": "getWeirdItem",
+                        "parameters": [
+                            { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        assert!(
+            ts.contains(
+                r#"`${this.baseUrl}/items/\`raw\`/\${injected}/${encodeURIComponent(String(id))}`"#
+            ),
+            "backticks and ${{...}} in static path segments must be escaped:\n{ts}"
         );
     }
 }

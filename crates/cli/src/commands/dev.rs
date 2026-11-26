@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
 
 use console::style;
@@ -33,25 +34,22 @@ pub async fn run(bin: Option<String>, watch: Vec<PathBuf>, no_migrate: bool, deb
         watch_paths.push(PathBuf::from("."));
     }
 
-    let cargo_args = build_cargo_run_args(bin.as_deref());
+    let build_args = build_cargo_build_args(bin.as_deref());
     println!(
         "{}",
         style(format!(
             "Starting dev server (`cargo {}`), watching {} path(s)...",
-            cargo_args.join(" "),
+            build_args.join(" "),
             watch_paths.len()
         ))
         .green()
         .bold()
     );
 
-    let mut child = match spawn_server(&cargo_args) {
+    let mut child = match build_and_spawn_server(bin.as_deref()).await {
         Ok(c) => Some(c),
         Err(err) => {
-            eprintln!(
-                "{}",
-                style(format!("error: failed to spawn cargo run: {err}")).red()
-            );
+            eprintln!("{}", style(format!("error: {err}")).red());
             std::process::exit(1);
         }
     };
@@ -105,13 +103,10 @@ pub async fn run(bin: Option<String>, watch: Vec<PathBuf>, no_migrate: bool, deb
                     if let Some(ref mut c) = child {
                         terminate_child(c).await;
                     }
-                    match spawn_server(&cargo_args) {
+                    match build_and_spawn_server(bin.as_deref()).await {
                         Ok(c) => child = Some(c),
                         Err(err) => {
-                            eprintln!(
-                                "{}",
-                                style(format!("error: failed to spawn cargo run: {err}")).red()
-                            );
+                            eprintln!("{}", style(format!("error: {err}")).red());
                             child = None;
                         }
                     }
@@ -131,6 +126,80 @@ fn resolve_watch_paths(watch: Vec<PathBuf>) -> Vec<PathBuf> {
     } else {
         watch.into_iter().filter(|p| p.exists()).collect()
     }
+}
+
+/// Builds the argument list for `cargo build --message-format=json`.
+pub fn build_cargo_build_args(bin: Option<&str>) -> Vec<String> {
+    let mut args = vec!["build".to_string(), "--message-format=json".to_string()];
+    if let Some(name) = bin {
+        args.push("--bin".to_string());
+        args.push(name.to_string());
+    }
+    args
+}
+
+/// Parses `cargo build --message-format=json` stdout to locate the compiled binary executable.
+fn parse_cargo_executable_from_json(stdout: &str, bin: Option<&str>) -> Option<PathBuf> {
+    let mut fallback: Option<PathBuf> = None;
+    for line in stdout.lines() {
+        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if msg.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
+            continue;
+        }
+        let Some(executable) = msg.get("executable").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let target_name = msg
+            .get("target")
+            .and_then(|t| t.get("name"))
+            .and_then(serde_json::Value::as_str);
+        if let Some(wanted) = bin
+            && target_name == Some(wanted)
+        {
+            return Some(PathBuf::from(executable));
+        }
+        fallback = Some(PathBuf::from(executable));
+    }
+    fallback
+}
+
+/// Builds the server with `cargo build --message-format=json` and spawns the compiled
+/// executable directly so `child.kill()` terminates the actual server process instead of
+/// only killing a `cargo run` wrapper and orphaning the grandchild server under
+/// `#![forbid(unsafe_code)]`.
+async fn build_and_spawn_server(bin: Option<&str>) -> Result<tokio::process::Child, String> {
+    let build_args = build_cargo_build_args(bin);
+    let output = tokio::process::Command::new("cargo")
+        .args(&build_args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .output()
+        .await
+        .map_err(|err| format!("failed to run cargo build: {err}"))?;
+
+    if !output.status.success() {
+        return Err(format!("cargo build failed ({})", output.status));
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Some(executable) = parse_cargo_executable_from_json(&stdout, bin) {
+        return tokio::process::Command::new(&executable)
+            .kill_on_drop(true)
+            .spawn()
+            .map_err(|err| {
+                format!(
+                    "failed to spawn compiled server binary '{}': {err}",
+                    executable.display()
+                )
+            });
+    }
+
+    // Why: fall back to `cargo run` only if `cargo build --message-format=json` emitted no
+    // executable artifact (e.g. custom cargo wrapper or workspace without a default bin).
+    let run_args = build_cargo_run_args(bin);
+    spawn_server(&run_args).map_err(|err| format!("failed to spawn cargo run: {err}"))
 }
 
 fn spawn_server(args: &[String]) -> std::io::Result<tokio::process::Child> {
@@ -191,7 +260,9 @@ fn collect_snapshot(path: &Path, out: &mut BTreeMap<PathBuf, (u64, SystemTime)>)
         return;
     }
 
-    let Ok(meta) = fs::metadata(path) else {
+    // Why: use `symlink_metadata` instead of `metadata` so symlinks are not followed and
+    // directory symlink cycles cannot cause unbounded recursion / stack overflow.
+    let Ok(meta) = fs::symlink_metadata(path) else {
         return;
     };
 
@@ -351,6 +422,41 @@ mod tests {
         assert_eq!(
             build_cargo_run_args(Some("api")),
             vec!["run".to_string(), "--bin".to_string(), "api".to_string()]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_tree_handles_directory_symlink_cycle_without_overflow() {
+        let dir = TempDir::new().expect("create temp dir");
+        let root = dir.path().to_path_buf();
+        let src_dir = root.join("src");
+        fs::create_dir_all(&src_dir).expect("create src dir");
+        let main_rs = src_dir.join("main.rs");
+        fs::write(&main_rs, "fn main() {}").expect("write main.rs");
+
+        // Create a directory symlink loop: src/loop -> root
+        std::os::unix::fs::symlink(&root, src_dir.join("loop")).expect("create symlink loop");
+
+        let snap = snapshot_tree(std::slice::from_ref(&root));
+        assert!(snap.contains_key(&main_rs));
+    }
+
+    #[test]
+    fn parse_cargo_executable_from_json_selects_matching_bin() {
+        let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"helper","kind":["bin"]},"executable":"/tmp/target/debug/helper"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"api","kind":["bin"]},"executable":"/tmp/target/debug/api"}"#,
+            "\n"
+        );
+        assert_eq!(
+            parse_cargo_executable_from_json(stdout, Some("helper")),
+            Some(PathBuf::from("/tmp/target/debug/helper"))
+        );
+        assert_eq!(
+            parse_cargo_executable_from_json(stdout, None),
+            Some(PathBuf::from("/tmp/target/debug/api"))
         );
     }
 }

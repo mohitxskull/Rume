@@ -400,7 +400,10 @@ fn check_redis_connectivity() -> DoctorCheck {
 }
 
 fn check_module_dag() -> (String, bool) {
-    let src_dir = Path::new("src");
+    check_module_dag_in(Path::new("src"))
+}
+
+fn check_module_dag_in(src_dir: &Path) -> (String, bool) {
     if !src_dir.exists() {
         return ("src directory not found (skipped)".to_string(), true);
     }
@@ -419,20 +422,46 @@ fn check_module_dag() -> (String, bool) {
         }
     }
     visit_dirs(src_dir, &mut files);
+    files.sort();
 
     let mut deps_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut module_origins: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut diagnostics: Vec<String> = Vec::new();
 
     for file_path in files {
         let content = match std::fs::read_to_string(&file_path) {
             Ok(content) => content,
-            Err(_) => continue,
+            Err(err) => {
+                diagnostics.push(format!("failed to read {}: {err}", file_path.display()));
+                continue;
+            }
         };
-        for decl in extract_module_info(&content) {
+        let decls = match extract_module_info(&content) {
+            Ok(decls) => decls,
+            Err(err) => {
+                diagnostics.push(format!("syntax error in {}: {err}", file_path.display()));
+                continue;
+            }
+        };
+        for decl in decls {
             let Some(name) = decl.name else {
                 continue;
             };
+            if let Some(first_path) = module_origins.get(&name) {
+                diagnostics.push(format!(
+                    "duplicate module '{name}' declared in {} and {}",
+                    first_path.display(),
+                    file_path.display()
+                ));
+                continue;
+            }
+            module_origins.insert(name.clone(), file_path.clone());
             deps_map.insert(name, decl.dependencies);
         }
+    }
+
+    if !diagnostics.is_empty() {
+        return (diagnostics.join("; "), false);
     }
 
     if deps_map.is_empty() {
@@ -515,14 +544,12 @@ struct ModuleDecl {
 /// formatting — a `fn` signature split across lines, a string literal split
 /// across lines, or a `vec![...]` spread over several lines — is parsed
 /// correctly without a fragile hand-rolled brace-depth scanner (RC-20).
-fn extract_module_info(content: &str) -> Vec<ModuleDecl> {
-    let Ok(file) = parse_file(content) else {
-        return Vec::new();
-    };
+fn extract_module_info(content: &str) -> Result<Vec<ModuleDecl>, syn::Error> {
+    let file = parse_file(content)?;
 
     let mut extractor = ModuleExtractor::default();
     extractor.visit_file(&file);
-    extractor.decls
+    Ok(extractor.decls)
 }
 
 /// Walks a parsed syntax tree and records the `name` and `dependencies`
@@ -659,7 +686,7 @@ impl Module for CatalogModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("catalog"));
         assert!(decls[0].dependencies.is_empty());
@@ -685,7 +712,7 @@ impl Module for OrdersModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("orders"));
         assert_eq!(
@@ -709,7 +736,7 @@ impl Module for ShippingModule {
     }
 }
 "##;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("shipping"));
         assert!(decls[0].dependencies.is_empty());
@@ -732,7 +759,7 @@ impl Module for InventoryModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("inventory"));
         assert_eq!(decls[0].dependencies, vec!["catalog".to_string()]);
@@ -761,7 +788,7 @@ impl rume::Module for InventoryModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 2);
         assert_eq!(decls[0].name.as_deref(), Some("orders"));
         assert_eq!(decls[0].dependencies, vec!["inventory".to_string()]);
@@ -811,7 +838,7 @@ impl Module for BillingModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("billing"));
         assert_eq!(decls[0].dependencies, vec!["orders".to_string()]);
@@ -819,13 +846,54 @@ impl Module for BillingModule {
 
     #[test]
     fn extract_module_info_empty_input() {
-        let decls = extract_module_info("");
+        let decls = extract_module_info("").unwrap();
         assert!(decls.is_empty());
     }
 
     #[test]
     fn extract_module_info_unparseable_input() {
-        let decls = extract_module_info("this is not rust {{{");
-        assert!(decls.is_empty());
+        assert!(extract_module_info("this is not rust {{{").is_err());
+    }
+
+    #[test]
+    fn check_module_dag_surfaces_duplicate_modules_and_syntax_errors() {
+        let dup_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dup_dir.path().join("a.rs"),
+            r#"
+impl Module for OrdersA {
+    fn name(&self) -> &str { "orders" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dup_dir.path().join("b.rs"),
+            r#"
+impl Module for OrdersB {
+    fn name(&self) -> &str { "orders" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+
+        let (dup_msg, dup_ok) = check_module_dag_in(dup_dir.path());
+        assert!(!dup_ok, "duplicate modules must fail DAG check");
+        assert!(
+            dup_msg.contains("duplicate module 'orders'"),
+            "expected duplicate module diagnostic, got: {dup_msg}"
+        );
+
+        let err_dir = tempfile::tempdir().unwrap();
+        std::fs::write(err_dir.path().join("broken.rs"), "fn broken( {{{").unwrap();
+
+        let (err_msg, err_ok) = check_module_dag_in(err_dir.path());
+        assert!(!err_ok, "syntax errors must fail DAG check");
+        assert!(
+            err_msg.contains("syntax error") && err_msg.contains("broken.rs"),
+            "expected syntax error diagnostic, got: {err_msg}"
+        );
     }
 }

@@ -48,7 +48,21 @@ impl ResolvedEnv {
 
     /// Load the environment rooted at `dir` for a specific environment name.
     pub fn load_for_env_in(dir: &Path, env_name: &str) -> Result<Self, EnvError> {
-        load_merged_map_for_env_in(dir, env_name)
+        Self::load_for_env_with_vars(dir, env_name, std::env::vars())
+    }
+
+    /// Load the environment rooted at `dir` for a specific environment name,
+    /// overlaying an explicit set of process environment variables instead of
+    /// reading `std::env::vars()`.
+    pub fn load_for_env_with_vars<I>(
+        dir: &Path,
+        env_name: &str,
+        process_vars: I,
+    ) -> Result<Self, EnvError>
+    where
+        I: IntoIterator<Item = (String, String)>,
+    {
+        load_merged_map_for_env_with_vars(dir, env_name, process_vars)
     }
 
     /// Look up a resolved value. Secret values are exposed via `expose_secret()`.
@@ -96,7 +110,21 @@ pub fn load_for_env_in<T>(dir: &Path, env_name: &str) -> Result<T, EnvError>
 where
     T: DeserializeOwned,
 {
-    let resolved = load_merged_map_for_env_in(dir, env_name)?;
+    load_for_env_with_vars(dir, env_name, std::env::vars())
+}
+
+/// Load and validate a typed environment rooted at `dir` for a specific environment name,
+/// overlaying an explicit set of process environment variables instead of reading `std::env::vars()`.
+pub fn load_for_env_with_vars<T, I>(
+    dir: &Path,
+    env_name: &str,
+    process_vars: I,
+) -> Result<T, EnvError>
+where
+    T: DeserializeOwned,
+    I: IntoIterator<Item = (String, String)>,
+{
+    let resolved = load_merged_map_for_env_with_vars(dir, env_name, process_vars)?;
     load_from_resolved(resolved)
 }
 
@@ -209,16 +237,26 @@ pub fn load_merged_map() -> Result<ResolvedEnv, EnvError> {
 /// Load the merged environment map rooted at `dir`.
 fn load_merged_map_in(dir: &Path) -> Result<ResolvedEnv, EnvError> {
     let env_name = resolve_env_name();
-    load_merged_map_for_env_in(dir, &env_name)
+    load_merged_map_for_env_with_vars(dir, &env_name, std::env::vars())
 }
 
-/// Load the merged environment map rooted at `dir` for a specific environment name.
-fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv, EnvError> {
+/// Load the merged environment map rooted at `dir` for a specific environment name,
+/// using `process_vars` as the process-environment overlay.
+fn load_merged_map_for_env_with_vars<I>(
+    dir: &Path,
+    env_name: &str,
+    process_vars: I,
+) -> Result<ResolvedEnv, EnvError>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     validate_env_name(env_name)?;
 
     // Collect raw values from all file sources, lowest to highest priority.
-    // Later files override earlier ones. `file:` resolution happens here, per
-    // value, before interpolation.
+    // Why: parse `.env` files raw (without `dotenvy`'s eager per-file `${VAR}`
+    // expansion) so overrides in `.env.{env}`, `.env.local`, or process env
+    // drive `${VAR}` expansion after all layers are merged. `file:` resolution
+    // happens here, per value, before interpolation.
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
 
@@ -227,17 +265,12 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
             continue;
         }
 
-        let iterator = dotenvy::from_path_iter(&path).map_err(|source| EnvError::Dotenv {
+        let content = fs::read_to_string(&path).map_err(|source| EnvError::Io {
             path: path.clone(),
             source,
         })?;
 
-        for item in iterator {
-            let (key, raw_value) = item.map_err(|source| EnvError::Dotenv {
-                path: path.clone(),
-                source,
-            })?;
-
+        for (key, raw_value) in parse_dotenv(&content, &path)? {
             let value = resolve_value(raw_value, dir).map_err(|source| EnvError::Io {
                 path: path.clone(),
                 source,
@@ -250,18 +283,16 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
 
     // Process environment always wins. Overlay process env on top of the
     // merged file values so process variables participate in interpolation
-    // (they can reference file-sourced variables) and take precedence over
-    // file values. Process env keys are not added to `file_keys` because they
-    // did not originate from an env file.
-    for (key, value) in std::env::vars() {
-        merged.insert(key.clone(), (value, "process env".to_string()));
+    // lookup (file variables can reference process-overridden variables) and
+    // take precedence over file values. Process env keys are not added to
+    // `file_keys` because they did not originate from an env file.
+    for (key, value) in process_vars {
+        merged.insert(key, (value, "process env".to_string()));
     }
 
     // The final merged variable map (files + process env) is the interpolation
-    // context: every variable can reference any other, including
-    // process-overridden variables. Interpolation runs against this final map
-    // rather than against file-only values, so a file variable referencing a
-    // process-overridden variable resolves to the process value.
+    // context: every file-sourced variable can reference any other, including
+    // process-overridden variables.
     let vars: BTreeMap<String, String> = merged
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
@@ -271,14 +302,16 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
-    // Why: only interpolate values for keys that originated from an env file
-    // (`file_keys`). Inherited OS variables (e.g. `PS1`, shell prompts, or
-    // CI runner vars) frequently contain literal `${...}` syntax unrelated to
-    // Rume; interpolating them would fail boot on healthy environments.
+    // Why: only interpolate values whose winning source is an env file
+    // (`file_keys` and not overridden by `"process env"`). Inherited OS
+    // variables (e.g. `PS1`, shell prompts, CI runner vars, or a process
+    // `DATABASE_URL` whose password contains `${...}`) frequently contain
+    // literal `${...}` syntax unrelated to Rume; interpolating them would
+    // fail boot or corrupt credentials on healthy environments.
     // Process-env values still remain in `vars` as lookup targets so file
     // variables can reference process-overridden variables.
     for (key, (value, source)) in &merged {
-        let resolved_value = if file_keys.contains(key) {
+        let resolved_value = if file_keys.contains(key) && source != "process env" {
             interpolate_value(value, &vars)?
         } else {
             value.clone()
@@ -297,6 +330,120 @@ fn load_merged_map_for_env_in(dir: &Path, env_name: &str) -> Result<ResolvedEnv,
         sources,
         file_keys,
     })
+}
+
+/// Parse a `.env` file into raw `(key, value)` pairs without expanding `${VAR}` references.
+pub(crate) fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>, EnvError> {
+    let mut entries = Vec::new();
+    for (idx, raw_line) in content.lines().enumerate() {
+        let line_no = idx + 1;
+        let trimmed = raw_line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+
+        let after_export = trimmed
+            .strip_prefix("export ")
+            .or_else(|| trimmed.strip_prefix("export\t"))
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+
+        let Some((raw_key, raw_val)) = after_export.split_once('=') else {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "missing '='".to_string(),
+            });
+        };
+
+        let key = raw_key.trim();
+        if key.is_empty() || key.chars().any(char::is_whitespace) {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "invalid variable name".to_string(),
+            });
+        }
+
+        let value = parse_dotenv_value(raw_val, path, line_no)?;
+        entries.push((key.to_string(), value));
+    }
+    Ok(entries)
+}
+
+fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<String, EnvError> {
+    let val = raw_val.trim_start();
+    if let Some(rest) = val.strip_prefix('"') {
+        let mut out = String::new();
+        let mut chars = rest.chars();
+        let mut closed = false;
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    closed = true;
+                    break;
+                }
+                '\\' => match chars.next() {
+                    Some('n') => out.push('\n'),
+                    Some('r') => out.push('\r'),
+                    Some('t') => out.push('\t'),
+                    Some('"') => out.push('"'),
+                    Some('\\') => out.push('\\'),
+                    Some(other) => {
+                        out.push('\\');
+                        out.push(other);
+                    }
+                    None => break,
+                },
+                other => out.push(other),
+            }
+        }
+        if !closed {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "unclosed double quote".to_string(),
+            });
+        }
+        let trailing = chars.as_str().trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "unexpected trailing characters".to_string(),
+            });
+        }
+        Ok(out)
+    } else if let Some(rest) = val.strip_prefix('\'') {
+        let Some((inner, trailing)) = rest.split_once('\'') else {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "unclosed single quote".to_string(),
+            });
+        };
+        let trailing = trailing.trim_start();
+        if !trailing.is_empty() && !trailing.starts_with('#') {
+            return Err(EnvError::Dotenv {
+                path: path.to_path_buf(),
+                line: line_no,
+                message: "unexpected trailing characters".to_string(),
+            });
+        }
+        Ok(inner.to_string())
+    } else {
+        // Strip inline `# comment` only when preceded by whitespace.
+        let mut end = val.len();
+        let mut prev_ws = false;
+        for (i, ch) in val.char_indices() {
+            if ch == '#' && prev_ws {
+                end = i;
+                break;
+            }
+            prev_ws = ch.is_whitespace();
+        }
+        Ok(val[..end].trim_end().to_string())
+    }
 }
 
 pub(crate) fn is_running_in_test() -> bool {
@@ -741,5 +888,23 @@ mod tests {
         for good in ["development", "test", "prod-1", "staging_eu_2"] {
             assert!(is_valid_env_name(good));
         }
+    }
+
+    #[test]
+    fn cross_file_interpolation_resolves_after_layer_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "HOST=dev.example.com\nURL=https://${HOST}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join(".env.production"),
+            "HOST=prod.example.com\n",
+        )
+        .unwrap();
+
+        let resolved = ResolvedEnv::load_for_env_in(dir.path(), "production").unwrap();
+        assert_eq!(resolved.get("URL"), Some("https://prod.example.com"));
     }
 }

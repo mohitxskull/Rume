@@ -13,11 +13,11 @@ pub enum EnvError {
         source: std::io::Error,
     },
 
-    #[error("failed to parse environment file {path}: {source}")]
+    #[error("failed to parse environment file {path} at line {line}: {message}")]
     Dotenv {
         path: PathBuf,
-        #[source]
-        source: dotenvy::Error,
+        line: usize,
+        message: String,
     },
 
     #[error("failed to interpolate ${{{variable}}}: variable not found")]
@@ -28,6 +28,9 @@ pub enum EnvError {
 
     #[error("maximum interpolation depth ({depth}) exceeded while interpolating ${{{variable}}}")]
     MaxDepthExceeded { variable: String, depth: usize },
+
+    #[error("interpolation budget exceeded while interpolating ${{{variable}}}: {reason}")]
+    BudgetExceeded { variable: String, reason: String },
 
     #[error("failed to validate environment: {0}")]
     Validation(String),
