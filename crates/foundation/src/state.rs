@@ -46,6 +46,8 @@ pub enum ApplicationMode {
     Inspect,
     /// Boot, execute a registered application task (or list tasks), and shut down cleanly.
     Task,
+    /// Collect routes and emit the OpenAPI v3.1 JSON specification without serving.
+    OpenApi,
 }
 
 /// Lifecycle state of a running application.

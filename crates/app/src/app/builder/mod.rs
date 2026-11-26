@@ -304,6 +304,8 @@ where
     task_error: Option<crate::app::task::TaskError>,
     /// Selected task name for [`ApplicationMode::Task`].
     task_name: Option<String>,
+    /// OpenAPI metadata used by [`ApplicationMode::OpenApi`] (populated via `.openapi()` or `.openapi_info()`).
+    openapi_info: Option<rume_http::openapi::OpenApiInfo>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -340,6 +342,7 @@ where
             tasks: crate::app::task::TaskRegistry::new(),
             task_error: None,
             task_name: None,
+            openapi_info: None,
         }
     }
 
@@ -561,7 +564,12 @@ where
     }
 
     fn effective_mode(&self) -> ApplicationMode {
-        if std::env::var_os("RUME_INSPECT").is_some()
+        if std::env::var_os("RUME_INSPECT").as_deref() == Some(std::ffi::OsStr::new("openapi"))
+            || std::env::args_os()
+                .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-openapi"))
+        {
+            ApplicationMode::OpenApi
+        } else if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
                 a.as_os_str() == std::ffi::OsStr::new("--inspect")
                     || a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes")
@@ -581,16 +589,16 @@ where
         }
     }
 
-    pub(crate) fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
-        // Why: `Inspect` mode runs `ModuleRegistry` DAG validation, middleware
-        // validation, CORS config validation, `collect_and_validate_routes`, and
-        // the actual Axum router merge so module cycles, misconfigured
+    fn inspect_routes_preflight(mut self) -> Result<RouteRegistry, std::io::Error> {
+        // Why: `Inspect` and `OpenApi` modes run `ModuleRegistry` DAG validation,
+        // middleware validation, CORS config validation, `collect_and_validate_routes`,
+        // and the actual Axum router merge so module cycles, misconfigured
         // middleware, invalid CORS configs, and duplicate routes fail closed
-        // without starting the server. It intentionally skips `on_start`,
-        // `on_ready`, and `on_shutdown` hooks so `rume list:routes` and boot
-        // checks remain side-effect-free, and also skips
+        // without starting the server. They intentionally skip `on_start`,
+        // `on_ready`, and `on_shutdown` hooks so `rume list:routes` and
+        // `rume openapi export` remain side-effect-free, and also skip
         // `Module::register_health_checks` (so duplicate health-check names are
-        // detected by the serving build rather than `Inspect`).
+        // detected by the serving build rather than inspection).
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
         validate_middleware_config(
             &self.middleware,
@@ -612,27 +620,46 @@ where
             collect_and_validate_routes(&resolved.startup, &app_routes)?;
         let _merged = merge_module_router(self.router, module_axum)?;
 
-        {
+        let final_registry = {
             let mut reg = self
                 .route_registry
                 .write()
                 .map_err(|_| BuildError::RouteRegistryPoisoned)?;
             reg.extend(module_routes);
             self.ctx.route_registry = reg.clone();
-        }
+            reg.clone()
+        };
 
         self.ctx.lifecycle.set(LifecycleState::Booted);
         self.ctx.availability.set(AvailabilityState::Live);
+
+        Ok(final_registry)
+    }
+
+    pub(crate) fn run_inspect_mode(self) -> Result<(), std::io::Error> {
+        let registry = self.inspect_routes_preflight()?;
 
         if std::env::var_os("RUME_INSPECT").as_deref() == Some(std::ffi::OsStr::new("routes"))
             || std::env::args_os()
                 .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes"))
         {
-            let json = serde_json::to_string(self.ctx.route_registry.routes())
-                .unwrap_or_else(|_| "[]".to_string());
+            let json =
+                serde_json::to_string(registry.routes()).unwrap_or_else(|_| "[]".to_string());
             println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
         }
 
+        Ok(())
+    }
+
+    pub(crate) fn run_openapi_mode(mut self) -> Result<(), std::io::Error> {
+        let info = self
+            .openapi_info
+            .take()
+            .unwrap_or_else(|| rume_http::openapi::OpenApiInfo::new("Rume API", "0.1.0"));
+        let registry = self.inspect_routes_preflight()?;
+        let spec = registry.to_openapi(info);
+        let json = spec.to_json_string().map_err(std::io::Error::other)?;
+        println!("__RUME_OPENAPI_JSON_START__\n{json}\n__RUME_OPENAPI_JSON_END__");
         Ok(())
     }
 
@@ -767,6 +794,7 @@ where
     {
         match self.effective_mode() {
             ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::OpenApi => return self.run_openapi_mode(),
             ApplicationMode::Task => return self.run_task_mode().await,
             ApplicationMode::Run => {}
         }
@@ -795,6 +823,7 @@ where
     {
         match self.effective_mode() {
             ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::OpenApi => return self.run_openapi_mode(),
             ApplicationMode::Task => return self.run_task_mode().await,
             ApplicationMode::Run => {}
         }

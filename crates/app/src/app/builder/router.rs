@@ -277,11 +277,20 @@ where
         self
     }
 
+    /// Set the [`OpenApiInfo`](rume_http::openapi::OpenApiInfo) metadata used by
+    /// [`ApplicationMode::OpenApi`](crate::app::state::ApplicationMode::OpenApi)
+    /// when exporting the OpenAPI specification.
+    pub fn openapi_info(mut self, info: rume_http::openapi::OpenApiInfo) -> Self {
+        self.openapi_info = Some(info);
+        self
+    }
+
     /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
     ///
     /// The specification is generated lazily when requested from the shared route registry,
     /// guaranteeing that routes registered after `.openapi()` and module routes are included.
-    pub fn openapi(self, path: &str, info: rume_http::openapi::OpenApiInfo) -> Self {
+    pub fn openapi(mut self, path: &str, info: rume_http::openapi::OpenApiInfo) -> Self {
+        self.openapi_info = Some(info.clone());
         let registry = Arc::clone(&self.route_registry);
         self.get(path, move || {
             let reg = Arc::clone(&registry);

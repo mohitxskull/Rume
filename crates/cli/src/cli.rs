@@ -136,6 +136,36 @@ pub enum Commands {
         #[command(subcommand)]
         command: TaskCommands,
     },
+    /// Export OpenAPI v3.1 JSON or generate a typed TypeScript SDK client.
+    Openapi {
+        #[command(subcommand)]
+        command: OpenapiCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum OpenapiCommands {
+    /// Export the application's OpenAPI v3.1 JSON specification.
+    Export {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Write output to a file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Generate typed TypeScript interfaces and a fetch client from OpenAPI JSON.
+    Ts {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Read OpenAPI JSON from a file instead of inspecting the project binary.
+        #[arg(long)]
+        input: Option<std::path::PathBuf>,
+        /// Write generated TypeScript to a file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

@@ -1346,3 +1346,63 @@ async fn task_mode_unknown_task_returns_not_found_after_shutdown() {
         vec!["on_start".to_string(), "on_shutdown".to_string()]
     );
 }
+
+#[tokio::test]
+async fn openapi_mode_collects_app_and_module_routes_without_binding() {
+    struct OpenApiTestModule {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::module::Module for OpenApiTestModule {
+        fn name(&self) -> &str {
+            "openapi-test-module"
+        }
+
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router<()>,
+        ) -> rume_http::routing::Router<()> {
+            router.get("/module-items", || async { "items" })
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    let module_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_flag = std::sync::Arc::clone(&ready_called);
+
+    let ctx = test_ctx();
+    let result = RumeBuilder::new(ctx)
+        .bind("127.0.0.1:0")
+        .module(OpenApiTestModule {
+            started: std::sync::Arc::clone(&module_started),
+        })
+        .get("/app-health", || async { "ok" })
+        .openapi_info(rume_http::openapi::OpenApiInfo::new("Test API", "1.2.3"))
+        .on_ready(move |_ctx| async move {
+            ready_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .mode(ApplicationMode::OpenApi)
+        .run_with_signal(std::future::pending())
+        .await;
+
+    assert!(result.is_ok(), "OpenApi mode should succeed: {result:?}");
+    assert!(
+        !module_started.load(std::sync::atomic::Ordering::SeqCst),
+        "OpenApi mode must not run module on_start hooks"
+    );
+    assert!(
+        !ready_called.load(std::sync::atomic::Ordering::SeqCst),
+        "OpenApi mode must not run application on_ready hooks"
+    );
+}

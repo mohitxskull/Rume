@@ -6,6 +6,7 @@ mod env;
 mod generate;
 mod list_routes;
 mod new;
+mod openapi;
 mod sql_check;
 mod task;
 
@@ -103,6 +104,9 @@ pub async fn run(cli: Cli) {
         Some(Commands::Task { command }) => {
             require_rume_project();
             task::run(command);
+        }
+        Some(Commands::Openapi { command }) => {
+            openapi::run(command);
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;
