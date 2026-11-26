@@ -11,9 +11,11 @@ rume-foundation.workspace = true
 rume-observability.workspace = true
 rume-data.workspace = true
 rume-security.workspace = true
-axum = { workspace = true, features = ["multipart"] }
+rume-messaging.workspace = true
+rume-enterprise = { workspace = true, optional = true }
+axum = { workspace = true, features = ["multipart", "ws"] }
 tower.workspace = true
-tower-http.workspace = true
+tower-http = { workspace = true, features = ["fs"] }
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,6 +29,13 @@ rand.workspace = true
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-pki-types = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+hyper-util = { workspace = true, features = ["server-auto", "server-graceful", "tokio"], optional = true }
+rustls-acme = { workspace = true, optional = true }
+rust-embed = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -36,3 +45,13 @@ tower-http = { workspace = true, features = ["decompression-gzip", "decompressio
 default = []
 redis = ["rume-security/redis", "dep:deadpool-redis", "dep:redis"]
 dns-srv = ["dep:hickory-resolver"]
+tls = [
+    "dep:tokio-rustls",
+    "dep:rustls",
+    "dep:rustls-pki-types",
+    "dep:rustls-pemfile",
+    "dep:hyper-util",
+]
+acme = ["tls", "dep:rustls-acme"]
+static-embed = ["dep:rust-embed"]
+scim = ["dep:rume-enterprise"]

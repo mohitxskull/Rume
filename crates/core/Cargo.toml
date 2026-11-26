@@ -25,6 +25,10 @@ rume-enterprise.workspace = true
 rume-app.workspace = true
 # Testing helpers, TestApp, TestServer, and declarative harnesses.
 rume-testing = { workspace = true, optional = true }
+# Optional gRPC server integration.
+rume-grpc = { workspace = true, optional = true }
+# Optional GraphQL server integration.
+rume-graphql = { workspace = true, optional = true }
 # Core HTTP substrate (used by `rume::prelude`).
 axum.workspace = true
 # Serialization (used by `rume::prelude`).
@@ -38,6 +42,7 @@ testing = ["dep:rume-testing", "rume-testing/testing"]
 postgres = [
     "rume-data/postgres",
     "rume-messaging/postgres",
+    "rume-security/postgres",
     "rume-enterprise/postgres",
     "rume-testing?/postgres",
 ]
@@ -55,6 +60,7 @@ rabbitmq = ["rume-messaging/rabbitmq"]
 sqlite = [
     "rume-data/sqlite",
     "rume-messaging/sqlite",
+    "rume-security/sqlite",
     "rume-enterprise/sqlite",
     "rume-testing?/sqlite",
 ]
@@ -68,6 +74,13 @@ saml = ["rume-enterprise/saml"]
 enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]
 s3 = ["rume-data/s3"]
+tls = ["rume-app/tls", "rume-http/tls"]
+acme = ["tls", "rume-app/acme", "rume-http/acme"]
+static-embed = ["rume-app/static-embed", "rume-http/static-embed"]
+mailer = ["rume-messaging/mailer"]
+scim = ["rume-http/scim"]
+grpc = ["dep:rume-grpc"]
+graphql = ["dep:rume-graphql"]
 
 [dev-dependencies]
 # Why: `tokio`, `sqlx`, and `uuid` belong in `[dev-dependencies]` rather than runtime

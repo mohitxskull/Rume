@@ -567,3 +567,99 @@ pub const MYSQL_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/mysql/saga_lis
 pub const MYSQL_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/mysql/saga_acquire_claim.sql");
 /// Release an execution claim lease for a saga in MySQL.
 pub const MYSQL_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/mysql/saga_release_claim.sql");
+
+// Milestone E: Feature flags (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_feature_flags` in SQLite.
+pub const SQLITE_FEATURE_FLAGS_SCHEMA: &str =
+    include_str!("../sql/sqlite/feature_flags_schema.sql");
+
+/// Schema DDL for `rume_feature_flags` in PostgreSQL.
+pub const PG_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/postgres/feature_flags_schema.sql");
+
+/// Schema DDL for `rume_feature_flags` in MySQL.
+pub const MYSQL_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/mysql/feature_flags_schema.sql");
+
+// Milestone E: Usage metering (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_usage_counters` in SQLite.
+pub const SQLITE_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/sqlite/usage_metering_schema.sql");
+
+/// Schema DDL for `rume_usage_counters` in PostgreSQL.
+pub const PG_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/postgres/usage_metering_schema.sql");
+
+/// Schema DDL for `rume_usage_counters` in MySQL.
+pub const MYSQL_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/mysql/usage_metering_schema.sql");
+
+// Milestone E: Webhook deliveries (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_webhook_deliveries` in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_schema.sql");
+
+/// Schema DDL for `rume_webhook_deliveries` in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/postgres/webhook_deliveries_schema.sql");
+
+/// Schema DDL for `rume_webhook_deliveries` in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/mysql/webhook_deliveries_schema.sql");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserts that every Milestone E SQLite/Postgres/MySQL DDL constant for
+    /// feature flags, usage metering, and webhook deliveries is non-empty.
+    ///
+    /// Why: `include_str!` silently includes an empty file if the SQL asset was
+    /// accidentally created as a placeholder. This test catches that at
+    /// `cargo test` time, well before any migration runner executes the DDL.
+    #[test]
+    fn milestone_e_sql_assets_are_non_empty() {
+        // Feature flags.
+        assert!(
+            !SQLITE_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "SQLITE_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "PG_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "MYSQL_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+
+        // Usage metering.
+        assert!(
+            !SQLITE_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "SQLITE_USAGE_METERING_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "PG_USAGE_METERING_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "MYSQL_USAGE_METERING_SCHEMA must be non-empty"
+        );
+
+        // Webhook deliveries.
+        assert!(
+            !SQLITE_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "SQLITE_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "PG_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "MYSQL_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+    }
+}

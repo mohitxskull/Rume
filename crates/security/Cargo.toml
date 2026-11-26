@@ -36,6 +36,7 @@ url.workspace = true
 reqwest = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 rume-data = { workspace = true, features = ["sqlite"] }
@@ -43,5 +44,8 @@ tokio = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
+sqlite = ["rume-data/sqlite", "dep:sqlx", "sqlx/sqlite"]
+postgres = ["rume-data/postgres", "dep:sqlx", "sqlx/postgres"]
+mysql = ["rume-data/mysql", "dep:sqlx", "sqlx/mysql"]
 redis = ["rume-data/redis", "dep:deadpool-redis", "dep:redis"]
 http-client = ["dep:reqwest"]

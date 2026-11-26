@@ -22,6 +22,7 @@
 pub mod error;
 pub mod interpolation;
 pub mod loading;
+pub mod secret_provider;
 pub mod secrets;
 
 // Re-export the public env surface at the module root for convenience.

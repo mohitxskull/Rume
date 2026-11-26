@@ -8,6 +8,7 @@ pub mod ext;
 pub mod fixtures;
 pub mod harness;
 pub mod jobs;
+pub mod mailer;
 pub mod module_harness;
 #[cfg(feature = "testing")]
 pub mod server;

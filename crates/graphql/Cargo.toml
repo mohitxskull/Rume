@@ -1,0 +1,22 @@
+[package]
+name = "rume-graphql"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Optional async-graphql integration with W3C TraceContext and AppError extensions for Rume."
+
+[dependencies]
+rume-foundation.workspace = true
+rume-observability.workspace = true
+rume-http.workspace = true
+axum.workspace = true
+tokio.workspace = true
+async-graphql.workspace = true
+async-graphql-axum.workspace = true
+tracing.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true }

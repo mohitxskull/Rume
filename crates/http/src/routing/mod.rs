@@ -24,6 +24,7 @@ pub mod resource;
 pub mod router;
 pub mod spec;
 pub mod validated_param;
+pub mod versioning;
 
 // Re-export the public routing surface at the module root for convenience.
 pub use group::RouteGroup;

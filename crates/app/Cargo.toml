@@ -15,3 +15,9 @@ tower.workspace = true
 tokio.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[features]
+default = []
+tls = ["rume-http/tls"]
+acme = ["tls", "rume-http/acme"]
+static-embed = ["rume-http/static-embed"]
