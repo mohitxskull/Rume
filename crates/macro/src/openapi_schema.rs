@@ -474,7 +474,7 @@ fn parse_i64_lit(expr: &Expr) -> Option<i64> {
 }
 
 /// Returns `true` if `ty` is `Option<T>`, `std::option::Option<T>`, or `core::option::Option<T>`.
-fn is_option_type(ty: &Type) -> bool {
+pub(crate) fn is_option_type(ty: &Type) -> bool {
     let type_path = match ty {
         Type::Group(group) => return is_option_type(&group.elem),
         Type::Path(type_path) if type_path.qself.is_none() => type_path,
@@ -503,7 +503,7 @@ fn is_option_type(ty: &Type) -> bool {
     )
 }
 
-fn collect_used_type_params(
+pub(crate) fn collect_used_type_params(
     ty: &Type,
     type_param_names: &BTreeSet<String>,
     used: &mut BTreeSet<String>,

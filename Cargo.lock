@@ -4650,6 +4650,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "rume-data",
+ "serde",
  "serde_json",
  "syn 3.0.10",
  "trybuild",
