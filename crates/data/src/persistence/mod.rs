@@ -31,6 +31,10 @@ pub use builder::{
     BuiltQuery, DynamicDelete, DynamicInsert, DynamicSelect, DynamicUpdate, SqlDialect,
 };
 pub use config::DatabaseConfig;
+pub use conventions::{
+    OptimisticLock, SoftDeletable, execute_cas, execute_cas_tx, soft_delete_update,
+    where_not_deleted, where_only_deleted, with_version_check,
+};
 pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator, RUME_AUTH_MIGRATION_ID};
 #[cfg(feature = "mysql")]
@@ -42,6 +46,7 @@ pub use pool::{
 #[cfg(feature = "postgres")]
 pub use postgres::{PostgresBackend, PostgresTransaction};
 pub use query::SqlQuery;
+pub use read_write::{ReadWriteConfig, ReadWriteHealthCheck, ReadWritePool, ReadWritePoolStatus};
 pub use row::{DbRow, FromDbValue, FromRow};
 #[cfg(feature = "sqlite")]
 pub use sqlite::{SqliteBackend, SqliteTransaction};
