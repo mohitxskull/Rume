@@ -1,10 +1,405 @@
 //! Streaming multipart file upload extractor and validation.
+//!
+//! Note: Axum's `DefaultBodyLimit` defaults to 2 MiB and rejects larger
+//! payloads before [`ValidatedMultipart`] runs. Routes accepting uploads larger
+//! than 2 MiB should pair [`ValidatedMultipart`] with
+//! `axum::extract::DefaultBodyLimit::disable()` (or `RequestBodyLimitLayer`).
 
-/// Placeholder multipart upload configuration for Milestone C.
-pub struct MultipartUploadConfig;
+use std::path::Path;
 
-/// Placeholder uploaded file representation for Milestone C.
-pub struct UploadedFile;
+use axum::extract::{FromRequest, Multipart, Request};
+use axum::http::StatusCode;
+use rume_foundation::AppError;
 
-/// Placeholder validated multipart extractor for Milestone C.
-pub struct ValidatedMultipart;
+const DEFAULT_MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024;
+const DEFAULT_MAX_FILES: usize = 10;
+
+/// Configuration governing [`ValidatedMultipart`] and [`extract_multipart_files`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUploadConfig {
+    pub max_file_size_bytes: usize,
+    pub max_files: usize,
+    pub allowed_mime_types: Vec<String>,
+    pub allowed_extensions: Vec<String>,
+}
+
+impl Default for MultipartUploadConfig {
+    fn default() -> Self {
+        Self {
+            max_file_size_bytes: DEFAULT_MAX_FILE_SIZE_BYTES,
+            max_files: DEFAULT_MAX_FILES,
+            allowed_mime_types: Vec::new(),
+            allowed_extensions: Vec::new(),
+        }
+    }
+}
+
+/// A validated uploaded file extracted from a multipart request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UploadedFile {
+    pub field_name: String,
+    pub file_name: String,
+    pub sanitized_file_name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+/// Axum [`FromRequest`] extractor that streams and validates multipart file uploads.
+///
+/// Reads an optional [`MultipartUploadConfig`] from request extensions, falling
+/// back to [`MultipartUploadConfig::default()`].
+#[derive(Debug, Clone)]
+pub struct ValidatedMultipart {
+    pub files: Vec<UploadedFile>,
+}
+
+impl<S> FromRequest<S> for ValidatedMultipart
+where
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let config = req
+            .extensions()
+            .get::<MultipartUploadConfig>()
+            .cloned()
+            .unwrap_or_default();
+
+        let multipart =
+            Multipart::from_request(req, state)
+                .await
+                .map_err(|e| AppError::BadRequest {
+                    code: "INVALID_MULTIPART",
+                    message: format!("invalid multipart request: {e}"),
+                })?;
+
+        let files = extract_multipart_files(multipart, &config).await?;
+        Ok(Self { files })
+    }
+}
+
+/// Sanitizes an untrusted client filename.
+///
+/// Strips directory prefixes (`/` and `\`), control characters, null bytes,
+/// and leading dots, falling back to `"upload.bin"` if the result is empty.
+pub fn sanitize_filename(raw: &str) -> String {
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .collect();
+    let trimmed = cleaned.trim().trim_start_matches('.');
+    if trimmed.is_empty() {
+        "upload.bin".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Streams and validates multipart file fields according to `config`.
+pub async fn extract_multipart_files(
+    mut multipart: Multipart,
+    config: &MultipartUploadConfig,
+) -> Result<Vec<UploadedFile>, AppError> {
+    let mut files = Vec::new();
+
+    while let Some(mut field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest {
+            code: "INVALID_MULTIPART",
+            message: format!("failed to read multipart field: {e}"),
+        })?
+    {
+        let Some(raw_file_name) = field.file_name().map(ToString::to_string) else {
+            continue;
+        };
+
+        if files.len() >= config.max_files {
+            return Err(AppError::BadRequest {
+                code: "TOO_MANY_FILES",
+                message: format!("maximum of {} uploaded files exceeded", config.max_files),
+            });
+        }
+
+        let field_name = field.name().unwrap_or("file").to_string();
+        let content_type = field.content_type().map(ToString::to_string);
+        let sanitized_file_name = sanitize_filename(&raw_file_name);
+
+        validate_mime_type(content_type.as_deref(), &config.allowed_mime_types)?;
+        validate_extension(&sanitized_file_name, &config.allowed_extensions)?;
+
+        let mut bytes = Vec::new();
+        while let Some(chunk) = field.chunk().await.map_err(|e| AppError::BadRequest {
+            code: "INVALID_MULTIPART",
+            message: format!("failed to read multipart chunk: {e}"),
+        })? {
+            if bytes.len().saturating_add(chunk.len()) > config.max_file_size_bytes {
+                return Err(AppError::Public {
+                    status: StatusCode::PAYLOAD_TOO_LARGE,
+                    code: "PAYLOAD_TOO_LARGE",
+                    message: format!(
+                        "uploaded file exceeds maximum size of {} bytes",
+                        config.max_file_size_bytes
+                    ),
+                });
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        files.push(UploadedFile {
+            field_name,
+            file_name: raw_file_name,
+            sanitized_file_name,
+            content_type,
+            bytes,
+        });
+    }
+
+    Ok(files)
+}
+
+fn validate_mime_type(
+    content_type: Option<&str>,
+    allowed_mime_types: &[String],
+) -> Result<(), AppError> {
+    if allowed_mime_types.is_empty() {
+        return Ok(());
+    }
+
+    let essence = content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    let allowed = essence
+        .as_deref()
+        .is_some_and(|e| allowed_mime_types.iter().any(|a| a.eq_ignore_ascii_case(e)));
+
+    if !allowed {
+        return Err(AppError::Public {
+            status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            code: "UNSUPPORTED_MEDIA_TYPE",
+            message: "uploaded file MIME type is not allowed".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_extension(file_name: &str, allowed_extensions: &[String]) -> Result<(), AppError> {
+    if allowed_extensions.is_empty() {
+        return Ok(());
+    }
+
+    let ext = Path::new(file_name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+
+    let allowed = ext.as_deref().is_some_and(|e| {
+        allowed_extensions
+            .iter()
+            .any(|a| a.trim_start_matches('.').eq_ignore_ascii_case(e))
+    });
+
+    if !allowed {
+        return Err(AppError::BadRequest {
+            code: "UNSUPPORTED_FILE_EXTENSION",
+            message: "uploaded file extension is not allowed".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode, header};
+    use axum::routing::post;
+    use axum::{Extension, Json, Router};
+    use tower::ServiceExt;
+
+    #[test]
+    fn sanitize_filename_strips_traversal_and_control_chars() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "passwd");
+        assert_eq!(sanitize_filename(r"..\..\secret.txt"), "secret.txt");
+        assert_eq!(sanitize_filename(".hidden"), "hidden");
+        assert_eq!(sanitize_filename(".."), "upload.bin");
+        assert_eq!(sanitize_filename(""), "upload.bin");
+        assert_eq!(sanitize_filename("a\x00b\nc.txt"), "abc.txt");
+    }
+
+    fn build_multipart_body(
+        boundary: &str,
+        name: &str,
+        filename: &str,
+        content_type: &str,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"; filename=\"{filename}\"\r\n")
+                .as_bytes(),
+        );
+        body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+        body.extend_from_slice(data);
+        body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+        body
+    }
+
+    #[tokio::test]
+    async fn multipart_extractor_enforces_size_mime_and_extension_limits() {
+        let config = MultipartUploadConfig {
+            max_file_size_bytes: 16,
+            max_files: 2,
+            allowed_mime_types: vec!["text/plain".to_string()],
+            allowed_extensions: vec!["txt".to_string()],
+        };
+
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len(), "name": files[0].sanitized_file_name }))
+                }),
+            )
+            .layer(Extension(config));
+
+        let boundary = "----rume-test-boundary";
+
+        // Valid upload
+        let valid_body =
+            build_multipart_body(boundary, "file", "../hello.txt", "text/plain", b"hello");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(valid_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Oversized upload -> 413
+        let big_body = build_multipart_body(boundary, "file", "big.txt", "text/plain", &[b'x'; 32]);
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(big_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        // Disallowed MIME -> 415
+        let bad_mime_body = build_multipart_body(
+            boundary,
+            "file",
+            "doc.txt",
+            "application/octet-stream",
+            b"hi",
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(bad_mime_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Disallowed extension -> 400 or 415
+        let bad_ext_body =
+            build_multipart_body(boundary, "file", "script.exe", "text/plain", b"hi");
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(bad_ext_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            resp.status() == StatusCode::BAD_REQUEST
+                || resp.status() == StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_extractor_accepts_large_upload_with_default_body_limit_disabled() {
+        let config = MultipartUploadConfig {
+            max_file_size_bytes: 3 * 1024 * 1024,
+            max_files: 1,
+            allowed_mime_types: vec![],
+            allowed_extensions: vec![],
+        };
+
+        let app = Router::new()
+            .route(
+                "/upload-large",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "size": files[0].bytes.len() }))
+                }),
+            )
+            .layer(axum::extract::DefaultBodyLimit::disable())
+            .layer(Extension(config));
+
+        let boundary = "----rume-large-boundary";
+        let payload = vec![b'a'; 2_500_000];
+        let body = build_multipart_body(
+            boundary,
+            "file",
+            "large.bin",
+            "application/octet-stream",
+            &payload,
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload-large")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+}
