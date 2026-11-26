@@ -8,6 +8,7 @@ use std::sync::{Arc, RwLock};
 
 use axum::http::header::HOST;
 use axum::http::request::Parts;
+use serde::{Deserialize, Serialize};
 
 use crate::tenant::error::TenantError;
 use crate::tenant::model::Tenant;
@@ -122,14 +123,8 @@ impl TenantResolver for HeaderTenantResolver {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
         Box::pin(async move {
-            let Some(header_val) = parts.headers.get(&self.header_name) else {
+            let Some(key) = extract_header_key(parts, &self.header_name)? else {
                 return Ok(None);
-            };
-
-            let Ok(key) = header_val.to_str() else {
-                return Err(TenantError::InvalidIdentifier(
-                    "malformed tenant header".into(),
-                ));
             };
 
             // Why: Look up by ID first, falling back to slug lookup only if not found in by_id,
@@ -170,13 +165,8 @@ pub struct SubdomainTenantResolver {
 impl SubdomainTenantResolver {
     /// Creates a new subdomain resolver for the given base domain.
     pub fn new(base_domain: impl Into<String>) -> Self {
-        let normalized = base_domain
-            .into()
-            .trim()
-            .trim_end_matches('.')
-            .to_ascii_lowercase();
         Self {
-            base_domain: normalized,
+            base_domain: normalize_base_domain(&base_domain.into()),
             tenants: Arc::new(RwLock::new(BTreeMap::new())),
         }
     }
@@ -214,70 +204,20 @@ impl TenantResolver for SubdomainTenantResolver {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
         Box::pin(async move {
-            // Why: HTTP/1.1 sends the `Host` header, while HTTP/2 requests carry
-            // the target authority in `:authority` (`parts.uri.authority()`).
-            let raw_host = if let Some(host_val) = parts.headers.get(HOST) {
-                let Ok(host_str) = host_val.to_str() else {
-                    return Err(TenantError::InvalidIdentifier(
-                        "malformed host header".into(),
-                    ));
-                };
-                host_str
-            } else if let Some(authority) = parts.uri.authority() {
-                authority.as_str()
-            } else {
+            let Some(subdomain) = extract_subdomain_slug(parts, &self.base_domain)? else {
                 return Ok(None);
             };
 
-            // Convert host to lowercase, remove optional port, and strip trailing FQDN dot:
-            // "ACME.myplatform.com.:8080" -> "acme.myplatform.com"
-            let host_lower = raw_host.to_ascii_lowercase();
-            let host_no_port = if host_lower.starts_with('[') {
-                if let Some(bracket_end) = host_lower.find(']') {
-                    &host_lower[1..bracket_end]
-                } else {
-                    &host_lower
-                }
+            let map = self
+                .tenants
+                .read()
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
+
+            if let Some(tenant) = map.get(&subdomain) {
+                Ok(Some(tenant.clone()))
             } else {
-                host_lower.split(':').next().unwrap_or(&host_lower)
-            };
-            let host_normalized = host_no_port.trim_end_matches('.');
-
-            // Why: Normalizing base_domain to guarantee a leading dot (".{base_domain}") ensures that
-            // host.strip_suffix matches strictly on a DNS label boundary. Without the leading dot,
-            // "evilapp.platform.io" matches suffix "app.platform.io", extracting "evil" as a valid tenant.
-            let normalized_base = if self.base_domain.starts_with('.') {
-                self.base_domain.clone()
-            } else {
-                format!(".{}", self.base_domain)
-            };
-
-            if let Some(subdomain) = host_normalized.strip_suffix(&normalized_base) {
-                // Why: A tenant subdomain must be a single DNS label. Subdomains containing dots
-                // (e.g. "attacker.acme.app.platform.io") represent nested domain delegations that must
-                // not be treated as a composite slug.
-                if subdomain.is_empty()
-                    || subdomain.contains('.')
-                    || !subdomain
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
-                {
-                    return Ok(None);
-                }
-
-                let map = self
-                    .tenants
-                    .read()
-                    .map_err(|e| TenantError::Internal(e.to_string()))?;
-
-                if let Some(tenant) = map.get(subdomain) {
-                    return Ok(Some(tenant.clone()));
-                } else {
-                    return Err(TenantError::TenantNotFound(subdomain.to_string()));
-                }
+                Err(TenantError::TenantNotFound(subdomain))
             }
-
-            Ok(None)
         })
     }
 }
@@ -300,9 +240,130 @@ pub trait TenantStore: Debug + Send + Sync + 'static {
     fn deactivate<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, TenantError>>;
 }
 
+/// Extracts a tenant key from a request header, rejecting malformed non-UTF-8 values.
+fn extract_header_key<'a>(
+    parts: &'a Parts,
+    header_name: &str,
+) -> Result<Option<&'a str>, TenantError> {
+    let Some(header_val) = parts.headers.get(header_name) else {
+        return Ok(None);
+    };
+    let Ok(key) = header_val.to_str() else {
+        return Err(TenantError::InvalidIdentifier(
+            "malformed tenant header".into(),
+        ));
+    };
+    Ok(Some(key))
+}
+
+/// Normalizes a base domain for subdomain extraction (lowercase, trimmed, no trailing dot).
+fn normalize_base_domain(base_domain: &str) -> String {
+    base_domain
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+/// Extracts a single-label subdomain slug from `Host` or HTTP/2 `:authority`.
+fn extract_subdomain_slug(parts: &Parts, base_domain: &str) -> Result<Option<String>, TenantError> {
+    // Why: HTTP/1.1 sends the `Host` header, while HTTP/2 requests carry
+    // the target authority in `:authority` (`parts.uri.authority()`).
+    let raw_host = if let Some(host_val) = parts.headers.get(HOST) {
+        let Ok(host_str) = host_val.to_str() else {
+            return Err(TenantError::InvalidIdentifier(
+                "malformed host header".into(),
+            ));
+        };
+        host_str
+    } else if let Some(authority) = parts.uri.authority() {
+        authority.as_str()
+    } else {
+        return Ok(None);
+    };
+
+    // Convert host to lowercase, remove optional port, and strip trailing FQDN dot:
+    // "ACME.myplatform.com.:8080" -> "acme.myplatform.com"
+    let host_lower = raw_host.to_ascii_lowercase();
+    let host_no_port = if host_lower.starts_with('[') {
+        if let Some(bracket_end) = host_lower.find(']') {
+            &host_lower[1..bracket_end]
+        } else {
+            &host_lower
+        }
+    } else {
+        host_lower.split(':').next().unwrap_or(&host_lower)
+    };
+    let host_normalized = host_no_port.trim_end_matches('.');
+
+    // Why: Normalizing base_domain to guarantee a leading dot (".{base_domain}") ensures that
+    // host.strip_suffix matches strictly on a DNS label boundary. Without the leading dot,
+    // "evilapp.platform.io" matches suffix "app.platform.io", extracting "evil" as a valid tenant.
+    let normalized_base = if base_domain.starts_with('.') {
+        base_domain.to_string()
+    } else {
+        format!(".{base_domain}")
+    };
+
+    if let Some(subdomain) = host_normalized.strip_suffix(&normalized_base) {
+        // Why: A tenant subdomain must be a single DNS label. Subdomains containing dots
+        // (e.g. "attacker.acme.app.platform.io") represent nested domain delegations that must
+        // not be treated as a composite slug.
+        if subdomain.is_empty()
+            || subdomain.contains('.')
+            || !subdomain
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        {
+            return Ok(None);
+        }
+        return Ok(Some(subdomain.to_string()));
+    }
+
+    Ok(None)
+}
+
+/// Normalizes a URL path prefix to always begin and end with `/`.
+fn normalize_path_prefix(prefix: &str) -> String {
+    let mut normalized = prefix.trim().to_string();
+    if !normalized.starts_with('/') {
+        normalized.insert(0, '/');
+    }
+    if !normalized.ends_with('/') {
+        normalized.push('/');
+    }
+    normalized
+}
+
+/// Validates a tenant slug extracted from a URL path segment.
+fn validate_path_slug(slug: &str) -> Result<(), TenantError> {
+    if slug.is_empty()
+        || slug.len() > 64
+        || !slug
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(TenantError::InvalidIdentifier(format!(
+            "invalid tenant slug in path: '{slug}'"
+        )));
+    }
+    Ok(())
+}
+
+/// Extracts and validates a tenant slug from a URL path matching `normalized_prefix`.
+fn extract_path_prefix_slug(
+    parts: &Parts,
+    normalized_prefix: &str,
+) -> Result<Option<String>, TenantError> {
+    let Some(rest) = parts.uri.path().strip_prefix(normalized_prefix) else {
+        return Ok(None);
+    };
+    let slug = rest.split('/').next().unwrap_or("");
+    validate_path_slug(slug)?;
+    Ok(Some(slug.to_string()))
+}
+
 /// SQL-backed [`TenantStore`] using `rume-data` queries.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct SqlTenantStore<B: rume_data::persistence::DatabaseBackend> {
     backend: Arc<B>,
 }
@@ -312,36 +373,109 @@ impl<B: rume_data::persistence::DatabaseBackend> SqlTenantStore<B> {
     pub fn new(backend: Arc<B>) -> Self {
         Self { backend }
     }
+
+    fn row_to_tenant(row: rume_data::persistence::DbRow) -> Result<Tenant, TenantError> {
+        let id: String = row
+            .get("id")
+            .map_err(|e| TenantError::Internal(format!("failed to decode tenant id: {e}")))?;
+        let slug: String = row
+            .get("slug")
+            .map_err(|e| TenantError::Internal(format!("failed to decode tenant slug: {e}")))?;
+        let metadata_json: Option<String> = row
+            .get_opt("metadata_json")
+            .map_err(|e| TenantError::Internal(format!("failed to decode metadata_json: {e}")))?;
+        let metadata = match metadata_json.as_deref() {
+            Some(raw) if !raw.is_empty() => serde_json::from_str(raw).map_err(|e| {
+                TenantError::Internal(format!("failed to parse tenant metadata JSON: {e}"))
+            })?,
+            _ => BTreeMap::new(),
+        };
+        Ok(Tenant { id, slug, metadata })
+    }
 }
 
 impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<B> {
-    #[allow(unused_variables)]
     fn find_by_id<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            let sql = match self.backend.dialect() {
+                "postgres" => rume_data::sql::PG_AUTH_TENANT_FIND_BY_ID,
+                "mysql" => rume_data::sql::MYSQL_AUTH_TENANT_FIND_BY_ID,
+                _ => rume_data::sql::SQLITE_AUTH_TENANT_FIND_BY_ID,
+            };
+            let row = self
+                .backend
+                .fetch_optional(sql, &[rume_data::persistence::DbValue::from(id)])
+                .await
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
+            row.map(Self::row_to_tenant).transpose()
+        })
     }
 
-    #[allow(unused_variables)]
     fn find_by_slug<'a>(
         &'a self,
         slug: &'a str,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            let sql = match self.backend.dialect() {
+                "postgres" => rume_data::sql::PG_AUTH_TENANT_FIND_BY_SLUG,
+                "mysql" => rume_data::sql::MYSQL_AUTH_TENANT_FIND_BY_SLUG,
+                _ => rume_data::sql::SQLITE_AUTH_TENANT_FIND_BY_SLUG,
+            };
+            let row = self
+                .backend
+                .fetch_optional(sql, &[rume_data::persistence::DbValue::from(slug)])
+                .await
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
+            row.map(Self::row_to_tenant).transpose()
+        })
     }
 
-    #[allow(unused_variables)]
     fn upsert<'a>(&'a self, tenant: &'a Tenant) -> BoxFuture<'a, Result<(), TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            let sql = match self.backend.dialect() {
+                "postgres" => rume_data::sql::PG_AUTH_TENANT_UPSERT,
+                "mysql" => rume_data::sql::MYSQL_AUTH_TENANT_UPSERT,
+                _ => rume_data::sql::SQLITE_AUTH_TENANT_UPSERT,
+            };
+            let metadata_json = serde_json::to_string(&tenant.metadata)
+                .map_err(|e| TenantError::Internal(format!("failed to serialize metadata: {e}")))?;
+            let created_at = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+            let params = [
+                rume_data::persistence::DbValue::from(tenant.id.as_str()),
+                rume_data::persistence::DbValue::from(tenant.slug.as_str()),
+                rume_data::persistence::DbValue::from(metadata_json),
+                rume_data::persistence::DbValue::from(created_at),
+            ];
+            self.backend
+                .execute_params(sql, &params)
+                .await
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
+            Ok(())
+        })
     }
 
-    #[allow(unused_variables)]
     fn deactivate<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            let sql = match self.backend.dialect() {
+                "postgres" => rume_data::sql::PG_AUTH_TENANT_DEACTIVATE,
+                "mysql" => rume_data::sql::MYSQL_AUTH_TENANT_DEACTIVATE,
+                _ => rume_data::sql::SQLITE_AUTH_TENANT_DEACTIVATE,
+            };
+            let affected = self
+                .backend
+                .execute_params(sql, &[rume_data::persistence::DbValue::from(id)])
+                .await
+                .map_err(|e| TenantError::Internal(e.to_string()))?;
+            Ok(affected > 0)
+        })
     }
 }
 
 /// Resolves tenant from a URL path prefix (e.g. `/t/{slug}/...`).
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PathPrefixTenantResolver {
     prefix: String,
     tenants: Arc<RwLock<BTreeMap<String, Tenant>>>,
@@ -359,9 +493,9 @@ impl PathPrefixTenantResolver {
     }
 
     /// Sets a custom path prefix.
-    #[allow(unused_variables)]
-    pub fn with_prefix(self, prefix: impl Into<String>) -> Self {
-        todo!("implemented in Task 05")
+    pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
+        self.prefix = normalize_path_prefix(&prefix.into());
+        self
     }
 
     /// Backs this resolver with a [`TenantStore`].
@@ -371,9 +505,22 @@ impl PathPrefixTenantResolver {
     }
 
     /// Attempts to register a tenant by slug, returning an error on conflict.
-    #[allow(unused_variables)]
     pub fn try_add_tenant(&self, tenant: Tenant) -> Result<(), TenantError> {
-        todo!("implemented in Task 05")
+        validate_path_slug(&tenant.slug)?;
+        let mut map = self
+            .tenants
+            .write()
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
+        if let Some(existing) = map.get(&tenant.slug)
+            && existing.id != tenant.id
+        {
+            return Err(TenantError::Conflict(format!(
+                "path-prefix slug '{}' already registered to tenant '{}'",
+                tenant.slug, existing.id
+            )));
+        }
+        map.insert(tenant.slug.clone(), tenant);
+        Ok(())
     }
 
     /// Registers a tenant by slug.
@@ -392,12 +539,34 @@ impl Default for PathPrefixTenantResolver {
 }
 
 impl TenantResolver for PathPrefixTenantResolver {
-    #[allow(unused_variables)]
     fn resolve<'a>(
         &'a self,
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            let Some(slug) = extract_path_prefix_slug(parts, &self.prefix)? else {
+                return Ok(None);
+            };
+
+            let static_hit = {
+                let map = self
+                    .tenants
+                    .read()
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                map.get(&slug).cloned()
+            };
+            if let Some(tenant) = static_hit {
+                return Ok(Some(tenant));
+            }
+
+            if let Some(store) = &self.store
+                && let Some(tenant) = store.find_by_slug(&slug).await?
+            {
+                return Ok(Some(tenant));
+            }
+
+            Err(TenantError::TenantNotFound(slug))
+        })
     }
 }
 
@@ -412,9 +581,14 @@ pub enum TenantKeyExtractor {
     PathPrefix(String),
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+enum CachedTenantEntry {
+    Found(Tenant),
+    NotFound,
+}
+
 /// DB-backed [`TenantResolver`] with positive/negative caching and explicit invalidation.
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct CachedDbTenantResolver<S: TenantStore, C: rume_data::cache::CacheBackend> {
     store: Arc<S>,
     cache: Arc<C>,
@@ -447,22 +621,131 @@ impl<S: TenantStore, C: rume_data::cache::CacheBackend> CachedDbTenantResolver<S
         self
     }
 
+    fn cache_key(kind: &str, key: &str) -> String {
+        format!("rume:tenant:{kind}:{key}")
+    }
+
+    async fn cache_get_entry(
+        &self,
+        cache_key: &str,
+    ) -> Result<Option<CachedTenantEntry>, TenantError> {
+        let Some(bytes) = self
+            .cache
+            .get(cache_key)
+            .await
+            .map_err(|e| TenantError::Internal(e.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let entry = serde_json::from_slice::<CachedTenantEntry>(&bytes)
+            .map_err(|e| TenantError::Internal(format!("invalid cached tenant entry: {e}")))?;
+        Ok(Some(entry))
+    }
+
+    async fn cache_set_entry(
+        &self,
+        cache_key: &str,
+        entry: &CachedTenantEntry,
+        ttl: std::time::Duration,
+    ) -> Result<(), TenantError> {
+        let bytes = serde_json::to_vec(entry).map_err(|e| {
+            TenantError::Internal(format!("failed to serialize tenant cache entry: {e}"))
+        })?;
+        self.cache
+            .set(cache_key, bytes, Some(ttl))
+            .await
+            .map_err(|e| TenantError::Internal(e.to_string()))
+    }
+
+    async fn lookup_by_kind(&self, kind: &str, key: &str) -> Result<Option<Tenant>, TenantError> {
+        let cache_key = Self::cache_key(kind, key);
+        if let Some(entry) = self.cache_get_entry(&cache_key).await? {
+            return match entry {
+                CachedTenantEntry::Found(t) => Ok(Some(t)),
+                CachedTenantEntry::NotFound => Ok(None),
+            };
+        }
+
+        let db_result = match kind {
+            "id" => self.store.find_by_id(key).await?,
+            _ => self.store.find_by_slug(key).await?,
+        };
+
+        match db_result {
+            Some(tenant) => {
+                self.cache_set_entry(
+                    &cache_key,
+                    &CachedTenantEntry::Found(tenant.clone()),
+                    self.positive_ttl,
+                )
+                .await?;
+                Ok(Some(tenant))
+            }
+            None => {
+                self.cache_set_entry(&cache_key, &CachedTenantEntry::NotFound, self.negative_ttl)
+                    .await?;
+                Ok(None)
+            }
+        }
+    }
+
     /// Invalidates cached entries for `tenant_id` and `slug`.
-    #[allow(unused_variables)]
     pub async fn invalidate(&self, tenant_id: &str, slug: &str) -> Result<(), TenantError> {
-        todo!("implemented in Task 05")
+        self.cache
+            .delete(&Self::cache_key("id", tenant_id))
+            .await
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
+        self.cache
+            .delete(&Self::cache_key("slug", slug))
+            .await
+            .map_err(|e| TenantError::Internal(e.to_string()))?;
+        Ok(())
     }
 }
 
 impl<S: TenantStore, C: rume_data::cache::CacheBackend + 'static> TenantResolver
     for CachedDbTenantResolver<S, C>
 {
-    #[allow(unused_variables)]
     fn resolve<'a>(
         &'a self,
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<Tenant>, TenantError>> {
-        todo!("implemented in Task 05")
+        Box::pin(async move {
+            match &self.extractor {
+                TenantKeyExtractor::Header(header_name) => {
+                    let Some(key) = extract_header_key(parts, header_name)? else {
+                        return Ok(None);
+                    };
+                    if let Some(tenant) = self.lookup_by_kind("id", key).await? {
+                        return Ok(Some(tenant));
+                    }
+                    if let Some(tenant) = self.lookup_by_kind("slug", key).await? {
+                        return Ok(Some(tenant));
+                    }
+                    Err(TenantError::TenantNotFound(key.to_string()))
+                }
+                TenantKeyExtractor::Subdomain(base_domain) => {
+                    let base = normalize_base_domain(base_domain);
+                    let Some(slug) = extract_subdomain_slug(parts, &base)? else {
+                        return Ok(None);
+                    };
+                    match self.lookup_by_kind("slug", &slug).await? {
+                        Some(tenant) => Ok(Some(tenant)),
+                        None => Err(TenantError::TenantNotFound(slug)),
+                    }
+                }
+                TenantKeyExtractor::PathPrefix(prefix) => {
+                    let normalized = normalize_path_prefix(prefix);
+                    let Some(slug) = extract_path_prefix_slug(parts, &normalized)? else {
+                        return Ok(None);
+                    };
+                    match self.lookup_by_kind("slug", &slug).await? {
+                        Some(tenant) => Ok(Some(tenant)),
+                        None => Err(TenantError::TenantNotFound(slug)),
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -602,5 +885,126 @@ mod tests {
             .unwrap()
             .into_parts();
         assert_eq!(resolver.resolve(&parts_h2).await.unwrap(), Some(tenant));
+    }
+
+    #[tokio::test]
+    async fn path_prefix_tenant_resolver_extracts_slug_and_rejects_traversal_or_unknown() {
+        let acme = Tenant::new("t-acme", "acme");
+        let resolver = PathPrefixTenantResolver::new()
+            .with_prefix("/t/")
+            .add_tenant(acme.clone());
+
+        let (parts_ok, _) = Request::builder()
+            .uri("/t/acme/orders/42")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(resolver.resolve(&parts_ok).await.unwrap(), Some(acme));
+
+        let (parts_traversal, _) = Request::builder()
+            .uri("/t/../admin")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            resolver.resolve(&parts_traversal).await.unwrap_err(),
+            TenantError::InvalidIdentifier(_)
+        ));
+
+        let (parts_encoded, _) = Request::builder()
+            .uri("/t/acme%2fadmin/orders")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            resolver.resolve(&parts_encoded).await.unwrap_err(),
+            TenantError::InvalidIdentifier(_)
+        ));
+
+        let (parts_unknown, _) = Request::builder()
+            .uri("/t/unknown/orders")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            resolver.resolve(&parts_unknown).await.unwrap_err(),
+            TenantError::TenantNotFound(s) if s == "unknown"
+        ));
+    }
+
+    #[tokio::test]
+    async fn path_prefix_tenant_resolver_returns_none_for_unprefixed_paths() {
+        let acme = Tenant::new("t-acme", "acme");
+        let resolver = PathPrefixTenantResolver::new().add_tenant(acme);
+
+        let (parts_health, _) = Request::builder()
+            .uri("/health/live")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(resolver.resolve(&parts_health).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn cached_db_tenant_resolver_caches_hits_negative_misses_and_invalidates() {
+        use rume_data::cache::backend::{CacheBackend, InMemoryCacheBackend};
+        use rume_data::persistence::backend::DatabaseBackend;
+        use rume_data::persistence::sqlite::SqliteBackend;
+
+        let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
+        backend
+            .execute(rume_data::sql::SQLITE_AUTH_SCHEMA)
+            .await
+            .unwrap();
+
+        let store = Arc::new(SqlTenantStore::new(Arc::clone(&backend)));
+        let cache = Arc::new(InMemoryCacheBackend::new());
+
+        let acme = Tenant::new("t-acme", "acme");
+        store.upsert(&acme).await.unwrap();
+
+        let resolver = CachedDbTenantResolver::new(
+            Arc::clone(&store),
+            Arc::clone(&cache),
+            TenantKeyExtractor::PathPrefix("/t/".into()),
+        );
+
+        // Positive lookup populates cache
+        let (parts_ok, _) = Request::builder()
+            .uri("/t/acme/dashboard")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert_eq!(
+            resolver.resolve(&parts_ok).await.unwrap(),
+            Some(acme.clone())
+        );
+        assert!(cache.exists("rume:tenant:slug:acme").await.unwrap());
+
+        // Deactivate in DB; cached positive entry still resolves until invalidated
+        assert!(store.deactivate("t-acme").await.unwrap());
+        assert_eq!(resolver.resolve(&parts_ok).await.unwrap(), Some(acme));
+
+        // Explicit invalidation evicts cache; subsequent lookup sees DB deactivation and caches negative miss
+        resolver.invalidate("t-acme", "acme").await.unwrap();
+        assert!(!cache.exists("rume:tenant:slug:acme").await.unwrap());
+        assert!(matches!(
+            resolver.resolve(&parts_ok).await.unwrap_err(),
+            TenantError::TenantNotFound(s) if s == "acme"
+        ));
+        assert!(cache.exists("rume:tenant:slug:acme").await.unwrap());
+
+        // Re-upsert in DB; negative cache blocks until invalidated
+        let acme_recreated = Tenant::new("t-acme", "acme");
+        store.upsert(&acme_recreated).await.unwrap();
+        assert!(matches!(
+            resolver.resolve(&parts_ok).await.unwrap_err(),
+            TenantError::TenantNotFound(_)
+        ));
+        resolver.invalidate("t-acme", "acme").await.unwrap();
+        assert_eq!(
+            resolver.resolve(&parts_ok).await.unwrap(),
+            Some(acme_recreated)
+        );
     }
 }
