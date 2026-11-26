@@ -215,6 +215,9 @@ impl JobQueue for SqliteJobQueue {
             let new_lease_token = Uuid::new_v4().to_string();
 
             let row: Option<SqliteRow> = if let Some(qs) = queue_filter {
+                // Why: SQLite lacks Postgres's `= ANY($1)` array binding, so `IN (?4, ...)`
+                // is built from a strict `?` placeholder count and bound via `.bind()`
+                // parameters with `AssertSqlSafe` (no user input is interpolated into SQL).
                 let placeholders = (0..qs.len())
                     .map(|idx| format!("?{}", idx + 4))
                     .collect::<Vec<_>>()

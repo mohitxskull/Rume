@@ -226,6 +226,9 @@ impl JobQueue for MysqlJobQueue {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
             let row: Option<MySqlRow> = if let Some(qs) = queue_filter {
+                // Why: MySQL lacks Postgres's `= ANY($1)` array binding, so `IN (?, ...)`
+                // is built from a strict `?` placeholder repeat count and bound via `.bind()`
+                // parameters with `AssertSqlSafe` (no user input is interpolated into SQL).
                 let placeholders = vec!["?"; qs.len()].join(", ");
                 let sql = format!(
                     "SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority
