@@ -30,14 +30,18 @@ pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::util;
+pub use rume_http::client;
 pub use rume_http::pagination;
 pub use rume_http::resilience;
 pub use rume_http::transport;
 pub use rume_http::upload;
 pub use rume_http::validation;
+pub use rume_messaging::broker;
+pub use rume_messaging::cron;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
 pub use rume_messaging::outbox;
+pub use rume_messaging::pubsub;
 pub use rume_observability::metrics;
 pub use rume_observability::prometheus;
 pub use rume_observability::redaction;
@@ -83,7 +87,7 @@ pub use app::{
     init_tracing, try_init_tracing,
 };
 pub use error::AppError;
-pub use events::{Event, EventBus};
+pub use events::{DistributedEventBus, Event, EventBus};
 pub use module::{Module, ModuleContext};
 pub use routing::Router;
 pub use rume_data::{MetricsRegistryPoolExt, params};

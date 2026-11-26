@@ -341,32 +341,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        let claim = match self.acquire_execution_claim(saga_id).await {
-            Ok(c) => c,
-            Err(error) => {
-                return Err(SagaRecoveryError::new(
-                    error,
-                    SagaRecoveryHandle {
-                        saga_id: saga_id.to_string(),
-                        saga_name: self.name.clone(),
-                        context: ctx,
-                        phase: SagaRecoveryPhase::Forward,
-                        completed_steps: Vec::new(),
-                        compensated_steps: Vec::new(),
-                        version: 0,
-                    },
-                ));
-            }
-        };
-
+        // Why: `SqlSagaStore` stores execution claim leases on the `rume_sagas` row itself, so
+        // the initial `Pending` row (`expected_version = 0`) must be inserted before acquiring
+        // the execution claim; `INSERT` atomicity also fences concurrent starters for the same ID.
         let mut version = 0u64;
         if let Err(error) = self
             .persist_state(saga_id, &mut version, SagaStatus::Pending, &[], &[])
             .await
         {
-            if let Some(c) = claim {
-                c.release().await;
-            }
             return Err(SagaRecoveryError::new(
                 error,
                 SagaRecoveryHandle {
@@ -380,6 +362,24 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 },
             ));
         }
+
+        let claim = match self.acquire_execution_claim(saga_id).await {
+            Ok(c) => c,
+            Err(error) => {
+                return Err(SagaRecoveryError::new(
+                    error,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Forward,
+                        completed_steps: Vec::new(),
+                        compensated_steps: Vec::new(),
+                        version,
+                    },
+                ));
+            }
+        };
 
         let res = self
             .execute_forward_from_recoverable(
