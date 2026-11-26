@@ -10,6 +10,7 @@ use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use parking_lot::RwLock;
@@ -178,6 +179,7 @@ pub struct CachedSecretProvider {
     inner: Arc<dyn SecretProvider>,
     ttl: Duration,
     cache: RwLock<BTreeMap<String, CachedEntry>>,
+    generation: AtomicU64,
     on_rotation: Option<RotationCallback>,
 }
 
@@ -188,6 +190,7 @@ impl CachedSecretProvider {
             inner,
             ttl,
             cache: RwLock::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
             on_rotation: None,
         }
     }
@@ -201,12 +204,16 @@ impl CachedSecretProvider {
 
     /// Evicts a single cached secret so the next [`Self::get_secret`] reloads it.
     pub fn invalidate(&self, key: &str) {
-        self.cache.write().remove(key);
+        let mut cache = self.cache.write();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        cache.remove(key);
     }
 
     /// Clears all cached secrets.
     pub fn invalidate_all(&self) {
-        self.cache.write().clear();
+        let mut cache = self.cache.write();
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        cache.clear();
     }
 }
 
@@ -235,16 +242,23 @@ impl SecretProvider for CachedSecretProvider {
                 return Ok(entry.value.clone());
             }
 
+            // Why: Capture generation before awaiting `inner.get_secret` so an in-flight fetch
+            // returning a pre-rotation secret cannot overwrite a newer rotated or invalidated
+            // entry once it completes (`RC-18`).
+            let observed_gen = self.generation.load(Ordering::Acquire);
             let secret = self.inner.get_secret(key).await?;
             if !self.ttl.is_zero() {
-                let expires_at = Instant::now() + self.ttl;
-                self.cache.write().insert(
-                    key.to_string(),
-                    CachedEntry {
-                        value: secret.clone(),
-                        expires_at,
-                    },
-                );
+                let mut cache = self.cache.write();
+                if self.generation.load(Ordering::Acquire) == observed_gen {
+                    let expires_at = Instant::now() + self.ttl;
+                    cache.insert(
+                        key.to_string(),
+                        CachedEntry {
+                            value: secret.clone(),
+                            expires_at,
+                        },
+                    );
+                }
             }
             Ok(secret)
         })
@@ -257,15 +271,19 @@ impl SecretProvider for CachedSecretProvider {
         Box::pin(async move {
             match self.inner.rotate(key).await {
                 Ok(new_secret) => {
-                    if !self.ttl.is_zero() {
-                        let expires_at = Instant::now() + self.ttl;
-                        self.cache.write().insert(
-                            key.to_string(),
-                            CachedEntry {
-                                value: new_secret.clone(),
-                                expires_at,
-                            },
-                        );
+                    {
+                        let mut cache = self.cache.write();
+                        self.generation.fetch_add(1, Ordering::AcqRel);
+                        if !self.ttl.is_zero() {
+                            let expires_at = Instant::now() + self.ttl;
+                            cache.insert(
+                                key.to_string(),
+                                CachedEntry {
+                                    value: new_secret.clone(),
+                                    expires_at,
+                                },
+                            );
+                        }
                     }
                     if let Some(cb) = &self.on_rotation {
                         cb(key);
@@ -570,5 +588,66 @@ mod tests {
             kms.get_secret("db").await.unwrap().expose_secret(),
             "kms-secret"
         );
+    }
+
+    #[tokio::test]
+    async fn cached_secret_provider_stale_fetch_does_not_overwrite_rotated_secret() {
+        use tokio::sync::Barrier;
+
+        struct BarrierProvider {
+            fetch_started: Arc<Barrier>,
+            rotate_finished: Arc<Barrier>,
+        }
+
+        impl SecretProvider for BarrierProvider {
+            fn get_secret<'a>(
+                &'a self,
+                _key: &'a str,
+            ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
+                Box::pin(async move {
+                    // Signal that get_secret is in flight (captured generation before inner fetch).
+                    self.fetch_started.wait().await;
+                    // Wait until rotate has completed and cached v2.
+                    self.rotate_finished.wait().await;
+                    Ok(SecretString::from("v1"))
+                })
+            }
+
+            fn rotate<'a>(
+                &'a self,
+                _key: &'a str,
+            ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
+                Box::pin(async move { Ok(SecretString::from("v2")) })
+            }
+        }
+
+        let fetch_started = Arc::new(Barrier::new(2));
+        let rotate_finished = Arc::new(Barrier::new(2));
+        let inner = Arc::new(BarrierProvider {
+            fetch_started: Arc::clone(&fetch_started),
+            rotate_finished: Arc::clone(&rotate_finished),
+        });
+        let provider = Arc::new(CachedSecretProvider::new(inner, Duration::from_secs(60)));
+
+        let p_get = Arc::clone(&provider);
+        let get_task = tokio::spawn(async move { p_get.get_secret("db_pass").await.unwrap() });
+
+        let p_rot = Arc::clone(&provider);
+        let rot_task = tokio::spawn(async move {
+            // Wait until get_secret has entered inner.get_secret.
+            fetch_started.wait().await;
+            let rotated = p_rot.rotate("db_pass").await.unwrap();
+            assert_eq!(rotated.expose_secret(), "v2");
+            // Release get_secret so it returns stale v1.
+            rotate_finished.wait().await;
+        });
+
+        let fetched = get_task.await.unwrap();
+        assert_eq!(fetched.expose_secret(), "v1");
+        rot_task.await.unwrap();
+
+        // Subsequent cached read must return v2 (v1 must NOT have overwritten v2).
+        let cached = provider.get_secret("db_pass").await.unwrap();
+        assert_eq!(cached.expose_secret(), "v2");
     }
 }

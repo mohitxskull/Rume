@@ -201,18 +201,41 @@ impl S3ObjectStore {
         expires_in_secs: u64,
         now: DateTime<Utc>,
     ) -> Result<PresignedUrl, ObjectStoreError> {
+        self.presign_at_with_content_type(method, key, expires_in_secs, None, now)
+    }
+
+    /// Generates a deterministic SigV4 presigned URL, optionally signing `content-type`.
+    pub fn presign_at_with_content_type(
+        &self,
+        method: &'static str,
+        key: &ObjectKey,
+        expires_in_secs: u64,
+        content_type: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<PresignedUrl, ObjectStoreError> {
         let (host, canonical_uri, base_url) = self.host_and_path(Some(key.as_str()));
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
         let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.config.region);
         let credential = format!("{}/{}", self.config.access_key_id, credential_scope);
 
+        let (canonical_headers, signed_headers) = match content_type {
+            Some(ct) => (
+                format!("content-type:{}\nhost:{host}\n", ct.trim()),
+                "content-type;host",
+            ),
+            None => (format!("host:{host}\n"), "host"),
+        };
+
         let mut query_params = vec![
             ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_string()),
             ("X-Amz-Credential", percent_encode_component(&credential)),
             ("X-Amz-Date", amz_date.clone()),
             ("X-Amz-Expires", expires_in_secs.to_string()),
-            ("X-Amz-SignedHeaders", "host".to_string()),
+            (
+                "X-Amz-SignedHeaders",
+                percent_encode_component(signed_headers),
+            ),
         ];
         if let Some(token) = &self.config.session_token {
             query_params.push(("X-Amz-Security-Token", percent_encode_component(token)));
@@ -225,9 +248,8 @@ impl S3ObjectStore {
             .collect::<Vec<_>>()
             .join("&");
 
-        let canonical_headers = format!("host:{host}\n");
         let canonical_request = format!(
-            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\nhost\nUNSIGNED-PAYLOAD"
+            "{method}\n{canonical_uri}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\nUNSIGNED-PAYLOAD"
         );
         let canonical_request_hash = hex::encode(Sha256::digest(canonical_request.as_bytes()));
         let string_to_sign =
@@ -391,20 +413,50 @@ impl ObjectStore for S3ObjectStore {
     fn list(&self, prefix: &str) -> BoxFuture<'_, Result<Vec<ObjectMeta>, ObjectStoreError>> {
         let prefix = prefix.to_string();
         Box::pin(async move {
-            let query = format!("list-type=2&prefix={}", percent_encode_component(&prefix));
-            let resp = self
-                .send_signed(Method::GET, None, &query, Vec::new(), None)
-                .await?;
+            let mut all_items = Vec::new();
+            let mut continuation_token: Option<String> = None;
 
-            if !resp.status().is_success() {
-                return Err(map_status_error(resp.status(), &prefix));
+            loop {
+                let mut params = Vec::with_capacity(3);
+                if let Some(ref token) = continuation_token {
+                    params.push(("continuation-token", percent_encode_component(token)));
+                }
+                params.push(("list-type", "2".to_string()));
+                params.push(("prefix", percent_encode_component(&prefix)));
+                params.sort_by(|a, b| a.0.cmp(b.0));
+
+                let query = params
+                    .iter()
+                    .map(|(k, v)| format!("{k}={v}"))
+                    .collect::<Vec<_>>()
+                    .join("&");
+
+                let resp = self
+                    .send_signed(Method::GET, None, &query, Vec::new(), None)
+                    .await?;
+
+                if !resp.status().is_success() {
+                    return Err(map_status_error(resp.status(), &prefix));
+                }
+
+                let xml = resp
+                    .text()
+                    .await
+                    .map_err(|e| ObjectStoreError::Http(e.to_string()))?;
+                let page = parse_list_objects_v2_page(&xml);
+                all_items.extend(page.items);
+
+                if page.is_truncated {
+                    match page.next_continuation_token {
+                        Some(next) if !next.is_empty() => continuation_token = Some(next),
+                        _ => break,
+                    }
+                } else {
+                    break;
+                }
             }
 
-            let xml = resp
-                .text()
-                .await
-                .map_err(|e| ObjectStoreError::Http(e.to_string()))?;
-            Ok(parse_list_objects_v2_xml(&xml))
+            Ok(all_items)
         })
     }
 
@@ -424,12 +476,18 @@ impl ObjectStore for S3ObjectStore {
         &self,
         key: &ObjectKey,
         expires_in_secs: u64,
-        _options: PutObjectOptions,
+        options: PutObjectOptions,
     ) -> BoxFuture<'_, Result<PresignedUrl, ObjectStoreError>> {
         let key = key.clone();
         Box::pin(async move {
             let now = DateTime::<Utc>::from(SystemTime::now());
-            self.presign_at("PUT", &key, expires_in_secs, now)
+            self.presign_at_with_content_type(
+                "PUT",
+                &key,
+                expires_in_secs,
+                options.content_type.as_deref(),
+                now,
+            )
         })
     }
 }
@@ -470,6 +528,25 @@ fn percent_encode_component(input: &str) -> String {
     out
 }
 
+struct ListObjectsV2Page {
+    items: Vec<ObjectMeta>,
+    is_truncated: bool,
+    next_continuation_token: Option<String>,
+}
+
+fn parse_list_objects_v2_page(xml: &str) -> ListObjectsV2Page {
+    let items = parse_list_objects_v2_xml(xml);
+    let is_truncated = extract_xml_tag(xml, "IsTruncated")
+        .as_deref()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+    let next_continuation_token = extract_xml_tag(xml, "NextContinuationToken");
+    ListObjectsV2Page {
+        items,
+        is_truncated,
+        next_continuation_token,
+    }
+}
+
 fn parse_list_objects_v2_xml(xml: &str) -> Vec<ObjectMeta> {
     let mut items = Vec::new();
     let mut rest = xml;
@@ -506,12 +583,35 @@ fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
 }
 
 fn decode_xml_entities(input: &str) -> String {
-    input
-        .replace("&amp;", "&")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&apos;", "'")
+    // Why: Single-pass entity decoding ensures `&amp;lt;` decodes once to `&lt;` rather than
+    // being double-decoded into `<`.
+    let mut out = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(amp_idx) = rest.find('&') {
+        out.push_str(&rest[..amp_idx]);
+        let tail = &rest[amp_idx..];
+        if let Some(after) = tail.strip_prefix("&amp;") {
+            out.push('&');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&lt;") {
+            out.push('<');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&gt;") {
+            out.push('>');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&quot;") {
+            out.push('"');
+            rest = after;
+        } else if let Some(after) = tail.strip_prefix("&apos;") {
+            out.push('\'');
+            rest = after;
+        } else {
+            out.push('&');
+            rest = &tail[1..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -640,5 +740,114 @@ mod tests {
 
         store.delete(&key).await.expect("delete");
         server.await.expect("server");
+    }
+
+    #[tokio::test]
+    async fn s3_presign_put_includes_content_type_in_signed_headers() {
+        let store = S3ObjectStore::new(S3Config {
+            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: "my-bucket".to_string(),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            session_token: None,
+            path_style: false,
+        })
+        .expect("s3 config");
+
+        let key = ObjectKey::new("folder/data.json").expect("valid key");
+        let with_ct = store
+            .presign_put(
+                &key,
+                300,
+                PutObjectOptions {
+                    content_type: Some("application/json".to_string()),
+                },
+            )
+            .await
+            .expect("presign_put with content_type");
+        assert!(
+            with_ct
+                .url
+                .contains("X-Amz-SignedHeaders=content-type%3Bhost"),
+            "presign_put with content_type must sign content-type;host, got: {}",
+            with_ct.url
+        );
+
+        let without_ct = store
+            .presign_put(&key, 300, PutObjectOptions::default())
+            .await
+            .expect("presign_put without content_type");
+        assert!(
+            without_ct.url.contains("X-Amz-SignedHeaders=host&")
+                || without_ct.url.ends_with("X-Amz-SignedHeaders=host"),
+            "presign_put without content_type must sign only host, got: {}",
+            without_ct.url
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_list_paginates_truncated_responses_with_continuation_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("addr");
+
+        let server = tokio::spawn(async move {
+            let page1 = r#"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>tok+1/2</NextContinuationToken><Contents><Key>logs/a.txt</Key><Size>10</Size><ETag>&quot;e1&quot;</ETag></Contents></ListBucketResult>"#;
+            let page2 = r#"<ListBucketResult><IsTruncated>false</IsTruncated><Contents><Key>logs/b.txt</Key><Size>20</Size><ETag>&quot;e2&quot;</ETag></Contents></ListBucketResult>"#;
+
+            for page_idx in 0..2 {
+                let (mut socket, _) = listener.accept().await.expect("accept");
+                let mut buf = vec![0u8; 4096];
+                let n = socket.read(&mut buf).await.expect("read");
+                let req = String::from_utf8_lossy(&buf[..n]);
+                let body = if page_idx == 0 {
+                    assert!(
+                        req.starts_with("GET /test-bucket?list-type=2&prefix=logs%2F "),
+                        "unexpected first list request: {req}"
+                    );
+                    page1
+                } else {
+                    assert!(
+                        req.starts_with(
+                            "GET /test-bucket?continuation-token=tok%2B1%2F2&list-type=2&prefix=logs%2F "
+                        ),
+                        "unexpected second list request: {req}"
+                    );
+                    page2
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                socket.write_all(response.as_bytes()).await.expect("write");
+            }
+        });
+
+        let store = S3ObjectStore::new(S3Config {
+            endpoint: format!("http://{addr}"),
+            region: "us-east-1".to_string(),
+            bucket: "test-bucket".to_string(),
+            access_key_id: "test-key".to_string(),
+            secret_access_key: "test-secret".to_string(),
+            session_token: None,
+            path_style: true,
+        })
+        .expect("s3 store");
+
+        let items = store.list("logs/").await.expect("paginated list");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "logs/a.txt");
+        assert_eq!(items[1].key, "logs/b.txt");
+        server.await.expect("server");
+    }
+
+    #[test]
+    fn s3_decode_xml_entities_does_not_double_decode_amp() {
+        assert_eq!(decode_xml_entities("a&amp;lt;b"), "a&lt;b");
+        assert_eq!(decode_xml_entities("a&amp;amp;b"), "a&amp;b");
+        assert_eq!(
+            decode_xml_entities("&lt;tag attr=&quot;1&quot; o=&apos;2&apos;&gt;&amp;"),
+            "<tag attr=\"1\" o='2'>&"
+        );
     }
 }

@@ -336,3 +336,21 @@ impl LeaderElector for PostgresLeaderElector {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn postgres_acquire_sql_enforces_monotonic_fencing_token_and_term() {
+        assert!(
+            LOCK_ACQUIRE_SQL
+                .contains("GREATEST(EXCLUDED.fencing_token, rume_locks.fencing_token + 1)"),
+            "lock_acquire.sql must guard against non-monotonic fencing tokens: {LOCK_ACQUIRE_SQL}"
+        );
+        assert!(
+            LEADER_ACQUIRE_SQL.contains("GREATEST(EXCLUDED.term, rume_leaders.term + 1)"),
+            "leader_acquire.sql must guard against non-monotonic leader terms: {LEADER_ACQUIRE_SQL}"
+        );
+    }
+}
