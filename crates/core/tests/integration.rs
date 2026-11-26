@@ -74,6 +74,9 @@ pub mod milestone_d_e2e;
 ))]
 pub mod milestone_e_e2e;
 
+#[path = "integration/milestone_f_e2e.rs"]
+pub mod milestone_f_e2e;
+
 #[path = "integration/openapi.rs"]
 pub mod openapi;
 

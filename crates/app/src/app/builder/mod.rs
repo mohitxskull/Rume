@@ -576,8 +576,8 @@ where
             })
         {
             ApplicationMode::Inspect
-        } else if std::env::var_os("RUME_TASK").is_some()
-            || std::env::var_os("RUME_TASK_LIST").is_some()
+        } else if std::env::var("RUME_TASK").is_ok_and(|v| !v.is_empty())
+            || std::env::var("RUME_TASK_LIST").is_ok_and(|v| !v.is_empty())
             || std::env::args_os().any(|a| {
                 let s = a.to_string_lossy();
                 s == "--rume-list-tasks" || s == "--rume-task" || s.starts_with("--rume-task=")
@@ -696,7 +696,7 @@ where
             ));
         }
 
-        let list_mode = std::env::var_os("RUME_TASK_LIST").is_some()
+        let list_mode = std::env::var("RUME_TASK_LIST").is_ok_and(|v| !v.is_empty())
             || std::env::args_os()
                 .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-list-tasks"));
         let selected_task = self.resolve_cli_task_name();

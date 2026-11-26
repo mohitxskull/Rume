@@ -406,7 +406,7 @@ fn extract_request_body(op: &Map<String, Value>) -> Option<(bool, String)> {
     let required = body
         .get("required")
         .and_then(Value::as_bool)
-        .unwrap_or(true);
+        .unwrap_or(false);
     let schema = body
         .get("content")
         .and_then(|c| c.get("application/json"))
