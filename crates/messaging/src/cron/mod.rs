@@ -1,116 +1,293 @@
 //! Leader-elected distributed cron scheduler.
 
-use std::fmt::Debug;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::time::Duration;
+mod scheduler;
+mod spec;
 
-use chrono::FixedOffset;
-use rume_data::coordination::LeaderElector;
-use thiserror::Error;
+pub use scheduler::{BoxFuture, CronScheduler, CronSchedulerHandle};
+pub use spec::{CronError, CronJobSpec, MissedTickPolicy, TickDecision};
 
-/// Pinned boxed future type alias for cron job callbacks.
-pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
-/// Errors returned by [`CronScheduler`] and [`CronJobSpec`].
-#[derive(Debug, Error)]
-pub enum CronError {
-    /// Invalid cron expression syntax.
-    #[error("invalid cron expression '{expression}': {message}")]
-    InvalidExpression { expression: String, message: String },
-    /// Scheduler execution or handler failure.
-    #[error("cron execution error: {0}")]
-    Execution(String),
-}
+    use chrono::{FixedOffset, TimeZone, Utc};
+    use rume_data::coordination::lock::CoordinationFuture;
+    use rume_data::coordination::{LeaderElector, LeaderLease};
 
-/// Policy governing how missed cron ticks are handled after leadership failover or delay.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum MissedTickPolicy {
-    /// Skip any missed ticks and schedule the next future occurrence.
-    #[default]
-    Skip,
-    /// Execute a single catch-up tick immediately, then resume normal scheduling.
-    RunOnce,
-}
+    use super::*;
 
-/// Specification for a recurring cron job.
-#[derive(Debug, Clone)]
-pub struct CronJobSpec {
-    /// Unique name identifying this cron job.
-    pub name: String,
-    /// 5-field or 6-field cron expression.
-    pub expression: String,
-    /// Timezone offset for evaluating the cron schedule (defaults to UTC).
-    pub timezone: FixedOffset,
-    /// Policy for missed ticks.
-    pub missed_tick_policy: MissedTickPolicy,
-}
-
-impl CronJobSpec {
-    /// Creates a new UTC cron job specification, validating the cron expression.
-    pub fn new(name: impl Into<String>, expression: impl Into<String>) -> Result<Self, CronError> {
-        let _ = (name, expression);
-        todo!("Task 03: implement CronJobSpec::new")
+    #[derive(Debug, Default)]
+    struct InMemoryLeaderElector {
+        leases: Mutex<HashMap<String, LeaderLease>>,
     }
 
-    /// Sets a fixed timezone offset for evaluating the cron schedule.
-    pub fn with_timezone(mut self, timezone: FixedOffset) -> Self {
-        self.timezone = timezone;
-        self
+    impl InMemoryLeaderElector {
+        fn new() -> Self {
+            Self::default()
+        }
     }
 
-    /// Sets the [`MissedTickPolicy`] for this cron job.
-    pub fn with_missed_tick_policy(mut self, policy: MissedTickPolicy) -> Self {
-        self.missed_tick_policy = policy;
-        self
+    impl LeaderElector for InMemoryLeaderElector {
+        fn try_acquire<'a>(
+            &'a self,
+            role: &'a str,
+            candidate_id: &'a str,
+            ttl: Duration,
+        ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+            Box::pin(async move {
+                let mut leases = self.leases.lock().expect("lock");
+                let now = Instant::now();
+                let next_term = match leases.get(role) {
+                    Some(existing) if !existing.is_expired() => {
+                        if existing.candidate_id == candidate_id {
+                            let updated = LeaderLease::new(role, candidate_id, existing.term)
+                                .with_expires_at(now + ttl);
+                            leases.insert(role.to_string(), updated.clone());
+                            return Ok(Some(updated));
+                        }
+                        return Ok(None);
+                    }
+                    Some(existing) => existing.term + 1,
+                    None => 1,
+                };
+                let lease =
+                    LeaderLease::new(role, candidate_id, next_term).with_expires_at(now + ttl);
+                leases.insert(role.to_string(), lease.clone());
+                Ok(Some(lease))
+            })
+        }
+
+        fn renew<'a>(
+            &'a self,
+            role: &'a str,
+            candidate_id: &'a str,
+            ttl: Duration,
+        ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+            Box::pin(async move {
+                let mut leases = self.leases.lock().expect("lock");
+                let now = Instant::now();
+                if let Some(existing) = leases.get_mut(role)
+                    && !existing.is_expired()
+                    && existing.candidate_id == candidate_id
+                {
+                    existing.expires_at = Some(now + ttl);
+                    return Ok(Some(existing.clone()));
+                }
+                Ok(None)
+            })
+        }
+
+        fn get_leader<'a>(&'a self, role: &'a str) -> CoordinationFuture<'a, Option<LeaderLease>> {
+            Box::pin(async move {
+                let leases = self.leases.lock().expect("lock");
+                Ok(leases.get(role).filter(|l| !l.is_expired()).cloned())
+            })
+        }
+
+        fn resign<'a>(
+            &'a self,
+            role: &'a str,
+            candidate_id: &'a str,
+        ) -> CoordinationFuture<'a, bool> {
+            Box::pin(async move {
+                let mut leases = self.leases.lock().expect("lock");
+                if let Some(existing) = leases.get(role)
+                    && existing.candidate_id == candidate_id
+                {
+                    leases.remove(role);
+                    return Ok(true);
+                }
+                Ok(false)
+            })
+        }
     }
-}
 
-/// Leader-elected cron scheduler ensuring each recurring job runs once per cluster.
-pub struct CronScheduler {
-    _elector: Arc<dyn LeaderElector>,
-}
+    #[test]
+    fn cron_spec_rejects_invalid_expression_and_computes_next_tick_in_timezone() {
+        assert!(CronJobSpec::new("bad", "not a cron").is_err());
 
-impl Debug for CronScheduler {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CronScheduler").finish_non_exhaustive()
-    }
-}
+        // 5-field expression: every day at 09:30 in UTC+05:30
+        let ist = FixedOffset::east_opt(5 * 3600 + 1800).expect("valid offset");
+        let spec_5 = CronJobSpec::new("daily-ist", "30 9 * * *")
+            .expect("valid 5-field")
+            .with_timezone(ist);
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 3, 0, 0).unwrap();
+        let next = spec_5.next_tick(now).expect("next tick");
+        // 09:30 IST == 04:00 UTC
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 6, 1, 4, 0, 0).unwrap());
 
-impl CronScheduler {
-    /// Creates a new leader-elected cron scheduler.
-    pub fn new(
-        elector: Arc<dyn LeaderElector>,
-        _role: impl Into<String>,
-        _candidate_id: impl Into<String>,
-        _lease_ttl: Duration,
-    ) -> Self {
-        Self { _elector: elector }
+        // 6-field expression: at second 15 of every minute
+        let spec_6 = CronJobSpec::new("every-min-15s", "15 * * * * *").expect("valid 6-field");
+        let now_6 = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 10).unwrap();
+        let next_6 = spec_6.next_tick(now_6).expect("next 6-field tick");
+        assert_eq!(next_6, Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 15).unwrap());
     }
 
-    /// Registers a recurring cron job with an async handler closure.
-    pub fn register<F, Fut>(&mut self, _spec: CronJobSpec, _handler: F) -> Result<(), CronError>
-    where
-        F: Fn() -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<(), CronError>> + Send + 'static,
-    {
-        todo!("Task 03: implement CronScheduler::register")
+    #[tokio::test]
+    async fn cron_scheduler_executes_only_on_elected_leader() {
+        let elector = Arc::new(InMemoryLeaderElector::new());
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let mut sched_a = CronScheduler::new(
+            elector.clone(),
+            "cron-role",
+            "node-a",
+            Duration::from_millis(200),
+        );
+        let ca = Arc::clone(&count_a);
+        sched_a
+            .register(
+                CronJobSpec::new("tick", "* * * * * *").expect("valid"),
+                move || {
+                    let ca = Arc::clone(&ca);
+                    async move {
+                        ca.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("register a");
+
+        let mut sched_b = CronScheduler::new(
+            elector.clone(),
+            "cron-role",
+            "node-b",
+            Duration::from_millis(200),
+        );
+        let cb = Arc::clone(&count_b);
+        sched_b
+            .register(
+                CronJobSpec::new("tick", "* * * * * *").expect("valid"),
+                move || {
+                    let cb = Arc::clone(&cb);
+                    async move {
+                        cb.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("register b");
+
+        let handle_a = sched_a.start();
+        let handle_b = sched_b.start();
+
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+
+        let a = count_a.load(Ordering::SeqCst);
+        let b = count_b.load(Ordering::SeqCst);
+        assert!(a + b >= 1, "expected at least one tick, got a={a}, b={b}");
+        assert!(
+            a == 0 || b == 0,
+            "only one leader should execute ticks, got a={a}, b={b}"
+        );
+
+        handle_a
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown a");
+        handle_b
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown b");
     }
 
-    /// Starts the leader-election loop and cron scheduling tasks.
-    pub fn start(self) -> CronSchedulerHandle {
-        todo!("Task 03: implement CronScheduler::start")
+    #[tokio::test]
+    async fn cron_scheduler_fails_over_when_leader_steps_down() {
+        let elector = Arc::new(InMemoryLeaderElector::new());
+        let count_a = Arc::new(AtomicUsize::new(0));
+        let count_b = Arc::new(AtomicUsize::new(0));
+
+        let mut sched_a = CronScheduler::new(
+            elector.clone(),
+            "cron-failover",
+            "node-a",
+            Duration::from_millis(200),
+        );
+        let ca = Arc::clone(&count_a);
+        sched_a
+            .register(
+                CronJobSpec::new("tick", "* * * * * *").expect("valid"),
+                move || {
+                    let ca = Arc::clone(&ca);
+                    async move {
+                        ca.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("register a");
+
+        let handle_a = sched_a.start();
+        tokio::time::sleep(Duration::from_millis(1200)).await;
+        assert!(count_a.load(Ordering::SeqCst) >= 1, "primary should tick");
+
+        let mut sched_b = CronScheduler::new(
+            elector.clone(),
+            "cron-failover",
+            "node-b",
+            Duration::from_millis(200),
+        );
+        let cb = Arc::clone(&count_b);
+        sched_b
+            .register(
+                CronJobSpec::new("tick", "* * * * * *").expect("valid"),
+                move || {
+                    let cb = Arc::clone(&cb);
+                    async move {
+                        cb.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("register b");
+
+        let handle_b = sched_b.start();
+        handle_a
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown a");
+
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert!(
+            count_b.load(Ordering::SeqCst) >= 1,
+            "standby should take over and tick after primary resigns"
+        );
+
+        handle_b
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown b");
     }
-}
 
-/// Handle for gracefully shutting down a running [`CronScheduler`].
-#[derive(Debug)]
-pub struct CronSchedulerHandle;
+    #[test]
+    fn cron_scheduler_respects_missed_tick_policy() {
+        let scheduled = Utc.with_ymd_and_hms(2026, 6, 1, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 6, 1, 12, 3, 10).unwrap();
 
-impl CronSchedulerHandle {
-    /// Signals shutdown, resigns leadership, and awaits running tasks up to `timeout`.
-    pub async fn shutdown(self, _timeout: Duration) -> Result<(), CronError> {
-        todo!("Task 03: implement CronSchedulerHandle::shutdown")
+        let skip_spec = CronJobSpec::new("skip-job", "0 * * * * *")
+            .expect("valid")
+            .with_missed_tick_policy(MissedTickPolicy::Skip);
+        let skip_decision = skip_spec.evaluate_tick(scheduled, now).expect("eval skip");
+        assert!(!skip_decision.should_run);
+        assert_eq!(
+            skip_decision.next_scheduled,
+            Utc.with_ymd_and_hms(2026, 6, 1, 12, 4, 0).unwrap()
+        );
+
+        let run_once_spec = CronJobSpec::new("run-once-job", "0 * * * * *")
+            .expect("valid")
+            .with_missed_tick_policy(MissedTickPolicy::RunOnce);
+        let run_once_decision = run_once_spec
+            .evaluate_tick(scheduled, now)
+            .expect("eval run_once");
+        assert!(run_once_decision.should_run);
+        assert_eq!(
+            run_once_decision.next_scheduled,
+            Utc.with_ymd_and_hms(2026, 6, 1, 12, 4, 0).unwrap()
+        );
     }
 }
