@@ -149,9 +149,3 @@ async-graphql-axum = "=7.2.1"
 # that needs full debug info.
 [profile.dev]
 debug = "line-tables-only"
-
-# Why: third-party crates (`sqlx`, `tonic`, `opentelemetry`, `sqlparser`, etc.) bloat
-# `target/` and link times when compiled with full DWARF (`debug = 2`); `line-tables-only`
-# preserves file:line backtraces while keeping full debug info for workspace crates.
-[profile.dev.package."*"]
-debug = "line-tables-only"

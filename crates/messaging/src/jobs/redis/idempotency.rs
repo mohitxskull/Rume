@@ -8,6 +8,59 @@ use crate::jobs::job::BoxFuture;
 use crate::jobs::reliability::{IdempotencyStatus, IdempotencyStore};
 use rume_data::cache::redis::RedisCacheBackend;
 
+const COMPLETE_WITH_TOKEN_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+local matches = false
+if current and ARGV[3] == '' and current == 'IN_PROGRESS' then
+    matches = true
+elseif current and ARGV[3] ~= '' and current == ('IN_PROGRESS:' .. ARGV[3]) then
+    matches = true
+end
+
+if matches then
+    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+    return 1
+else
+    return 0
+end
+"#;
+
+const RELEASE_WITH_TOKEN_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+local can_delete = false
+if current and ARGV[1] == '' and current == 'IN_PROGRESS' then
+    can_delete = true
+elseif current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
+    can_delete = true
+elseif current and ARGV[1] == '' and string.sub(current, 1, 9) == 'COMPLETED' then
+    can_delete = true
+end
+
+if can_delete then
+    redis.call('DEL', KEYS[1])
+    return 1
+else
+    return 0
+end
+"#;
+
+const EXTEND_LOCK_WITH_TOKEN_SCRIPT: &str = r#"
+local current = redis.call('GET', KEYS[1])
+local matches = false
+if current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
+    matches = true
+elseif current and ARGV[1] == '' and current == 'IN_PROGRESS' then
+    matches = true
+end
+
+if matches then
+    redis.call('PEXPIRE', KEYS[1], ARGV[2])
+    return 1
+else
+    return 0
+end
+"#;
+
 /// Redis-backed implementation of [`IdempotencyStore`].
 ///
 /// Guarantees cluster-wide idempotency locking and cached execution results across
@@ -169,27 +222,10 @@ impl IdempotencyStore for RedisIdempotencyStore {
 
             // Retain completed state for 24 hours (86,400,000 ms), but only transition if currently IN_PROGRESS.
             // Why: an empty token (`ARGV[3] == ''`) may ONLY match an unfenced
-            // bare `'IN_PROGRESS'` lock, never a fenced `'IN_PROGRESS:<token>'`
-            // lock, so an unfenced caller cannot hijack another worker's lease.
+            // bare `'IN_PROGRESS'` lock, and a non-empty fencing token (`ARGV[3] ~= ''`)
+            // may ONLY match `'IN_PROGRESS:' .. ARGV[3]`, never a bare `'IN_PROGRESS'` lock.
             let ttl_ms = 86_400_000_u64;
-            let script = redis::Script::new(
-                r#"
-                local current = redis.call('GET', KEYS[1])
-                local matches = false
-                if current == 'IN_PROGRESS' then
-                    matches = true
-                elseif current and ARGV[3] ~= '' and current == ('IN_PROGRESS:' .. ARGV[3]) then
-                    matches = true
-                end
-
-                if matches then
-                    redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
-                    return 1
-                else
-                    return 0
-                end
-                "#,
-            );
+            let script = redis::Script::new(COMPLETE_WITH_TOKEN_SCRIPT);
 
             let res: i64 = script
                 .key(&redis_key)
@@ -225,28 +261,10 @@ impl IdempotencyStore for RedisIdempotencyStore {
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
 
-            // Evicts key if bare IN_PROGRESS, matching IN_PROGRESS:<token>, or COMPLETED (with empty token).
-            // Why: empty token (`ARGV[1] == ''`) must never break a fenced `IN_PROGRESS:<token>` lock.
-            let script = redis::Script::new(
-                r#"
-                local current = redis.call('GET', KEYS[1])
-                local can_delete = false
-                if current == 'IN_PROGRESS' then
-                    can_delete = true
-                elseif current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
-                    can_delete = true
-                elseif current and ARGV[1] == '' and string.sub(current, 1, 9) == 'COMPLETED' then
-                    can_delete = true
-                end
-
-                if can_delete then
-                    redis.call('DEL', KEYS[1])
-                    return 1
-                else
-                    return 0
-                end
-                "#,
-            );
+            // Evicts key if bare IN_PROGRESS (with empty token), matching IN_PROGRESS:<token>, or COMPLETED (with empty token).
+            // Why: empty token (`ARGV[1] == ''`) must never break a fenced `IN_PROGRESS:<token>` lock,
+            // and a non-empty fencing token (`ARGV[1] ~= ''`) must never release an unfenced bare `IN_PROGRESS` lock.
+            let script = redis::Script::new(RELEASE_WITH_TOKEN_SCRIPT);
 
             let res: i64 = script
                 .key(&redis_key)
@@ -284,24 +302,7 @@ impl IdempotencyStore for RedisIdempotencyStore {
 
             // Why: empty token (`ARGV[1] == ''`) may only extend an unfenced
             // bare `'IN_PROGRESS'` lock, never a fenced `'IN_PROGRESS:<token>'` lock.
-            let script = redis::Script::new(
-                r#"
-                local current = redis.call('GET', KEYS[1])
-                local matches = false
-                if current and ARGV[1] ~= '' and current == ('IN_PROGRESS:' .. ARGV[1]) then
-                    matches = true
-                elseif current and ARGV[1] == '' and current == 'IN_PROGRESS' then
-                    matches = true
-                end
-
-                if matches then
-                    redis.call('PEXPIRE', KEYS[1], ARGV[2])
-                    return 1
-                else
-                    return 0
-                end
-                "#,
-            );
+            let script = redis::Script::new(EXTEND_LOCK_WITH_TOKEN_SCRIPT);
 
             let res: i64 = script
                 .key(&redis_key)
@@ -340,4 +341,35 @@ fn hex_decode(s: &str) -> Option<Vec<u8>> {
         bytes.push(byte);
     }
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lua_scripts_fence_bare_in_progress_entries_with_empty_token_guard() {
+        assert!(
+            COMPLETE_WITH_TOKEN_SCRIPT.contains("ARGV[3] == '' and current == 'IN_PROGRESS'"),
+            "complete_with_token must guard bare IN_PROGRESS with ARGV[3] == ''"
+        );
+        assert!(
+            !COMPLETE_WITH_TOKEN_SCRIPT.contains("if current == 'IN_PROGRESS' then"),
+            "complete_with_token must not allow a non-empty token to match bare IN_PROGRESS"
+        );
+
+        assert!(
+            RELEASE_WITH_TOKEN_SCRIPT.contains("ARGV[1] == '' and current == 'IN_PROGRESS'"),
+            "release_with_token must guard bare IN_PROGRESS with ARGV[1] == ''"
+        );
+        assert!(
+            !RELEASE_WITH_TOKEN_SCRIPT.contains("if current == 'IN_PROGRESS' then"),
+            "release_with_token must not allow a non-empty token to match bare IN_PROGRESS"
+        );
+
+        assert!(
+            EXTEND_LOCK_WITH_TOKEN_SCRIPT.contains("ARGV[1] == '' and current == 'IN_PROGRESS'"),
+            "extend_lock_with_token must guard bare IN_PROGRESS with ARGV[1] == ''"
+        );
+    }
 }

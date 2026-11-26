@@ -184,6 +184,9 @@ impl TraceContext {
 
     /// Validates whether a string matches W3C `traceparent` specification.
     pub fn is_valid_traceparent(s: &str) -> bool {
+        // Why: W3C TraceContext §3.2.2 restricts `trace-id`, `parent-id`, and
+        // `trace-flags` to lowercase hexadecimal `[0-9a-f]` only.
+        let is_lower_hex = |c: char| matches!(c, '0'..='9' | 'a'..='f');
         let parts: Vec<&str> = s.split('-').collect();
         if parts.len() != 4 {
             return false;
@@ -192,18 +195,18 @@ impl TraceContext {
             return false;
         }
         if parts[1].len() != 32
-            || !parts[1].chars().all(|c| c.is_ascii_hexdigit())
+            || !parts[1].chars().all(is_lower_hex)
             || parts[1] == "00000000000000000000000000000000"
         {
             return false;
         }
         if parts[2].len() != 16
-            || !parts[2].chars().all(|c| c.is_ascii_hexdigit())
+            || !parts[2].chars().all(is_lower_hex)
             || parts[2] == "0000000000000000"
         {
             return false;
         }
-        if parts[3].len() != 2 || !parts[3].chars().all(|c| c.is_ascii_hexdigit()) {
+        if parts[3].len() != 2 || !parts[3].chars().all(is_lower_hex) {
             return false;
         }
         true
@@ -310,5 +313,30 @@ mod tests {
             TraceContext::parse_serialized(single_line).expect("must parse single line");
         assert_eq!(parsed_single.traceparent, single_line);
         assert_eq!(parsed_single.tracestate, None);
+    }
+
+    #[test]
+    fn traceparent_rejects_uppercase_hex_per_w3c_spec() {
+        assert!(TraceContext::is_valid_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        ));
+        assert!(
+            !TraceContext::is_valid_traceparent(
+                "00-4BF92F3577B34DA6A3CE929D0E0E4736-00f067aa0ba902b7-01"
+            ),
+            "uppercase hex in trace-id must be rejected"
+        );
+        assert!(
+            !TraceContext::is_valid_traceparent(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00F067AA0BA902B7-01"
+            ),
+            "uppercase hex in parent-id must be rejected"
+        );
+        assert!(
+            !TraceContext::is_valid_traceparent(
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-0F"
+            ),
+            "uppercase hex in trace-flags must be rejected"
+        );
     }
 }

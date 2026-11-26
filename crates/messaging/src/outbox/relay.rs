@@ -32,26 +32,34 @@ pub fn broker_dispatcher(
 {
     move |msg: &OutboxMessage| {
         let broker = Arc::clone(&broker);
-        let mut headers = BTreeMap::new();
-        headers.insert("message_id".to_string(), msg.id.clone());
-        headers.insert("event_type".to_string(), msg.event_type.clone());
-        let trace_ctx = rume_observability::TraceContext::current().or_else(|| {
-            msg.trace_context
-                .as_deref()
-                .and_then(rume_observability::TraceContext::parse_serialized)
-        });
-        if let Some(tc) = trace_ctx {
-            headers.insert("traceparent".to_string(), tc.traceparent);
-            if let Some(ts) = tc.tracestate {
-                headers.insert("tracestate".to_string(), ts);
-            }
-        }
-        let broker_msg = crate::broker::BrokerMessage {
-            topic: msg.event_type.clone(),
-            payload: msg.payload.clone(),
-            headers,
-        };
+        let msg_id = msg.id.clone();
+        let event_type = msg.event_type.clone();
+        let payload = msg.payload.clone();
+        let msg_trace_context = msg.trace_context.clone();
         Box::pin(async move {
+            let mut headers = BTreeMap::new();
+            headers.insert("message_id".to_string(), msg_id);
+            headers.insert("event_type".to_string(), event_type.clone());
+            // Why: capture `TraceContext::current()` inside the async future so it
+            // observes the child span entered by `tc.scope_future(span, fut)` in
+            // `OutboxRelay::poll_and_dispatch` instead of synchronously capturing
+            // any ambient span active before entering the scope.
+            let trace_ctx = rume_observability::TraceContext::current().or_else(|| {
+                msg_trace_context
+                    .as_deref()
+                    .and_then(rume_observability::TraceContext::parse_serialized)
+            });
+            if let Some(tc) = trace_ctx {
+                headers.insert("traceparent".to_string(), tc.traceparent);
+                if let Some(ts) = tc.tracestate {
+                    headers.insert("tracestate".to_string(), ts);
+                }
+            }
+            let broker_msg = crate::broker::BrokerMessage {
+                topic: event_type,
+                payload,
+                headers,
+            };
             broker
                 .publish(broker_msg)
                 .await
@@ -1081,6 +1089,47 @@ mod tests {
         assert!(
             seen_queued_renewals.load(Ordering::SeqCst),
             "remaining batch messages m2 and m3 must be heartbeated while m1 is dispatching"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_dispatcher_captures_scoped_child_span_not_ambient_sync_span() {
+        use crate::broker::{InMemoryBroker, MessageBroker};
+        use rume_observability::TraceContext;
+
+        let broker = Arc::new(InMemoryBroker::new());
+        let mut consumer = broker.subscribe("order.scoped").await.expect("subscribe");
+        let dispatcher = broker_dispatcher(broker);
+
+        let ambient_tc = TraceContext::generate();
+        let child_tc = TraceContext::generate();
+        let msg = OutboxMessage::new("msg-scoped-1", "order.scoped", b"{}".to_vec());
+
+        // Invoke the dispatcher closure while an unrelated ambient OTel context is attached
+        // synchronously, then await the returned future inside `child_tc.scope_future(...)`.
+        let fut = {
+            let _ambient_guard = ambient_tc.to_otel_context().attach();
+            dispatcher(&msg)
+        };
+
+        let span = tracing::info_span!("outbox.dispatch.test");
+        child_tc
+            .scope_future(span, fut)
+            .await
+            .expect("broker dispatch");
+
+        let delivered = consumer
+            .next_message()
+            .await
+            .expect("next_message")
+            .expect("delivered");
+        let tp = delivered
+            .headers
+            .get("traceparent")
+            .expect("traceparent header");
+        assert_eq!(
+            tp, &child_tc.traceparent,
+            "broker_dispatcher must capture the async scoped span, not the synchronous ambient span"
         );
     }
 }

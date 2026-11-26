@@ -361,7 +361,22 @@ impl ScimFilter {
             Self::Presence { attr } => resolve(attr).iter().any(AttrVal::is_present),
             Self::Compare { attr, op, value } => {
                 let vals = resolve(attr);
-                vals.iter().any(|v| compare_attr(v, *op, value))
+                match (op, value) {
+                    (ScimFilterOp::Eq, ScimFilterValue::Null) => {
+                        !vals.iter().any(AttrVal::is_present)
+                    }
+                    (ScimFilterOp::Ne, ScimFilterValue::Null) => {
+                        vals.iter().any(AttrVal::is_present)
+                    }
+                    (_, ScimFilterValue::Null) => false,
+                    // Why: per RFC 7644 §3.4.2.2, `ne` on multi-valued or absent
+                    // attributes is the negation of `eq` across the value set:
+                    // `["a", "b"] ne "a"` is `false`, and absent `ne "a"` is `true`.
+                    (ScimFilterOp::Ne, _) => !vals
+                        .iter()
+                        .any(|v| compare_attr(v, ScimFilterOp::Eq, value)),
+                    _ => vals.iter().any(|v| compare_attr(v, *op, value)),
+                }
             }
         }
     }
@@ -540,5 +555,72 @@ fn compare_attr(attr: &AttrVal<'_>, op: ScimFilterOp, value: &ScimFilterValue) -
             _ => false,
         },
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scim_ne_evaluates_multi_valued_and_absent_attributes_per_rfc7644() {
+        let user = ScimUser::new("u1", "alice")
+            .with_email("a@example.com", true)
+            .with_email("b@example.com", false);
+
+        // Multi-valued `ne`: false if ANY value matches `eq`.
+        let ne_present = ScimFilter::parse(r#"emails.value ne "a@example.com""#).unwrap();
+        assert!(
+            !ne_present.matches_user(&user),
+            "multi-valued attribute containing 'a@example.com' must not match `ne \"a@example.com\"`"
+        );
+
+        let ne_other = ScimFilter::parse(r#"emails.value ne "c@example.com""#).unwrap();
+        assert!(
+            ne_other.matches_user(&user),
+            "multi-valued attribute not containing 'c@example.com' must match `ne \"c@example.com\"`"
+        );
+
+        // Absent attribute `ne`: true per RFC 7644 §3.4.2.2.
+        let ne_absent = ScimFilter::parse(r#"displayName ne "Alice""#).unwrap();
+        assert!(
+            ne_absent.matches_user(&user),
+            "absent displayName must match `displayName ne \"Alice\"`"
+        );
+    }
+
+    #[test]
+    fn scim_null_comparisons_handle_absent_and_present_attributes() {
+        let mut user = ScimUser::new("u2", "bob");
+        let eq_null = ScimFilter::parse("displayName eq null").unwrap();
+        let ne_null = ScimFilter::parse("displayName ne null").unwrap();
+
+        assert!(
+            eq_null.matches_user(&user),
+            "absent displayName must match `eq null`"
+        );
+        assert!(
+            !ne_null.matches_user(&user),
+            "absent displayName must not match `ne null`"
+        );
+
+        user.display_name = Some("Bob".to_string());
+        assert!(
+            !eq_null.matches_user(&user),
+            "present displayName must not match `eq null`"
+        );
+        assert!(
+            ne_null.matches_user(&user),
+            "present displayName must match `ne null`"
+        );
+
+        let emails_eq_null = ScimFilter::parse("emails eq null").unwrap();
+        let emails_ne_null = ScimFilter::parse("emails ne null").unwrap();
+        assert!(emails_eq_null.matches_user(&user));
+        assert!(!emails_ne_null.matches_user(&user));
+
+        let user_with_email = user.with_email("bob@example.com", true);
+        assert!(!emails_eq_null.matches_user(&user_with_email));
+        assert!(emails_ne_null.matches_user(&user_with_email));
     }
 }

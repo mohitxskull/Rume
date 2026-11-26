@@ -955,15 +955,25 @@ impl<Q: JobQueue> JobWorker<Q> {
                     // Bound the wait so a hung Redis call never permanently holds the semaphore
                     // permit or in-flight slot.
                     const COMPLETE_TIMEOUT: Duration = Duration::from_secs(5);
-                    match tokio::time::timeout(
-                        COMPLETE_TIMEOUT,
-                        store.complete_with_token(key, &token, None),
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
+                    let complete_res = {
+                        // Why: hold `hb.tick_lock` across `complete_with_token` AND
+                        // `hb.idemp_committed.store(true, ...)` so a concurrent heartbeat
+                        // tick cannot observe `COMPLETED:` before `idemp_committed` is set
+                        // and spuriously increment `lost_leases`.
+                        let _tick_guard = hb.tick_lock.lock().await;
+                        let res = tokio::time::timeout(
+                            COMPLETE_TIMEOUT,
+                            store.complete_with_token(key, &token, None),
+                        )
+                        .await;
+                        if matches!(res, Ok(Ok(()))) {
                             hb.extend_idempotency.store(false, Ordering::SeqCst);
                             hb.idemp_committed.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    };
+                    match complete_res {
+                        Ok(Ok(())) => {
                             if let Err(err) = queue.ack(&job_id, &token).await {
                                 tracing::error!(
                                     job_id = %job_id,
@@ -1018,36 +1028,45 @@ impl<Q: JobQueue> JobWorker<Q> {
                                 error = %err,
                                 "Transport error recording idempotency completion; reconciling store state"
                             );
-                            match tokio::time::timeout(
-                                COMPLETE_TIMEOUT,
-                                store.try_acquire_with_token(key, &token, Duration::from_secs(1)),
-                            )
-                            .await
-                            {
-                                Ok(Ok(IdempotencyStatus::Completed(_))) => {
+                            let reconciled = {
+                                let _tick_guard = hb.tick_lock.lock().await;
+                                let res = tokio::time::timeout(
+                                    COMPLETE_TIMEOUT,
+                                    store.try_acquire_with_token(
+                                        key,
+                                        &token,
+                                        Duration::from_secs(1),
+                                    ),
+                                )
+                                .await;
+                                if matches!(res, Ok(Ok(IdempotencyStatus::Completed(_)))) {
                                     hb.extend_idempotency.store(false, Ordering::SeqCst);
                                     hb.idemp_committed.store(true, Ordering::SeqCst);
-                                    if let Err(ack_err) = queue.ack(&job_id, &token).await {
-                                        tracing::error!(
-                                            job_id = %job_id,
-                                            error = %ack_err,
-                                            "Failed to ack job after reconciling idempotency completion"
-                                        );
-                                        transition_errors.fetch_add(1, Ordering::SeqCst);
-                                        lost_leases.fetch_add(1, Ordering::SeqCst);
-                                    } else {
-                                        hb.queue_committed.store(true, Ordering::SeqCst);
-                                    }
+                                    true
+                                } else {
+                                    false
                                 }
-                                _ => {
+                            };
+                            if reconciled {
+                                if let Err(ack_err) = queue.ack(&job_id, &token).await {
                                     tracing::error!(
                                         job_id = %job_id,
-                                        key = %key,
-                                        "Idempotency completion outcome remains unknown after reconciliation; skipping ACK to preserve recovery path"
+                                        error = %ack_err,
+                                        "Failed to ack job after reconciling idempotency completion"
                                     );
                                     transition_errors.fetch_add(1, Ordering::SeqCst);
                                     lost_leases.fetch_add(1, Ordering::SeqCst);
+                                } else {
+                                    hb.queue_committed.store(true, Ordering::SeqCst);
                                 }
+                            } else {
+                                tracing::error!(
+                                    job_id = %job_id,
+                                    key = %key,
+                                    "Idempotency completion outcome remains unknown after reconciliation; skipping ACK to preserve recovery path"
+                                );
+                                transition_errors.fetch_add(1, Ordering::SeqCst);
+                                lost_leases.fetch_add(1, Ordering::SeqCst);
                             }
                         }
                         Err(_) => {

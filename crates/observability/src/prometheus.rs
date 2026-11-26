@@ -213,20 +213,27 @@ fn collect_metric_data<T: Copy>(
                 MetricType::Gauge
             };
             let (family_name, sample_name) = resolve_names(raw_name, metric_type, format);
-            let family = get_or_insert_family(families, family_name, metric_type, description);
-            collect_sum(family, &sample_name, sum, format_val);
+            if let Some(family) =
+                get_or_insert_family(families, family_name, metric_type, description)
+            {
+                collect_sum(family, &sample_name, sum, format_val);
+            }
         }
         MetricData::Gauge(gauge) => {
             let (family_name, sample_name) = resolve_names(raw_name, MetricType::Gauge, format);
-            let family =
-                get_or_insert_family(families, family_name, MetricType::Gauge, description);
-            collect_gauge(family, &sample_name, gauge, format_val);
+            if let Some(family) =
+                get_or_insert_family(families, family_name, MetricType::Gauge, description)
+            {
+                collect_gauge(family, &sample_name, gauge, format_val);
+            }
         }
         MetricData::Histogram(hist) => {
             let (family_name, sample_name) = resolve_names(raw_name, MetricType::Histogram, format);
-            let family =
-                get_or_insert_family(families, family_name, MetricType::Histogram, description);
-            collect_histogram(family, &sample_name, hist, format_val);
+            if let Some(family) =
+                get_or_insert_family(families, family_name, MetricType::Histogram, description)
+            {
+                collect_histogram(family, &sample_name, hist, format_val);
+            }
         }
         MetricData::ExponentialHistogram(_) => {
             // Exponential histograms are not emitted by `MetricsRegistry` and have no
@@ -240,7 +247,22 @@ fn get_or_insert_family<'a>(
     family_name: String,
     metric_type: MetricType,
     description: &str,
-) -> &'a mut MetricFamily {
+) -> Option<&'a mut MetricFamily> {
+    if let Some(existing) = families.get(&family_name)
+        && existing.metric_type != metric_type
+    {
+        // Why: Prometheus 0.0.4 and OpenMetrics 1.0 forbid conflicting `# TYPE`
+        // declarations for the same family name. Skip colliding metrics whose
+        // sanitized family name maps to a different metric type rather than
+        // emitting invalid mixed-type samples under the first family's `# TYPE`.
+        tracing::warn!(
+            family = %family_name,
+            existing_type = existing.metric_type.as_str(),
+            conflicting_type = metric_type.as_str(),
+            "Skipping metric whose sanitized Prometheus family name collides with a different metric type"
+        );
+        return None;
+    }
     let entry = families.entry(family_name).or_insert_with(|| MetricFamily {
         metric_type,
         description: description.to_string(),
@@ -249,7 +271,7 @@ fn get_or_insert_family<'a>(
     if entry.description.is_empty() && !description.is_empty() {
         entry.description = description.to_string();
     }
-    entry
+    Some(entry)
 }
 
 fn resolve_names(
@@ -329,7 +351,7 @@ fn collect_histogram<T: Copy>(
 
         family.samples.push(Sample::Histogram {
             name: sample_name.to_string(),
-            labels: sorted_labels(dp.attributes()),
+            labels: sorted_labels_with_filter(dp.attributes(), true),
             buckets,
             sum: format_val(dp.sum()),
             count: dp.count(),
@@ -338,16 +360,28 @@ fn collect_histogram<T: Copy>(
 }
 
 fn sorted_labels<'a>(attrs: impl Iterator<Item = &'a KeyValue>) -> Vec<(String, String)> {
-    let mut labels: Vec<(String, String)> = attrs
-        .map(|kv| {
-            (
-                sanitize_label_name(kv.key.as_str()),
-                kv.value.as_str().into_owned(),
-            )
-        })
-        .collect();
-    labels.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    labels
+    sorted_labels_with_filter(attrs, false)
+}
+
+fn sorted_labels_with_filter<'a>(
+    attrs: impl Iterator<Item = &'a KeyValue>,
+    exclude_le: bool,
+) -> Vec<(String, String)> {
+    // Why: distinct OTel attribute keys (e.g. `a.b` and `a-b`) can collide after
+    // Prometheus label sanitization; `BTreeMap` deduplicates sanitized keys and
+    // guarantees deterministic ordering. For histograms, `"le"` is reserved for
+    // cumulative bucket bounds and must be excluded from custom labels.
+    let mut labels: BTreeMap<String, String> = BTreeMap::new();
+    for kv in attrs {
+        let key = sanitize_label_name(kv.key.as_str());
+        if exclude_le && key == "le" {
+            continue;
+        }
+        labels
+            .entry(key)
+            .or_insert_with(|| kv.value.as_str().into_owned());
+    }
+    labels.into_iter().collect()
 }
 
 fn write_sample_line(out: &mut String, name: &str, labels: &[(String, String)], value: &str) {
@@ -712,5 +746,110 @@ mod tests {
                 "http_requests_total".to_string()
             )
         );
+    }
+
+    #[test]
+    fn prometheus_deduplicates_sanitized_label_keys() {
+        let reader = Arc::new(ManualReader::builder().build());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(TestManualReader(Arc::clone(&reader)))
+            .build();
+        let meter = provider.meter("test");
+        let counter = meter.u64_counter("dup_label_counter").build();
+        counter.add(
+            1,
+            &[
+                KeyValue::new("a.b", "first"),
+                KeyValue::new("a-b", "second"),
+            ],
+        );
+
+        let mut rm = ResourceMetrics::default();
+        reader.collect(&mut rm).expect("collect metrics");
+        let rendered = render_resource_metrics(&[rm], PrometheusFormat::Text004);
+
+        let sample_line = rendered
+            .lines()
+            .find(|l| l.starts_with("dup_label_counter{"))
+            .expect("sample line must exist");
+        assert_eq!(
+            sample_line.matches("a_b=").count(),
+            1,
+            "sanitized duplicate label 'a_b' must appear only once: {sample_line}"
+        );
+        let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn prometheus_excludes_reserved_le_label_from_histogram() {
+        let reader = Arc::new(ManualReader::builder().build());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(TestManualReader(Arc::clone(&reader)))
+            .build();
+        let meter = provider.meter("test");
+        let hist = meter.f64_histogram("latency_with_le").build();
+        hist.record(
+            0.25,
+            &[
+                KeyValue::new("le", "custom"),
+                KeyValue::new("route", "/api"),
+            ],
+        );
+
+        let mut rm = ResourceMetrics::default();
+        reader.collect(&mut rm).expect("collect metrics");
+        let rendered = render_resource_metrics(&[rm], PrometheusFormat::Text004);
+
+        for line in rendered.lines() {
+            if line.starts_with("latency_with_le_bucket{") {
+                assert_eq!(
+                    line.matches("le=").count(),
+                    1,
+                    "bucket line must contain only the bucket le label: {line}"
+                );
+                assert!(
+                    !line.contains("le=\"custom\""),
+                    "custom le label must be excluded from bucket line: {line}"
+                );
+            } else if line.starts_with("latency_with_le_sum{")
+                || line.starts_with("latency_with_le_count{")
+            {
+                assert!(
+                    !line.contains("le="),
+                    "custom le label must be excluded from histogram sum/count: {line}"
+                );
+            }
+        }
+        let _ = provider.shutdown();
+    }
+
+    #[test]
+    fn prometheus_does_not_merge_conflicting_metric_types_in_same_family() {
+        let reader = Arc::new(ManualReader::builder().build());
+        let provider = SdkMeterProvider::builder()
+            .with_reader(TestManualReader(Arc::clone(&reader)))
+            .build();
+        let meter = provider.meter("test");
+        let counter = meter.u64_counter("same.family").build();
+        let gauge = meter.u64_gauge("same-family").build();
+        counter.add(5, &[KeyValue::new("kind", "counter")]);
+        gauge.record(42, &[KeyValue::new("kind", "gauge")]);
+
+        let mut rm = ResourceMetrics::default();
+        reader.collect(&mut rm).expect("collect metrics");
+        let rendered = render_resource_metrics(&[rm], PrometheusFormat::Text004);
+
+        assert_eq!(
+            rendered.matches("# TYPE same_family ").count(),
+            1,
+            "family must have exactly one # TYPE line:\n{rendered}"
+        );
+        let has_counter = rendered.contains("kind=\"counter\"");
+        let has_gauge = rendered.contains("kind=\"gauge\"");
+        assert!(
+            has_counter ^ has_gauge,
+            "conflicting metric types must not be merged into the same family:\n{rendered}"
+        );
+        let _ = provider.shutdown();
     }
 }

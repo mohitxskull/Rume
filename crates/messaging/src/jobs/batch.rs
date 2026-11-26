@@ -109,7 +109,10 @@ impl JobBatch {
                 lease_duration: Duration::from_secs(60),
                 trace_context: None,
             };
-            registry.dispatch(&queued).await?;
+            if let Err(err) = registry.dispatch(&queued).await {
+                let _ = store.release_callbacks_claim(&self.id).await;
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -137,7 +140,10 @@ impl JobBatch {
                 tenant_id: None,
                 trace_context: None,
             };
-            queue.enqueue_raw(raw, Duration::ZERO).await?;
+            if let Err(err) = queue.enqueue_raw(raw, Duration::ZERO).await {
+                let _ = store.release_callbacks_claim(&self.id).await;
+                return Err(err);
+            }
         }
         Ok(())
     }
@@ -159,6 +165,10 @@ pub trait BatchStore: Debug + Send + Sync + 'static {
 
     /// Atomically claims the right to dispatch terminal callbacks (`true` on first claim).
     fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>>;
+
+    /// Releases a previously claimed callback dispatch lock after a failed dispatch attempt
+    /// so a retry can re-claim and deliver callbacks instead of dropping them permanently.
+    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
 
     /// Marks a running batch as cancelled.
     fn cancel(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
@@ -264,6 +274,20 @@ impl BatchStore for InMemoryBatchStore {
                 batch.callbacks_dispatched = true;
                 Ok(true)
             }
+        })
+    }
+
+    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut guard = self
+                .batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(batch) = guard.get_mut(&id) {
+                batch.callbacks_dispatched = false;
+            }
+            Ok(())
         })
     }
 
@@ -621,6 +645,45 @@ impl BatchStore for SqlBatchStore {
         })
     }
 
+    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+        let id = id.0.clone();
+        Box::pin(async move {
+            match self {
+                #[cfg(feature = "sqlite")]
+                Self::Sqlite(pool) => {
+                    sqlx::query(
+                        "UPDATE rume_job_batches SET callbacks_dispatched = 0 WHERE id = ?1",
+                    )
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+                #[cfg(feature = "postgres")]
+                Self::Postgres(pool) => {
+                    sqlx::query(
+                        "UPDATE rume_job_batches SET callbacks_dispatched = FALSE WHERE id = $1",
+                    )
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+                #[cfg(feature = "mysql")]
+                Self::Mysql(pool) => {
+                    sqlx::query(
+                        "UPDATE rume_job_batches SET callbacks_dispatched = 0 WHERE id = ?",
+                    )
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn cancel(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
         let id = id.0.clone();
         Box::pin(async move {
@@ -722,6 +785,11 @@ impl BatchBuilder {
         if let Some(err) = self.build_error {
             return Err(JobError::Serialization(err));
         }
+        if self.jobs.is_empty() {
+            return Err(JobError::Fatal(
+                "cannot create a batch with 0 jobs".to_string(),
+            ));
+        }
         let total = u32::try_from(self.jobs.len()).unwrap_or(u32::MAX);
         let (then_job_name, then_job_payload) = match self.then_job {
             Some((n, p)) => (Some(n), Some(p)),
@@ -761,9 +829,18 @@ impl BatchBuilder {
         store: &S,
     ) -> Result<JobBatch, JobError> {
         let (batch, jobs) = self.build_record()?;
+        let total = jobs.len();
         let created = store.create_batch(batch).await?;
-        for job in jobs {
-            queue.enqueue_raw(job, Duration::ZERO).await?;
+        for (idx, job) in jobs.into_iter().enumerate() {
+            if let Err(err) = queue.enqueue_raw(job, Duration::ZERO).await {
+                // Why: account for every job that was never enqueued so `pending_jobs`,
+                // `failed_jobs`, and `status` stay accurate instead of hanging forever
+                // waiting on jobs that never entered the queue.
+                for _ in idx..total {
+                    let _ = store.record_failure(&created.id).await;
+                }
+                return Err(err);
+            }
         }
         Ok(created)
     }
@@ -941,5 +1018,159 @@ mod tests {
             .expect("enqueue callbacks");
         // 2 original jobs + then + finally = 4 pending jobs
         assert_eq!(queue.pending_count().await.unwrap(), 4);
+    }
+
+    #[tokio::test]
+    async fn empty_batch_is_rejected_instead_of_hanging_in_running_state() {
+        let store = InMemoryBatchStore::new();
+        let err = BatchBuilder::new("empty-batch")
+            .create_in_store(&store)
+            .await
+            .expect_err("0-job batch must not start Running with pending_jobs = 0");
+        assert!(
+            err.to_string().contains("0 jobs") || err.to_string().contains("at least one"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_enqueue_failure_accounts_for_unenqueued_jobs_and_allows_callback_retry() {
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug)]
+        struct FlakyQueue {
+            fail_after: usize,
+            enqueued: AtomicUsize,
+            fail_all: AtomicBool,
+        }
+
+        impl JobQueue for FlakyQueue {
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                job: J,
+                delay: Duration,
+                trace_context: Option<String>,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                match RawJob::from_job(job, trace_context) {
+                    Ok(raw) => self.enqueue_raw(raw, delay),
+                    Err(err) => Box::pin(async move { Err(err) }),
+                }
+            }
+            fn enqueue_raw(
+                &self,
+                _job: RawJob,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async move {
+                    if self.fail_all.load(Ordering::SeqCst) {
+                        return Err(JobError::Fatal("queue unavailable".into()));
+                    }
+                    let n = self.enqueued.fetch_add(1, Ordering::SeqCst);
+                    if n >= self.fail_after {
+                        Err(JobError::Fatal("enqueue failed mid-batch".into()))
+                    } else {
+                        Ok(format!("job-{n}"))
+                    }
+                })
+            }
+            fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn ack(&self, _job_id: &str, _token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _reason: String,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let store = InMemoryBatchStore::new();
+        let queue = FlakyQueue {
+            fail_after: 1,
+            enqueued: AtomicUsize::new(0),
+            fail_all: AtomicBool::new(false),
+        };
+
+        // 3 jobs: job 0 enqueues, job 1 fails -> jobs 1 and 2 are recorded as failed.
+        let err = BatchBuilder::new("partial-enqueue")
+            .add_job(WorkItem { id: 1 })
+            .add_job(WorkItem { id: 2 })
+            .add_job(WorkItem { id: 3 })
+            .finally(FinallyCallback {
+                label: "cleanup".into(),
+            })
+            .dispatch(&queue, &store)
+            .await
+            .expect_err("mid-batch enqueue failure must return Err");
+        assert!(err.to_string().contains("enqueue failed mid-batch"));
+
+        // Find the created batch and verify pending_jobs == 1, failed_jobs == 2.
+        let batch = store
+            .batches
+            .lock()
+            .unwrap()
+            .values()
+            .next()
+            .cloned()
+            .expect("batch must be persisted");
+        assert_eq!(batch.pending_jobs, 1);
+        assert_eq!(batch.failed_jobs, 2);
+        assert_eq!(batch.status, BatchStatus::Running);
+
+        // When the 1 enqueued job finishes, the batch transitions cleanly to Failed.
+        let terminal = store
+            .record_success(&batch.id)
+            .await
+            .expect("record_success");
+        assert_eq!(terminal.pending_jobs, 0);
+        assert_eq!(terminal.status, BatchStatus::Failed);
+
+        // Callback enqueue fails -> claim must be released so a retry succeeds.
+        queue.fail_all.store(true, Ordering::SeqCst);
+        let cb_err = terminal
+            .dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect_err("callback enqueue must fail when queue is down");
+        assert!(cb_err.to_string().contains("queue unavailable"));
+
+        // Queue recovers; retry must re-claim and enqueue the `finally` callback.
+        queue.fail_all.store(false, Ordering::SeqCst);
+        queue.enqueued.store(0, Ordering::SeqCst);
+        terminal
+            .dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect("callback retry must succeed after claim rollback");
+        assert_eq!(queue.enqueued.load(Ordering::SeqCst), 1);
     }
 }
