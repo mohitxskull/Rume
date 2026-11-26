@@ -27,11 +27,15 @@ pub use backend::{
     BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue, validate_sql_identifier,
     validate_tenant_id,
 };
+pub use builder::{
+    BuiltQuery, DynamicDelete, DynamicInsert, DynamicSelect, DynamicUpdate, SqlDialect,
+};
 pub use config::DatabaseConfig;
 pub use error::PersistenceError;
 pub use migration::{Migration, MigrationSummary, Migrator, RUME_AUTH_MIGRATION_ID};
 #[cfg(feature = "mysql")]
 pub use mysql::{MariadbBackend, MariadbTransaction, MysqlBackend, MysqlTransaction};
+pub use pagination::{CursorCodec, CursorPage, CursorPageRequest, OffsetPage, OffsetPageRequest};
 pub use pool::{
     ConnectionLease, DatabaseHealthCheck, DatabasePool, MetricsRegistryPoolExt, PoolStatus,
 };
