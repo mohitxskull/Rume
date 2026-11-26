@@ -5,6 +5,7 @@
 pub mod openapi;
 pub mod resilience;
 pub mod routing;
+pub mod transport;
 pub mod validation;
 
 #[cfg(test)]

@@ -18,6 +18,7 @@
 pub mod group;
 pub mod health;
 pub mod matchers;
+pub mod metrics;
 pub mod registry;
 pub mod resource;
 pub mod router;
@@ -31,6 +32,7 @@ pub use health::{
     health_routes,
 };
 pub use matchers::Matcher;
+pub use metrics::{metrics_handler, metrics_routes, metrics_routes_at};
 pub use registry::{RouteInfo, RouteRegistry};
 pub use resource::Resource;
 pub use router::Router;

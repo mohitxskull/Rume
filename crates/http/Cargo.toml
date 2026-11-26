@@ -12,6 +12,7 @@ rume-observability.workspace = true
 rume-security.workspace = true
 axum.workspace = true
 tower.workspace = true
+tower-http.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -25,6 +26,7 @@ redis = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+tower-http = { workspace = true, features = ["decompression-gzip", "decompression-br", "decompression-zstd"] }
 
 [features]
 default = []

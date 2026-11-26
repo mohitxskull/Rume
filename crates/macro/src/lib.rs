@@ -11,6 +11,8 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Token, Visibility, parse_macro_input};
 
+mod openapi_schema;
+
 struct SqlAssetsArgs {
     vis: Visibility,
     mod_name: Ident,
@@ -646,6 +648,13 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
     };
 
     expanded.into()
+}
+
+/// Derives `HasOpenApiSchema` for a struct, reflecting field types, `Option<T>`
+/// optionality, `#[serde(...)]` attributes, and common `#[garde(...)]` rules.
+#[proc_macro_derive(HasOpenApiSchema, attributes(openapi, serde, garde))]
+pub fn derive_has_openapi_schema(input: TokenStream) -> TokenStream {
+    openapi_schema::expand(input)
 }
 
 #[cfg(test)]

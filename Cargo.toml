@@ -44,6 +44,7 @@ rume-app = { path = "crates/app", version = "=0.1.0" }
 rume-testing = { path = "crates/testing", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
+tower-http = { version = "=0.6.11", default-features = false, features = ["cors", "compression-gzip", "compression-br", "compression-zstd", "limit"] }
 tokio = { version = "=1.54.1", features = ["full"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tracing = "=0.1.44"
