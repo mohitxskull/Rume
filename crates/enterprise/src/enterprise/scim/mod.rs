@@ -1,4 +1,15 @@
-//! SCIM 2.0 (RFC 7643 / RFC 7644) protocol models and response envelopes.
+//! SCIM 2.0 (RFC 7643 / RFC 7644) protocol models, filter parser, and store.
+
+pub mod filter;
+pub mod store;
+
+pub use filter::{
+    DEFAULT_MAX_FILTER_DEPTH, DEFAULT_MAX_FILTER_LEN, ScimFilter, ScimFilterError, ScimFilterOp,
+    ScimFilterValue,
+};
+pub use store::{
+    InMemoryScimStore, ScimListQuery, ScimPatchOp, ScimPatchRequest, ScimStore, ScimStoreError,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +21,8 @@ pub const SCIM_GROUP_SCHEMA: &str = "urn:ietf:params:scim:schemas:core:2.0:Group
 pub const SCIM_LIST_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:ListResponse";
 /// Standard Error message URN.
 pub const SCIM_ERROR_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:Error";
+/// Standard PatchOp message URN.
+pub const SCIM_PATCH_SCHEMA: &str = "urn:ietf:params:scim:api:messages:2.0:PatchOp";
 
 /// SCIM Name sub-attribute.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -156,9 +169,12 @@ pub struct ScimMember {
 #[serde(rename_all = "camelCase")]
 pub struct ScimGroup {
     pub schemas: Vec<String>,
+    #[serde(default)]
     pub id: String,
     pub display_name: String,
+    #[serde(default)]
     pub members: Vec<ScimMember>,
+    #[serde(default)]
     pub meta: Option<ScimMeta>,
 }
 
@@ -255,5 +271,47 @@ mod tests {
         .expect("schema-bearing ScimUser must deserialize");
         assert_eq!(valid.schemas, vec![SCIM_USER_SCHEMA.to_string()]);
         assert_eq!(valid.user_name, "alice");
+    }
+
+    #[test]
+    fn scim_filter_parses_compound_boolean_and_evaluates_users() {
+        let filter = ScimFilter::parse(
+            r#"userName eq "alice" and (active eq true or emails.value co "@example.com") and not (displayName sw "Test")"#,
+        )
+        .expect("compound SCIM filter must parse");
+
+        let mut matching = ScimUser::new("u1", "alice").with_email("alice@other.org", true);
+        matching.display_name = Some("Alice Smith".to_string());
+        assert!(filter.matches_user(&matching));
+
+        let mut matching_inactive_by_email =
+            ScimUser::new("u2", "alice").with_email("alice@example.com", true);
+        matching_inactive_by_email.active = false;
+        matching_inactive_by_email.display_name = Some("Alice".to_string());
+        assert!(filter.matches_user(&matching_inactive_by_email));
+
+        let mut excluded_test_prefix =
+            ScimUser::new("u3", "alice").with_email("alice@example.com", true);
+        excluded_test_prefix.display_name = Some("Test Alice".to_string());
+        assert!(!filter.matches_user(&excluded_test_prefix));
+
+        let mut wrong_username = ScimUser::new("u4", "bob").with_email("bob@example.com", true);
+        wrong_username.display_name = Some("Bob".to_string());
+        assert!(!filter.matches_user(&wrong_username));
+
+        let mut inactive_wrong_email =
+            ScimUser::new("u5", "alice").with_email("alice@other.org", true);
+        inactive_wrong_email.active = false;
+        inactive_wrong_email.display_name = Some("Alice".to_string());
+        assert!(!filter.matches_user(&inactive_wrong_email));
+
+        // Bounded depth & length checks.
+        let too_long = "a".repeat(DEFAULT_MAX_FILTER_LEN + 1);
+        let err = ScimFilter::parse(&too_long).expect_err("oversized filter must fail");
+        assert_eq!(ScimErrorResponse::from(&err).status, "400");
+
+        let deep = format!("{}userName eq \"a\"{}", "(".repeat(40), ")".repeat(40));
+        let err = ScimFilter::parse(&deep).expect_err("over-deep filter must fail");
+        assert_eq!(ScimErrorResponse::from(&err).status, "400");
     }
 }
