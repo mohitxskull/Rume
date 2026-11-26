@@ -109,7 +109,17 @@ impl RumeClientBuilder {
 
     /// Builds the [`RumeClient`].
     pub fn build(self) -> Result<RumeClient, OutboundHttpError> {
-        todo!("Task 04: implement RumeClientBuilder::build")
+        let inner = match self.client {
+            Some(client) => client,
+            None => reqwest::Client::builder().build()?,
+        };
+        Ok(RumeClient {
+            inner,
+            circuit_breaker: self.circuit_breaker,
+            retry: self.retry,
+            attempt_timeout: self.attempt_timeout,
+            total_timeout: self.total_timeout,
+        })
     }
 }
 
@@ -117,10 +127,10 @@ impl RumeClientBuilder {
 #[derive(Debug, Clone)]
 pub struct RumeClient {
     inner: reqwest::Client,
-    _circuit_breaker: Option<Arc<CircuitBreaker>>,
-    _retry: RetryConfig,
-    _attempt_timeout: Option<Duration>,
-    _total_timeout: Option<Duration>,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
+    retry: RetryConfig,
+    attempt_timeout: Option<Duration>,
+    total_timeout: Option<Duration>,
 }
 
 impl RumeClient {
@@ -140,8 +150,8 @@ impl RumeClient {
     }
 
     /// Starts building a request with the given HTTP `method` and `url`.
-    pub fn request(&self, _method: Method, _url: &str) -> reqwest::RequestBuilder {
-        todo!("Task 04: implement RumeClient::request")
+    pub fn request(&self, method: Method, url: &str) -> reqwest::RequestBuilder {
+        self.inner.request(method, url)
     }
 
     /// Convenience `GET` request builder.
@@ -170,7 +180,423 @@ impl RumeClient {
     }
 
     /// Executes a `reqwest::Request` with trace propagation, circuit breaking, retries, and timeouts.
-    pub async fn execute(&self, _request: Request) -> Result<Response, OutboundHttpError> {
-        todo!("Task 04: implement RumeClient::execute")
+    pub async fn execute(&self, mut request: Request) -> Result<Response, OutboundHttpError> {
+        inject_telemetry_headers(request.headers_mut());
+
+        match self.total_timeout {
+            Some(total) => tokio::time::timeout(total, self.execute_with_retries(request))
+                .await
+                .map_err(|_| OutboundHttpError::Timeout)?,
+            None => self.execute_with_retries(request).await,
+        }
+    }
+
+    async fn execute_with_retries(&self, request: Request) -> Result<Response, OutboundHttpError> {
+        let max_attempts = self.retry.max_attempts.max(1);
+        let can_retry_method =
+            is_idempotent_method(request.method()) || self.retry.retry_non_idempotent;
+        let mut pending = Some(request);
+
+        for attempt in 1..=max_attempts {
+            let current_request = pending.take().expect("request must be present for attempt");
+            let want_retry = attempt < max_attempts && can_retry_method;
+            let (attempt_request, can_retry_after) = if want_retry {
+                match current_request.try_clone() {
+                    Some(cloned) => {
+                        pending = Some(current_request);
+                        (cloned, true)
+                    }
+                    None => (current_request, false),
+                }
+            } else {
+                (current_request, false)
+            };
+
+            match self.execute_single_attempt(attempt_request).await {
+                Ok(resp) if !resp.status().is_server_error() || !can_retry_after => {
+                    return Ok(resp);
+                }
+                Ok(_) => {}
+                Err(OutboundHttpError::CircuitOpen) => return Err(OutboundHttpError::CircuitOpen),
+                Err(err) if !can_retry_after => return Err(err),
+                Err(_) => {}
+            }
+
+            let delay =
+                full_jitter_backoff(self.retry.initial_backoff, self.retry.max_backoff, attempt);
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
+
+        unreachable!("loop always returns on the final attempt")
+    }
+
+    async fn execute_single_attempt(
+        &self,
+        request: Request,
+    ) -> Result<Response, OutboundHttpError> {
+        let permit = match self.circuit_breaker {
+            Some(ref cb) => Some(cb.try_acquire().ok_or(OutboundHttpError::CircuitOpen)?),
+            None => None,
+        };
+
+        let result = match self.attempt_timeout {
+            Some(timeout) => match tokio::time::timeout(timeout, self.inner.execute(request)).await
+            {
+                Ok(res) => res.map_err(OutboundHttpError::Transport),
+                Err(_) => Err(OutboundHttpError::Timeout),
+            },
+            None => self
+                .inner
+                .execute(request)
+                .await
+                .map_err(OutboundHttpError::Transport),
+        };
+
+        match result {
+            Ok(resp) => {
+                if let Some(p) = permit {
+                    if resp.status().is_server_error() {
+                        p.complete_failure();
+                    } else {
+                        p.complete_success();
+                    }
+                }
+                Ok(resp)
+            }
+            Err(err) => {
+                if let Some(p) = permit {
+                    p.complete_failure();
+                }
+                Err(err)
+            }
+        }
+    }
+}
+
+fn is_idempotent_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::PUT | Method::DELETE | Method::OPTIONS
+    )
+}
+
+fn full_jitter_backoff(initial: Duration, max: Duration, attempt: u32) -> Duration {
+    let shift = attempt.saturating_sub(1);
+    let factor = 1u32.checked_shl(shift).unwrap_or(u32::MAX);
+    let cap = initial.saturating_mul(factor).min(max);
+    let max_nanos = cap.as_nanos().min(u128::from(u64::MAX)) as u64;
+    if max_nanos == 0 {
+        Duration::ZERO
+    } else {
+        Duration::from_nanos(rand::random_range(0..=max_nanos))
+    }
+}
+
+fn inject_telemetry_headers(headers: &mut reqwest::header::HeaderMap) {
+    use rume_foundation::telemetry::{RequestId, X_REQUEST_ID};
+    use rume_observability::trace_context::{TRACEPARENT, TRACESTATE, TraceContext};
+
+    if !headers.contains_key(X_REQUEST_ID.as_str())
+        && let Ok(val) = reqwest::header::HeaderValue::from_str(RequestId::generate().as_str())
+    {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-request-id"),
+            val,
+        );
+    }
+
+    if !headers.contains_key(TRACEPARENT.as_str())
+        && let Some(tc) = TraceContext::current()
+    {
+        if let Ok(tp_val) = reqwest::header::HeaderValue::from_str(&tc.traceparent) {
+            headers.insert(
+                reqwest::header::HeaderName::from_static("traceparent"),
+                tp_val,
+            );
+        }
+        if let Some(ts) = tc.tracestate
+            && !headers.contains_key(TRACESTATE.as_str())
+            && let Ok(ts_val) = reqwest::header::HeaderValue::from_str(&ts)
+        {
+            headers.insert(
+                reqwest::header::HeaderName::from_static("tracestate"),
+                ts_val,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::Router;
+    use axum::http::{HeaderMap, StatusCode};
+    use axum::routing::{get, post};
+    use rume_foundation::telemetry::X_REQUEST_ID;
+    use rume_observability::trace_context::{TRACEPARENT, TRACESTATE, TraceContext};
+    use tokio::net::TcpListener;
+
+    use crate::resilience::circuit_breaker::{CircuitBreakerConfig, CircuitState};
+
+    async fn spawn_test_server(app: Router) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test app");
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn rume_client_injects_traceparent_tracestate_and_request_id() {
+        let captured = Arc::new(parking_lot::Mutex::new(None::<HeaderMap>));
+        let captured_clone = Arc::clone(&captured);
+
+        let app = Router::new().route(
+            "/echo",
+            get(move |headers: HeaderMap| {
+                let captured = Arc::clone(&captured_clone);
+                async move {
+                    *captured.lock() = Some(headers);
+                    StatusCode::OK
+                }
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+        let client = RumeClient::new().expect("build client");
+
+        let tc = TraceContext {
+            traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01".to_string(),
+            tracestate: Some("rojo=00f067aa0ba902b7".to_string()),
+        };
+
+        let resp = tc
+            .scope_future(tracing::info_span!("outbound_test"), async {
+                let req = client
+                    .get(&format!("{base_url}/echo"))
+                    .build()
+                    .expect("build request");
+                client.execute(req).await
+            })
+            .await
+            .expect("execute request");
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let headers = captured.lock().clone().expect("headers captured");
+        assert_eq!(
+            headers
+                .get(TRACEPARENT.as_str())
+                .and_then(|v| v.to_str().ok()),
+            Some("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+        );
+        assert_eq!(
+            headers
+                .get(TRACESTATE.as_str())
+                .and_then(|v| v.to_str().ok()),
+            Some("rojo=00f067aa0ba902b7")
+        );
+        let req_id = headers
+            .get(X_REQUEST_ID.as_str())
+            .and_then(|v| v.to_str().ok())
+            .expect("x-request-id header present");
+        assert!(!req_id.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rume_client_retries_idempotent_get_with_backoff_and_succeeds() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+
+        let app = Router::new().route(
+            "/flaky",
+            get(move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    let n = attempts.fetch_add(1, Ordering::SeqCst);
+                    if n < 2 {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+        let client = RumeClient::builder()
+            .retry(RetryConfig {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(20),
+                retry_non_idempotent: false,
+            })
+            .build()
+            .expect("build client");
+
+        let req = client
+            .get(&format!("{base_url}/flaky"))
+            .build()
+            .expect("build request");
+        let resp = client.execute(req).await.expect("execute request");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn rume_client_does_not_retry_post_unless_opted_in() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = Arc::clone(&attempts);
+
+        let app = Router::new().route(
+            "/submit",
+            post(move || {
+                let attempts = Arc::clone(&attempts_clone);
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+
+        let default_client = RumeClient::builder()
+            .retry(RetryConfig {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(20),
+                retry_non_idempotent: false,
+            })
+            .build()
+            .expect("build default client");
+
+        let req = default_client
+            .post(&format!("{base_url}/submit"))
+            .build()
+            .expect("build post");
+        let resp = default_client
+            .execute(req)
+            .await
+            .expect("execute default post");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        attempts.store(0, Ordering::SeqCst);
+        let retry_client = RumeClient::builder()
+            .retry(RetryConfig {
+                max_attempts: 3,
+                initial_backoff: Duration::from_millis(5),
+                max_backoff: Duration::from_millis(20),
+                retry_non_idempotent: false,
+            })
+            .retry_non_idempotent(true)
+            .build()
+            .expect("build retry post client");
+
+        let req = retry_client
+            .post(&format!("{base_url}/submit"))
+            .build()
+            .expect("build post");
+        let resp = retry_client.execute(req).await.expect("execute retry post");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn rume_client_trips_circuit_breaker_and_recovers() {
+        let fail = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let fail_clone = Arc::clone(&fail);
+
+        let app = Router::new().route(
+            "/cb",
+            get(move || {
+                let fail = Arc::clone(&fail_clone);
+                async move {
+                    if fail.load(Ordering::SeqCst) {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 2,
+            success_threshold: 1,
+            reset_timeout: Duration::from_millis(50),
+        }));
+        let client = RumeClient::builder()
+            .circuit_breaker(Arc::clone(&breaker))
+            .retry(RetryConfig {
+                max_attempts: 1,
+                ..RetryConfig::default()
+            })
+            .build()
+            .expect("build client");
+
+        for _ in 0..2 {
+            let req = client
+                .get(&format!("{base_url}/cb"))
+                .build()
+                .expect("build req");
+            let resp = client.execute(req).await.expect("500 response");
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        assert_eq!(breaker.state(), CircuitState::Open);
+
+        let req = client
+            .get(&format!("{base_url}/cb"))
+            .build()
+            .expect("build req");
+        let err = client
+            .execute(req)
+            .await
+            .expect_err("expected circuit open");
+        assert!(matches!(err, OutboundHttpError::CircuitOpen));
+
+        fail.store(false, Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(65)).await;
+
+        let req = client
+            .get(&format!("{base_url}/cb"))
+            .build()
+            .expect("build req");
+        let resp = client.execute(req).await.expect("recovery probe");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
+    async fn rume_client_enforces_total_timeout() {
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                StatusCode::OK
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+
+        let client = RumeClient::builder()
+            .total_timeout(Duration::from_millis(40))
+            .build()
+            .expect("build client");
+
+        let req = client
+            .get(&format!("{base_url}/slow"))
+            .build()
+            .expect("build req");
+        let err = client
+            .execute(req)
+            .await
+            .expect_err("expected total timeout");
+        assert!(matches!(err, OutboundHttpError::Timeout));
     }
 }
