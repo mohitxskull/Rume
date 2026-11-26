@@ -9,6 +9,12 @@
 //! policy or self-host the assets and point [`OpenApiDocsConfig::with_script_url`]
 //! (and [`OpenApiDocsConfig::with_stylesheet_url`] for Swagger UI) at your own
 //! origin.
+//!
+//! Note that [`OpenApiUi::Scalar`] emits no inline script and works with
+//! `default-src 'self'` when self-hosted, whereas [`OpenApiUi::SwaggerUi`]
+//! embeds an inline `<script>` bootstrap block (`SwaggerUIBundle(...)`) that
+//! requires `'unsafe-inline'`, a CSP nonce, or a script hash even when the
+//! bundle and stylesheet are self-hosted.
 
 use axum::body::Bytes;
 use axum::http::{StatusCode, header};
@@ -143,7 +149,10 @@ fn escape_js_string(value: &str) -> String {
 /// when using `SecurityHeadersConfig::default()` (`default-src 'self'`), or
 /// overriding [`OpenApiDocsConfig::with_script_url`] (and
 /// [`OpenApiDocsConfig::with_stylesheet_url`] for Swagger UI) to serve
-/// self-hosted assets from `'self'`.
+/// self-hosted assets from `'self'`. [`OpenApiUi::Scalar`] has no inline script
+/// and works with `default-src 'self'` when self-hosted; [`OpenApiUi::SwaggerUi`]
+/// embeds an inline `<script>` bootstrap block requiring `'unsafe-inline'`, a
+/// nonce, or a hash even when self-hosted.
 #[must_use]
 pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
     let title = escape_html(&config.title);
@@ -239,7 +248,10 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
 /// the default pinned CDN script/stylesheet URLs. Either allow the CDN origin
 /// in your CSP or configure [`OpenApiDocsConfig::with_script_url`] (and
 /// [`OpenApiDocsConfig::with_stylesheet_url`] for Swagger UI) to point to
-/// self-hosted assets.
+/// self-hosted assets. [`OpenApiUi::Scalar`] has no inline script and works
+/// with `default-src 'self'` when self-hosted; [`OpenApiUi::SwaggerUi`] embeds
+/// an inline `<script>` bootstrap block requiring `'unsafe-inline'`, a nonce,
+/// or a hash even when self-hosted.
 #[must_use]
 pub fn openapi_docs_routes<S>(docs_path: &str, config: OpenApiDocsConfig) -> Router<S>
 where

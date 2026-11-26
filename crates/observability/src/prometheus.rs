@@ -259,7 +259,10 @@ fn resolve_names(
 ) -> (String, String) {
     match (metric_type, format) {
         (MetricType::Counter, PrometheusFormat::OpenMetrics100) => {
-            let family = raw_name.strip_suffix("_total").unwrap_or(raw_name);
+            let family = raw_name
+                .strip_suffix("_total")
+                .filter(|s| !s.is_empty())
+                .unwrap_or(raw_name);
             let sample = if raw_name.ends_with("_total") {
                 raw_name.to_string()
             } else {
@@ -425,6 +428,7 @@ fn escape_help(text: &str) -> String {
     for ch in text.chars() {
         match ch {
             '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
             '\n' => out.push_str("\\n"),
             _ => out.push(ch),
         }
@@ -619,7 +623,7 @@ mod tests {
         let meter = provider.meter("test");
         let counter = meter
             .u64_counter("custom.escaped-total")
-            .with_description("Path C:\\metrics\nSecond line")
+            .with_description("Path \"C:\\metrics\"\nSecond line")
             .build();
         counter.add(1, &[KeyValue::new("k", "a\\b\"c\nd")]);
 
@@ -627,7 +631,8 @@ mod tests {
         reader.collect(&mut rm).expect("collect metrics");
         let rendered = render_resource_metrics(&[rm], PrometheusFormat::Text004);
         assert!(
-            rendered.contains("# HELP custom_escaped_total Path C:\\\\metrics\\nSecond line\n"),
+            rendered
+                .contains("# HELP custom_escaped_total Path \\\"C:\\\\metrics\\\"\\nSecond line\n"),
             "HELP description not properly escaped:\n{rendered}"
         );
         assert!(
@@ -684,5 +689,28 @@ mod tests {
         let first = render_prometheus(&snap);
         let second = render_prometheus(&snap);
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn openmetrics_counter_named_total_does_not_emit_empty_family() {
+        assert_eq!(
+            resolve_names(
+                "_total",
+                MetricType::Counter,
+                PrometheusFormat::OpenMetrics100
+            ),
+            ("_total".to_string(), "_total".to_string())
+        );
+        assert_eq!(
+            resolve_names(
+                "http_requests_total",
+                MetricType::Counter,
+                PrometheusFormat::OpenMetrics100
+            ),
+            (
+                "http_requests".to_string(),
+                "http_requests_total".to_string()
+            )
+        );
     }
 }

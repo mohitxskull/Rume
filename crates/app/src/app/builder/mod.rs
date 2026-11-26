@@ -485,11 +485,12 @@ where
 
     pub(crate) fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
         // Why: `Inspect` mode runs `ModuleRegistry` DAG validation, middleware
-        // validation, `collect_and_validate_routes`, and the actual Axum router
-        // merge so module cycles, misconfigured middleware, and duplicate routes
-        // fail closed without starting the server. It intentionally skips
-        // `on_start`, `on_ready`, and `on_shutdown` hooks so `rume list:routes`
-        // and boot checks remain side-effect-free, and also skips
+        // validation, CORS config validation, `collect_and_validate_routes`, and
+        // the actual Axum router merge so module cycles, misconfigured
+        // middleware, invalid CORS configs, and duplicate routes fail closed
+        // without starting the server. It intentionally skips `on_start`,
+        // `on_ready`, and `on_shutdown` hooks so `rume list:routes` and boot
+        // checks remain side-effect-free, and also skips
         // `Module::register_health_checks` (so duplicate health-check names are
         // detected by the serving build rather than `Inspect`).
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;

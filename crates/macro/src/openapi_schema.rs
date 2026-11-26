@@ -117,6 +117,7 @@ fn expand_derive(input: DeriveInput) -> syn::Result<TokenStream2> {
     let (impl_generics, ty_generics, where_clause) = generics.split_for_impl();
 
     Ok(quote! {
+        #[automatically_derived]
         impl #impl_generics #crate_path::HasOpenApiSchema for #struct_ident #ty_generics #where_clause {
             fn schema() -> #crate_path::OpenApiSchema {
                 #crate_path::OpenApiSchema::object()

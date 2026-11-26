@@ -201,6 +201,7 @@ where
                 // `application/problem+json` body-integrity invariant below remain untouched).
                 if let Some(ref cfg) = redaction
                     && cfg.log_headers()
+                    && tracing::enabled!(tracing::Level::DEBUG)
                 {
                     let redacted_headers = cfg.redact_headers(req.headers());
                     tracing::debug!(headers = ?redacted_headers, "http request headers");
@@ -210,6 +211,7 @@ where
 
                 if let Some(ref cfg) = redaction
                     && cfg.log_headers()
+                    && tracing::enabled!(tracing::Level::DEBUG)
                 {
                     let redacted_headers = cfg.redact_headers(response.headers());
                     tracing::debug!(headers = ?redacted_headers, "http response headers");
@@ -363,6 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_layer_extracts_w3c_traceparent_into_otel_span_and_response() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
         let incoming_span_id = "00f067aa0ba902b7";
         let captured_handler_tp = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
@@ -559,6 +562,8 @@ mod tests {
         use axum::routing::get;
         use tower::ServiceExt;
 
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+
         let router = axum::Router::new()
             .route("/users/{id}", get(|| async { "user" }))
             .route_layer(axum::middleware::from_fn(
@@ -596,6 +601,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_body_on_invalid_problem_details_json() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let raw_payload = b"this is not valid json problem details";
         let mut svc = ObservabilityLayer::new().layer(tower::service_fn(
             move |_req: Request<Body>| async move {
@@ -625,6 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_body_on_oversized_stream() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let chunk_size = 64 * 1024;
         let num_chunks = 24;
         let chunks: Vec<axum::body::Bytes> = (0..num_chunks)
@@ -668,6 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_injects_request_id_into_valid_problem_details() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let raw_problem = serde_json::json!({
             "type": "https://example.com/probs/out-of-credit",
             "title": "You do not have enough credit.",
@@ -704,6 +712,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_stream_error_on_inspected_problem_details() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let mut svc = ObservabilityLayer::new().layer(tower::service_fn(|_req: Request<Body>| {
             let stream = futures_util::stream::iter(vec![
                 Ok(axum::body::Bytes::from_static(b"{\"title\":\"partial\"")),
@@ -921,6 +930,7 @@ mod tests {
             events: Arc::clone(&captured),
         });
         let _sub_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         let redaction = crate::redaction::RedactionConfig::new().with_log_headers(true);
         let mut svc = ObservabilityLayer::with_redaction(redaction).layer(tower::service_fn(

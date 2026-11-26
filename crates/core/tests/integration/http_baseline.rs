@@ -456,6 +456,7 @@ async fn e2e_redaction_config_masks_headers_and_json_body_without_breaking_strea
         events: Arc::clone(&captured),
     });
     let _sub_guard = tracing::subscriber::set_default(subscriber);
+    tracing::callsite::rebuild_interest_cache();
 
     let redaction = RedactionConfig::new()
         .with_log_headers(true)

@@ -250,12 +250,19 @@ fn parse_origins(origins: &[String]) -> Result<Vec<HeaderValue>, CorsConfigError
         .iter()
         .map(|origin| {
             reject_literal_wildcard("allow_origins", origin)?;
-            // Why: `http::HeaderValue::from_str` permits obs-text bytes (0x80..=0xFF),
-            // but RFC 6454 / Fetch `Origin` values must be ASCII (IDNs use punycode).
+            // Why: `http::HeaderValue::from_str` permits obs-text bytes (0x80..=0xFF)
+            // and ASCII spaces/HTAB, but RFC 6454 / Fetch `Origin` values must be
+            // ASCII without whitespace (IDNs use punycode).
             if !origin.is_ascii() {
                 return Err(CorsConfigError::InvalidValue {
                     field: "allow_origins",
                     reason: "origin must contain only ASCII characters".to_string(),
+                });
+            }
+            if origin.bytes().any(|b| b.is_ascii_whitespace()) {
+                return Err(CorsConfigError::InvalidValue {
+                    field: "allow_origins",
+                    reason: "origin must not contain ASCII whitespace".to_string(),
                 });
             }
             HeaderValue::from_str(origin).map_err(|err| CorsConfigError::InvalidValue {
@@ -494,5 +501,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn cors_rejects_origin_with_ascii_whitespace() {
+        for bad_origin in [
+            " https://app.example",
+            "https://app.example ",
+            "https://app.example\t",
+            "\thttps://app.example",
+            "https://app.example https://other.example",
+        ] {
+            let err = CorsConfig::new()
+                .allow_origins([bad_origin])
+                .build_layer()
+                .expect_err("origin containing ASCII whitespace must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    CorsConfigError::InvalidValue {
+                        field: "allow_origins",
+                        ..
+                    }
+                ),
+                "expected InvalidValue for {bad_origin:?}, got: {err:?}"
+            );
+        }
     }
 }
