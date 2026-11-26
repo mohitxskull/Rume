@@ -9,10 +9,13 @@ use std::time::Duration;
 use reqwest::{Method, Request, Response};
 use thiserror::Error;
 
-use crate::resilience::circuit_breaker::CircuitBreaker;
+use crate::resilience::circuit_breaker::{CircuitBreaker, TrialPermit};
 #[cfg(feature = "dns-srv")]
 pub use discovery::DnsSrvDiscovery;
 pub use discovery::{ServiceDiscovery, ServiceEndpoint, StaticDiscovery};
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Errors returned by [`RumeClient`] outbound HTTP operations.
 #[derive(Debug, Error)]
@@ -56,13 +59,31 @@ impl Default for RetryConfig {
 }
 
 /// Builder for [`RumeClient`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct RumeClientBuilder {
     client: Option<reqwest::Client>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
     retry: RetryConfig,
     attempt_timeout: Option<Duration>,
     total_timeout: Option<Duration>,
+    connect_timeout: Option<Duration>,
+    request_timeout: Option<Duration>,
+    redirect_policy: Option<reqwest::redirect::Policy>,
+}
+
+impl Default for RumeClientBuilder {
+    fn default() -> Self {
+        Self {
+            client: None,
+            circuit_breaker: None,
+            retry: RetryConfig::default(),
+            attempt_timeout: None,
+            total_timeout: None,
+            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
+            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
+            redirect_policy: None,
+        }
+    }
 }
 
 impl RumeClientBuilder {
@@ -107,11 +128,41 @@ impl RumeClientBuilder {
         self
     }
 
+    /// Sets the TCP/TLS connect timeout on the underlying `reqwest::Client` (default: 10s).
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the request timeout on the underlying `reqwest::Client` (default: 30s).
+    pub fn request_timeout(mut self, timeout: Duration) -> Self {
+        self.request_timeout = Some(timeout);
+        self
+    }
+
+    /// Sets the HTTP redirect policy on the underlying `reqwest::Client` (default: `Policy::none()`).
+    pub fn redirect_policy(mut self, policy: reqwest::redirect::Policy) -> Self {
+        self.redirect_policy = Some(policy);
+        self
+    }
+
     /// Builds the [`RumeClient`].
     pub fn build(self) -> Result<RumeClient, OutboundHttpError> {
         let inner = match self.client {
             Some(client) => client,
-            None => reqwest::Client::builder().build()?,
+            None => {
+                let mut builder = reqwest::Client::builder().redirect(
+                    self.redirect_policy
+                        .unwrap_or_else(reqwest::redirect::Policy::none),
+                );
+                if let Some(connect_timeout) = self.connect_timeout {
+                    builder = builder.connect_timeout(connect_timeout);
+                }
+                if let Some(request_timeout) = self.request_timeout {
+                    builder = builder.timeout(request_timeout);
+                }
+                builder.build()?
+            }
         };
         Ok(RumeClient {
             inner,
@@ -183,15 +234,33 @@ impl RumeClient {
     pub async fn execute(&self, mut request: Request) -> Result<Response, OutboundHttpError> {
         inject_telemetry_headers(request.headers_mut());
 
+        let active_permit = parking_lot::Mutex::new(None);
         match self.total_timeout {
-            Some(total) => tokio::time::timeout(total, self.execute_with_retries(request))
-                .await
-                .map_err(|_| OutboundHttpError::Timeout)?,
-            None => self.execute_with_retries(request).await,
+            Some(total) => match tokio::time::timeout(
+                total,
+                self.execute_with_retries(request, &active_permit),
+            )
+            .await
+            {
+                Ok(res) => res,
+                Err(_) => {
+                    // Why: `tokio::time::timeout` cancels the inner future before `execute_single_attempt`
+                    // can report failure; explicitly complete the held permit so the circuit breaker trips.
+                    if let Some(permit) = active_permit.lock().take() {
+                        permit.complete_failure();
+                    }
+                    Err(OutboundHttpError::Timeout)
+                }
+            },
+            None => self.execute_with_retries(request, &active_permit).await,
         }
     }
 
-    async fn execute_with_retries(&self, request: Request) -> Result<Response, OutboundHttpError> {
+    async fn execute_with_retries(
+        &self,
+        request: Request,
+        active_permit: &parking_lot::Mutex<Option<TrialPermit>>,
+    ) -> Result<Response, OutboundHttpError> {
         let max_attempts = self.retry.max_attempts.max(1);
         let can_retry_method =
             is_idempotent_method(request.method()) || self.retry.retry_non_idempotent;
@@ -212,7 +281,10 @@ impl RumeClient {
                 (current_request, false)
             };
 
-            match self.execute_single_attempt(attempt_request).await {
+            match self
+                .execute_single_attempt(attempt_request, active_permit)
+                .await
+            {
                 Ok(resp) if !resp.status().is_server_error() || !can_retry_after => {
                     return Ok(resp);
                 }
@@ -235,11 +307,12 @@ impl RumeClient {
     async fn execute_single_attempt(
         &self,
         request: Request,
+        active_permit: &parking_lot::Mutex<Option<TrialPermit>>,
     ) -> Result<Response, OutboundHttpError> {
-        let permit = match self.circuit_breaker {
-            Some(ref cb) => Some(cb.try_acquire().ok_or(OutboundHttpError::CircuitOpen)?),
-            None => None,
-        };
+        if let Some(ref cb) = self.circuit_breaker {
+            let permit = cb.try_acquire().ok_or(OutboundHttpError::CircuitOpen)?;
+            *active_permit.lock() = Some(permit);
+        }
 
         let result = match self.attempt_timeout {
             Some(timeout) => match tokio::time::timeout(timeout, self.inner.execute(request)).await
@@ -254,6 +327,7 @@ impl RumeClient {
                 .map_err(OutboundHttpError::Transport),
         };
 
+        let permit = active_permit.lock().take();
         match result {
             Ok(resp) => {
                 if let Some(p) = permit {
@@ -598,5 +672,76 @@ mod tests {
             .await
             .expect_err("expected total timeout");
         assert!(matches!(err, OutboundHttpError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn rume_client_total_timeout_trips_circuit_breaker() {
+        let app = Router::new().route(
+            "/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                StatusCode::OK
+            }),
+        );
+        let base_url = spawn_test_server(app).await;
+
+        let breaker = Arc::new(CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            reset_timeout: Duration::from_secs(30),
+        }));
+        let client = RumeClient::builder()
+            .circuit_breaker(Arc::clone(&breaker))
+            .total_timeout(Duration::from_millis(40))
+            .build()
+            .expect("build client");
+
+        let req = client
+            .get(&format!("{base_url}/slow"))
+            .build()
+            .expect("build req");
+        let err = client
+            .execute(req)
+            .await
+            .expect_err("expected total timeout");
+        assert!(matches!(err, OutboundHttpError::Timeout));
+        assert_eq!(breaker.state(), CircuitState::Open);
+    }
+
+    #[tokio::test]
+    async fn rume_client_does_not_follow_redirects_by_default() {
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_clone = Arc::clone(&target_hits);
+
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/internal-secret")],
+                    )
+                }),
+            )
+            .route(
+                "/internal-secret",
+                get(move || {
+                    let target_hits = Arc::clone(&target_hits_clone);
+                    async move {
+                        target_hits.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::OK
+                    }
+                }),
+            );
+        let base_url = spawn_test_server(app).await;
+        let client = RumeClient::new().expect("build client");
+
+        let req = client
+            .get(&format!("{base_url}/redirect"))
+            .build()
+            .expect("build req");
+        let resp = client.execute(req).await.expect("execute redirect");
+        assert_eq!(resp.status(), StatusCode::FOUND);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     }
 }

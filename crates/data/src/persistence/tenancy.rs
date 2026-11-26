@@ -104,12 +104,21 @@ impl<B: DatabaseBackend> TenantPoolManager<B> {
     }
 
     /// Returns the pool associated with the given tenant.
+    ///
+    /// Only supported for [`TenantIsolationStrategy::DatabasePerTenant`]. For
+    /// [`TenantIsolationStrategy::RowLevelSecurity`] and
+    /// [`TenantIsolationStrategy::SchemaPerTenant`], callers must use
+    /// [`Self::tenant_transaction`] so tenant isolation is enforced on every query.
     pub fn pool_for_tenant(&self, tenant_id: &str) -> Result<DatabasePool<B>, PersistenceError> {
         validate_tenant_id(tenant_id)?;
         match &self.strategy {
-            TenantIsolationStrategy::RowLevelSecurity
-            | TenantIsolationStrategy::SchemaPerTenant { .. } => {
-                self.shared_pool.clone().ok_or(PersistenceError::Closed)
+            TenantIsolationStrategy::RowLevelSecurity => Err(PersistenceError::TransactionError(
+                "pool_for_tenant is not supported for RowLevelSecurity; use tenant_transaction to enforce tenant isolation".into(),
+            )),
+            TenantIsolationStrategy::SchemaPerTenant { .. } => {
+                Err(PersistenceError::TransactionError(
+                    "pool_for_tenant is not supported for SchemaPerTenant; use tenant_transaction to enforce tenant isolation".into(),
+                ))
             }
             TenantIsolationStrategy::DatabasePerTenant => {
                 let pools = self.tenant_pools.read().map_err(|e| {
@@ -139,7 +148,7 @@ impl<B: DatabaseBackend> TenantPoolManager<B> {
             validate_tenant_id(tenant_id)?;
             match &self.strategy {
                 TenantIsolationStrategy::RowLevelSecurity => {
-                    let pool = self.pool_for_tenant(tenant_id)?;
+                    let pool = self.shared_pool.clone().ok_or(PersistenceError::Closed)?;
                     pool.transaction(|tx| async move {
                         tx.set_tenant_context(tenant_id).await?;
                         f(tx).await
@@ -149,7 +158,7 @@ impl<B: DatabaseBackend> TenantPoolManager<B> {
                 TenantIsolationStrategy::SchemaPerTenant { schema_prefix } => {
                     let schema = format!("{schema_prefix}{tenant_id}");
                     validate_sql_identifier(&schema)?;
-                    let pool = self.pool_for_tenant(tenant_id)?;
+                    let pool = self.shared_pool.clone().ok_or(PersistenceError::Closed)?;
                     pool.transaction(|tx| async move {
                         tx.set_tenant_search_path(&schema).await?;
                         f(tx).await
@@ -236,5 +245,20 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, PersistenceError::QueryFailed(_)));
+    }
+
+    #[tokio::test]
+    async fn tenant_pool_manager_pool_for_tenant_rejects_rls_and_schema_per_tenant() {
+        let backend_rls = SqliteBackend::in_memory().await.unwrap();
+        let pool_rls = DatabasePool::new(backend_rls, DatabaseConfig::new("sqlite::memory:"));
+        let rls_manager = TenantPoolManager::new_rls(pool_rls);
+        let rls_err = rls_manager.pool_for_tenant("tenant-a").unwrap_err();
+        assert!(matches!(rls_err, PersistenceError::TransactionError(_)));
+
+        let backend_schema = SqliteBackend::in_memory().await.unwrap();
+        let pool_schema = DatabasePool::new(backend_schema, DatabaseConfig::new("sqlite::memory:"));
+        let schema_manager = TenantPoolManager::new_schema_per_tenant(pool_schema, "tenant_");
+        let schema_err = schema_manager.pool_for_tenant("tenant_a").unwrap_err();
+        assert!(matches!(schema_err, PersistenceError::TransactionError(_)));
     }
 }

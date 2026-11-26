@@ -1,7 +1,9 @@
 //! Outbound webhook dispatcher, HTTP transport, and Outbox/JobQueue integrations.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,131 @@ use crate::jobs::{Job, JobContext, JobError, JobHandler, RetryPolicy};
 use crate::outbox::error::OutboxError;
 use crate::outbox::message::OutboxMessage;
 use crate::outbox::repository::BoxFuture;
+
+const DEFAULT_WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_WEBHOOK_RESPONSE_BYTES: usize = 4096;
+
+fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
+    ip.is_loopback()
+        || ip.is_private()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        || ip.is_multicast()
+        || is_cgnat
+}
+
+fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_forbidden_ipv4(v4);
+    }
+    let segments = ip.segments();
+    let is_ula = (segments[0] & 0xfe00) == 0xfc00;
+    let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
+    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_ula || is_link_local
+}
+
+fn is_forbidden_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
+        IpAddr::V6(v6) => is_forbidden_ipv6(v6),
+    }
+}
+
+fn validate_webhook_url(
+    url: &str,
+    allow_private_networks: bool,
+) -> Result<reqwest::Url, WebhookError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| WebhookError::Transport(format!("invalid webhook URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(WebhookError::Transport(format!(
+            "unsupported webhook URL scheme '{}'",
+            parsed.scheme()
+        )));
+    }
+    if parsed.host().is_none() {
+        return Err(WebhookError::Transport("webhook URL missing host".into()));
+    }
+    if !allow_private_networks {
+        match parsed.host_str() {
+            Some(h)
+                if h.eq_ignore_ascii_case("localhost")
+                    || h.to_ascii_lowercase().ends_with(".localhost") =>
+            {
+                return Err(WebhookError::Transport(format!(
+                    "SSRF protection blocked private/loopback webhook host '{h}'"
+                )));
+            }
+            Some(h) => {
+                let stripped = h.trim_start_matches('[').trim_end_matches(']');
+                if let Ok(ip) = stripped.parse::<IpAddr>()
+                    && is_forbidden_ip(ip)
+                {
+                    return Err(WebhookError::Transport(format!(
+                        "SSRF protection blocked private/internal webhook IP '{ip}'"
+                    )));
+                }
+            }
+            None => {
+                return Err(WebhookError::Transport("webhook URL missing host".into()));
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+#[derive(Debug)]
+struct SsrfSafeDnsResolver;
+
+impl reqwest::dns::Resolve for SsrfSafeDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+                .collect();
+            if addrs.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    format!("DNS resolution returned no addresses for '{host}'"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            for addr in &addrs {
+                if is_forbidden_ip(addr.ip()) {
+                    return Err(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "SSRF protection blocked resolved private/internal IP {} for '{host}'",
+                            addr.ip()
+                        ),
+                    ))
+                        as Box<dyn std::error::Error + Send + Sync>);
+                }
+            }
+            let iter: reqwest::dns::Addrs = Box::new(addrs.into_iter());
+            Ok(iter)
+        })
+    }
+}
+
+fn build_webhook_client(allow_private_networks: bool) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(DEFAULT_WEBHOOK_CONNECT_TIMEOUT)
+        .timeout(DEFAULT_WEBHOOK_TIMEOUT);
+    if !allow_private_networks {
+        builder = builder.dns_resolver(Arc::new(SsrfSafeDnsResolver));
+    }
+    builder
+        .build()
+        .expect("valid reqwest webhook client config")
+}
 
 /// HTTP response returned by a [`WebhookTransport`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +168,7 @@ pub trait WebhookTransport: std::fmt::Debug + Send + Sync + 'static {
 #[derive(Debug, Clone)]
 pub struct ReqwestWebhookTransport {
     client: reqwest::Client,
+    allow_private_networks: bool,
 }
 
 impl Default for ReqwestWebhookTransport {
@@ -50,16 +178,30 @@ impl Default for ReqwestWebhookTransport {
 }
 
 impl ReqwestWebhookTransport {
-    /// Creates a new [`ReqwestWebhookTransport`] with a default `reqwest::Client`.
+    /// Creates a new [`ReqwestWebhookTransport`] with SSRF protection, disabled redirects,
+    /// and bounded connect/request timeouts.
     pub fn new() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: build_webhook_client(false),
+            allow_private_networks: false,
         }
+    }
+
+    /// Configures whether private, loopback, and link-local network targets are permitted.
+    ///
+    /// Defaults to `false`. Enable only for local integration tests.
+    pub fn with_allow_private_networks(mut self, allow: bool) -> Self {
+        self.allow_private_networks = allow;
+        self.client = build_webhook_client(allow);
+        self
     }
 
     /// Creates a new [`ReqwestWebhookTransport`] using the supplied `reqwest::Client`.
     pub fn with_client(client: reqwest::Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            allow_private_networks: false,
+        }
     }
 }
 
@@ -73,9 +215,10 @@ impl WebhookTransport for ReqwestWebhookTransport {
         body: Vec<u8>,
     ) -> BoxFuture<'a, Result<WebhookHttpResponse, WebhookError>> {
         Box::pin(async move {
-            let response = self
+            let parsed_url = validate_webhook_url(url, self.allow_private_networks)?;
+            let mut response = self
                 .client
-                .post(url)
+                .post(parsed_url)
                 .header("Content-Type", "application/json")
                 .header("X-Rume-Signature", signature_header)
                 .header("X-Rume-Event", event_type)
@@ -85,9 +228,35 @@ impl WebhookTransport for ReqwestWebhookTransport {
                 .await
                 .map_err(|e| WebhookError::Transport(e.to_string()))?;
 
-            let status = response.status().as_u16();
-            let text = response.text().await.ok();
-            Ok(WebhookHttpResponse { status, body: text })
+            let status = response.status();
+            if status.is_redirection() {
+                return Err(WebhookError::Transport(format!(
+                    "webhook redirect rejected: HTTP {}",
+                    status.as_u16()
+                )));
+            }
+
+            let mut buf = Vec::new();
+            while let Some(chunk) = response
+                .chunk()
+                .await
+                .map_err(|e| WebhookError::Transport(e.to_string()))?
+            {
+                let remaining = MAX_WEBHOOK_RESPONSE_BYTES.saturating_sub(buf.len());
+                if remaining == 0 {
+                    break;
+                }
+                let take = chunk.len().min(remaining);
+                buf.extend_from_slice(&chunk[..take]);
+                if buf.len() >= MAX_WEBHOOK_RESPONSE_BYTES {
+                    break;
+                }
+            }
+            let text = Some(String::from_utf8_lossy(&buf).into_owned());
+            Ok(WebhookHttpResponse {
+                status: status.as_u16(),
+                body: text,
+            })
         })
     }
 }
@@ -125,13 +294,17 @@ impl WebhookDispatcher {
         }
     }
 
-    fn matching_endpoints(&self, event_type: &str) -> Vec<WebhookEndpoint> {
+    fn matching_endpoints(
+        &self,
+        tenant_id: Option<&str>,
+        event_type: &str,
+    ) -> Vec<WebhookEndpoint> {
         let Ok(guard) = self.endpoints.read() else {
             return Vec::new();
         };
         guard
             .values()
-            .filter(|ep| ep.subscribes_to(event_type))
+            .filter(|ep| ep.tenant_id.as_deref() == tenant_id && ep.subscribes_to(event_type))
             .cloned()
             .collect()
     }
@@ -140,15 +313,16 @@ impl WebhookDispatcher {
         self.endpoints.read().ok()?.get(id).cloned()
     }
 
-    /// Dispatches `event_type` with `payload` to all active matching endpoints.
+    /// Dispatches `event_type` with `payload` to all active matching endpoints scoped to `tenant_id`.
     pub async fn dispatch_event(
         &self,
+        tenant_id: Option<&str>,
         event_type: &str,
         payload: serde_json::Value,
     ) -> Result<Vec<WebhookDeliveryRecord>, WebhookError> {
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| WebhookError::Serialization(e.to_string()))?;
-        let endpoints = self.matching_endpoints(event_type);
+        let endpoints = self.matching_endpoints(tenant_id, event_type);
         let mut results = Vec::with_capacity(endpoints.len());
 
         for endpoint in endpoints {
@@ -256,7 +430,7 @@ impl WebhookDispatcher {
                 let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
                     .map_err(|e| OutboxError::Dispatch(format!("invalid JSON payload: {e}")))?;
                 dispatcher
-                    .dispatch_event(&event_type, payload)
+                    .dispatch_event(None, &event_type, payload)
                     .await
                     .map(|_| ())
                     .map_err(|e| OutboxError::Dispatch(e.to_string()))
@@ -268,6 +442,9 @@ impl WebhookDispatcher {
 /// Background [`Job`] payload for dispatching a webhook event via [`JobQueue`](crate::jobs::JobQueue).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WebhookDeliveryJob {
+    /// Optional tenant scope for multi-tenant webhook isolation.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
     /// Event type name.
     pub event_type: String,
     /// JSON payload to deliver.
@@ -299,10 +476,179 @@ impl JobHandler<WebhookDeliveryJob> for WebhookDeliveryJobHandler {
     ) -> crate::jobs::BoxFuture<'a, Result<(), JobError>> {
         Box::pin(async move {
             self.dispatcher
-                .dispatch_event(&job.event_type, job.payload)
+                .dispatch_event(job.tenant_id.as_deref(), &job.event_type, job.payload)
                 .await
                 .map(|_| ())
                 .map_err(|e| JobError::Retryable(e.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use secrecy::SecretString;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use super::*;
+    use crate::webhooks::InMemoryWebhookDeliveryStore;
+
+    async fn spawn_raw_http_server(response: String) -> (String, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                hits_clone.fetch_add(1, Ordering::SeqCst);
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        (format!("http://{addr}"), hits)
+    }
+
+    #[tokio::test]
+    async fn reqwest_webhook_transport_rejects_ssrf_ips_by_default() {
+        let transport = ReqwestWebhookTransport::new();
+        for blocked in [
+            "http://127.0.0.1:8080/hook",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.1/internal",
+            "http://192.168.1.1/admin",
+            "http://[::1]:8080/hook",
+            "http://[fe80::1]/hook",
+            "http://[fd00::1]/hook",
+            "http://[::ffff:127.0.0.1]/hook",
+            "http://localhost:9000/hook",
+        ] {
+            let err = transport
+                .send(blocked, "t=1,v1=abc", "evt", "del-1", b"{}".to_vec())
+                .await
+                .expect_err(&format!("expected SSRF rejection for {blocked}"));
+            assert!(
+                matches!(err, WebhookError::Transport(_)),
+                "unexpected error for {blocked}: {err:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reqwest_webhook_transport_rejects_redirects_without_following() {
+        let (target_url, target_hits) =
+            spawn_raw_http_server("HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".into()).await;
+        let redirect_resp = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}/metadata\r\nContent-Length: 0\r\n\r\n"
+        );
+        let (redir_url, redir_hits) = spawn_raw_http_server(redirect_resp).await;
+
+        let transport = ReqwestWebhookTransport::new().with_allow_private_networks(true);
+        let err = transport
+            .send(&redir_url, "t=1,v1=abc", "evt", "del-1", b"{}".to_vec())
+            .await
+            .expect_err("expected 302 redirect to be rejected");
+        assert!(matches!(err, WebhookError::Transport(ref msg) if msg.contains("redirect")));
+        assert_eq!(redir_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn reqwest_webhook_transport_caps_response_body_to_4kib() {
+        let big_body = "x".repeat(16 * 1024);
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            big_body.len(),
+            big_body
+        );
+        let (url, _) = spawn_raw_http_server(resp).await;
+
+        let transport = ReqwestWebhookTransport::new().with_allow_private_networks(true);
+        let out = transport
+            .send(&url, "t=1,v1=abc", "evt", "del-1", b"{}".to_vec())
+            .await
+            .expect("webhook delivery should succeed");
+        assert_eq!(out.status, 200);
+        let body = out.body.expect("body snippet present");
+        assert_eq!(body.len(), MAX_WEBHOOK_RESPONSE_BYTES);
+    }
+
+    #[derive(Debug, Default)]
+    struct CapturingTransport {
+        urls: Mutex<Vec<String>>,
+    }
+
+    impl WebhookTransport for CapturingTransport {
+        fn send<'a>(
+            &'a self,
+            url: &'a str,
+            _signature_header: &'a str,
+            _event_type: &'a str,
+            _delivery_id: &'a str,
+            _body: Vec<u8>,
+        ) -> BoxFuture<'a, Result<WebhookHttpResponse, WebhookError>> {
+            self.urls.lock().unwrap().push(url.to_string());
+            Box::pin(async {
+                Ok(WebhookHttpResponse {
+                    status: 200,
+                    body: Some("ok".into()),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn webhook_dispatcher_isolates_deliveries_by_tenant() {
+        let store = Arc::new(InMemoryWebhookDeliveryStore::new());
+        let transport = Arc::new(CapturingTransport::default());
+        let dispatcher = WebhookDispatcher::new(store, transport.clone());
+
+        dispatcher.register_endpoint(
+            WebhookEndpoint::new(
+                "ep-a",
+                "https://tenant-a.example/hook",
+                SecretString::from("secret-a".to_string()),
+            )
+            .with_tenant_id("tenant-a"),
+        );
+        dispatcher.register_endpoint(
+            WebhookEndpoint::new(
+                "ep-b",
+                "https://tenant-b.example/hook",
+                SecretString::from("secret-b".to_string()),
+            )
+            .with_tenant_id("tenant-b"),
+        );
+        dispatcher.register_endpoint(WebhookEndpoint::new(
+            "ep-global",
+            "https://global.example/hook",
+            SecretString::from("secret-g".to_string()),
+        ));
+
+        let deliveries_a = dispatcher
+            .dispatch_event(
+                Some("tenant-a"),
+                "invoice.paid",
+                serde_json::json!({"id": "inv-1"}),
+            )
+            .await
+            .expect("dispatch tenant-a");
+        assert_eq!(deliveries_a.len(), 1);
+        assert_eq!(deliveries_a[0].endpoint_id, "ep-a");
+        assert_eq!(
+            *transport.urls.lock().unwrap(),
+            vec!["https://tenant-a.example/hook".to_string()]
+        );
+
+        let deliveries_global = dispatcher
+            .dispatch_event(None, "invoice.paid", serde_json::json!({"id": "inv-2"}))
+            .await
+            .expect("dispatch global");
+        assert_eq!(deliveries_global.len(), 1);
+        assert_eq!(deliveries_global[0].endpoint_id, "ep-global");
     }
 }

@@ -147,7 +147,8 @@ impl OidcDiscovery {
         })
     }
 
-    /// Converts this discovery document into [`OAuth2Config`], verifying `expected_issuer`.
+    /// Converts this discovery document into [`OAuth2Config`], verifying `expected_issuer`
+    /// and enforcing `https://` on all discovered endpoints.
     pub fn to_oauth2_config(
         &self,
         expected_issuer: &str,
@@ -156,11 +157,43 @@ impl OidcDiscovery {
         redirect_uri: impl Into<String>,
         scopes: Vec<String>,
     ) -> Result<OAuth2Config, AuthError> {
+        self.to_oauth2_config_with_options(
+            expected_issuer,
+            client_id,
+            client_secret,
+            redirect_uri,
+            scopes,
+            false,
+        )
+    }
+
+    /// Converts this discovery document into [`OAuth2Config`], verifying `expected_issuer`
+    /// and validating discovered endpoints (`https://` required unless `allow_http` is `true`).
+    pub fn to_oauth2_config_with_options(
+        &self,
+        expected_issuer: &str,
+        client_id: impl Into<String>,
+        client_secret: Option<SecretString>,
+        redirect_uri: impl Into<String>,
+        scopes: Vec<String>,
+        allow_http: bool,
+    ) -> Result<OAuth2Config, AuthError> {
         if self.issuer != expected_issuer {
             return Err(AuthError::InvalidCredentials(format!(
                 "OIDC discovery issuer mismatch: expected '{expected_issuer}', got '{}'",
                 self.issuer
             )));
+        }
+
+        validate_discovery_endpoint(
+            "authorization_endpoint",
+            &self.authorization_endpoint,
+            allow_http,
+        )?;
+        validate_discovery_endpoint("token_endpoint", &self.token_endpoint, allow_http)?;
+        validate_discovery_endpoint("jwks_uri", &self.jwks_uri, allow_http)?;
+        if let Some(ref userinfo) = self.userinfo_endpoint {
+            validate_discovery_endpoint("userinfo_endpoint", userinfo, allow_http)?;
         }
 
         Ok(OAuth2Config {
@@ -174,6 +207,28 @@ impl OidcDiscovery {
             jwks_uri: Some(self.jwks_uri.clone()),
         })
     }
+}
+
+fn validate_discovery_endpoint(field: &str, raw: &str, allow_http: bool) -> Result<(), AuthError> {
+    let parsed = Url::parse(raw)
+        .map_err(|e| AuthError::InvalidCredentials(format!("invalid OIDC {field} URL: {e}")))?;
+    if !parsed.has_host() {
+        return Err(AuthError::InvalidCredentials(format!(
+            "OIDC {field} URL missing host"
+        )));
+    }
+    if allow_http {
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(AuthError::InvalidCredentials(format!(
+                "OIDC {field} must use http or https"
+            )));
+        }
+    } else if parsed.scheme() != "https" {
+        return Err(AuthError::InvalidCredentials(format!(
+            "OIDC {field} must use HTTPS"
+        )));
+    }
+    Ok(())
 }
 
 /// Persisted OAuth2 authorization state for callback validation.
@@ -396,11 +451,11 @@ impl ReqwestOidcDiscoveryClient {
     pub async fn discover(&self, issuer: &str) -> Result<OidcDiscovery, AuthError> {
         let parsed_issuer = Url::parse(issuer)
             .map_err(|e| AuthError::InvalidCredentials(format!("invalid issuer URL: {e}")))?;
-        if parsed_issuer.scheme() != "https" && !self.allow_http {
-            return Err(AuthError::InvalidCredentials(
-                "OIDC issuer URL must use HTTPS".to_owned(),
-            ));
-        }
+        crate::auth::ssrf::validate_outbound_url(
+            &parsed_issuer,
+            self.allow_http,
+            "OIDC issuer URL",
+        )?;
 
         let discovery_url = format!(
             "{}/.well-known/openid-configuration",
@@ -409,17 +464,26 @@ impl ReqwestOidcDiscoveryClient {
         let parsed_discovery = Url::parse(&discovery_url).map_err(|e| {
             AuthError::InvalidCredentials(format!("invalid OIDC discovery URL: {e}"))
         })?;
+        crate::auth::ssrf::validate_outbound_url(
+            &parsed_discovery,
+            self.allow_http,
+            "OIDC discovery URL",
+        )?;
 
-        let client = reqwest::Client::builder()
-            .timeout(DEFAULT_DISCOVERY_TIMEOUT)
-            .build()
-            .map_err(|e| AuthError::ProviderError(format!("HTTP client error: {e}")))?;
+        let client =
+            crate::auth::ssrf::build_hardened_client(DEFAULT_DISCOVERY_TIMEOUT, self.allow_http)?;
 
-        let mut resp = client
-            .get(parsed_discovery)
-            .send()
-            .await
-            .map_err(|e| AuthError::ProviderError(format!("OIDC discovery fetch failed: {e}")))?
+        let resp =
+            client.get(parsed_discovery).send().await.map_err(|e| {
+                AuthError::ProviderError(format!("OIDC discovery fetch failed: {e}"))
+            })?;
+        if resp.status().is_redirection() {
+            return Err(AuthError::ProviderError(format!(
+                "OIDC discovery redirect rejected: HTTP {}",
+                resp.status().as_u16()
+            )));
+        }
+        let mut resp = resp
             .error_for_status()
             .map_err(|e| AuthError::ProviderError(format!("OIDC discovery HTTP error: {e}")))?;
 
@@ -598,5 +662,142 @@ mod tests {
             vec!["openid".to_owned()],
         );
         assert!(matches!(mismatch, Err(AuthError::InvalidCredentials(_))));
+    }
+
+    #[test]
+    fn oidc_discovery_to_oauth2_config_rejects_non_https_endpoints() {
+        let base = OidcDiscovery {
+            issuer: "https://idp.example.com".to_owned(),
+            authorization_endpoint: "https://idp.example.com/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/token".to_owned(),
+            jwks_uri: "https://idp.example.com/.well-known/jwks.json".to_owned(),
+            userinfo_endpoint: Some("https://idp.example.com/userinfo".to_owned()),
+            end_session_endpoint: None,
+            response_types_supported: vec![],
+            code_challenge_methods_supported: vec![],
+        };
+
+        let mut bad_auth = base.clone();
+        bad_auth.authorization_endpoint = "http://idp.example.com/authorize".to_owned();
+        assert!(matches!(
+            bad_auth.to_oauth2_config(
+                "https://idp.example.com",
+                "c",
+                None,
+                "https://app/cb",
+                vec![]
+            ),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        let mut bad_token = base.clone();
+        bad_token.token_endpoint = "http://idp.example.com/token".to_owned();
+        assert!(matches!(
+            bad_token.to_oauth2_config(
+                "https://idp.example.com",
+                "c",
+                None,
+                "https://app/cb",
+                vec![]
+            ),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        let mut bad_jwks = base.clone();
+        bad_jwks.jwks_uri = "http://idp.example.com/jwks.json".to_owned();
+        assert!(matches!(
+            bad_jwks.to_oauth2_config(
+                "https://idp.example.com",
+                "c",
+                None,
+                "https://app/cb",
+                vec![]
+            ),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        let mut bad_userinfo = base.clone();
+        bad_userinfo.userinfo_endpoint = Some("http://idp.example.com/userinfo".to_owned());
+        assert!(matches!(
+            bad_userinfo.to_oauth2_config(
+                "https://idp.example.com",
+                "c",
+                None,
+                "https://app/cb",
+                vec![]
+            ),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        // Explicitly allowing HTTP permits HTTP endpoints for local tests.
+        assert!(
+            bad_userinfo
+                .to_oauth2_config_with_options(
+                    "https://idp.example.com",
+                    "c",
+                    None,
+                    "https://app/cb",
+                    vec![],
+                    true
+                )
+                .is_ok()
+        );
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn reqwest_oidc_discovery_rejects_ssrf_and_redirects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let client = ReqwestOidcDiscoveryClient::new();
+        for blocked in [
+            "https://127.0.0.1",
+            "https://169.254.169.254",
+            "https://10.0.0.1",
+            "https://[::1]",
+            "https://localhost",
+        ] {
+            let err = client
+                .discover(blocked)
+                .await
+                .expect_err(&format!("expected SSRF rejection for {blocked}"));
+            assert!(matches!(err, AuthError::InvalidCredentials(_)));
+        }
+
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_clone = Arc::clone(&target_hits);
+        let app = axum::Router::new()
+            .route(
+                "/.well-known/openid-configuration",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/internal")],
+                    )
+                }),
+            )
+            .route(
+                "/internal",
+                axum::routing::get(move || {
+                    let hits = Arc::clone(&target_hits_clone);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        "{}"
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let test_client = ReqwestOidcDiscoveryClient::new().allow_http_for_tests();
+        let err = test_client
+            .discover(&format!("http://{addr}"))
+            .await
+            .expect_err("expected 302 redirect to be rejected");
+        assert!(matches!(err, AuthError::ProviderError(ref msg) if msg.contains("redirect")));
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     }
 }

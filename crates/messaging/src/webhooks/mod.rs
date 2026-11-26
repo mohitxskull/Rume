@@ -185,7 +185,11 @@ mod tests {
         dispatcher.register_endpoint(endpoint);
 
         let records = dispatcher
-            .dispatch_event("order.paid", serde_json::json!({"order_id": "ord-123"}))
+            .dispatch_event(
+                None,
+                "order.paid",
+                serde_json::json!({"order_id": "ord-123"}),
+            )
             .await
             .expect("dispatch_event");
         assert_eq!(records.len(), 1);

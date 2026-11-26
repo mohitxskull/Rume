@@ -19,6 +19,8 @@ pub mod redis;
 pub mod schemes;
 pub mod session;
 pub mod sql_session;
+#[cfg(feature = "http-client")]
+pub(crate) mod ssrf;
 pub mod tokens;
 
 #[cfg(feature = "redis")]

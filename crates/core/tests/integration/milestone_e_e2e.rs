@@ -584,7 +584,7 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
         webhook_secret,
     ));
     let deliveries = dispatcher
-        .dispatch_event("invoice.paid", serde_json::json!({"id": "inv_1"}))
+        .dispatch_event(None, "invoice.paid", serde_json::json!({"id": "inv_1"}))
         .await
         .expect("dispatch webhook");
     assert_eq!(deliveries.len(), 1);

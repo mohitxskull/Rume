@@ -892,22 +892,22 @@ impl JwksFetcher for ReqwestJwksFetcher {
         Box::pin(async move {
             let parsed = url::Url::parse(&self.jwks_url)
                 .map_err(|e| AuthError::InvalidCredentials(format!("invalid JWKS URL: {e}")))?;
-            if parsed.scheme() != "https" && !self.allow_http {
-                return Err(AuthError::InvalidCredentials(
-                    "JWKS URL must use HTTPS".to_owned(),
-                ));
-            }
+            crate::auth::ssrf::validate_outbound_url(&parsed, self.allow_http, "JWKS URL")?;
 
-            let client = reqwest::Client::builder()
-                .timeout(self.timeout)
-                .build()
-                .map_err(|e| AuthError::ProviderError(format!("HTTP client error: {e}")))?;
+            let client = crate::auth::ssrf::build_hardened_client(self.timeout, self.allow_http)?;
 
-            let mut resp = client
+            let resp = client
                 .get(parsed)
                 .send()
                 .await
-                .map_err(|e| AuthError::ProviderError(format!("JWKS fetch failed: {e}")))?
+                .map_err(|e| AuthError::ProviderError(format!("JWKS fetch failed: {e}")))?;
+            if resp.status().is_redirection() {
+                return Err(AuthError::ProviderError(format!(
+                    "JWKS redirect rejected: HTTP {}",
+                    resp.status().as_u16()
+                )));
+            }
+            let mut resp = resp
                 .error_for_status()
                 .map_err(|e| AuthError::ProviderError(format!("JWKS HTTP error: {e}")))?;
 
@@ -1329,5 +1329,62 @@ mod tests {
             ));
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn reqwest_jwks_fetcher_rejects_ssrf_and_redirects() {
+        for blocked in [
+            "https://127.0.0.1/.well-known/jwks.json",
+            "https://169.254.169.254/latest/meta-data/",
+            "https://10.0.0.1/jwks.json",
+            "https://[::1]/jwks.json",
+            "https://localhost/jwks.json",
+        ] {
+            let fetcher = ReqwestJwksFetcher::new(blocked).unwrap();
+            let err = fetcher
+                .fetch_jwks()
+                .await
+                .expect_err(&format!("expected SSRF rejection for {blocked}"));
+            assert!(matches!(err, AuthError::InvalidCredentials(_)));
+        }
+
+        let target_hits = Arc::new(AtomicUsize::new(0));
+        let target_hits_clone = Arc::clone(&target_hits);
+        let app = axum::Router::new()
+            .route(
+                "/jwks.json",
+                axum::routing::get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/internal")],
+                    )
+                }),
+            )
+            .route(
+                "/internal",
+                axum::routing::get(move || {
+                    let hits = Arc::clone(&target_hits_clone);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        r#"{"keys":[]}"#
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let fetcher = ReqwestJwksFetcher::new(format!("http://{addr}/jwks.json"))
+            .unwrap()
+            .allow_http_for_tests();
+        let err = fetcher
+            .fetch_jwks()
+            .await
+            .expect_err("expected 302 redirect to be rejected");
+        assert!(matches!(err, AuthError::ProviderError(ref msg) if msg.contains("redirect")));
+        assert_eq!(target_hits.load(Ordering::SeqCst), 0);
     }
 }

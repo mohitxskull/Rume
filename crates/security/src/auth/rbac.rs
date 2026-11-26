@@ -204,10 +204,13 @@ impl RoleStore for InMemoryRoleStore {
         Box::pin(async move {
             let tenant = to_sql_tenant(tenant_id)?.to_string();
             let mut guard = self.state.write().await;
-            if !guard.roles.contains_key(role_id) {
+            let Some(role) = guard.roles.get(role_id) else {
                 return Err(AuthError::ProviderError(format!(
                     "role '{role_id}' not found"
                 )));
+            };
+            if role.tenant_id.is_some() && role.tenant_id.as_deref() != tenant_id {
+                return Err(AuthError::Forbidden);
             }
             guard
                 .user_roles
@@ -268,7 +271,10 @@ impl RoleStore for InMemoryRoleStore {
                     .get(&(user_id.to_string(), scope.to_string()))
                 {
                     for id in ids {
-                        if seen.insert(id.clone()) {
+                        let role_allowed = guard.roles.get(id).is_some_and(|role| {
+                            role.tenant_id.is_none() || role.tenant_id.as_deref() == Some(scope)
+                        });
+                        if role_allowed && seen.insert(id.clone()) {
                             out.push(id.clone());
                         }
                     }
@@ -411,23 +417,54 @@ impl<B: DatabaseBackend> RoleStore for SqlRoleStore<B> {
     ) -> BoxFuture<'a, Result<(), AuthError>> {
         Box::pin(async move {
             let tenant_sql = to_sql_tenant(tenant_id)?;
+            let dialect = self.backend.dialect();
             let stmt = select_sql(
-                self.backend.dialect(),
+                dialect,
                 sql::PG_AUTH_USER_ROLE_ASSIGN,
                 sql::MYSQL_AUTH_USER_ROLE_ASSIGN,
                 sql::SQLITE_AUTH_USER_ROLE_ASSIGN,
             );
-            self.backend
+            let affected = self
+                .backend
                 .execute_params(
                     stmt,
                     &[
                         DbValue::from(user_id),
                         DbValue::from(tenant_sql),
                         DbValue::from(role_id),
+                        DbValue::from(tenant_sql),
                     ],
                 )
                 .await
                 .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+
+            if affected == 0 {
+                // Why: `INSERT ... SELECT ... WHERE r.tenant_id IN ('', tenant)` returns 0 rows
+                // both for idempotent re-assignment and for missing/cross-tenant roles. Disambiguate
+                // so cross-tenant assignments fail closed instead of silently succeeding.
+                let lookup_stmt = select_sql(
+                    dialect,
+                    "SELECT tenant_id FROM rume_roles WHERE id = $1",
+                    "SELECT tenant_id FROM rume_roles WHERE id = ?",
+                    "SELECT tenant_id FROM rume_roles WHERE id = ?",
+                );
+                let rows = self
+                    .backend
+                    .fetch_all(lookup_stmt, &[DbValue::from(role_id)])
+                    .await
+                    .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+                let Some(row) = rows.into_iter().next() else {
+                    return Err(AuthError::ProviderError(format!(
+                        "role '{role_id}' not found"
+                    )));
+                };
+                let role_tenant: String = row
+                    .get("tenant_id")
+                    .map_err(|e| AuthError::ProviderError(e.to_string()))?;
+                if !role_tenant.is_empty() && role_tenant != tenant_sql {
+                    return Err(AuthError::Forbidden);
+                }
+            }
             Ok(())
         })
     }
@@ -992,5 +1029,122 @@ mod tests {
             ..ctx_partial
         };
         assert!(all.evaluate(&ctx_full).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn role_stores_reject_cross_tenant_role_assignment_and_filter_effective_permissions() {
+        // 1. InMemoryRoleStore
+        let mem = InMemoryRoleStore::new();
+        mem.create_role(&Role {
+            id: "role-a".into(),
+            tenant_id: Some("tenant-a".into()),
+            name: "admin-a".into(),
+            description: String::new(),
+            permissions: vec!["a:secret".into()],
+        })
+        .await
+        .unwrap();
+        mem.create_role(&Role {
+            id: "role-global".into(),
+            tenant_id: None,
+            name: "global".into(),
+            description: String::new(),
+            permissions: vec!["global:read".into()],
+        })
+        .await
+        .unwrap();
+
+        // Cross-tenant assignment (tenant-a role into tenant-b) must fail.
+        assert_eq!(
+            mem.assign_role("user-1", Some("tenant-b"), "role-a").await,
+            Err(AuthError::Forbidden)
+        );
+        // Assigning tenant-scoped role globally must fail.
+        assert_eq!(
+            mem.assign_role("user-1", None, "role-a").await,
+            Err(AuthError::Forbidden)
+        );
+        // Same-tenant and global role assignments succeed.
+        mem.assign_role("user-1", Some("tenant-a"), "role-a")
+            .await
+            .unwrap();
+        mem.assign_role("user-1", Some("tenant-b"), "role-global")
+            .await
+            .unwrap();
+        assert_eq!(
+            mem.effective_permissions("user-1", Some("tenant-b"))
+                .await
+                .unwrap(),
+            BTreeSet::from(["global:read".to_string()])
+        );
+
+        // 2. SqlRoleStore
+        let backend = setup_sqlite().await;
+        let sql_store = SqlRoleStore::new(Arc::clone(&backend));
+        sql_store
+            .create_role(&Role {
+                id: "role-a".into(),
+                tenant_id: Some("tenant-a".into()),
+                name: "admin-a".into(),
+                description: String::new(),
+                permissions: vec!["a:secret".into()],
+            })
+            .await
+            .unwrap();
+        sql_store
+            .create_role(&Role {
+                id: "role-global".into(),
+                tenant_id: None,
+                name: "global".into(),
+                description: String::new(),
+                permissions: vec!["global:read".into()],
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            sql_store
+                .assign_role("user-1", Some("tenant-b"), "role-a")
+                .await,
+            Err(AuthError::Forbidden)
+        );
+        assert_eq!(
+            sql_store.assign_role("user-1", None, "role-a").await,
+            Err(AuthError::Forbidden)
+        );
+        // Idempotent valid re-assignment succeeds.
+        sql_store
+            .assign_role("user-1", Some("tenant-a"), "role-a")
+            .await
+            .unwrap();
+        sql_store
+            .assign_role("user-1", Some("tenant-a"), "role-a")
+            .await
+            .unwrap();
+        sql_store
+            .assign_role("user-1", Some("tenant-b"), "role-global")
+            .await
+            .unwrap();
+
+        // Defense in depth: even if a rogue cross-tenant row existed in rume_user_roles,
+        // effective_permissions must filter it out via rume_roles.tenant_id.
+        backend
+            .execute_params(
+                "INSERT INTO rume_user_roles (user_id, tenant_id, role_id) VALUES (?, ?, ?)",
+                &[
+                    DbValue::from("user-1"),
+                    DbValue::from("tenant-b"),
+                    DbValue::from("role-a"),
+                ],
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sql_store
+                .effective_permissions("user-1", Some("tenant-b"))
+                .await
+                .unwrap(),
+            BTreeSet::from(["global:read".to_string()])
+        );
     }
 }
