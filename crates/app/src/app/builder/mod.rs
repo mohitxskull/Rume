@@ -296,6 +296,8 @@ where
     /// Optional native TLS configuration (feature-gated under `tls`).
     #[cfg(feature = "tls")]
     tls: Option<rume_http::tls::TlsConfig>,
+    /// Optional real-time WebSocket/SSE hub.
+    realtime: Option<rume_http::realtime::RealtimeHub>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -328,6 +330,7 @@ where
             redaction: None,
             #[cfg(feature = "tls")]
             tls: None,
+            realtime: None,
         }
     }
 
@@ -482,6 +485,12 @@ where
         self
     }
 
+    /// Attach a [`rume_http::realtime::RealtimeHub`] to application extensions and graceful shutdown.
+    pub fn realtime(mut self, hub: rume_http::realtime::RealtimeHub) -> Self {
+        self.realtime = Some(hub);
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
         if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
@@ -557,6 +566,7 @@ where
         let shutdown_timeout = self.shutdown_timeout;
         #[cfg(feature = "tls")]
         let tls = self.tls.take();
+        let realtime = self.realtime.clone();
         let ctx = self.ctx.clone();
 
         let (router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
@@ -571,6 +581,7 @@ where
             shutdown_timeout,
             #[cfg(feature = "tls")]
             tls,
+            realtime,
         })
     }
 
@@ -635,6 +646,7 @@ where
             shutdown_timeout,
             #[cfg(feature = "tls")]
             tls,
+            realtime,
         } = prepared;
 
         let addr = listener.local_addr()?;
@@ -683,6 +695,9 @@ where
             );
             shutdown_lifecycle.set(LifecycleState::Terminating);
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
+            if let Some(hub) = realtime {
+                hub.shutdown().await;
+            }
         };
 
         let result = {
@@ -754,6 +769,7 @@ where
     shutdown_timeout: Duration,
     #[cfg(feature = "tls")]
     tls: Option<rume_http::tls::TlsConfig>,
+    realtime: Option<rume_http::realtime::RealtimeHub>,
 }
 
 #[cfg(test)]

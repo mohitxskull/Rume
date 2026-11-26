@@ -1087,3 +1087,54 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
         "on_shutdown hook must run after TLS drain"
     );
 }
+
+#[tokio::test]
+async fn rume_builder_realtime_attaches_hub_and_drains_on_shutdown() {
+    let hub = rume_http::realtime::RealtimeHub::new(
+        rume_http::realtime::RealtimeConfig::default()
+            .with_shutdown_drain_timeout(Duration::from_millis(200)),
+    );
+    let hub_check = hub.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        Rume::new()
+            .realtime(hub)
+            .get(
+                "/hub-node",
+                |axum::Extension(h): axum::Extension<rume_http::realtime::RealtimeHub>| async move {
+                    h.node_id().to_string()
+                },
+            )
+            .run_with_listener_and_signal(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut tcp = None;
+    for _ in 0..40 {
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            tcp = Some(stream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut tcp = tcp.expect("server did not start listening");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tcp.write_all(b"GET /hub-node HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tcp.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(hub_check.node_id()));
+
+    assert!(!hub_check.is_shutting_down());
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    assert!(hub_check.is_shutting_down());
+}

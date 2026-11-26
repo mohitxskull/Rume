@@ -376,6 +376,7 @@ where
             cors,
             compression,
             redaction,
+            realtime,
             ..
         } = self;
 
@@ -517,6 +518,9 @@ where
         router = router.layer(observability_layer);
         if let Some(compression_cfg) = compression {
             router = router.layer(compression_cfg.build_layer());
+        }
+        if let Some(hub) = realtime {
+            router = router.layer(axum::Extension(hub));
         }
 
         Ok((router, ctx))
