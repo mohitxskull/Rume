@@ -51,7 +51,9 @@ pub use rbac::{
     AbacContext, AbacPolicy, AllOfPolicy, AnyOfPolicy, DynamicPolicyLayer, InMemoryRoleStore,
     RequireDynamicPermission, Role, RoleStore, SqlRoleStore,
 };
-pub use schemes::{ApiKeyScheme, AuthenticationScheme, BearerTokenScheme, SessionScheme};
+pub use schemes::{
+    ApiKeyScheme, AuthenticationScheme, BearerTokenScheme, JwtClaimsMapper, SessionScheme,
+};
 pub use session::{InMemorySessionStore, Session, SessionStore};
 pub use sql_session::SqlSessionStore;
 pub use tokens::{SignedTokenClaims, SignedUrl, TokenSigner};

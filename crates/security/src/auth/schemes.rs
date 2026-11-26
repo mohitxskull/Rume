@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::error::AuthError;
 use crate::auth::identity::AuthUser;
+use crate::auth::jwt::{JwtClaims, JwtVerifier};
 use crate::auth::session::{BoxFuture, SessionStore};
 
 /// An authentication scheme that extracts and verifies credentials from request parts.
@@ -28,6 +29,41 @@ pub type TokenValidator = Arc<
     dyn Fn(&str) -> BoxFuture<'static, Result<Option<AuthUser>, AuthError>> + Send + Sync + 'static,
 >;
 
+/// Maps verified [`JwtClaims`] into an [`AuthUser`].
+#[derive(Clone)]
+pub struct JwtClaimsMapper {
+    mapper: Arc<dyn Fn(JwtClaims) -> Result<AuthUser, AuthError> + Send + Sync + 'static>,
+}
+
+impl std::fmt::Debug for JwtClaimsMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtClaimsMapper").finish_non_exhaustive()
+    }
+}
+
+impl Default for JwtClaimsMapper {
+    fn default() -> Self {
+        Self::new(JwtClaims::into_auth_user)
+    }
+}
+
+impl JwtClaimsMapper {
+    /// Creates a custom claims-to-user mapper.
+    pub fn new<F>(mapper: F) -> Self
+    where
+        F: Fn(JwtClaims) -> Result<AuthUser, AuthError> + Send + Sync + 'static,
+    {
+        Self {
+            mapper: Arc::new(mapper),
+        }
+    }
+
+    /// Maps verified [`JwtClaims`] into an [`AuthUser`].
+    pub fn map(&self, claims: JwtClaims) -> Result<AuthUser, AuthError> {
+        (self.mapper)(claims)
+    }
+}
+
 /// Bearer token authentication scheme (`Authorization: Bearer <token>`).
 #[derive(Clone)]
 pub struct BearerTokenScheme {
@@ -46,6 +82,27 @@ impl BearerTokenScheme {
                 let token_owned = token.to_string();
                 let fut = validator(token_owned);
                 Box::pin(fut)
+            }),
+        }
+    }
+
+    /// Creates a Bearer token scheme backed by a [`JwtVerifier`] and [`JwtClaimsMapper`].
+    pub fn from_jwt_verifier(verifier: JwtVerifier, mapper: JwtClaimsMapper) -> Self {
+        let verifier = Arc::new(verifier);
+        Self {
+            validator: Arc::new(move |token| {
+                let verifier = Arc::clone(&verifier);
+                let mapper = mapper.clone();
+                let token = token.to_owned();
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let claims = verifier.verify(&token, now).await?;
+                    let user = mapper.map(claims)?;
+                    Ok(Some(user))
+                })
             }),
         }
     }
@@ -216,5 +273,88 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
 
             Ok(None)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use axum::body::Body;
+    use axum::http::{Request, Response, StatusCode, header::AUTHORIZATION};
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use hmac::{Hmac, KeyInit, Mac};
+    use serde_json::json;
+    use sha2::Sha256;
+    use tower::{Layer, ServiceExt};
+
+    use super::*;
+    use crate::auth::identity::AuthUser;
+    use crate::auth::jwt::{JwtAlgorithm, JwtValidationConfig, JwtVerifier};
+    use crate::auth::layer::AuthLayer;
+
+    fn sign_hs256_jwt(secret: &[u8], claims: &serde_json::Value) -> String {
+        let header_b64 = URL_SAFE_NO_PAD.encode(br#"{"alg":"HS256","typ":"JWT"}"#);
+        let payload_b64 = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap());
+        let signing_input = format!("{header_b64}.{payload_b64}");
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(signing_input.as_bytes());
+        let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        format!("{signing_input}.{sig_b64}")
+    }
+
+    #[tokio::test]
+    async fn bearer_token_scheme_from_jwt_verifier_populates_auth_user_in_auth_layer() {
+        let secret = b"0123456789abcdef0123456789abcdef";
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        let mut allowed = BTreeSet::new();
+        allowed.insert(JwtAlgorithm::Hs256);
+        let config = JwtValidationConfig {
+            allowed_algorithms: allowed,
+            expected_issuers: vec!["https://auth.example.com".to_owned()],
+            expected_audiences: vec!["rume-api".to_owned()],
+            ..Default::default()
+        };
+
+        let verifier = JwtVerifier::from_hmac_secret(secret, config).unwrap();
+        let scheme = BearerTokenScheme::from_jwt_verifier(verifier, JwtClaimsMapper::default());
+        let layer = AuthLayer::required().scheme(scheme);
+
+        let svc = layer.layer(tower::service_fn(|req: Request<Body>| async move {
+            let user = req.extensions().get::<AuthUser>().cloned().unwrap();
+            let body = format!("{}:{:?}:{}", user.id, user.tenant_id, user.roles.join(","));
+            Ok::<_, std::convert::Infallible>(Response::new(Body::from(body)))
+        }));
+
+        let token = sign_hs256_jwt(
+            secret,
+            &json!({
+                "sub": "user-42",
+                "iss": "https://auth.example.com",
+                "aud": "rume-api",
+                "exp": now + 300,
+                "tenant_id": "tenant-a",
+                "roles": ["admin", "editor"],
+                "permissions": ["users:read"]
+            }),
+        );
+
+        let req = Request::builder()
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "user-42:Some(\"tenant-a\"):admin,editor"
+        );
     }
 }
