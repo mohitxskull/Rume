@@ -22,7 +22,7 @@ pub use self::redis::{RedisHeartbeatRegistry, RedisIdempotencyStore};
 pub use batch::SqlBatchStore;
 pub use batch::{BatchBuilder, BatchId, BatchStatus, BatchStore, InMemoryBatchStore, JobBatch};
 pub use error::JobError;
-pub use job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob};
+pub use job::{BoxFuture, Job, JobContext, JobHandler, QueuedJob, RawJob};
 #[cfg(feature = "mysql")]
 pub use mysql::MysqlJobQueue;
 #[cfg(feature = "postgres")]

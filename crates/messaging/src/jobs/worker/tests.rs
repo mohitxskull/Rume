@@ -2301,3 +2301,166 @@ async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
 
     hb.finish().await;
 }
+
+#[tokio::test]
+async fn job_worker_enforces_per_queue_concurrency_cap() {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CappedJob {
+        idx: usize,
+    }
+
+    impl Job for CappedJob {
+        const NAME: &'static str = "capped_queue_job";
+
+        fn queue(&self) -> &str {
+            "emails"
+        }
+    }
+
+    struct ConcurrencyProbeHandler {
+        active: Arc<AtomicUsize>,
+        max_observed: Arc<AtomicUsize>,
+        done_tx: mpsc::Sender<()>,
+    }
+
+    impl JobHandler<CappedJob> for ConcurrencyProbeHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: CappedJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let active = Arc::clone(&self.active);
+            let max_observed = Arc::clone(&self.max_observed);
+            let done_tx = self.done_tx.clone();
+            Box::pin(async move {
+                let prev = active.fetch_add(1, Ordering::SeqCst);
+                let current = prev + 1;
+                max_observed.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(()).await;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MultiJobQueue {
+        jobs: Mutex<Vec<QueuedJob>>,
+    }
+
+    impl JobQueue for MultiJobQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async move { Ok("id".into()) })
+        }
+
+        fn dequeue_for(
+            &self,
+            worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            let wid = worker_id.to_string();
+            Box::pin(async move {
+                let mut guard = self.jobs.lock().await;
+                if guard.is_empty() {
+                    Ok(None)
+                } else {
+                    let mut job = guard.remove(0);
+                    job.attempt += 1;
+                    job.assigned_worker = Some(wid);
+                    job.lease_token = Some("tok".into());
+                    Ok(Some(job))
+                }
+            })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    let queued: Vec<QueuedJob> = (0..6)
+        .map(|idx| QueuedJob {
+            id: format!("capped-{idx}"),
+            name: CappedJob::NAME.to_string(),
+            queue: "emails".to_string(),
+            priority: 0,
+            payload: serde_json::to_vec(&CappedJob { idx }).unwrap(),
+            attempt: 0,
+            retry_policy: RetryPolicy::default(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: None,
+            lease_token: None,
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(30),
+            trace_context: None,
+        })
+        .collect();
+
+    let queue = Arc::new(MultiJobQueue {
+        jobs: Mutex::new(queued),
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+    let (done_tx, mut done_rx) = mpsc::channel(10);
+
+    let mut registry = JobRegistry::new();
+    registry.register(ConcurrencyProbeHandler {
+        active: Arc::clone(&active),
+        max_observed: Arc::clone(&max_observed),
+        done_tx,
+    });
+
+    let worker = JobWorker::with_concurrency_limit(queue, Arc::new(registry), 10)
+        .with_queue_concurrency("emails", 2);
+    let handle = worker.start();
+
+    for _ in 0..6 {
+        tokio::time::timeout(Duration::from_secs(2), done_rx.recv())
+            .await
+            .expect("job completed in time")
+            .expect("channel open");
+    }
+
+    assert!(handle.shutdown(Duration::from_secs(2)).await);
+    assert_eq!(max_observed.load(Ordering::SeqCst), 2);
+}

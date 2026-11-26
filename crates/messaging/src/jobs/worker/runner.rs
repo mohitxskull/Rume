@@ -1,4 +1,5 @@
 use futures_util::FutureExt;
+use std::collections::HashMap;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -64,6 +65,8 @@ pub struct JobWorker<Q: JobQueue> {
     in_flight_zero: Arc<tokio::sync::Notify>,
     concurrency_limit: usize,
     semaphore: Arc<tokio::sync::Semaphore>,
+    queue_concurrency: HashMap<String, Arc<tokio::sync::Semaphore>>,
+    queues: Option<Vec<String>>,
     heartbeat_registry: Option<Arc<dyn HeartbeatRegistry>>,
     heartbeat_ttl: Duration,
     heartbeat_interval: Duration,
@@ -92,6 +95,8 @@ impl<Q: JobQueue> Clone for JobWorker<Q> {
             in_flight_zero: Arc::clone(&self.in_flight_zero),
             concurrency_limit: self.concurrency_limit,
             semaphore: Arc::clone(&self.semaphore),
+            queue_concurrency: self.queue_concurrency.clone(),
+            queues: self.queues.clone(),
             heartbeat_registry: self.heartbeat_registry.clone(),
             heartbeat_ttl: self.heartbeat_ttl,
             heartbeat_interval: self.heartbeat_interval,
@@ -158,6 +163,8 @@ impl<Q: JobQueue> JobWorker<Q> {
             in_flight_zero: Arc::new(tokio::sync::Notify::new()),
             concurrency_limit: limit,
             semaphore: Arc::new(tokio::sync::Semaphore::new(limit)),
+            queue_concurrency: HashMap::new(),
+            queues: None,
             heartbeat_registry: None,
             heartbeat_ttl: Duration::from_secs(30),
             heartbeat_interval: Duration::from_secs(10),
@@ -179,6 +186,25 @@ impl<Q: JobQueue> JobWorker<Q> {
         let limit = limit.max(1);
         self.concurrency_limit = limit;
         self.semaphore = Arc::new(tokio::sync::Semaphore::new(limit));
+        self
+    }
+
+    /// Sets a per-queue concurrency cap enforced alongside the global worker concurrency limit.
+    pub fn with_queue_concurrency(
+        mut self,
+        queue: impl Into<String>,
+        max_concurrent: usize,
+    ) -> Self {
+        self.queue_concurrency.insert(
+            queue.into(),
+            Arc::new(tokio::sync::Semaphore::new(max_concurrent.max(1))),
+        );
+        self
+    }
+
+    /// Restricts this worker to poll only the specified named queues.
+    pub fn with_queues(mut self, queues: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.queues = Some(queues.into_iter().map(Into::into).collect());
         self
     }
 
@@ -431,6 +457,38 @@ impl<Q: JobQueue> JobWorker<Q> {
         }
     }
 
+    /// Defers an unexecuted job during shutdown drain without burning a retry attempt,
+    /// retrying transient defer errors briefly and marking the drain dirty if deferral fails.
+    async fn defer_during_drain(&self, job: QueuedJob) {
+        let job_id = job.id.clone();
+        let token = job.lease_token.clone().unwrap_or_default();
+        let mut deferred = false;
+        for attempt in 0..3u32 {
+            match self.queue.defer(job.clone(), &token, Duration::ZERO).await {
+                Ok(()) => {
+                    deferred = true;
+                    break;
+                }
+                Err(err) => {
+                    tracing::error!(
+                        job_id = %job_id,
+                        attempt = attempt + 1,
+                        error = %err,
+                        "Failed to defer dequeued job during drain"
+                    );
+                    if self.abort_requested.load(Ordering::SeqCst) || attempt == 2 {
+                        break;
+                    }
+                    sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
+                }
+            }
+        }
+        if !deferred {
+            self.transition_errors.fetch_add(1, Ordering::SeqCst);
+            self.drain_dirty.store(true, Ordering::SeqCst);
+        }
+    }
+
     /// Internal worker execution loop.
     async fn run_loop(&self, run_worker_id: String) {
         // Why: own all spawned job tasks in a local `tokio::task::JoinSet` instead of a shared
@@ -475,9 +533,54 @@ impl<Q: JobQueue> JobWorker<Q> {
                 break;
             }
 
-            match self.queue.dequeue_for(&run_worker_id).await {
+            let queue_refs: Option<Vec<&str>> = self
+                .queues
+                .as_ref()
+                .map(|qs| qs.iter().map(String::as_str).collect());
+            let dequeue_fut = match queue_refs.as_deref() {
+                Some(qs) => self.queue.dequeue_from(&run_worker_id, Some(qs)),
+                None => self.queue.dequeue_for(&run_worker_id),
+            };
+            match dequeue_fut.await {
                 Ok(Some(job)) => {
                     consecutive_errors = 0;
+
+                    // Acquire optional per-queue concurrency permit before `admission_lock`
+                    // so `in_flight_count` only tracks jobs that hold all permits, while
+                    // still honoring `shutdown_rx` and reaping completed tasks while waiting.
+                    let queue_permit = if let Some(q_sem) = self.queue_concurrency.get(&job.queue) {
+                        let mut acquired = None;
+                        loop {
+                            if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
+                                break;
+                            }
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
+                                res = Arc::clone(q_sem).acquire_owned() => match res {
+                                    Ok(qp) => {
+                                        acquired = Some(qp);
+                                        break;
+                                    }
+                                    Err(_) => break,
+                                },
+                                res = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
+                                    if let Some(outcome) = res {
+                                        Self::log_in_flight_outcome(outcome);
+                                    }
+                                    self.record_join_set_len(in_flight_tasks.len());
+                                }
+                            }
+                        }
+                        if acquired.is_none() {
+                            self.defer_during_drain(job).await;
+                            drop(permit);
+                            break;
+                        }
+                        acquired
+                    } else {
+                        None
+                    };
 
                     // Why: serialize job admission with the `is_stopping` transition under
                     // `admission_lock` so no new job can start after draining begins, and
@@ -500,37 +603,8 @@ impl<Q: JobQueue> JobWorker<Q> {
                     };
 
                     let Some(in_flight_guard) = admitted_guard else {
-                        // Crucial race check: draining started while dequeue was in-flight!
-                        // Defer the unexecuted job without burning a retry attempt, retrying
-                        // transient defer errors briefly and marking the drain dirty if
-                        // deferral still fails.
-                        let job_id = job.id.clone();
-                        let token = job.lease_token.clone().unwrap_or_default();
-                        let mut deferred = false;
-                        for attempt in 0..3u32 {
-                            match self.queue.defer(job.clone(), &token, Duration::ZERO).await {
-                                Ok(()) => {
-                                    deferred = true;
-                                    break;
-                                }
-                                Err(err) => {
-                                    tracing::error!(
-                                        job_id = %job_id,
-                                        attempt = attempt + 1,
-                                        error = %err,
-                                        "Failed to defer dequeued job during drain"
-                                    );
-                                    if self.abort_requested.load(Ordering::SeqCst) || attempt == 2 {
-                                        break;
-                                    }
-                                    sleep(Duration::from_millis(25 * u64::from(attempt + 1))).await;
-                                }
-                            }
-                        }
-                        if !deferred {
-                            self.transition_errors.fetch_add(1, Ordering::SeqCst);
-                            self.drain_dirty.store(true, Ordering::SeqCst);
-                        }
+                        self.defer_during_drain(job).await;
+                        drop(queue_permit);
                         drop(permit);
                         break;
                     };
@@ -553,6 +627,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                     in_flight_tasks.spawn(
                         async move {
                             let _permit = permit;
+                            let _queue_permit = queue_permit;
                             let _guard = in_flight_guard;
                             Self::execute_job_with_shutdown(
                                 queue,

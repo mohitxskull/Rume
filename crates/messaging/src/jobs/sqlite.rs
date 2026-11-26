@@ -1,13 +1,76 @@
 //! SQLite-backed durable background job queue using SQLx.
 
 use std::fmt::Debug;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use sqlx::SqlitePool;
+use sqlx::sqlite::SqliteRow;
+use sqlx::{Row, SqlitePool};
+use uuid::Uuid;
 
 use crate::jobs::error::JobError;
-use crate::jobs::job::{BoxFuture, Job, QueuedJob};
+use crate::jobs::job::{BoxFuture, Job, QueuedJob, RawJob};
 use crate::jobs::queue::JobQueue;
+use crate::jobs::retry::RetryPolicy;
+
+fn current_epoch_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
+fn row_to_queued_job(r: &SqliteRow, lease_duration: Duration) -> Result<QueuedJob, JobError> {
+    let id: String = r.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+    let name: String = r.try_get(1).map_err(|e| JobError::Fatal(e.to_string()))?;
+    let payload: Vec<u8> = r.try_get(2).map_err(|e| JobError::Fatal(e.to_string()))?;
+    let attempt: i32 = r.try_get(3).unwrap_or(0);
+    let max_attempts: i32 = r.try_get(4).unwrap_or(3);
+    let initial_backoff_ms: i64 = r.try_get(5).unwrap_or(1000);
+    let max_backoff_ms: i64 = r.try_get(6).unwrap_or(60000);
+    let backoff_factor: f64 = r.try_get(7).unwrap_or(2.0);
+    let timeout_ms: Option<i64> = r.try_get(8).ok();
+    let idempotency_key: Option<String> = r.try_get(9).ok();
+    let tenant_id: Option<String> = r.try_get(10).ok();
+    let assigned_worker: Option<String> = r.try_get(11).ok();
+    let available_at_ms: i64 = r.try_get(12).unwrap_or(0);
+    let lease_token: Option<String> = r.try_get(13).ok();
+    let trace_context: Option<String> = r.try_get(14).ok();
+    let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+    let priority: i32 = r.try_get(16).unwrap_or(0);
+
+    let retry_policy = RetryPolicy {
+        max_attempts: max_attempts.max(1) as u32,
+        initial_backoff_ms: initial_backoff_ms.max(0) as u64,
+        max_backoff_ms: max_backoff_ms.max(0) as u64,
+        backoff_factor,
+    };
+    let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
+
+    let now = current_epoch_millis();
+    let available_at = if available_at_ms <= now {
+        Instant::now()
+    } else {
+        Instant::now() + Duration::from_millis((available_at_ms - now).max(0) as u64)
+    };
+
+    Ok(QueuedJob {
+        id,
+        name,
+        queue,
+        priority,
+        payload,
+        attempt: attempt.max(1) as u32,
+        retry_policy,
+        timeout,
+        idempotency_key,
+        tenant_id,
+        assigned_worker,
+        lease_token,
+        available_at,
+        lease_duration,
+        trace_context,
+    })
+}
 
 /// SQLite-backed implementation of [`JobQueue`].
 #[derive(Clone)]
@@ -49,96 +112,636 @@ impl SqliteJobQueue {
 
     /// Initializes the `rume_jobs` table and indexes if not already present.
     pub async fn init_schema(&self) -> Result<(), JobError> {
-        todo!("Task 02: implement SqliteJobQueue::init_schema")
+        sqlx::raw_sql(Self::SCHEMA)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(format!("failed to init sqlite jobs schema: {e}")))?;
+        Ok(())
     }
 }
 
 impl JobQueue for SqliteJobQueue {
     fn enqueue_delayed_with_trace<J: Job>(
         &self,
-        _job: J,
-        _delay: Duration,
-        _trace_context: Option<String>,
+        job: J,
+        delay: Duration,
+        trace_context: Option<String>,
     ) -> BoxFuture<'_, Result<String, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::enqueue_delayed_with_trace")
+        match RawJob::from_job(job, trace_context) {
+            Ok(raw) => self.enqueue_raw(raw, delay),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
     }
 
-    fn dequeue_for(&self, _worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::dequeue_for")
+    fn enqueue_raw(&self, job: RawJob, delay: Duration) -> BoxFuture<'_, Result<String, JobError>> {
+        let id = Uuid::new_v4().to_string();
+        Box::pin(async move {
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            let max_attempts = i32::try_from(job.retry_policy.max_attempts).unwrap_or(i32::MAX);
+            let initial_backoff_ms =
+                i64::try_from(job.retry_policy.initial_backoff_ms).unwrap_or(i64::MAX);
+            let max_backoff_ms = i64::try_from(job.retry_policy.max_backoff_ms).unwrap_or(i64::MAX);
+            let backoff_factor = job.retry_policy.backoff_factor;
+            let timeout_ms = job
+                .timeout
+                .map(|t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
+
+            let row = sqlx::query(rume_data::sql::SQLITE_JOBS_INSERT)
+                .bind(&id)
+                .bind(&job.name)
+                .bind(&job.payload)
+                .bind(max_attempts)
+                .bind(initial_backoff_ms)
+                .bind(max_backoff_ms)
+                .bind(backoff_factor)
+                .bind(timeout_ms)
+                .bind(&job.idempotency_key)
+                .bind(&job.tenant_id)
+                .bind(delay_ms)
+                .bind(&job.trace_context)
+                .bind(&job.queue)
+                .bind(job.priority)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if let Some(r) = row {
+                let inserted_id: String = r.try_get(0).unwrap_or(id);
+                Ok(inserted_id)
+            } else if let Some(ref ikey) = job.idempotency_key {
+                let existing = sqlx::query(rume_data::sql::SQLITE_JOBS_IDEMPOTENCY_CHECK)
+                    .bind(&job.tenant_id)
+                    .bind(ikey)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+                if let Some(erow) = existing {
+                    let existing_id: String = erow
+                        .try_get(0)
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    Ok(existing_id)
+                } else {
+                    Err(JobError::Fatal(
+                        "idempotency conflict race: conflicting row is no longer active".into(),
+                    ))
+                }
+            } else {
+                Err(JobError::Fatal(
+                    "conflict detected but no idempotency key was supplied".into(),
+                ))
+            }
+        })
+    }
+
+    fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_from(worker_id, None)
     }
 
     fn dequeue_from(
         &self,
-        _worker_id: &str,
-        _queues: Option<&[&str]>,
+        worker_id: &str,
+        queues: Option<&[&str]>,
     ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::dequeue_from")
+        let wid = worker_id.to_string();
+        let queue_filter: Option<Vec<String>> =
+            queues.map(|qs| qs.iter().map(|s| (*s).to_string()).collect());
+        Box::pin(async move {
+            if queue_filter.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(None);
+            }
+            let lease_duration_ms =
+                i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
+            let new_lease_token = Uuid::new_v4().to_string();
+
+            let row: Option<SqliteRow> = if let Some(qs) = queue_filter {
+                let placeholders = (0..qs.len())
+                    .map(|idx| format!("?{}", idx + 4))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE rume_jobs
+SET status = 'in_flight',
+    assigned_worker = ?1,
+    attempt = attempt + 1,
+    lease_expires_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ?2,
+    lease_token = ?3
+WHERE id = (
+    SELECT id FROM rume_jobs
+    WHERE queue IN ({placeholders})
+      AND ((status = 'pending' AND available_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+       OR (status = 'in_flight' AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))
+    ORDER BY priority DESC, available_at ASC, created_at ASC
+    LIMIT 1
+)
+RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority;"
+                );
+                let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                    .bind(&wid)
+                    .bind(lease_duration_ms)
+                    .bind(&new_lease_token);
+                for name in &qs {
+                    q = q.bind(name);
+                }
+                q.fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+            } else {
+                sqlx::query(rume_data::sql::SQLITE_JOBS_CLAIM)
+                    .bind(&wid)
+                    .bind(lease_duration_ms)
+                    .bind(&new_lease_token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+            };
+
+            row.as_ref()
+                .map(|r| row_to_queued_job(r, self.default_lease_duration))
+                .transpose()
+        })
     }
 
     fn reclaim_abandoned_jobs(
         &self,
-        _dead_workers: &[String],
+        dead_workers: &[String],
     ) -> BoxFuture<'_, Result<usize, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::reclaim_abandoned_jobs")
+        let workers = dead_workers.to_vec();
+        Box::pin(async move {
+            if workers.is_empty() {
+                return Ok(0);
+            }
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+            let mut reclaimed: usize = 0;
+            for wid in &workers {
+                let res = sqlx::query(rume_data::sql::SQLITE_JOBS_REAP)
+                    .bind(wid)
+                    .execute(&mut *tx)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                reclaimed += res.rows_affected() as usize;
+            }
+            tx.commit()
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+            Ok(reclaimed)
+        })
     }
 
-    fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::ack")
+    fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+        let jid = job_id.to_string();
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_ACK)
+                .bind(&jid)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot ack job {jid}: lease lost, expired, or invalid token"
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn nack(
         &self,
-        _job: QueuedJob,
-        _lease_token: &str,
-        _delay: Duration,
+        job: QueuedJob,
+        lease_token: &str,
+        delay: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::nack")
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_NACK)
+                .bind(delay_ms)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot nack job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn defer(
         &self,
-        _job: QueuedJob,
-        _lease_token: &str,
-        _delay: Duration,
+        job: QueuedJob,
+        lease_token: &str,
+        delay: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::defer")
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_DEFER)
+                .bind(delay_ms)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot defer job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn dead_letter(
         &self,
-        _job: QueuedJob,
-        _lease_token: &str,
-        _reason: String,
+        job: QueuedJob,
+        lease_token: &str,
+        reason: String,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::dead_letter")
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_DEAD_LETTER)
+                .bind(&reason)
+                .bind(&job.id)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot dead_letter job {}: lease lost, expired, or invalid token",
+                    job.id
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn renew_lease(
         &self,
-        _job_id: &str,
-        _lease_token: &str,
-        _extension: Duration,
+        job_id: &str,
+        lease_token: &str,
+        extension: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::renew_lease")
+        let jid = job_id.to_string();
+        let token = lease_token.to_string();
+        Box::pin(async move {
+            let extension_ms = i64::try_from(extension.as_millis()).unwrap_or(i64::MAX);
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_RENEW_LEASE)
+                .bind(extension_ms)
+                .bind(&jid)
+                .bind(&token)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "cannot renew lease for job {jid}: invalid lease token or job no longer in flight"
+                )));
+            }
+            Ok(())
+        })
     }
 
     fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::pending_count")
+        Box::pin(async move {
+            let row = sqlx::query(rume_data::sql::SQLITE_JOBS_PENDING_COUNT)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let count: i64 = row.try_get(0).unwrap_or(0);
+            Ok(count as usize)
+        })
     }
 
     fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::dead_letter_count")
+        Box::pin(async move {
+            let row = sqlx::query(rume_data::sql::SQLITE_JOBS_DEAD_LETTER_COUNT)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let count: i64 = row.try_get(0).unwrap_or(0);
+            Ok(count as usize)
+        })
     }
 
-    fn list_dead_letters(&self, _limit: usize) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::list_dead_letters")
+    fn list_dead_letters(&self, limit: usize) -> BoxFuture<'_, Result<Vec<QueuedJob>, JobError>> {
+        Box::pin(async move {
+            let rows = sqlx::query(rume_data::sql::SQLITE_JOBS_LIST_DEAD_LETTERS)
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            rows.iter()
+                .map(|r| row_to_queued_job(r, self.default_lease_duration))
+                .collect()
+        })
     }
 
-    fn purge_completed(&self, _retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::purge_completed")
+    fn purge_completed(&self, retention: Duration) -> BoxFuture<'_, Result<u64, JobError>> {
+        let retention_ms = i64::try_from(retention.as_millis()).unwrap_or(i64::MAX);
+        Box::pin(async move {
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_PURGE)
+                .bind(retention_ms)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            Ok(res.rows_affected())
+        })
     }
 
-    fn replay_dead_letter(&self, _job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
-        todo!("Task 02: implement SqliteJobQueue::replay_dead_letter")
+    fn replay_dead_letter(&self, job_id: &str) -> BoxFuture<'_, Result<(), JobError>> {
+        let jid = job_id.to_string();
+        Box::pin(async move {
+            let res = sqlx::query(rume_data::sql::SQLITE_JOBS_REPLAY_DEAD_LETTER)
+                .bind(&jid)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if res.rows_affected() == 0 {
+                return Err(JobError::Fatal(format!(
+                    "dead letter job {jid} not found or not in dead_letter status"
+                )));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct SampleJob {
+        msg: String,
+    }
+
+    impl Job for SampleJob {
+        const NAME: &'static str = "sample_job";
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+    struct PriorityJob {
+        label: String,
+        prio: i32,
+        target_queue: String,
+    }
+
+    impl Job for PriorityJob {
+        const NAME: &'static str = "priority_job";
+
+        fn queue(&self) -> &str {
+            &self.target_queue
+        }
+
+        fn priority(&self) -> i32 {
+            self.prio
+        }
+    }
+
+    async fn setup_sqlite_queue() -> SqliteJobQueue {
+        let pool = SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("connect in-memory sqlite");
+        let queue = SqliteJobQueue::new(pool);
+        queue.init_schema().await.expect("init_schema");
+        queue
+    }
+
+    #[tokio::test]
+    async fn sqlite_job_queue_enqueues_dequeues_acks_and_dead_letters() {
+        let queue = setup_sqlite_queue().await;
+
+        let id1 = queue
+            .enqueue(SampleJob {
+                msg: "first".into(),
+            })
+            .await
+            .expect("enqueue first");
+        let id2 = queue
+            .enqueue(SampleJob {
+                msg: "second".into(),
+            })
+            .await
+            .expect("enqueue second");
+        assert_eq!(queue.pending_count().await.expect("pending_count"), 2);
+
+        let claimed1 = queue
+            .dequeue_for("worker-a")
+            .await
+            .expect("dequeue 1")
+            .expect("job 1 present");
+        assert_eq!(claimed1.id, id1);
+        assert_eq!(claimed1.attempt, 1);
+        let token1 = claimed1.lease_token.clone().expect("lease_token 1");
+
+        queue.ack(&claimed1.id, &token1).await.expect("ack job 1");
+        assert_eq!(queue.pending_count().await.expect("pending_count"), 1);
+
+        let claimed2 = queue
+            .dequeue_for("worker-a")
+            .await
+            .expect("dequeue 2")
+            .expect("job 2 present");
+        assert_eq!(claimed2.id, id2);
+        let token2 = claimed2.lease_token.clone().expect("lease_token 2");
+
+        queue
+            .dead_letter(claimed2, &token2, "fatal error".into())
+            .await
+            .expect("dead_letter job 2");
+        assert_eq!(queue.pending_count().await.expect("pending_count"), 0);
+        assert_eq!(
+            queue.dead_letter_count().await.expect("dead_letter_count"),
+            1
+        );
+
+        let dlq = queue
+            .list_dead_letters(10)
+            .await
+            .expect("list_dead_letters");
+        assert_eq!(dlq.len(), 1);
+        assert_eq!(dlq[0].id, id2);
+
+        queue
+            .replay_dead_letter(&id2)
+            .await
+            .expect("replay_dead_letter");
+        assert_eq!(
+            queue.dead_letter_count().await.expect("dlq after replay"),
+            0
+        );
+        assert_eq!(
+            queue.pending_count().await.expect("pending after replay"),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn job_queue_orders_by_priority_desc_then_available_at() {
+        let queue = setup_sqlite_queue().await;
+
+        let low_id = queue
+            .enqueue(PriorityJob {
+                label: "low".into(),
+                prio: 1,
+                target_queue: "default".into(),
+            })
+            .await
+            .expect("enqueue low");
+        let high_id = queue
+            .enqueue(PriorityJob {
+                label: "high".into(),
+                prio: 100,
+                target_queue: "default".into(),
+            })
+            .await
+            .expect("enqueue high");
+        let med_id = queue
+            .enqueue(PriorityJob {
+                label: "med".into(),
+                prio: 50,
+                target_queue: "default".into(),
+            })
+            .await
+            .expect("enqueue med");
+
+        let j1 = queue.dequeue_for("w1").await.unwrap().unwrap();
+        let j2 = queue.dequeue_for("w1").await.unwrap().unwrap();
+        let j3 = queue.dequeue_for("w1").await.unwrap().unwrap();
+
+        assert_eq!(j1.id, high_id);
+        assert_eq!(j1.priority, 100);
+        assert_eq!(j2.id, med_id);
+        assert_eq!(j2.priority, 50);
+        assert_eq!(j3.id, low_id);
+        assert_eq!(j3.priority, 1);
+    }
+
+    #[tokio::test]
+    async fn job_queue_filters_by_named_queue() {
+        let queue = setup_sqlite_queue().await;
+
+        let email_id = queue
+            .enqueue(PriorityJob {
+                label: "email".into(),
+                prio: 0,
+                target_queue: "emails".into(),
+            })
+            .await
+            .expect("enqueue email");
+        let billing_id = queue
+            .enqueue(PriorityJob {
+                label: "billing".into(),
+                prio: 10,
+                target_queue: "billing".into(),
+            })
+            .await
+            .expect("enqueue billing");
+
+        let claimed_email = queue
+            .dequeue_from("w1", Some(&["emails"]))
+            .await
+            .expect("dequeue emails")
+            .expect("email job present");
+        assert_eq!(claimed_email.id, email_id);
+        assert_eq!(claimed_email.queue, "emails");
+
+        // No more jobs in "emails", even though "billing" has a higher-priority job.
+        assert!(
+            queue
+                .dequeue_from("w1", Some(&["emails"]))
+                .await
+                .expect("dequeue empty emails")
+                .is_none()
+        );
+
+        let claimed_billing = queue
+            .dequeue_from("w1", Some(&["billing"]))
+            .await
+            .expect("dequeue billing")
+            .expect("billing job present");
+        assert_eq!(claimed_billing.id, billing_id);
+        assert_eq!(claimed_billing.queue, "billing");
+    }
+
+    #[tokio::test]
+    async fn sqlite_job_queue_defer_idempotency_and_reclaim() {
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        struct IdempJob {
+            key: String,
+        }
+
+        impl Job for IdempJob {
+            const NAME: &'static str = "idemp_job";
+
+            fn idempotency_key(&self) -> Option<String> {
+                Some(self.key.clone())
+            }
+        }
+
+        let queue = setup_sqlite_queue().await;
+
+        let id1 = queue
+            .enqueue(IdempJob {
+                key: "dedup-1".into(),
+            })
+            .await
+            .expect("enqueue 1");
+        let id2 = queue
+            .enqueue(IdempJob {
+                key: "dedup-1".into(),
+            })
+            .await
+            .expect("enqueue duplicate");
+        assert_eq!(id1, id2);
+        assert_eq!(queue.pending_count().await.unwrap(), 1);
+
+        let claimed = queue.dequeue_for("worker-1").await.unwrap().unwrap();
+        assert_eq!(claimed.attempt, 1);
+        let tok = claimed.lease_token.clone().unwrap();
+
+        queue
+            .renew_lease(&claimed.id, &tok, Duration::from_secs(30))
+            .await
+            .expect("renew_lease");
+
+        // Defer must decrement attempt back to 0 so next dequeue sees attempt == 1.
+        queue
+            .defer(claimed, &tok, Duration::ZERO)
+            .await
+            .expect("defer");
+        let reclaimed = queue.dequeue_for("worker-2").await.unwrap().unwrap();
+        assert_eq!(reclaimed.attempt, 1);
+
+        let reaped = queue
+            .reclaim_abandoned_jobs(&["worker-2".to_string()])
+            .await
+            .expect("reclaim_abandoned_jobs");
+        assert_eq!(reaped, 1);
+        assert_eq!(queue.pending_count().await.unwrap(), 1);
     }
 }
