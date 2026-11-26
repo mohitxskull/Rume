@@ -290,10 +290,20 @@ impl OutboxRepository for SqliteBackend {
 
     fn recover_expired_claims(
         &self,
-        _max_lease_age_secs: u64,
+        max_lease_age_secs: u64,
     ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        self.recover_expired_claims_with_max_retries(max_lease_age_secs, 5)
+    }
+
+    fn recover_expired_claims_with_max_retries(
+        &self,
+        _max_lease_age_secs: u64,
+        max_retries: u32,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        let max_retries_i32 = i32::try_from(max_retries).unwrap_or(i32::MAX);
         Box::pin(async move {
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
+                .bind(max_retries_i32)
                 .execute(self.pool())
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
@@ -549,5 +559,59 @@ mod sqlite_outbox_tests {
             backend.pending_count().await.expect("pending_count"),
             TOTAL_MESSAGES
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_outbox_recover_expired_increments_retry_count_and_fails_at_max_retries() {
+        let backend = SqliteBackend::in_memory().await.expect("sqlite in-memory");
+        backend
+            .init_outbox_table()
+            .await
+            .expect("init outbox table");
+
+        let msg = OutboxMessage::new(
+            "poison-outbox-1",
+            "order.poison",
+            br#"{"poison":true}"#.to_vec(),
+        );
+        backend.save(msg).await.expect("save poison message");
+
+        // 1st claim with 0s lease -> expires immediately, recovery increments retry_count to 1 (< 2 => pending).
+        let claimed1 = backend
+            .claim_pending_with_lease(1, 0)
+            .await
+            .expect("first claim");
+        assert_eq!(claimed1.len(), 1);
+        assert_eq!(claimed1[0].retry_count, 0);
+
+        let recovered1 = backend
+            .recover_expired_claims_with_max_retries(0, 2)
+            .await
+            .expect("first recovery");
+        assert_eq!(recovered1, 1);
+        assert_eq!(backend.failed_count().await.expect("failed_count"), 0);
+        assert_eq!(backend.pending_count().await.expect("pending_count"), 1);
+
+        // 2nd claim with 0s lease -> sees retry_count == 1; recovery increments to 2 (>= 2 => failed).
+        let claimed2 = backend
+            .claim_pending_with_lease(1, 0)
+            .await
+            .expect("second claim");
+        assert_eq!(claimed2.len(), 1);
+        assert_eq!(claimed2[0].retry_count, 1);
+
+        let recovered2 = backend
+            .recover_expired_claims_with_max_retries(0, 2)
+            .await
+            .expect("second recovery");
+        assert_eq!(recovered2, 1);
+        assert_eq!(backend.pending_count().await.expect("pending_count"), 0);
+        assert_eq!(backend.failed_count().await.expect("failed_count"), 1);
+
+        let failed = backend.fetch_failed(10).await.expect("fetch_failed");
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].id, "poison-outbox-1");
+        assert_eq!(failed[0].status, OutboxStatus::Failed);
+        assert_eq!(failed[0].retry_count, 2);
     }
 }

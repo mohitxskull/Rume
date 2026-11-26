@@ -47,7 +47,26 @@ pub enum BrokerError {
 /// Consumer handle yielding messages from a broker subscription.
 pub trait BrokerConsumer: Debug + Send + Sync {
     /// Receives the next message from the subscribed topic/subject.
+    ///
+    /// Brokers supporting manual acknowledgment (such as RabbitMQ) MUST NOT acknowledge
+    /// the delivery before returning it; callers should invoke [`BrokerConsumer::ack`]
+    /// after processing or [`BrokerConsumer::nack`] on failure.
     fn next_message(&mut self) -> BoxFuture<'_, Result<Option<BrokerMessage>, BrokerError>>;
+
+    /// Acknowledges the most recently received message.
+    ///
+    /// Defaults to a no-op for brokers without explicit per-delivery acknowledgments
+    /// (such as core NATS pub/sub).
+    fn ack(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Negatively acknowledges the most recently received message, optionally requeuing it.
+    ///
+    /// Defaults to a no-op for brokers without explicit per-delivery acknowledgments.
+    fn nack(&mut self, _requeue: bool) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Publishing contract for external message brokers.

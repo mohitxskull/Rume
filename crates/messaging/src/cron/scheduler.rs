@@ -6,19 +6,76 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rume_data::coordination::LeaderElector;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::watch;
 use tokio::task::JoinSet;
+use tokio::time::Instant;
 use tracing::{debug, error, warn};
 
 use crate::cron::spec::{CronError, CronJobSpec};
-use crate::jobs::{Job, JobQueue};
+use crate::jobs::{Job, JobQueue, RetryPolicy};
 
 /// Pinned boxed future type alias for cron job callbacks.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-type CronHandler = Arc<dyn Fn() -> BoxFuture<'static, Result<(), CronError>> + Send + Sync>;
+type CronHandler =
+    Arc<dyn Fn(DateTime<Utc>) -> BoxFuture<'static, Result<(), CronError>> + Send + Sync>;
+
+/// Wrapper attaching a deterministic `cron:{job_name}:{unix_ts}` idempotency key to a typed
+/// [`Job`] without altering its serialized payload or metadata.
+struct CronIdempotentJob<J> {
+    inner: J,
+    idempotency_key: String,
+}
+
+impl<J: Serialize> Serialize for CronIdempotentJob<J> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.inner.serialize(serializer)
+    }
+}
+
+impl<'de, J: Deserialize<'de>> Deserialize<'de> for CronIdempotentJob<J> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        J::deserialize(deserializer).map(|inner| Self {
+            inner,
+            idempotency_key: String::new(),
+        })
+    }
+}
+
+impl<J: Job> Job for CronIdempotentJob<J> {
+    const NAME: &'static str = J::NAME;
+
+    fn retry_policy(&self) -> RetryPolicy {
+        self.inner.retry_policy()
+    }
+
+    fn timeout(&self) -> Option<Duration> {
+        self.inner.timeout()
+    }
+
+    fn idempotency_key(&self) -> Option<String> {
+        Some(self.idempotency_key.clone())
+    }
+
+    fn tenant_id(&self) -> Option<String> {
+        self.inner.tenant_id()
+    }
+
+    fn trace_context(&self) -> Option<String> {
+        self.inner.trace_context()
+    }
+
+    fn queue(&self) -> &str {
+        self.inner.queue()
+    }
+
+    fn priority(&self) -> i32 {
+        self.inner.priority()
+    }
+}
 
 struct RegisteredCronJob {
     spec: CronJobSpec,
@@ -68,6 +125,18 @@ impl CronScheduler {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<(), CronError>> + Send + 'static,
     {
+        self.register_with_scheduled(spec, move |_scheduled_at| handler())
+    }
+
+    fn register_with_scheduled<F, Fut>(
+        &mut self,
+        spec: CronJobSpec,
+        handler: F,
+    ) -> Result<(), CronError>
+    where
+        F: Fn(DateTime<Utc>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<(), CronError>> + Send + 'static,
+    {
         if self.jobs.iter().any(|job| job.spec.name == spec.name) {
             return Err(CronError::Execution(format!(
                 "duplicate cron job name '{}'",
@@ -75,12 +144,14 @@ impl CronScheduler {
             )));
         }
 
-        let handler: CronHandler = Arc::new(move || Box::pin(handler()));
+        let handler: CronHandler = Arc::new(move |scheduled_at| Box::pin(handler(scheduled_at)));
         self.jobs.push(RegisteredCronJob { spec, handler });
         Ok(())
     }
 
-    /// Registers a recurring cron job that enqueues a [`Job`] onto a [`JobQueue`].
+    /// Registers a recurring cron job that enqueues a [`Job`] onto a [`JobQueue`] with a
+    /// deterministic `cron:{job_name}:{unix_ts}` idempotency key so failover within the same
+    /// tick cannot double-execute.
     pub fn register_job<Q, J, F>(
         &mut self,
         spec: CronJobSpec,
@@ -92,13 +163,18 @@ impl CronScheduler {
         J: Job,
         F: Fn() -> J + Send + Sync + 'static,
     {
+        let job_name = spec.name.clone();
         let factory = Arc::new(job_factory);
-        self.register(spec, move || {
+        self.register_with_scheduled(spec, move |scheduled_at| {
             let queue = Arc::clone(&queue);
-            let job = factory();
+            let idempotency_key = format!("cron:{job_name}:{}", scheduled_at.timestamp());
+            let wrapped = CronIdempotentJob {
+                inner: factory(),
+                idempotency_key,
+            };
             async move {
                 queue
-                    .enqueue(job)
+                    .enqueue(wrapped)
                     .await
                     .map(|_| ())
                     .map_err(|err| CronError::Execution(err.to_string()))
@@ -109,7 +185,7 @@ impl CronScheduler {
     /// Starts the leader-election loop and cron scheduling tasks.
     pub fn start(self) -> CronSchedulerHandle {
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let (leader_tx, leader_rx) = watch::channel(false);
+        let (leader_tx, leader_rx) = watch::channel::<Option<Instant>>(None);
         let mut tasks = JoinSet::new();
 
         let elector = self.elector;
@@ -142,48 +218,100 @@ impl CronScheduler {
     }
 }
 
+fn is_leader_valid(leader_rx: &watch::Receiver<Option<Instant>>) -> bool {
+    leader_rx
+        .borrow()
+        .is_some_and(|deadline| Instant::now() < deadline)
+}
+
 async fn run_election_loop(
     elector: Arc<dyn LeaderElector>,
     role: String,
     candidate_id: String,
     lease_ttl: Duration,
-    leader_tx: watch::Sender<bool>,
+    leader_tx: watch::Sender<Option<Instant>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     // Why: renew at 1/3 of lease TTL (minimum 10ms) so transient jitter does not expire
     // leadership before the next renewal, while short test TTLs still fail over quickly.
     let renew_interval = (lease_ttl / 3).max(Duration::from_millis(10));
-    let mut is_leader = false;
+    let mut leader_deadline: Option<Instant> = None;
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        if is_leader {
-            match elector.renew(&role, &candidate_id, lease_ttl).await {
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    warn!(role = %role, candidate_id = %candidate_id, "lost cron leadership lease");
-                    is_leader = false;
-                    let _ = leader_tx.send(false);
+        if let Some(deadline) = leader_deadline {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                warn!(role = %role, candidate_id = %candidate_id, "cron leadership lease expired locally");
+                leader_deadline = None;
+                let _ = leader_tx.send(None);
+                continue;
+            }
+            // Why: bound `elector.renew` by the remaining local lease TTL so a hung
+            // coordinator/network call cannot keep `leader_tx` armed past lease expiry
+            // and cause split-brain double-firing. Measure `call_start` before the RPC so
+            // network latency never inflates our local belief beyond server expiry.
+            let call_start = Instant::now();
+            let renew_res = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
                 }
-                Err(err) => {
+                res = tokio::time::timeout(remaining, elector.renew(&role, &candidate_id, lease_ttl)) => res,
+            };
+            match renew_res {
+                Ok(Ok(Some(_))) => {
+                    let next_deadline = call_start + lease_ttl;
+                    leader_deadline = Some(next_deadline);
+                    let _ = leader_tx.send(leader_deadline);
+                }
+                Ok(Ok(None)) => {
+                    warn!(role = %role, candidate_id = %candidate_id, "lost cron leadership lease");
+                    leader_deadline = None;
+                    let _ = leader_tx.send(None);
+                }
+                Ok(Err(err)) => {
                     warn!(role = %role, candidate_id = %candidate_id, error = %err, "cron leadership renewal failed");
-                    is_leader = false;
-                    let _ = leader_tx.send(false);
+                    leader_deadline = None;
+                    let _ = leader_tx.send(None);
+                }
+                Err(_) => {
+                    warn!(role = %role, candidate_id = %candidate_id, "cron leadership renewal timed out; stepping down");
+                    leader_deadline = None;
+                    let _ = leader_tx.send(None);
                 }
             }
         } else {
-            match elector.try_acquire(&role, &candidate_id, lease_ttl).await {
-                Ok(Some(_)) => {
-                    debug!(role = %role, candidate_id = %candidate_id, "acquired cron leadership");
-                    is_leader = true;
-                    let _ = leader_tx.send(true);
+            let call_start = Instant::now();
+            let acquire_res = tokio::select! {
+                biased;
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                    continue;
                 }
-                Ok(None) => {}
-                Err(err) => {
+                res = tokio::time::timeout(lease_ttl, elector.try_acquire(&role, &candidate_id, lease_ttl)) => res,
+            };
+            match acquire_res {
+                Ok(Ok(Some(_))) => {
+                    debug!(role = %role, candidate_id = %candidate_id, "acquired cron leadership");
+                    let next_deadline = call_start + lease_ttl;
+                    leader_deadline = Some(next_deadline);
+                    let _ = leader_tx.send(leader_deadline);
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(err)) => {
                     warn!(role = %role, candidate_id = %candidate_id, error = %err, "cron leadership acquisition failed");
+                }
+                Err(_) => {
+                    warn!(role = %role, candidate_id = %candidate_id, "cron leadership acquisition timed out");
                 }
             }
         }
@@ -198,14 +326,18 @@ async fn run_election_loop(
         }
     }
 
-    if is_leader && let Err(err) = elector.resign(&role, &candidate_id).await {
+    let _ = leader_tx.send(None);
+    if leader_deadline.is_some()
+        && let Ok(Err(err)) =
+            tokio::time::timeout(lease_ttl, elector.resign(&role, &candidate_id)).await
+    {
         warn!(role = %role, candidate_id = %candidate_id, error = %err, "failed to resign cron leadership on shutdown");
     }
 }
 
 async fn run_job_loop(
     job: RegisteredCronJob,
-    leader_rx: &mut watch::Receiver<bool>,
+    leader_rx: &mut watch::Receiver<Option<Instant>>,
     shutdown_rx: &mut watch::Receiver<bool>,
 ) {
     let mut next_scheduled = match job.spec.next_tick(Utc::now()) {
@@ -215,13 +347,15 @@ async fn run_job_loop(
             return;
         }
     };
+    let mut was_leader = is_leader_valid(leader_rx);
 
     loop {
         if *shutdown_rx.borrow() {
             break;
         }
 
-        if !*leader_rx.borrow() {
+        if !is_leader_valid(leader_rx) {
+            was_leader = false;
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -237,9 +371,32 @@ async fn run_job_loop(
             continue;
         }
 
+        // Why: on non-leader -> leader transition, recompute `next_scheduled` from `now`
+        // so a long-running standby never fires stale missed ticks from before it became
+        // leader (which the previous leader already executed).
+        if !was_leader {
+            match job.spec.next_tick(Utc::now()) {
+                Ok(next) => next_scheduled = next,
+                Err(err) => {
+                    error!(job = %job.spec.name, error = %err, "failed to recompute cron tick on leadership acquisition");
+                    break;
+                }
+            }
+            was_leader = true;
+        }
+
         let now = Utc::now();
         if now < next_scheduled {
             let wait = (next_scheduled - now).to_std().unwrap_or(Duration::ZERO);
+            let remaining_lease = leader_rx
+                .borrow()
+                .map(|d| d.saturating_duration_since(Instant::now()))
+                .unwrap_or(Duration::ZERO);
+            if remaining_lease.is_zero() {
+                was_leader = false;
+                continue;
+            }
+            let sleep_dur = wait.min(remaining_lease);
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
@@ -252,22 +409,29 @@ async fn run_job_loop(
                     }
                     continue;
                 }
-                _ = tokio::time::sleep(wait) => {}
+                _ = tokio::time::sleep(sleep_dur) => {}
             }
         }
 
-        if *shutdown_rx.borrow() || !*leader_rx.borrow() {
+        if *shutdown_rx.borrow() || !is_leader_valid(leader_rx) {
+            if !is_leader_valid(leader_rx) {
+                was_leader = false;
+            }
             continue;
         }
 
         let eval_now = Utc::now();
-        match job.spec.evaluate_tick(next_scheduled, eval_now) {
+        if eval_now < next_scheduled {
+            continue;
+        }
+        let scheduled_at = next_scheduled;
+        match job.spec.evaluate_tick(scheduled_at, eval_now) {
             Ok(decision) => {
                 next_scheduled = decision.next_scheduled;
                 if decision.should_run
-                    && *leader_rx.borrow()
+                    && is_leader_valid(leader_rx)
                     && !*shutdown_rx.borrow()
-                    && let Err(err) = (job.handler)().await
+                    && let Err(err) = (job.handler)(scheduled_at).await
                 {
                     error!(job = %job.spec.name, error = %err, "cron job handler failed");
                 }

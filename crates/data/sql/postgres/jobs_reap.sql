@@ -1,5 +1,16 @@
 UPDATE rume_jobs
-SET status = 'pending',
+SET status = CASE
+        WHEN attempt >= max_attempts THEN 'dead_letter'
+        ELSE 'pending'
+    END,
+    dead_letter_reason = CASE
+        WHEN attempt >= max_attempts THEN 'max attempts exceeded (worker abandoned)'
+        ELSE dead_letter_reason
+    END,
+    dead_lettered_at = CASE
+        WHEN attempt >= max_attempts THEN (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT
+        ELSE dead_lettered_at
+    END,
     assigned_worker = NULL,
     lease_expires_at = NULL,
     lease_token = NULL

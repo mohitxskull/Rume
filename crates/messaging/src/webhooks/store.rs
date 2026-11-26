@@ -2,9 +2,10 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use rume_data::persistence::{DatabaseBackend, DbRow, DbValue};
+use rume_data::persistence::{DatabaseBackend, DatabaseTransaction, DbRow, DbValue};
 use rume_data::sql;
 
 use super::WebhookError;
@@ -15,6 +16,8 @@ use crate::outbox::repository::BoxFuture;
 pub enum WebhookDeliveryStatus {
     /// Queued for initial delivery or scheduled for retry.
     Pending,
+    /// Claimed by a dispatcher worker and currently in flight.
+    InFlight,
     /// Successfully delivered (2xx HTTP response).
     Delivered,
     /// Permanently failed after exhausting retry attempts.
@@ -26,6 +29,7 @@ impl WebhookDeliveryStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Pending => "pending",
+            Self::InFlight => "in_flight",
             Self::Delivered => "delivered",
             Self::Failed => "failed",
         }
@@ -35,6 +39,7 @@ impl WebhookDeliveryStatus {
     pub fn parse(s: &str) -> Result<Self, WebhookError> {
         match s {
             "pending" => Ok(Self::Pending),
+            "in_flight" | "inflight" => Ok(Self::InFlight),
             "delivered" => Ok(Self::Delivered),
             "failed" => Ok(Self::Failed),
             other => Err(WebhookError::Store(format!(
@@ -88,6 +93,15 @@ pub trait WebhookDeliveryStore: std::fmt::Debug + Send + Sync + 'static {
         &self,
         now: DateTime<Utc>,
         limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>>;
+
+    /// Atomically claims up to `limit` due pending (or lease-expired `InFlight`) delivery records,
+    /// transitioning them to [`WebhookDeliveryStatus::InFlight`] for `lease_duration`.
+    fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        lease_duration: Duration,
     ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>>;
 }
 
@@ -168,6 +182,45 @@ impl WebhookDeliveryStore for InMemoryWebhookDeliveryStore {
             items.sort_by_key(|r| r.created_at);
             items.truncate(limit);
             Ok(items)
+        })
+    }
+
+    fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        lease_duration: Duration,
+    ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>> {
+        Box::pin(async move {
+            let mut guard = self
+                .records
+                .write()
+                .map_err(|_| WebhookError::Store("webhook store lock poisoned".into()))?;
+            let mut due_ids: Vec<(DateTime<Utc>, String)> = guard
+                .values()
+                .filter(|r| {
+                    (r.status == WebhookDeliveryStatus::Pending
+                        && r.next_attempt_at.is_none_or(|due| due <= now))
+                        || (r.status == WebhookDeliveryStatus::InFlight
+                            && r.next_attempt_at.is_some_and(|exp| exp <= now))
+                })
+                .map(|r| (r.created_at, r.id.clone()))
+                .collect();
+            due_ids.sort_by_key(|(created_at, _)| *created_at);
+            due_ids.truncate(limit);
+
+            let lease_delta = chrono::Duration::from_std(lease_duration).unwrap_or_default();
+            let lease_until = now + lease_delta;
+            let mut claimed = Vec::with_capacity(due_ids.len());
+            for (_, id) in due_ids {
+                if let Some(record) = guard.get_mut(&id) {
+                    record.status = WebhookDeliveryStatus::InFlight;
+                    record.next_attempt_at = Some(lease_until);
+                    record.updated_at = now;
+                    claimed.push(record.clone());
+                }
+            }
+            Ok(claimed)
         })
     }
 }
@@ -357,6 +410,90 @@ impl<B: DatabaseBackend> WebhookDeliveryStore for SqlWebhookDeliveryStore<B> {
                 .await
                 .map_err(|e| WebhookError::Store(e.to_string()))?;
             rows.iter().map(decode_delivery_row).collect()
+        })
+    }
+
+    fn claim_due(
+        &self,
+        now: DateTime<Utc>,
+        limit: usize,
+        lease_duration: Duration,
+    ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>> {
+        Box::pin(async move {
+            if limit == 0 {
+                return Ok(Vec::new());
+            }
+            let dialect = self.backend.dialect();
+            let lease_delta = chrono::Duration::from_std(lease_duration).unwrap_or_default();
+            let lease_until = now + lease_delta;
+            let now_str = format_ts(dialect, now);
+            let lease_until_str = format_ts(dialect, lease_until);
+            let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+
+            if dialect == "mysql" {
+                let tx = self
+                    .backend
+                    .begin_transaction()
+                    .await
+                    .map_err(|e| WebhookError::Store(e.to_string()))?;
+                let rows = tx
+                    .fetch_all(
+                        sql::MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_SELECT,
+                        &[
+                            DbValue::Text(now_str.clone()),
+                            DbValue::Text(now_str.clone()),
+                            DbValue::Int(limit_i64),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| WebhookError::Store(e.to_string()))?;
+                let mut claimed = Vec::with_capacity(rows.len());
+                for row in &rows {
+                    let mut record = decode_delivery_row(row)?;
+                    tx.execute_params(
+                        sql::MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_UPDATE,
+                        &[
+                            DbValue::Text(lease_until_str.clone()),
+                            DbValue::Text(now_str.clone()),
+                            DbValue::Text(record.id.clone()),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| WebhookError::Store(e.to_string()))?;
+                    record.status = WebhookDeliveryStatus::InFlight;
+                    record.next_attempt_at = Some(lease_until);
+                    record.updated_at = now;
+                    claimed.push(record);
+                }
+                tx.commit()
+                    .await
+                    .map_err(|e| WebhookError::Store(e.to_string()))?;
+                return Ok(claimed);
+            }
+
+            let stmt = if dialect == "postgres" {
+                sql::PG_WEBHOOK_DELIVERIES_CLAIM_DUE
+            } else {
+                sql::SQLITE_WEBHOOK_DELIVERIES_CLAIM_DUE
+            };
+            let rows = self
+                .backend
+                .fetch_all(
+                    stmt,
+                    &[
+                        DbValue::Text(now_str),
+                        DbValue::Text(lease_until_str),
+                        DbValue::Int(limit_i64),
+                    ],
+                )
+                .await
+                .map_err(|e| WebhookError::Store(e.to_string()))?;
+            let mut claimed: Vec<WebhookDeliveryRecord> = rows
+                .iter()
+                .map(decode_delivery_row)
+                .collect::<Result<_, _>>()?;
+            claimed.sort_by_key(|r| r.created_at);
+            Ok(claimed)
         })
     }
 }

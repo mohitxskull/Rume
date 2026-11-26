@@ -2,22 +2,30 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 use futures_util::StreamExt;
 use lapin::BasicProperties;
 use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicPublishOptions, QueueDeclareOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
+    ConfirmSelectOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
+use tokio::sync::Mutex;
 
 use crate::broker::{
     BoxFuture, BrokerConsumer, BrokerError, BrokerMessage, BrokerPublisher, MessageBroker,
 };
 
+/// Persistent AMQP delivery mode (`2` = write message to disk on durable queues).
+const AMQP_DELIVERY_MODE_PERSISTENT: u8 = 2;
+
 /// RabbitMQ-backed [`MessageBroker`].
 #[derive(Clone)]
 pub struct RabbitMqBroker {
-    connection: std::sync::Arc<lapin::Connection>,
+    connection: Arc<lapin::Connection>,
+    /// Pooled publisher channel with publisher confirms enabled, recreated only if closed.
+    publish_channel: Arc<Mutex<Option<lapin::Channel>>>,
 }
 
 impl Debug for RabbitMqBroker {
@@ -28,8 +36,11 @@ impl Debug for RabbitMqBroker {
 
 impl RabbitMqBroker {
     /// Wraps an existing `lapin::Connection`.
-    pub fn new(connection: std::sync::Arc<lapin::Connection>) -> Self {
-        Self { connection }
+    pub fn new(connection: Arc<lapin::Connection>) -> Self {
+        Self {
+            connection,
+            publish_channel: Arc::new(Mutex::new(None)),
+        }
     }
 
     /// Connects to a RabbitMQ broker at `uri`.
@@ -37,20 +48,41 @@ impl RabbitMqBroker {
         let connection = lapin::Connection::connect(uri, lapin::ConnectionProperties::default())
             .await
             .map_err(|e| BrokerError::Transport(e.to_string()))?;
-        Ok(Self {
-            connection: std::sync::Arc::new(connection),
-        })
+        Ok(Self::new(Arc::new(connection)))
     }
 
     /// Returns a reference to the underlying `lapin::Connection`.
     pub fn connection(&self) -> &lapin::Connection {
         &self.connection
     }
+
+    /// Returns the pooled publisher channel with publisher confirms enabled, creating a new
+    /// channel only when none exists yet or the cached channel is no longer connected.
+    async fn acquire_publish_channel(&self) -> Result<lapin::Channel, BrokerError> {
+        let mut guard = self.publish_channel.lock().await;
+        if let Some(ref ch) = *guard
+            && ch.status().connected()
+        {
+            return Ok(ch.clone());
+        }
+        let ch = self
+            .connection
+            .create_channel()
+            .await
+            .map_err(|e| BrokerError::Transport(e.to_string()))?;
+        ch.confirm_select(ConfirmSelectOptions::default())
+            .await
+            .map_err(|e| BrokerError::Transport(e.to_string()))?;
+        *guard = Some(ch.clone());
+        Ok(ch)
+    }
 }
 
 struct RabbitMqConsumer {
     topic: String,
+    channel: lapin::Channel,
     consumer: lapin::Consumer,
+    pending_delivery_tag: Option<u64>,
 }
 
 impl Debug for RabbitMqConsumer {
@@ -66,10 +98,10 @@ impl BrokerConsumer for RabbitMqConsumer {
         Box::pin(async move {
             match self.consumer.next().await {
                 Some(Ok(delivery)) => {
-                    delivery
-                        .ack(BasicAckOptions::default())
-                        .await
-                        .map_err(|e| BrokerError::Transport(e.to_string()))?;
+                    // Why: do NOT ack before yielding to the caller; retain the delivery
+                    // tag so the caller explicitly invokes `ack()` after processing or
+                    // `nack(requeue)` on failure, preventing message loss on crash.
+                    self.pending_delivery_tag = Some(delivery.delivery_tag);
                     let mut headers = BTreeMap::new();
                     if let Some(table) = delivery.properties.headers() {
                         for (key, value) in table.inner() {
@@ -89,18 +121,45 @@ impl BrokerConsumer for RabbitMqConsumer {
             }
         })
     }
+
+    fn ack(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async move {
+            if let Some(tag) = self.pending_delivery_tag.take() {
+                self.channel
+                    .basic_ack(tag, BasicAckOptions::default())
+                    .await
+                    .map_err(|e| BrokerError::Transport(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
+
+    fn nack(&mut self, requeue: bool) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async move {
+            if let Some(tag) = self.pending_delivery_tag.take() {
+                self.channel
+                    .basic_nack(
+                        tag,
+                        BasicNackOptions {
+                            requeue,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(|e| BrokerError::Transport(e.to_string()))?;
+            }
+            Ok(())
+        })
+    }
 }
 
 impl BrokerPublisher for RabbitMqBroker {
     fn publish(&self, message: BrokerMessage) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            let channel = self
-                .connection
-                .create_channel()
-                .await
-                .map_err(|e| BrokerError::Transport(e.to_string()))?;
+            let channel = self.acquire_publish_channel().await?;
 
-            let mut props = BasicProperties::default();
+            let mut props =
+                BasicProperties::default().with_delivery_mode(AMQP_DELIVERY_MODE_PERSISTENT);
             if !message.headers.is_empty() {
                 let mut table = FieldTable::default();
                 for (key, value) in &message.headers {
@@ -112,7 +171,7 @@ impl BrokerPublisher for RabbitMqBroker {
                 props = props.with_headers(table);
             }
 
-            channel
+            let publish_res = channel
                 .basic_publish(
                     "".into(),
                     message.topic.as_str().into(),
@@ -120,10 +179,24 @@ impl BrokerPublisher for RabbitMqBroker {
                     &message.payload,
                     props,
                 )
-                .await
-                .map_err(|e| BrokerError::Transport(e.to_string()))?
-                .await
-                .map_err(|e| BrokerError::Transport(e.to_string()))?;
+                .await;
+
+            let confirm = match publish_res {
+                Ok(c) => c,
+                Err(e) => {
+                    if !channel.status().connected() {
+                        *self.publish_channel.lock().await = None;
+                    }
+                    return Err(BrokerError::Transport(e.to_string()));
+                }
+            };
+
+            if let Err(e) = confirm.await {
+                if !channel.status().connected() {
+                    *self.publish_channel.lock().await = None;
+                }
+                return Err(BrokerError::Transport(e.to_string()));
+            }
 
             Ok(())
         })
@@ -163,7 +236,9 @@ impl MessageBroker for RabbitMqBroker {
 
             Ok(Box::new(RabbitMqConsumer {
                 topic: topic.to_string(),
+                channel,
                 consumer,
+                pending_delivery_tag: None,
             }) as Box<dyn BrokerConsumer>)
         })
     }

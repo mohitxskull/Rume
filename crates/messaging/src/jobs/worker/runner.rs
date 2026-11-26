@@ -533,10 +533,43 @@ impl<Q: JobQueue> JobWorker<Q> {
                 break;
             }
 
-            let queue_refs: Option<Vec<&str>> = self
-                .queues
-                .as_ref()
-                .map(|qs| qs.iter().map(String::as_str).collect());
+            let queue_refs: Option<Vec<&str>> = self.queues.as_ref().map(|qs| {
+                qs.iter()
+                    .filter(|q| {
+                        self.queue_concurrency
+                            .get(q.as_str())
+                            .is_none_or(|sem| sem.available_permits() > 0)
+                    })
+                    .map(String::as_str)
+                    .collect()
+            });
+            // Why: when every configured queue is at its per-queue concurrency cap,
+            // do NOT poll `dequeue_from` (which would either return nothing or claim a
+            // job we cannot run yet) — release the global permit and wait for an
+            // in-flight task to finish (freeing a per-queue permit) or shutdown.
+            if let Some(ref qs) = queue_refs
+                && qs.is_empty()
+            {
+                drop(permit);
+                if !in_flight_tasks.is_empty() {
+                    tokio::select! {
+                        biased;
+                        _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
+                        res = in_flight_tasks.join_next() => {
+                            if let Some(outcome) = res {
+                                Self::log_in_flight_outcome(outcome);
+                            }
+                            self.record_join_set_len(in_flight_tasks.len());
+                        }
+                    }
+                } else if self
+                    .sleep_while_reaping(Duration::from_millis(25), &mut in_flight_tasks)
+                    .await
+                {
+                    break;
+                }
+                continue;
+            }
             let dequeue_fut = match queue_refs.as_deref() {
                 Some(qs) => self.queue.dequeue_from(&run_worker_id, Some(qs)),
                 None => self.queue.dequeue_for(&run_worker_id),
@@ -545,39 +578,42 @@ impl<Q: JobQueue> JobWorker<Q> {
                 Ok(Some(job)) => {
                     consecutive_errors = 0;
 
-                    // Acquire optional per-queue concurrency permit before `admission_lock`
-                    // so `in_flight_count` only tracks jobs that hold all permits, while
-                    // still honoring `shutdown_rx` and reaping completed tasks while waiting.
+                    // Why: acquire the optional per-queue concurrency permit with
+                    // `try_acquire_owned()` instead of blocking in `run_loop`. Blocking
+                    // after dequeue holds an un-heartbeated claimed job (risking lease
+                    // expiry) and head-of-line blocks other non-saturated queues. If a
+                    // queue is saturated (e.g. when polling all queues with `queues == None`
+                    // or racing a cloned worker), defer immediately without consuming a
+                    // retry attempt and continue polling other queues.
                     let queue_permit = if let Some(q_sem) = self.queue_concurrency.get(&job.queue) {
-                        let mut acquired = None;
-                        loop {
-                            if *shutdown_rx.borrow() || self.is_stopping.load(Ordering::SeqCst) {
-                                break;
-                            }
-                            tokio::select! {
-                                biased;
-                                _ = shutdown_rx.wait_for(|&stopped| stopped) => break,
-                                res = Arc::clone(q_sem).acquire_owned() => match res {
-                                    Ok(qp) => {
-                                        acquired = Some(qp);
-                                        break;
-                                    }
-                                    Err(_) => break,
-                                },
-                                res = in_flight_tasks.join_next(), if !in_flight_tasks.is_empty() => {
-                                    if let Some(outcome) = res {
-                                        Self::log_in_flight_outcome(outcome);
-                                    }
-                                    self.record_join_set_len(in_flight_tasks.len());
+                        match Arc::clone(q_sem).try_acquire_owned() {
+                            Ok(qp) => Some(qp),
+                            Err(_) => {
+                                let token = job.lease_token.clone().unwrap_or_default();
+                                if let Err(err) = self
+                                    .queue
+                                    .defer(job, &token, Duration::from_millis(50))
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        error = %err,
+                                        "Failed to defer job from saturated queue"
+                                    );
+                                    self.transition_errors.fetch_add(1, Ordering::SeqCst);
                                 }
+                                drop(permit);
+                                if self
+                                    .sleep_while_reaping(
+                                        Duration::from_millis(10),
+                                        &mut in_flight_tasks,
+                                    )
+                                    .await
+                                {
+                                    break;
+                                }
+                                continue;
                             }
                         }
-                        if acquired.is_none() {
-                            self.defer_during_drain(job).await;
-                            drop(permit);
-                            break;
-                        }
-                        acquired
                     } else {
                         None
                     };
@@ -760,6 +796,33 @@ impl<Q: JobQueue> JobWorker<Q> {
         }
 
         let token = job.lease_token.clone().unwrap_or_default();
+
+        // Why: guard against poison-pill infinite crash loops. When a worker crashes
+        // mid-execution without acking/nacking, lease expiry causes the next claim to
+        // increment `attempt` past `max_attempts`. Dead-letter immediately before
+        // invoking the handler so a crashing payload cannot loop forever.
+        if job.attempt > job.retry_policy.max_attempts {
+            let reason = format!(
+                "max attempts exceeded on claim (attempt {} > max_attempts {})",
+                job.attempt, job.retry_policy.max_attempts
+            );
+            tracing::warn!(
+                job_id = %job_id,
+                attempt = job.attempt,
+                max_attempts = job.retry_policy.max_attempts,
+                "Dead-lettering job before dispatch because attempt exceeded max_attempts"
+            );
+            if let Err(err) = queue.dead_letter(job, &token, reason).await {
+                tracing::error!(
+                    job_id = %job_id,
+                    error = %err,
+                    "Failed to dead-letter job whose attempt exceeded max_attempts"
+                );
+                transition_errors.fetch_add(1, Ordering::SeqCst);
+                lost_leases.fetch_add(1, Ordering::SeqCst);
+            }
+            return;
+        }
 
         if let (Some(store), Some(key)) = (&idempotency_store, &effective_key) {
             match store

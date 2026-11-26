@@ -266,5 +266,19 @@ mod tests {
         let due = store.list_due(now, 10).await.expect("list_due");
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, "del-1");
+
+        let claimed = store
+            .claim_due(now, 10, Duration::from_secs(30))
+            .await
+            .expect("claim_due");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].status, WebhookDeliveryStatus::InFlight);
+
+        // Second concurrent claim before lease expiry must return empty.
+        let claimed_again = store
+            .claim_due(now, 10, Duration::from_secs(30))
+            .await
+            .expect("second claim_due");
+        assert!(claimed_again.is_empty());
     }
 }

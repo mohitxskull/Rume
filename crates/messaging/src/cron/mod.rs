@@ -290,4 +290,312 @@ mod tests {
             Utc.with_ymd_and_hms(2026, 6, 1, 12, 4, 0).unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn cron_scheduler_stops_firing_when_renew_stalls_past_lease_ttl() {
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug)]
+        struct StallingRenewElector {
+            acquired: AtomicBool,
+        }
+
+        impl LeaderElector for StallingRenewElector {
+            fn try_acquire<'a>(
+                &'a self,
+                role: &'a str,
+                candidate_id: &'a str,
+                ttl: Duration,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move {
+                    if !self.acquired.swap(true, Ordering::SeqCst) {
+                        Ok(Some(
+                            LeaderLease::new(role, candidate_id, 1)
+                                .with_expires_at(Instant::now() + ttl),
+                        ))
+                    } else {
+                        // Once leadership is lost after stalled renew, refuse re-acquisition.
+                        Ok(None)
+                    }
+                })
+            }
+
+            fn renew<'a>(
+                &'a self,
+                _role: &'a str,
+                _candidate_id: &'a str,
+                _ttl: Duration,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move {
+                    // Stall far longer than lease_ttl (150ms).
+                    tokio::time::sleep(Duration::from_secs(10)).await;
+                    Ok(None)
+                })
+            }
+
+            fn get_leader<'a>(
+                &'a self,
+                _role: &'a str,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn resign<'a>(
+                &'a self,
+                _role: &'a str,
+                _candidate_id: &'a str,
+            ) -> CoordinationFuture<'a, bool> {
+                Box::pin(async move { Ok(true) })
+            }
+        }
+
+        let elector = Arc::new(StallingRenewElector {
+            acquired: AtomicBool::new(false),
+        });
+        let fires = Arc::new(AtomicUsize::new(0));
+        let fires_clone = Arc::clone(&fires);
+
+        // Lease TTL is 150ms, far shorter than the 1-second cron tick interval, so by the
+        // time the first tick would arrive, the stalled renew has timed out and stepped down.
+        let mut sched = CronScheduler::new(
+            elector,
+            "cron-stalled-renew",
+            "node-stalled",
+            Duration::from_millis(150),
+        );
+        sched
+            .register(
+                CronJobSpec::new("tick", "* * * * * *").expect("valid"),
+                move || {
+                    let fires_clone = Arc::clone(&fires_clone);
+                    async move {
+                        fires_clone.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .expect("register");
+
+        let handle = sched.start();
+        // Wait > 1.3s: if renew wasn't bounded / deadline-fenced, the 1s tick would fire.
+        tokio::time::sleep(Duration::from_millis(1350)).await;
+
+        assert_eq!(
+            fires.load(Ordering::SeqCst),
+            0,
+            "scheduler with stalled renew() past lease_ttl must NOT fire ticks"
+        );
+
+        handle
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn cron_standby_takeover_skips_stale_ticks_and_attaches_deterministic_idempotency_key() {
+        use std::sync::atomic::AtomicBool;
+
+        use serde::{Deserialize, Serialize};
+
+        use crate::jobs::{Job, JobError, JobQueue, QueuedJob};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct CronPingJob;
+
+        impl Job for CronPingJob {
+            const NAME: &'static str = "cron.ping";
+        }
+
+        #[derive(Debug, Default)]
+        struct CapturingQueue {
+            keys: Mutex<Vec<(Option<String>, Instant)>>,
+        }
+
+        impl JobQueue for CapturingQueue {
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                job: J,
+                _delay: Duration,
+                _trace_context: Option<String>,
+            ) -> crate::jobs::BoxFuture<'_, Result<String, JobError>> {
+                self.keys
+                    .lock()
+                    .unwrap()
+                    .push((job.idempotency_key(), Instant::now()));
+                Box::pin(async { Ok("job-1".to_string()) })
+            }
+
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> crate::jobs::BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> crate::jobs::BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+
+            fn ack(
+                &self,
+                _job_id: &str,
+                _lease_token: &str,
+            ) -> crate::jobs::BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _delay: Duration,
+            ) -> crate::jobs::BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _lease_token: &str,
+                _reason: String,
+            ) -> crate::jobs::BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn pending_count(&self) -> crate::jobs::BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+
+            fn dead_letter_count(&self) -> crate::jobs::BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        #[derive(Debug)]
+        struct GatedElector {
+            allow_leader: AtomicBool,
+        }
+
+        impl LeaderElector for GatedElector {
+            fn try_acquire<'a>(
+                &'a self,
+                role: &'a str,
+                candidate_id: &'a str,
+                ttl: Duration,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move {
+                    if self.allow_leader.load(Ordering::SeqCst) {
+                        Ok(Some(
+                            LeaderLease::new(role, candidate_id, 1)
+                                .with_expires_at(Instant::now() + ttl),
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                })
+            }
+
+            fn renew<'a>(
+                &'a self,
+                role: &'a str,
+                candidate_id: &'a str,
+                ttl: Duration,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move {
+                    if self.allow_leader.load(Ordering::SeqCst) {
+                        Ok(Some(
+                            LeaderLease::new(role, candidate_id, 1)
+                                .with_expires_at(Instant::now() + ttl),
+                        ))
+                    } else {
+                        Ok(None)
+                    }
+                })
+            }
+
+            fn get_leader<'a>(
+                &'a self,
+                _role: &'a str,
+            ) -> CoordinationFuture<'a, Option<LeaderLease>> {
+                Box::pin(async move { Ok(None) })
+            }
+
+            fn resign<'a>(
+                &'a self,
+                _role: &'a str,
+                _candidate_id: &'a str,
+            ) -> CoordinationFuture<'a, bool> {
+                Box::pin(async move { Ok(true) })
+            }
+        }
+
+        let elector = Arc::new(GatedElector {
+            allow_leader: AtomicBool::new(false),
+        });
+        let queue = Arc::new(CapturingQueue::default());
+
+        let mut sched = CronScheduler::new(
+            elector.clone(),
+            "cron-standby",
+            "node-standby",
+            Duration::from_millis(200),
+        );
+        // Use RunOnce so that if standby didn't recompute `next_scheduled` on takeover,
+        // it would immediately fire a bogus catch-up tick upon acquiring leadership.
+        let spec = CronJobSpec::new("heartbeat", "* * * * * *")
+            .expect("valid")
+            .with_missed_tick_policy(MissedTickPolicy::RunOnce);
+        sched
+            .register_job(spec, Arc::clone(&queue), || CronPingJob)
+            .expect("register_job");
+
+        let handle = sched.start();
+
+        // Remain in standby across at least 2 full 1-second ticks so the initial
+        // `next_scheduled` is firmly in the past.
+        tokio::time::sleep(Duration::from_millis(2100)).await;
+        assert!(
+            queue.keys.lock().unwrap().is_empty(),
+            "standby must not enqueue jobs before becoming leader"
+        );
+
+        let takeover_unix_ts = Utc::now().timestamp();
+        elector.allow_leader.store(true, Ordering::SeqCst);
+
+        // Wait for one legitimate future tick after takeover.
+        tokio::time::sleep(Duration::from_millis(1250)).await;
+
+        let recorded = queue.keys.lock().unwrap().clone();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "standby takeover must fire only the next future tick (no bogus catch-up), got {recorded:?}"
+        );
+        let key = recorded[0]
+            .0
+            .as_deref()
+            .expect("enqueued cron job must carry deterministic idempotency key");
+        assert!(
+            key.starts_with("cron:heartbeat:"),
+            "expected key prefix 'cron:heartbeat:', got '{key}'"
+        );
+        let key_ts: i64 = key
+            .strip_prefix("cron:heartbeat:")
+            .unwrap()
+            .parse()
+            .expect("unix timestamp suffix");
+        assert!(
+            key_ts > takeover_unix_ts,
+            "scheduled tick timestamp {key_ts} must be strictly after takeover {takeover_unix_ts} (not a stale pre-takeover tick)"
+        );
+
+        handle
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+    }
 }

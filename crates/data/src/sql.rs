@@ -697,6 +697,9 @@ pub const SQLITE_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
 /// List due pending webhook delivery records in SQLite.
 pub const SQLITE_WEBHOOK_DELIVERIES_LIST_DUE: &str =
     include_str!("../sql/sqlite/webhook_deliveries_list_due.sql");
+/// Atomically claim due pending or lease-expired webhook delivery records in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_CLAIM_DUE: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_claim_due.sql");
 
 /// Upsert a webhook delivery record in PostgreSQL.
 pub const PG_WEBHOOK_DELIVERIES_UPSERT: &str =
@@ -710,6 +713,9 @@ pub const PG_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
 /// List due pending webhook delivery records in PostgreSQL.
 pub const PG_WEBHOOK_DELIVERIES_LIST_DUE: &str =
     include_str!("../sql/postgres/webhook_deliveries_list_due.sql");
+/// Atomically claim due pending or lease-expired webhook delivery records in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_CLAIM_DUE: &str =
+    include_str!("../sql/postgres/webhook_deliveries_claim_due.sql");
 
 /// Upsert a webhook delivery record in MySQL.
 pub const MYSQL_WEBHOOK_DELIVERIES_UPSERT: &str =
@@ -723,6 +729,12 @@ pub const MYSQL_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
 /// List due pending webhook delivery records in MySQL.
 pub const MYSQL_WEBHOOK_DELIVERIES_LIST_DUE: &str =
     include_str!("../sql/mysql/webhook_deliveries_list_due.sql");
+/// Select and lock due webhook delivery records in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_SELECT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_claim_due_select.sql");
+/// Transition a locked webhook delivery record to `in_flight` in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_UPDATE: &str =
+    include_str!("../sql/mysql/webhook_deliveries_claim_due_update.sql");
 
 #[cfg(test)]
 mod tests {

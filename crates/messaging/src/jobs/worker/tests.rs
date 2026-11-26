@@ -2398,6 +2398,21 @@ async fn job_worker_enforces_per_queue_concurrency_cap() {
             Box::pin(async { Ok(()) })
         }
 
+        fn defer(
+            &self,
+            mut job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move {
+                job.attempt = job.attempt.saturating_sub(1);
+                job.assigned_worker = None;
+                job.lease_token = None;
+                self.jobs.lock().await.push(job);
+                Ok(())
+            })
+        }
+
         fn dead_letter(
             &self,
             _job: QueuedJob,

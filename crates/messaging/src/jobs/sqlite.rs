@@ -747,4 +747,240 @@ mod tests {
         assert_eq!(reaped, 1);
         assert_eq!(queue.pending_count().await.unwrap(), 1);
     }
+
+    #[tokio::test]
+    async fn sqlite_poison_pill_job_dead_letters_without_reexecuting_handler() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        use crate::jobs::{JobContext, JobHandler, JobRegistry, JobWorker};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct PoisonJob {
+            id: String,
+        }
+
+        impl Job for PoisonJob {
+            const NAME: &'static str = "test.poison_pill";
+
+            fn retry_policy(&self) -> RetryPolicy {
+                RetryPolicy::new().with_max_attempts(1)
+            }
+        }
+
+        struct CountingHandler(Arc<AtomicUsize>);
+
+        impl JobHandler<PoisonJob> for CountingHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: PoisonJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let backend = rume_data::persistence::SqliteBackend::in_memory()
+            .await
+            .expect("sqlite");
+        let queue = Arc::new(
+            SqliteJobQueue::new(backend.pool().clone())
+                .with_lease_duration(Duration::from_millis(50)),
+        );
+        queue.init_schema().await.expect("init_schema");
+
+        queue
+            .enqueue(PoisonJob { id: "p-1".into() })
+            .await
+            .expect("enqueue");
+
+        // Simulate worker 1 claiming the job (attempt = 1 == max_attempts) and crashing without ack.
+        let claimed = queue
+            .dequeue_for("crashed-worker")
+            .await
+            .expect("dequeue")
+            .expect("job claimed");
+        assert_eq!(claimed.attempt, 1);
+
+        // Wait for lease to expire.
+        tokio::time::sleep(Duration::from_millis(90)).await;
+
+        let executions = Arc::new(AtomicUsize::new(0));
+        let mut registry = JobRegistry::new();
+        registry.register(CountingHandler(Arc::clone(&executions)));
+
+        let worker = JobWorker::with_concurrency_limit(Arc::clone(&queue), Arc::new(registry), 2);
+        let handle = worker.start();
+
+        // Wait until the worker claims the expired row and dead-letters it.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if queue.dead_letter_count().await.expect("dlq count") == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        assert!(
+            handle.shutdown(Duration::from_secs(2)).await,
+            "worker shutdown must drain cleanly"
+        );
+
+        assert_eq!(
+            queue.dead_letter_count().await.expect("dlq count"),
+            1,
+            "expired max_attempts=1 job must be dead-lettered"
+        );
+        assert_eq!(queue.pending_count().await.expect("pending count"), 0);
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "handler must NOT be re-executed after attempt exceeded max_attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_fast_queue_not_blocked_by_saturated_slow_queue() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        use crate::jobs::{JobContext, JobHandler, JobRegistry, JobWorker};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct SlowJob;
+
+        impl Job for SlowJob {
+            const NAME: &'static str = "test.slow_queue_job";
+            fn queue(&self) -> &str {
+                "slow"
+            }
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct FastJob;
+
+        impl Job for FastJob {
+            const NAME: &'static str = "test.fast_queue_job";
+            fn queue(&self) -> &str {
+                "fast"
+            }
+        }
+
+        struct SlowHandler {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+            release: Arc<Notify>,
+        }
+
+        impl JobHandler<SlowJob> for SlowHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: SlowJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let started = Arc::clone(&self.started);
+                let completed = Arc::clone(&self.completed);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        struct FastHandler(Arc<AtomicUsize>);
+
+        impl JobHandler<FastJob> for FastHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: FastJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        let backend = rume_data::persistence::SqliteBackend::in_memory()
+            .await
+            .expect("sqlite");
+        let queue = Arc::new(SqliteJobQueue::new(backend.pool().clone()));
+        queue.init_schema().await.expect("init_schema");
+
+        // Enqueue 2 slow jobs (slow queue concurrency = 1) and 2 fast jobs.
+        queue.enqueue(SlowJob).await.expect("slow 1");
+        queue.enqueue(SlowJob).await.expect("slow 2");
+        queue.enqueue(FastJob).await.expect("fast 1");
+        queue.enqueue(FastJob).await.expect("fast 2");
+
+        let slow_started = Arc::new(AtomicUsize::new(0));
+        let slow_completed = Arc::new(AtomicUsize::new(0));
+        let slow_release = Arc::new(Notify::new());
+        let fast_completed = Arc::new(AtomicUsize::new(0));
+
+        let mut registry = JobRegistry::new();
+        registry.register(SlowHandler {
+            started: Arc::clone(&slow_started),
+            completed: Arc::clone(&slow_completed),
+            release: Arc::clone(&slow_release),
+        });
+        registry.register(FastHandler(Arc::clone(&fast_completed)));
+
+        let worker = JobWorker::with_concurrency_limit(Arc::clone(&queue), Arc::new(registry), 4)
+            .with_queues(["slow", "fast"])
+            .with_queue_concurrency("slow", 1);
+        let handle = worker.start();
+
+        // Both fast jobs must complete while the slow queue is saturated with slow_1 still running.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if fast_completed.load(Ordering::SeqCst) == 2
+                && slow_started.load(Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        assert_eq!(
+            fast_completed.load(Ordering::SeqCst),
+            2,
+            "fast queue jobs must complete while slow queue is saturated"
+        );
+        assert_eq!(
+            slow_started.load(Ordering::SeqCst),
+            1,
+            "slow queue concurrency=1 must allow only 1 slow job in flight"
+        );
+        assert_eq!(slow_completed.load(Ordering::SeqCst), 0);
+
+        // Release both slow jobs one by one.
+        slow_release.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if slow_started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        slow_release.notify_one();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if slow_completed.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(slow_completed.load(Ordering::SeqCst), 2);
+
+        assert!(
+            handle.shutdown(Duration::from_secs(2)).await,
+            "worker shutdown must drain cleanly"
+        );
+    }
 }

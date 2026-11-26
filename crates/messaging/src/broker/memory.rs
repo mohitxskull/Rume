@@ -27,11 +27,39 @@ impl InMemoryBroker {
 #[derive(Debug)]
 struct InMemoryConsumer {
     rx: mpsc::UnboundedReceiver<BrokerMessage>,
+    requeued: std::collections::VecDeque<BrokerMessage>,
+    in_flight: Option<BrokerMessage>,
 }
 
 impl BrokerConsumer for InMemoryConsumer {
     fn next_message(&mut self) -> BoxFuture<'_, Result<Option<BrokerMessage>, BrokerError>> {
-        Box::pin(async move { Ok(self.rx.recv().await) })
+        Box::pin(async move {
+            let msg = if let Some(m) = self.requeued.pop_front() {
+                Some(m)
+            } else {
+                self.rx.recv().await
+            };
+            self.in_flight = msg.clone();
+            Ok(msg)
+        })
+    }
+
+    fn ack(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async move {
+            self.in_flight = None;
+            Ok(())
+        })
+    }
+
+    fn nack(&mut self, requeue: bool) -> BoxFuture<'_, Result<(), BrokerError>> {
+        Box::pin(async move {
+            if let Some(msg) = self.in_flight.take()
+                && requeue
+            {
+                self.requeued.push_front(msg);
+            }
+            Ok(())
+        })
     }
 }
 
@@ -56,7 +84,11 @@ impl MessageBroker for InMemoryBroker {
             let (tx, rx) = mpsc::unbounded_channel();
             let mut map = self.subscribers.write().await;
             map.entry(topic.to_string()).or_default().push(tx);
-            Ok(Box::new(InMemoryConsumer { rx }) as Box<dyn BrokerConsumer>)
+            Ok(Box::new(InMemoryConsumer {
+                rx,
+                requeued: std::collections::VecDeque::new(),
+                in_flight: None,
+            }) as Box<dyn BrokerConsumer>)
         })
     }
 }
@@ -96,5 +128,38 @@ mod tests {
         assert_eq!(received.topic, "orders.created");
         assert_eq!(received.payload, br#"{"order_id":42}"#);
         assert_eq!(received.headers, headers);
+        consumer.ack().await.expect("ack");
+    }
+
+    #[tokio::test]
+    async fn in_memory_broker_explicit_nack_requeues_message() {
+        let broker = InMemoryBroker::new();
+        let mut consumer = broker.subscribe("orders.retry").await.expect("subscribe");
+
+        broker
+            .publish(BrokerMessage {
+                topic: "orders.retry".to_string(),
+                payload: br#"{"attempt":1}"#.to_vec(),
+                headers: BTreeMap::new(),
+            })
+            .await
+            .expect("publish");
+
+        let first = consumer
+            .next_message()
+            .await
+            .expect("first next_message")
+            .expect("message present");
+        assert_eq!(first.payload, br#"{"attempt":1}"#);
+
+        consumer.nack(true).await.expect("nack with requeue");
+
+        let redelivered = consumer
+            .next_message()
+            .await
+            .expect("second next_message")
+            .expect("redelivered message");
+        assert_eq!(redelivered.payload, br#"{"attempt":1}"#);
+        consumer.ack().await.expect("ack after redelivery");
     }
 }

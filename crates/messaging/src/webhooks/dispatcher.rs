@@ -19,6 +19,7 @@ use crate::outbox::repository::BoxFuture;
 
 const DEFAULT_WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_WEBHOOK_CLAIM_LEASE: Duration = Duration::from_secs(60);
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 4096;
 
 fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
@@ -327,14 +328,16 @@ impl WebhookDispatcher {
 
         for endpoint in endpoints {
             let now = Utc::now();
+            let lease_until =
+                now + chrono::Duration::from_std(DEFAULT_WEBHOOK_CLAIM_LEASE).unwrap_or_default();
             let mut record = WebhookDeliveryRecord {
                 id: Uuid::new_v4().to_string(),
                 endpoint_id: endpoint.id.clone(),
                 event_type: event_type.to_string(),
                 payload: payload_str.clone(),
-                status: WebhookDeliveryStatus::Pending,
+                status: WebhookDeliveryStatus::InFlight,
                 attempt: 0,
-                next_attempt_at: None,
+                next_attempt_at: Some(lease_until),
                 last_response: None,
                 created_at: now,
                 updated_at: now,
@@ -349,7 +352,10 @@ impl WebhookDispatcher {
 
     /// Processes due pending deliveries up to `limit`, returning the count attempted.
     pub async fn process_due_deliveries(&self, limit: usize) -> Result<usize, WebhookError> {
-        let due = self.store.list_due(Utc::now(), limit).await?;
+        let due = self
+            .store
+            .claim_due(Utc::now(), limit, DEFAULT_WEBHOOK_CLAIM_LEASE)
+            .await?;
         let mut attempted = 0;
 
         for mut record in due {
@@ -650,5 +656,96 @@ mod tests {
             .expect("dispatch global");
         assert_eq!(deliveries_global.len(), 1);
         assert_eq!(deliveries_global[0].endpoint_id, "ep-global");
+    }
+
+    #[tokio::test]
+    async fn concurrent_process_due_deliveries_sends_each_delivery_once() {
+        use std::collections::HashMap;
+        use tokio::sync::Barrier;
+
+        #[derive(Debug, Default)]
+        struct SlowCountingTransport {
+            counts: Mutex<HashMap<String, usize>>,
+        }
+
+        impl WebhookTransport for SlowCountingTransport {
+            fn send<'a>(
+                &'a self,
+                _url: &'a str,
+                _signature_header: &'a str,
+                _event_type: &'a str,
+                delivery_id: &'a str,
+                _body: Vec<u8>,
+            ) -> BoxFuture<'a, Result<WebhookHttpResponse, WebhookError>> {
+                let id = delivery_id.to_string();
+                Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    *self.counts.lock().unwrap().entry(id).or_insert(0) += 1;
+                    Ok(WebhookHttpResponse {
+                        status: 200,
+                        body: Some("ok".into()),
+                    })
+                })
+            }
+        }
+
+        let store = Arc::new(InMemoryWebhookDeliveryStore::new());
+        let transport = Arc::new(SlowCountingTransport::default());
+        let dispatcher = Arc::new(WebhookDispatcher::new(store.clone(), transport.clone()));
+        dispatcher.register_endpoint(WebhookEndpoint::new(
+            "ep-concurrent",
+            "https://example.test/hook",
+            SecretString::from("secret".to_string()),
+        ));
+
+        let now = Utc::now();
+        for i in 0..6 {
+            store
+                .upsert(WebhookDeliveryRecord {
+                    id: format!("del-{i}"),
+                    endpoint_id: "ep-concurrent".into(),
+                    event_type: "order.paid".into(),
+                    payload: format!(r#"{{"i":{i}}}"#),
+                    status: WebhookDeliveryStatus::Pending,
+                    attempt: 0,
+                    next_attempt_at: Some(now - chrono::Duration::seconds(5)),
+                    last_response: None,
+                    created_at: now + chrono::Duration::milliseconds(i),
+                    updated_at: now,
+                })
+                .await
+                .expect("seed delivery");
+        }
+
+        let barrier = Arc::new(Barrier::new(4));
+        let mut handles = Vec::with_capacity(4);
+        for _ in 0..4 {
+            let dispatcher = Arc::clone(&dispatcher);
+            let barrier = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                barrier.wait().await;
+                dispatcher
+                    .process_due_deliveries(10)
+                    .await
+                    .expect("process_due_deliveries")
+            }));
+        }
+
+        let mut total_attempted = 0usize;
+        for h in handles {
+            total_attempted += h.await.expect("task must not panic");
+        }
+        assert_eq!(total_attempted, 6);
+
+        let counts = transport.counts.lock().unwrap();
+        assert_eq!(counts.len(), 6);
+        for i in 0..6 {
+            let id = format!("del-{i}");
+            assert_eq!(
+                counts.get(&id).copied(),
+                Some(1),
+                "delivery {id} must be sent exactly once across 4 concurrent pollers"
+            );
+        }
     }
 }
