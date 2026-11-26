@@ -5563,6 +5563,7 @@ dependencies = [
 name = "rume"
 version = "0.1.0"
 dependencies = [
+ "async-graphql",
  "axum",
  "base64 0.23.1",
  "bergshamra",
@@ -5588,6 +5589,9 @@ dependencies = [
  "rume-observability",
  "rume-security",
  "rume-testing",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
  "sea-query",
  "secrecy",
  "serde",
@@ -5598,6 +5602,8 @@ dependencies = [
  "tempfile",
  "testcontainers-modules",
  "tokio",
+ "tokio-rustls",
+ "tonic",
  "tower",
  "tower-http 0.7.1",
  "tracing",
