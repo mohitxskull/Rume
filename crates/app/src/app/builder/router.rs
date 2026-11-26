@@ -189,7 +189,8 @@ where
             Into<std::convert::Infallible> + 'static,
         <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
-        self.router = self.router.layer(layer);
+        self.layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
@@ -380,6 +381,7 @@ where
             groups_order,
             applied_middleware,
             applied_groups,
+            layers,
             route_registry,
             body_limit,
             cors,
@@ -463,6 +465,12 @@ where
         // and returning the finalized `ctx` keeps `TestAppParts.ctx`, `on_ready`,
         // and `on_shutdown` in sync with module routes and health checks.
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx.clone());
+
+        // 0. Apply deferred `.layer()` and `.http_cache()` closures so they wrap
+        // both application routes and merged module routes.
+        for layer_fn in layers {
+            router = layer_fn(router);
+        }
 
         // 1. Apply group middleware (innermost middleware layers)
         for name in groups_order.iter().rev() {

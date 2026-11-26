@@ -164,7 +164,22 @@ impl SignedUrl {
         serializer.append_pair("expires", &expires_at.to_string());
         let query = serializer.finish();
 
-        format!("{}\n{}\n{}", method.to_ascii_uppercase(), url.path(), query)
+        let scheme = url.scheme();
+        let host = url.host_str().unwrap_or("").to_ascii_lowercase();
+        let port = url
+            .port_or_known_default()
+            .map(|p| p.to_string())
+            .unwrap_or_default();
+
+        format!(
+            "{}\n{}\n{}\n{}\n{}\n{}",
+            method.to_ascii_uppercase(),
+            scheme,
+            host,
+            port,
+            url.path(),
+            query
+        )
     }
 
     /// Appends `expires` and `sig` query parameters to `url`.
@@ -209,8 +224,22 @@ impl SignedUrl {
         let mut sig_raw: Option<String> = None;
         for (k, v) in url.query_pairs() {
             match k.as_ref() {
-                "expires" => expires_raw = Some(v.into_owned()),
-                "sig" => sig_raw = Some(v.into_owned()),
+                "expires" => {
+                    if expires_raw.is_some() {
+                        return Err(AuthError::InvalidCredentials(
+                            "duplicate expires parameter".to_owned(),
+                        ));
+                    }
+                    expires_raw = Some(v.into_owned());
+                }
+                "sig" => {
+                    if sig_raw.is_some() {
+                        return Err(AuthError::InvalidCredentials(
+                            "duplicate sig parameter".to_owned(),
+                        ));
+                    }
+                    sig_raw = Some(v.into_owned());
+                }
                 _ => {}
             }
         }
@@ -363,6 +392,35 @@ mod tests {
         let tampered = Url::parse(&signed.as_str().replace("a=1", "a=999")).unwrap();
         assert!(matches!(
             SignedUrl::verify(&signer, "GET", &tampered, 4_999),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        // Cross-host URL must be rejected
+        let cross_host =
+            Url::parse(&signed.as_str().replace("example.com", "b.example.com")).unwrap();
+        assert!(matches!(
+            SignedUrl::verify(&signer, "GET", &cross_host, 4_999),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        // Scheme-downgrade URL must be rejected
+        let downgraded = Url::parse(&signed.as_str().replacen("https://", "http://", 1)).unwrap();
+        assert!(matches!(
+            SignedUrl::verify(&signer, "GET", &downgraded, 4_999),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        // Duplicate expires parameter must be rejected
+        let dup_expires = Url::parse(&format!("{}&expires=9999999999", signed.as_str())).unwrap();
+        assert!(matches!(
+            SignedUrl::verify(&signer, "GET", &dup_expires, 4_999),
+            Err(AuthError::InvalidCredentials(_))
+        ));
+
+        // Duplicate sig parameter must be rejected
+        let dup_sig = Url::parse(&format!("{}&sig=deadbeef", signed.as_str())).unwrap();
+        assert!(matches!(
+            SignedUrl::verify(&signer, "GET", &dup_sig, 4_999),
             Err(AuthError::InvalidCredentials(_))
         ));
     }

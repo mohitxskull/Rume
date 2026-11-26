@@ -1406,3 +1406,80 @@ async fn openapi_mode_collects_app_and_module_routes_without_binding() {
         "OpenApi mode must not run application on_ready hooks"
     );
 }
+
+#[tokio::test]
+async fn deferred_layer_wraps_module_routes_and_later_routes() {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, StatusCode};
+    use tower::ServiceExt;
+
+    struct LayerTestModule;
+
+    impl crate::module::Module for LayerTestModule {
+        fn name(&self) -> &str {
+            "layer-test-module"
+        }
+
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router<()>,
+        ) -> rume_http::routing::Router<()> {
+            router.get("/module-ping", || async { "pong" })
+        }
+    }
+
+    let ctx = test_ctx();
+    let router = RumeBuilder::new(ctx)
+        .module(LayerTestModule)
+        .layer(axum::middleware::map_response(
+            |mut res: axum::response::Response| async move {
+                res.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-deferred-layer"),
+                    HeaderValue::from_static("applied"),
+                );
+                res
+            },
+        ))
+        .get("/app-ping", || async { "app-pong" })
+        .build_router(test_ctx())
+        .expect("build_router should succeed");
+
+    let app = router.with_state(test_ctx());
+
+    let mod_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/module-ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mod_res.status(), StatusCode::OK);
+    assert_eq!(
+        mod_res
+            .headers()
+            .get("x-deferred-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("applied")
+    );
+
+    let app_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/app-ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_res.status(), StatusCode::OK);
+    assert_eq!(
+        app_res
+            .headers()
+            .get("x-deferred-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("applied")
+    );
+}

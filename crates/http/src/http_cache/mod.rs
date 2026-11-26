@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use axum::body::{Body, to_bytes};
+use axum::body::Body;
 use axum::http::{HeaderName, HeaderValue, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use futures_util::StreamExt;
 use rume_data::cache::CacheBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -28,6 +29,8 @@ pub struct HttpCacheConfig {
     pub weak_etags: bool,
     /// Request header names included in the cache key and emitted in `Vary`.
     pub vary_headers: Vec<HeaderName>,
+    /// Whether requests carrying `Authorization` or `Cookie` may read/write the cache.
+    pub cache_authenticated: bool,
 }
 
 impl Default for HttpCacheConfig {
@@ -37,6 +40,7 @@ impl Default for HttpCacheConfig {
             cache_control: Some("public, max-age=60".to_string()),
             weak_etags: false,
             vary_headers: Vec::new(),
+            cache_authenticated: false,
         }
     }
 }
@@ -74,6 +78,12 @@ impl HttpCacheConfig {
     /// Sets request headers that vary the cache key and `Vary` response header.
     pub fn with_vary_headers(mut self, headers: Vec<HeaderName>) -> Self {
         self.vary_headers = headers;
+        self
+    }
+
+    /// Opts in to caching requests carrying `Authorization` or `Cookie` headers.
+    pub fn with_cache_authenticated(mut self, allow: bool) -> Self {
+        self.cache_authenticated = allow;
         self
     }
 }
@@ -154,6 +164,12 @@ where
             let cache_key = derive_cache_key(&req, &config.vary_headers);
 
             if method == Method::GET || method == Method::HEAD {
+                let has_auth_headers = req.headers().contains_key(header::AUTHORIZATION)
+                    || req.headers().contains_key(header::COOKIE);
+                if !config.cache_authenticated && has_auth_headers {
+                    return Ok(inner.call(req).await?.into_response());
+                }
+
                 let if_none_match = header_str(req.headers().get(header::IF_NONE_MATCH));
                 if let Ok(Some(raw)) = backend.get(&cache_key).await
                     && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
@@ -171,14 +187,55 @@ where
                 }
 
                 let res = inner.call(req).await?.into_response();
-                if res.status() != StatusCode::OK {
+                if res.status() != StatusCode::OK || !is_cacheable_response(res.headers()) {
+                    return Ok(res);
+                }
+
+                let content_length_too_large = res
+                    .headers()
+                    .get(header::CONTENT_LENGTH)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .is_some_and(|len| len > MAX_CACHEABLE_BODY_BYTES);
+                if content_length_too_large {
                     return Ok(res);
                 }
 
                 let (mut parts, body) = res.into_parts();
-                let Ok(bytes) = to_bytes(body, MAX_CACHEABLE_BODY_BYTES).await else {
-                    return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
-                };
+                let mut stream = body.into_data_stream();
+                let mut buf = Vec::new();
+                let mut overflow_chunk: Option<axum::body::Bytes> = None;
+                let mut stream_err = false;
+                while let Some(next) = stream.next().await {
+                    match next {
+                        Ok(chunk) => {
+                            if buf.len().saturating_add(chunk.len()) > MAX_CACHEABLE_BODY_BYTES {
+                                overflow_chunk = Some(chunk);
+                                break;
+                            }
+                            buf.extend_from_slice(&chunk);
+                        }
+                        Err(_) => {
+                            stream_err = true;
+                            break;
+                        }
+                    }
+                }
+                if overflow_chunk.is_some() || stream_err {
+                    let out_body = if method == Method::HEAD {
+                        Body::empty()
+                    } else {
+                        let prefix = futures_util::stream::iter(
+                            (!buf.is_empty())
+                                .then(|| Ok(axum::body::Bytes::from(buf)))
+                                .into_iter()
+                                .chain(overflow_chunk.map(Ok)),
+                        );
+                        Body::from_stream(prefix.chain(stream))
+                    };
+                    return Ok(Response::from_parts(parts, out_body));
+                }
+                let bytes = axum::body::Bytes::from(buf);
 
                 let etag = parts
                     .headers
@@ -227,16 +284,12 @@ where
             }
 
             if matches!(method, Method::PUT | Method::PATCH | Method::DELETE) {
-                if let Some(if_match) = header_str(req.headers().get(header::IF_MATCH)) {
-                    let matched = match backend.get(&cache_key).await {
-                        Ok(Some(raw)) => serde_json::from_slice::<CachedHttpResponse>(&raw)
-                            .map(|cached| etag_matches_strong(&if_match, &cached.etag))
-                            .unwrap_or(false),
-                        _ => false,
-                    };
-                    if !matched {
-                        return Ok(StatusCode::PRECONDITION_FAILED.into_response());
-                    }
+                if let Some(if_match) = header_str(req.headers().get(header::IF_MATCH))
+                    && let Ok(Some(raw)) = backend.get(&cache_key).await
+                    && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
+                    && !etag_matches_strong(&if_match, &cached.etag)
+                {
+                    return Ok(StatusCode::PRECONDITION_FAILED.into_response());
                 }
 
                 let res = inner.call(req).await?.into_response();
@@ -321,7 +374,7 @@ where
             }
 
             let (mut parts, body) = res.into_parts();
-            let Ok(bytes) = to_bytes(body, MAX_CACHEABLE_BODY_BYTES).await else {
+            let Ok(bytes) = axum::body::to_bytes(body, MAX_CACHEABLE_BODY_BYTES).await else {
                 return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
             };
 
@@ -355,23 +408,71 @@ where
     }
 }
 
+fn is_cacheable_response(headers: &axum::http::HeaderMap) -> bool {
+    if headers.contains_key(header::SET_COOKIE) {
+        return false;
+    }
+    for val in headers.get_all(header::VARY) {
+        if let Ok(s) = val.to_str()
+            && s.split(',').any(|token| token.trim() == "*")
+        {
+            return false;
+        }
+    }
+    for val in headers.get_all(header::CACHE_CONTROL) {
+        if let Ok(s) = val.to_str() {
+            for directive in s.split(',') {
+                let name = directive.split('=').next().unwrap_or("").trim();
+                if name.eq_ignore_ascii_case("private")
+                    || name.eq_ignore_ascii_case("no-store")
+                    || name.eq_ignore_ascii_case("no-cache")
+                {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
+fn push_framed(buf: &mut String, value: &str) {
+    use std::fmt::Write as _;
+    let _ = write!(buf, "{}:{value}|", value.len());
+}
+
 fn derive_cache_key(req: &Request<Body>, vary_headers: &[HeaderName]) -> String {
     let pq = req
         .uri()
         .path_and_query()
         .map(|v| v.as_str())
         .unwrap_or_else(|| req.uri().path());
-    let mut key = format!("rume:http_cache:{pq}");
+    let tenant_id = req
+        .extensions()
+        .get::<rume_security::tenant::Tenant>()
+        .map(|t| t.id.as_str())
+        .or_else(|| {
+            req.extensions()
+                .get::<rume_security::tenant::TenantContext>()
+                .map(|tc| tc.id.as_str())
+        });
+
+    let mut key = String::from("rume:http_cache:");
+    match tenant_id {
+        Some(tid) => {
+            key.push_str("1:");
+            push_framed(&mut key, tid);
+        }
+        None => key.push_str("0:|"),
+    }
+    push_framed(&mut key, pq);
     for name in vary_headers {
+        push_framed(&mut key, name.as_str());
         let val = req
             .headers()
             .get(name)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
-        key.push('|');
-        key.push_str(name.as_str());
-        key.push('=');
-        key.push_str(val);
+        push_framed(&mut key, val);
     }
     key
 }
@@ -457,7 +558,7 @@ fn response_from_cached(
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_bytes(&v),
         ) {
-            res.headers_mut().insert(name, val);
+            res.headers_mut().append(name, val);
         }
     }
     if let Ok(val) = HeaderValue::from_str(&cached.etag) {
@@ -697,6 +798,333 @@ mod tests {
         );
         let head_hit_body = to_bytes(head_hit.into_body(), usize::MAX).await.unwrap();
         assert!(head_hit_body.is_empty());
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn authenticated_and_private_responses_are_never_replayed_to_other_callers() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let auth_hits = Arc::new(AtomicUsize::new(0));
+        let auth_hits_clone = Arc::clone(&auth_hits);
+        let cookie_hits = Arc::new(AtomicUsize::new(0));
+        let cookie_hits_clone = Arc::clone(&cookie_hits);
+        let private_hits = Arc::new(AtomicUsize::new(0));
+        let private_hits_clone = Arc::clone(&private_hits);
+
+        let app = Router::new()
+            .route(
+                "/auth-secret",
+                get(move |req: Request<Body>| {
+                    let hits = Arc::clone(&auth_hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        let auth = req
+                            .headers()
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("none")
+                            .to_owned();
+                        format!("secret-{n}-{auth}")
+                    }
+                }),
+            )
+            .route(
+                "/login",
+                get(move || {
+                    let hits = Arc::clone(&cookie_hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        (
+                            [(header::SET_COOKIE, format!("sid=user-{n}; HttpOnly"))],
+                            format!("logged-in-{n}"),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/private",
+                get(move || {
+                    let hits = Arc::clone(&private_hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        (
+                            [(header::CACHE_CONTROL, "private, max-age=60")],
+                            format!("private-{n}"),
+                        )
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        // 1. Request with Authorization must bypass cache read/write.
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/auth-secret")
+                    .header(header::AUTHORIZATION, "Bearer alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r1.into_body(), usize::MAX).await.unwrap(),
+            b"secret-1-Bearer alice".as_slice()
+        );
+
+        let r2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/auth-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r2.into_body(), usize::MAX).await.unwrap(),
+            b"secret-2-none".as_slice()
+        );
+        assert_eq!(auth_hits.load(Ordering::SeqCst), 2);
+
+        // 2. Response with Set-Cookie must not be cached or replayed.
+        let c1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            c1.headers().get(header::SET_COOKIE).unwrap(),
+            "sid=user-1; HttpOnly"
+        );
+        let c2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/login")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            c2.headers().get(header::SET_COOKIE).unwrap(),
+            "sid=user-2; HttpOnly"
+        );
+        assert_eq!(cookie_hits.load(Ordering::SeqCst), 2);
+
+        // 3. Response with Cache-Control: private must not be cached or replayed.
+        let p1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(p1.into_body(), usize::MAX).await.unwrap(),
+            b"private-1".as_slice()
+        );
+        let p2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/private")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(p2.into_body(), usize::MAX).await.unwrap(),
+            b"private-2".as_slice()
+        );
+        assert_eq!(private_hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn large_body_exceeding_max_cacheable_bytes_passes_through_without_500() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let large_size = MAX_CACHEABLE_BODY_BYTES + 1024 * 1024; // 9 MiB
+
+        let app = Router::new()
+            .route(
+                "/large-known",
+                get(move || async move { vec![b'x'; large_size] }),
+            )
+            .route(
+                "/large-stream",
+                get(move || async move {
+                    let chunk = vec![b'y'; 1024 * 1024];
+                    let stream = futures_util::stream::iter(
+                        (0..9).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+                    );
+                    Body::from_stream(stream)
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let res_known = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/large-known")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_known.status(), StatusCode::OK);
+        let body_known = to_bytes(res_known.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body_known.len(), large_size);
+
+        let res_stream = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/large-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_stream.status(), StatusCode::OK);
+        let body_stream = to_bytes(res_stream.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body_stream.len(), 9 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn put_with_if_match_wildcard_on_cold_cache_reaches_inner_handler() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let put_hits = Arc::new(AtomicUsize::new(0));
+        let put_hits_clone = Arc::clone(&put_hits);
+
+        let app = Router::new()
+            .route(
+                "/resource/cold",
+                put(move || {
+                    let hits = Arc::clone(&put_hits_clone);
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        "updated-cold"
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/resource/cold")
+                    .header(header::IF_MATCH, "*")
+                    .body(Body::from("payload"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(put_hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn tenant_isolation_and_multi_value_headers_are_preserved() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/tenant-items",
+                get(move |req: Request<Body>| {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        let tenant = req
+                            .extensions()
+                            .get::<rume_security::tenant::Tenant>()
+                            .map(|t| t.id.clone())
+                            .unwrap_or_else(|| "none".to_string());
+                        let mut res = Response::new(Body::from(format!("{tenant}-{n}")));
+                        res.headers_mut().append(
+                            HeaderName::from_static("x-multi"),
+                            HeaderValue::from_static("one"),
+                        );
+                        res.headers_mut().append(
+                            HeaderName::from_static("x-multi"),
+                            HeaderValue::from_static("two"),
+                        );
+                        res
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let mut req_a = Request::builder()
+            .method(Method::GET)
+            .uri("/tenant-items")
+            .body(Body::empty())
+            .unwrap();
+        req_a
+            .extensions_mut()
+            .insert(rume_security::tenant::Tenant::new("tenant-a", "a"));
+        let res_a = app.clone().oneshot(req_a).await.unwrap();
+        assert_eq!(
+            to_bytes(res_a.into_body(), usize::MAX).await.unwrap(),
+            b"tenant-a-1".as_slice()
+        );
+
+        let mut req_b = Request::builder()
+            .method(Method::GET)
+            .uri("/tenant-items")
+            .body(Body::empty())
+            .unwrap();
+        req_b
+            .extensions_mut()
+            .insert(rume_security::tenant::Tenant::new("tenant-b", "b"));
+        let res_b = app.clone().oneshot(req_b).await.unwrap();
+        assert_eq!(
+            to_bytes(res_b.into_body(), usize::MAX).await.unwrap(),
+            b"tenant-b-2".as_slice()
+        );
+
+        // Cached hit for tenant-a preserves multi-value headers.
+        let mut req_a2 = Request::builder()
+            .method(Method::GET)
+            .uri("/tenant-items")
+            .body(Body::empty())
+            .unwrap();
+        req_a2
+            .extensions_mut()
+            .insert(rume_security::tenant::Tenant::new("tenant-a", "a"));
+        let res_a2 = app.oneshot(req_a2).await.unwrap();
+        let multi: Vec<&str> = res_a2
+            .headers()
+            .get_all("x-multi")
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(multi, vec!["one", "two"]);
+        assert_eq!(
+            to_bytes(res_a2.into_body(), usize::MAX).await.unwrap(),
+            b"tenant-a-1".as_slice()
+        );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }
 }

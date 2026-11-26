@@ -283,6 +283,16 @@ where
     applied_middleware: BTreeSet<String>,
     /// Group names marked for application via `use_group`.
     applied_groups: BTreeSet<String>,
+    /// Deferred Tower layers registered via [`layer`](Self::layer) or
+    /// [`http_cache`](Self::http_cache), applied after module routes are merged.
+    layers: Vec<
+        Box<
+            dyn FnOnce(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
     /// Maximum time to wait for all shutdown hooks before force-terminating.
     shutdown_timeout: Duration,
     /// Transport-level maximum request body size in bytes (default: 2 MiB; `None` disables the cap).
@@ -331,6 +341,7 @@ where
             groups_order: Vec::new(),
             applied_middleware: BTreeSet::new(),
             applied_groups: BTreeSet::new(),
+            layers: Vec::new(),
             shutdown_timeout: Duration::from_secs(30),
             body_limit: Some(rume_http::transport::DEFAULT_BODY_LIMIT_BYTES),
             cors: None,
@@ -530,7 +541,8 @@ where
 
     /// Apply an [`rume_http::http_cache::HttpCacheLayer`] to the application router.
     pub fn http_cache(mut self, layer: rume_http::http_cache::HttpCacheLayer) -> Self {
-        self.router = self.router.layer(layer);
+        self.layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
