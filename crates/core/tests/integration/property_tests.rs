@@ -8,14 +8,14 @@
 use proptest::prelude::*;
 use rume::app::TraceContext;
 use rume::env::secrets::redact_diagnostic_text;
-use rume::helpers::bytes::{format_bytes, parse_bytes};
-use rume::helpers::case::{camel_case, kebab_case, pascal_case, snake_case};
-use rume::helpers::duration::{format_duration, parse_duration};
-use rume::helpers::mask::mask_secret;
-use rume::helpers::slug::slug;
-use rume::helpers::truncate::truncate;
-use rume::helpers::whitespace::condense_whitespace;
 use rume::routing::Matcher;
+use rume::util::bytes::{format_bytes, parse_bytes};
+use rume::util::case::{camel_case, kebab_case, pascal_case, snake_case};
+use rume::util::duration::{format_duration, parse_duration};
+use rume::util::mask::mask_secret;
+use rume::util::slug::slug;
+use rume::util::truncate::truncate;
+use rume::util::whitespace::condense_whitespace;
 use std::time::Duration;
 
 proptest! {

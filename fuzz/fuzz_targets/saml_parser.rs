@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rume_enterprise::enterprise::saml::{
+use rume_enterprise::saml::{
     SamlError, SamlParser, SamlSignatureVerifier, parse_iso8601_strict,
 };
 
@@ -10,9 +10,9 @@ struct AcceptAllVerifier;
 impl SamlSignatureVerifier for AcceptAllVerifier {
     fn verify_assertion_signature(
         &self,
-        _signed_xml: &str,
-        _signature_value: &str,
-        _expected_ref_id: &str,
+        _raw_xml: &str,
+        _assertion_id: &str,
+        _assertion_xml: &str,
     ) -> Result<(), SamlError> {
         Ok(())
     }

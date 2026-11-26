@@ -13,14 +13,14 @@ use crate::persistence::config::DatabaseConfig;
 use crate::persistence::error::PersistenceError;
 use crate::persistence::row::DbRow;
 
-pub const OUTBOX_TABLE_SCHEMA: &str = include_str!("sql/mysql/outbox_schema.sql");
-const MIGRATIONS_SCHEMA: &str = include_str!("sql/mysql/migrations_schema.sql");
+pub const OUTBOX_TABLE_SCHEMA: &str = include_str!("../../sql/mysql/outbox_schema.sql");
+const MIGRATIONS_SCHEMA: &str = include_str!("../../sql/mysql/migrations_schema.sql");
 
 // Per-operation MySQL SQL, externalized from inline string literals.
 // Why: All MySQL queries (including lock cleanup and lease-expiry lookup) live in
 // `sql/mysql/*.sql` so this module contains no divergent inline SQL literals.
-const MYSQL_PING_SQL: &str = include_str!("sql/common/ping.sql");
-const MYSQL_AUDIT_INSERT_SQL: &str = include_str!("sql/mysql/audit_insert.sql");
+const MYSQL_PING_SQL: &str = include_str!("../../sql/common/ping.sql");
+const MYSQL_AUDIT_INSERT_SQL: &str = include_str!("../../sql/mysql/audit_insert.sql");
 
 /// Production MySQL and MariaDB database backend backed by an asynchronous SQLx connection pool.
 #[derive(Clone)]

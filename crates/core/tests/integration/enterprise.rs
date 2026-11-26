@@ -312,11 +312,11 @@ mod saml_tests {
 
     #[test]
     fn test_enterprise_idp_metadata_entity_id_resolution() {
-        let valid_metadata = r#"<EntityDescriptor entityID="https://mock-idp.example.com"><IDPSSODescriptor /></EntityDescriptor>"#;
+        let valid_metadata = r#"<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://mock-idp.example.com"><IDPSSODescriptor /></EntityDescriptor>"#;
         let entity_id = SamlParser::parse_entity_id(valid_metadata).expect("parse valid entity id");
         assert_eq!(entity_id, "https://mock-idp.example.com");
 
-        let missing_id = r#"<EntityDescriptor><IDPSSODescriptor /></EntityDescriptor>"#;
+        let missing_id = r#"<EntityDescriptor xmlns="urn:oasis:names:tc:SAML:2.0:metadata"><IDPSSODescriptor /></EntityDescriptor>"#;
         assert!(
             SamlParser::parse_entity_id(missing_id).is_err(),
             "missing entityID must fail"

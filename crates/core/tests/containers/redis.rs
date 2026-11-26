@@ -550,28 +550,28 @@ async fn test_redis_idempotency_store_token_fencing_and_heartbeat_renewal() {
         .expect("acquire token-A");
     assert_eq!(status_a, IdempotencyStatus::New);
 
-    // 2. Worker B attempts to complete or release with token-B -> fails closed with Fatal error
+    // 2. Worker B attempts to complete or release with token-B -> fails closed with IdempotencyLockLost
     let comp_err = store
         .complete_with_token(key, "token-B", Some(b"fake-completion".to_vec()))
         .await;
     assert!(
-        matches!(comp_err, Err(rume::jobs::JobError::Fatal(_))),
-        "complete with wrong token must fail closed with Fatal, got: {comp_err:?}"
+        matches!(comp_err, Err(rume::jobs::JobError::IdempotencyLockLost(_))),
+        "complete with wrong token must fail closed with IdempotencyLockLost, got: {comp_err:?}"
     );
 
     let rel_err = store.release_with_token(key, "token-B").await;
     assert!(
-        matches!(rel_err, Err(rume::jobs::JobError::Fatal(_))),
-        "release with wrong token must fail closed with Fatal, got: {rel_err:?}"
+        matches!(rel_err, Err(rume::jobs::JobError::IdempotencyLockLost(_))),
+        "release with wrong token must fail closed with IdempotencyLockLost, got: {rel_err:?}"
     );
 
-    // 3. Worker B attempts to extend lock with token-B -> fails closed with Fatal error
+    // 3. Worker B attempts to extend lock with token-B -> fails closed with IdempotencyLockLost
     let ext_err = store
         .extend_lock_with_token(key, "token-B", Duration::from_secs(120))
         .await;
     assert!(
-        matches!(ext_err, Err(rume::jobs::JobError::Fatal(_))),
-        "extend with wrong token must fail closed with Fatal, got: {ext_err:?}"
+        matches!(ext_err, Err(rume::jobs::JobError::IdempotencyLockLost(_))),
+        "extend with wrong token must fail closed with IdempotencyLockLost, got: {ext_err:?}"
     );
 
     // 4. Worker A extends its own lock -> succeeds

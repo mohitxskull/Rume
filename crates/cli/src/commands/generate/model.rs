@@ -6,7 +6,7 @@ pub fn run(name: &str) {
     super::validate_identifier(name, "model");
 
     let module_name = name.to_ascii_lowercase().replace('-', "_");
-    let struct_name = rume::helpers::pascal_case(&module_name);
+    let struct_name = rume::util::pascal_case(&module_name);
 
     let dir = "src/models";
     let _ = std::fs::create_dir_all(dir);

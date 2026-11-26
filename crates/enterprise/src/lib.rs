@@ -4,6 +4,8 @@
 
 pub mod enterprise;
 pub mod saga;
+#[cfg(feature = "saml")]
+pub mod saml;
 
 #[cfg(test)]
 mod tests {
