@@ -13,7 +13,7 @@ path = "src/main.rs"
 [dependencies]
 rume = { version = "=0.1.0", path = "../../crates/core", features = ["postgres", "sqlite", "mysql"] }
 clap.workspace = true
-clap_complete = "=4.6.11"
+clap_complete = "=4.6.12"
 tokio.workspace = true
 console = "=0.16.6"
 comfy-table = "=8.0.1"

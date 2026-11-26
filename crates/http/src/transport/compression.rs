@@ -74,7 +74,7 @@ impl CompressionConfig {
 
     /// Builds a configured [`CompressionLayer`].
     pub fn build_layer(&self) -> CompressionLayer {
-        let predicate = SizeAbove::new(self.min_size_bytes)
+        let predicate = SizeAbove::new(u64::from(self.min_size_bytes))
             .and(NotForContentType::GRPC)
             .and(NotForContentType::IMAGES)
             .and(NotForContentType::SSE);

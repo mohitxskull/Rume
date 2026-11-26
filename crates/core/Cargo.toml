@@ -69,7 +69,7 @@ schemars = ["rume-foundation/schemars"]
 # when tests enable `postgres`, `sqlite`, or `mysql`.
 tokio = { workspace = true, features = ["test-util"] }
 sqlx.workspace = true
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 deadpool-redis.workspace = true
 futures-util.workspace = true
 garde = { workspace = true, features = ["derive", "email", "url"] }
@@ -82,7 +82,7 @@ tracing-subscriber.workspace = true
 tempfile = "=3.27.0"
 testcontainers-modules = { workspace = true }
 insta = { version = "=1.49.0", features = ["json"] }
-rstest = "=0.28.0"
+rstest = "=0.29.0"
 wiremock = "=0.6.5"
 ureq = "=3.5.2"
 proptest.workspace = true

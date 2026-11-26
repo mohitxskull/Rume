@@ -14,7 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 sha2.workspace = true
 sqlparser = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }

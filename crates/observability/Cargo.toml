@@ -21,7 +21,7 @@ opentelemetry.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["experimental_metrics_custom_reader"] }
 opentelemetry-appender-tracing.workspace = true
 opentelemetry-otlp = { workspace = true, optional = true }
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 
 [features]
 otel = ["dep:opentelemetry-otlp"]
