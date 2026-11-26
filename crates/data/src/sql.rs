@@ -535,6 +535,8 @@ pub const SQLITE_SAGA_LIST_INCOMPLETE: &str =
     include_str!("../sql/sqlite/saga_list_incomplete.sql");
 /// Acquire an execution claim lease for a saga in SQLite.
 pub const SQLITE_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/sqlite/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_RENEW_CLAIM: &str = include_str!("../sql/sqlite/saga_renew_claim.sql");
 /// Release an execution claim lease for a saga in SQLite.
 pub const SQLITE_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/sqlite/saga_release_claim.sql");
 
@@ -550,6 +552,8 @@ pub const PG_SAGA_LOAD: &str = include_str!("../sql/postgres/saga_load.sql");
 pub const PG_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/postgres/saga_list_incomplete.sql");
 /// Acquire an execution claim lease for a saga in PostgreSQL.
 pub const PG_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/postgres/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_RENEW_CLAIM: &str = include_str!("../sql/postgres/saga_renew_claim.sql");
 /// Release an execution claim lease for a saga in PostgreSQL.
 pub const PG_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/postgres/saga_release_claim.sql");
 
@@ -565,6 +569,8 @@ pub const MYSQL_SAGA_LOAD: &str = include_str!("../sql/mysql/saga_load.sql");
 pub const MYSQL_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/mysql/saga_list_incomplete.sql");
 /// Acquire an execution claim lease for a saga in MySQL.
 pub const MYSQL_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/mysql/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_RENEW_CLAIM: &str = include_str!("../sql/mysql/saga_renew_claim.sql");
 /// Release an execution claim lease for a saga in MySQL.
 pub const MYSQL_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/mysql/saga_release_claim.sql");
 

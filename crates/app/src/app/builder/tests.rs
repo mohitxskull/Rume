@@ -1483,3 +1483,62 @@ async fn deferred_layer_wraps_module_routes_and_later_routes() {
         Some("applied")
     );
 }
+
+#[tokio::test]
+async fn plain_http_shutdown_completes_within_shutdown_timeout_with_stalled_connection() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let handler_entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered_clone = Arc::clone(&handler_entered);
+    let shutdown_hook_ran = Arc::new(AtomicBool::new(false));
+    let shutdown_hook_ran_clone = Arc::clone(&shutdown_hook_ran);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        Rume::new()
+            .shutdown_timeout(Duration::from_millis(120))
+            .get("/stall", move || {
+                let entered = Arc::clone(&handler_entered_clone);
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            })
+            .on_shutdown(move |_ctx| async move {
+                shutdown_hook_ran_clone.store(true, Ordering::SeqCst);
+            })
+            .run_with_listener_and_signal(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"GET /stall HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    handler_entered.notified().await;
+
+    let started = tokio::time::Instant::now();
+    let _ = shutdown_tx.send(());
+
+    let res = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("plain-HTTP shutdown must not hang past shutdown_timeout with a stalled client")
+        .expect("server task should not panic");
+    res.expect("server should complete shutdown cleanly");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown should complete promptly after shutdown_timeout"
+    );
+    assert!(
+        shutdown_hook_ran.load(Ordering::SeqCst),
+        "on_shutdown hook must run after plain-HTTP drain timeout"
+    );
+    drop(tcp);
+}

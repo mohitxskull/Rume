@@ -36,6 +36,15 @@ impl SagaStore for FaultySagaStore {
         record: &SagaRecord,
         expected_version: u64,
     ) -> BoxFuture<'_, Result<(), SagaError>> {
+        self.save_record_cas_with_claim(record, expected_version, None)
+    }
+
+    fn save_record_cas_with_claim(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+        claim_token: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
         let should_fail = self
             .fail_on
             .lock()
@@ -50,7 +59,8 @@ impl SagaStore for FaultySagaStore {
                 })
             });
         }
-        self.inner.save_record_cas(record, expected_version)
+        self.inner
+            .save_record_cas_with_claim(record, expected_version, claim_token)
     }
 
     fn load_record(&self, saga_id: &str) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>> {

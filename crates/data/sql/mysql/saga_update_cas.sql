@@ -7,4 +7,5 @@ SET saga_name = ?,
     updated_at = ?,
     version = version + 1
 WHERE saga_id = ?
-  AND version = ?;
+  AND version = ?
+  AND (? IS NULL OR claim_token = ?);

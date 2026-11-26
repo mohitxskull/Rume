@@ -935,26 +935,24 @@ where
                     .await
                 } else {
                     println!("listening on http://{addr}");
-                    axum::serve(
+                    serve_plain_http(
                         listener,
-                        router
-                            .with_state(serve_ctx.clone())
-                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                        router.with_state(serve_ctx.clone()),
+                        graceful_signal,
+                        shutdown_timeout,
                     )
-                    .with_graceful_shutdown(graceful_signal)
                     .await
                 }
             }
             #[cfg(not(feature = "tls"))]
             {
                 println!("listening on http://{addr}");
-                axum::serve(
+                serve_plain_http(
                     listener,
-                    router
-                        .with_state(serve_ctx.clone())
-                        .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+                    router.with_state(serve_ctx.clone()),
+                    graceful_signal,
+                    shutdown_timeout,
                 )
-                .with_graceful_shutdown(graceful_signal)
                 .await
             }
         };
@@ -998,6 +996,48 @@ where
     #[cfg(feature = "tls")]
     tls: Option<rume_http::tls::TlsConfig>,
     realtime: Option<rume_http::realtime::RealtimeHub>,
+}
+
+async fn serve_plain_http<F>(
+    listener: TcpListener,
+    app: Router<()>,
+    graceful_signal: F,
+    shutdown_timeout: Duration,
+) -> Result<(), std::io::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (signal_fired_tx, signal_fired_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_fut = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            graceful_signal.await;
+            let _ = signal_fired_tx.send(());
+        }),
+    );
+    tokio::pin!(serve_fut);
+
+    tokio::select! {
+        res = &mut serve_fut => res,
+        _ = signal_fired_rx => {
+            // Why: Bound plain-HTTP post-signal connection drain by `shutdown_timeout`
+            // (matching `serve_tls_listener`) so stalled/keep-alive clients cannot hang
+            // graceful shutdown indefinitely and prevent `run_shutdown()` hooks from running.
+            match tokio::time::timeout(shutdown_timeout, serve_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = shutdown_timeout.as_millis() as u64,
+                        "plain-HTTP graceful shutdown drain timed out; force-closing remaining connections"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

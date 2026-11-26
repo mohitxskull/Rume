@@ -25,6 +25,19 @@ pub async fn ws_handler(
         .on_upgrade(move |socket| handle_ws_socket(socket, hub, sub, auth, room)))
 }
 
+async fn send_with_timeout(
+    socket: &mut WebSocket,
+    msg: Message,
+    timeout: std::time::Duration,
+) -> bool {
+    // Why: A client with a zero TCP receive window would otherwise stall `socket.send().await`
+    // indefinitely, preventing heartbeat enforcement and `RealtimeRecv::Shutdown` from running.
+    matches!(
+        tokio::time::timeout(timeout, socket.send(msg)).await,
+        Ok(Ok(()))
+    )
+}
+
 async fn handle_ws_socket(
     mut socket: WebSocket,
     hub: RealtimeHub,
@@ -52,7 +65,7 @@ async fn handle_ws_socket(
                 RealtimeRecv::Event(ev) => {
                     match serde_json::to_string(&ev) {
                         Ok(json) => {
-                            if socket.send(Message::Text(json.into())).await.is_err() {
+                            if !send_with_timeout(&mut socket, Message::Text(json.into()), hb_timeout).await {
                                 break;
                             }
                         }
@@ -73,17 +86,20 @@ async fn handle_ws_socket(
                         "data": { "skipped": skipped }
                     })
                     .to_string();
-                    if socket.send(Message::Text(lag_json.into())).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Text(lag_json.into()), hb_timeout).await {
                         break;
                     }
                 }
                 RealtimeRecv::Shutdown => {
-                    let _ = socket
-                        .send(Message::Close(Some(CloseFrame {
+                    let _ = send_with_timeout(
+                        &mut socket,
+                        Message::Close(Some(CloseFrame {
                             code: 1001,
                             reason: "server shutting down".into(),
-                        })))
-                        .await;
+                        })),
+                        hb_timeout,
+                    )
+                    .await;
                     break;
                 }
                 RealtimeRecv::Closed => break,
@@ -99,17 +115,20 @@ async fn handle_ws_socket(
                     room = %room,
                     "websocket heartbeat timeout; closing unresponsive client"
                 );
-                let _ = socket
-                    .send(Message::Close(Some(CloseFrame {
+                let _ = send_with_timeout(
+                    &mut socket,
+                    Message::Close(Some(CloseFrame {
                         code: 1001,
                         reason: "heartbeat timeout".into(),
-                    })))
-                    .await;
+                    })),
+                    hb_timeout,
+                )
+                .await;
                 break;
             },
             _ = ping_ticker.tick() => {
                 if awaiting_pong_since.is_none() {
-                    if socket.send(Message::Ping(Bytes::new())).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Ping(Bytes::new()), hb_timeout).await {
                         break;
                     }
                     awaiting_pong_since = Some(tokio::time::Instant::now());
@@ -120,7 +139,7 @@ async fn handle_ws_socket(
                     awaiting_pong_since = None;
                 }
                 Some(Ok(Message::Ping(payload))) => {
-                    if socket.send(Message::Pong(payload)).await.is_err() {
+                    if !send_with_timeout(&mut socket, Message::Pong(payload), hb_timeout).await {
                         break;
                     }
                 }

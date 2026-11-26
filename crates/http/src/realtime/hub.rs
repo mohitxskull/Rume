@@ -160,8 +160,10 @@ struct PubSubEnvelope {
 /// Subscription handle to a tenant-scoped room on [`RealtimeHub`].
 #[derive(Debug)]
 pub struct RealtimeSubscription {
-    rx: broadcast::Receiver<RealtimeEvent>,
+    rx: Option<broadcast::Receiver<RealtimeEvent>>,
     shutdown_rx: watch::Receiver<bool>,
+    hub: Arc<RealtimeHubInner>,
+    key: (String, String),
 }
 
 impl RealtimeSubscription {
@@ -170,6 +172,9 @@ impl RealtimeSubscription {
         if *self.shutdown_rx.borrow() {
             return RealtimeRecv::Shutdown;
         }
+        let Some(rx) = self.rx.as_mut() else {
+            return RealtimeRecv::Closed;
+        };
         tokio::select! {
             biased;
             res = self.shutdown_rx.changed() => {
@@ -179,10 +184,29 @@ impl RealtimeSubscription {
                     RealtimeRecv::Closed
                 }
             }
-            msg = self.rx.recv() => match msg {
+            msg = rx.recv() => match msg {
                 Ok(ev) => RealtimeRecv::Event(ev),
                 Err(broadcast::error::RecvError::Lagged(skipped)) => RealtimeRecv::Lagged(skipped),
                 Err(broadcast::error::RecvError::Closed) => RealtimeRecv::Closed,
+            }
+        }
+    }
+}
+
+impl Drop for RealtimeSubscription {
+    fn drop(&mut self) {
+        // Drop our receiver before inspecting `receiver_count()` so it is no longer counted.
+        drop(self.rx.take());
+        // Why: Evict empty room channels and abort their pubsub pump tasks when the last
+        // local subscriber disconnects so ephemeral rooms never leak memory or broker subscriptions.
+        let mut channels = self.hub.channels.write();
+        let should_evict = channels
+            .get(&self.key)
+            .is_some_and(|tx| tx.receiver_count() == 0);
+        if should_evict {
+            channels.remove(&self.key);
+            if let Some(handle) = self.hub.pubsub_tasks.lock().remove(&self.key) {
+                handle.abort();
             }
         }
     }
@@ -297,18 +321,6 @@ impl RealtimeHub {
         format!("realtime:{tenant_id}:{room}")
     }
 
-    fn sender_for(&self, tenant_id: &str, room: &str) -> broadcast::Sender<RealtimeEvent> {
-        let key = (tenant_id.to_string(), room.to_string());
-        if let Some(tx) = self.inner.channels.read().get(&key) {
-            return tx.clone();
-        }
-        let mut guard = self.inner.channels.write();
-        guard
-            .entry(key)
-            .or_insert_with(|| broadcast::channel(self.inner.config.channel_capacity).0)
-            .clone()
-    }
-
     async fn ensure_pubsub_pump(
         &self,
         tenant_id: &str,
@@ -389,8 +401,17 @@ impl RealtimeHub {
             return Err(RealtimeError::ShuttingDown);
         }
 
-        let tx = self.sender_for(tenant_id, room);
-        let local_receivers = tx.send(event.clone()).unwrap_or(0);
+        // Why: Look up existing local room channel without inserting a new entry so
+        // publishing to rooms with no local subscribers never leaks channel map entries.
+        let local_receivers = {
+            let key = (tenant_id.to_string(), room.to_string());
+            self.inner
+                .channels
+                .read()
+                .get(&key)
+                .and_then(|tx| tx.send(event.clone()).ok())
+                .unwrap_or(0)
+        };
 
         if let Some(ref pubsub) = self.inner.pubsub {
             let topic = Self::topic_for(tenant_id, room);
@@ -421,13 +442,28 @@ impl RealtimeHub {
             return Err(RealtimeError::ShuttingDown);
         }
 
-        let tx = self.sender_for(tenant_id, room);
-        self.ensure_pubsub_pump(tenant_id, room, tx.clone()).await?;
-
-        Ok(RealtimeSubscription {
-            rx: tx.subscribe(),
+        let key = (tenant_id.to_string(), room.to_string());
+        // Why: Subscribe while holding the write lock and wrap `rx` in `RealtimeSubscription`
+        // before awaiting `ensure_pubsub_pump` so concurrent drops cannot evict the room mid-setup
+        // and any pump error automatically cleans up via `Drop`.
+        let (tx, rx) = {
+            let mut guard = self.inner.channels.write();
+            let tx = guard
+                .entry(key.clone())
+                .or_insert_with(|| broadcast::channel(self.inner.config.channel_capacity).0)
+                .clone();
+            let rx = tx.subscribe();
+            (tx, rx)
+        };
+        let sub = RealtimeSubscription {
+            rx: Some(rx),
             shutdown_rx: self.inner.shutdown_tx.subscribe(),
-        })
+            hub: Arc::clone(&self.inner),
+            key,
+        };
+        self.ensure_pubsub_pump(tenant_id, room, tx).await?;
+
+        Ok(sub)
     }
 
     /// Broadcasts the shutdown signal to all active WebSocket and SSE streams and
@@ -450,8 +486,16 @@ impl RealtimeHub {
             return;
         }
         let deadline = tokio::time::Instant::now() + self.inner.config.shutdown_drain_timeout;
-        while self.inner.active_connections.load(Ordering::Acquire) > 0 {
+        loop {
+            // Why: Register and `.enable()` the waiter before checking `active_connections`
+            // so a `ConnectionGuard::drop` calling `notify_waiters()` between the load and
+            // the await cannot cause a lost wakeup that stalls until `deadline`.
             let notified = self.inner.drain_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.inner.active_connections.load(Ordering::Acquire) == 0 {
+                return;
+            }
             if tokio::time::timeout_at(deadline, notified).await.is_err() {
                 tracing::warn!(
                     remaining = self.inner.active_connections.load(Ordering::Acquire),
@@ -467,5 +511,62 @@ impl RealtimeHub {
     pub async fn shutdown(&self) {
         self.initiate_shutdown();
         self.wait_drained().await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rume_messaging::pubsub::InMemoryPubSub;
+
+    #[tokio::test]
+    async fn realtime_hub_evicts_empty_rooms_and_pubsub_tasks_on_drop() {
+        let pubsub = Arc::new(InMemoryPubSub::new());
+        let hub = RealtimeHub::new(RealtimeConfig::default()).with_pubsub(pubsub);
+
+        for i in 0..100 {
+            let sub = hub
+                .subscribe("acme", &format!("ephemeral-{i}"))
+                .await
+                .expect("subscribe");
+            drop(sub);
+        }
+
+        assert!(
+            hub.inner.channels.read().is_empty(),
+            "channels map must be empty after dropping all room subscriptions"
+        );
+        assert!(
+            hub.inner.pubsub_tasks.lock().is_empty(),
+            "pubsub_tasks map must be empty after dropping all room subscriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn wait_drained_wakes_promptly_when_last_connection_drops() {
+        let hub = RealtimeHub::new(
+            RealtimeConfig::default().with_shutdown_drain_timeout(Duration::from_secs(10)),
+        );
+
+        for _ in 0..50 {
+            let guard = hub.track_connection();
+            let hub_clone = hub.clone();
+            let waiter = tokio::spawn(async move {
+                let start = tokio::time::Instant::now();
+                hub_clone.wait_drained().await;
+                start.elapsed()
+            });
+            tokio::task::yield_now().await;
+            drop(guard);
+
+            let elapsed = tokio::time::timeout(Duration::from_secs(2), waiter)
+                .await
+                .expect("wait_drained must not stall on lost wakeup")
+                .expect("waiter task should not panic");
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "wait_drained took {elapsed:?}, expected prompt wakeup well below 10s timeout"
+            );
+        }
     }
 }

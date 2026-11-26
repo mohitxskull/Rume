@@ -87,6 +87,21 @@ pub trait SagaStore: Send + Sync + 'static {
         expected_version: u64,
     ) -> BoxFuture<'_, Result<(), SagaError>>;
 
+    /// Atomically saves or updates a saga execution record with both version CAS
+    /// and optional execution claim fencing (`claim_token`).
+    ///
+    /// When `claim_token` is `Some` (and `expected_version > 0`), stores that enforce
+    /// claim fencing reject the write if another worker currently owns the execution claim.
+    fn save_record_cas_with_claim(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+        claim_token: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
+        let _ = claim_token;
+        self.save_record_cas(record, expected_version)
+    }
+
     /// Loads a saga execution record by its unique ID.
     fn load_record(&self, saga_id: &str) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>>;
 
@@ -100,6 +115,24 @@ pub trait SagaStore: Send + Sync + 'static {
     /// Returns an opaque claim token on success, or [`SagaError::Storage`] if another
     /// worker currently owns execution for `saga_id`.
     fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>>;
+
+    /// Renews the lease for an active execution claim held under `claim_token`.
+    ///
+    /// Returns [`SagaError::Storage`] if the claim was lost or expired.
+    fn renew_execution(
+        &self,
+        saga_id: &str,
+        claim_token: &str,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
+        let _ = (saga_id, claim_token);
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Returns the claim lease TTL if this store uses time-bounded execution leases
+    /// requiring background heartbeat renewal while steps execute.
+    fn claim_ttl(&self) -> Option<std::time::Duration> {
+        None
+    }
 
     /// Releases a previously acquired execution claim for `saga_id`.
     fn release_execution(
@@ -172,11 +205,36 @@ impl SagaStore for InMemorySagaStore {
         record: &SagaRecord,
         expected_version: u64,
     ) -> BoxFuture<'_, Result<(), SagaError>> {
+        self.save_record_cas_with_claim(record, expected_version, None)
+    }
+
+    fn save_record_cas_with_claim(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+        claim_token: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
         let record = record.clone();
+        let claim_token = claim_token.map(str::to_string);
         let records = Arc::clone(&self.records);
+        let active_claims = Arc::clone(&self.active_claims);
         let max_retained = self.max_retained_terminal;
         Box::pin(async move {
             let mut map = records.write().await;
+            if expected_version > 0
+                && let Some(token) = claim_token.as_deref()
+            {
+                let claims = active_claims.lock().map_err(|_| SagaError::Storage {
+                    saga_id: Some(record.saga_id.clone()),
+                    message: "saga claim lock poisoned".into(),
+                })?;
+                if claims.get(&record.saga_id).map(String::as_str) != Some(token) {
+                    return Err(SagaError::Storage {
+                        saga_id: Some(record.saga_id.clone()),
+                        message: "saga execution claim mismatch".into(),
+                    });
+                }
+            }
             let current_version = map.get(&record.saga_id).map(|r| r.version).unwrap_or(0);
             if current_version != expected_version {
                 return Err(SagaError::Storage {
@@ -257,15 +315,20 @@ impl SagaStore for InMemorySagaStore {
 }
 
 /// RAII guard that holds an exclusive per-saga execution claim across step and
-/// compensation callbacks, releasing it on normal completion or task cancellation.
+/// compensation callbacks, renewing its lease in the background and releasing it on
+/// normal completion or task cancellation.
 pub(super) struct ExecutionClaimGuard {
     pub(super) store: Option<Arc<dyn SagaStore>>,
     pub(super) saga_id: String,
     pub(super) token: String,
+    pub(super) renew_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ExecutionClaimGuard {
     pub(super) async fn release(mut self) {
+        if let Some(handle) = self.renew_task.take() {
+            handle.abort();
+        }
         // Why: keep `self.store` populated until `release_execution` returns `Ok(())` so if
         // this future is cancelled mid-await or the backend returns a transient error, `Drop`
         // still holds the store and runs fallback cleanup instead of stranding the claim.
@@ -282,6 +345,9 @@ impl ExecutionClaimGuard {
 
 impl Drop for ExecutionClaimGuard {
     fn drop(&mut self) {
+        if let Some(handle) = self.renew_task.take() {
+            handle.abort();
+        }
         if let Some(store) = self.store.take() {
             // Why: release synchronously when supported (e.g. `InMemorySagaStore`) so
             // dropping a pending saga future outside a Tokio runtime context cannot leak

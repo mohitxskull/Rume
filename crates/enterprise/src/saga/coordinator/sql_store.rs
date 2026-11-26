@@ -204,7 +204,17 @@ impl SagaStore for SqlSagaStore {
         record: &SagaRecord,
         expected_version: u64,
     ) -> BoxFuture<'_, Result<(), SagaError>> {
+        self.save_record_cas_with_claim(record, expected_version, None)
+    }
+
+    fn save_record_cas_with_claim(
+        &self,
+        record: &SagaRecord,
+        expected_version: u64,
+        claim_token: Option<&str>,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
         let record = record.clone();
+        let claim_token = claim_token.map(str::to_string);
         Box::pin(async move {
             let (status_json, completed_json, compensated_json) = serialize_record(&record)?;
             let is_terminal = record.status.is_terminal();
@@ -238,6 +248,7 @@ impl SagaStore for SqlSagaStore {
                             .bind(is_term_int)
                             .bind(updated_at)
                             .bind(expected_ver)
+                            .bind(claim_token.as_deref())
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -269,6 +280,7 @@ impl SagaStore for SqlSagaStore {
                             .bind(is_terminal)
                             .bind(updated_at)
                             .bind(expected_ver)
+                            .bind(claim_token.as_deref())
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -292,7 +304,8 @@ impl SagaStore for SqlSagaStore {
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
                             .rows_affected()
                     } else {
-                        // Why: MySQL uses positional `?` placeholders, so `SET` columns precede `WHERE`.
+                        // Why: MySQL uses positional `?` placeholders, so `SET` columns precede `WHERE`
+                        // and `claim_token` is bound twice for `(? IS NULL OR claim_token = ?)`.
                         sqlx::query(rume_data::sql::MYSQL_SAGA_UPDATE_CAS)
                             .bind(&record.saga_name)
                             .bind(&status_json)
@@ -302,6 +315,8 @@ impl SagaStore for SqlSagaStore {
                             .bind(updated_at)
                             .bind(&record.saga_id)
                             .bind(expected_ver)
+                            .bind(claim_token.as_deref())
+                            .bind(claim_token.as_deref())
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -311,9 +326,14 @@ impl SagaStore for SqlSagaStore {
             };
 
             if rows_affected == 0 {
+                let message = if claim_token.is_some() && expected_version > 0 {
+                    format!("saga version or claim conflict: expected version {expected_version}")
+                } else {
+                    format!("saga version conflict: expected version {expected_version}")
+                };
                 return Err(SagaError::Storage {
                     saga_id: Some(record.saga_id),
-                    message: format!("saga version conflict: expected version {expected_version}"),
+                    message,
                 });
             }
             Ok(())
@@ -435,6 +455,72 @@ impl SagaStore for SqlSagaStore {
             }
             Ok(token)
         })
+    }
+
+    fn renew_execution(
+        &self,
+        saga_id: &str,
+        claim_token: &str,
+    ) -> BoxFuture<'_, Result<(), SagaError>> {
+        let saga_id = saga_id.to_string();
+        let claim_token = claim_token.to_string();
+        Box::pin(async move {
+            let rows_affected = match self {
+                #[cfg(feature = "sqlite")]
+                Self::Sqlite { pool, claim_ttl } => {
+                    sqlx::query(rume_data::sql::SQLITE_SAGA_RENEW_CLAIM)
+                        .bind(&saga_id)
+                        .bind(&claim_token)
+                        .bind(ttl_millis(*claim_ttl))
+                        .execute(pool)
+                        .await
+                        .map_err(|e| storage_err(Some(&saga_id), e))?
+                        .rows_affected()
+                }
+                #[cfg(feature = "postgres")]
+                Self::Postgres { pool, claim_ttl } => {
+                    sqlx::query(rume_data::sql::PG_SAGA_RENEW_CLAIM)
+                        .bind(&saga_id)
+                        .bind(&claim_token)
+                        .bind(ttl_millis(*claim_ttl))
+                        .execute(pool)
+                        .await
+                        .map_err(|e| storage_err(Some(&saga_id), e))?
+                        .rows_affected()
+                }
+                #[cfg(feature = "mysql")]
+                Self::Mysql { pool, claim_ttl } => {
+                    // Why: MySQL positional `?` binds `ttl_ms`, `saga_id`, then `claim_token`.
+                    sqlx::query(rume_data::sql::MYSQL_SAGA_RENEW_CLAIM)
+                        .bind(ttl_millis(*claim_ttl))
+                        .bind(&saga_id)
+                        .bind(&claim_token)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| storage_err(Some(&saga_id), e))?
+                        .rows_affected()
+                }
+            };
+
+            if rows_affected == 0 {
+                return Err(SagaError::Storage {
+                    saga_id: Some(saga_id),
+                    message: "saga execution claim lost or expired".into(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn claim_ttl(&self) -> Option<Duration> {
+        match self {
+            #[cfg(feature = "sqlite")]
+            Self::Sqlite { claim_ttl, .. } => Some(*claim_ttl),
+            #[cfg(feature = "postgres")]
+            Self::Postgres { claim_ttl, .. } => Some(*claim_ttl),
+            #[cfg(feature = "mysql")]
+            Self::Mysql { claim_ttl, .. } => Some(*claim_ttl),
+        }
     }
 
     fn release_execution(
@@ -593,5 +679,117 @@ mod tests {
             .await
             .expect("re-acquire after release");
         assert_ne!(token, token2);
+    }
+
+    #[tokio::test]
+    async fn resume_from_handle_succeeds_on_version_zero_handle_with_sql_store() {
+        use crate::saga::coordinator::workflow::{Saga, SagaRecoveryHandle, SagaRecoveryPhase};
+        use std::sync::Arc;
+
+        let (_pool, store) = sqlite_store().await;
+        let saga = Saga::<Vec<&'static str>>::new("v0_sql_recovery")
+            .with_store(Arc::new(store))
+            .step(
+                "step_1",
+                |ctx| {
+                    ctx.push("step_1");
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            )
+            .step(
+                "step_2",
+                |ctx| {
+                    ctx.push("step_2");
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        let handle = SagaRecoveryHandle {
+            saga_id: "saga-v0-recovery".into(),
+            saga_name: "v0_sql_recovery".into(),
+            context: vec!["initial"],
+            phase: SagaRecoveryPhase::Forward,
+            completed_steps: Vec::new(),
+            compensated_steps: Vec::new(),
+            version: 0,
+        };
+
+        let report = saga
+            .resume_from_handle(handle)
+            .await
+            .expect("resume_from_handle on version == 0 must succeed under SqlSagaStore");
+        assert!(report.status.is_success());
+        assert_eq!(report.context, vec!["initial", "step_1", "step_2"]);
+        assert_eq!(
+            report.completed_steps,
+            vec!["step_1".to_string(), "step_2".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_saga_store_rejects_stale_claim_token_cas() {
+        let (_pool, store) = sqlite_store().await;
+        let rec1 = SagaRecord {
+            saga_id: "saga-fence".into(),
+            saga_name: "order_flow".into(),
+            status: SagaStatus::Pending,
+            completed_steps: vec![],
+            compensated_steps: vec![],
+            updated_at: 300,
+            version: 1,
+        };
+        store.save_record_cas(&rec1, 0).await.expect("insert");
+
+        let token_a = store
+            .try_acquire_execution("saga-fence")
+            .await
+            .expect("worker A acquires claim");
+        store
+            .renew_execution("saga-fence", &token_a)
+            .await
+            .expect("worker A renews active claim");
+
+        // Worker A releases and Worker B takes over the claim.
+        store
+            .release_execution("saga-fence", &token_a)
+            .await
+            .expect("worker A releases claim");
+        let token_b = store
+            .try_acquire_execution("saga-fence")
+            .await
+            .expect("worker B acquires claim");
+
+        // Stale worker A attempts CAS with its old token -> MUST be rejected.
+        let mut rec2 = rec1.clone();
+        rec2.status = SagaStatus::Running {
+            current_step: "step_1".into(),
+        };
+        rec2.version = 2;
+        assert!(
+            store
+                .save_record_cas_with_claim(&rec2, 1, Some(&token_a))
+                .await
+                .is_err(),
+            "stale claim_token CAS must be rejected when another worker holds the claim"
+        );
+        assert!(
+            store.renew_execution("saga-fence", &token_a).await.is_err(),
+            "stale claim_token renewal must be rejected"
+        );
+
+        // Current claimant worker B succeeds with its token.
+        store
+            .save_record_cas_with_claim(&rec2, 1, Some(&token_b))
+            .await
+            .expect("active claimant CAS must succeed");
+
+        let loaded = store
+            .load_record("saga-fence")
+            .await
+            .expect("load")
+            .expect("record exists");
+        assert_eq!(loaded.version, 2);
     }
 }
