@@ -9,6 +9,8 @@
 
 /// Schema DDL for the durable `rume_jobs` table in PostgreSQL.
 pub const PG_JOBS_SCHEMA: &str = include_str!("../sql/postgres/jobs_schema.sql");
+/// Additive migration adding `queue` and `priority` columns to `rume_jobs` in PostgreSQL.
+pub const PG_JOBS_QUEUE_PRIORITY: &str = include_str!("../sql/postgres/jobs_queue_priority.sql");
 
 /// Schema DDL for the `rume_audit_log` table in PostgreSQL.
 pub const PG_AUDIT_SCHEMA: &str = include_str!("../sql/postgres/audit_schema.sql");
@@ -385,3 +387,183 @@ pub const SQLITE_AUTH_TENANT_FIND_BY_SLUG: &str =
 /// Deactivate a tenant in SQLite.
 pub const SQLITE_AUTH_TENANT_DEACTIVATE: &str =
     include_str!("../sql/sqlite/auth_tenant_deactivate.sql");
+
+// Jobs (SQLite).
+
+/// Schema DDL for the durable `rume_jobs` table in SQLite.
+pub const SQLITE_JOBS_SCHEMA: &str = include_str!("../sql/sqlite/jobs_schema.sql");
+/// Insert a new durable job in SQLite.
+pub const SQLITE_JOBS_INSERT: &str = include_str!("../sql/sqlite/jobs_insert.sql");
+/// Claim the next available pending job in SQLite.
+pub const SQLITE_JOBS_CLAIM: &str = include_str!("../sql/sqlite/jobs_claim.sql");
+/// Acknowledge a claimed job in SQLite.
+pub const SQLITE_JOBS_ACK: &str = include_str!("../sql/sqlite/jobs_ack.sql");
+/// Negatively acknowledge a claimed job in SQLite.
+pub const SQLITE_JOBS_NACK: &str = include_str!("../sql/sqlite/jobs_nack.sql");
+/// Defer a job until a later time in SQLite.
+pub const SQLITE_JOBS_DEFER: &str = include_str!("../sql/sqlite/jobs_defer.sql");
+/// Move a job to the dead-letter queue in SQLite.
+pub const SQLITE_JOBS_DEAD_LETTER: &str = include_str!("../sql/sqlite/jobs_dead_letter.sql");
+/// Renew the lease of an in-flight job in SQLite.
+pub const SQLITE_JOBS_RENEW_LEASE: &str = include_str!("../sql/sqlite/jobs_renew_lease.sql");
+/// Reap jobs abandoned by a dead worker in SQLite.
+pub const SQLITE_JOBS_REAP: &str = include_str!("../sql/sqlite/jobs_reap.sql");
+/// Count currently pending jobs in SQLite.
+pub const SQLITE_JOBS_PENDING_COUNT: &str = include_str!("../sql/sqlite/jobs_pending_count.sql");
+/// Count jobs in the dead-letter queue in SQLite.
+pub const SQLITE_JOBS_DEAD_LETTER_COUNT: &str =
+    include_str!("../sql/sqlite/jobs_dead_letter_count.sql");
+/// Check for an existing idempotency key in SQLite.
+pub const SQLITE_JOBS_IDEMPOTENCY_CHECK: &str =
+    include_str!("../sql/sqlite/jobs_idempotency_check.sql");
+/// List dead-lettered jobs in SQLite.
+pub const SQLITE_JOBS_LIST_DEAD_LETTERS: &str =
+    include_str!("../sql/sqlite/jobs_list_dead_letters.sql");
+/// Replay a dead-lettered job in SQLite.
+pub const SQLITE_JOBS_REPLAY_DEAD_LETTER: &str =
+    include_str!("../sql/sqlite/jobs_replay_dead_letter.sql");
+/// Purge terminal jobs in SQLite.
+pub const SQLITE_JOBS_PURGE: &str = include_str!("../sql/sqlite/jobs_purge.sql");
+
+// Jobs (MySQL).
+
+/// Schema DDL for the durable `rume_jobs` table in MySQL.
+pub const MYSQL_JOBS_SCHEMA: &str = include_str!("../sql/mysql/jobs_schema.sql");
+/// Insert a new durable job in MySQL.
+pub const MYSQL_JOBS_INSERT: &str = include_str!("../sql/mysql/jobs_insert.sql");
+/// Select and lock the next available pending job in MySQL.
+pub const MYSQL_JOBS_CLAIM: &str = include_str!("../sql/mysql/jobs_claim.sql");
+/// Update a locked job row to `in_flight` in MySQL.
+pub const MYSQL_JOBS_CLAIM_UPDATE: &str = include_str!("../sql/mysql/jobs_claim_update.sql");
+/// Acknowledge a claimed job in MySQL.
+pub const MYSQL_JOBS_ACK: &str = include_str!("../sql/mysql/jobs_ack.sql");
+/// Negatively acknowledge a claimed job in MySQL.
+pub const MYSQL_JOBS_NACK: &str = include_str!("../sql/mysql/jobs_nack.sql");
+/// Defer a job until a later time in MySQL.
+pub const MYSQL_JOBS_DEFER: &str = include_str!("../sql/mysql/jobs_defer.sql");
+/// Move a job to the dead-letter queue in MySQL.
+pub const MYSQL_JOBS_DEAD_LETTER: &str = include_str!("../sql/mysql/jobs_dead_letter.sql");
+/// Renew the lease of an in-flight job in MySQL.
+pub const MYSQL_JOBS_RENEW_LEASE: &str = include_str!("../sql/mysql/jobs_renew_lease.sql");
+/// Reap jobs abandoned by a dead worker in MySQL.
+pub const MYSQL_JOBS_REAP: &str = include_str!("../sql/mysql/jobs_reap.sql");
+/// Count currently pending jobs in MySQL.
+pub const MYSQL_JOBS_PENDING_COUNT: &str = include_str!("../sql/mysql/jobs_pending_count.sql");
+/// Count jobs in the dead-letter queue in MySQL.
+pub const MYSQL_JOBS_DEAD_LETTER_COUNT: &str =
+    include_str!("../sql/mysql/jobs_dead_letter_count.sql");
+/// Check for an existing idempotency key in MySQL.
+pub const MYSQL_JOBS_IDEMPOTENCY_CHECK: &str =
+    include_str!("../sql/mysql/jobs_idempotency_check.sql");
+/// List dead-lettered jobs in MySQL.
+pub const MYSQL_JOBS_LIST_DEAD_LETTERS: &str =
+    include_str!("../sql/mysql/jobs_list_dead_letters.sql");
+/// Replay a dead-lettered job in MySQL.
+pub const MYSQL_JOBS_REPLAY_DEAD_LETTER: &str =
+    include_str!("../sql/mysql/jobs_replay_dead_letter.sql");
+/// Purge terminal jobs in MySQL.
+pub const MYSQL_JOBS_PURGE: &str = include_str!("../sql/mysql/jobs_purge.sql");
+
+// Job Batches (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_job_batches` in SQLite.
+pub const SQLITE_BATCHES_SCHEMA: &str = include_str!("../sql/sqlite/batches_schema.sql");
+/// Insert a new job batch in SQLite.
+pub const SQLITE_BATCHES_INSERT: &str = include_str!("../sql/sqlite/batches_insert.sql");
+/// Load a job batch by ID in SQLite.
+pub const SQLITE_BATCHES_LOAD: &str = include_str!("../sql/sqlite/batches_load.sql");
+/// Record a completed job in a batch in SQLite.
+pub const SQLITE_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/sqlite/batches_record_success.sql");
+/// Record a failed job in a batch in SQLite.
+pub const SQLITE_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/sqlite/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in SQLite.
+pub const SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/sqlite/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in SQLite.
+pub const SQLITE_BATCHES_CANCEL: &str = include_str!("../sql/sqlite/batches_cancel.sql");
+
+/// Schema DDL for `rume_job_batches` in PostgreSQL.
+pub const PG_BATCHES_SCHEMA: &str = include_str!("../sql/postgres/batches_schema.sql");
+/// Insert a new job batch in PostgreSQL.
+pub const PG_BATCHES_INSERT: &str = include_str!("../sql/postgres/batches_insert.sql");
+/// Load a job batch by ID in PostgreSQL.
+pub const PG_BATCHES_LOAD: &str = include_str!("../sql/postgres/batches_load.sql");
+/// Record a completed job in a batch in PostgreSQL.
+pub const PG_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/postgres/batches_record_success.sql");
+/// Record a failed job in a batch in PostgreSQL.
+pub const PG_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/postgres/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in PostgreSQL.
+pub const PG_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/postgres/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in PostgreSQL.
+pub const PG_BATCHES_CANCEL: &str = include_str!("../sql/postgres/batches_cancel.sql");
+
+/// Schema DDL for `rume_job_batches` in MySQL.
+pub const MYSQL_BATCHES_SCHEMA: &str = include_str!("../sql/mysql/batches_schema.sql");
+/// Insert a new job batch in MySQL.
+pub const MYSQL_BATCHES_INSERT: &str = include_str!("../sql/mysql/batches_insert.sql");
+/// Load a job batch by ID in MySQL.
+pub const MYSQL_BATCHES_LOAD: &str = include_str!("../sql/mysql/batches_load.sql");
+/// Record a completed job in a batch in MySQL.
+pub const MYSQL_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/mysql/batches_record_success.sql");
+/// Record a failed job in a batch in MySQL.
+pub const MYSQL_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/mysql/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in MySQL.
+pub const MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/mysql/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in MySQL.
+pub const MYSQL_BATCHES_CANCEL: &str = include_str!("../sql/mysql/batches_cancel.sql");
+
+// Sagas (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_sagas` in SQLite.
+pub const SQLITE_SAGA_SCHEMA: &str = include_str!("../sql/sqlite/saga_schema.sql");
+/// Insert a new saga record in SQLite.
+pub const SQLITE_SAGA_INSERT: &str = include_str!("../sql/sqlite/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in SQLite.
+pub const SQLITE_SAGA_UPDATE_CAS: &str = include_str!("../sql/sqlite/saga_update_cas.sql");
+/// Load a saga record by ID in SQLite.
+pub const SQLITE_SAGA_LOAD: &str = include_str!("../sql/sqlite/saga_load.sql");
+/// List incomplete saga records in SQLite.
+pub const SQLITE_SAGA_LIST_INCOMPLETE: &str =
+    include_str!("../sql/sqlite/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/sqlite/saga_acquire_claim.sql");
+/// Release an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/sqlite/saga_release_claim.sql");
+
+/// Schema DDL for `rume_sagas` in PostgreSQL.
+pub const PG_SAGA_SCHEMA: &str = include_str!("../sql/postgres/saga_schema.sql");
+/// Insert a new saga record in PostgreSQL.
+pub const PG_SAGA_INSERT: &str = include_str!("../sql/postgres/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in PostgreSQL.
+pub const PG_SAGA_UPDATE_CAS: &str = include_str!("../sql/postgres/saga_update_cas.sql");
+/// Load a saga record by ID in PostgreSQL.
+pub const PG_SAGA_LOAD: &str = include_str!("../sql/postgres/saga_load.sql");
+/// List incomplete saga records in PostgreSQL.
+pub const PG_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/postgres/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/postgres/saga_acquire_claim.sql");
+/// Release an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/postgres/saga_release_claim.sql");
+
+/// Schema DDL for `rume_sagas` in MySQL.
+pub const MYSQL_SAGA_SCHEMA: &str = include_str!("../sql/mysql/saga_schema.sql");
+/// Insert a new saga record in MySQL.
+pub const MYSQL_SAGA_INSERT: &str = include_str!("../sql/mysql/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in MySQL.
+pub const MYSQL_SAGA_UPDATE_CAS: &str = include_str!("../sql/mysql/saga_update_cas.sql");
+/// Load a saga record by ID in MySQL.
+pub const MYSQL_SAGA_LOAD: &str = include_str!("../sql/mysql/saga_load.sql");
+/// List incomplete saga records in MySQL.
+pub const MYSQL_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/mysql/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/mysql/saga_acquire_claim.sql");
+/// Release an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/mysql/saga_release_claim.sql");

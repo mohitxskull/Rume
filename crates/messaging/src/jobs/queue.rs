@@ -52,6 +52,17 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Dequeues the next available job, recording the worker identifier that claimed it.
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
 
+    /// Dequeues the next available job from the specified named queues (or all queues if `None`).
+    ///
+    /// Defaults to delegating to [`JobQueue::dequeue_for`] for backward compatibility.
+    fn dequeue_from(
+        &self,
+        worker_id: &str,
+        _queues: Option<&[&str]>,
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     /// Dequeues the next available job whose `available_at` time has passed.
     ///
     /// Delegates to [`JobQueue::dequeue_for`] with an anonymous worker identifier.

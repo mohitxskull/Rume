@@ -1,0 +1,14 @@
+INSERT INTO rume_jobs (
+    id, name, queue, priority, payload, attempt, max_attempts, initial_backoff_ms,
+    max_backoff_ms, backoff_factor, timeout_ms, idempotency_key,
+    tenant_id, available_at, status, created_at, trace_context
+) VALUES (
+    ?1, ?2, ?13, ?14, ?3, 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+    (CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ?11),
+    'pending',
+    CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER),
+    ?12
+)
+ON CONFLICT (COALESCE(tenant_id, ''), idempotency_key) WHERE idempotency_key IS NOT NULL AND status NOT IN ('dead_letter', 'purged')
+DO NOTHING
+RETURNING id;

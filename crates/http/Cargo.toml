@@ -22,8 +22,11 @@ thiserror.workspace = true
 garde.workspace = true
 parking_lot.workspace = true
 uuid = { version = "=1.29.3", features = ["v4"] }
+reqwest.workspace = true
+rand.workspace = true
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+hickory-resolver = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -32,3 +35,4 @@ tower-http = { workspace = true, features = ["decompression-gzip", "decompressio
 [features]
 default = []
 redis = ["rume-security/redis", "dep:deadpool-redis", "dep:redis"]
+dns-srv = ["dep:hickory-resolver"]

@@ -43,6 +43,16 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn trace_context(&self) -> Option<String> {
         None
     }
+
+    /// Named queue to route this job into (defaults to `"default"`).
+    fn queue(&self) -> &str {
+        "default"
+    }
+
+    /// Numeric priority for this job (higher values dequeue first, defaults to `0`).
+    fn priority(&self) -> i32 {
+        0
+    }
 }
 
 use std::sync::Arc;
@@ -109,6 +119,10 @@ pub struct QueuedJob {
     pub id: String,
     /// Job type identifier.
     pub name: String,
+    /// Named queue this job belongs to (defaults to `"default"`).
+    pub queue: String,
+    /// Numeric priority (higher values dequeue first, defaults to `0`).
+    pub priority: i32,
     /// Serialized JSON payload.
     pub payload: Vec<u8>,
     /// Current attempt count.

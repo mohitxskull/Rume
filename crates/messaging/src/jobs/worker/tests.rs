@@ -162,6 +162,8 @@ async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_defers_withou
     let job = QueuedJob {
         id: "job-123".to_string(),
         name: BlockTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 0,
         retry_policy: RetryPolicy::new(),
@@ -439,6 +441,8 @@ async fn test_worker_heartbeat_loss_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-dlq-test".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -528,6 +532,8 @@ async fn test_idempotency_store_acquisition_failure_fails_closed_and_nacks() {
     let job = QueuedJob {
         id: "job-fail-closed".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -658,6 +664,8 @@ async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-renew-fail".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -751,6 +759,8 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-unsupported-fail".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1040,6 +1050,8 @@ async fn test_worker_retryable_failure_releases_idempotency_lock_before_nack() {
     let job = QueuedJob {
         id: "job-retry-lock".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1205,6 +1217,8 @@ async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
     let job_a = QueuedJob {
         id: "job-dlq-fail".to_string(),
         name: SlowOkJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&SlowOkJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1253,6 +1267,8 @@ async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
     let job_b = QueuedJob {
         id: "job-dlq-ok".to_string(),
         name: SlowOkJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&SlowOkJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1419,6 +1435,8 @@ async fn test_worker_keeps_heartbeat_active_until_nack_completes_on_slow_release
     let job = QueuedJob {
         id: "job-slow-rel".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&RetryFailJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1576,6 +1594,8 @@ async fn test_worker_in_progress_idempotency_defers_without_burning_retry_budget
     let job = QueuedJob {
         id: "job-defer".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&RetryFailJob).unwrap(),
         attempt: 2,
         retry_policy: RetryPolicy::new().with_max_attempts(3),
@@ -1736,6 +1756,8 @@ async fn worker_fast_completing_job_never_leaks_abort_handle() {
         jobs.push_back(QueuedJob {
             id: format!("fast-{idx}"),
             name: BurstOrHangJob::NAME.to_string(),
+            queue: "default".to_string(),
+            priority: 0,
             payload: serde_json::to_vec(&BurstOrHangJob { hang: false }).unwrap(),
             attempt: 1,
             retry_policy: RetryPolicy::new(),
@@ -1752,6 +1774,8 @@ async fn worker_fast_completing_job_never_leaks_abort_handle() {
     jobs.push_back(QueuedJob {
         id: "hang-job".to_string(),
         name: BurstOrHangJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&BurstOrHangJob { hang: true }).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1921,6 +1945,8 @@ async fn in_flight_idempotency_loss_before_ack_routes_to_dead_letter() {
     let job = QueuedJob {
         id: "job-gated-idemp".to_string(),
         name: GatedIdempJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&GatedIdempJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -2103,6 +2129,8 @@ async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
     let job = QueuedJob {
         id: "job-stalled-renew".to_string(),
         name: StalledRenewJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&StalledRenewJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),

@@ -1,9 +1,9 @@
 INSERT INTO rume_jobs (
-    id, name, payload, attempt, max_attempts, initial_backoff_ms,
+    id, name, queue, priority, payload, attempt, max_attempts, initial_backoff_ms,
     max_backoff_ms, backoff_factor, timeout_ms, idempotency_key,
     tenant_id, available_at, status, created_at, trace_context
 ) VALUES (
-    $1, $2, $3, 0, $4, $5, $6, $7, $8, $9, $10,
+    $1, $2, $13, $14, $3, 0, $4, $5, $6, $7, $8, $9, $10,
     (FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $11),
     'pending',
     FLOOR(EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT,

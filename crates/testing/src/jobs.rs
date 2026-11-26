@@ -122,6 +122,8 @@ impl JobQueue for TestJobQueue {
         let queued = QueuedJob {
             id: id.clone(),
             name: J::NAME.to_string(),
+            queue: job.queue().to_string(),
+            priority: job.priority(),
             payload,
             attempt: 0,
             retry_policy: job.retry_policy(),

@@ -2,6 +2,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
 pub mod openapi;
 pub mod pagination;
 pub mod resilience;

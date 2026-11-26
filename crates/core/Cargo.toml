@@ -38,6 +38,7 @@ testing = ["dep:rume-testing", "rume-testing/testing"]
 postgres = [
     "rume-data/postgres",
     "rume-messaging/postgres",
+    "rume-enterprise/postgres",
     "rume-testing?/postgres",
 ]
 redis = [
@@ -48,14 +49,19 @@ redis = [
     "rume-enterprise/redis",
 ]
 http-client = ["rume-security/http-client"]
+dns-srv = ["rume-http/dns-srv"]
+nats = ["rume-messaging/nats"]
+rabbitmq = ["rume-messaging/rabbitmq"]
 sqlite = [
     "rume-data/sqlite",
     "rume-messaging/sqlite",
+    "rume-enterprise/sqlite",
     "rume-testing?/sqlite",
 ]
 mysql = [
     "rume-data/mysql",
     "rume-messaging/mysql",
+    "rume-enterprise/mysql",
     "rume-testing?/mysql",
 ]
 saml = ["rume-enterprise/saml"]

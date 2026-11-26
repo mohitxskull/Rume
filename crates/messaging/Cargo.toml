@@ -16,10 +16,14 @@ serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
-uuid = { version = "=1.29.3", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4", "serde"] }
+chrono = { workspace = true, features = ["clock"] }
+croner.workspace = true
 sqlx = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+async-nats = { workspace = true, optional = true }
+lapin = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -34,3 +38,5 @@ sqlite = ["rume-data/sqlite", "dep:sqlx", "sqlx/sqlite"]
 postgres = ["rume-data/postgres", "dep:sqlx", "sqlx/postgres"]
 mysql = ["rume-data/mysql", "dep:sqlx", "sqlx/mysql"]
 redis = ["rume-data/redis", "dep:deadpool-redis", "dep:redis"]
+nats = ["dep:async-nats"]
+rabbitmq = ["dep:lapin"]

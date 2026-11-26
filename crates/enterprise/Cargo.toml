@@ -9,6 +9,7 @@ description = "Enterprise SAML/SCIM integrations and Saga workflow orchestration
 [dependencies]
 rume-foundation.workspace = true
 rume-observability.workspace = true
+rume-data.workspace = true
 tokio.workspace = true
 futures-util.workspace = true
 serde.workspace = true
@@ -22,6 +23,7 @@ chrono = { workspace = true, optional = true }
 bergshamra = { workspace = true, optional = true }
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
+sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]
 opentelemetry.workspace = true
@@ -34,4 +36,7 @@ tracing-subscriber.workspace = true
 default = []
 saml = ["dep:quick-xml", "dep:saml-rs", "dep:chrono", "dep:bergshamra"]
 redis = ["dep:deadpool-redis", "dep:redis"]
+sqlite = ["rume-data/sqlite", "dep:sqlx", "sqlx/sqlite"]
+postgres = ["rume-data/postgres", "dep:sqlx", "sqlx/postgres"]
+mysql = ["rume-data/mysql", "dep:sqlx", "sqlx/mysql"]
 enterprise = ["saml"]

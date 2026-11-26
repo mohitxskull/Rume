@@ -235,8 +235,16 @@ mod tests {
         const TYPE: &'static str = "test.sync_event";
     }
 
+    static SUBSCRIBER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[tokio::test]
     async fn event_bus_publish_sync_creates_span_and_propagates_trace_context() {
+        // Why: `tracing-core` caches per-callsite `Interest` globally across threads.
+        // Concurrent tests without an active subscriber can cache `Interest::never()` on
+        // `event.publish_sync` or `test.caller`, so serialize subscriber-override tests
+        // and rebuild the interest cache after installing each test subscriber.
+        let _sub_lock = SUBSCRIBER_TEST_LOCK.lock().await;
+
         let parent_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
         let parent_span_id = "00f067aa0ba902b7";
         let parent_tc = rume_observability::TraceContext::from_traceparent(format!(
@@ -249,6 +257,7 @@ mod tests {
         let subscriber =
             tracing_subscriber::registry().with(tracing_opentelemetry::layer().with_tracer(tracer));
         let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
 
         let bus = EventBus::new();
         let seen_otel = Arc::new(Mutex::new(None::<rume_observability::TraceContext>));
@@ -294,6 +303,7 @@ mod tests {
         drop(_guard);
         let no_otel_sub = tracing_subscriber::registry();
         let _no_otel_guard = tracing::subscriber::set_default(no_otel_sub);
+        tracing::callsite::rebuild_interest_cache();
         let bus_no_otel = EventBus::new();
         let seen_no_otel = Arc::new(Mutex::new(None::<rume_observability::TraceContext>));
         let seen_no_otel_clone = Arc::clone(&seen_no_otel);

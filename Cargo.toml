@@ -100,6 +100,12 @@ subtle = "=2.6.1"
 # Non-poisoning synchronous RwLock/Mutex for hot-path resilience, routing, and health registries.
 parking_lot = "=0.13.0"
 
+# Milestone D: cron scheduling, DNS SRV discovery, and external message brokers.
+croner = "=5.0.1"
+hickory-resolver = "=0.26.4"
+async-nats = "=0.53.0"
+lapin = "=4.13.0"
+
 # Rust source parsing used by `rume doctor` to validate module DAG acyclicity
 # (RC-20). Pinned to match crates/macro. syn::parse_file tokenizes the whole
 # file so multi-line rustfmt formatting is handled natively instead of by a

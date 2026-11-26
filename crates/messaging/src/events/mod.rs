@@ -5,9 +5,11 @@
 //! failing closed with [`EventError::Bus`] if type downcasting fails.
 
 pub mod bus;
+pub mod distributed;
 pub mod error;
 pub mod event;
 
 pub use bus::EventBus;
+pub use distributed::{DistributedEventBus, DistributedEventEnvelope};
 pub use error::EventError;
 pub use event::{BoxFuture, Event, EventHandler};

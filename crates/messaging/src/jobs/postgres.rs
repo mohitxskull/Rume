@@ -87,6 +87,12 @@ impl PostgresJobQueue {
             .execute(&self.pool)
             .await
             .map_err(|e| JobError::Fatal(format!("failed to init schema: {e}")))?;
+        sqlx::raw_sql(rume_data::sql::PG_JOBS_QUEUE_PRIORITY)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| {
+                JobError::Fatal(format!("failed to apply queue/priority migration: {e}"))
+            })?;
         Ok(())
     }
 }
@@ -110,6 +116,8 @@ impl JobQueue for PostgresJobQueue {
         trace_context: Option<String>,
     ) -> BoxFuture<'_, Result<String, JobError>> {
         let name = J::NAME.to_string();
+        let queue = job.queue().to_string();
+        let priority = job.priority();
         let retry_policy = job.retry_policy();
         let timeout = job.timeout();
         let idempotency_key = job.idempotency_key();
@@ -141,6 +149,8 @@ impl JobQueue for PostgresJobQueue {
                 .bind(&tenant_id)
                 .bind(delay_ms)
                 .bind(&trace_context)
+                .bind(&queue)
+                .bind(priority)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -214,6 +224,8 @@ impl JobQueue for PostgresJobQueue {
                     .try_get(14)
                     .ok()
                     .or_else(|| r.try_get("trace_context").ok());
+                let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+                let priority: i32 = r.try_get(16).unwrap_or(0);
 
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
@@ -234,6 +246,8 @@ impl JobQueue for PostgresJobQueue {
                 Ok(Some(QueuedJob {
                     id,
                     name,
+                    queue,
+                    priority,
                     payload,
                     attempt: attempt.max(1) as u32,
                     retry_policy,
@@ -478,6 +492,8 @@ impl JobQueue for PostgresJobQueue {
                 let trace_context: Option<String> = r
                     .try_get::<Option<String>, _>("trace_context")
                     .map_err(|e| JobError::Fatal(e.to_string()))?;
+                let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+                let priority: i32 = r.try_get(16).unwrap_or(0);
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
                     initial_backoff_ms: initial_backoff_ms.max(0) as u64,
@@ -488,6 +504,8 @@ impl JobQueue for PostgresJobQueue {
                 jobs.push(QueuedJob {
                     id,
                     name,
+                    queue,
+                    priority,
                     payload,
                     attempt: attempt.max(1) as u32,
                     retry_policy,
