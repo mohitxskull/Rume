@@ -38,6 +38,7 @@ deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 
 [dev-dependencies]
+rume-data = { workspace = true, features = ["sqlite"] }
 tokio = { workspace = true, features = ["test-util"] }
 
 [features]

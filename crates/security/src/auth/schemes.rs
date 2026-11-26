@@ -141,6 +141,7 @@ impl AuthenticationScheme for BearerTokenScheme {
 pub struct ApiKeyScheme {
     header_name: String,
     keys: Arc<HashMap<[u8; 32], AuthUser>>,
+    store: Option<Arc<dyn crate::auth::api_key::ApiKeyStore>>,
 }
 
 impl ApiKeyScheme {
@@ -149,6 +150,7 @@ impl ApiKeyScheme {
         Self {
             header_name: "x-api-key".to_string(),
             keys: Arc::new(HashMap::new()),
+            store: None,
         }
     }
 
@@ -167,6 +169,12 @@ impl ApiKeyScheme {
         hasher.update(key.as_ref());
         let hash: [u8; 32] = hasher.finalize().into();
         Arc::make_mut(&mut self.keys).insert(hash, user);
+        self
+    }
+
+    /// Backs this scheme with a persistent [`ApiKeyStore`](crate::auth::api_key::ApiKeyStore).
+    pub fn with_store(mut self, store: impl crate::auth::api_key::ApiKeyStore) -> Self {
+        self.store = Some(Arc::new(store));
         self
     }
 }
@@ -199,6 +207,21 @@ impl AuthenticationScheme for ApiKeyScheme {
 
             if let Some(user) = self.keys.get(&incoming_hash) {
                 return Ok(Some(user.clone()));
+            }
+
+            if let Some(store) = &self.store {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Some(record) = store.verify_key(key_str, now).await? {
+                    let _ = store.touch_last_used(&record.id, now).await;
+                    let mut user = AuthUser::new(record.user_id).with_permissions(record.scopes);
+                    if let Some(tenant_id) = record.tenant_id {
+                        user = user.with_tenant_id(tenant_id);
+                    }
+                    return Ok(Some(user));
+                }
             }
 
             Err(AuthError::InvalidCredentials("unrecognized api key".into()))
@@ -355,6 +378,61 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&bytes).unwrap(),
             "user-42:Some(\"tenant-a\"):admin,editor"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_key_scheme_with_store_authenticates_and_maps_scopes_and_tenant() {
+        use crate::auth::api_key::{ApiKeyStore, SqlApiKeyStore};
+        use rume_data::persistence::{Migrator, SqliteBackend};
+        use secrecy::ExposeSecret;
+
+        let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
+        let migrator = Migrator::new().with_rume_auth("sqlite");
+        migrator.run_pending(backend.as_ref()).await.unwrap();
+
+        let store = SqlApiKeyStore::new(backend);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let issued = store
+            .create(
+                "svc-user",
+                Some("tenant-xyz"),
+                "service-key",
+                vec!["billing:read".into(), "invoices:write".into()],
+                Some(now + 3600),
+                now,
+            )
+            .await
+            .unwrap();
+
+        let scheme = ApiKeyScheme::new().with_store(store);
+        let layer = AuthLayer::required().scheme(scheme);
+        let svc = layer.layer(tower::service_fn(|req: Request<Body>| async move {
+            let user = req.extensions().get::<AuthUser>().cloned().unwrap();
+            let body = format!(
+                "{}:{:?}:{}",
+                user.id,
+                user.tenant_id,
+                user.permissions.join(",")
+            );
+            Ok::<_, std::convert::Infallible>(Response::new(Body::from(body)))
+        }));
+
+        let req = Request::builder()
+            .header("x-api-key", issued.plaintext.expose_secret())
+            .body(Body::empty())
+            .unwrap();
+        let resp = svc.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(
+            std::str::from_utf8(&bytes).unwrap(),
+            "svc-user:Some(\"tenant-xyz\"):billing:read,invoices:write"
         );
     }
 }
