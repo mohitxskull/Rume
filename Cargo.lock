@@ -4565,6 +4565,7 @@ dependencies = [
  "sqlparser",
  "sqlx",
  "subtle",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",
