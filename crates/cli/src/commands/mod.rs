@@ -7,6 +7,7 @@ mod generate;
 mod list_routes;
 mod new;
 mod sql_check;
+mod task;
 
 use crate::cli::{Cli, Commands};
 pub fn require_rume_project() {
@@ -98,6 +99,10 @@ pub async fn run(cli: Cli) {
         }) => {
             require_rume_project();
             sql_check::run(&path, &format, json, dialect.as_deref(), db).await;
+        }
+        Some(Commands::Task { command }) => {
+            require_rume_project();
+            task::run(command);
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

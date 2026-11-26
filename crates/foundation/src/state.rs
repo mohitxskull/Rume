@@ -44,6 +44,8 @@ pub enum ApplicationMode {
     Run,
     /// Boot for inspection/tooling without serving or side effects.
     Inspect,
+    /// Boot, execute a registered application task (or list tasks), and shut down cleanly.
+    Task,
 }
 
 /// Lifecycle state of a running application.

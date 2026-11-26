@@ -298,6 +298,12 @@ where
     tls: Option<rume_http::tls::TlsConfig>,
     /// Optional real-time WebSocket/SSE hub.
     realtime: Option<rume_http::realtime::RealtimeHub>,
+    /// Registered one-off application tasks.
+    tasks: crate::app::task::TaskRegistry<E, C, S>,
+    /// Deferred duplicate-task registration error surfaced during task execution.
+    task_error: Option<crate::app::task::TaskError>,
+    /// Selected task name for [`ApplicationMode::Task`].
+    task_name: Option<String>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -331,6 +337,9 @@ where
             #[cfg(feature = "tls")]
             tls: None,
             realtime: None,
+            tasks: crate::app::task::TaskRegistry::new(),
+            task_error: None,
+            task_name: None,
         }
     }
 
@@ -522,6 +531,35 @@ where
         self
     }
 
+    /// Register a named one-off application task for [`ApplicationMode::Task`].
+    pub fn task<F, Fut, R>(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: F,
+    ) -> Self
+    where
+        F: FnOnce(AppContext<E, C, S>) -> Fut + Send + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoHookResult + 'static,
+    {
+        if let Err(err) = self.tasks.register(
+            name,
+            description,
+            Box::new(move |ctx| Box::pin(async move { handler(ctx).await.into_hook_result() })),
+        ) && self.task_error.is_none()
+        {
+            self.task_error = Some(err);
+        }
+        self
+    }
+
+    /// Select the task name to run when executing in [`ApplicationMode::Task`].
+    pub fn task_name(mut self, name: impl Into<String>) -> Self {
+        self.task_name = Some(name.into());
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
         if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
@@ -530,6 +568,14 @@ where
             })
         {
             ApplicationMode::Inspect
+        } else if std::env::var_os("RUME_TASK").is_some()
+            || std::env::var_os("RUME_TASK_LIST").is_some()
+            || std::env::args_os().any(|a| {
+                let s = a.to_string_lossy();
+                s == "--rume-list-tasks" || s == "--rume-task" || s.starts_with("--rume-task=")
+            })
+        {
+            ApplicationMode::Task
         } else {
             self.mode
         }
@@ -590,6 +636,100 @@ where
         Ok(())
     }
 
+    fn resolve_cli_task_name(&self) -> Option<String> {
+        let mut args = std::env::args_os();
+        while let Some(arg) = args.next() {
+            let s = arg.to_string_lossy();
+            if s == "--rume-task" {
+                if let Some(val) = args.next() {
+                    let v = val.to_string_lossy().into_owned();
+                    if !v.is_empty() {
+                        return Some(v);
+                    }
+                }
+            } else if let Some(val) = s.strip_prefix("--rume-task=")
+                && !val.is_empty()
+            {
+                return Some(val.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("RUME_TASK")
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+        self.task_name.clone()
+    }
+
+    pub(crate) async fn run_task_mode(mut self) -> Result<(), std::io::Error> {
+        if let Some(err) = self.task_error.take() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                err.to_string(),
+            ));
+        }
+
+        let list_mode = std::env::var_os("RUME_TASK_LIST").is_some()
+            || std::env::args_os()
+                .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-list-tasks"));
+        let selected_task = self.resolve_cli_task_name();
+
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        let mut tasks = std::mem::take(&mut self.tasks);
+        let mut on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
+        let shutdown_timeout = self.shutdown_timeout;
+        let ctx = self.ctx.clone();
+
+        let (_router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
+
+        crate::app::lifecycle::run_startup(
+            &serve_ctx,
+            &resolved.startup,
+            on_ready,
+            &mut on_shutdown,
+            shutdown_timeout,
+            None,
+        )
+        .await?;
+
+        let result = if list_mode {
+            let list = tasks.list();
+            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+            println!("__RUME_TASKS_JSON_START__\n{json}\n__RUME_TASKS_JSON_END__");
+            Ok(())
+        } else {
+            match selected_task {
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no task name specified (use --rume-task <name> or RUME_TASK=<name>)",
+                )),
+                Some(name) => match tasks.take(&name) {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("unknown task '{name}'"),
+                    )),
+                    Some(handler) => handler(serve_ctx.clone()).await.map_err(|err| {
+                        std::io::Error::other(format!("task '{name}' failed: {err}"))
+                    }),
+                },
+            }
+        };
+
+        // Why: Always execute teardown hooks and module `on_shutdown` even if the
+        // selected task was missing or returned an error so DB pools and modules
+        // close cleanly.
+        crate::app::lifecycle::run_shutdown(
+            &serve_ctx,
+            on_shutdown,
+            resolved.shutdown,
+            shutdown_timeout,
+        )
+        .await;
+
+        result
+    }
+
     fn prepare_serve(mut self) -> Result<PreparedServe<E, C, S>, std::io::Error> {
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
@@ -625,8 +765,10 @@ where
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if self.effective_mode() == ApplicationMode::Inspect {
-            return self.run_inspect_mode();
+        match self.effective_mode() {
+            ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::Task => return self.run_task_mode().await,
+            ApplicationMode::Run => {}
         }
 
         let bind_addr = self.bind.clone();
@@ -651,8 +793,10 @@ where
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if self.effective_mode() == ApplicationMode::Inspect {
-            return self.run_inspect_mode();
+        match self.effective_mode() {
+            ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::Task => return self.run_task_mode().await,
+            ApplicationMode::Run => {}
         }
 
         let prepared = self.prepare_serve()?;

@@ -103,8 +103,8 @@ pub mod routing {
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
-    Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder, X_REQUEST_ID,
-    init_tracing, try_init_tracing,
+    Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder, TaskHandler, TaskInfo,
+    TaskRegistry, X_REQUEST_ID, init_tracing, try_init_tracing,
 };
 pub use error::AppError;
 pub use events::{DistributedEventBus, Event, EventBus};

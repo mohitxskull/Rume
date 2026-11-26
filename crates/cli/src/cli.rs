@@ -131,6 +131,35 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List or run registered application tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommands,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TaskCommands {
+    /// List registered application tasks.
+    List {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Output tasks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a registered application task.
+    Run {
+        /// Name of the task to execute.
+        name: String,
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]

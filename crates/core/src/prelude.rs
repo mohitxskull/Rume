@@ -5,6 +5,7 @@ pub use crate::HasOpenApiSchema;
 pub use crate::app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
     IntoBindAddr, Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder,
+    TaskHandler, TaskInfo, TaskRegistry,
 };
 #[cfg(feature = "nats")]
 pub use crate::broker::NatsBroker;

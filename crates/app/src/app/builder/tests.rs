@@ -1218,3 +1218,131 @@ async fn rume_builder_realtime_attaches_hub_and_drains_on_shutdown() {
     server.await.unwrap().unwrap();
     assert!(hub_check.is_shutting_down());
 }
+
+#[tokio::test]
+async fn task_mode_runs_selected_task_with_startup_and_shutdown() {
+    struct TaskLifecycleModule {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::module::Module for TaskLifecycleModule {
+        fn name(&self) -> &str {
+            "task-lifecycle"
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_start".to_string());
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_shutdown".to_string());
+            })
+        }
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_events = std::sync::Arc::clone(&events);
+
+    let ctx = AppContext::new(
+        (),
+        (),
+        ProjectPaths::from_current_dir(),
+        Availability::new(),
+        HealthChecks::new(),
+        "task-state-value".to_string(),
+    );
+
+    RumeBuilder::new(ctx)
+        .module(TaskLifecycleModule {
+            events: std::sync::Arc::clone(&events),
+        })
+        .task(
+            "greet",
+            "Read state from AppContext",
+            move |ctx| async move {
+                task_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("task:{}", ctx.state));
+                Ok::<_, std::io::Error>(())
+            },
+        )
+        .mode(ApplicationMode::Task)
+        .task_name("greet")
+        .run_with_signal(std::future::pending())
+        .await
+        .expect("task mode should execute and shut down cleanly");
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "on_start".to_string(),
+            "task:task-state-value".to_string(),
+            "on_shutdown".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn task_mode_unknown_task_returns_not_found_after_shutdown() {
+    struct ShutdownTrackerModule {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::module::Module for ShutdownTrackerModule {
+        fn name(&self) -> &str {
+            "shutdown-tracker"
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_start".to_string());
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_shutdown".to_string());
+            })
+        }
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ctx = test_ctx();
+
+    let err = RumeBuilder::new(ctx)
+        .module(ShutdownTrackerModule {
+            events: std::sync::Arc::clone(&events),
+        })
+        .task("existing", "An existing task", |_ctx| async {
+            Ok::<_, std::io::Error>(())
+        })
+        .mode(ApplicationMode::Task)
+        .task_name("missing")
+        .run_with_signal(std::future::pending())
+        .await
+        .expect_err("unknown task should return NotFound");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["on_start".to_string(), "on_shutdown".to_string()]
+    );
+}
