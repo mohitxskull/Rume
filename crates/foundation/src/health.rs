@@ -342,24 +342,37 @@ impl HealthChecks {
                 };
 
                 if let Some(mut rx) = waiter {
-                    if rx.wait_for(|val| val.is_some()).await.is_err() {
-                        let mut sf = self.singleflight.lock().await;
-                        // Why: only clear the slot if it still points to the
-                        // cancelled leader's channel. Otherwise a second waking
-                        // follower would wipe a newly elected Leader L2's slot,
-                        // breaking stampede suppression.
-                        if sf
-                            .as_ref()
-                            .is_some_and(|existing| existing.same_channel(&rx))
-                        {
-                            *sf = None;
+                    let waited = rx
+                        .wait_for(|val| val.is_some())
+                        .await
+                        .map(|guard| guard.clone());
+                    match waited {
+                        Ok(Some(mut report)) => {
+                            // Why: return the leader's published report directly (marked
+                            // `cached = true`) instead of re-querying `get_cached_report(ttl)`,
+                            // so singleflight still coalesces concurrent callers when
+                            // `ttl == Duration::ZERO` or the check outlived a short TTL (`RC-35`).
+                            for check in &mut report.checks {
+                                check.cached = true;
+                            }
+                            return report;
                         }
-                        continue;
+                        Ok(None) => continue,
+                        Err(_) => {
+                            let mut sf = self.singleflight.lock().await;
+                            // Why: only clear the slot if it still points to the
+                            // cancelled leader's channel. Otherwise a second waking
+                            // follower would wipe a newly elected Leader L2's slot,
+                            // breaking stampede suppression.
+                            if sf
+                                .as_ref()
+                                .is_some_and(|existing| existing.same_channel(&rx))
+                            {
+                                *sf = None;
+                            }
+                            continue;
+                        }
                     }
-                    if let Some(report) = self.get_cached_report(ttl) {
-                        return report;
-                    }
-                    continue;
                 }
 
                 // Leader executes the checks
@@ -721,5 +734,69 @@ mod tests {
         let mut checks = HealthChecks::new();
         assert!(checks.try_add(DummyCheck("db")).is_ok());
         assert!(checks.try_add(DummyCheck("db")).is_err());
+    }
+
+    #[tokio::test]
+    async fn singleflight_coalesces_concurrent_callers_with_zero_ttl() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        #[derive(Debug)]
+        struct GatedCheck {
+            runs: Arc<AtomicUsize>,
+            started: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl HealthCheck for GatedCheck {
+            fn name(&self) -> &str {
+                "gated"
+            }
+
+            fn run(&self) -> Pin<Box<dyn Future<Output = HealthCheckResult> + Send>> {
+                let runs = Arc::clone(&self.runs);
+                let started = Arc::clone(&self.started);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    started.notify_one();
+                    release.notified().await;
+                    HealthCheckResult::ok("gated", "ok")
+                })
+            }
+        }
+
+        let runs = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+
+        let checks = Arc::new(
+            HealthChecks::new()
+                .cache_ttl(Some(Duration::ZERO))
+                .register(GatedCheck {
+                    runs: Arc::clone(&runs),
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                }),
+        );
+
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let mut leader = Box::pin(checks.run());
+        assert!(leader.as_mut().poll(&mut cx).is_pending());
+        started.notified().await;
+
+        let mut follower = Box::pin(checks.run());
+        assert!(follower.as_mut().poll(&mut cx).is_pending());
+
+        release.notify_waiters();
+        let (leader_report, follower_report) = tokio::join!(leader, follower);
+
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "concurrent callers with Duration::ZERO TTL must coalesce onto a single execution"
+        );
+        assert!(!leader_report.checks[0].cached);
+        assert!(follower_report.checks[0].cached);
     }
 }

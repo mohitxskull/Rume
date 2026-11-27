@@ -374,10 +374,28 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                     }
                     return Err(err);
                 }
-                self.backend
+                if let Err(e) = self
+                    .backend
                     .execute_params(mark_exported_stmt, &[DbValue::from(batch_id.as_str())])
                     .await
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
+                {
+                    // Why: release claims on all remaining unexported batches so a DB error
+                    // during `mark_exported` does not strand `batches_to_export[idx + 1..]`
+                    // for the full 60s claim lease (`RC-38`).
+                    for (pending_id, _) in &batches_to_export[idx + 1..] {
+                        let _ = self
+                            .backend
+                            .execute_params(
+                                release_claim_stmt,
+                                &[
+                                    DbValue::from(pending_id.as_str()),
+                                    DbValue::from(claim_token.as_str()),
+                                ],
+                            )
+                            .await;
+                    }
+                    return Err(MeteringError::Store(e.to_string()));
+                }
                 exported_records += records.len();
             }
 

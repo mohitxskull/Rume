@@ -79,6 +79,21 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         self.dequeue_for(worker_id)
     }
 
+    /// Dequeues the next available job from any queue NOT in `excluded_queues`.
+    ///
+    /// Used when polling all queues (`queues == None`) while one or more queues have
+    /// reached their per-queue concurrency cap, so saturated high-priority queues cannot
+    /// starve other queues or churn DB deferrals (`RC-30`).
+    ///
+    /// Defaults to delegating to [`JobQueue::dequeue_for`] for backward compatibility.
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     /// Dequeues the next available job whose `available_at` time has passed.
     ///
     /// Delegates to [`JobQueue::dequeue_for`] with an anonymous worker identifier.

@@ -1,4 +1,6 @@
 UPDATE rume_job_batches
-SET callbacks_dispatched = 1
+SET then_dispatched = 1,
+    finally_dispatched = 1
 WHERE id = ?
-  AND callbacks_dispatched = 0;
+  AND then_dispatched = 0
+  AND finally_dispatched = 0;

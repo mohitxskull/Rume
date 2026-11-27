@@ -289,6 +289,82 @@ FOR UPDATE SKIP LOCKED;"
         })
     }
 
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        if excluded_queues.is_empty() {
+            return self.dequeue_for(worker_id);
+        }
+        let wid = worker_id.to_string();
+        let excluded: Vec<String> = excluded_queues.to_vec();
+        Box::pin(async move {
+            let lease_duration_ms =
+                i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
+            let new_lease_token = Uuid::new_v4().to_string();
+
+            let mut tx = self
+                .pool
+                .begin()
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let placeholders = vec!["?"; excluded.len()].join(", ");
+            let sql = format!(
+                "SELECT id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority
+FROM rume_jobs
+WHERE queue NOT IN ({placeholders})
+  AND ((status = 'pending' AND available_at <= FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000))
+   OR (status = 'in_flight' AND lease_expires_at <= FLOOR(UNIX_TIMESTAMP(NOW(3)) * 1000)))
+ORDER BY priority DESC, available_at ASC, created_at ASC
+LIMIT 1
+FOR UPDATE SKIP LOCKED;"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for name in &excluded {
+                q = q.bind(name);
+            }
+            let row: Option<MySqlRow> = q
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let Some(r) = row else {
+                tx.commit()
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                return Ok(None);
+            };
+
+            let id: String = r.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+            let prev_attempt: i32 = r.try_get(3).unwrap_or(0);
+            let next_attempt = (prev_attempt + 1).max(1) as u32;
+
+            sqlx::query(rume_data::sql::MYSQL_JOBS_CLAIM_UPDATE)
+                .bind(&wid)
+                .bind(lease_duration_ms)
+                .bind(&new_lease_token)
+                .bind(&id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            tx.commit()
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            let job = row_to_queued_job(
+                &r,
+                self.default_lease_duration,
+                Some(next_attempt),
+                Some(wid),
+                Some(new_lease_token),
+            )?;
+            Ok(Some(job))
+        })
+    }
+
     fn reclaim_abandoned_jobs(
         &self,
         dead_workers: &[String],

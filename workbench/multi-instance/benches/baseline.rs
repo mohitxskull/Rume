@@ -437,6 +437,7 @@ pub async fn run_competing_outbox_relays_benchmark<B: DatabaseBackend + OutboxRe
             batch_size,
             poll_interval: Duration::from_millis(5),
             max_retries: 3,
+            ..Default::default()
         };
 
         let relay = OutboxRelay::new(pool_clone, |_msg: &OutboxMessage| async { Ok(()) })

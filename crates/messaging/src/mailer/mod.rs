@@ -28,6 +28,9 @@ pub enum MailerError {
     /// Invalid sender or recipient email address.
     #[error("invalid email address: {0}")]
     InvalidAddress(String),
+    /// Invalid email message (missing recipients or forbidden header control characters).
+    #[error("invalid email message: {0}")]
+    InvalidMessage(String),
     /// Failed to construct the MIME email message.
     #[error("failed to build email: {0}")]
     Build(String),

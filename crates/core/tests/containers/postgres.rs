@@ -1631,6 +1631,7 @@ async fn test_postgres_outbox_relay_heartbeat_renewal_keeps_long_running_dispatc
         lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     let dispatched = Arc::new(AtomicUsize::new(0));
@@ -1681,6 +1682,7 @@ async fn test_postgres_outbox_batch_lease_expiry_and_pre_dispatch_renewal() {
         lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     let processed = Arc::new(AtomicUsize::new(0));
@@ -1739,6 +1741,7 @@ async fn test_postgres_database_pool_outbox_relay_heartbeat_renewal_keeps_long_r
         lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     let dispatched = Arc::new(AtomicUsize::new(0));

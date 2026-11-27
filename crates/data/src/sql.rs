@@ -479,6 +479,20 @@ pub const SQLITE_BATCHES_RECORD_FAILURE: &str =
 /// Mark batch callbacks as dispatched in SQLite.
 pub const SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
     include_str!("../sql/sqlite/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in SQLite.
+pub const SQLITE_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/sqlite/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_CLAIM_THEN: &str = include_str!("../sql/sqlite/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_RELEASE_THEN: &str =
+    include_str!("../sql/sqlite/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/sqlite/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/sqlite/batches_release_finally.sql");
 /// Cancel a running batch in SQLite.
 pub const SQLITE_BATCHES_CANCEL: &str = include_str!("../sql/sqlite/batches_cancel.sql");
 
@@ -497,6 +511,19 @@ pub const PG_BATCHES_RECORD_FAILURE: &str =
 /// Mark batch callbacks as dispatched in PostgreSQL.
 pub const PG_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
     include_str!("../sql/postgres/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in PostgreSQL.
+pub const PG_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/postgres/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_CLAIM_THEN: &str = include_str!("../sql/postgres/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_RELEASE_THEN: &str = include_str!("../sql/postgres/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/postgres/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/postgres/batches_release_finally.sql");
 /// Cancel a running batch in PostgreSQL.
 pub const PG_BATCHES_CANCEL: &str = include_str!("../sql/postgres/batches_cancel.sql");
 
@@ -515,6 +542,19 @@ pub const MYSQL_BATCHES_RECORD_FAILURE: &str =
 /// Mark batch callbacks as dispatched in MySQL.
 pub const MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
     include_str!("../sql/mysql/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in MySQL.
+pub const MYSQL_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/mysql/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_CLAIM_THEN: &str = include_str!("../sql/mysql/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_RELEASE_THEN: &str = include_str!("../sql/mysql/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/mysql/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/mysql/batches_release_finally.sql");
 /// Cancel a running batch in MySQL.
 pub const MYSQL_BATCHES_CANCEL: &str = include_str!("../sql/mysql/batches_cancel.sql");
 

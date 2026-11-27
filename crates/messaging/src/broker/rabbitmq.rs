@@ -9,7 +9,7 @@ use futures_util::StreamExt;
 use lapin::BasicProperties;
 use lapin::Confirmation;
 use lapin::options::{
-    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
+    BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions, BasicQosOptions,
     ConfirmSelectOptions, QueueDeclareOptions,
 };
 use lapin::types::{AMQPValue, FieldTable, LongString, ShortString};
@@ -22,53 +22,110 @@ use crate::broker::{
 /// Persistent AMQP delivery mode (`2` = write message to disk on durable queues).
 const AMQP_DELIVERY_MODE_PERSISTENT: u8 = 2;
 
+/// Default AMQP consumer prefetch limit bounding unacknowledged in-flight deliveries.
+const DEFAULT_PREFETCH_COUNT: u16 = 32;
+
 /// RabbitMQ-backed [`MessageBroker`].
 #[derive(Clone)]
 pub struct RabbitMqBroker {
-    connection: Arc<lapin::Connection>,
+    uri: Option<String>,
+    connection: Arc<Mutex<Arc<lapin::Connection>>>,
     /// Pooled publisher channel with publisher confirms enabled, recreated only if closed.
     publish_channel: Arc<Mutex<Option<lapin::Channel>>>,
+    prefetch_count: u16,
+    durable: bool,
 }
 
 impl Debug for RabbitMqBroker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RabbitMqBroker").finish_non_exhaustive()
+        f.debug_struct("RabbitMqBroker")
+            .field("prefetch_count", &self.prefetch_count)
+            .field("durable", &self.durable)
+            .field("reconnectable", &self.uri.is_some())
+            .finish_non_exhaustive()
     }
 }
 
 impl RabbitMqBroker {
-    /// Wraps an existing `lapin::Connection`.
+    /// Wraps an existing `lapin::Connection` (non-reconnectable unless constructed via [`Self::connect`]).
     pub fn new(connection: Arc<lapin::Connection>) -> Self {
         Self {
-            connection,
+            uri: None,
+            connection: Arc::new(Mutex::new(connection)),
             publish_channel: Arc::new(Mutex::new(None)),
+            prefetch_count: DEFAULT_PREFETCH_COUNT,
+            durable: true,
         }
     }
 
-    /// Connects to a RabbitMQ broker at `uri`.
+    /// Connects to a RabbitMQ broker at `uri` with automatic reconnect on connection drop.
     pub async fn connect(uri: &str) -> Result<Self, BrokerError> {
         let connection = lapin::Connection::connect(uri, lapin::ConnectionProperties::default())
             .await
             .map_err(|e| BrokerError::Transport(e.to_string()))?;
-        Ok(Self::new(Arc::new(connection)))
+        Ok(Self {
+            uri: Some(uri.to_string()),
+            connection: Arc::new(Mutex::new(Arc::new(connection))),
+            publish_channel: Arc::new(Mutex::new(None)),
+            prefetch_count: DEFAULT_PREFETCH_COUNT,
+            durable: true,
+        })
     }
 
-    /// Returns a reference to the underlying `lapin::Connection`.
-    pub fn connection(&self) -> &lapin::Connection {
-        &self.connection
+    /// Configures the AMQP `basic_qos` prefetch count for new consumers (default: `32`).
+    pub fn with_prefetch_count(mut self, prefetch_count: u16) -> Self {
+        self.prefetch_count = prefetch_count;
+        self
+    }
+
+    /// Configures whether declared queues are durable (default: `true`).
+    pub fn with_durable(mut self, durable: bool) -> Self {
+        self.durable = durable;
+        self
+    }
+
+    /// Returns a connected `lapin::Connection`, reconnecting transparently when `uri` is configured.
+    pub async fn connection(&self) -> Result<Arc<lapin::Connection>, BrokerError> {
+        let mut guard = self.connection.lock().await;
+        if guard.status().connected() {
+            return Ok(Arc::clone(&guard));
+        }
+        let Some(ref uri) = self.uri else {
+            return Err(BrokerError::Transport(
+                "RabbitMQ connection is closed and no reconnect URI is configured".into(),
+            ));
+        };
+        let reconnected = Arc::new(
+            lapin::Connection::connect(uri, lapin::ConnectionProperties::default())
+                .await
+                .map_err(|e| BrokerError::Transport(e.to_string()))?,
+        );
+        *guard = Arc::clone(&reconnected);
+        drop(guard);
+        *self.publish_channel.lock().await = None;
+        Ok(reconnected)
     }
 
     /// Returns the pooled publisher channel with publisher confirms enabled, creating a new
     /// channel only when none exists yet or the cached channel is no longer connected.
     async fn acquire_publish_channel(&self) -> Result<lapin::Channel, BrokerError> {
+        {
+            let guard = self.publish_channel.lock().await;
+            if let Some(ref ch) = *guard
+                && ch.status().connected()
+            {
+                return Ok(ch.clone());
+            }
+        }
+
+        let conn = self.connection().await?;
         let mut guard = self.publish_channel.lock().await;
         if let Some(ref ch) = *guard
             && ch.status().connected()
         {
             return Ok(ch.clone());
         }
-        let ch = self
-            .connection
+        let ch = conn
             .create_channel()
             .await
             .map_err(|e| BrokerError::Transport(e.to_string()))?;
@@ -78,6 +135,24 @@ impl RabbitMqBroker {
         *guard = Some(ch.clone());
         Ok(ch)
     }
+
+    /// Invalidates the cached publish channel only if it still matches `failed_channel_id`
+    /// or is itself disconnected, so a failing task never evicts another task's healthy
+    /// replacement channel (`RC-29`).
+    async fn invalidate_publish_channel(&self, failed_channel_id: u16) {
+        let mut guard = self.publish_channel.lock().await;
+        if guard.as_ref().is_some_and(|c| {
+            should_invalidate_channel(c.id(), c.status().connected(), failed_channel_id)
+        }) {
+            *guard = None;
+        }
+    }
+}
+
+/// Pure decision helper for `RC-29`: returns `true` iff the cached channel is the same
+/// channel that failed or is no longer connected.
+fn should_invalidate_channel(cached_id: u16, cached_connected: bool, failed_id: u16) -> bool {
+    cached_id == failed_id || !cached_connected
 }
 
 /// Validates a RabbitMQ publisher confirmation, rejecting broker `Nack` or disabled confirms.
@@ -240,7 +315,7 @@ impl BrokerPublisher for RabbitMqBroker {
                 Ok(c) => c,
                 Err(e) => {
                     if !channel.status().connected() {
-                        *self.publish_channel.lock().await = None;
+                        self.invalidate_publish_channel(channel.id()).await;
                     }
                     return Err(BrokerError::Transport(e.to_string()));
                 }
@@ -252,14 +327,14 @@ impl BrokerPublisher for RabbitMqBroker {
                         if !channel.status().connected()
                             || matches!(confirmation, Confirmation::NotRequested)
                         {
-                            *self.publish_channel.lock().await = None;
+                            self.invalidate_publish_channel(channel.id()).await;
                         }
                         return Err(err);
                     }
                 }
                 Err(e) => {
                     if !channel.status().connected() {
-                        *self.publish_channel.lock().await = None;
+                        self.invalidate_publish_channel(channel.id()).await;
                     }
                     return Err(BrokerError::Transport(e.to_string()));
                 }
@@ -276,8 +351,8 @@ impl MessageBroker for RabbitMqBroker {
         topic: &'a str,
     ) -> BoxFuture<'a, Result<Box<dyn BrokerConsumer>, BrokerError>> {
         Box::pin(async move {
-            let channel = self
-                .connection
+            let conn = self.connection().await?;
+            let channel = conn
                 .create_channel()
                 .await
                 .map_err(|e| BrokerError::Transport(e.to_string()))?;
@@ -285,9 +360,20 @@ impl MessageBroker for RabbitMqBroker {
             channel
                 .queue_declare(
                     topic.into(),
-                    QueueDeclareOptions::default(),
+                    QueueDeclareOptions {
+                        durable: self.durable,
+                        ..Default::default()
+                    },
                     FieldTable::default(),
                 )
+                .await
+                .map_err(|e| BrokerError::Transport(e.to_string()))?;
+
+            // Why: bound unacknowledged in-flight deliveries per consumer so a slow
+            // consumer cannot accumulate unbounded AMQP deliveries in `PendingDeliveryTags`
+            // (`RC-10`).
+            channel
+                .basic_qos(self.prefetch_count, BasicQosOptions::default())
                 .await
                 .map_err(|e| BrokerError::Transport(e.to_string()))?;
 
@@ -314,6 +400,19 @@ impl MessageBroker for RabbitMqBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_invalidation_preserves_healthy_replacement_channel() {
+        // Same channel ID that failed -> must invalidate even if status flickered.
+        assert!(should_invalidate_channel(1, true, 1));
+        assert!(should_invalidate_channel(1, false, 1));
+
+        // Healthy replacement channel with a different ID -> must NOT evict (`RC-29`).
+        assert!(!should_invalidate_channel(2, true, 1));
+
+        // Disconnected replacement channel -> must invalidate.
+        assert!(should_invalidate_channel(2, false, 1));
+    }
 
     #[test]
     fn verify_publish_confirmation_accepts_ack_and_rejects_nack_or_not_requested() {

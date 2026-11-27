@@ -191,6 +191,7 @@ async fn handle_outbox(
                 batch_size: 10,
                 poll_interval: Duration::from_millis(50),
                 max_retries: 3,
+                ..Default::default()
             };
             let relay =
                 OutboxRelay::new(Arc::clone(&pool), |_msg: &OutboxMessage| async { Ok(()) })

@@ -265,6 +265,60 @@ RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_back
         })
     }
 
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        if excluded_queues.is_empty() {
+            return self.dequeue_for(worker_id);
+        }
+        let wid = worker_id.to_string();
+        let excluded: Vec<String> = excluded_queues.to_vec();
+        Box::pin(async move {
+            let lease_duration_ms =
+                i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
+            let new_lease_token = Uuid::new_v4().to_string();
+            // Why: SQLite lacks array bindings; build positional `?4, ?5, ...` placeholders
+            // and bind each excluded queue name via `.bind()` (`RC-30`).
+            let placeholders = (0..excluded.len())
+                .map(|idx| format!("?{}", idx + 4))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!(
+                "UPDATE rume_jobs
+SET status = 'in_flight',
+    assigned_worker = ?1,
+    attempt = attempt + 1,
+    lease_expires_at = CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER) + ?2,
+    lease_token = ?3
+WHERE id = (
+    SELECT id FROM rume_jobs
+    WHERE queue NOT IN ({placeholders})
+      AND ((status = 'pending' AND available_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER))
+       OR (status = 'in_flight' AND lease_expires_at <= CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)))
+    ORDER BY priority DESC, available_at ASC, created_at ASC
+    LIMIT 1
+)
+RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority;"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
+                .bind(&wid)
+                .bind(lease_duration_ms)
+                .bind(&new_lease_token);
+            for name in &excluded {
+                q = q.bind(name);
+            }
+            let row: Option<SqliteRow> = q
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|e| JobError::Fatal(e.to_string()))?;
+            row.as_ref()
+                .map(|r| row_to_queued_job(r, self.default_lease_duration))
+                .transpose()
+        })
+    }
+
     fn reclaim_abandoned_jobs(
         &self,
         dead_workers: &[String],
@@ -982,5 +1036,154 @@ mod tests {
             handle.shutdown(Duration::from_secs(2)).await,
             "worker shutdown must drain cleanly"
         );
+    }
+
+    #[tokio::test]
+    async fn sqlite_worker_unrestricted_queues_excludes_saturated_high_priority_queue() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::sync::Notify;
+
+        use crate::jobs::job::{JobContext, JobHandler};
+        use crate::jobs::worker::{JobRegistry, JobWorker};
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct HighPrioSlowJob {
+            id: u32,
+        }
+        impl Job for HighPrioSlowJob {
+            const NAME: &'static str = "rc30_high_prio_slow";
+            fn queue(&self) -> &str {
+                "slow_hp"
+            }
+            fn priority(&self) -> i32 {
+                100
+            }
+        }
+
+        #[derive(Debug, Serialize, Deserialize)]
+        struct LowPrioFastJob {
+            id: u32,
+        }
+        impl Job for LowPrioFastJob {
+            const NAME: &'static str = "rc30_low_prio_fast";
+            fn queue(&self) -> &str {
+                "fast_lp"
+            }
+            fn priority(&self) -> i32 {
+                0
+            }
+        }
+
+        struct BlockingSlowHandler {
+            started: Arc<AtomicUsize>,
+            completed: Arc<AtomicUsize>,
+            release: Arc<Notify>,
+        }
+        impl JobHandler<HighPrioSlowJob> for BlockingSlowHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: HighPrioSlowJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let started = Arc::clone(&self.started);
+                let completed = Arc::clone(&self.completed);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    release.notified().await;
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        struct FastHandler {
+            completed: Arc<AtomicUsize>,
+        }
+        impl JobHandler<LowPrioFastJob> for FastHandler {
+            fn handle<'a>(
+                &'a self,
+                _ctx: &'a JobContext,
+                _job: LowPrioFastJob,
+            ) -> BoxFuture<'a, Result<(), JobError>> {
+                let completed = Arc::clone(&self.completed);
+                Box::pin(async move {
+                    completed.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory");
+        let queue = Arc::new(SqliteJobQueue::new(pool));
+        queue.init_schema().await.expect("init schema");
+
+        // Enqueue 2 high-priority slow jobs and 1 low-priority fast job.
+        queue.enqueue(HighPrioSlowJob { id: 1 }).await.unwrap();
+        queue.enqueue(HighPrioSlowJob { id: 2 }).await.unwrap();
+        queue.enqueue(LowPrioFastJob { id: 1 }).await.unwrap();
+
+        let slow_started = Arc::new(AtomicUsize::new(0));
+        let slow_completed = Arc::new(AtomicUsize::new(0));
+        let slow_release = Arc::new(Notify::new());
+        let fast_completed = Arc::new(AtomicUsize::new(0));
+
+        let mut registry = JobRegistry::new();
+        registry.register(BlockingSlowHandler {
+            started: Arc::clone(&slow_started),
+            completed: Arc::clone(&slow_completed),
+            release: Arc::clone(&slow_release),
+        });
+        registry.register(FastHandler {
+            completed: Arc::clone(&fast_completed),
+        });
+
+        // Notice: `queues == None` (no `.with_queues(...)`), only `.with_queue_concurrency("slow_hp", 1)`.
+        let worker = JobWorker::new(Arc::clone(&queue), Arc::new(registry))
+            .with_concurrency(4)
+            .with_queue_concurrency("slow_hp", 1);
+
+        let handle = worker.start();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if fast_completed.load(Ordering::SeqCst) == 1
+                && slow_started.load(Ordering::SeqCst) == 1
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+
+        assert_eq!(
+            fast_completed.load(Ordering::SeqCst),
+            1,
+            "low-priority fast queue must complete immediately without starvation when high-priority slow queue is saturated (queues == None)"
+        );
+        assert_eq!(slow_started.load(Ordering::SeqCst), 1);
+        assert_eq!(slow_completed.load(Ordering::SeqCst), 0);
+
+        // Release both slow jobs and shut down cleanly.
+        slow_release.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if slow_started.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        slow_release.notify_one();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline {
+            if slow_completed.load(Ordering::SeqCst) == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        assert_eq!(slow_completed.load(Ordering::SeqCst), 2);
+        assert!(handle.shutdown(Duration::from_secs(2)).await);
     }
 }

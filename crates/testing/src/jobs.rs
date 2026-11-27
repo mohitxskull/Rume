@@ -145,7 +145,16 @@ impl JobQueue for TestJobQueue {
     }
 
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_excluding(worker_id, &[])
+    }
+
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
         let worker = worker_id.to_string();
+        let excluded = excluded_queues.to_vec();
         Box::pin(async move {
             let mut lock = self
                 .jobs
@@ -153,7 +162,10 @@ impl JobQueue for TestJobQueue {
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
             let now = Instant::now();
             for job in lock.iter_mut() {
-                if job.available_at <= now && job.assigned_worker.is_none() {
+                if job.available_at <= now
+                    && job.assigned_worker.is_none()
+                    && !excluded.contains(&job.queue)
+                {
                     job.assigned_worker = Some(worker.clone());
                     job.lease_token = Some(Uuid::new_v4().to_string());
                     job.attempt += 1;

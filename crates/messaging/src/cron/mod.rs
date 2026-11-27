@@ -598,4 +598,58 @@ mod tests {
             .await
             .expect("shutdown");
     }
+
+    #[tokio::test]
+    async fn cron_scheduler_isolates_handler_panics_and_continues_next_tick() {
+        let elector = Arc::new(InMemoryLeaderElector::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut sched = CronScheduler::new(
+            elector,
+            "cron-panic-isolation",
+            "node-1",
+            Duration::from_secs(5),
+        );
+        let spec = CronJobSpec::new("panicky", "* * * * * *").expect("valid 6-field cron");
+        let attempts_cb = Arc::clone(&attempts);
+        let completed_cb = Arc::clone(&completed);
+        sched
+            .register(spec, move || {
+                let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Synchronous panic during future construction on tick 0.
+                    panic!("sync panic on tick 0");
+                }
+                let completed_inner = Arc::clone(&completed_cb);
+                async move {
+                    if n == 1 {
+                        // Asynchronous panic during future polling on tick 1.
+                        panic!("async panic on tick 1");
+                    }
+                    completed_inner.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("register");
+
+        let handle = sched.start();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while completed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 3,
+            "scheduler must survive both sync and async panics and fire subsequent ticks"
+        );
+        assert!(
+            completed.load(Ordering::SeqCst) >= 1,
+            "tick after panics must execute cleanly"
+        );
+    }
 }
