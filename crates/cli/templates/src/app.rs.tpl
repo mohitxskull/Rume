@@ -1,7 +1,7 @@
 use crate::config::Config;
 use crate::env::Env;
 use crate::routes;
-use rume::app::{AppContext, Rume, init_tracing};
+use rume::app::{AppContext, Rume, init_tracing, shutdown_global_observability_async};
 use rume::routing::health_routes;
 
 #[derive(Clone)]
@@ -29,11 +29,14 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let router = build_router(ctx.clone());
 
-    Rume::builder(ctx)
+    let run_result = Rume::builder(ctx)
         .router(router)
         .bind((env.host, env.port))
         .run()
-        .await?;
+        .await;
+
+    shutdown_global_observability_async().await;
+    run_result?;
 
     Ok(())
 }

@@ -361,6 +361,7 @@ pub(super) struct ExecutionClaimGuard {
     pub(super) saga_id: String,
     pub(super) token: String,
     pub(super) renew_task: Option<tokio::task::JoinHandle<()>>,
+    pub(super) claim_lost_rx: tokio::sync::watch::Receiver<bool>,
 }
 
 impl ExecutionClaimGuard {

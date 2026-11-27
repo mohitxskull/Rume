@@ -185,37 +185,42 @@ impl CronScheduler {
 
     /// Starts the leader-election loop and cron scheduling tasks.
     pub fn start(self) -> CronSchedulerHandle {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (job_shutdown_tx, job_shutdown_rx) = watch::channel(false);
+        let (election_shutdown_tx, mut election_shutdown_rx) = watch::channel(false);
         let (leader_tx, leader_rx) = watch::channel::<Option<Instant>>(None);
-        let mut tasks = JoinSet::new();
+        let mut job_tasks = JoinSet::new();
 
         let elector = self.elector;
         let role = self.role;
         let candidate_id = self.candidate_id;
         let lease_ttl = self.lease_ttl;
-        let mut election_shutdown = shutdown_rx.clone();
 
-        tasks.spawn(async move {
+        let election_task = tokio::spawn(async move {
             run_election_loop(
                 elector,
                 role,
                 candidate_id,
                 lease_ttl,
                 leader_tx,
-                &mut election_shutdown,
+                &mut election_shutdown_rx,
             )
             .await;
         });
 
         for job in self.jobs {
-            let mut job_shutdown = shutdown_rx.clone();
+            let mut job_shutdown = job_shutdown_rx.clone();
             let mut job_leader = leader_rx.clone();
-            tasks.spawn(async move {
+            job_tasks.spawn(async move {
                 run_job_loop(job, &mut job_leader, &mut job_shutdown).await;
             });
         }
 
-        CronSchedulerHandle { shutdown_tx, tasks }
+        CronSchedulerHandle {
+            job_shutdown_tx,
+            election_shutdown_tx,
+            job_tasks,
+            election_task,
+        }
     }
 }
 
@@ -463,16 +468,24 @@ async fn run_job_loop(
 /// Handle for gracefully shutting down a running [`CronScheduler`].
 #[derive(Debug)]
 pub struct CronSchedulerHandle {
-    shutdown_tx: watch::Sender<bool>,
-    tasks: JoinSet<()>,
+    job_shutdown_tx: watch::Sender<bool>,
+    election_shutdown_tx: watch::Sender<bool>,
+    job_tasks: JoinSet<()>,
+    election_task: tokio::task::JoinHandle<()>,
 }
 
 impl CronSchedulerHandle {
-    /// Signals shutdown, resigns leadership, and awaits running tasks up to `timeout`.
+    /// Signals shutdown, drains in-flight job handlers while keeping leadership renewal active,
+    /// and only then resigns leadership — all bounded by `timeout` (`RC-10`).
     pub async fn shutdown(mut self, timeout: Duration) -> Result<(), CronError> {
-        let _ = self.shutdown_tx.send(true);
-        let drain = async {
-            while let Some(res) = self.tasks.join_next().await {
+        let deadline = Instant::now() + timeout;
+
+        // Why: stop scheduling new job ticks first while keeping `election_task` renewing
+        // the lease so another node cannot acquire leadership and double-fire a cron job
+        // while an in-flight handler is still draining (`RC-10`).
+        let _ = self.job_shutdown_tx.send(true);
+        let drain_jobs = async {
+            while let Some(res) = self.job_tasks.join_next().await {
                 if let Err(err) = res
                     && !err.is_cancelled()
                 {
@@ -481,13 +494,181 @@ impl CronSchedulerHandle {
             }
         };
 
-        if tokio::time::timeout(timeout, drain).await.is_err() {
-            self.tasks.abort_all();
+        let jobs_timed_out = tokio::time::timeout_at(deadline, drain_jobs).await.is_err();
+        if jobs_timed_out {
+            self.job_tasks.abort_all();
+        }
+
+        // Now resign leadership and wait for the election loop to finish within remaining budget.
+        let _ = self.election_shutdown_tx.send(true);
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.election_task.abort();
+            return Err(CronError::Execution(
+                "cron scheduler shutdown timed out".to_string(),
+            ));
+        }
+
+        match tokio::time::timeout(remaining, &mut self.election_task).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) if !err.is_cancelled() => {
+                warn!(error = %err, "cron election task panicked during shutdown");
+            }
+            Ok(Err(_)) => {}
+            Err(_) => {
+                self.election_task.abort();
+                return Err(CronError::Execution(
+                    "cron scheduler shutdown timed out".to_string(),
+                ));
+            }
+        }
+
+        if jobs_timed_out {
             return Err(CronError::Execution(
                 "cron scheduler shutdown timed out".to_string(),
             ));
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rume_data::coordination::{CoordinationError, LeaderLease};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::Notify;
+
+    #[derive(Debug)]
+    struct TrackingElector {
+        resigned_before_handler_done: Arc<AtomicBool>,
+        handler_done: Arc<AtomicBool>,
+        resigned: Arc<AtomicBool>,
+    }
+
+    impl LeaderElector for TrackingElector {
+        fn try_acquire<'a>(
+            &'a self,
+            role: &'a str,
+            candidate_id: &'a str,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Option<LeaderLease>, CoordinationError>> {
+            let lease = LeaderLease {
+                role: role.to_string(),
+                candidate_id: candidate_id.to_string(),
+                term: 1,
+                expires_at: Some(std::time::Instant::now() + ttl),
+            };
+            Box::pin(async move { Ok(Some(lease)) })
+        }
+
+        fn renew<'a>(
+            &'a self,
+            role: &'a str,
+            candidate_id: &'a str,
+            ttl: Duration,
+        ) -> BoxFuture<'a, Result<Option<LeaderLease>, CoordinationError>> {
+            let lease = LeaderLease {
+                role: role.to_string(),
+                candidate_id: candidate_id.to_string(),
+                term: 1,
+                expires_at: Some(std::time::Instant::now() + ttl),
+            };
+            Box::pin(async move { Ok(Some(lease)) })
+        }
+
+        fn resign<'a>(
+            &'a self,
+            _role: &'a str,
+            _candidate_id: &'a str,
+        ) -> BoxFuture<'a, Result<bool, CoordinationError>> {
+            if !self.handler_done.load(Ordering::SeqCst) {
+                self.resigned_before_handler_done
+                    .store(true, Ordering::SeqCst);
+            }
+            self.resigned.store(true, Ordering::SeqCst);
+            Box::pin(async { Ok(true) })
+        }
+
+        fn get_leader<'a>(
+            &'a self,
+            _role: &'a str,
+        ) -> BoxFuture<'a, Result<Option<LeaderLease>, CoordinationError>> {
+            Box::pin(async { Ok(None) })
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_in_flight_handler_before_resigning_leadership() {
+        let handler_started = Arc::new(Notify::new());
+        let release_handler = Arc::new(Notify::new());
+        let handler_done = Arc::new(AtomicBool::new(false));
+        let resigned = Arc::new(AtomicBool::new(false));
+        let resigned_before_handler_done = Arc::new(AtomicBool::new(false));
+
+        let elector = Arc::new(TrackingElector {
+            resigned_before_handler_done: Arc::clone(&resigned_before_handler_done),
+            handler_done: Arc::clone(&handler_done),
+            resigned: Arc::clone(&resigned),
+        });
+
+        let mut scheduler = CronScheduler::new(
+            elector,
+            "cron-drain-test",
+            "node-1",
+            Duration::from_millis(200),
+        );
+        let started_clone = Arc::clone(&handler_started);
+        let release_clone = Arc::clone(&release_handler);
+        let done_clone = Arc::clone(&handler_done);
+        scheduler
+            .register(
+                CronJobSpec::new("slow-job", "* * * * * *").unwrap(),
+                move || {
+                    let started = Arc::clone(&started_clone);
+                    let release = Arc::clone(&release_clone);
+                    let done = Arc::clone(&done_clone);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        done.store(true, Ordering::SeqCst);
+                        Ok(())
+                    }
+                },
+            )
+            .unwrap();
+
+        let handle = scheduler.start();
+
+        // Wait until the slow handler is actively running.
+        tokio::time::timeout(Duration::from_secs(3), handler_started.notified())
+            .await
+            .expect("slow handler should start");
+
+        // Trigger shutdown in a background task while the handler is still blocked.
+        let shutdown_task =
+            tokio::spawn(async move { handle.shutdown(Duration::from_secs(3)).await });
+
+        // Give shutdown a moment to progress; leadership must NOT have been resigned yet.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            !resigned.load(Ordering::SeqCst),
+            "elector.resign() must not be called while an in-flight handler is still running"
+        );
+
+        // Release the slow handler and verify shutdown completes cleanly and resigns afterward.
+        release_handler.notify_one();
+        shutdown_task
+            .await
+            .expect("shutdown task panicked")
+            .expect("shutdown should succeed");
+
+        assert!(handler_done.load(Ordering::SeqCst));
+        assert!(resigned.load(Ordering::SeqCst));
+        assert!(
+            !resigned_before_handler_done.load(Ordering::SeqCst),
+            "resign() was called before the in-flight handler completed"
+        );
     }
 }

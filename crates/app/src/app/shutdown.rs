@@ -1,6 +1,9 @@
 //! Shutdown signal handling and operational tracing re-exports.
 
-pub use crate::app::observability::{init_tracing, try_init_tracing};
+pub use crate::app::observability::{
+    init_tracing, shutdown_global_observability, shutdown_global_observability_async,
+    try_init_tracing,
+};
 
 // Why: `ops_router` was removed because `crate::routing::health_routes` is the
 // canonical liveness/readiness surface and `ops_router` had zero workspace callers.

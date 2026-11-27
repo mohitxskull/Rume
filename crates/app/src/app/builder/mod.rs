@@ -978,6 +978,9 @@ where
         )
         .await;
 
+        // --- Step 9: Flush and shut down global OpenTelemetry providers after drain/hooks (`RC-06`) ---
+        crate::app::observability::shutdown_global_observability_async().await;
+
         result.map_err(|err| {
             std::io::Error::new(err.kind(), format!("server error on {addr}: {err}"))
         })

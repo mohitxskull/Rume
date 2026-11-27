@@ -263,6 +263,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         token: String,
     ) -> ExecutionClaimGuard {
+        let (claim_lost_tx, claim_lost_rx) = tokio::sync::watch::channel(false);
         let renew_task = store.claim_ttl().map(|ttl| {
             let store = Arc::clone(store);
             let saga_id = saga_id.to_string();
@@ -270,7 +271,8 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             let interval = (ttl / 3).max(std::time::Duration::from_millis(50));
             // Why: Renew lease-backed execution claims periodically while long-running steps
             // execute (>60s) so the active worker stays fenced and another worker cannot
-            // steal the lease mid-step.
+            // steal the lease mid-step. On explicit claim loss (`Ok(false)`), signal
+            // `claim_lost_tx` so in-flight step execution cancels immediately (`RC-23`).
             tokio::spawn(async move {
                 let mut ticker = tokio::time::interval(interval);
                 ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -281,9 +283,10 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     match store.renew_execution(&saga_id, &token).await {
                         Ok(true) => {}
                         Ok(false) => {
+                            let _ = claim_lost_tx.send(true);
                             tracing::warn!(
                                 saga_id = %saga_id,
-                                "saga execution claim lost or expired; stopping renewal loop"
+                                "saga execution claim lost or expired; cancelling in-flight step and stopping renewal loop"
                             );
                             break;
                         }
@@ -307,6 +310,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             saga_id: saga_id.to_string(),
             token,
             renew_task,
+            claim_lost_rx,
         }
     }
 
@@ -435,11 +439,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         };
 
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
+        let claim_lost = claim.as_ref().map(|c| &c.claim_lost_rx);
         let res = self
             .execute_forward_from_recoverable(
                 saga_id,
                 version,
                 claim_token,
+                claim_lost,
                 ctx,
                 0,
                 Vec::new(),
@@ -585,6 +591,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         }
 
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
+        let claim_lost = claim.as_ref().map(|c| &c.claim_lost_rx);
         let res = match record.status {
             SagaStatus::Success
             | SagaStatus::Compensated { .. }
@@ -595,11 +602,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 compensated_steps: record.compensated_steps,
             }),
             SagaStatus::Compensating { .. } => {
-                self.resume_compensation_recoverable(saga_id, claim_token, record, ctx)
+                self.resume_compensation_recoverable(saga_id, claim_token, claim_lost, record, ctx)
                     .await
             }
             SagaStatus::Pending | SagaStatus::Running { .. } => {
-                self.resume_forward_recoverable(saga_id, claim_token, record, ctx)
+                self.resume_forward_recoverable(saga_id, claim_token, claim_lost, record, ctx)
                     .await
             }
         };
@@ -802,6 +809,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         };
 
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
+        let claim_lost = claim.as_ref().map(|c| &c.claim_lost_rx);
         let res = match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
@@ -809,6 +817,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     &handle.saga_id,
                     effective_version,
                     claim_token,
+                    claim_lost,
                     handle.context,
                     start_idx,
                     completed_indices,
@@ -825,6 +834,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                     &handle.saga_id,
                     effective_version,
                     claim_token,
+                    claim_lost,
                     handle.context,
                     &completed_indices,
                     &effective_completed_steps,
@@ -876,6 +886,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         mut version: u64,
         claim_token: Option<&str>,
+        claim_lost: Option<&tokio::sync::watch::Receiver<bool>>,
         mut ctx: Ctx,
         start_idx: usize,
         mut completed_indices: Vec<usize>,
@@ -924,10 +935,35 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             // links each `saga.step` directly to the initiating span across step boundaries (instead
             // of a phantom `new_child()` parent ID), while non-OTel runs keep `OtelContext::current()`
             // fallback populated inside step handlers.
-            let res = if let Some(ref tc) = parent_tc {
-                tc.scope_future(step_span, fut).await
-            } else {
-                tracing::Instrument::instrument(fut, step_span).await
+            let step_exec = async {
+                if let Some(ref tc) = parent_tc {
+                    tc.scope_future(step_span, fut).await
+                } else {
+                    tracing::Instrument::instrument(fut, step_span).await
+                }
+            };
+            let res = match run_cancellable_on_claim_loss(step_exec, claim_lost).await {
+                Some(outcome) => outcome,
+                None => {
+                    return Err(SagaRecoveryError::new(
+                        SagaError::Storage {
+                            saga_id: Some(saga_id.to_string()),
+                            message: format!(
+                                "saga execution claim lost during step '{}'",
+                                step.name()
+                            ),
+                        },
+                        SagaRecoveryHandle {
+                            saga_id: saga_id.to_string(),
+                            saga_name: self.name.clone(),
+                            context: ctx,
+                            phase: SagaRecoveryPhase::Forward,
+                            completed_steps: completed_names,
+                            compensated_steps: compensated_names,
+                            version,
+                        },
+                    ));
+                }
             };
             let step_result = match res {
                 Ok(r) => r,
@@ -980,6 +1016,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                             saga_id,
                             version,
                             claim_token,
+                            claim_lost,
                             ctx,
                             &completed_indices,
                             &completed_names,
@@ -1031,6 +1068,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         mut version: u64,
         claim_token: Option<&str>,
+        claim_lost: Option<&tokio::sync::watch::Receiver<bool>>,
         mut ctx: Ctx,
         completed_indices: &[usize],
         completed_names: &[String],
@@ -1088,10 +1126,38 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             // Why: pass `parent_tc` directly to `scope_future(comp_span, ...)` so `OpenTelemetryLayer`
             // links each `saga.compensate` directly to the initiating trace across compensation
             // boundaries, while non-OTel runs preserve `OtelContext::current()` fallback.
-            let comp_res = if let Some(ref tc) = parent_tc {
-                tc.scope_future(comp_span, fut).await
-            } else {
-                tracing::Instrument::instrument(fut, comp_span).await
+            let comp_exec = async {
+                if let Some(ref tc) = parent_tc {
+                    tc.scope_future(comp_span, fut).await
+                } else {
+                    tracing::Instrument::instrument(fut, comp_span).await
+                }
+            };
+            let comp_res = match run_cancellable_on_claim_loss(comp_exec, claim_lost).await {
+                Some(outcome) => outcome,
+                None => {
+                    return Err(SagaRecoveryError::new(
+                        SagaError::Storage {
+                            saga_id: Some(saga_id.to_string()),
+                            message: format!(
+                                "saga execution claim lost during compensation for step '{}'",
+                                prev_step.name()
+                            ),
+                        },
+                        SagaRecoveryHandle {
+                            saga_id: saga_id.to_string(),
+                            saga_name: self.name.clone(),
+                            context: ctx,
+                            phase: SagaRecoveryPhase::Compensating {
+                                error: original_error,
+                                compensation_errors,
+                            },
+                            completed_steps: completed_names.to_vec(),
+                            compensated_steps: compensated_names,
+                            version,
+                        },
+                    ));
+                }
             };
             let comp_outcome = match comp_res {
                 Ok(r) => r,
@@ -1217,6 +1283,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         saga_id: &str,
         claim_token: Option<&str>,
+        claim_lost: Option<&tokio::sync::watch::Receiver<bool>>,
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
@@ -1243,6 +1310,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             saga_id,
             record.version,
             claim_token,
+            claim_lost,
             ctx,
             start_idx,
             completed_indices,
@@ -1256,6 +1324,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         saga_id: &str,
         claim_token: Option<&str>,
+        claim_lost: Option<&tokio::sync::watch::Receiver<bool>>,
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
@@ -1288,6 +1357,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             saga_id,
             record.version,
             claim_token,
+            claim_lost,
             ctx,
             &completed_indices,
             &record.completed_steps,
@@ -1440,6 +1510,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         // saga already committed; already-`Compensated` / `CompensationFailed`
         // sagas are returned intact to preserve their original error record.
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
+        let claim_lost = claim.as_ref().map(|c| &c.claim_lost_rx);
         let res = match record.status {
             SagaStatus::Success => Err(SagaRecoveryError::new(
                 SagaError::Aborted {
@@ -1465,7 +1536,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 })
             }
             SagaStatus::Pending | SagaStatus::Running { .. } | SagaStatus::Compensating { .. } => {
-                self.resume_compensation_recoverable(saga_id, claim_token, record, ctx)
+                self.resume_compensation_recoverable(saga_id, claim_token, claim_lost, record, ctx)
                     .await
             }
         };
@@ -1476,10 +1547,133 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     }
 }
 
+/// Polls `fut` to completion unless `claim_lost` transitions to `true`, in which case `fut`
+/// is dropped immediately and `None` is returned (`RC-23`).
+async fn run_cancellable_on_claim_loss<F, T>(
+    fut: F,
+    claim_lost: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(rx) = claim_lost else {
+        return Some(fut.await);
+    };
+    let mut rx = rx.clone();
+    if *rx.borrow() {
+        return None;
+    }
+    tokio::pin!(fut);
+    let lost = tokio::select! {
+        biased;
+        res = rx.wait_for(|&lost| lost) => res.is_ok(),
+        outcome = &mut fut => return Some(outcome),
+    };
+    if lost { None } else { Some(fut.await) }
+}
+
 fn panic_message<'a>(payload: &'a Box<dyn std::any::Any + Send>, fallback: &'a str) -> &'a str {
     payload
         .downcast_ref::<&str>()
         .copied()
         .or_else(|| payload.downcast_ref::<String>().map(|s| s.as_str()))
         .unwrap_or(fallback)
+}
+
+#[cfg(test)]
+mod claim_cancellation_tests {
+    use super::*;
+    use crate::saga::coordinator::BoxFuture;
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct LosingClaimStore {
+        inner: InMemorySagaStore,
+    }
+
+    impl SagaStore for LosingClaimStore {
+        fn save_record_cas(
+            &self,
+            record: &SagaRecord,
+            expected_version: u64,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
+            self.inner.save_record_cas(record, expected_version)
+        }
+        fn save_record_cas_with_claim(
+            &self,
+            record: &SagaRecord,
+            expected_version: u64,
+            claim_token: Option<&str>,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
+            self.inner
+                .save_record_cas_with_claim(record, expected_version, claim_token)
+        }
+        fn create_and_claim_record<'a>(
+            &'a self,
+            record: &'a SagaRecord,
+        ) -> BoxFuture<'a, Result<String, SagaError>> {
+            self.inner.create_and_claim_record(record)
+        }
+        fn load_record(
+            &self,
+            saga_id: &str,
+        ) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>> {
+            self.inner.load_record(saga_id)
+        }
+        fn list_incomplete(&self) -> BoxFuture<'_, Result<Vec<SagaRecord>, SagaError>> {
+            self.inner.list_incomplete()
+        }
+        fn try_acquire_execution(&self, saga_id: &str) -> BoxFuture<'_, Result<String, SagaError>> {
+            self.inner.try_acquire_execution(saga_id)
+        }
+        fn renew_execution(
+            &self,
+            _saga_id: &str,
+            _claim_token: &str,
+        ) -> BoxFuture<'_, Result<bool, SagaError>> {
+            // Simulate immediate lease loss on the first renewal tick.
+            Box::pin(async { Ok(false) })
+        }
+        fn claim_ttl(&self) -> Option<Duration> {
+            Some(Duration::from_millis(60))
+        }
+        fn release_execution(
+            &self,
+            saga_id: &str,
+            claim_token: &str,
+        ) -> BoxFuture<'_, Result<(), SagaError>> {
+            self.inner.release_execution(saga_id, claim_token)
+        }
+        fn release_execution_sync(&self, saga_id: &str, claim_token: &str) -> bool {
+            self.inner.release_execution_sync(saga_id, claim_token)
+        }
+    }
+
+    #[tokio::test]
+    async fn saga_cancels_in_flight_step_immediately_on_claim_loss() {
+        let store = Arc::new(LosingClaimStore {
+            inner: InMemorySagaStore::new(),
+        });
+        let saga = Saga::<()>::new("cancel-on-lease-loss")
+            .with_store(store)
+            .step(
+                "hang-forever",
+                |_ctx| async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                },
+                |_ctx| async { Ok(()) },
+            );
+
+        let res = tokio::time::timeout(Duration::from_secs(2), saga.run(()))
+            .await
+            .expect("saga step must be cancelled promptly when execution claim is lost");
+        let err = res
+            .err()
+            .expect("saga must fail when execution claim is lost");
+        assert!(
+            matches!(err, SagaError::Storage { ref message, .. } if message.contains("claim lost")),
+            "expected Storage claim-lost error, got {err:?}"
+        );
+    }
 }

@@ -9,7 +9,8 @@ pub use app::{
     AppContext, AppContextBuilder, ApplicationMode, Availability, AvailabilityState, BuildError,
     Environment, IntoBindAddr, Lifecycle, LifecycleState, MiddlewareConfigError, ProjectPaths,
     RequestId, Rume, RumeBuilder, TaskError, TaskHandler, TaskInfo, TaskRegistry, X_REQUEST_ID,
-    init_tracing, shutdown_global_observability, try_init_tracing,
+    init_tracing, shutdown_global_observability, shutdown_global_observability_async,
+    try_init_tracing,
 };
 pub use module::{
     ArchitectureRules, ArchitectureViolation, BoxFuture, Module, ModuleContext, ModuleError,

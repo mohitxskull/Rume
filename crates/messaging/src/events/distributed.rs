@@ -1,14 +1,48 @@
 //! Distributed event bus bridging local [`EventBus`] with [`PubSub`].
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use tokio::sync::watch;
 use uuid::Uuid;
 
 use crate::events::bus::EventBus;
 use crate::events::error::EventError;
 use crate::events::event::Event;
-use crate::pubsub::PubSub;
+use crate::pubsub::{PubSub, PubSubError};
+
+const BRIDGE_INITIAL_BACKOFF: Duration = Duration::from_millis(50);
+const BRIDGE_MAX_BACKOFF: Duration = Duration::from_secs(5);
+
+/// Supervised handle for a background [`DistributedEventBus::bridge`] task (`RC-13`).
+///
+/// Dropping the handle aborts the background task; call [`Self::shutdown`] to stop the
+/// bridge gracefully and await task termination.
+#[derive(Debug)]
+pub struct BridgeHandle {
+    shutdown_tx: watch::Sender<bool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl BridgeHandle {
+    /// Signals shutdown and awaits the background bridge task to exit.
+    pub async fn shutdown(mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.task.take() {
+            let _ = handle.await;
+        }
+    }
+}
+
+impl Drop for BridgeHandle {
+    fn drop(&mut self) {
+        let _ = self.shutdown_tx.send(true);
+        if let Some(handle) = self.task.take() {
+            handle.abort();
+        }
+    }
+}
 
 /// Wire envelope published across nodes by [`DistributedEventBus`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,7 +121,13 @@ impl DistributedEventBus {
 
     /// Subscribes to remote events of type `E` and dispatches them to the local [`EventBus`],
     /// ignoring echoes from `self.node_id`.
-    pub async fn bridge<E: Event + for<'de> Deserialize<'de>>(&self) -> Result<(), EventError> {
+    ///
+    /// Returns a supervised [`BridgeHandle`] whose background task automatically reconnects
+    /// with bounded exponential backoff on [`PubSubError::Transport`] and shuts down cleanly
+    /// on [`BridgeHandle::shutdown`] or drop (`RC-13`).
+    pub async fn bridge<E: Event + for<'de> Deserialize<'de>>(
+        &self,
+    ) -> Result<BridgeHandle, EventError> {
         let mut sub = self
             .pubsub
             .subscribe(E::TYPE)
@@ -95,11 +135,26 @@ impl DistributedEventBus {
             .map_err(|e| EventError::Bus(e.to_string()))?;
         let node_id = self.node_id;
         let local = self.local.clone();
+        let pubsub = Arc::clone(&self.pubsub);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
+            let mut backoff = BRIDGE_INITIAL_BACKOFF;
             loop {
-                match sub.recv().await {
+                let recv_res = tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                        continue;
+                    }
+                    res = sub.recv() => res,
+                };
+
+                match recv_res {
                     Ok(Some(msg)) => {
+                        backoff = BRIDGE_INITIAL_BACKOFF;
                         let envelope: DistributedEventEnvelope =
                             match serde_json::from_slice(&msg.payload) {
                                 Ok(env) => env,
@@ -152,7 +207,61 @@ impl DistributedEventBus {
                             );
                         }
                     }
-                    Ok(None) => break,
+                    Ok(None) => {
+                        tracing::info!(
+                            event.type = E::TYPE,
+                            "distributed event bridge subscription closed"
+                        );
+                        break;
+                    }
+                    Err(PubSubError::Transport(e)) => {
+                        tracing::warn!(
+                            event.type = E::TYPE,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "distributed event bridge transport error; re-subscribing"
+                        );
+                        // Re-subscribe loop with bounded exponential backoff until connected or shut down.
+                        let reconnected = loop {
+                            tokio::select! {
+                                biased;
+                                _ = shutdown_rx.changed() => {
+                                    if *shutdown_rx.borrow() {
+                                        break None;
+                                    }
+                                    continue;
+                                }
+                                _ = tokio::time::sleep(backoff) => {}
+                            }
+                            match pubsub.subscribe(E::TYPE).await {
+                                Ok(new_sub) => {
+                                    backoff = BRIDGE_INITIAL_BACKOFF;
+                                    break Some(new_sub);
+                                }
+                                Err(PubSubError::Transport(sub_err)) => {
+                                    backoff = (backoff * 2).min(BRIDGE_MAX_BACKOFF);
+                                    tracing::warn!(
+                                        event.type = E::TYPE,
+                                        error = %sub_err,
+                                        next_backoff_ms = backoff.as_millis() as u64,
+                                        "distributed event bridge reconnect failed; retrying"
+                                    );
+                                }
+                                Err(fatal_err) => {
+                                    tracing::error!(
+                                        event.type = E::TYPE,
+                                        error = %fatal_err,
+                                        "distributed event bridge encountered non-transport error during reconnect; stopping"
+                                    );
+                                    break None;
+                                }
+                            }
+                        };
+                        match reconnected {
+                            Some(new_sub) => sub = new_sub,
+                            None => break,
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!(
                             event.type = E::TYPE,
@@ -164,7 +273,10 @@ impl DistributedEventBus {
             }
         });
 
-        Ok(())
+        Ok(BridgeHandle {
+            shutdown_tx,
+            task: Some(task),
+        })
     }
 }
 
@@ -225,8 +337,8 @@ mod tests {
                 }
             });
 
-        node_a.bridge::<OrderPlaced>().await.unwrap();
-        node_b.bridge::<OrderPlaced>().await.unwrap();
+        let _bridge_a = node_a.bridge::<OrderPlaced>().await.unwrap();
+        let _bridge_b = node_b.bridge::<OrderPlaced>().await.unwrap();
 
         let event = OrderPlaced {
             order_id: "ord-42".into(),
@@ -275,7 +387,7 @@ mod tests {
                 }
             });
 
-        node_b.bridge::<OrderPlaced>().await.unwrap();
+        let _bridge_b = node_b.bridge::<OrderPlaced>().await.unwrap();
 
         let parent_tc = TraceContext::generate();
         let expected_trace_id = parent_tc.trace_id().to_string();
@@ -297,5 +409,108 @@ mod tests {
             .expect("oneshot channel closed")
             .expect("node_b listener must observe TraceContext::current()");
         assert_eq!(observed_tc.trace_id(), expected_trace_id);
+    }
+
+    #[tokio::test]
+    async fn distributed_event_bridge_reconnects_after_transient_transport_error() {
+        use crate::outbox::repository::BoxFuture;
+        use crate::pubsub::{PubSubMessage, PubSubSubscription};
+
+        #[derive(Debug)]
+        struct FailingOnceSub;
+        impl PubSubSubscription for FailingOnceSub {
+            fn recv(&mut self) -> BoxFuture<'_, Result<Option<PubSubMessage>, PubSubError>> {
+                Box::pin(async { Err(PubSubError::Transport("simulated socket drop".into())) })
+            }
+        }
+
+        #[derive(Debug)]
+        struct SingleMessageSub {
+            msg: Option<PubSubMessage>,
+        }
+        impl PubSubSubscription for SingleMessageSub {
+            fn recv(&mut self) -> BoxFuture<'_, Result<Option<PubSubMessage>, PubSubError>> {
+                let next = self.msg.take();
+                Box::pin(async move {
+                    if let Some(m) = next {
+                        Ok(Some(m))
+                    } else {
+                        std::future::pending().await
+                    }
+                })
+            }
+        }
+
+        #[derive(Debug)]
+        struct ReconnectingPubSub {
+            attempts: AtomicUsize,
+            payload: Vec<u8>,
+        }
+        impl PubSub for ReconnectingPubSub {
+            fn publish<'a>(
+                &'a self,
+                _topic: &'a str,
+                _payload: &'a [u8],
+            ) -> BoxFuture<'a, Result<(), PubSubError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn subscribe<'a>(
+                &'a self,
+                topic: &'a str,
+            ) -> BoxFuture<'a, Result<Box<dyn PubSubSubscription>, PubSubError>> {
+                let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+                let topic = topic.to_string();
+                let payload = self.payload.clone();
+                Box::pin(async move {
+                    match attempt {
+                        0 => Ok(Box::new(FailingOnceSub) as Box<dyn PubSubSubscription>),
+                        1 => Err(PubSubError::Transport("broker still restarting".into())),
+                        _ => Ok(Box::new(SingleMessageSub {
+                            msg: Some(PubSubMessage { topic, payload }),
+                        }) as Box<dyn PubSubSubscription>),
+                    }
+                })
+            }
+        }
+
+        let _sub_lock = crate::events::bus::tests::SUBSCRIBER_TEST_LOCK.lock().await;
+        let expected_event = OrderPlaced {
+            order_id: "ord-after-reconnect".into(),
+        };
+        let envelope = DistributedEventEnvelope {
+            origin_node_id: Uuid::new_v4(),
+            event_type: OrderPlaced::TYPE.to_string(),
+            payload: serde_json::to_vec(&expected_event).unwrap(),
+            trace_context: None,
+        };
+        let pubsub = Arc::new(ReconnectingPubSub {
+            attempts: AtomicUsize::new(0),
+            payload: serde_json::to_vec(&envelope).unwrap(),
+        });
+
+        let bus = DistributedEventBus::new(EventBus::new(), pubsub.clone());
+        let (tx, rx) = oneshot::channel::<OrderPlaced>();
+        let tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        bus.local().subscribe_fn::<OrderPlaced, _, _>(move |evt| {
+            let tx = Arc::clone(&tx);
+            let evt = evt.clone();
+            async move {
+                if let Some(sender) = tx.lock().await.take() {
+                    let _ = sender.send(evt);
+                }
+                Ok(())
+            }
+        });
+
+        let handle = bus.bridge::<OrderPlaced>().await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(3), rx)
+            .await
+            .expect("bridge should reconnect and deliver event after transient transport errors")
+            .expect("oneshot channel closed");
+        assert_eq!(received, expected_event);
+        assert!(pubsub.attempts.load(Ordering::SeqCst) >= 3);
+
+        handle.shutdown().await;
     }
 }

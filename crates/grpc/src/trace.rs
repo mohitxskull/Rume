@@ -148,11 +148,22 @@ where
     }
 
     fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
-        let tc = extract_trace_context_from_headers(req.headers())
+        // Why: preserve `TraceContext` and `RequestId` already inserted by an outer
+        // `ObservabilityLayer` before falling back to raw HTTP headers or generating fresh IDs
+        // so HTTP-layer logs/spans and gRPC handler logs/spans correlate under one ID (`RC-07`).
+        let tc = req
+            .extensions()
+            .get::<TraceContext>()
+            .cloned()
             .or_else(TraceContext::current)
+            .or_else(|| extract_trace_context_from_headers(req.headers()))
             .unwrap_or_else(TraceContext::generate);
-        let request_id =
-            extract_request_id_from_headers(req.headers()).unwrap_or_else(RequestId::generate);
+        let request_id = req
+            .extensions()
+            .get::<RequestId>()
+            .cloned()
+            .or_else(|| extract_request_id_from_headers(req.headers()))
+            .unwrap_or_else(RequestId::generate);
 
         let span = tracing::info_span!(
             "grpc.request",
@@ -166,5 +177,89 @@ where
 
         let fut = self.inner.call(req);
         Box::pin(tc.scope_future(span, fut))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Response as HttpResponse;
+    use rume_observability::ObservabilityLayer;
+    use std::sync::{Arc, Mutex};
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn grpc_trace_layer_preserves_outer_observability_layer_request_id_and_trace_context() {
+        type CapturedContext = (RequestId, TraceContext, Option<TraceContext>);
+        let captured: Arc<Mutex<Option<CapturedContext>>> = Arc::new(Mutex::new(None));
+        let captured_clone = Arc::clone(&captured);
+
+        let inner = tower::service_fn(move |req: HttpRequest<Body>| {
+            let captured = Arc::clone(&captured_clone);
+            async move {
+                let req_id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .cloned()
+                    .expect("RequestId extension");
+                let tc = req
+                    .extensions()
+                    .get::<TraceContext>()
+                    .cloned()
+                    .expect("TraceContext extension");
+                let current_tc = TraceContext::current();
+                *captured.lock().unwrap() = Some((req_id, tc, current_tc));
+                Ok::<_, std::convert::Infallible>(HttpResponse::new(Body::empty()))
+            }
+        });
+
+        let svc = ObservabilityLayer::new().layer(RumeGrpcTraceLayer.layer(inner));
+
+        // Send a request with NO x-request-id and an incoming traceparent so ObservabilityLayer
+        // generates a RequestId and derives a child TraceContext.
+        let parent_tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let req = HttpRequest::builder()
+            .uri("/rume.v1.Greeter/SayHello")
+            .header("traceparent", parent_tp)
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = svc.oneshot(req).await.unwrap();
+        let outer_req_id = resp
+            .headers()
+            .get("x-request-id")
+            .expect("ObservabilityLayer sets x-request-id response header")
+            .to_str()
+            .unwrap()
+            .to_string();
+        let outer_tp = resp
+            .headers()
+            .get("traceparent")
+            .expect("ObservabilityLayer sets traceparent response header")
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let (handler_req_id, handler_tc, handler_current_tc) =
+            captured.lock().unwrap().clone().expect("handler invoked");
+        assert_eq!(
+            handler_req_id.as_str(),
+            outer_req_id,
+            "RumeGrpcTraceLayer must preserve ObservabilityLayer's RequestId"
+        );
+        assert_eq!(
+            handler_tc.traceparent, outer_tp,
+            "RumeGrpcTraceLayer must preserve ObservabilityLayer's child TraceContext"
+        );
+        assert_ne!(
+            handler_tc.traceparent, parent_tp,
+            "child TraceContext must not be overwritten back to raw header parent"
+        );
+        assert_eq!(
+            handler_current_tc.map(|t| t.traceparent),
+            Some(outer_tp),
+            "TraceContext::current() inside gRPC handler must match ObservabilityLayer"
+        );
     }
 }
