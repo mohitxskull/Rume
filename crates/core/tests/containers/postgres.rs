@@ -1392,10 +1392,11 @@ async fn test_postgres_job_queue_valid_lease_renewal_prevents_recovery() {
 
 /// A job whose lease has expired but which no peer has reclaimed is still owned by
 /// the original worker: the lease token is the fencing mechanism, not wall-clock
-/// expiry. A renewal under load may execute just after the expiry timestamp has
-/// passed; it must still succeed so long as no one else has taken the job.
+/// Once a job's lease expires on the database clock (`P2-02`), `renew_lease` MUST
+/// fail closed (matching `jobs_ack.sql` and `outbox_renew_lease.sql`) so a stalled
+/// worker cannot resurrect an expired lease before a peer reclaims the job.
 #[tokio::test]
-async fn expired_but_unclaimed_job_lease_can_be_renewed_with_same_token() {
+async fn expired_job_lease_renewal_is_rejected_and_peer_can_reclaim() {
     let (_container, pool) = setup_postgres_pool(4).await;
     let queue = PostgresJobQueue::from_backend(pool.backend())
         .with_lease_duration(Duration::from_millis(100));
@@ -1418,8 +1419,7 @@ async fn expired_but_unclaimed_job_lease_can_be_renewed_with_same_token() {
     assert_eq!(job.id, job_id);
     let token = job.lease_token.clone().unwrap();
 
-    // Move `lease_expires_at` into the past using the database clock with NO worker or
-    // reaper running, so ownership has not actually transferred to anyone.
+    // Move `lease_expires_at` into the past using the database clock.
     pool.backend()
         .execute_params(
             "UPDATE rume_jobs SET lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT - 1000 WHERE id = $1",
@@ -1428,25 +1428,35 @@ async fn expired_but_unclaimed_job_lease_can_be_renewed_with_same_token() {
         .await
         .expect("backdate lease_expires_at");
 
-    // The renewal executes after the lease expired on the clock but before any
-    // reclaim: the token still fences ownership, so renewal must succeed.
-    queue
+    // Renewal after DB-clock expiry must fail closed (`P2-02`).
+    let renew_res = queue
         .renew_lease(&job_id, &token, Duration::from_secs(5))
-        .await
-        .expect("renewing an expired but unclaimed lease with the owning token must succeed");
-
-    // Peer cannot reclaim a job whose lease was renewed.
-    let peer_dequeue = queue.dequeue_for("peer-worker").await.unwrap();
+        .await;
     assert!(
-        peer_dequeue.is_none(),
-        "renewed lease must still prevent peer reclaim"
+        renew_res.is_err(),
+        "renewing an expired lease must fail closed, got: {renew_res:?}"
     );
 
-    // The original worker can ack with the same token, proving fencing held.
-    queue
-        .ack(&job_id, &token)
+    // Acking with the expired token must also fail closed.
+    let ack_res = queue.ack(&job_id, &token).await;
+    assert!(
+        ack_res.is_err(),
+        "acking an expired lease must fail closed, got: {ack_res:?}"
+    );
+
+    // Peer can reclaim the expired job with a fresh lease token and ack it.
+    let reclaimed = queue
+        .dequeue_for("peer-worker")
         .await
-        .expect("ack with the owning token after renewal must succeed");
+        .expect("peer dequeue failed")
+        .expect("peer must reclaim expired job");
+    assert_eq!(reclaimed.id, job_id);
+    let new_token = reclaimed.lease_token.expect("reclaimed job has new token");
+    assert_ne!(new_token, token);
+    queue
+        .ack(&job_id, &new_token)
+        .await
+        .expect("peer ack with fresh token must succeed");
 }
 
 #[tokio::test]
