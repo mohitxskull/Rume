@@ -50,6 +50,17 @@ impl RedisHeartbeatRegistry {
     }
 }
 
+/// Converts a heartbeat `Duration` into a positive millisecond count safe for Redis scores,
+/// rejecting `Duration::ZERO` and saturating instead of wrapping on huge durations (`P2-14`).
+fn heartbeat_ttl_ms(ttl: Duration) -> Result<i64, JobError> {
+    if ttl.is_zero() {
+        return Err(JobError::Fatal(
+            "heartbeat TTL must be greater than zero".into(),
+        ));
+    }
+    Ok(i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX))
+}
+
 impl HeartbeatRegistry for RedisHeartbeatRegistry {
     fn record_heartbeat(
         &self,
@@ -57,8 +68,9 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
         ttl: Duration,
     ) -> BoxFuture<'_, Result<(), JobError>> {
         let wid = worker_id.to_string();
-        let ttl_ms = ttl.as_millis() as i64;
+        let ttl_ms = heartbeat_ttl_ms(ttl);
         Box::pin(async move {
+            let ttl_ms = ttl_ms?;
             let mut conn = self
                 .pool
                 .get()
@@ -150,5 +162,18 @@ impl HeartbeatRegistry for RedisHeartbeatRegistry {
 
             Ok(dead_workers)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heartbeat_ttl_ms_rejects_zero_rounds_sub_ms_up_and_saturates_max() {
+        assert!(heartbeat_ttl_ms(Duration::ZERO).is_err());
+        assert_eq!(heartbeat_ttl_ms(Duration::from_micros(500)).unwrap(), 1);
+        assert_eq!(heartbeat_ttl_ms(Duration::from_secs(30)).unwrap(), 30_000);
+        assert_eq!(heartbeat_ttl_ms(Duration::MAX).unwrap(), i64::MAX);
     }
 }

@@ -486,9 +486,6 @@ pub const SQLITE_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in SQLite.
 pub const SQLITE_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/sqlite/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in SQLite.
-pub const SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/sqlite/batches_mark_callbacks_dispatched.sql");
 /// Record an idempotent per-job outcome in SQLite.
 pub const SQLITE_BATCHES_RECORD_JOB_OUTCOME: &str =
     include_str!("../sql/sqlite/batches_record_job_outcome.sql");
@@ -518,9 +515,6 @@ pub const PG_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in PostgreSQL.
 pub const PG_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/postgres/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in PostgreSQL.
-pub const PG_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/postgres/batches_mark_callbacks_dispatched.sql");
 /// Record an idempotent per-job outcome in PostgreSQL.
 pub const PG_BATCHES_RECORD_JOB_OUTCOME: &str =
     include_str!("../sql/postgres/batches_record_job_outcome.sql");
@@ -549,9 +543,6 @@ pub const MYSQL_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in MySQL.
 pub const MYSQL_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/mysql/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in MySQL.
-pub const MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/mysql/batches_mark_callbacks_dispatched.sql");
 /// Record an idempotent per-job outcome in MySQL.
 pub const MYSQL_BATCHES_RECORD_JOB_OUTCOME: &str =
     include_str!("../sql/mysql/batches_record_job_outcome.sql");
@@ -920,5 +911,14 @@ mod tests {
                 "{name} must guard against renewing an already-expired lease"
             );
         }
+
+        // `P2-15`: feature flag schemas enforce uniqueness for global (NULL tenant_id) rows
+        // and MySQL upsert uses MySQL 8 row alias `AS new`.
+        assert!(PG_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(SQLITE_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(MYSQL_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(MYSQL_FEATURE_FLAGS_SCHEMA.contains("STORED"));
+        assert!(MYSQL_FEATURE_FLAGS_UPSERT.contains("AS new"));
+        assert!(!MYSQL_FEATURE_FLAGS_UPSERT.contains("VALUES(enabled)"));
     }
 }

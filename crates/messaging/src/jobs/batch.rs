@@ -255,12 +255,6 @@ pub trait BatchStore: Debug + Send + Sync + 'static {
     /// Loads a batch record by ID.
     fn load_batch(&self, id: &BatchId) -> BoxFuture<'_, Result<Option<JobBatch>, JobError>>;
 
-    /// Atomically records a successful job completion in the batch.
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>>;
-
-    /// Atomically records a failed job in the batch.
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>>;
-
     /// Idempotently records a successful completion for `(batch_id, job_id)` so duplicate
     /// redeliveries of the same job never decrement `pending_jobs` more than once (`RC-14`).
     fn record_job_success(
@@ -288,13 +282,6 @@ pub trait BatchStore: Debug + Send + Sync + 'static {
 
     /// Releases a previously claimed `finally` callback lock after a failed dispatch attempt.
     fn release_finally_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
-
-    /// Atomically claims the right to dispatch terminal callbacks (`true` on first claim).
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>>;
-
-    /// Releases a previously claimed callback dispatch lock after a failed dispatch attempt
-    /// so a retry can re-claim and deliver callbacks instead of dropping them permanently.
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
 
     /// Marks a running batch as cancelled.
     fn cancel(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
@@ -340,48 +327,6 @@ impl BatchStore for InMemoryBatchStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             Ok(guard.get(&id).cloned())
-        })
-    }
-
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut guard = self
-                .batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let batch = guard
-                .get_mut(&id)
-                .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
-            batch.completed_jobs = batch.completed_jobs.saturating_add(1);
-            batch.pending_jobs = batch.pending_jobs.saturating_sub(1);
-            if batch.status != BatchStatus::Cancelled && batch.pending_jobs == 0 {
-                batch.status = if batch.failed_jobs > 0 {
-                    BatchStatus::Failed
-                } else {
-                    BatchStatus::Completed
-                };
-            }
-            Ok(batch.clone())
-        })
-    }
-
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut guard = self
-                .batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let batch = guard
-                .get_mut(&id)
-                .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
-            batch.failed_jobs = batch.failed_jobs.saturating_add(1);
-            batch.pending_jobs = batch.pending_jobs.saturating_sub(1);
-            if batch.status != BatchStatus::Cancelled && batch.pending_jobs == 0 {
-                batch.status = BatchStatus::Failed;
-            }
-            Ok(batch.clone())
         })
     }
 
@@ -513,41 +458,6 @@ impl BatchStore for InMemoryBatchStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(batch) = guard.get_mut(&id) {
-                batch.finally_dispatched = false;
-            }
-            Ok(())
-        })
-    }
-
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut guard = self
-                .batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let batch = guard
-                .get_mut(&id)
-                .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
-            if batch.then_dispatched || batch.finally_dispatched {
-                Ok(false)
-            } else {
-                batch.then_dispatched = true;
-                batch.finally_dispatched = true;
-                Ok(true)
-            }
-        })
-    }
-
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
-        let id = id.clone();
-        Box::pin(async move {
-            let mut guard = self
-                .batches
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(batch) = guard.get_mut(&id) {
-                batch.then_dispatched = false;
                 batch.finally_dispatched = false;
             }
             Ok(())
@@ -765,110 +675,6 @@ impl BatchStore for SqlBatchStore {
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?;
                     row.as_ref().map(|r| map_batch_row!(r)).transpose()
-                }
-            }
-        })
-    }
-
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
-        let id = id.0.clone();
-        Box::pin(async move {
-            match self {
-                #[cfg(feature = "sqlite")]
-                Self::Sqlite(pool) => {
-                    let row = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_SUCCESS)
-                        .bind(&id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
-                    map_batch_row!(&row)
-                }
-                #[cfg(feature = "postgres")]
-                Self::Postgres(pool) => {
-                    let row = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_SUCCESS)
-                        .bind(&id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
-                    map_batch_row!(&row)
-                }
-                #[cfg(feature = "mysql")]
-                Self::Mysql(pool) => {
-                    let mut tx = pool
-                        .begin()
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_SUCCESS)
-                        .bind(&id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    if res.rows_affected() == 0 {
-                        return Err(JobError::Fatal(format!("batch {id} not found")));
-                    }
-                    let row = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
-                        .bind(&id)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    map_batch_row!(&row)
-                }
-            }
-        })
-    }
-
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
-        let id = id.0.clone();
-        Box::pin(async move {
-            match self {
-                #[cfg(feature = "sqlite")]
-                Self::Sqlite(pool) => {
-                    let row = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_FAILURE)
-                        .bind(&id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
-                    map_batch_row!(&row)
-                }
-                #[cfg(feature = "postgres")]
-                Self::Postgres(pool) => {
-                    let row = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_FAILURE)
-                        .bind(&id)
-                        .fetch_optional(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
-                    map_batch_row!(&row)
-                }
-                #[cfg(feature = "mysql")]
-                Self::Mysql(pool) => {
-                    let mut tx = pool
-                        .begin()
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_FAILURE)
-                        .bind(&id)
-                        .execute(&mut *tx)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    if res.rows_affected() == 0 {
-                        return Err(JobError::Fatal(format!("batch {id} not found")));
-                    }
-                    let row = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
-                        .bind(&id)
-                        .fetch_one(&mut *tx)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    tx.commit()
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    map_batch_row!(&row)
                 }
             }
         })
@@ -1248,81 +1054,6 @@ impl BatchStore for SqlBatchStore {
         })
     }
 
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
-        let id = id.0.clone();
-        Box::pin(async move {
-            let affected = match self {
-                #[cfg(feature = "sqlite")]
-                Self::Sqlite(pool) => {
-                    sqlx::query(rume_data::sql::SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
-                #[cfg(feature = "postgres")]
-                Self::Postgres(pool) => {
-                    sqlx::query(rume_data::sql::PG_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
-                #[cfg(feature = "mysql")]
-                Self::Mysql(pool) => {
-                    sqlx::query(rume_data::sql::MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
-            };
-            Ok(affected > 0)
-        })
-    }
-
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
-        let id = id.0.clone();
-        Box::pin(async move {
-            match self {
-                #[cfg(feature = "sqlite")]
-                Self::Sqlite(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET then_dispatched = 0, finally_dispatched = 0 WHERE id = ?1",
-                    )
-                    .bind(&id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
-                }
-                #[cfg(feature = "postgres")]
-                Self::Postgres(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET then_dispatched = FALSE, finally_dispatched = FALSE WHERE id = $1",
-                    )
-                    .bind(&id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
-                }
-                #[cfg(feature = "mysql")]
-                Self::Mysql(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET then_dispatched = 0, finally_dispatched = 0 WHERE id = ?",
-                    )
-                    .bind(&id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
-                }
-            }
-            Ok(())
-        })
-    }
-
     fn cancel(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
         let id = id.0.clone();
         Box::pin(async move {
@@ -1476,8 +1207,10 @@ impl BatchBuilder {
                 // Why: account for every job that was never enqueued so `pending_jobs`,
                 // `failed_jobs`, and `status` stay accurate instead of hanging forever
                 // waiting on jobs that never entered the queue.
-                for _ in idx..total {
-                    let _ = store.record_failure(&created.id).await;
+                for failed_idx in idx..total {
+                    let _ = store
+                        .record_job_failure(&created.id, &format!("enqueue-failed-{failed_idx}"))
+                        .await;
                 }
                 return Err(err);
             }
@@ -1560,11 +1293,17 @@ mod tests {
             .await
             .expect("create batch");
 
-        let b1 = store.record_success(&batch.id).await.expect("success 1");
+        let b1 = store
+            .record_job_success(&batch.id, "job-1")
+            .await
+            .expect("success 1");
         assert_eq!(b1.status, BatchStatus::Running);
         assert_eq!(b1.pending_jobs, 1);
 
-        let b2 = store.record_success(&batch.id).await.expect("success 2");
+        let b2 = store
+            .record_job_success(&batch.id, "job-2")
+            .await
+            .expect("success 2");
         assert_eq!(b2.status, BatchStatus::Completed);
         assert_eq!(b2.pending_jobs, 0);
 
@@ -1603,10 +1342,16 @@ mod tests {
             .await
             .expect("create batch");
 
-        let b1 = store.record_failure(&batch.id).await.expect("failure 1");
+        let b1 = store
+            .record_job_failure(&batch.id, "job-1")
+            .await
+            .expect("failure 1");
         assert_eq!(b1.status, BatchStatus::Running);
 
-        let b2 = store.record_success(&batch.id).await.expect("success 2");
+        let b2 = store
+            .record_job_success(&batch.id, "job-2")
+            .await
+            .expect("success 2");
         assert_eq!(b2.status, BatchStatus::Failed);
         assert_eq!(b2.pending_jobs, 0);
 
@@ -1649,8 +1394,8 @@ mod tests {
         assert_eq!(loaded.pending_jobs, 2);
         assert_eq!(loaded.status, BatchStatus::Running);
 
-        let _ = store.record_success(&batch.id).await.unwrap();
-        let done = store.record_success(&batch.id).await.unwrap();
+        let _ = store.record_job_success(&batch.id, "job-1").await.unwrap();
+        let done = store.record_job_success(&batch.id, "job-2").await.unwrap();
         assert_eq!(done.status, BatchStatus::Completed);
 
         done.dispatch_callbacks_to_queue(&store, &queue)
@@ -1790,9 +1535,9 @@ mod tests {
 
         // When the 1 enqueued job finishes, the batch transitions cleanly to Failed.
         let terminal = store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, "job-0")
             .await
-            .expect("record_success");
+            .expect("record_job_success");
         assert_eq!(terminal.pending_jobs, 0);
         assert_eq!(terminal.status, BatchStatus::Failed);
 
@@ -1903,9 +1648,9 @@ mod tests {
             .expect("create batch");
 
         let done = store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, "job-1")
             .await
-            .expect("record_success");
+            .expect("record_job_success");
         done.dispatch_callbacks_to_queue(&store, &queue)
             .await
             .expect("dispatch callbacks");

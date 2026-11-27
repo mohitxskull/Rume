@@ -240,6 +240,7 @@ fn collect_top_level_statement_heads_from_tokens(
     let mut heads: Vec<Vec<String>> = Vec::new();
     let mut leading_words: Vec<String> = Vec::with_capacity(3);
     let mut in_compound_create_decl = false;
+    let mut seen_non_compound_create_target = false;
     let mut seen_lparen = false;
     let mut block_depth: usize = 0;
 
@@ -252,6 +253,7 @@ fn collect_top_level_statement_heads_from_tokens(
                         heads.push(std::mem::take(&mut leading_words));
                     }
                     in_compound_create_decl = false;
+                    seen_non_compound_create_target = false;
                     seen_lparen = false;
                 }
             }
@@ -269,16 +271,24 @@ fn collect_top_level_statement_heads_from_tokens(
                     // Why: only enter a compound SQL block (`BEGIN ... END`) when the
                     // enclosing `CREATE` statement explicitly declares a compound object
                     // (`TRIGGER`, `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(`
-                    // so column definitions like `CREATE TABLE t (event INT)` never trigger
-                    // `in_compound_create_decl` (`RC-13`).
-                    if !seen_lparen
-                        && leading_words.first().map(String::as_str) == Some("CREATE")
-                        && matches!(
+                    // and before any non-compound DDL keyword (`TABLE`, `VIEW`, `INDEX`,
+                    // `SCHEMA`, `TYPE`, `SEQUENCE`), so `CREATE TABLE trigger (...) BEGIN ...`
+                    // or `CREATE TABLE t (event INT)` cannot enable compound blocks (`RC-13`, `P2-20`).
+                    if !seen_lparen && leading_words.first().map(String::as_str) == Some("CREATE") {
+                        if matches!(
                             upper.as_str(),
-                            "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
-                        )
-                    {
-                        in_compound_create_decl = true;
+                            "TABLE" | "VIEW" | "INDEX" | "SCHEMA" | "TYPE" | "SEQUENCE"
+                        ) {
+                            seen_non_compound_create_target = true;
+                            in_compound_create_decl = false;
+                        } else if !seen_non_compound_create_target
+                            && matches!(
+                                upper.as_str(),
+                                "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
+                            )
+                        {
+                            in_compound_create_decl = true;
+                        }
                     }
                     if upper == "BEGIN" && in_compound_create_decl {
                         block_depth = 1;
@@ -1137,5 +1147,19 @@ mod data_sql_scanners_proptests {
             matches!(res, Err(PersistenceError::TransactionError(_))),
             "column name `event` inside CREATE TABLE (...) must not enable compound BEGIN block"
         );
+
+        // `P2-20`: a table/view/index named `trigger` (or `function`/`procedure`/`event`)
+        // before `(` must NOT enable compound BEGIN blocks either.
+        for bypass in [
+            "CREATE TABLE trigger (id INT) BEGIN SELECT 1; COMMIT; END;",
+            "CREATE VIEW event AS SELECT 1 BEGIN SELECT 1; ROLLBACK; END;",
+        ] {
+            let res =
+                validate_managed_transaction_sql(bypass, &sqlparser::dialect::SQLiteDialect {});
+            assert!(
+                matches!(res, Err(PersistenceError::TransactionError(_))),
+                "non-compound CREATE target must not enable compound BEGIN block: {bypass}"
+            );
+        }
     }
 }

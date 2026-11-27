@@ -614,11 +614,9 @@ async fn jwks_ttl_refresh_failure_backs_off_for_min_refresh_interval() {
     tokio::time::advance(Duration::from_secs(61)).await;
     fail.store(true, Ordering::SeqCst);
 
-    // First post-TTL request attempts refresh and fails (calls = 2).
-    assert!(matches!(
-        verifier.verify(&token, 1_061).await,
-        Err(AuthError::ProviderError(_))
-    ));
+    // First post-TTL request attempts refresh (calls = 2) and falls back consistently to cached
+    // keys rather than failing Request 1 while succeeding Request 2 (`P2-18`).
+    verifier.verify(&token, 1_061).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 2);
 
     // Second request 5s later (within min_refresh_interval = 30s) must NOT hammer IdP (calls still 2).
@@ -631,6 +629,93 @@ async fn jwks_ttl_refresh_failure_backs_off_for_min_refresh_interval() {
     fail.store(false, Ordering::SeqCst);
     verifier.verify(&token, 1_092).await.unwrap();
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn jwks_slow_timeout_still_enforces_full_backoff_after_completion() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    tokio::time::pause();
+
+    struct SlowFailFetcher {
+        calls: Arc<AtomicUsize>,
+        slow_fail: Arc<AtomicBool>,
+        jwk_set: JwkSet,
+    }
+
+    impl JwksFetcher for SlowFailFetcher {
+        fn fetch_jwks(&self) -> BoxFuture<'_, Result<JwkSet, AuthError>> {
+            let calls = Arc::clone(&self.calls);
+            let slow_fail = Arc::clone(&self.slow_fail);
+            let set = self.jwk_set.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if slow_fail.load(Ordering::SeqCst) {
+                    // Simulate a 15s network timeout (> min_refresh_interval = 10s).
+                    tokio::time::sleep(Duration::from_secs(15)).await;
+                    Err(AuthError::ProviderError("IdP timed out".to_owned()))
+                } else {
+                    Ok(set)
+                }
+            })
+        }
+    }
+
+    let secret = b"super-secret-jwks-slow-backoff-1";
+    let valid_jwk = Jwk {
+        kty: "oct".to_owned(),
+        kid: Some("k1".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: None,
+        alg: Some("HS256".to_owned()),
+        n: None,
+        e: None,
+        crv: None,
+        x: None,
+        y: None,
+        k: Some(URL_SAFE_NO_PAD.encode(secret)),
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let slow_fail = Arc::new(AtomicBool::new(false));
+    let fetcher = SlowFailFetcher {
+        calls: Arc::clone(&calls),
+        slow_fail: Arc::clone(&slow_fail),
+        jwk_set: JwkSet {
+            keys: vec![valid_jwk],
+        },
+    };
+    let mut cfg = JwtValidationConfig::default();
+    cfg.allowed_algorithms.insert(JwtAlgorithm::Hs256);
+    let verifier = JwtVerifier::from_jwks_fetcher(
+        fetcher,
+        cfg,
+        Duration::from_secs(60),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","kid":"k1"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(r#"{"sub":"u1","exp":9999999999}"#);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+    mac.update(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let token = format!("{signing_input}.{sig_b64}");
+
+    verifier.verify(&token, 1_000).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Expire TTL and trigger a 15s slow timeout failure.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    slow_fail.store(true, Ordering::SeqCst);
+    verifier.verify(&token, 1_061).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Immediately (and 5s after completion, well within min_refresh_interval = 10s),
+    // backoff MUST prevent another fetch even though the previous attempt took 15s (`P2-18`).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    verifier.verify(&token, 1_081).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
 }
 
 #[test]

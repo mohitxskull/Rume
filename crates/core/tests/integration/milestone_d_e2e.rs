@@ -240,7 +240,7 @@ async fn milestone_d_job_queue_priority_batch_and_cron_e2e() {
             .await
             .expect("ack batch item");
         batch_store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, &job.id)
             .await
             .expect("record completion");
     }

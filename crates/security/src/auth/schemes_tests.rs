@@ -181,3 +181,57 @@ async fn session_scheme_caps_cookie_candidate_store_lookups() {
     assert!(res.is_none());
     assert_eq!(loads.load(Ordering::SeqCst), MAX_SESSION_COOKIE_CANDIDATES);
 }
+
+#[tokio::test]
+async fn p2_17_bearer_case_insensitive_and_duplicate_auth_or_api_key_headers_rejected() {
+    let bearer = BearerTokenScheme::new(|tok| {
+        let ok = tok == "good-tok";
+        Box::pin(async move {
+            if ok {
+                Ok(Some(AuthUser::new("u-bearer")))
+            } else {
+                Err(AuthError::InvalidCredentials("bad".into()))
+            }
+        })
+    });
+
+    // Lowercase and uppercase `bearer` scheme accepted per RFC 6750 / RFC 9110.
+    for hdr in ["bearer good-tok", "BEARER good-tok", "BeArEr good-tok"] {
+        let (parts, ()) = Request::builder()
+            .header(AUTHORIZATION, hdr)
+            .body(())
+            .unwrap()
+            .into_parts();
+        let user = bearer
+            .authenticate(&parts)
+            .await
+            .expect("case-insensitive bearer must authenticate")
+            .expect("user present");
+        assert_eq!(user.id, "u-bearer");
+    }
+
+    // Duplicate Authorization headers rejected.
+    let (dup_auth_parts, ()) = Request::builder()
+        .header(AUTHORIZATION, "Bearer good-tok")
+        .header(AUTHORIZATION, "Bearer other-tok")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        bearer.authenticate(&dup_auth_parts).await,
+        Err(AuthError::InvalidCredentials(_))
+    ));
+
+    // Duplicate X-Api-Key headers rejected.
+    let api_key = ApiKeyScheme::new().add_key("k1", AuthUser::new("u-key"));
+    let (dup_key_parts, ()) = Request::builder()
+        .header("x-api-key", "k1")
+        .header("x-api-key", "k2")
+        .body(())
+        .unwrap()
+        .into_parts();
+    assert!(matches!(
+        api_key.authenticate(&dup_key_parts).await,
+        Err(AuthError::InvalidCredentials(_))
+    ));
+}

@@ -291,7 +291,7 @@ fn extract_subdomain_slug(parts: &Parts, base_domain: &str) -> Result<Option<Str
     // the target authority in `:authority` (`parts.uri.authority()`).
     // Reject duplicate `Host` headers to prevent proxy/backend routing ambiguity (`RC-17`).
     let mut host_values = parts.headers.get_all(HOST).iter();
-    let raw_host = if let Some(host_val) = host_values.next() {
+    let header_host = if let Some(host_val) = host_values.next() {
         if host_values.next().is_some() {
             return Err(TenantError::InvalidIdentifier(
                 "duplicate host header".into(),
@@ -302,11 +302,27 @@ fn extract_subdomain_slug(parts: &Parts, base_domain: &str) -> Result<Option<Str
                 "malformed host header".into(),
             ));
         };
-        host_str
-    } else if let Some(authority) = parts.uri.authority() {
-        authority.as_str()
+        let trimmed = host_str.trim();
+        if trimmed.is_empty() {
+            return Err(TenantError::InvalidIdentifier("empty host header".into()));
+        }
+        Some(trimmed)
     } else {
-        return Ok(None);
+        None
+    };
+
+    let uri_authority = parts.uri.authority().map(|a| a.as_str());
+    let raw_host = match (header_host, uri_authority) {
+        // Why: RFC 9113 §8.3.1 requires `Host` and HTTP/2 `:authority` to agree when both
+        // are present; accepting a disagreeing pair allows proxy/origin tenant confusion (`P2-17`).
+        (Some(h), Some(u)) if !h.eq_ignore_ascii_case(u) => {
+            return Err(TenantError::InvalidIdentifier(
+                "host header does not match request authority".into(),
+            ));
+        }
+        (Some(h), _) => h,
+        (None, Some(u)) => u,
+        (None, None) => return Ok(None),
     };
 
     // Convert host to lowercase, remove optional port, and strip trailing FQDN dot:
@@ -1402,6 +1418,18 @@ mod tests {
             .into_parts();
         assert!(matches!(
             sub_resolver.resolve(&dup_host_parts).await,
+            Err(TenantError::InvalidIdentifier(_))
+        ));
+
+        // Disagreeing Host vs HTTP/2 :authority rejected (`P2-17`)
+        let (mismatch_parts, _) = Request::builder()
+            .uri("https://evil.app.platform.io/dashboard")
+            .header(HOST, "acme.app.platform.io")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            sub_resolver.resolve(&mismatch_parts).await,
             Err(TenantError::InvalidIdentifier(_))
         ));
 

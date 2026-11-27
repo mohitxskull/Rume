@@ -301,12 +301,22 @@ where
                 // inner handler which holds authoritative ETag state (`RC-02`).
                 if config.vary_headers.is_empty()
                     && matches!(method, Method::PUT | Method::PATCH | Method::DELETE)
-                    && let Some(if_match) = joined_header_values(req.headers(), &header::IF_MATCH)
-                    && let Ok(Some(raw)) = backend.get(&cache_key).await
-                    && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
-                    && !etag_matches_strong(&if_match, &cached.etag)
                 {
-                    return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+                    match extract_header_values_strict(req.headers(), &header::IF_MATCH) {
+                        StrictHeaderValues::InvalidUtf8 => {
+                            return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+                        }
+                        StrictHeaderValues::Present(if_match) => {
+                            if let Ok(Some(raw)) = backend.get(&cache_key).await
+                                && let Ok(cached) =
+                                    serde_json::from_slice::<CachedHttpResponse>(&raw)
+                                && !etag_matches_strong(&if_match, &cached.etag)
+                            {
+                                return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+                            }
+                        }
+                        StrictHeaderValues::Absent => {}
+                    }
                 }
 
                 let res = inner.call(req).await?.into_response();
@@ -421,6 +431,11 @@ where
                 && etag_matches_weak(inm, etag_val)
             {
                 let mut res = StatusCode::NOT_MODIFIED.into_response();
+                for name in &NOT_MODIFIED_PRESERVED_HEADERS {
+                    for val in parts.headers.get_all(name) {
+                        res.headers_mut().append(name.clone(), val.clone());
+                    }
+                }
                 if let Ok(val) = HeaderValue::from_str(etag_val) {
                     res.headers_mut().insert(header::ETAG, val);
                 }
@@ -584,7 +599,11 @@ fn extract_request_authority(req: &Request<Body>) -> RequestAuthority {
             let Ok(s) = val.to_str() else {
                 return RequestAuthority::Ambiguous;
             };
-            Some(s.trim().to_ascii_lowercase())
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                return RequestAuthority::Ambiguous;
+            }
+            Some(trimmed.to_ascii_lowercase())
         }
         (None, _) => None,
     };
@@ -784,6 +803,35 @@ fn compute_etag(body: &[u8], weak: bool) -> String {
         format!("W/\"{hex_digest}\"")
     } else {
         format!("\"{hex_digest}\"")
+    }
+}
+
+enum StrictHeaderValues {
+    Absent,
+    Present(String),
+    InvalidUtf8,
+}
+
+fn extract_header_values_strict(
+    headers: &axum::http::HeaderMap,
+    name: &HeaderName,
+) -> StrictHeaderValues {
+    let mut joined = String::new();
+    let mut found = false;
+    for val in headers.get_all(name) {
+        let Ok(s) = val.to_str() else {
+            return StrictHeaderValues::InvalidUtf8;
+        };
+        if found {
+            joined.push_str(", ");
+        }
+        joined.push_str(s);
+        found = true;
+    }
+    if found {
+        StrictHeaderValues::Present(joined)
+    } else {
+        StrictHeaderValues::Absent
     }
 }
 
@@ -2508,5 +2556,113 @@ mod tests {
                 .and_then(|v| v.to_str().ok()),
             Some("private")
         );
+    }
+
+    #[tokio::test]
+    async fn p2_16_conditional_304_preserves_headers_empty_host_is_ambiguous_and_non_utf8_if_match_412()
+     {
+        // 1. ConditionalRequestLayer 304 must preserve RFC 9110 §15.4.5 headers.
+        let cond_app = Router::new()
+            .route(
+                "/doc",
+                get(|| async {
+                    (
+                        [
+                            (header::CACHE_CONTROL, "public, max-age=120"),
+                            (header::VARY, "Accept-Encoding"),
+                            (header::EXPIRES, "Wed, 21 Oct 2030 07:28:00 GMT"),
+                            (header::DATE, "Wed, 21 Oct 2026 07:28:00 GMT"),
+                        ],
+                        "hello-doc",
+                    )
+                }),
+            )
+            .layer(ConditionalRequestLayer::new());
+
+        let r1 = cond_app
+            .clone()
+            .oneshot(Request::builder().uri("/doc").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        let etag = r1
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let r2 = cond_app
+            .oneshot(
+                Request::builder()
+                    .uri("/doc")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            r2.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("public, max-age=120")
+        );
+        assert_eq!(
+            r2.headers().get(header::VARY).and_then(|v| v.to_str().ok()),
+            Some("Accept-Encoding")
+        );
+        assert_eq!(
+            r2.headers()
+                .get(header::EXPIRES)
+                .and_then(|v| v.to_str().ok()),
+            Some("Wed, 21 Oct 2030 07:28:00 GMT")
+        );
+        assert_eq!(
+            r2.headers().get(header::DATE).and_then(|v| v.to_str().ok()),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+
+        // 2. Empty/whitespace `Host:` header must be treated as Ambiguous (not Present("")).
+        let empty_host_req = Request::builder()
+            .uri("/item")
+            .header(header::HOST, "   ")
+            .body(Body::empty())
+            .unwrap();
+        assert!(matches!(
+            extract_request_authority(&empty_host_req),
+            RequestAuthority::Ambiguous
+        ));
+
+        // 3. Non-UTF-8 `If-Match` header must return 412 Precondition Failed (never fail open).
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let cache_app = Router::new()
+            .route(
+                "/item",
+                get(|| async { "v1" }).put(|| async { StatusCode::OK }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let _ = cache_app
+            .clone()
+            .oneshot(Request::builder().uri("/item").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        let bad_if_match = HeaderValue::from_bytes(b"\"bad-\xff-etag\"").unwrap();
+        let put_res = cache_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/item")
+                    .header(header::IF_MATCH, bad_if_match)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(put_res.status(), StatusCode::PRECONDITION_FAILED);
     }
 }

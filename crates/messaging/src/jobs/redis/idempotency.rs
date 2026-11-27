@@ -112,6 +112,18 @@ impl RedisIdempotencyStore {
     }
 }
 
+/// Converts an idempotency TTL `Duration` into a positive millisecond count safe for Redis
+/// `PX`/`PEXPIRE` (capped at `i64::MAX as u64`), rejecting `Duration::ZERO` (`P2-14`).
+fn idempotency_ttl_ms(ttl: Duration) -> Result<u64, JobError> {
+    if ttl.is_zero() {
+        return Err(JobError::Fatal(
+            "idempotency TTL must be greater than zero".into(),
+        ));
+    }
+    let clamped = i64::try_from(ttl.as_millis().max(1)).unwrap_or(i64::MAX);
+    Ok(clamped as u64)
+}
+
 impl IdempotencyStore for RedisIdempotencyStore {
     fn try_acquire(
         &self,
@@ -129,8 +141,9 @@ impl IdempotencyStore for RedisIdempotencyStore {
     ) -> BoxFuture<'_, Result<IdempotencyStatus, JobError>> {
         let redis_key = self.key(key);
         let token = token.to_string();
-        let ttl_ms = ttl.as_millis().max(1) as u64;
+        let ttl_ms = idempotency_ttl_ms(ttl);
         Box::pin(async move {
+            let ttl_ms = ttl_ms?;
             let mut conn = self
                 .pool
                 .get()
@@ -292,8 +305,9 @@ impl IdempotencyStore for RedisIdempotencyStore {
         let redis_key = self.key(key);
         let key = key.to_string();
         let token = token.to_string();
-        let extension_ms = extension.as_millis().max(1) as u64;
+        let extension_ms = idempotency_ttl_ms(extension);
         Box::pin(async move {
+            let extension_ms = extension_ms?;
             let mut conn = self
                 .pool
                 .get()
@@ -371,5 +385,13 @@ mod tests {
             EXTEND_LOCK_WITH_TOKEN_SCRIPT.contains("ARGV[1] == '' and current == 'IN_PROGRESS'"),
             "extend_lock_with_token must guard bare IN_PROGRESS with ARGV[1] == ''"
         );
+    }
+
+    #[test]
+    fn idempotency_ttl_ms_rejects_zero_rounds_sub_ms_up_and_saturates_max() {
+        assert!(idempotency_ttl_ms(Duration::ZERO).is_err());
+        assert_eq!(idempotency_ttl_ms(Duration::from_micros(500)).unwrap(), 1);
+        assert_eq!(idempotency_ttl_ms(Duration::from_secs(15)).unwrap(), 15_000);
+        assert_eq!(idempotency_ttl_ms(Duration::MAX).unwrap(), i64::MAX as u64);
     }
 }

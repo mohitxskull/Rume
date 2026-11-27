@@ -715,8 +715,8 @@ impl JwtVerifier {
 
         if needs_initial_or_ttl_refresh {
             let _refresh_guard = dynamic.refresh_lock.lock().await;
-            let should_fetch = {
-                let mut cache = dynamic.cache.write().await;
+            let (should_fetch, has_cached_keys) = {
+                let cache = dynamic.cache.read().await;
                 let now_w = Instant::now();
                 let ttl_expired = cache.fetched_at.is_none_or(|fetched| {
                     now_w.saturating_duration_since(fetched) >= dynamic.cache_ttl
@@ -724,26 +724,40 @@ impl JwtVerifier {
                 let backoff_elapsed = cache.last_refresh_attempt.is_none_or(|last| {
                     now_w.saturating_duration_since(last) >= dynamic.min_refresh_interval
                 });
-                if ttl_expired && backoff_elapsed {
-                    // Why: record attempt timestamp before releasing `cache` and awaiting
-                    // `fetch_jwks()` so failed TTL refreshes back off for `min_refresh_interval`
-                    // instead of hammering the IdP on every subsequent request (`RC-18`).
-                    cache.last_refresh_attempt = Some(now_w);
-                    true
-                } else {
-                    false
-                }
+                (ttl_expired && backoff_elapsed, !cache.keys.is_empty())
             };
             if should_fetch {
                 // Why: perform network I/O with NO lock held on `cache` so concurrent
                 // verifications for already-cached keys remain non-blocking while a
-                // refresh is in flight.
-                let set = dynamic.fetcher.fetch_jwks().await?;
-                let parsed = parse_jwk_set(&set)?;
-                let refreshed_at = Instant::now();
+                // refresh is in flight. Stamp `last_refresh_attempt` AFTER the fetch
+                // completes so slow timeouts still back off for the full `min_refresh_interval`
+                // (`P2-18`).
+                let fetch_result = dynamic
+                    .fetcher
+                    .fetch_jwks()
+                    .await
+                    .and_then(|set| parse_jwk_set(&set));
+                let completed_at = Instant::now();
                 let mut cache = dynamic.cache.write().await;
-                cache.keys = parsed;
-                cache.fetched_at = Some(refreshed_at);
+                cache.last_refresh_attempt = Some(completed_at);
+                match fetch_result {
+                    Ok(parsed) => {
+                        cache.keys = parsed;
+                        cache.fetched_at = Some(completed_at);
+                    }
+                    Err(err) => {
+                        if !has_cached_keys {
+                            return Err(err);
+                        }
+                        // Why: serve stale cached keys consistently on BOTH the failing
+                        // refresh request and subsequent requests during the backoff window
+                        // rather than failing only the first request (`P2-18`).
+                        tracing::warn!(
+                            error = %err,
+                            "JWKS TTL refresh failed; continuing with cached keys until backoff expires"
+                        );
+                    }
+                }
             }
         }
 
@@ -767,32 +781,29 @@ impl JwtVerifier {
         {
             let _refresh_guard = dynamic.refresh_lock.lock().await;
             let should_fetch = {
-                let mut cache = dynamic.cache.write().await;
+                let cache = dynamic.cache.read().await;
                 if has_key_candidate(&cache.keys, alg, Some(kid_str)) {
                     false
                 } else {
                     let now_w = Instant::now();
-                    let allowed = cache.last_refresh_attempt.is_none_or(|last| {
+                    cache.last_refresh_attempt.is_none_or(|last| {
                         now_w.saturating_duration_since(last) >= dynamic.min_refresh_interval
-                    });
-                    if allowed {
-                        // Why: record attempt timestamp before releasing `cache` and awaiting
-                        // fetch so concurrent or failing misses still respect `min_refresh_interval`
-                        // without blocking readers on `cache` during network I/O.
-                        cache.last_refresh_attempt = Some(now_w);
-                        true
-                    } else {
-                        false
-                    }
+                    })
                 }
             };
 
             if should_fetch {
-                let set = dynamic.fetcher.fetch_jwks().await?;
-                let parsed = parse_jwk_set(&set)?;
+                let fetch_result = dynamic
+                    .fetcher
+                    .fetch_jwks()
+                    .await
+                    .and_then(|set| parse_jwk_set(&set));
+                let completed_at = Instant::now();
                 let mut cache = dynamic.cache.write().await;
+                cache.last_refresh_attempt = Some(completed_at);
+                let parsed = fetch_result?;
                 cache.keys = parsed;
-                cache.fetched_at = Some(Instant::now());
+                cache.fetched_at = Some(completed_at);
             }
         }
 

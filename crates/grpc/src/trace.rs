@@ -52,13 +52,13 @@ impl RumeTraceInterceptor {
         }
     }
 
-    /// Extracts a [`RequestId`] from gRPC [`MetadataMap`] (`x-request-id`).
+    /// Extracts a validated [`RequestId`] from gRPC [`MetadataMap`] (`x-request-id`).
     pub fn extract_request_id(metadata: &MetadataMap) -> Option<RequestId> {
         metadata
             .get("x-request-id")
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
-            .filter(|s| !s.is_empty())
+            .filter(|s| rume_observability::is_valid_request_id(s))
             .map(RequestId::from)
     }
 
@@ -109,7 +109,7 @@ fn extract_request_id_from_headers(headers: &HeaderMap) -> Option<RequestId> {
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| rume_observability::is_valid_request_id(s))
         .map(RequestId::from)
 }
 
