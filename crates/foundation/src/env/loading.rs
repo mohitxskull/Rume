@@ -14,7 +14,7 @@ use secrecy::{ExposeSecret, SecretBox};
 use serde::de::DeserializeOwned;
 
 use crate::env::error::EnvError;
-use crate::env::interpolation::interpolate_value;
+use crate::env::interpolation::interpolate_value_with_literals;
 use crate::env::secrets::{is_secret_key, value_looks_sensitive};
 
 /// A resolved environment: the merged values plus where each one came from.
@@ -297,6 +297,11 @@ where
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
         .collect();
+    let literal_keys: BTreeSet<String> = merged
+        .iter()
+        .filter(|(_, (_, source))| source == "process env")
+        .map(|(key, _)| key.clone())
+        .collect();
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
@@ -309,10 +314,11 @@ where
     // literal `${...}` syntax unrelated to Rume; interpolating them would
     // fail boot or corrupt credentials on healthy environments.
     // Process-env values still remain in `vars` as lookup targets so file
-    // variables can reference process-overridden variables.
+    // variables can reference process-overridden variables, and `literal_keys`
+    // ensures they are substituted verbatim without recursive `${...}` expansion.
     for (key, (value, source)) in &merged {
         let resolved_value = if file_keys.contains(key) && source != "process env" {
-            interpolate_value(value, &vars)?
+            interpolate_value_with_literals(value, &vars, &literal_keys)?
         } else {
             value.clone()
         };
@@ -568,6 +574,7 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::interpolation::interpolate_value;
 
     #[test]
     fn get_exposes_secret_via_expose_secret() {
@@ -906,5 +913,26 @@ mod tests {
 
         let resolved = ResolvedEnv::load_for_env_in(dir.path(), "production").unwrap();
         assert_eq!(resolved.get("URL"), Some("https://prod.example.com"));
+    }
+
+    #[test]
+    fn process_env_value_is_interpolated_literally_without_recursing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "URL=postgres://u:${DB_PASS}@h/db\n",
+        )
+        .unwrap();
+
+        let resolved = ResolvedEnv::load_for_env_with_vars(
+            dir.path(),
+            "production",
+            vec![("DB_PASS".to_string(), "p@ss${LITERAL}".to_string())],
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.get("URL"),
+            Some("postgres://u:p@ss${LITERAL}@h/db")
+        );
     }
 }

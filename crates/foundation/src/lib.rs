@@ -7,6 +7,7 @@ pub mod env;
 pub mod error;
 pub mod health;
 pub mod paths;
+pub mod ssrf;
 pub mod state;
 pub mod telemetry;
 pub mod util;

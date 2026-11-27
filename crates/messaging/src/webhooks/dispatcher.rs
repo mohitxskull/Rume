@@ -1,11 +1,12 @@
 //! Outbound webhook dispatcher, HTTP transport, and Outbox/JobQueue integrations.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
+use rume_foundation::ssrf::{is_forbidden_ip, validate_host};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -22,35 +23,6 @@ const DEFAULT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_WEBHOOK_CLAIM_LEASE: Duration = Duration::from_secs(60);
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 4096;
 
-fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || is_cgnat
-}
-
-fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_forbidden_ipv4(v4);
-    }
-    let segments = ip.segments();
-    let is_ula = (segments[0] & 0xfe00) == 0xfc00;
-    let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_ula || is_link_local
-}
-
-fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
-        IpAddr::V6(v6) => is_forbidden_ipv6(v6),
-    }
-}
-
 fn validate_webhook_url(
     url: &str,
     allow_private_networks: bool,
@@ -63,33 +35,13 @@ fn validate_webhook_url(
             parsed.scheme()
         )));
     }
-    if parsed.host().is_none() {
+    let Some(host) = parsed.host_str() else {
         return Err(WebhookError::Transport("webhook URL missing host".into()));
-    }
+    };
     if !allow_private_networks {
-        match parsed.host_str() {
-            Some(h)
-                if h.eq_ignore_ascii_case("localhost")
-                    || h.to_ascii_lowercase().ends_with(".localhost") =>
-            {
-                return Err(WebhookError::Transport(format!(
-                    "SSRF protection blocked private/loopback webhook host '{h}'"
-                )));
-            }
-            Some(h) => {
-                let stripped = h.trim_start_matches('[').trim_end_matches(']');
-                if let Ok(ip) = stripped.parse::<IpAddr>()
-                    && is_forbidden_ip(ip)
-                {
-                    return Err(WebhookError::Transport(format!(
-                        "SSRF protection blocked private/internal webhook IP '{ip}'"
-                    )));
-                }
-            }
-            None => {
-                return Err(WebhookError::Transport("webhook URL missing host".into()));
-            }
-        }
+        validate_host(host).map_err(|reason| {
+            WebhookError::Transport(format!("SSRF protection blocked webhook target: {reason}"))
+        })?;
     }
     Ok(parsed)
 }
@@ -130,17 +82,78 @@ impl reqwest::dns::Resolve for SsrfSafeDnsResolver {
     }
 }
 
-fn build_webhook_client(allow_private_networks: bool) -> reqwest::Client {
+fn build_webhook_client(
+    connect_timeout: Duration,
+    timeout: Duration,
+    allow_private_networks: bool,
+) -> Result<reqwest::Client, WebhookError> {
     let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(DEFAULT_WEBHOOK_CONNECT_TIMEOUT)
-        .timeout(DEFAULT_WEBHOOK_TIMEOUT);
+        .connect_timeout(connect_timeout)
+        .timeout(timeout);
     if !allow_private_networks {
         builder = builder.dns_resolver(Arc::new(SsrfSafeDnsResolver));
     }
     builder
         .build()
-        .expect("valid reqwest webhook client config")
+        .map_err(|e| WebhookError::Transport(format!("failed to build webhook client: {e}")))
+}
+
+/// Hardened builder for [`ReqwestWebhookTransport`].
+///
+/// Why: exposing an arbitrary `with_client(reqwest::Client)` would allow callers to bypass
+/// `SsrfSafeDnsResolver` and `Policy::none()`. This builder lets callers tune timeouts and
+/// private-network opt-in while always attaching the hardened redirect and DNS policies.
+#[derive(Debug, Clone)]
+pub struct ReqwestWebhookTransportBuilder {
+    connect_timeout: Duration,
+    timeout: Duration,
+    allow_private_networks: bool,
+}
+
+impl Default for ReqwestWebhookTransportBuilder {
+    fn default() -> Self {
+        Self {
+            connect_timeout: DEFAULT_WEBHOOK_CONNECT_TIMEOUT,
+            timeout: DEFAULT_WEBHOOK_TIMEOUT,
+            allow_private_networks: false,
+        }
+    }
+}
+
+impl ReqwestWebhookTransportBuilder {
+    /// Sets the TCP connect timeout.
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.connect_timeout = timeout;
+        self
+    }
+
+    /// Sets the total per-request timeout.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    /// Configures whether private, loopback, and link-local network targets are permitted.
+    ///
+    /// Defaults to `false`. Enable only for local integration tests.
+    pub fn allow_private_networks(mut self, allow: bool) -> Self {
+        self.allow_private_networks = allow;
+        self
+    }
+
+    /// Builds a hardened [`ReqwestWebhookTransport`].
+    pub fn build(self) -> Result<ReqwestWebhookTransport, WebhookError> {
+        let client = build_webhook_client(
+            self.connect_timeout,
+            self.timeout,
+            self.allow_private_networks,
+        )?;
+        Ok(ReqwestWebhookTransport {
+            client,
+            allow_private_networks: self.allow_private_networks,
+        })
+    }
 }
 
 /// HTTP response returned by a [`WebhookTransport`].
@@ -182,27 +195,24 @@ impl ReqwestWebhookTransport {
     /// Creates a new [`ReqwestWebhookTransport`] with SSRF protection, disabled redirects,
     /// and bounded connect/request timeouts.
     pub fn new() -> Self {
-        Self {
-            client: build_webhook_client(false),
-            allow_private_networks: false,
-        }
+        Self::builder()
+            .build()
+            .expect("valid default reqwest webhook client config")
+    }
+
+    /// Returns a hardened [`ReqwestWebhookTransportBuilder`].
+    pub fn builder() -> ReqwestWebhookTransportBuilder {
+        ReqwestWebhookTransportBuilder::default()
     }
 
     /// Configures whether private, loopback, and link-local network targets are permitted.
     ///
     /// Defaults to `false`. Enable only for local integration tests.
-    pub fn with_allow_private_networks(mut self, allow: bool) -> Self {
-        self.allow_private_networks = allow;
-        self.client = build_webhook_client(allow);
-        self
-    }
-
-    /// Creates a new [`ReqwestWebhookTransport`] using the supplied `reqwest::Client`.
-    pub fn with_client(client: reqwest::Client) -> Self {
-        Self {
-            client,
-            allow_private_networks: false,
-        }
+    pub fn with_allow_private_networks(self, allow: bool) -> Self {
+        Self::builder()
+            .allow_private_networks(allow)
+            .build()
+            .expect("valid reqwest webhook client config")
     }
 }
 
@@ -531,6 +541,11 @@ mod tests {
             "http://[fe80::1]/hook",
             "http://[fd00::1]/hook",
             "http://[::ffff:127.0.0.1]/hook",
+            "http://[64:ff9b::a9fe:a9fe]/hook",
+            "http://[::127.0.0.1]/hook",
+            "http://0.1.2.3/hook",
+            "http://198.18.0.1/hook",
+            "https://localhost./hook",
             "http://localhost:9000/hook",
         ] {
             let err = transport
@@ -538,7 +553,7 @@ mod tests {
                 .await
                 .expect_err(&format!("expected SSRF rejection for {blocked}"));
             assert!(
-                matches!(err, WebhookError::Transport(_)),
+                matches!(err, WebhookError::Transport(ref msg) if msg.contains("SSRF")),
                 "unexpected error for {blocked}: {err:?}"
             );
         }

@@ -161,7 +161,7 @@ where
 
         Box::pin(async move {
             let method = req.method().clone();
-            let cache_key = derive_cache_key(&req, &config.vary_headers);
+            let cache_key = derive_cache_key(&req, &config);
 
             if method == Method::GET || method == Method::HEAD {
                 let has_auth_headers = req.headers().contains_key(header::AUTHORIZATION)
@@ -177,65 +177,44 @@ where
                     if let Some(ref inm) = if_none_match
                         && etag_matches_weak(inm, &cached.etag)
                     {
-                        return Ok(not_modified_response(&cached.etag, &config));
+                        return Ok(not_modified_response(
+                            &cached.etag,
+                            &config,
+                            has_auth_headers,
+                        ));
                     }
                     return Ok(response_from_cached(
                         cached,
                         method == Method::HEAD,
                         &config,
+                        has_auth_headers,
                     ));
                 }
 
                 let res = inner.call(req).await?.into_response();
-                if res.status() != StatusCode::OK || !is_cacheable_response(res.headers()) {
-                    return Ok(res);
-                }
-
-                let content_length_too_large = res
-                    .headers()
-                    .get(header::CONTENT_LENGTH)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<usize>().ok())
-                    .is_some_and(|len| len > MAX_CACHEABLE_BODY_BYTES);
-                if content_length_too_large {
+                if res.status() != StatusCode::OK
+                    || !is_cacheable_response(res.headers(), &config.vary_headers)
+                {
                     return Ok(res);
                 }
 
                 let (mut parts, body) = res.into_parts();
-                let mut stream = body.into_data_stream();
-                let mut buf = Vec::new();
-                let mut overflow_chunk: Option<axum::body::Bytes> = None;
-                let mut stream_err = false;
-                while let Some(next) = stream.next().await {
-                    match next {
-                        Ok(chunk) => {
-                            if buf.len().saturating_add(chunk.len()) > MAX_CACHEABLE_BODY_BYTES {
-                                overflow_chunk = Some(chunk);
-                                break;
-                            }
-                            buf.extend_from_slice(&chunk);
-                        }
-                        Err(_) => {
-                            stream_err = true;
-                            break;
-                        }
+                let bytes = match buffer_or_passthrough_body(
+                    &parts.headers,
+                    body,
+                    MAX_CACHEABLE_BODY_BYTES,
+                    method == Method::HEAD,
+                )
+                .await
+                {
+                    BufferedBody::Complete(bytes) => bytes,
+                    BufferedBody::Passthrough(out_body) => {
+                        return Ok(Response::from_parts(parts, out_body));
                     }
-                }
-                if overflow_chunk.is_some() || stream_err {
-                    let out_body = if method == Method::HEAD {
-                        Body::empty()
-                    } else {
-                        let prefix = futures_util::stream::iter(
-                            (!buf.is_empty())
-                                .then(|| Ok(axum::body::Bytes::from(buf)))
-                                .into_iter()
-                                .chain(overflow_chunk.map(Ok)),
-                        );
-                        Body::from_stream(prefix.chain(stream))
-                    };
-                    return Ok(Response::from_parts(parts, out_body));
-                }
-                let bytes = axum::body::Bytes::from(buf);
+                    BufferedBody::StreamError => {
+                        return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                    }
+                };
 
                 let etag = parts
                     .headers
@@ -247,7 +226,7 @@ where
                 if let Ok(val) = HeaderValue::from_str(&etag) {
                     parts.headers.insert(header::ETAG, val);
                 }
-                apply_cache_headers(&mut parts.headers, &config);
+                apply_cache_headers(&mut parts.headers, &config, has_auth_headers);
 
                 // Why: HEAD responses carry an empty body, so caching a HEAD miss
                 // would poison the shared GET cache entry with an empty body and ETag.
@@ -272,7 +251,7 @@ where
                 if let Some(ref inm) = if_none_match
                     && etag_matches_weak(inm, &etag)
                 {
-                    return Ok(not_modified_response(&etag, &config));
+                    return Ok(not_modified_response(&etag, &config, has_auth_headers));
                 }
 
                 let out_body = if method == Method::HEAD {
@@ -374,8 +353,21 @@ where
             }
 
             let (mut parts, body) = res.into_parts();
-            let Ok(bytes) = axum::body::to_bytes(body, MAX_CACHEABLE_BODY_BYTES).await else {
-                return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+            let bytes = match buffer_or_passthrough_body(
+                &parts.headers,
+                body,
+                MAX_CACHEABLE_BODY_BYTES,
+                method == Method::HEAD,
+            )
+            .await
+            {
+                BufferedBody::Complete(bytes) => bytes,
+                BufferedBody::Passthrough(out_body) => {
+                    return Ok(Response::from_parts(parts, out_body));
+                }
+                BufferedBody::StreamError => {
+                    return Ok(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+                }
             };
 
             let etag = parts
@@ -408,15 +400,83 @@ where
     }
 }
 
-fn is_cacheable_response(headers: &axum::http::HeaderMap) -> bool {
+enum BufferedBody {
+    /// Entire body fit within `max_bytes`.
+    Complete(axum::body::Bytes),
+    /// Body exceeded `max_bytes` (via `Content-Length` or while streaming) and must be
+    /// passed through as a streaming body without caching or ETag hashing.
+    Passthrough(Body),
+    /// Upstream body stream errored while buffering before response headers were sent.
+    StreamError,
+}
+
+/// Buffers a response body up to `max_bytes`, switching seamlessly to streaming pass-through
+/// if the body exceeds `max_bytes`.
+///
+/// Why: never turn a valid >`max_bytes` response into `500`, and never swallow a mid-stream
+/// `Err(e)` into a truncated `200 OK`: errors before pass-through yield `StreamError` (`500`),
+/// while errors after pass-through begins propagate inside `Body::from_stream`.
+async fn buffer_or_passthrough_body(
+    headers: &axum::http::HeaderMap,
+    body: Body,
+    max_bytes: usize,
+    head_only: bool,
+) -> BufferedBody {
+    let content_length_too_large = headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<usize>().ok())
+        .is_some_and(|len| len > max_bytes);
+    if content_length_too_large {
+        return BufferedBody::Passthrough(if head_only { Body::empty() } else { body });
+    }
+
+    let mut stream = body.into_data_stream();
+    let mut buf = Vec::new();
+    while let Some(next) = stream.next().await {
+        match next {
+            Ok(chunk) => {
+                if buf.len().saturating_add(chunk.len()) > max_bytes {
+                    let out_body = if head_only {
+                        Body::empty()
+                    } else {
+                        let prefix = futures_util::stream::iter(
+                            (!buf.is_empty())
+                                .then(|| Ok(axum::body::Bytes::from(buf)))
+                                .into_iter()
+                                .chain(std::iter::once(Ok(chunk))),
+                        );
+                        Body::from_stream(prefix.chain(stream))
+                    };
+                    return BufferedBody::Passthrough(out_body);
+                }
+                buf.extend_from_slice(&chunk);
+            }
+            Err(_) => {
+                return BufferedBody::StreamError;
+            }
+        }
+    }
+
+    BufferedBody::Complete(axum::body::Bytes::from(buf))
+}
+
+fn is_cacheable_response(headers: &axum::http::HeaderMap, vary_headers: &[HeaderName]) -> bool {
     if headers.contains_key(header::SET_COOKIE) {
         return false;
     }
     for val in headers.get_all(header::VARY) {
-        if let Ok(s) = val.to_str()
-            && s.split(',').any(|token| token.trim() == "*")
-        {
+        let Ok(s) = val.to_str() else {
             return false;
+        };
+        for token in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+            if token == "*"
+                || !vary_headers
+                    .iter()
+                    .any(|configured| configured.as_str().eq_ignore_ascii_case(token))
+            {
+                return false;
+            }
         }
     }
     for val in headers.get_all(header::CACHE_CONTROL) {
@@ -440,7 +500,19 @@ fn push_framed(buf: &mut String, value: &str) {
     let _ = write!(buf, "{}:{value}|", value.len());
 }
 
-fn derive_cache_key(req: &Request<Body>, vary_headers: &[HeaderName]) -> String {
+fn hash_header_values(headers: &axum::http::HeaderMap, name: &HeaderName) -> Option<String> {
+    let mut iter = headers.get_all(name).iter().peekable();
+    iter.peek()?;
+    let mut hasher = Sha256::new();
+    for val in iter {
+        let bytes = val.as_bytes();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(bytes);
+    }
+    Some(hex::encode(hasher.finalize()))
+}
+
+fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig) -> String {
     let pq = req
         .uri()
         .path_and_query()
@@ -465,7 +537,7 @@ fn derive_cache_key(req: &Request<Body>, vary_headers: &[HeaderName]) -> String 
         None => key.push_str("0:|"),
     }
     push_framed(&mut key, pq);
-    for name in vary_headers {
+    for name in &config.vary_headers {
         push_framed(&mut key, name.as_str());
         let val = req
             .headers()
@@ -473,6 +545,22 @@ fn derive_cache_key(req: &Request<Body>, vary_headers: &[HeaderName]) -> String 
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         push_framed(&mut key, val);
+    }
+    if config.cache_authenticated {
+        match hash_header_values(req.headers(), &header::AUTHORIZATION) {
+            Some(digest) => {
+                key.push_str("a1:");
+                push_framed(&mut key, &digest);
+            }
+            None => key.push_str("a0:|"),
+        }
+        match hash_header_values(req.headers(), &header::COOKIE) {
+            Some(digest) => {
+                key.push_str("c1:");
+                push_framed(&mut key, &digest);
+            }
+            None => key.push_str("c0:|"),
+        }
     }
     key
 }
@@ -511,8 +599,52 @@ fn etag_matches_strong(header_val: &str, current_etag: &str) -> bool {
     })
 }
 
-fn apply_cache_headers(headers: &mut axum::http::HeaderMap, config: &HttpCacheConfig) {
-    if let Some(ref cc) = config.cache_control
+fn rewrite_cache_control_private(cc: &str) -> String {
+    let mut directives: Vec<&str> = Vec::new();
+    let mut has_private = false;
+    for raw in cc.split(',') {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let name = trimmed.split('=').next().unwrap_or("").trim();
+        if name.eq_ignore_ascii_case("public") {
+            if !has_private {
+                directives.push("private");
+                has_private = true;
+            }
+        } else {
+            if name.eq_ignore_ascii_case("private") {
+                has_private = true;
+            }
+            directives.push(trimmed);
+        }
+    }
+    if !has_private {
+        directives.insert(0, "private");
+    }
+    directives.join(", ")
+}
+
+fn apply_cache_headers(
+    headers: &mut axum::http::HeaderMap,
+    config: &HttpCacheConfig,
+    is_authenticated: bool,
+) {
+    if is_authenticated {
+        if let Some(existing) = headers
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .map(rewrite_cache_control_private)
+            .and_then(|s| HeaderValue::from_str(&s).ok())
+        {
+            headers.insert(header::CACHE_CONTROL, existing);
+        } else if let Some(ref cc) = config.cache_control
+            && let Ok(val) = HeaderValue::from_str(&rewrite_cache_control_private(cc))
+        {
+            headers.insert(header::CACHE_CONTROL, val);
+        }
+    } else if let Some(ref cc) = config.cache_control
         && !headers.contains_key(header::CACHE_CONTROL)
         && let Ok(val) = HeaderValue::from_str(cc)
     {
@@ -531,12 +663,12 @@ fn apply_cache_headers(headers: &mut axum::http::HeaderMap, config: &HttpCacheCo
     }
 }
 
-fn not_modified_response(etag: &str, config: &HttpCacheConfig) -> Response {
+fn not_modified_response(etag: &str, config: &HttpCacheConfig, is_authenticated: bool) -> Response {
     let mut res = StatusCode::NOT_MODIFIED.into_response();
     if let Ok(val) = HeaderValue::from_str(etag) {
         res.headers_mut().insert(header::ETAG, val);
     }
-    apply_cache_headers(res.headers_mut(), config);
+    apply_cache_headers(res.headers_mut(), config, is_authenticated);
     res
 }
 
@@ -544,6 +676,7 @@ fn response_from_cached(
     cached: CachedHttpResponse,
     head_only: bool,
     config: &HttpCacheConfig,
+    is_authenticated: bool,
 ) -> Response {
     let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
     let body = if head_only {
@@ -564,7 +697,7 @@ fn response_from_cached(
     if let Ok(val) = HeaderValue::from_str(&cached.etag) {
         res.headers_mut().insert(header::ETAG, val);
     }
-    apply_cache_headers(res.headers_mut(), config);
+    apply_cache_headers(res.headers_mut(), config, is_authenticated);
     res
 }
 
@@ -1124,6 +1257,288 @@ mod tests {
         assert_eq!(
             to_bytes(res_a2.into_body(), usize::MAX).await.unwrap(),
             b"tenant-a-1".as_slice()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn mid_stream_error_is_not_silently_truncated_to_200_ok() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let cache_app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    let stream = futures_util::stream::iter(vec![
+                        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(
+                            b"partial",
+                        )),
+                        Err(std::io::Error::other("upstream disconnect")),
+                    ]);
+                    Body::from_stream(stream)
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let res = cache_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/boom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        let cond_app = Router::new()
+            .route(
+                "/boom",
+                get(|| async {
+                    let stream = futures_util::stream::iter(vec![
+                        Ok::<axum::body::Bytes, std::io::Error>(axum::body::Bytes::from_static(
+                            b"partial",
+                        )),
+                        Err(std::io::Error::other("upstream disconnect")),
+                    ]);
+                    Body::from_stream(stream)
+                }),
+            )
+            .layer(ConditionalRequestLayer::new());
+
+        let cond_res = cond_app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/boom")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(cond_res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn large_9mib_response_through_conditional_request_layer_returns_200() {
+        let large_size = MAX_CACHEABLE_BODY_BYTES + 1024 * 1024; // 9 MiB
+        let app = Router::new()
+            .route(
+                "/large-known",
+                get(move || async move { vec![b'z'; large_size] }),
+            )
+            .route(
+                "/large-stream",
+                get(move || async move {
+                    let chunk = vec![b'w'; 1024 * 1024];
+                    let stream = futures_util::stream::iter(
+                        (0..9).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone())),
+                    );
+                    Body::from_stream(stream)
+                }),
+            )
+            .layer(ConditionalRequestLayer::new());
+
+        let res_known = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/large-known")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_known.status(), StatusCode::OK);
+        let body_known = to_bytes(res_known.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body_known.len(), large_size);
+
+        let res_stream = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/large-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_stream.status(), StatusCode::OK);
+        let body_stream = to_bytes(res_stream.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(body_stream.len(), 9 * 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn cache_authenticated_isolates_users_and_never_emits_public() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/me",
+                get(move |req: Request<Body>| {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        let auth = req
+                            .headers()
+                            .get(header::AUTHORIZATION)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("anon")
+                            .to_owned();
+                        format!("user={auth},hit={n}")
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(
+                backend,
+                HttpCacheConfig::default().with_cache_authenticated(true),
+            ));
+
+        let r_alice1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/me")
+                    .header(header::AUTHORIZATION, "Bearer alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_alice1.status(), StatusCode::OK);
+        let cc_alice1 = r_alice1
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(
+            !cc_alice1.contains("public"),
+            "authenticated response must never emit public Cache-Control: {cc_alice1}"
+        );
+        assert!(
+            cc_alice1.contains("private"),
+            "authenticated response should emit private Cache-Control: {cc_alice1}"
+        );
+        assert_eq!(
+            to_bytes(r_alice1.into_body(), usize::MAX).await.unwrap(),
+            b"user=Bearer alice,hit=1".as_slice()
+        );
+
+        let r_bob = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/me")
+                    .header(header::AUTHORIZATION, "Bearer bob")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_bob.status(), StatusCode::OK);
+        let cc_bob = r_bob
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(!cc_bob.contains("public"));
+        assert_eq!(
+            to_bytes(r_bob.into_body(), usize::MAX).await.unwrap(),
+            b"user=Bearer bob,hit=2".as_slice()
+        );
+
+        // Second request for alice hits alice's isolated cache entry.
+        let r_alice2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/me")
+                    .header(header::AUTHORIZATION, "Bearer alice")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let cc_alice2 = r_alice2
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        assert!(!cc_alice2.contains("public"));
+        assert_eq!(
+            to_bytes(r_alice2.into_body(), usize::MAX).await.unwrap(),
+            b"user=Bearer alice,hit=1".as_slice()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn response_vary_header_outside_config_vary_headers_bypasses_cache() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/localized",
+                get(move |req: Request<Body>| {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        let lang = req
+                            .headers()
+                            .get(header::ACCEPT_LANGUAGE)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("en")
+                            .to_owned();
+                        (
+                            [(header::VARY, "accept-language")],
+                            format!("lang={lang},hit={n}"),
+                        )
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/localized")
+                    .header(header::ACCEPT_LANGUAGE, "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r1.into_body(), usize::MAX).await.unwrap(),
+            b"lang=en,hit=1".as_slice()
+        );
+
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/localized")
+                    .header(header::ACCEPT_LANGUAGE, "fr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r2.into_body(), usize::MAX).await.unwrap(),
+            b"lang=fr,hit=2".as_slice()
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
     }

@@ -212,21 +212,28 @@ impl OidcDiscovery {
 fn validate_discovery_endpoint(field: &str, raw: &str, allow_http: bool) -> Result<(), AuthError> {
     let parsed = Url::parse(raw)
         .map_err(|e| AuthError::InvalidCredentials(format!("invalid OIDC {field} URL: {e}")))?;
-    if !parsed.has_host() {
+    let Some(host) = parsed.host_str() else {
         return Err(AuthError::InvalidCredentials(format!(
             "OIDC {field} URL missing host"
         )));
-    }
+    };
     if allow_http {
         if !matches!(parsed.scheme(), "http" | "https") {
             return Err(AuthError::InvalidCredentials(format!(
                 "OIDC {field} must use http or https"
             )));
         }
-    } else if parsed.scheme() != "https" {
-        return Err(AuthError::InvalidCredentials(format!(
-            "OIDC {field} must use HTTPS"
-        )));
+    } else {
+        if parsed.scheme() != "https" {
+            return Err(AuthError::InvalidCredentials(format!(
+                "OIDC {field} must use HTTPS"
+            )));
+        }
+        rume_foundation::ssrf::validate_host(host).map_err(|reason| {
+            AuthError::InvalidCredentials(format!(
+                "OIDC {field} blocked by SSRF protection: {reason}"
+            ))
+        })?;
     }
     Ok(())
 }
@@ -475,6 +482,15 @@ impl ReqwestOidcDiscoveryClient {
     pub async fn discover(&self, issuer: &str) -> Result<OidcDiscovery, AuthError> {
         let parsed_issuer = Url::parse(issuer)
             .map_err(|e| AuthError::InvalidCredentials(format!("invalid issuer URL: {e}")))?;
+        if parsed_issuer.query().is_some()
+            || parsed_issuer.fragment().is_some()
+            || !parsed_issuer.username().is_empty()
+            || parsed_issuer.password().is_some()
+        {
+            return Err(AuthError::InvalidCredentials(
+                "OIDC issuer URL must not contain query, fragment, or userinfo".to_owned(),
+            ));
+        }
         crate::auth::ssrf::validate_outbound_url(
             &parsed_issuer,
             self.allow_http,
@@ -845,5 +861,55 @@ mod tests {
         // Updating an existing key to expired and saving a new key prunes s1 and admits s3.
         store.save(make("s1", now.saturating_sub(1))).await.unwrap();
         store.save(make("s3", now + 300)).await.unwrap();
+    }
+
+    #[test]
+    fn oidc_discovery_to_oauth2_config_rejects_ssrf_endpoints() {
+        let doc = OidcDiscovery {
+            issuer: "https://idp.example.com".to_owned(),
+            authorization_endpoint: "https://idp.example.com/authorize".to_owned(),
+            token_endpoint: "https://169.254.169.254/token".to_owned(),
+            jwks_uri: "https://idp.example.com/.well-known/jwks.json".to_owned(),
+            userinfo_endpoint: None,
+            end_session_endpoint: None,
+            response_types_supported: vec![],
+            code_challenge_methods_supported: vec![],
+        };
+
+        let err = doc
+            .to_oauth2_config(
+                "https://idp.example.com",
+                "client-1",
+                None,
+                "https://app.example.com/cb",
+                vec!["openid".to_owned()],
+            )
+            .expect_err("metadata IP token_endpoint must be rejected");
+        assert!(matches!(err, AuthError::InvalidCredentials(_)));
+    }
+
+    #[cfg(feature = "http-client")]
+    #[tokio::test]
+    async fn reqwest_oidc_discovery_rejects_query_fragment_userinfo_and_rfc6890_ssrf() {
+        let client = ReqwestOidcDiscoveryClient::new();
+        for invalid in [
+            "https://issuer.example.com?x=1",
+            "https://issuer.example.com#frag",
+            "https://user:pass@issuer.example.com",
+            "https://localhost./",
+            "https://[64:ff9b::a9fe:a9fe]",
+            "https://[::127.0.0.1]",
+            "https://0.1.2.3",
+            "https://198.18.0.1",
+        ] {
+            let err = client
+                .discover(invalid)
+                .await
+                .expect_err(&format!("expected rejection for {invalid}"));
+            assert!(
+                matches!(err, AuthError::InvalidCredentials(_)),
+                "unexpected error for {invalid}: {err:?}"
+            );
+        }
     }
 }

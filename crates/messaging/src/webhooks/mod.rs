@@ -5,8 +5,8 @@ pub mod signer;
 pub mod store;
 
 pub use dispatcher::{
-    ReqwestWebhookTransport, WebhookDeliveryJob, WebhookDeliveryJobHandler, WebhookDispatcher,
-    WebhookHttpResponse, WebhookTransport,
+    ReqwestWebhookTransport, ReqwestWebhookTransportBuilder, WebhookDeliveryJob,
+    WebhookDeliveryJobHandler, WebhookDispatcher, WebhookHttpResponse, WebhookTransport,
 };
 pub use signer::sign_webhook_payload;
 pub use store::{

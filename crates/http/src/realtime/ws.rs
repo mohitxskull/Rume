@@ -59,8 +59,9 @@ async fn handle_ws_socket(
     loop {
         let pong_deadline = awaiting_pong_since.map(|t| t + hb_timeout);
 
+        // Why: fair (unbiased) `select!` ensures continuous outbound broadcasts on `sub.recv()`
+        // cannot starve incoming `Pong` frames on `socket.recv()` and trigger false heartbeat timeouts.
         tokio::select! {
-            biased;
             recv = sub.recv() => match recv {
                 RealtimeRecv::Event(ev) => {
                     match serde_json::to_string(&ev) {

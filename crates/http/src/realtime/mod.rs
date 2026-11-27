@@ -159,6 +159,24 @@ mod tests {
                 _ => None,
             }
         }
+
+        async fn send_pong(&mut self, payload: &[u8]) {
+            // RFC 6455 client-to-server masked Pong frame (FIN=1, opcode=0xA).
+            let mask = [0x12, 0x34, 0x56, 0x78];
+            let mut frame = Vec::with_capacity(2 + 4 + payload.len());
+            frame.push(0x8A);
+            frame.push(0x80 | (payload.len() as u8));
+            frame.extend_from_slice(&mask);
+            for (i, b) in payload.iter().enumerate() {
+                frame.push(b ^ mask[i % 4]);
+            }
+            self.stream
+                .get_mut()
+                .write_all(&frame)
+                .await
+                .expect("write pong frame");
+            self.stream.get_mut().flush().await.expect("flush pong");
+        }
     }
 
     #[tokio::test]
@@ -499,5 +517,75 @@ mod tests {
             .expect("Session with tenant_id should authenticate");
         assert_eq!(auth_s.subject, "u2");
         assert_eq!(auth_s.tenant_id, "t2");
+    }
+
+    #[tokio::test]
+    async fn ws_high_rate_broadcast_does_not_starve_pong_heartbeat() {
+        let hub = RealtimeHub::new(
+            RealtimeConfig::default()
+                .with_channel_capacity(512)
+                .with_heartbeat_interval(Duration::from_millis(40))
+                .with_heartbeat_timeout(Duration::from_millis(120)),
+        );
+        let signer = RealtimeTicketSigner::new(TEST_SECRET).expect("signer");
+        let ticket = signer
+            .issue("user-fast", "tenant-fast", None, 60)
+            .expect("ticket");
+
+        let (addr, server) = spawn_test_server(build_test_router(hub.clone(), signer)).await;
+        let mut ws = TestWsClient::connect(addr, &format!("/ws/firehose?ticket={ticket}"))
+            .await
+            .expect("ws connect");
+
+        let pub_hub = hub.clone();
+        let publisher = tokio::spawn(async move {
+            let mut seq = 0u64;
+            loop {
+                seq += 1;
+                let _ = pub_hub
+                    .publish(
+                        "tenant-fast",
+                        "firehose",
+                        RealtimeEvent::new("tick", serde_json::json!({ "seq": seq })),
+                    )
+                    .await;
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        });
+
+        let mut pongs_sent = 0usize;
+        let mut texts_received = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+
+        while pongs_sent < 3 {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "timed out waiting for 3 heartbeat ping/pong cycles (pongs_sent={pongs_sent}, texts={texts_received})"
+            );
+            let frame = tokio::time::timeout(remaining, ws.read_frame())
+                .await
+                .expect("ws read timeout")
+                .expect("ws must not close during active ping/pong");
+            match frame {
+                WsFrame::Ping(payload) => {
+                    ws.send_pong(&payload).await;
+                    pongs_sent += 1;
+                }
+                WsFrame::Text(_) => {
+                    texts_received += 1;
+                }
+                WsFrame::Close => {
+                    panic!(
+                        "unexpected Close frame during high-rate broadcast with timely Pongs (pongs_sent={pongs_sent}, texts={texts_received})"
+                    );
+                }
+                WsFrame::Pong(_) => {}
+            }
+        }
+
+        assert!(texts_received > 0, "expected broadcast text frames");
+        publisher.abort();
+        server.abort();
     }
 }

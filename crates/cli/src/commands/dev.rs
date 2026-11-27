@@ -128,9 +128,12 @@ fn resolve_watch_paths(watch: Vec<PathBuf>) -> Vec<PathBuf> {
     }
 }
 
-/// Builds the argument list for `cargo build --message-format=json`.
+/// Builds the argument list for `cargo build --message-format=json-render-diagnostics`.
 pub fn build_cargo_build_args(bin: Option<&str>) -> Vec<String> {
-    let mut args = vec!["build".to_string(), "--message-format=json".to_string()];
+    let mut args = vec![
+        "build".to_string(),
+        "--message-format=json-render-diagnostics".to_string(),
+    ];
     if let Some(name) = bin {
         args.push("--bin".to_string());
         args.push(name.to_string());
@@ -138,7 +141,8 @@ pub fn build_cargo_build_args(bin: Option<&str>) -> Vec<String> {
     args
 }
 
-/// Parses `cargo build --message-format=json` stdout to locate the compiled binary executable.
+/// Parses `cargo build --message-format=json-render-diagnostics` stdout to locate the compiled
+/// binary executable.
 fn parse_cargo_executable_from_json(stdout: &str, bin: Option<&str>) -> Option<PathBuf> {
     let mut fallback: Option<PathBuf> = None;
     for line in stdout.lines() {
@@ -148,6 +152,14 @@ fn parse_cargo_executable_from_json(stdout: &str, bin: Option<&str>) -> Option<P
         if msg.get("reason").and_then(serde_json::Value::as_str) != Some("compiler-artifact") {
             continue;
         }
+        let is_bin = msg
+            .get("target")
+            .and_then(|t| t.get("kind"))
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|kinds| kinds.iter().any(|k| k.as_str() == Some("bin")));
+        if !is_bin {
+            continue;
+        }
         let Some(executable) = msg.get("executable").and_then(serde_json::Value::as_str) else {
             continue;
         };
@@ -155,12 +167,13 @@ fn parse_cargo_executable_from_json(stdout: &str, bin: Option<&str>) -> Option<P
             .get("target")
             .and_then(|t| t.get("name"))
             .and_then(serde_json::Value::as_str);
-        if let Some(wanted) = bin
-            && target_name == Some(wanted)
-        {
-            return Some(PathBuf::from(executable));
+        if let Some(wanted) = bin {
+            if target_name == Some(wanted) {
+                return Some(PathBuf::from(executable));
+            }
+        } else {
+            fallback = Some(PathBuf::from(executable));
         }
-        fallback = Some(PathBuf::from(executable));
     }
     fallback
 }
@@ -443,11 +456,35 @@ mod tests {
     }
 
     #[test]
+    fn build_cargo_build_args_uses_json_render_diagnostics() {
+        assert_eq!(
+            build_cargo_build_args(None),
+            vec![
+                "build".to_string(),
+                "--message-format=json-render-diagnostics".to_string()
+            ]
+        );
+        assert_eq!(
+            build_cargo_build_args(Some("api")),
+            vec![
+                "build".to_string(),
+                "--message-format=json-render-diagnostics".to_string(),
+                "--bin".to_string(),
+                "api".to_string()
+            ]
+        );
+    }
+
+    #[test]
     fn parse_cargo_executable_from_json_selects_matching_bin() {
         let stdout = concat!(
+            r#"{"reason":"compiler-artifact","target":{"name":"build-script-build","kind":["custom-build"]},"executable":"/tmp/target/debug/build/foo/build-script-build"}"#,
+            "\n",
             r#"{"reason":"compiler-artifact","target":{"name":"helper","kind":["bin"]},"executable":"/tmp/target/debug/helper"}"#,
             "\n",
             r#"{"reason":"compiler-artifact","target":{"name":"api","kind":["bin"]},"executable":"/tmp/target/debug/api"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","target":{"name":"post-build","kind":["custom-build"]},"executable":"/tmp/target/debug/build/bar/build-script-build"}"#,
             "\n"
         );
         assert_eq!(
@@ -457,6 +494,14 @@ mod tests {
         assert_eq!(
             parse_cargo_executable_from_json(stdout, None),
             Some(PathBuf::from("/tmp/target/debug/api"))
+        );
+        assert_eq!(
+            parse_cargo_executable_from_json(stdout, Some("missing")),
+            None
+        );
+        assert_eq!(
+            parse_cargo_executable_from_json(stdout, Some("build-script-build")),
+            None
         );
     }
 }

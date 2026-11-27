@@ -3,7 +3,7 @@
 //! Provides recursive `${VAR}` interpolation with circular-reference
 //! detection, escaping (`\${VAR}`), and a maximum recursion depth.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use crate::env::error::EnvError;
 
@@ -69,13 +69,33 @@ impl InterpolationBudget {
 /// - Exceeding maximum recursion depth returns [`EnvError::MaxDepthExceeded`].
 /// - Exceeding expansion count or output byte budgets returns [`EnvError::BudgetExceeded`].
 pub fn interpolate_value(value: &str, vars: &BTreeMap<String, String>) -> Result<String, EnvError> {
+    interpolate_value_with_literals(value, vars, &BTreeSet::new())
+}
+
+/// Interpolate `${VAR}` references in `value` using `vars`, treating any variable
+/// whose name appears in `literal_keys` (such as values originating from process env)
+/// as literal text without recursively expanding `${...}` sequences inside it.
+pub fn interpolate_value_with_literals(
+    value: &str,
+    vars: &BTreeMap<String, String>,
+    literal_keys: &BTreeSet<String>,
+) -> Result<String, EnvError> {
     let mut budget = InterpolationBudget::new();
-    interpolate_recursive(value, vars, &mut HashSet::new(), 0, None, &mut budget)
+    interpolate_recursive(
+        value,
+        vars,
+        literal_keys,
+        &mut HashSet::new(),
+        0,
+        None,
+        &mut budget,
+    )
 }
 
 fn interpolate_recursive(
     value: &str,
     vars: &BTreeMap<String, String>,
+    literal_keys: &BTreeSet<String>,
     visiting: &mut HashSet<String>,
     depth: usize,
     current_var: Option<&str>,
@@ -136,9 +156,24 @@ fn interpolate_recursive(
                 });
             }
             budget.consume_expansion(&var)?;
+            if literal_keys.contains(&var) {
+                // Why: keys sourced from process env (e.g. passwords containing literal `${...}`)
+                // must be substituted verbatim without recursive `${...}` expansion.
+                budget.consume_bytes(resolved.len(), Some(&var))?;
+                out.push_str(resolved);
+                i += end;
+                continue;
+            }
             visiting.insert(var.clone());
-            let expanded =
-                interpolate_recursive(resolved, vars, visiting, depth + 1, Some(&var), budget);
+            let expanded = interpolate_recursive(
+                resolved,
+                vars,
+                literal_keys,
+                visiting,
+                depth + 1,
+                Some(&var),
+                budget,
+            );
             visiting.remove(&var);
             out.push_str(&expanded?);
             i += end;

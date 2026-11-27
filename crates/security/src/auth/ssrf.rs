@@ -1,43 +1,15 @@
 //! Shared SSRF protection and hardened `reqwest::Client` construction for auth HTTP clients.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use url::{Host, Url};
+use rume_foundation::ssrf::{is_forbidden_ip, validate_host};
+use url::Url;
 
 use crate::auth::error::AuthError;
 
 pub(crate) const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-pub(crate) fn is_forbidden_ipv4(ip: Ipv4Addr) -> bool {
-    let octets = ip.octets();
-    let is_cgnat = octets[0] == 100 && (octets[1] & 0xc0) == 64;
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || is_cgnat
-}
-
-pub(crate) fn is_forbidden_ipv6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return is_forbidden_ipv4(v4);
-    }
-    let segments = ip.segments();
-    let is_ula = (segments[0] & 0xfe00) == 0xfc00;
-    let is_link_local = (segments[0] & 0xffc0) == 0xfe80;
-    ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || is_ula || is_link_local
-}
-
-pub(crate) fn is_forbidden_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => is_forbidden_ipv4(v4),
-        IpAddr::V6(v6) => is_forbidden_ipv6(v6),
-    }
-}
 
 pub(crate) fn validate_outbound_url(
     parsed: &Url,
@@ -56,34 +28,16 @@ pub(crate) fn validate_outbound_url(
         )));
     }
 
-    let Some(host) = parsed.host() else {
+    let Some(host) = parsed.host_str() else {
         return Err(AuthError::InvalidCredentials(format!(
             "{label} missing host"
         )));
     };
 
     if !allow_http {
-        match host {
-            Host::Ipv4(v4) if is_forbidden_ipv4(v4) => {
-                return Err(AuthError::InvalidCredentials(format!(
-                    "{label} blocked by SSRF protection: forbidden IP '{v4}'"
-                )));
-            }
-            Host::Ipv6(v6) if is_forbidden_ipv6(v6) => {
-                return Err(AuthError::InvalidCredentials(format!(
-                    "{label} blocked by SSRF protection: forbidden IP '{v6}'"
-                )));
-            }
-            Host::Domain(domain)
-                if domain.eq_ignore_ascii_case("localhost")
-                    || domain.to_ascii_lowercase().ends_with(".localhost") =>
-            {
-                return Err(AuthError::InvalidCredentials(format!(
-                    "{label} blocked by SSRF protection: forbidden host '{domain}'"
-                )));
-            }
-            _ => {}
-        }
+        validate_host(host).map_err(|reason| {
+            AuthError::InvalidCredentials(format!("{label} blocked by SSRF protection: {reason}"))
+        })?;
     }
 
     Ok(())

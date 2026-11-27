@@ -341,9 +341,18 @@ impl RealtimeHub {
             .await
             .map_err(|e| RealtimeError::PubSub(e.to_string()))?;
 
+        if self.is_shutting_down() {
+            return Err(RealtimeError::ShuttingDown);
+        }
+
         let node_id = self.inner.node_id.clone();
         let mut shutdown_rx = self.inner.shutdown_tx.subscribe();
         let handle = tokio::spawn(async move {
+            // Why: `watch::Sender::subscribe()` marks the current value as seen, so if shutdown
+            // was already signaled before `subscribe()`, `changed()` would never wake.
+            if *shutdown_rx.borrow() {
+                return;
+            }
             loop {
                 let msg = tokio::select! {
                     biased;
@@ -380,6 +389,13 @@ impl RealtimeHub {
         });
 
         let mut tasks = self.inner.pubsub_tasks.lock();
+        // Why: `initiate_shutdown` sets `shutdown_tx` to `true` before locking `pubsub_tasks`.
+        // Re-checking `is_shutting_down()` while holding `pubsub_tasks` closes the race window
+        // so a late pump handle can never be inserted as a zombie task after shutdown drains.
+        if self.is_shutting_down() {
+            handle.abort();
+            return Err(RealtimeError::ShuttingDown);
+        }
         if let std::collections::hash_map::Entry::Vacant(entry) = tasks.entry(key) {
             entry.insert(handle);
         } else {
@@ -568,5 +584,82 @@ mod tests {
                 "wait_drained took {elapsed:?}, expected prompt wakeup well below 10s timeout"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn gated_pubsub_subscribe_during_initiate_shutdown_leaves_pubsub_tasks_empty() {
+        use rume_messaging::pubsub::{PubSubError, PubSubMessage, PubSubSubscription};
+
+        #[derive(Debug)]
+        struct DummySubscription;
+
+        impl PubSubSubscription for DummySubscription {
+            fn recv(
+                &mut self,
+            ) -> rume_messaging::outbox::repository::BoxFuture<
+                '_,
+                Result<Option<PubSubMessage>, PubSubError>,
+            > {
+                Box::pin(async { std::future::pending().await })
+            }
+        }
+
+        #[derive(Debug)]
+        struct GatedPubSub {
+            entered: Arc<Notify>,
+            release: Arc<Notify>,
+        }
+
+        impl PubSub for GatedPubSub {
+            fn publish<'a>(
+                &'a self,
+                _topic: &'a str,
+                _payload: &'a [u8],
+            ) -> rume_messaging::outbox::repository::BoxFuture<'a, Result<(), PubSubError>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn subscribe<'a>(
+                &'a self,
+                _topic: &'a str,
+            ) -> rume_messaging::outbox::repository::BoxFuture<
+                'a,
+                Result<Box<dyn PubSubSubscription>, PubSubError>,
+            > {
+                let entered = Arc::clone(&self.entered);
+                let release = Arc::clone(&self.release);
+                Box::pin(async move {
+                    entered.notify_one();
+                    release.notified().await;
+                    Ok(Box::new(DummySubscription) as Box<dyn PubSubSubscription>)
+                })
+            }
+        }
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let pubsub = Arc::new(GatedPubSub {
+            entered: Arc::clone(&entered),
+            release: Arc::clone(&release),
+        });
+        let hub = RealtimeHub::new(RealtimeConfig::default()).with_pubsub(pubsub);
+
+        let hub_clone = hub.clone();
+        let sub_task = tokio::spawn(async move { hub_clone.subscribe("acme", "room-1").await });
+
+        entered.notified().await;
+        hub.initiate_shutdown();
+        release.notify_one();
+
+        let res = sub_task.await.expect("subscribe task must not panic");
+        assert!(
+            matches!(res, Err(RealtimeError::ShuttingDown)),
+            "expected ShuttingDown when shutdown races with pubsub.subscribe, got {res:?}"
+        );
+        assert!(
+            hub.inner.pubsub_tasks.lock().is_empty(),
+            "pubsub_tasks must remain empty after shutdown race"
+        );
     }
 }
