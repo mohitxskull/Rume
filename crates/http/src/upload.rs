@@ -1551,5 +1551,14 @@ mod tests {
             utf16be_html.extend_from_slice(&unit.to_be_bytes());
         }
         assert_eq!(sniff_mime_type(&utf16be_html), Some("text/html"));
+
+        // 4. `P3-05`: multi-byte leading UTF-8 stem fallback never exceeds MAX_FILENAME_BYTES.
+        let multibyte_overlong = format!("é.{}", "a".repeat(253));
+        let sanitized_mb = sanitize_filename(&multibyte_overlong);
+        assert!(
+            sanitized_mb.len() <= MAX_FILENAME_BYTES,
+            "sanitized filename exceeded 255 bytes: len={}",
+            sanitized_mb.len()
+        );
     }
 }

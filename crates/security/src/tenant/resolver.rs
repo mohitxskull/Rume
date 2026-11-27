@@ -496,9 +496,13 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
                     || lower.contains("duplicate key")
                     || lower.contains("23505")
                 {
-                    TenantError::Conflict(format!(
-                        "tenant slug '{slug}' already belongs to another tenant"
-                    ))
+                    if lower.contains("uq_rume_tenants_slug") || lower.contains("slug") {
+                        TenantError::Conflict(format!(
+                            "tenant slug '{slug}' already belongs to another tenant"
+                        ))
+                    } else {
+                        TenantError::Conflict(format!("tenant id or slug '{slug}' already exists"))
+                    }
                 } else {
                     TenantError::Internal(msg)
                 }

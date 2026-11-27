@@ -224,8 +224,7 @@ impl MetricsRegistry {
             use opentelemetry_otlp::{Protocol, WithExportConfig};
             let mut builder = builder;
             let mut attached = false;
-            if !crate::otel::is_global_otel_initialized()
-                && let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+            if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
                 && !endpoint.trim().is_empty()
                 && let Ok(otlp_exporter) = opentelemetry_otlp::MetricExporter::builder()
                     .with_http()

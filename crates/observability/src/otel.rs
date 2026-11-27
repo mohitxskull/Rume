@@ -323,12 +323,6 @@ pub(crate) fn normalize_otlp_http_endpoint(base: &str, signal_path: &str) -> Str
 static GLOBAL_OBSERVABILITY_GUARD: std::sync::OnceLock<ObservabilityGuard> =
     std::sync::OnceLock::new();
 
-/// Returns `true` when [`try_init_tracing`] has installed the global observability providers.
-#[cfg(feature = "otel")]
-pub(crate) fn is_global_otel_initialized() -> bool {
-    GLOBAL_OBSERVABILITY_GUARD.get().is_some()
-}
-
 /// Flushes and shuts down the global observability providers installed by [`try_init_tracing`].
 ///
 /// Safe to call multiple times or when [`try_init_tracing`] was never called.

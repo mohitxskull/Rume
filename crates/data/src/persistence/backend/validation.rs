@@ -237,11 +237,23 @@ fn collect_top_level_statement_heads_from_tokens(
 ) -> Result<Vec<Vec<String>>, PersistenceError> {
     use sqlparser::tokenizer::Token;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DefinerState {
+        None,
+        ExpectEq,
+        ExpectUser,
+        AfterUser,
+        ExpectHost,
+        AfterCurrentUser,
+        InCurrentUserParens,
+    }
+
     let mut heads: Vec<Vec<String>> = Vec::new();
     let mut leading_words: Vec<String> = Vec::with_capacity(3);
     let mut in_compound_create_decl = false;
     let mut seen_non_compound_create_target = false;
     let mut seen_lparen = false;
+    let mut definer_state = DefinerState::None;
     let mut block_depth: usize = 0;
 
     let mut i = 0;
@@ -255,12 +267,42 @@ fn collect_top_level_statement_heads_from_tokens(
                     in_compound_create_decl = false;
                     seen_non_compound_create_target = false;
                     seen_lparen = false;
+                    definer_state = DefinerState::None;
                 }
+            }
+            Token::Eq if block_depth == 0 && definer_state == DefinerState::ExpectEq => {
+                definer_state = DefinerState::ExpectUser;
+            }
+            Token::AtSign if block_depth == 0 && definer_state == DefinerState::AfterUser => {
+                definer_state = DefinerState::ExpectHost;
+            }
+            Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+                if block_depth == 0
+                    && matches!(
+                        definer_state,
+                        DefinerState::ExpectUser | DefinerState::ExpectHost
+                    ) =>
+            {
+                definer_state = if definer_state == DefinerState::ExpectUser {
+                    DefinerState::AfterUser
+                } else {
+                    DefinerState::None
+                };
             }
             Token::LParen => {
                 if block_depth == 0 {
-                    seen_lparen = true;
+                    if definer_state == DefinerState::AfterCurrentUser {
+                        definer_state = DefinerState::InCurrentUserParens;
+                    } else {
+                        definer_state = DefinerState::None;
+                        seen_lparen = true;
+                    }
                 }
+            }
+            Token::RParen
+                if block_depth == 0 && definer_state == DefinerState::InCurrentUserParens =>
+            {
+                definer_state = DefinerState::None;
             }
             Token::Word(word) if word.quote_style.is_none() => {
                 let upper = word.value.to_ascii_uppercase();
@@ -268,13 +310,38 @@ fn collect_top_level_statement_heads_from_tokens(
                     if leading_words.len() < 3 {
                         leading_words.push(upper.clone());
                     }
+                    // Why: handle MySQL `CREATE DEFINER = root@localhost TRIGGER` and
+                    // `CREATE DEFINER = CURRENT_USER() TRIGGER` without confusing the
+                    // definer user/host/parens for a non-compound DDL target or table
+                    // column list (`P3-04`).
+                    let consumed_by_definer = match definer_state {
+                        DefinerState::ExpectUser => {
+                            definer_state = if upper == "CURRENT_USER" {
+                                DefinerState::AfterCurrentUser
+                            } else {
+                                DefinerState::AfterUser
+                            };
+                            true
+                        }
+                        DefinerState::ExpectHost => {
+                            definer_state = DefinerState::None;
+                            true
+                        }
+                        DefinerState::AfterUser | DefinerState::AfterCurrentUser => {
+                            definer_state = DefinerState::None;
+                            false
+                        }
+                        _ => false,
+                    };
+
                     // Why: only enter a compound SQL block (`BEGIN ... END`) when the
                     // enclosing `CREATE` statement declares a compound object (`TRIGGER`,
                     // `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(` and with
                     // only valid pre-target `CREATE` modifiers in between (allowlist, not
                     // denylist), so `CREATE DATABASE trigger BEGIN ...` or `CREATE TABLE
                     // trigger (...) BEGIN ...` cannot enable compound blocks (`RC-13`, `P3-04`).
-                    if !seen_lparen
+                    if !consumed_by_definer
+                        && !seen_lparen
                         && !in_compound_create_decl
                         && !seen_non_compound_create_target
                         && leading_words.len() > 1
@@ -285,14 +352,11 @@ fn collect_top_level_statement_heads_from_tokens(
                             "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
                         ) {
                             in_compound_create_decl = true;
+                        } else if upper == "DEFINER" {
+                            definer_state = DefinerState::ExpectEq;
                         } else if !matches!(
                             upper.as_str(),
-                            "OR" | "REPLACE"
-                                | "TEMP"
-                                | "TEMPORARY"
-                                | "CONSTRAINT"
-                                | "DEFINER"
-                                | "CURRENT_USER"
+                            "OR" | "REPLACE" | "TEMP" | "TEMPORARY" | "CONSTRAINT"
                         ) {
                             seen_non_compound_create_target = true;
                         }
@@ -1155,17 +1219,34 @@ mod data_sql_scanners_proptests {
             "column name `event` inside CREATE TABLE (...) must not enable compound BEGIN block"
         );
 
-        // `P2-20`: a table/view/index named `trigger` (or `function`/`procedure`/`event`)
-        // before `(` must NOT enable compound BEGIN blocks either.
+        // `P2-20` & `P3-04`: non-compound CREATE targets (including unlisted DDL targets like
+        // `DATABASE` / `ROLE`) must NOT enable compound BEGIN blocks, while valid MySQL
+        // `CREATE DEFINER = ... TRIGGER` declarations remain allowed.
         for bypass in [
             "CREATE TABLE trigger (id INT) BEGIN SELECT 1; COMMIT; END;",
             "CREATE VIEW event AS SELECT 1 BEGIN SELECT 1; ROLLBACK; END;",
+            "CREATE DATABASE trigger BEGIN SELECT 1; COMMIT; END;",
+            "CREATE ROLE event BEGIN SELECT 1; COMMIT; END;",
         ] {
             let res =
                 validate_managed_transaction_sql(bypass, &sqlparser::dialect::SQLiteDialect {});
             assert!(
                 matches!(res, Err(PersistenceError::TransactionError(_))),
                 "non-compound CREATE target must not enable compound BEGIN block: {bypass}"
+            );
+        }
+
+        for valid_definer_trigger in [
+            "CREATE DEFINER = root@localhost TRIGGER t_ins AFTER INSERT ON items FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END;",
+            "CREATE DEFINER = CURRENT_USER() TRIGGER t_ins AFTER INSERT ON items FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END;",
+        ] {
+            assert!(
+                validate_managed_transaction_sql(
+                    valid_definer_trigger,
+                    &sqlparser::dialect::MySqlDialect {}
+                )
+                .is_ok(),
+                "valid MySQL DEFINER trigger must be allowed: {valid_definer_trigger}"
             );
         }
     }

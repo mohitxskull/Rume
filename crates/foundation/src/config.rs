@@ -438,5 +438,13 @@ mod tests {
             !msg.contains("secret_tail") && !msg.contains("part1"),
             "secret leaked in ConfigError: {msg}"
         );
+
+        // `P3-01`: `load_with_provenance` must also redact secrets via `ConfigError::from`.
+        let prov_err = load_with_provenance::<BadCfg>(dir).unwrap_err();
+        let prov_msg = prov_err.to_string();
+        assert!(
+            !prov_msg.contains("secret_tail") && !prov_msg.contains("part1"),
+            "secret leaked in load_with_provenance error: {prov_msg}"
+        );
     }
 }
