@@ -11,11 +11,12 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use parking_lot::RwLock;
 use secrecy::SecretString;
 use thiserror::Error;
+use tokio::time::Instant;
 
 /// Pinned boxed future returned by async [`SecretProvider`] operations.
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -486,7 +487,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cached_secret_provider_respects_ttl_and_invokes_rotation_callback() {
         let inner = Arc::new(RotatingMockProvider::new());
         let rotated_keys = Arc::new(RwLock::new(Vec::<String>::new()));
@@ -518,8 +519,8 @@ mod tests {
         assert_eq!(s3.expose_secret(), "db_pass-v1-supersecret");
         assert_eq!(inner.fetches.load(Ordering::SeqCst), 2);
 
-        // Waiting past TTL expires cache and forces reload.
-        tokio::time::sleep(Duration::from_millis(55)).await;
+        // Advancing paused Tokio clock past TTL expires cache deterministically.
+        tokio::time::advance(Duration::from_millis(55)).await;
         let s4 = provider.get_secret("db_pass").await.unwrap();
         assert_eq!(s4.expose_secret(), "db_pass-v1-supersecret");
         assert_eq!(inner.fetches.load(Ordering::SeqCst), 3);

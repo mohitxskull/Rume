@@ -226,22 +226,9 @@ impl LeaderElector for RedisLeaderElector {
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(s) = val
-                && let Some((len_str, rest)) = s.split_once(':')
-                && let Ok(len) = len_str.parse::<usize>()
-                && rest.len() > len
-                && &rest[len..=len] == ":"
-                && let Ok(term) = rest[len + 1..].parse::<u64>()
-            {
-                let candidate = &rest[..len];
-                Ok(Some(LeaderLease {
-                    role: r,
-                    candidate_id: candidate.to_string(),
-                    term,
-                    expires_at: None,
-                }))
-            } else {
-                Ok(None)
+            match val {
+                Some(s) => Ok(Some(parse_leader_value(&s, r)?)),
+                None => Ok(None),
             }
         })
     }
@@ -282,6 +269,34 @@ impl LeaderElector for RedisLeaderElector {
             Ok(result == 1)
         })
     }
+}
+
+fn parse_leader_value(s: &str, role: String) -> Result<LeaderLease, CoordinationError> {
+    let Some((len_str, rest)) = s.split_once(':') else {
+        return Err(CoordinationError::Backend(format!(
+            "malformed leader payload for role '{role}'"
+        )));
+    };
+    let len = len_str.parse::<usize>().map_err(|_| {
+        CoordinationError::Backend(format!("invalid leader payload length for role '{role}'"))
+    })?;
+    // Why: `len` is a byte length from Lua's `string.len`; check both the `:` separator
+    // byte AND `rest.is_char_boundary(len)` before slicing `&rest[..len]` so corrupted
+    // non-ASCII UTF-8 payloads (e.g. `"1:é:1"`) return an error instead of panicking (`RC-23`).
+    if rest.as_bytes().get(len) != Some(&b':') || !rest.is_char_boundary(len) {
+        return Err(CoordinationError::Backend(format!(
+            "malformed leader payload boundary for role '{role}'"
+        )));
+    }
+    let term = rest[len + 1..].parse::<u64>().map_err(|_| {
+        CoordinationError::Backend(format!("invalid leader term for role '{role}'"))
+    })?;
+    Ok(LeaderLease {
+        role,
+        candidate_id: rest[..len].to_string(),
+        term,
+        expires_at: None,
+    })
 }
 
 #[cfg(test)]
@@ -339,5 +354,17 @@ mod tests {
             tag_l, tag_t,
             "empty role leader and term keys must share the same non-empty hash tag"
         );
+    }
+
+    #[test]
+    fn parse_leader_value_rejects_non_char_boundary_utf8_without_panicking() {
+        // `"é"` is 2 UTF-8 bytes; byte index 1 is mid-character and previously panicked.
+        assert!(parse_leader_value("1:é:1", "scheduler".to_string()).is_err());
+
+        // Valid multi-byte UTF-8 candidate with accurate byte length parses cleanly.
+        let lease =
+            parse_leader_value("2:é:7", "scheduler".to_string()).expect("valid utf8 leader");
+        assert_eq!(lease.candidate_id, "é");
+        assert_eq!(lease.term, 7);
     }
 }

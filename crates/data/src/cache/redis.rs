@@ -73,16 +73,24 @@ impl RedisCacheBackend {
         format!("{}tag:{}", self.prefix, tag)
     }
 
+    fn tag_persist_key(&self, tag: &str) -> String {
+        // Why: place persist markers in a disjoint `tag_persist:` subspace rather than
+        // `tag:<t>:persist` so a user tag literally named `"foo:persist"` can never
+        // collide with the persist marker for tag `"foo"` and trigger `WRONGTYPE` (`RC-23`).
+        format!("{}tag_persist:{}", self.prefix, tag)
+    }
+
     fn clear_pattern(&self) -> String {
         format!("{}*", escape_redis_glob(&self.prefix))
     }
 
-    fn clear_prefix_patterns(&self, prefix: &str) -> [String; 2] {
+    fn clear_prefix_patterns(&self, prefix: &str) -> [String; 3] {
         let escaped_base = escape_redis_glob(&self.prefix);
         let escaped_ns = escape_redis_glob(prefix);
         [
             format!("{escaped_base}val:{escaped_ns}*"),
             format!("{escaped_base}tag:{escaped_ns}*"),
+            format!("{escaped_base}tag_persist:{escaped_ns}*"),
         ]
     }
 
@@ -216,7 +224,10 @@ impl CacheBackend for RedisCacheBackend {
         ttl: Option<Duration>,
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let k = self.prefixed_key(key);
-        let tag_keys: Vec<String> = tags.iter().map(|t| self.tag_set_key(t)).collect();
+        let tag_key_pairs: Vec<(String, String)> = tags
+            .iter()
+            .map(|t| (self.tag_set_key(t), self.tag_persist_key(t)))
+            .collect();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -224,7 +235,7 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            if tag_keys.is_empty() {
+            if tag_key_pairs.is_empty() {
                 let mut cmd = redis::cmd("SET");
                 cmd.arg(&k).arg(&value);
                 if let Some(ttl) = ttl {
@@ -292,8 +303,7 @@ impl CacheBackend for RedisCacheBackend {
             let script = redis::Script::new(SET_WITH_TAGS_SCRIPT);
             let mut invocation = script.prepare_invoke();
             invocation.key(&k);
-            for tk in &tag_keys {
-                let persist_key = format!("{tk}:persist");
+            for (tk, persist_key) in &tag_key_pairs {
                 invocation.key(tk).key(persist_key);
             }
             invocation
@@ -348,7 +358,7 @@ impl CacheBackend for RedisCacheBackend {
 
     fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tk = self.tag_set_key(tag);
-        let persist_key = format!("{tk}:persist");
+        let persist_key = self.tag_persist_key(tag);
         let val_prefix = format!("{}val:", self.prefix);
         Box::pin(async move {
             let mut conn = self
@@ -465,6 +475,12 @@ mod tests {
             "rume:cache:val:tag:users"
         );
         assert_eq!(backend.tag_set_key("users"), "rume:cache:tag:users");
+        assert_ne!(
+            backend.tag_persist_key("foo"),
+            backend.tag_set_key("foo:persist"),
+            "tag persist key for `foo` must never collide with tag set key `foo:persist`"
+        );
+        assert_eq!(backend.tag_persist_key("foo"), "rume:cache:tag_persist:foo");
     }
 
     #[test]
@@ -480,6 +496,7 @@ mod tests {
             [
                 r"app\[1\]\*:val:t\?a\[0\]\\b:*".to_string(),
                 r"app\[1\]\*:tag:t\?a\[0\]\\b:*".to_string(),
+                r"app\[1\]\*:tag_persist:t\?a\[0\]\\b:*".to_string(),
             ]
         );
     }

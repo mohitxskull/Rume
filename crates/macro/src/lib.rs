@@ -68,42 +68,25 @@ fn walk_sql_files(
     span: proc_macro2::Span,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), syn::Error> {
-    let entries = fs::read_dir(dir).map_err(|e| {
-        syn::Error::new(
-            span,
-            format!("sql_assets!: failed to read directory {dir:?}: {e}"),
-        )
-    })?;
-    let mut sorted_entries = Vec::new();
-    for entry in entries {
+    // Why: `walkdir::WalkDir` with `follow_links(false)` prevents symlink cycles from
+    // causing infinite recursion / stack overflow at compile time and guarantees
+    // deterministic ordering via `sort_by_file_name()`.
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
         let entry = entry.map_err(|e| {
             syn::Error::new(
                 span,
-                format!("sql_assets!: failed to read directory entry in {dir:?}: {e}"),
+                format!("sql_assets!: failed to walk directory {dir:?}: {e}"),
             )
         })?;
-        sorted_entries.push(entry);
-    }
-    sorted_entries.sort_by_key(|e| e.path());
-    for entry in sorted_entries {
-        let path = entry.path();
-        let meta = fs::symlink_metadata(&path).map_err(|e| {
-            syn::Error::new(
-                span,
-                format!("sql_assets!: failed to read metadata for {path:?}: {e}"),
-            )
-        })?;
-        let file_type = meta.file_type();
-        // Why: never follow symlinks during recursive directory discovery; a
-        // directory symlink (e.g. `sql/loop -> ..`) would otherwise cause
-        // infinite recursion / stack overflow at compile time.
+        let file_type = entry.file_type();
         if file_type.is_symlink() {
             continue;
         }
-        if file_type.is_dir() {
-            walk_sql_files(&path, span, out)?;
-        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "sql") {
-            out.push(path);
+        if file_type.is_file() && entry.path().extension().is_some_and(|ext| ext == "sql") {
+            out.push(entry.into_path());
         }
     }
     Ok(())

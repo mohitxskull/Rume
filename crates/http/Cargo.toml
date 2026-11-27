@@ -31,6 +31,7 @@ hex.workspace = true
 hmac.workspace = true
 subtle.workspace = true
 secrecy.workspace = true
+infer.workspace = true
 deadpool-redis = { workspace = true, optional = true }
 redis = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }

@@ -5,7 +5,6 @@
 //! WSL, containers, and network filesystems with zero extra dependencies.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant, SystemTime};
@@ -269,24 +268,20 @@ pub fn snapshot_tree(roots: &[PathBuf]) -> BTreeMap<PathBuf, (u64, SystemTime)> 
 }
 
 fn collect_snapshot(path: &Path, out: &mut BTreeMap<PathBuf, (u64, SystemTime)>) {
-    if should_ignore_path(path) {
-        return;
-    }
-
-    // Why: use `symlink_metadata` instead of `metadata` so symlinks are not followed and
-    // directory symlink cycles cannot cause unbounded recursion / stack overflow.
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return;
-    };
-
-    if meta.is_file() {
-        let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-        out.insert(path.to_path_buf(), (meta.len(), modified));
-    } else if meta.is_dir()
-        && let Ok(entries) = fs::read_dir(path)
+    // Why: `walkdir::WalkDir` with `follow_links(false)` prevents directory symlink
+    // cycles from causing unbounded recursion while `filter_entry` prunes ignored
+    // directories (e.g. `target/`, `.git/`) before descending into them.
+    for entry in walkdir::WalkDir::new(path)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| !should_ignore_path(e.path()))
+        .flatten()
     {
-        for entry in entries.flatten() {
-            collect_snapshot(&entry.path(), out);
+        if entry.file_type().is_file()
+            && let Ok(meta) = entry.metadata()
+        {
+            let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            out.insert(entry.into_path(), (meta.len(), modified));
         }
     }
 }

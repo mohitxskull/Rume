@@ -28,6 +28,7 @@ reqwest = { workspace = true, optional = true }
 hex = { workspace = true, optional = true }
 url = { workspace = true, optional = true }
 chrono = { workspace = true, optional = true }
+quick-xml = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
@@ -41,6 +42,6 @@ sqlite = ["dep:sqlx", "sqlx/sqlite", "dep:sqlparser"]
 postgres = ["dep:sqlx", "sqlx/postgres", "dep:sqlparser"]
 mysql = ["dep:sqlx", "sqlx/mysql", "dep:sqlparser"]
 redis = ["dep:deadpool-redis", "dep:redis"]
-s3 = ["dep:reqwest", "dep:hex", "dep:url", "dep:chrono"]
+s3 = ["dep:reqwest", "dep:hex", "dep:url", "dep:chrono", "dep:quick-xml"]
 # Exposes internal SQL validation entry points for `fuzz/` targets only.
 fuzzing = ["sqlite", "postgres", "mysql"]

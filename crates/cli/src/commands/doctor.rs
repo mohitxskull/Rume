@@ -409,24 +409,19 @@ fn check_module_dag_in(src_dir: &Path) -> (String, bool) {
     }
 
     let mut files = Vec::new();
-    fn visit_dirs(dir: &Path, files: &mut Vec<PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let Ok(ft) = entry.file_type() else {
-                    continue;
-                };
-                let path = entry.path();
-                // Why: `entry.file_type()` does not follow symlinks, preventing
-                // infinite recursion / stack overflow on symlink cycles (`RC-20`).
-                if ft.is_dir() {
-                    visit_dirs(&path, files);
-                } else if ft.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    files.push(path);
-                }
-            }
+    // Why: `walkdir::WalkDir` with `follow_links(false)` avoids symlink cycles cleanly
+    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`).
+    for entry in walkdir::WalkDir::new(src_dir)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
+        {
+            files.push(entry.into_path());
         }
     }
-    visit_dirs(src_dir, &mut files);
     files.sort();
 
     let mut deps_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -636,9 +631,18 @@ impl<'ast> Visit<'ast> for ModuleExtractor {
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         // syn's default visitor does not descend into macro bodies, so a
         // `dependencies()` body like `vec!["catalog", "inventory"]` would
-        // otherwise yield no string literals. Re-parse the macro token stream
-        // to collect them (RC-20).
+        // otherwise yield no string literals. Re-parse only `vec!` / `smallvec!`
+        // macro token streams so logging or formatting macros (e.g. `tracing::debug!`,
+        // `format!`) inside `dependencies()` never create false DAG edges (`RC-22`).
         if self.current_fn.as_deref() != Some("dependencies") {
+            return;
+        }
+        let is_vec_macro = node
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "vec" || seg.ident == "smallvec");
+        if !is_vec_macro {
             return;
         }
         let Some(decl) = self.current_decl.as_mut() else {
@@ -923,5 +927,26 @@ impl Module for ModA {
         let (msg, ok) = check_module_dag_in(dir.path());
         assert!(ok, "symlink cycle must not fail or hang DAG check: {msg}");
         assert!(msg.contains("1 module(s) verified acyclic"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_module_info_ignores_logging_and_format_macros_in_dependencies() {
+        let content = r#"
+impl Module for OrdersModule {
+    fn name(&self) -> &str {
+        "orders"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        tracing::debug!("orders");
+        let _msg = format!("billing");
+        vec!["catalog"]
+    }
+}
+"#;
+        let decls = extract_module_info(content).unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("orders"));
+        assert_eq!(decls[0].dependencies, vec!["catalog".to_string()]);
     }
 }

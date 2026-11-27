@@ -579,38 +579,35 @@ mod tests {
     #[test]
     fn get_exposes_secret_via_expose_secret() {
         // S-M2: get() exposes secret plaintext at consumption point.
-        let dir = std::env::temp_dir().join("rume_secret_get_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let env_file = dir.join(".env");
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
         std::fs::write(&env_file, "APP_KEY=super-secret-value\n").unwrap();
 
-        let resolved = load_merged_map_in(&dir).unwrap();
+        let resolved = load_merged_map_in(dir.path()).unwrap();
 
         assert_eq!(resolved.get("APP_KEY").unwrap(), "super-secret-value");
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
     fn file_value_traversal_is_rejected() {
-        let dir = std::env::temp_dir();
-        assert!(resolve_value("file:../../etc/secrets/app.key".to_string(), &dir).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_value("file:../../etc/secrets/app.key".to_string(), dir.path()).is_err());
     }
 
     #[test]
     fn file_value_absolute_path_is_rejected() {
-        assert!(resolve_value("file:/etc/passwd".to_string(), &std::env::temp_dir()).is_err());
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_value("file:/etc/passwd".to_string(), dir.path()).is_err());
     }
 
     #[test]
     fn file_value_normal_path_works() {
-        let dir = std::env::temp_dir();
-        let file_path = dir.join("rume_env_test_file.txt");
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("rume_env_test_file.txt");
         std::fs::write(&file_path, "test content").unwrap();
-        let result = resolve_value(format!("file:{}", file_path.display()), &dir);
+        let result = resolve_value("file:rume_env_test_file.txt".to_string(), dir.path());
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), "test content");
-        std::fs::remove_file(&file_path).ok();
     }
 
     #[test]
@@ -711,19 +708,16 @@ mod tests {
         // A secret key written to a .env file must be routed to the secrets
         // map (SecretBox), not the plain values map, avoiding plaintext
         // exposure.
-        let dir = std::env::temp_dir().join("rume_secret_route_test");
-        std::fs::create_dir_all(&dir).unwrap();
-        let env_file = dir.join(".env");
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
         std::fs::write(&env_file, "APP_KEY=super-secret-value\nHOST=localhost\n").unwrap();
 
-        let resolved = load_merged_map_in(&dir).unwrap();
+        let resolved = load_merged_map_in(dir.path()).unwrap();
 
         assert!(!resolved.values.contains_key("APP_KEY"));
         assert!(resolved.secrets.contains_key("APP_KEY"));
         assert_eq!(resolved.values.get("HOST"), Some(&"localhost".to_string()));
         assert!(!resolved.secrets.contains_key("HOST"));
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

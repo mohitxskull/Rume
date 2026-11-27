@@ -27,6 +27,7 @@ proc-macro2.workspace = true
 chrono = { workspace = true, features = ["clock"] }
 redis.workspace = true
 syn.workspace = true
+walkdir.workspace = true
 
 [dev-dependencies]
 cargo_metadata = "=0.23.1"

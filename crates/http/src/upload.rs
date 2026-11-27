@@ -209,39 +209,24 @@ pub async fn extract_multipart_files(
     Ok(files)
 }
 
-/// Sniffs the MIME type of `bytes` from common binary magic headers and leading
-/// HTML/SVG/XML script signatures.
+/// Sniffs the MIME type of `bytes` using `infer` for binary magic signatures (100+ formats)
+/// with a text-based HTML/SVG/XML script detection fallback.
 ///
 /// Returns `None` for unrecognized or plain-text payloads without a distinctive
 /// signature.
 pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
-    // Binary magic-byte signatures.
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some("image/png");
-    }
-    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
-        return Some("image/jpeg");
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-    if bytes.starts_with(b"%PDF-") {
-        return Some("application/pdf");
-    }
-    if bytes.starts_with(&[0x1F, 0x8B]) {
-        return Some("application/gzip");
-    }
-    if bytes.starts_with(b"PK\x03\x04")
-        || bytes.starts_with(b"PK\x05\x06")
-        || bytes.starts_with(b"PK\x07\x08")
-    {
-        return Some("application/zip");
+    // 1. Binary magic-byte signatures via `infer` (covers PNG, JPEG, GIF, WebP, PDF, ZIP, GZIP,
+    //    and 100+ additional binary formats).
+    if let Some(kind) = infer::get(bytes) {
+        let mime = kind.mime_type();
+        // If `infer` detects generic XML (`text/xml`), still refine to `image/svg+xml`
+        // when an `<svg` root/element is present.
+        if mime != "text/xml" {
+            return Some(mime);
+        }
     }
 
-    // Text / markup / script signatures (strip optional UTF-8 BOM and leading ASCII whitespace).
+    // 2. Text / markup / script signatures (strip optional UTF-8 BOM and leading ASCII whitespace).
     let trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     let prefix_len = trimmed.len().min(512);
     let prefix = std::str::from_utf8(&trimmed[..prefix_len])

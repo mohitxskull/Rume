@@ -1329,6 +1329,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "cfb"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a347dcabdae9c31b0825fd6a8bed285ec9c2acb89c47827126d52fa4f59cece3"
+dependencies = [
+ "fnv",
+ "uuid",
+ "web-time",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3445,6 +3456,15 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "infer"
+version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f4200d433cbd5178df7797c9c2e75b348b728e39631cf14520d1e2fc424201f4"
+dependencies = [
+ "cfb",
 ]
 
 [[package]]
@@ -5656,6 +5676,7 @@ dependencies = [
  "tokio",
  "toml 1.2.3+spec-1.1.0",
  "unicode-width",
+ "walkdir",
 ]
 
 [[package]]
@@ -5678,6 +5699,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "proptest",
+ "quick-xml",
  "redis",
  "reqwest",
  "rume-foundation",
@@ -5790,6 +5812,7 @@ dependencies = [
  "hickory-resolver",
  "hmac 0.13.0",
  "hyper-util",
+ "infer",
  "parking_lot 0.13.0",
  "rand 0.10.4",
  "redis",
@@ -5831,6 +5854,7 @@ dependencies = [
  "serde_json",
  "syn 3.0.10",
  "trybuild",
+ "walkdir",
 ]
 
 [[package]]
@@ -7967,9 +7991,9 @@ dependencies = [
 
 [[package]]
 name = "walkdir"
-version = "2.5.0"
+version = "2.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
+checksum = "b42e295b7452c4604982280d8586001fcad9b8b201cac67bca9771e7a7475403"
 dependencies = [
  "same-file",
  "winapi-util",

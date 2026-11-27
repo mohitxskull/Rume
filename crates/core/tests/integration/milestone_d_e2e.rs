@@ -300,7 +300,7 @@ async fn milestone_d_job_queue_priority_batch_and_cron_e2e() {
         .expect("register leader cron");
 
     let mut follower_sched = CronScheduler::new(
-        elector as Arc<dyn LeaderElector>,
+        Arc::clone(&elector) as Arc<dyn LeaderElector>,
         "e2e-cron",
         "node-2",
         Duration::from_secs(5),
@@ -320,8 +320,20 @@ async fn milestone_d_job_queue_priority_batch_and_cron_e2e() {
         .expect("register follower cron");
 
     let h1 = leader_sched.start();
-    // Give node-1 a brief moment to win leadership before node-2 starts.
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    // Wait deterministically until node-1 has acquired the leader lease before starting node-2.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Ok(Some(lease)) = elector.get_leader("e2e-cron").await
+                && lease.candidate_id == "node-1"
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("node-1 must win leadership before node-2 starts");
     let h2 = follower_sched.start();
 
     tokio::time::timeout(Duration::from_secs(3), notify.notified())

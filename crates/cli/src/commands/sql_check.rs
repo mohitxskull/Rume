@@ -260,19 +260,17 @@ fn collect_target_sql_files(target: &Path) -> Result<Vec<PathBuf>, String> {
 }
 
 fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let Ok(ft) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            // Why: `entry.file_type()` does not follow symlinks, preventing
-            // infinite recursion / stack overflow on symlink cycles (`RC-20`).
-            if ft.is_dir() {
-                collect_sql_files(&path, files);
-            } else if ft.is_file() && path.extension().and_then(|s| s.to_str()) == Some("sql") {
-                files.push(path);
-            }
+    // Why: `walkdir::WalkDir` with `follow_links(false)` avoids symlink cycles cleanly
+    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`).
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("sql")
+        {
+            files.push(entry.into_path());
         }
     }
 }

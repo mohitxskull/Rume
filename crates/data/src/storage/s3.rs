@@ -552,11 +552,107 @@ struct ListObjectsV2Page {
 }
 
 fn parse_list_objects_v2_page(xml: &str) -> ListObjectsV2Page {
-    let items = parse_list_objects_v2_xml(xml);
-    let is_truncated = extract_xml_tag(xml, "IsTruncated")
-        .as_deref()
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    let next_continuation_token = extract_xml_tag(xml, "NextContinuationToken");
+    use quick_xml::Reader;
+    use quick_xml::events::Event;
+
+    let mut reader = Reader::from_str(xml);
+    let mut items = Vec::new();
+    let mut is_truncated = false;
+    let mut next_continuation_token: Option<String> = None;
+
+    let mut in_contents = false;
+    let mut current_tag: Option<String> = None;
+    let mut current_text = String::new();
+
+    let mut cur_key: Option<String> = None;
+    let mut cur_size: u64 = 0;
+    let mut cur_etag: Option<String> = None;
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) => {
+                let name = e.local_name();
+                let name_str: &str = name.as_ref();
+                if name_str == "Contents" {
+                    in_contents = true;
+                    cur_key = None;
+                    cur_size = 0;
+                    cur_etag = None;
+                } else {
+                    current_tag = Some(name_str.to_string());
+                    current_text.clear();
+                }
+            }
+            Ok(Event::Text(e)) => {
+                if current_tag.is_some() {
+                    current_text.push_str(e.as_ref());
+                }
+            }
+            Ok(Event::GeneralRef(e)) => {
+                if current_tag.is_some() {
+                    if let Ok(Some(ch)) = e.resolve_char_ref() {
+                        current_text.push(ch);
+                    } else if let Some(resolved) = quick_xml::escape::resolve_xml_entity(e.as_ref())
+                    {
+                        current_text.push_str(resolved);
+                    } else {
+                        current_text.push('&');
+                        current_text.push_str(e.as_ref());
+                        current_text.push(';');
+                    }
+                }
+            }
+            Ok(Event::CData(e)) => {
+                if current_tag.is_some() {
+                    current_text.push_str(e.as_ref());
+                }
+            }
+            Ok(Event::End(e)) => {
+                let name = e.local_name();
+                let name_str: &str = name.as_ref();
+                if name_str == "Contents" {
+                    if let Some(key) = cur_key.take() {
+                        items.push(ObjectMeta {
+                            key,
+                            size: cur_size,
+                            content_type: None,
+                            etag: cur_etag.take(),
+                            last_modified_epoch_secs: None,
+                        });
+                    }
+                    in_contents = false;
+                } else if let Some(ref open) = current_tag
+                    && open.as_str() == name_str
+                {
+                    if in_contents {
+                        match open.as_str() {
+                            "Key" => cur_key = Some(std::mem::take(&mut current_text)),
+                            "Size" => {
+                                cur_size = current_text.trim().parse::<u64>().unwrap_or(0);
+                            }
+                            "ETag" => cur_etag = Some(std::mem::take(&mut current_text)),
+                            _ => {}
+                        }
+                    } else {
+                        match open.as_str() {
+                            "IsTruncated" => {
+                                is_truncated = current_text.trim().eq_ignore_ascii_case("true");
+                            }
+                            "NextContinuationToken" => {
+                                next_continuation_token = Some(std::mem::take(&mut current_text));
+                            }
+                            _ => {}
+                        }
+                    }
+                    current_tag = None;
+                    current_text.clear();
+                }
+            }
+            Ok(Event::Eof) | Err(_) => break,
+            _ => {}
+        }
+    }
+
     ListObjectsV2Page {
         items,
         is_truncated,
@@ -564,71 +660,9 @@ fn parse_list_objects_v2_page(xml: &str) -> ListObjectsV2Page {
     }
 }
 
+#[cfg(test)]
 fn parse_list_objects_v2_xml(xml: &str) -> Vec<ObjectMeta> {
-    let mut items = Vec::new();
-    let mut rest = xml;
-    while let Some(start) = rest.find("<Contents>") {
-        let after_start = &rest[start + "<Contents>".len()..];
-        let Some(end) = after_start.find("</Contents>") else {
-            break;
-        };
-        let block = &after_start[..end];
-        if let Some(key) = extract_xml_tag(block, "Key") {
-            let size = extract_xml_tag(block, "Size")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0);
-            let etag = extract_xml_tag(block, "ETag");
-            items.push(ObjectMeta {
-                key,
-                size,
-                content_type: None,
-                etag,
-                last_modified_epoch_secs: None,
-            });
-        }
-        rest = &after_start[end + "</Contents>".len()..];
-    }
-    items
-}
-
-fn extract_xml_tag(block: &str, tag: &str) -> Option<String> {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    let start = block.find(&open)? + open.len();
-    let end = block[start..].find(&close)? + start;
-    Some(decode_xml_entities(&block[start..end]))
-}
-
-fn decode_xml_entities(input: &str) -> String {
-    // Why: Single-pass entity decoding ensures `&amp;lt;` decodes once to `&lt;` rather than
-    // being double-decoded into `<`.
-    let mut out = String::with_capacity(input.len());
-    let mut rest = input;
-    while let Some(amp_idx) = rest.find('&') {
-        out.push_str(&rest[..amp_idx]);
-        let tail = &rest[amp_idx..];
-        if let Some(after) = tail.strip_prefix("&amp;") {
-            out.push('&');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&lt;") {
-            out.push('<');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&gt;") {
-            out.push('>');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&quot;") {
-            out.push('"');
-            rest = after;
-        } else if let Some(after) = tail.strip_prefix("&apos;") {
-            out.push('\'');
-            rest = after;
-        } else {
-            out.push('&');
-            rest = &tail[1..];
-        }
-    }
-    out.push_str(rest);
-    out
+    parse_list_objects_v2_page(xml).items
 }
 
 #[cfg(test)]
@@ -859,13 +893,13 @@ mod tests {
     }
 
     #[test]
-    fn s3_decode_xml_entities_does_not_double_decode_amp() {
-        assert_eq!(decode_xml_entities("a&amp;lt;b"), "a&lt;b");
-        assert_eq!(decode_xml_entities("a&amp;amp;b"), "a&amp;b");
-        assert_eq!(
-            decode_xml_entities("&lt;tag attr=&quot;1&quot; o=&apos;2&apos;&gt;&amp;"),
-            "<tag attr=\"1\" o='2'>&"
-        );
+    fn s3_xml_parser_decodes_entities_once_without_double_decoding() {
+        let xml = r#"<ListBucketResult><Contents><Key>a&amp;lt;b</Key><Size>1</Size><ETag>&quot;a&amp;amp;b&quot;</ETag></Contents><Contents><Key>&lt;tag attr=&quot;1&quot; o=&apos;2&apos;&gt;&amp;</Key><Size>2</Size></Contents></ListBucketResult>"#;
+        let items = parse_list_objects_v2_xml(xml);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].key, "a&lt;b");
+        assert_eq!(items[0].etag.as_deref(), Some("\"a&amp;b\""));
+        assert_eq!(items[1].key, "<tag attr=\"1\" o='2'>&");
     }
 
     #[test]

@@ -5,9 +5,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use rume_foundation::health::{HealthCheck, HealthCheckResult, HealthStatus};
+use tokio::time::Instant;
 
 use crate::persistence::backend::{DatabaseBackend, DbValue};
 use crate::persistence::error::PersistenceError;
