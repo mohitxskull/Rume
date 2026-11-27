@@ -636,11 +636,12 @@ async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client
         "anonymous client IP A must not drain tenant 'acme' rate-limit bucket for IP B"
     );
 
-    // Authenticated member of tenant `acme:198.51.100.10` must NOT share a bucket with
-    // anonymous requests to `acme` from `198.51.100.10`.
+    // Authenticated member of tenant `acme:198.51.100.10` (resolved via its safe slug
+    // `acme-ip-suffix`, since `X-Tenant-ID` rejects `:` delimiter characters per RC-17)
+    // must NOT share a bucket with anonymous requests to `acme` from `198.51.100.10`.
     let mut req_auth_suffix = axum::http::Request::builder()
         .uri("/api/tenant-scoped")
-        .header("x-tenant-id", "acme:198.51.100.10")
+        .header("x-tenant-id", "acme-ip-suffix")
         .body(axum::body::Body::empty())
         .unwrap();
     req_auth_suffix

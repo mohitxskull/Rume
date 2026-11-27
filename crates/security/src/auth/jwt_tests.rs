@@ -536,3 +536,145 @@ async fn reqwest_jwks_fetcher_rejects_ssrf_and_redirects() {
     assert!(matches!(err, AuthError::ProviderError(ref msg) if msg.contains("redirect")));
     assert_eq!(target_hits.load(Ordering::SeqCst), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn jwks_ttl_refresh_failure_backs_off_for_min_refresh_interval() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct FlakyFetcher {
+        calls: Arc<AtomicUsize>,
+        fail: Arc<AtomicBool>,
+        jwk_set: JwkSet,
+    }
+
+    impl JwksFetcher for FlakyFetcher {
+        fn fetch_jwks(&self) -> BoxFuture<'_, Result<JwkSet, AuthError>> {
+            let calls = Arc::clone(&self.calls);
+            let fail = Arc::clone(&self.fail);
+            let set = self.jwk_set.clone();
+            Box::pin(async move {
+                calls.fetch_add(1, Ordering::SeqCst);
+                if fail.load(Ordering::SeqCst) {
+                    Err(AuthError::ProviderError("IdP unavailable".to_owned()))
+                } else {
+                    Ok(set)
+                }
+            })
+        }
+    }
+
+    let secret = b"super-secret-jwks-backoff-key-01";
+    let valid_jwk = Jwk {
+        kty: "oct".to_owned(),
+        kid: Some("k1".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: None,
+        alg: Some("HS256".to_owned()),
+        n: None,
+        e: None,
+        crv: None,
+        x: None,
+        y: None,
+        k: Some(URL_SAFE_NO_PAD.encode(secret)),
+    };
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let fail = Arc::new(AtomicBool::new(false));
+    let fetcher = FlakyFetcher {
+        calls: Arc::clone(&calls),
+        fail: Arc::clone(&fail),
+        jwk_set: JwkSet {
+            keys: vec![valid_jwk],
+        },
+    };
+
+    let mut cfg = JwtValidationConfig::default();
+    cfg.allowed_algorithms.insert(JwtAlgorithm::Hs256);
+    let verifier = JwtVerifier::from_jwks_fetcher(
+        fetcher,
+        cfg,
+        Duration::from_secs(60),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+
+    let header_b64 = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","kid":"k1"}"#);
+    let payload_b64 = URL_SAFE_NO_PAD.encode(r#"{"sub":"u1","exp":9999999999}"#);
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+    mac.update(signing_input.as_bytes());
+    let sig_b64 = URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+    let token = format!("{signing_input}.{sig_b64}");
+
+    // Initial fetch succeeds (calls = 1).
+    verifier.verify(&token, 1_000).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+    // Advance past cache_ttl (60s) and make IdP fail.
+    tokio::time::advance(Duration::from_secs(61)).await;
+    fail.store(true, Ordering::SeqCst);
+
+    // First post-TTL request attempts refresh and fails (calls = 2).
+    assert!(matches!(
+        verifier.verify(&token, 1_061).await,
+        Err(AuthError::ProviderError(_))
+    ));
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // Second request 5s later (within min_refresh_interval = 30s) must NOT hammer IdP (calls still 2).
+    tokio::time::advance(Duration::from_secs(5)).await;
+    verifier.verify(&token, 1_066).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+
+    // After min_refresh_interval elapses, refresh is retried (calls = 3).
+    tokio::time::advance(Duration::from_secs(26)).await;
+    fail.store(false, Ordering::SeqCst);
+    verifier.verify(&token, 1_092).await.unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn parse_jwk_set_skips_malformed_key_when_valid_key_exists_and_fails_if_none_valid() {
+    let malformed = Jwk {
+        kty: "RSA".to_owned(),
+        kid: Some("bad-rsa".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: None,
+        alg: Some("RS256".to_owned()),
+        n: Some("!!!not-base64!!!".to_owned()),
+        e: Some("AQAB".to_owned()),
+        crv: None,
+        x: None,
+        y: None,
+        k: None,
+    };
+    let valid = Jwk {
+        kty: "oct".to_owned(),
+        kid: Some("good-oct".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: None,
+        alg: Some("HS256".to_owned()),
+        n: None,
+        e: None,
+        crv: None,
+        x: None,
+        y: None,
+        k: Some(URL_SAFE_NO_PAD.encode(b"valid-secret-key")),
+    };
+
+    // Mixed keyset: malformed key skipped, valid key kept.
+    let parsed = parse_jwk_set(&JwkSet {
+        keys: vec![malformed.clone(), valid],
+    })
+    .expect("valid key must survive malformed sibling");
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0].kid.as_deref(), Some("good-oct"));
+
+    // All-malformed keyset: fails closed when zero valid keys remain.
+    let err = parse_jwk_set(&JwkSet {
+        keys: vec![malformed],
+    })
+    .err()
+    .expect("all-malformed keyset must fail");
+    assert!(matches!(err, AuthError::InvalidCredentials(_)));
+}

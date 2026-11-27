@@ -161,9 +161,18 @@ where
 
         Box::pin(async move {
             let method = req.method().clone();
-            let gen_key = derive_generation_key(&req);
+            let authority = match extract_request_authority(&req) {
+                RequestAuthority::Present(auth) => Some(auth),
+                RequestAuthority::Absent => None,
+                // Why: multiple or malformed `Host` headers create proxy/origin ambiguity
+                // (`RC-01`); fail closed by bypassing cache read and write completely.
+                RequestAuthority::Ambiguous => {
+                    return Ok(inner.call(req).await?.into_response());
+                }
+            };
+            let gen_key = derive_generation_key(&req, authority.as_deref());
             let generation = load_generation(backend.as_ref(), &gen_key).await;
-            let cache_key = derive_cache_key(&req, &config, generation);
+            let cache_key = derive_cache_key(&req, authority.as_deref(), &config, generation);
 
             if method == Method::GET || method == Method::HEAD {
                 let has_auth_headers = req.headers().contains_key(header::AUTHORIZATION)
@@ -172,8 +181,10 @@ where
                     return Ok(inner.call(req).await?.into_response());
                 }
 
+                let req_cc = parse_request_cache_control(req.headers());
                 let if_none_match = joined_header_values(req.headers(), &header::IF_NONE_MATCH);
-                if let Ok(Some(raw)) = backend.get(&cache_key).await
+                if !req_cc.skip_read
+                    && let Ok(Some(raw)) = backend.get(&cache_key).await
                     && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
                 {
                     if let Some(ref inm) = if_none_match
@@ -200,6 +211,7 @@ where
                     return Ok(res);
                 }
 
+                let effective_ttl = response_cache_ttl(res.headers(), config.ttl);
                 let (mut parts, body) = res.into_parts();
                 let bytes = match buffer_or_passthrough_body(
                     &parts.headers,
@@ -241,6 +253,7 @@ where
                 // Why: HEAD responses carry an empty body, so caching a HEAD miss
                 // would poison the shared GET cache entry with an empty body and ETag.
                 if method == Method::GET
+                    && !req_cc.skip_write
                     && let Some(ref etag_val) = etag
                 {
                     let serialized_headers = parts
@@ -256,7 +269,7 @@ where
                         etag: etag_val.clone(),
                     };
                     if let Ok(encoded) = serde_json::to_vec(&cached) {
-                        let _ = backend.set(&cache_key, encoded, Some(config.ttl)).await;
+                        let _ = backend.set(&cache_key, encoded, Some(effective_ttl)).await;
                     }
                 }
 
@@ -275,8 +288,15 @@ where
                 return Ok(Response::from_parts(parts, out_body));
             }
 
-            if matches!(method, Method::PUT | Method::PATCH | Method::DELETE) {
-                if let Some(if_match) = joined_header_values(req.headers(), &header::IF_MATCH)
+            if !method.is_safe() {
+                // Why: when `config.vary_headers` is non-empty, `cache_key` depends on request
+                // headers that a mutating request may omit or send differently, so rejecting
+                // `If-Match` against a single cached variant risks false-positive 412s or
+                // checking the wrong representation. Delegate `If-Match` enforcement to the
+                // inner handler which holds authoritative ETag state (`RC-02`).
+                if config.vary_headers.is_empty()
+                    && matches!(method, Method::PUT | Method::PATCH | Method::DELETE)
+                    && let Some(if_match) = joined_header_values(req.headers(), &header::IF_MATCH)
                     && let Ok(Some(raw)) = backend.get(&cache_key).await
                     && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
                     && !etag_matches_strong(&if_match, &cached.etag)
@@ -478,6 +498,103 @@ async fn buffer_or_passthrough_body(
     BufferedBody::Complete(axum::body::Bytes::from(buf))
 }
 
+struct RequestCacheDirectives {
+    skip_read: bool,
+    skip_write: bool,
+}
+
+fn parse_directive_delta_seconds(raw_value: Option<&str>) -> Option<u64> {
+    let v = raw_value?.trim().trim_matches('"');
+    v.parse::<u64>().ok()
+}
+
+fn parse_request_cache_control(headers: &axum::http::HeaderMap) -> RequestCacheDirectives {
+    let mut directives = RequestCacheDirectives {
+        skip_read: false,
+        skip_write: false,
+    };
+    for val in headers.get_all(header::CACHE_CONTROL) {
+        let Ok(s) = val.to_str() else {
+            return RequestCacheDirectives {
+                skip_read: true,
+                skip_write: true,
+            };
+        };
+        for directive in s.split(',') {
+            let mut parts = directive.splitn(2, '=');
+            let name = parts.next().unwrap_or("").trim();
+            let value = parts.next();
+            if name.eq_ignore_ascii_case("no-store") {
+                directives.skip_read = true;
+                directives.skip_write = true;
+            } else if name.eq_ignore_ascii_case("no-cache")
+                || (name.eq_ignore_ascii_case("max-age")
+                    && parse_directive_delta_seconds(value).is_none_or(|secs| secs == 0))
+            {
+                directives.skip_read = true;
+            }
+        }
+    }
+    directives
+}
+
+fn response_cache_ttl(headers: &axum::http::HeaderMap, config_ttl: Duration) -> Duration {
+    let mut s_maxage: Option<u64> = None;
+    let mut max_age: Option<u64> = None;
+    for val in headers.get_all(header::CACHE_CONTROL) {
+        if let Ok(s) = val.to_str() {
+            for directive in s.split(',') {
+                let mut parts = directive.splitn(2, '=');
+                let name = parts.next().unwrap_or("").trim();
+                let value = parts.next();
+                if name.eq_ignore_ascii_case("s-maxage")
+                    && let Some(secs) = parse_directive_delta_seconds(value)
+                {
+                    s_maxage = Some(s_maxage.map_or(secs, |cur| cur.min(secs)));
+                } else if name.eq_ignore_ascii_case("max-age")
+                    && let Some(secs) = parse_directive_delta_seconds(value)
+                {
+                    max_age = Some(max_age.map_or(secs, |cur| cur.min(secs)));
+                }
+            }
+        }
+    }
+    match s_maxage.or(max_age) {
+        Some(secs) => config_ttl.min(Duration::from_secs(secs)),
+        None => config_ttl,
+    }
+}
+
+enum RequestAuthority {
+    Present(String),
+    Absent,
+    Ambiguous,
+}
+
+fn extract_request_authority(req: &Request<Body>) -> RequestAuthority {
+    let mut hosts = req.headers().get_all(header::HOST).iter();
+    let header_host = match (hosts.next(), hosts.next()) {
+        (Some(_), Some(_)) => return RequestAuthority::Ambiguous,
+        (Some(val), None) => {
+            let Ok(s) = val.to_str() else {
+                return RequestAuthority::Ambiguous;
+            };
+            Some(s.trim().to_ascii_lowercase())
+        }
+        (None, _) => None,
+    };
+    let uri_authority = req
+        .uri()
+        .authority()
+        .map(|a| a.as_str().to_ascii_lowercase());
+    match (header_host, uri_authority) {
+        (Some(h), Some(u)) if h != u => RequestAuthority::Ambiguous,
+        (Some(h), _) => RequestAuthority::Present(h),
+        (None, Some(u)) => RequestAuthority::Present(u),
+        (None, None) => RequestAuthority::Absent,
+    }
+}
+
 fn is_cacheable_response(headers: &axum::http::HeaderMap, vary_headers: &[HeaderName]) -> bool {
     if headers.contains_key(header::SET_COOKIE) {
         return false;
@@ -497,15 +614,24 @@ fn is_cacheable_response(headers: &axum::http::HeaderMap, vary_headers: &[Header
         }
     }
     for val in headers.get_all(header::CACHE_CONTROL) {
-        if let Ok(s) = val.to_str() {
-            for directive in s.split(',') {
-                let name = directive.split('=').next().unwrap_or("").trim();
-                if name.eq_ignore_ascii_case("private")
-                    || name.eq_ignore_ascii_case("no-store")
-                    || name.eq_ignore_ascii_case("no-cache")
-                {
-                    return false;
-                }
+        // Why: fail closed on non-UTF-8 `Cache-Control` headers, matching `VARY` (`RC-03`).
+        let Ok(s) = val.to_str() else {
+            return false;
+        };
+        for directive in s.split(',') {
+            let mut parts = directive.splitn(2, '=');
+            let name = parts.next().unwrap_or("").trim();
+            let value = parts.next();
+            if name.eq_ignore_ascii_case("private")
+                || name.eq_ignore_ascii_case("no-store")
+                || name.eq_ignore_ascii_case("no-cache")
+            {
+                return false;
+            }
+            if (name.eq_ignore_ascii_case("max-age") || name.eq_ignore_ascii_case("s-maxage"))
+                && parse_directive_delta_seconds(value).is_none_or(|secs| secs == 0)
+            {
+                return false;
             }
         }
     }
@@ -540,8 +666,15 @@ fn extract_tenant_id(req: &Request<Body>) -> Option<&str> {
         })
 }
 
-fn derive_generation_key(req: &Request<Body>) -> String {
+fn derive_generation_key(req: &Request<Body>, authority: Option<&str>) -> String {
     let mut key = String::from("rume:http_cache_gen:");
+    match authority {
+        Some(auth) => {
+            key.push_str("h1:");
+            push_framed(&mut key, auth);
+        }
+        None => key.push_str("h0:|"),
+    }
     match extract_tenant_id(req) {
         Some(tid) => {
             key.push_str("1:");
@@ -579,7 +712,12 @@ async fn bump_generation(backend: &dyn CacheBackend, gen_key: &str, ttl: Duratio
         .await;
 }
 
-fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u128) -> String {
+fn derive_cache_key(
+    req: &Request<Body>,
+    authority: Option<&str>,
+    config: &HttpCacheConfig,
+    generation: u128,
+) -> String {
     let pq = req
         .uri()
         .path_and_query()
@@ -590,6 +728,13 @@ fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u
     let mut key = String::from("rume:http_cache:");
     key.push_str(&generation.to_string());
     key.push(':');
+    match authority {
+        Some(auth) => {
+            key.push_str("h1:");
+            push_framed(&mut key, auth);
+        }
+        None => key.push_str("h0:|"),
+    }
     match tenant_id {
         Some(tid) => {
             key.push_str("1:");
@@ -600,8 +745,13 @@ fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u
     push_framed(&mut key, pq);
     for name in &config.vary_headers {
         push_framed(&mut key, name.as_str());
-        let val = joined_header_values(req.headers(), name).unwrap_or_default();
-        push_framed(&mut key, &val);
+        match hash_header_values(req.headers(), name) {
+            Some(digest) => {
+                key.push_str("1:");
+                push_framed(&mut key, &digest);
+            }
+            None => key.push_str("0:|"),
+        }
     }
     if config.cache_authenticated {
         match hash_header_values(req.headers(), &header::AUTHORIZATION) {
@@ -1888,5 +2038,290 @@ mod tests {
             to_bytes(r_get2.into_body(), usize::MAX).await.unwrap(),
             b"v3".as_slice()
         );
+    }
+
+    #[tokio::test]
+    async fn multi_host_isolation_and_duplicate_host_bypass() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/page",
+                get(move |req: Request<Body>| {
+                    let hits = Arc::clone(&hits_clone);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        let host = req
+                            .headers()
+                            .get(header::HOST)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or("none")
+                            .to_string();
+                        format!("{host}:{n}")
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        // Host A caches its own entry
+        let r_a1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/page")
+                    .header(header::HOST, "alpha.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_a1.into_body(), usize::MAX).await.unwrap(),
+            b"alpha.example.com:1".as_slice()
+        );
+
+        // Host B must NOT receive Host A's cached response
+        let r_b1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/page")
+                    .header(header::HOST, "beta.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_b1.into_body(), usize::MAX).await.unwrap(),
+            b"beta.example.com:2".as_slice()
+        );
+
+        // Duplicate Host headers must fail closed and bypass cache read/write
+        let r_dup = app
+            .oneshot(
+                Request::builder()
+                    .uri("/page")
+                    .header(header::HOST, "alpha.example.com")
+                    .header(header::HOST, "beta.example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_dup.into_body(), usize::MAX).await.unwrap(),
+            b"alpha.example.com:3".as_slice()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn post_invalidates_cached_entries() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let version = Arc::new(AtomicUsize::new(1));
+        let v_get = Arc::clone(&version);
+        let v_post = Arc::clone(&version);
+
+        let app = Router::new()
+            .route(
+                "/items",
+                get(move || {
+                    let v = v_get.load(Ordering::SeqCst);
+                    async move { format!("v{v}") }
+                })
+                .post(move || {
+                    let v_post = Arc::clone(&v_post);
+                    async move {
+                        v_post.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::CREATED
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r1.into_body(), usize::MAX).await.unwrap(),
+            b"v1".as_slice()
+        );
+
+        let r_post = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_post.status(), StatusCode::CREATED);
+
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .uri("/items")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r2.into_body(), usize::MAX).await.unwrap(),
+            b"v2".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_and_response_cache_control_directives_enforced() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_cc = Arc::clone(&hits);
+
+        let app = Router::new()
+            .route(
+                "/res",
+                get(move || {
+                    let hits = Arc::clone(&hits_cc);
+                    async move {
+                        let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                        format!("hit-{n}")
+                    }
+                }),
+            )
+            .route(
+                "/zero-max-age",
+                get(|| async { ([(header::CACHE_CONTROL, "public, max-age=0")], "fresh") }),
+            )
+            .route(
+                "/non-utf8-cc",
+                get(|| async {
+                    let mut res = "raw".into_response();
+                    res.headers_mut().insert(
+                        header::CACHE_CONTROL,
+                        HeaderValue::from_bytes(b"public, \xff").unwrap(),
+                    );
+                    res
+                }),
+            )
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        // 1. Request `Cache-Control: no-store` skips both read and write
+        let r_ns = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/res")
+                    .header(header::CACHE_CONTROL, "no-store")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_ns.into_body(), usize::MAX).await.unwrap(),
+            b"hit-1".as_slice()
+        );
+
+        // Subsequent normal GET must miss (because no-store did not write) and populate cache -> hit-2
+        let r_norm = app
+            .clone()
+            .oneshot(Request::builder().uri("/res").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_norm.into_body(), usize::MAX).await.unwrap(),
+            b"hit-2".as_slice()
+        );
+
+        // 2. Request `Cache-Control: no-cache` skips cache read and refreshes cache -> hit-3
+        let r_nc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/res")
+                    .header(header::CACHE_CONTROL, "no-cache")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_nc.into_body(), usize::MAX).await.unwrap(),
+            b"hit-3".as_slice()
+        );
+
+        // Subsequent normal GET now sees refreshed `hit-3`
+        let r_cached = app
+            .clone()
+            .oneshot(Request::builder().uri("/res").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_cached.into_body(), usize::MAX).await.unwrap(),
+            b"hit-3".as_slice()
+        );
+
+        // 3. Response `Cache-Control: max-age=0` and non-UTF-8 `Cache-Control` are not cached
+        let mut h_zero = axum::http::HeaderMap::new();
+        h_zero.insert(header::CACHE_CONTROL, HeaderValue::from_static("max-age=0"));
+        assert!(!is_cacheable_response(&h_zero, &[]));
+
+        let mut h_smax = axum::http::HeaderMap::new();
+        h_smax.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, s-maxage=0"),
+        );
+        assert!(!is_cacheable_response(&h_smax, &[]));
+
+        let mut h_non_utf8 = axum::http::HeaderMap::new();
+        h_non_utf8.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
+        assert!(!is_cacheable_response(&h_non_utf8, &[]));
+
+        // 4. Positive response `s-maxage` / `max-age` clamps backend TTL
+        let mut h_clamp = axum::http::HeaderMap::new();
+        h_clamp.insert(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=120, s-maxage=15"),
+        );
+        assert_eq!(
+            response_cache_ttl(&h_clamp, Duration::from_secs(60)),
+            Duration::from_secs(15)
+        );
+        let _ = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/zero-max-age")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .uri("/non-utf8-cc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
     }
 }

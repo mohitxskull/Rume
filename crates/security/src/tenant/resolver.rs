@@ -240,19 +240,40 @@ pub trait TenantStore: Debug + Send + Sync + 'static {
     fn deactivate<'a>(&'a self, id: &'a str) -> BoxFuture<'a, Result<bool, TenantError>>;
 }
 
-/// Extracts a tenant key from a request header, rejecting malformed non-UTF-8 values.
+/// Maximum accepted byte length for a tenant header identifier.
+const MAX_TENANT_HEADER_LEN: usize = 128;
+
+/// Extracts a tenant key from a request header, rejecting duplicate, non-UTF-8,
+/// oversized, or invalid-charset values before querying any store or cache.
 fn extract_header_key<'a>(
     parts: &'a Parts,
     header_name: &str,
 ) -> Result<Option<&'a str>, TenantError> {
-    let Some(header_val) = parts.headers.get(header_name) else {
+    let mut values = parts.headers.get_all(header_name).iter();
+    let Some(header_val) = values.next() else {
         return Ok(None);
     };
+    // Why: duplicate tenant headers create proxy/backend ambiguity (`RC-17`); fail closed.
+    if values.next().is_some() {
+        return Err(TenantError::InvalidIdentifier(
+            "duplicate tenant header".into(),
+        ));
+    }
     let Ok(key) = header_val.to_str() else {
         return Err(TenantError::InvalidIdentifier(
             "malformed tenant header".into(),
         ));
     };
+    if key.is_empty()
+        || key.len() > MAX_TENANT_HEADER_LEN
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        return Err(TenantError::InvalidIdentifier(
+            "invalid tenant header identifier".into(),
+        ));
+    }
     Ok(Some(key))
 }
 
@@ -268,7 +289,14 @@ fn normalize_base_domain(base_domain: &str) -> String {
 fn extract_subdomain_slug(parts: &Parts, base_domain: &str) -> Result<Option<String>, TenantError> {
     // Why: HTTP/1.1 sends the `Host` header, while HTTP/2 requests carry
     // the target authority in `:authority` (`parts.uri.authority()`).
-    let raw_host = if let Some(host_val) = parts.headers.get(HOST) {
+    // Reject duplicate `Host` headers to prevent proxy/backend routing ambiguity (`RC-17`).
+    let mut host_values = parts.headers.get_all(HOST).iter();
+    let raw_host = if let Some(host_val) = host_values.next() {
+        if host_values.next().is_some() {
+            return Err(TenantError::InvalidIdentifier(
+                "duplicate host header".into(),
+            ));
+        }
         let Ok(host_str) = host_val.to_str() else {
             return Err(TenantError::InvalidIdentifier(
                 "malformed host header".into(),
@@ -1006,5 +1034,53 @@ mod tests {
             resolver.resolve(&parts_ok).await.unwrap(),
             Some(acme_recreated)
         );
+    }
+
+    #[tokio::test]
+    async fn resolvers_reject_duplicate_headers_and_invalid_tenant_header_values() {
+        let acme = Tenant::new("t-acme", "acme");
+        let header_resolver = HeaderTenantResolver::new().add_tenant(acme.clone());
+        let sub_resolver = SubdomainTenantResolver::new("app.platform.io").add_tenant(acme);
+
+        // Duplicate X-Tenant-ID rejected
+        let (dup_tenant_parts, _) = Request::builder()
+            .header("x-tenant-id", "acme")
+            .header("x-tenant-id", "evil")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            header_resolver.resolve(&dup_tenant_parts).await,
+            Err(TenantError::InvalidIdentifier(_))
+        ));
+
+        // Duplicate Host rejected
+        let (dup_host_parts, _) = Request::builder()
+            .header(HOST, "acme.app.platform.io")
+            .header(HOST, "evil.app.platform.io")
+            .body(())
+            .unwrap()
+            .into_parts();
+        assert!(matches!(
+            sub_resolver.resolve(&dup_host_parts).await,
+            Err(TenantError::InvalidIdentifier(_))
+        ));
+
+        // Oversized (>128), empty, and unsafe charset X-Tenant-ID rejected
+        let oversized = "a".repeat(129);
+        for bad in ["", oversized.as_str(), "acme/admin", "acme;drop", "a b"] {
+            let (parts, _) = Request::builder()
+                .header("x-tenant-id", bad)
+                .body(())
+                .unwrap()
+                .into_parts();
+            assert!(
+                matches!(
+                    header_resolver.resolve(&parts).await,
+                    Err(TenantError::InvalidIdentifier(_))
+                ),
+                "expected InvalidIdentifier for header value {bad:?}"
+            );
+        }
     }
 }

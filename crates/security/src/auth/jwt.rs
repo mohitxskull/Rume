@@ -316,125 +316,146 @@ fn verify_hmac<M: KeyInit + Mac>(secret: &[u8], signing_input: &[u8], signature:
     bool::from(expected.as_slice().ct_eq(signature))
 }
 
+fn parse_single_jwk(jwk: &Jwk) -> Result<Option<ParsedKey>, String> {
+    // RFC 7517 §4.2: skip non-signing keys (e.g. "enc") while treating `use == None` as eligible.
+    if let Some(key_use) = jwk.key_use.as_deref()
+        && key_use != "sig"
+    {
+        return Ok(None);
+    }
+    // RFC 7517 §4.3: skip keys whose `key_ops` explicitly excludes `"verify"`.
+    if let Some(ops) = jwk.key_ops.as_ref()
+        && !ops.iter().any(|op| op == "verify")
+    {
+        return Ok(None);
+    }
+
+    let alg = match jwk.alg.as_deref() {
+        Some(alg_str) => match JwtAlgorithm::from_jwt_alg(alg_str) {
+            Some(a) => Some(a),
+            None => return Ok(None),
+        },
+        None => None,
+    };
+
+    let material = match jwk.kty.as_str() {
+        "RSA" => {
+            let n_b64 = jwk
+                .n
+                .as_deref()
+                .ok_or_else(|| "RSA JWK missing 'n'".to_owned())?;
+            let e_b64 = jwk
+                .e
+                .as_deref()
+                .ok_or_else(|| "RSA JWK missing 'e'".to_owned())?;
+            let n_bytes = URL_SAFE_NO_PAD
+                .decode(n_b64)
+                .map_err(|_| "invalid RSA JWK 'n'".to_owned())?;
+            let e_bytes = URL_SAFE_NO_PAD
+                .decode(e_b64)
+                .map_err(|_| "invalid RSA JWK 'e'".to_owned())?;
+            if n_bytes.is_empty() || n_bytes.len() > MAX_RSA_MODULUS_BYTES || e_bytes.is_empty() {
+                return Err("invalid RSA JWK modulus or exponent".to_owned());
+            }
+            let n = BoxedUint::from_be_slice_vartime(&n_bytes);
+            let e = BoxedUint::from_be_slice_vartime(&e_bytes);
+            let pk =
+                RsaPublicKey::new(n, e).map_err(|_| "invalid RSA JWK key material".to_owned())?;
+            KeyMaterial::Rsa(pk)
+        }
+        "EC" => {
+            let crv = jwk
+                .crv
+                .as_deref()
+                .ok_or_else(|| "EC JWK missing 'crv'".to_owned())?;
+            let coord_len = match crv {
+                "P-256" => 32,
+                "P-384" => 48,
+                _ => return Ok(None),
+            };
+            let x_b64 = jwk
+                .x
+                .as_deref()
+                .ok_or_else(|| "EC JWK missing 'x'".to_owned())?;
+            let y_b64 = jwk
+                .y
+                .as_deref()
+                .ok_or_else(|| "EC JWK missing 'y'".to_owned())?;
+            let x = URL_SAFE_NO_PAD
+                .decode(x_b64)
+                .map_err(|_| "invalid EC JWK 'x'".to_owned())?;
+            let y = URL_SAFE_NO_PAD
+                .decode(y_b64)
+                .map_err(|_| "invalid EC JWK 'y'".to_owned())?;
+            if x.len() != coord_len || y.len() != coord_len {
+                return Err("invalid EC JWK coordinate length".to_owned());
+            }
+            let mut sec1 = Vec::with_capacity(1 + 2 * coord_len);
+            sec1.push(0x04);
+            sec1.extend_from_slice(&x);
+            sec1.extend_from_slice(&y);
+            match crv {
+                "P-256" => {
+                    let vk = P256VerifyingKey::from_sec1_bytes(&sec1)
+                        .map_err(|_| "invalid P-256 JWK point".to_owned())?;
+                    KeyMaterial::EcP256(vk)
+                }
+                "P-384" => {
+                    let vk = P384VerifyingKey::from_sec1_bytes(&sec1)
+                        .map_err(|_| "invalid P-384 JWK point".to_owned())?;
+                    KeyMaterial::EcP384(vk)
+                }
+                _ => unreachable!(),
+            }
+        }
+        "oct" => {
+            let k_b64 = jwk
+                .k
+                .as_deref()
+                .ok_or_else(|| "oct JWK missing 'k'".to_owned())?;
+            let k = URL_SAFE_NO_PAD
+                .decode(k_b64)
+                .map_err(|_| "invalid oct JWK 'k'".to_owned())?;
+            if k.is_empty() {
+                return Err("oct JWK 'k' cannot be empty".to_owned());
+            }
+            KeyMaterial::Hmac(Zeroizing::new(k))
+        }
+        _ => return Ok(None),
+    };
+
+    Ok(Some(ParsedKey {
+        kid: jwk.kid.clone(),
+        alg,
+        material,
+    }))
+}
+
 fn parse_jwk_set(jwk_set: &JwkSet) -> Result<Vec<ParsedKey>, AuthError> {
     let mut parsed = Vec::new();
+    let mut last_error: Option<String> = None;
     for jwk in &jwk_set.keys {
-        // RFC 7517 §4.2: skip non-signing keys (e.g. "enc") while treating `use == None` as eligible.
-        if let Some(key_use) = jwk.key_use.as_deref()
-            && key_use != "sig"
-        {
-            continue;
+        match parse_single_jwk(jwk) {
+            Ok(Some(key)) => parsed.push(key),
+            Ok(None) => {}
+            Err(reason) => {
+                // Why: a single malformed or unsupported JWK in an IdP's keyset must
+                // not poison all other valid keys during rotation (`RC-18`). Skip it
+                // with a warning and fail only if zero valid keys remain.
+                tracing::warn!(
+                    kid = jwk.kid.as_deref().unwrap_or("<none>"),
+                    kty = jwk.kty.as_str(),
+                    error = %reason,
+                    "skipping malformed JWK in keyset"
+                );
+                last_error = Some(reason);
+            }
         }
-        // RFC 7517 §4.3: skip keys whose `key_ops` explicitly excludes `"verify"`.
-        if let Some(ops) = jwk.key_ops.as_ref()
-            && !ops.iter().any(|op| op == "verify")
-        {
-            continue;
-        }
-
-        let alg = match jwk.alg.as_deref() {
-            Some(alg_str) => match JwtAlgorithm::from_jwt_alg(alg_str) {
-                Some(a) => Some(a),
-                None => continue,
-            },
-            None => None,
-        };
-
-        let material = match jwk.kty.as_str() {
-            "RSA" => {
-                let n_b64 = jwk.n.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("RSA JWK missing 'n'".to_owned())
-                })?;
-                let e_b64 = jwk.e.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("RSA JWK missing 'e'".to_owned())
-                })?;
-                let n_bytes = URL_SAFE_NO_PAD
-                    .decode(n_b64)
-                    .map_err(|_| AuthError::InvalidCredentials("invalid RSA JWK 'n'".to_owned()))?;
-                let e_bytes = URL_SAFE_NO_PAD
-                    .decode(e_b64)
-                    .map_err(|_| AuthError::InvalidCredentials("invalid RSA JWK 'e'".to_owned()))?;
-                if n_bytes.is_empty() || n_bytes.len() > MAX_RSA_MODULUS_BYTES || e_bytes.is_empty()
-                {
-                    return Err(AuthError::InvalidCredentials(
-                        "invalid RSA JWK modulus or exponent".to_owned(),
-                    ));
-                }
-                let n = BoxedUint::from_be_slice_vartime(&n_bytes);
-                let e = BoxedUint::from_be_slice_vartime(&e_bytes);
-                let pk = RsaPublicKey::new(n, e).map_err(|_| {
-                    AuthError::InvalidCredentials("invalid RSA JWK key material".to_owned())
-                })?;
-                KeyMaterial::Rsa(pk)
-            }
-            "EC" => {
-                let crv = jwk.crv.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("EC JWK missing 'crv'".to_owned())
-                })?;
-                let coord_len = match crv {
-                    "P-256" => 32,
-                    "P-384" => 48,
-                    _ => continue,
-                };
-                let x_b64 = jwk.x.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("EC JWK missing 'x'".to_owned())
-                })?;
-                let y_b64 = jwk.y.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("EC JWK missing 'y'".to_owned())
-                })?;
-                let x = URL_SAFE_NO_PAD
-                    .decode(x_b64)
-                    .map_err(|_| AuthError::InvalidCredentials("invalid EC JWK 'x'".to_owned()))?;
-                let y = URL_SAFE_NO_PAD
-                    .decode(y_b64)
-                    .map_err(|_| AuthError::InvalidCredentials("invalid EC JWK 'y'".to_owned()))?;
-                if x.len() != coord_len || y.len() != coord_len {
-                    return Err(AuthError::InvalidCredentials(
-                        "invalid EC JWK coordinate length".to_owned(),
-                    ));
-                }
-                let mut sec1 = Vec::with_capacity(1 + 2 * coord_len);
-                sec1.push(0x04);
-                sec1.extend_from_slice(&x);
-                sec1.extend_from_slice(&y);
-                match crv {
-                    "P-256" => {
-                        let vk = P256VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| {
-                            AuthError::InvalidCredentials("invalid P-256 JWK point".to_owned())
-                        })?;
-                        KeyMaterial::EcP256(vk)
-                    }
-                    "P-384" => {
-                        let vk = P384VerifyingKey::from_sec1_bytes(&sec1).map_err(|_| {
-                            AuthError::InvalidCredentials("invalid P-384 JWK point".to_owned())
-                        })?;
-                        KeyMaterial::EcP384(vk)
-                    }
-                    _ => unreachable!(),
-                }
-            }
-            "oct" => {
-                let k_b64 = jwk.k.as_deref().ok_or_else(|| {
-                    AuthError::InvalidCredentials("oct JWK missing 'k'".to_owned())
-                })?;
-                let k = URL_SAFE_NO_PAD
-                    .decode(k_b64)
-                    .map_err(|_| AuthError::InvalidCredentials("invalid oct JWK 'k'".to_owned()))?;
-                if k.is_empty() {
-                    return Err(AuthError::InvalidCredentials(
-                        "oct JWK 'k' cannot be empty".to_owned(),
-                    ));
-                }
-                KeyMaterial::Hmac(Zeroizing::new(k))
-            }
-            _ => continue,
-        };
-
-        parsed.push(ParsedKey {
-            kid: jwk.kid.clone(),
-            alg,
-            material,
-        });
+    }
+    if parsed.is_empty()
+        && let Some(err) = last_error
+    {
+        return Err(AuthError::InvalidCredentials(err));
     }
     Ok(parsed)
 }
@@ -683,21 +704,37 @@ impl JwtVerifier {
         let now = Instant::now();
         let needs_initial_or_ttl_refresh = {
             let cache = dynamic.cache.read().await;
-            cache
+            let ttl_expired = cache
                 .fetched_at
-                .is_none_or(|fetched| now.saturating_duration_since(fetched) >= dynamic.cache_ttl)
+                .is_none_or(|fetched| now.saturating_duration_since(fetched) >= dynamic.cache_ttl);
+            let backoff_elapsed = cache.last_refresh_attempt.is_none_or(|last| {
+                now.saturating_duration_since(last) >= dynamic.min_refresh_interval
+            });
+            ttl_expired && backoff_elapsed
         };
 
         if needs_initial_or_ttl_refresh {
             let _refresh_guard = dynamic.refresh_lock.lock().await;
-            let still_needs_refresh = {
-                let cache = dynamic.cache.read().await;
-                let now_r = Instant::now();
-                cache.fetched_at.is_none_or(|fetched| {
-                    now_r.saturating_duration_since(fetched) >= dynamic.cache_ttl
-                })
+            let should_fetch = {
+                let mut cache = dynamic.cache.write().await;
+                let now_w = Instant::now();
+                let ttl_expired = cache.fetched_at.is_none_or(|fetched| {
+                    now_w.saturating_duration_since(fetched) >= dynamic.cache_ttl
+                });
+                let backoff_elapsed = cache.last_refresh_attempt.is_none_or(|last| {
+                    now_w.saturating_duration_since(last) >= dynamic.min_refresh_interval
+                });
+                if ttl_expired && backoff_elapsed {
+                    // Why: record attempt timestamp before releasing `cache` and awaiting
+                    // `fetch_jwks()` so failed TTL refreshes back off for `min_refresh_interval`
+                    // instead of hammering the IdP on every subsequent request (`RC-18`).
+                    cache.last_refresh_attempt = Some(now_w);
+                    true
+                } else {
+                    false
+                }
             };
-            if still_needs_refresh {
+            if should_fetch {
                 // Why: perform network I/O with NO lock held on `cache` so concurrent
                 // verifications for already-cached keys remain non-blocking while a
                 // refresh is in flight.
@@ -707,7 +744,6 @@ impl JwtVerifier {
                 let mut cache = dynamic.cache.write().await;
                 cache.keys = parsed;
                 cache.fetched_at = Some(refreshed_at);
-                cache.last_refresh_attempt = Some(refreshed_at);
             }
         }
 

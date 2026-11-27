@@ -53,7 +53,7 @@ fn totp_matches_rfc6238_test_vectors_for_sha1_sha256_sha512() {
 
 #[test]
 fn totp_verify_accepts_skew_window_and_returns_matched_step_for_replay_prevention() {
-    let secret = TotpSecret::generate(TotpConfig::default());
+    let secret = TotpSecret::generate(TotpConfig::default()).unwrap();
     let step_10_ts = 300_u64;
     let code_at_step_9 = secret.generate_code(270).unwrap();
     let code_at_step_11 = secret.generate_code(330).unwrap();
@@ -66,8 +66,59 @@ fn totp_verify_accepts_skew_window_and_returns_matched_step_for_replay_preventio
 }
 
 #[test]
+fn totp_rejects_invalid_config_and_enforces_replay_watermark() {
+    // skew_steps > MAX_SKEW_STEPS rejected by both generate and from_bytes
+    let excessive_skew = TotpConfig {
+        skew_steps: MAX_SKEW_STEPS + 1,
+        ..TotpConfig::default()
+    };
+    assert!(matches!(
+        TotpSecret::generate(excessive_skew.clone()),
+        Err(AuthError::InvalidCredentials(_))
+    ));
+    assert!(matches!(
+        TotpSecret::from_bytes(b"12345678901234567890".to_vec(), excessive_skew),
+        Err(AuthError::InvalidCredentials(_))
+    ));
+
+    // period_secs == 0 rejected by generate
+    let zero_period = TotpConfig {
+        period_secs: 0,
+        ..TotpConfig::default()
+    };
+    assert!(matches!(
+        TotpSecret::generate(zero_period),
+        Err(AuthError::InvalidCredentials(_))
+    ));
+
+    // verify_code_after rejects same and earlier steps, accepts strictly newer step
+    let secret = TotpSecret::generate(TotpConfig::default()).unwrap();
+    let step_10_ts = 300_u64;
+    let code_step_9 = secret.generate_code(270).unwrap();
+    let code_step_10 = secret.generate_code(300).unwrap();
+    let code_step_11 = secret.generate_code(330).unwrap();
+
+    let used = secret.verify_code_after(&code_step_10, step_10_ts, None);
+    assert_eq!(used, Some(10));
+    // Replaying step 10 or an earlier step (9) within the skew window must fail
+    assert_eq!(
+        secret.verify_code_after(&code_step_10, step_10_ts, used),
+        None
+    );
+    assert_eq!(
+        secret.verify_code_after(&code_step_9, step_10_ts, used),
+        None
+    );
+    // Strictly advancing to step 11 succeeds
+    assert_eq!(
+        secret.verify_code_after(&code_step_11, step_10_ts, used),
+        Some(11)
+    );
+}
+
+#[test]
 fn totp_otpauth_uri_escapes_issuer_and_account_and_roundtrips_base32() {
-    let secret = TotpSecret::generate(TotpConfig::default());
+    let secret = TotpSecret::generate(TotpConfig::default()).unwrap();
     let b32 = secret.to_base32();
     let lower_b32 = b32.to_ascii_lowercase();
     let decoded = TotpSecret::from_base32(&lower_b32, TotpConfig::default()).unwrap();

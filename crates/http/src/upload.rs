@@ -195,7 +195,13 @@ pub async fn extract_multipart_files(
             bytes.extend_from_slice(&chunk);
         }
 
-        validate_sniffed_mime_type(&bytes, content_type.as_deref(), &config.allowed_mime_types)?;
+        validate_sniffed_mime_type(
+            &bytes,
+            content_type.as_deref(),
+            &sanitized_file_name,
+            &config.allowed_mime_types,
+            &config.allowed_extensions,
+        )?;
 
         files.push(UploadedFile {
             field_name,
@@ -209,6 +215,29 @@ pub async fn extract_multipart_files(
     Ok(files)
 }
 
+/// Maximum bytes inspected during text/markup MIME sniffing (8 KiB).
+const TEXT_SNIFF_WINDOW_BYTES: usize = 8192;
+
+fn strip_leading_ws_and_comments(mut slice: &[u8]) -> &[u8] {
+    loop {
+        while let Some((&b, rest)) = slice.split_first() {
+            if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c') {
+                slice = rest;
+            } else {
+                break;
+            }
+        }
+        if let Some(after_open) = slice.strip_prefix(b"<!--")
+            && let Some(end_idx) = after_open.windows(3).position(|w| w == b"-->")
+        {
+            slice = &after_open[end_idx + 3..];
+            continue;
+        }
+        break;
+    }
+    slice
+}
+
 /// Sniffs the MIME type of `bytes` using `infer` for binary magic signatures (100+ formats)
 /// with a text-based HTML/SVG/XML script detection fallback.
 ///
@@ -217,64 +246,80 @@ pub async fn extract_multipart_files(
 pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
     // 1. Binary magic-byte signatures via `infer` (covers PNG, JPEG, GIF, WebP, PDF, ZIP, GZIP,
     //    and 100+ additional binary formats).
+    let mut infer_html_fallback = None;
     if let Some(kind) = infer::get(bytes) {
         let mime = kind.mime_type();
-        // If `infer` detects generic XML (`text/xml`), still refine to `image/svg+xml`
-        // when an `<svg` root/element is present.
-        if mime != "text/xml" {
+        // Why: `infer` classifies `<?xml` as `text/xml` and leading `<!--` comments as
+        // `text/html` without inspecting what follows, which misclassifies commented SVGs
+        // (`<!-- ... --><svg>`). Let the markup sniffer refine both (`RC-16`).
+        if mime != "text/xml" && mime != "text/html" {
             return Some(mime);
+        }
+        if mime == "text/html" {
+            infer_html_fallback = Some(mime);
         }
     }
 
-    // 2. Text / markup / script signatures: strip optional UTF-8 BOM and leading ASCII
-    //    whitespace on raw bytes BEFORE bounding to 512 bytes, and decode lossily so
-    //    invalid trailing UTF-8 (e.g. `\xff`) or >=512 leading spaces cannot bypass
-    //    HTML/script/SVG/XML detection (`RC-05`).
-    let mut trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    while let Some((&b, rest)) = trimmed.split_first() {
-        if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c') {
-            trimmed = rest;
-        } else {
-            break;
-        }
-    }
+    // 2. Text / markup / script signatures: strip optional UTF-8 BOM, leading ASCII
+    //    whitespace, and leading HTML/XML comments (`<!-- ... -->`) on raw bytes BEFORE
+    //    bounding to 8 KiB, and decode lossily so invalid trailing UTF-8 or >512B padded
+    //    comments cannot bypass HTML/script/SVG detection (`RC-05`, `RC-16`).
+    let after_bom = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let trimmed = strip_leading_ws_and_comments(after_bom);
     if trimmed.is_empty() {
-        return None;
+        return infer_html_fallback;
     }
-    let prefix_len = trimmed.len().min(512);
+    let prefix_len = trimmed.len().min(TEXT_SNIFF_WINDOW_BYTES);
     let prefix = String::from_utf8_lossy(&trimmed[..prefix_len]);
     let lower = prefix.to_ascii_lowercase();
 
-    let starts_with_tag = |tag: &str| -> bool {
-        lower.strip_prefix(tag).is_some_and(|rest| {
+    let starts_with_tag = |s: &str, tag: &str| -> bool {
+        s.strip_prefix(tag).is_some_and(|rest| {
             rest.is_empty()
                 || rest.starts_with(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '/'))
         })
     };
 
     if lower.starts_with("<!doctype html")
-        || starts_with_tag("<html")
-        || starts_with_tag("<script")
-        || starts_with_tag("<head")
-        || starts_with_tag("<body")
-        || starts_with_tag("<iframe")
-        || starts_with_tag("<object")
-        || starts_with_tag("<embed")
-        || starts_with_tag("<style")
+        || starts_with_tag(&lower, "<html")
+        || starts_with_tag(&lower, "<script")
+        || starts_with_tag(&lower, "<head")
+        || starts_with_tag(&lower, "<body")
+        || starts_with_tag(&lower, "<iframe")
+        || starts_with_tag(&lower, "<object")
+        || starts_with_tag(&lower, "<embed")
+        || starts_with_tag(&lower, "<style")
     {
         return Some("text/html");
     }
-    if starts_with_tag("<svg") {
+    if starts_with_tag(&lower, "<svg") {
         return Some("image/svg+xml");
     }
     if lower.starts_with("<?xml") {
+        // Also strip `<?xml ...?>` + any following comments so arbitrarily long comments
+        // between the XML prolog and `<svg>` / `<html>` / `<script>` still get classified.
+        if let Some(prolog_end) = trimmed.windows(2).position(|w| w == b"?>") {
+            let after_prolog = strip_leading_ws_and_comments(&trimmed[prolog_end + 2..]);
+            let after_len = after_prolog.len().min(TEXT_SNIFF_WINDOW_BYTES);
+            let after_lower =
+                String::from_utf8_lossy(&after_prolog[..after_len]).to_ascii_lowercase();
+            if starts_with_tag(&after_lower, "<svg") || after_lower.contains("<svg") {
+                return Some("image/svg+xml");
+            }
+            if starts_with_tag(&after_lower, "<html") || starts_with_tag(&after_lower, "<script") {
+                return Some("text/html");
+            }
+        }
         if lower.contains("<svg") {
             return Some("image/svg+xml");
+        }
+        if lower.contains("<html") || lower.contains("<script") {
+            return Some("text/html");
         }
         return Some("application/xml");
     }
 
-    None
+    infer_html_fallback
 }
 
 fn requires_magic_signature(mime: &str) -> bool {
@@ -341,50 +386,143 @@ fn mime_types_equivalent(a: &str, b: &str) -> bool {
     )
 }
 
+fn expected_mime_for_extension(ext: &str) -> Option<&'static str> {
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "bmp" => Some("image/bmp"),
+        "tif" | "tiff" => Some("image/tiff"),
+        "avif" => Some("image/avif"),
+        "ico" => Some("image/x-icon"),
+        "svg" => Some("image/svg+xml"),
+        "pdf" => Some("application/pdf"),
+        "zip" => Some("application/zip"),
+        "gz" | "gzip" => Some("application/gzip"),
+        "tar" => Some("application/x-tar"),
+        "rar" => Some("application/x-rar-compressed"),
+        "7z" => Some("application/x-7z-compressed"),
+        "bz2" => Some("application/x-bzip2"),
+        "xz" => Some("application/x-xz"),
+        "zst" => Some("application/zstd"),
+        "wasm" => Some("application/wasm"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mkv" => Some("video/x-matroska"),
+        "mov" => Some("video/quicktime"),
+        "avi" => Some("video/x-msvideo"),
+        "mp3" => Some("audio/mpeg"),
+        "ogg" => Some("audio/ogg"),
+        "wav" => Some("audio/wav"),
+        "flac" => Some("audio/flac"),
+        "aac" => Some("audio/aac"),
+        "woff" => Some("font/woff"),
+        "woff2" => Some("font/woff2"),
+        "ttf" => Some("font/ttf"),
+        "otf" => Some("font/otf"),
+        "xml" => Some("application/xml"),
+        "html" | "htm" => Some("text/html"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
+        _ => None,
+    }
+}
+
 fn validate_sniffed_mime_type(
     bytes: &[u8],
     content_type: Option<&str>,
+    file_name: &str,
     allowed_mime_types: &[String],
+    allowed_extensions: &[String],
 ) -> Result<(), AppError> {
-    if allowed_mime_types.is_empty() {
+    if allowed_mime_types.is_empty() && allowed_extensions.is_empty() {
         return Ok(());
     }
 
     let declared = content_type
         .and_then(|ct| ct.split(';').next())
         .map(|s| s.trim().to_ascii_lowercase());
+    let sniffed = sniff_mime_type(bytes);
 
     // Why: client-supplied `Content-Type` headers are untrusted; sniff magic bytes
     // and markup signatures so HTML/script payloads disguised as `image/png` (or
     // binary mismatches) are rejected with 415 Unsupported Media Type (`RC-16`, `RC-05`).
-    match sniff_mime_type(bytes) {
-        Some(detected) => {
-            let detected_allowed = allowed_mime_types
-                .iter()
-                .any(|a| mime_types_equivalent(a, detected));
-            let matches_declared = declared
-                .as_deref()
-                .is_none_or(|d| mime_types_equivalent(d, detected));
-            if !detected_allowed || !matches_declared {
+    if !allowed_mime_types.is_empty() {
+        match sniffed {
+            Some(detected) => {
+                let detected_allowed = allowed_mime_types
+                    .iter()
+                    .any(|a| mime_types_equivalent(a, detected));
+                let matches_declared = declared
+                    .as_deref()
+                    .is_none_or(|d| mime_types_equivalent(d, detected));
+                if !detected_allowed || !matches_declared {
+                    return Err(AppError::Public {
+                        status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        code: "UNSUPPORTED_MEDIA_TYPE",
+                        message: format!(
+                            "uploaded file content (detected {detected}) does not match allowed MIME types"
+                        ),
+                    });
+                }
+            }
+            None => {
+                if let Some(ref d) = declared
+                    && requires_magic_signature(d)
+                {
+                    return Err(AppError::Public {
+                        status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                        code: "UNSUPPORTED_MEDIA_TYPE",
+                        message: format!(
+                            "uploaded file content does not match declared MIME type {d}"
+                        ),
+                    });
+                }
+            }
+        }
+    }
+
+    // Why: configurations that restrict only `allowed_extensions` (leaving `allowed_mime_types`
+    // empty) must still cross-check sniffed content against the file extension so HTML or
+    // plain text uploaded as `avatar.png` is rejected (`RC-16`).
+    if !allowed_extensions.is_empty() {
+        let ext = Path::new(file_name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase);
+        let expected_mime = ext.as_deref().and_then(expected_mime_for_extension);
+
+        match (expected_mime, sniffed) {
+            (Some(expected), Some(detected)) if !mime_types_equivalent(expected, detected) => {
                 return Err(AppError::Public {
                     status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     code: "UNSUPPORTED_MEDIA_TYPE",
                     message: format!(
-                        "uploaded file content (detected {detected}) does not match allowed MIME types"
+                        "uploaded file content (detected {detected}) does not match file extension"
                     ),
                 });
             }
-        }
-        None => {
-            if let Some(ref d) = declared
-                && requires_magic_signature(d)
-            {
+            (Some(expected), None) if requires_magic_signature(expected) => {
                 return Err(AppError::Public {
                     status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     code: "UNSUPPORTED_MEDIA_TYPE",
-                    message: format!("uploaded file content does not match declared MIME type {d}"),
+                    message: format!(
+                        "uploaded file content does not match expected MIME type {expected} for extension"
+                    ),
                 });
             }
+            (None, Some(detected @ ("text/html" | "image/svg+xml"))) => {
+                return Err(AppError::Public {
+                    status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    code: "UNSUPPORTED_MEDIA_TYPE",
+                    message: format!(
+                        "uploaded file content (detected {detected}) does not match file extension"
+                    ),
+                });
+            }
+            _ => {}
         }
     }
 
@@ -967,5 +1105,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn allowed_extensions_only_cross_checks_sniffed_mime_and_long_comment_svg() {
+        // 1. >512B comment before `<svg>` must still be detected as `image/svg+xml` (not `application/xml`)
+        let long_comment = format!("<!-- {} -->", "x".repeat(1024));
+        let svg_after_comment =
+            format!("{long_comment}<svg xmlns=\"http://www.w3.org/2000/svg\"/>");
+        assert_eq!(
+            sniff_mime_type(svg_after_comment.as_bytes()),
+            Some("image/svg+xml")
+        );
+
+        let xml_then_long_comment_svg = format!(
+            "<?xml version=\"1.0\"?>{long_comment}<svg xmlns=\"http://www.w3.org/2000/svg\"/>"
+        );
+        assert_eq!(
+            sniff_mime_type(xml_then_long_comment_svg.as_bytes()),
+            Some("image/svg+xml")
+        );
+
+        // 2. `allowed_extensions: ["png"]` with empty `allowed_mime_types` rejects HTML and plain text
+        let ext_only_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec![],
+            allowed_extensions: vec!["png".to_string()],
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(ext_only_config));
+        let boundary = "----rume-rc16-boundary";
+
+        let html_as_png = build_multipart_body(
+            boundary,
+            "file",
+            "avatar.png",
+            "text/html",
+            b"<html><script>alert(1)</script></html>",
+        );
+        let resp_html = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(html_as_png))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_html.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        let text_as_png = build_multipart_body(
+            boundary,
+            "file",
+            "avatar.png",
+            "text/plain",
+            b"definitely not a png",
+        );
+        let resp_text = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(text_as_png))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_text.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Genuine PNG still succeeds
+        let ok_png = build_multipart_body(
+            boundary,
+            "file",
+            "avatar.png",
+            "image/png",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+        );
+        let resp_ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(ok_png))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
     }
 }
