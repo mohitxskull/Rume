@@ -370,11 +370,12 @@ impl WebhookDispatcher {
 
         for mut record in due {
             let Some(endpoint) = self.endpoint_by_id(&record.endpoint_id) else {
+                let expected_lease = record.next_attempt_at;
                 record.status = WebhookDeliveryStatus::Failed;
                 record.next_attempt_at = None;
                 record.last_response = Some("endpoint not registered".to_string());
                 record.updated_at = Utc::now();
-                let _ = self.store.complete_delivery(record).await?;
+                let _ = self.store.complete_delivery(record, expected_lease).await?;
                 continue;
             };
             self.attempt_delivery(&endpoint, &mut record).await?;
@@ -389,6 +390,10 @@ impl WebhookDispatcher {
         endpoint: &WebhookEndpoint,
         record: &mut WebhookDeliveryRecord,
     ) -> Result<(), WebhookError> {
+        // Why: capture the claim's lease timestamp BEFORE mutating `record.next_attempt_at`
+        // so `complete_delivery` fences updates on BOTH `status == InFlight` AND this worker's
+        // exact lease timestamp (`RC-02`).
+        let expected_lease = record.next_attempt_at;
         let now = Utc::now();
         let ts = u64::try_from(now.timestamp().max(0)).unwrap_or(0);
         let body = record.payload.as_bytes().to_vec();
@@ -418,14 +423,17 @@ impl WebhookDispatcher {
             }
         }
 
-        // Why: fence completion updates on `status == InFlight` so a slow worker whose
-        // claim lease expired cannot overwrite a record already marked `Delivered` by
-        // another worker (`RC-17`).
-        let updated = self.store.complete_delivery(record.clone()).await?;
+        // Why: fence completion updates on `status == InFlight` AND `expected_lease` so a slow
+        // worker whose claim lease expired cannot overwrite a record already reclaimed or
+        // marked `Delivered` by another worker (`RC-02`).
+        let updated = self
+            .store
+            .complete_delivery(record.clone(), expected_lease)
+            .await?;
         if !updated {
             tracing::warn!(
                 delivery_id = %record.id,
-                "Skipped webhook delivery state update because record is no longer InFlight"
+                "Skipped webhook delivery state update because record lease was superseded"
             );
         }
         Ok(())
@@ -774,51 +782,80 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn stale_worker_cannot_overwrite_delivered_webhook_record() {
-        let store = Arc::new(InMemoryWebhookDeliveryStore::new());
+    async fn assert_stale_worker_fenced_while_reclaimer_in_flight(
+        store: &dyn WebhookDeliveryStore,
+    ) {
         let now = Utc::now();
+        let lease_a = Some(now - chrono::Duration::seconds(10));
 
-        // Seed a record already claimed as InFlight by worker 1 with an expired lease.
-        let mut stale_record = WebhookDeliveryRecord {
+        // Seed a record already claimed as InFlight by Worker A with an expired lease.
+        let mut stale_a = WebhookDeliveryRecord {
             id: "del-stale-1".into(),
             endpoint_id: "ep-1".into(),
             event_type: "invoice.paid".into(),
             payload: r#"{"ok":true}"#.into(),
             status: WebhookDeliveryStatus::InFlight,
             attempt: 0,
-            next_attempt_at: Some(now - chrono::Duration::seconds(10)),
+            next_attempt_at: lease_a,
             last_response: None,
             created_at: now - chrono::Duration::seconds(60),
             updated_at: now - chrono::Duration::seconds(60),
         };
-        store.upsert(stale_record.clone()).await.unwrap();
+        store.upsert(stale_a.clone()).await.unwrap();
 
-        // Worker 2 reclaims after lease expiry and marks it Delivered.
+        // Worker B reclaims after lease expiry and is actively InFlight with lease_b.
         let claimed = store
             .claim_due(now, 10, Duration::from_secs(60))
             .await
             .unwrap();
         assert_eq!(claimed.len(), 1);
-        let mut winner = claimed.into_iter().next().unwrap();
-        winner.status = WebhookDeliveryStatus::Delivered;
-        winner.attempt = 1;
-        winner.next_attempt_at = None;
-        winner.last_response = Some("HTTP 200".into());
-        assert!(store.complete_delivery(winner).await.unwrap());
+        let mut worker_b = claimed.into_iter().next().unwrap();
+        let lease_b = worker_b.next_attempt_at;
+        assert_ne!(lease_a, lease_b);
 
-        // Stale worker 1 finishes later with a 500 error and tries to schedule a retry.
-        stale_record.status = WebhookDeliveryStatus::Pending;
-        stale_record.attempt = 1;
-        stale_record.next_attempt_at = Some(now + chrono::Duration::seconds(30));
-        stale_record.last_response = Some("HTTP 500".into());
+        // Interleave: stale Worker A finishes with a 500 error WHILE Worker B is still InFlight.
+        stale_a.status = WebhookDeliveryStatus::Pending;
+        stale_a.attempt = 1;
+        stale_a.next_attempt_at = Some(now + chrono::Duration::seconds(30));
+        stale_a.last_response = Some("HTTP 500".into());
         assert!(
-            !store.complete_delivery(stale_record).await.unwrap(),
-            "stale worker must not overwrite an already Delivered record"
+            !store.complete_delivery(stale_a, lease_a).await.unwrap(),
+            "stale Worker A must not overwrite Worker B's active InFlight claim"
+        );
+
+        // Worker B finishes with 200 OK and marks Delivered using lease_b -> succeeds!
+        worker_b.status = WebhookDeliveryStatus::Delivered;
+        worker_b.attempt = 1;
+        worker_b.next_attempt_at = None;
+        worker_b.last_response = Some("HTTP 200".into());
+        assert!(
+            store.complete_delivery(worker_b, lease_b).await.unwrap(),
+            "active Worker B must succeed with its matching lease"
         );
 
         let persisted = store.get("del-stale-1").await.unwrap().unwrap();
         assert_eq!(persisted.status, WebhookDeliveryStatus::Delivered);
         assert_eq!(persisted.last_response.as_deref(), Some("HTTP 200"));
+    }
+
+    #[tokio::test]
+    async fn stale_worker_cannot_overwrite_in_flight_or_delivered_webhook_record() {
+        let mem_store = InMemoryWebhookDeliveryStore::new();
+        assert_stale_worker_fenced_while_reclaimer_in_flight(&mem_store).await;
+
+        #[cfg(feature = "sqlite")]
+        {
+            use crate::webhooks::SqlWebhookDeliveryStore;
+            use rume_data::persistence::{DatabaseConfig, SqliteBackend};
+
+            let backend = Arc::new(
+                SqliteBackend::new(&DatabaseConfig::new(":memory:"))
+                    .await
+                    .expect("sqlite memory"),
+            );
+            let sql_store = SqlWebhookDeliveryStore::new(backend);
+            sql_store.ensure_schema().await.expect("ensure_schema");
+            assert_stale_worker_fenced_while_reclaimer_in_flight(&sql_store).await;
+        }
     }
 }

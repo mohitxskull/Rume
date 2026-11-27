@@ -198,15 +198,6 @@ fn ttl_millis(ttl: Duration) -> i64 {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
-fn now_millis() -> i64 {
-    let ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis();
-    i64::try_from(ms).unwrap_or(i64::MAX)
-}
-
-#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 impl SagaStore for SqlSagaStore {
     fn save_record_cas(
         &self,
@@ -229,7 +220,6 @@ impl SagaStore for SqlSagaStore {
             let is_terminal = record.status.is_terminal();
             let updated_at = i64::try_from(record.updated_at).unwrap_or(i64::MAX);
             let expected_ver = i64::try_from(expected_version).unwrap_or(i64::MAX);
-            let now_ms = now_millis();
 
             let rows_affected = match self {
                 #[cfg(feature = "sqlite")]
@@ -259,7 +249,6 @@ impl SagaStore for SqlSagaStore {
                             .bind(updated_at)
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
-                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -292,7 +281,6 @@ impl SagaStore for SqlSagaStore {
                             .bind(updated_at)
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
-                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -317,8 +305,8 @@ impl SagaStore for SqlSagaStore {
                             .rows_affected()
                     } else {
                         // Why: MySQL uses positional `?` placeholders, so `SET` columns precede `WHERE`,
-                        // `claim_token` is bound twice for `(? IS NULL OR (claim_token = ? AND claim_expires_at > ?))`,
-                        // and `now_ms` enforces lease freshness even before another worker overwrites `claim_token`.
+                        // `claim_token` is bound twice for `(? IS NULL OR (claim_token = ? AND claim_expires_at > ...))`,
+                        // and lease freshness is evaluated against the DB server clock (`RC-01`).
                         sqlx::query(rume_data::sql::MYSQL_SAGA_UPDATE_CAS)
                             .bind(&record.saga_name)
                             .bind(&status_json)
@@ -330,7 +318,6 @@ impl SagaStore for SqlSagaStore {
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
                             .bind(claim_token.as_deref())
-                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -479,7 +466,6 @@ impl SagaStore for SqlSagaStore {
         let saga_id = saga_id.to_string();
         let claim_token = claim_token.to_string();
         Box::pin(async move {
-            let now_ms = now_millis();
             let rows_affected = match self {
                 #[cfg(feature = "sqlite")]
                 Self::Sqlite { pool, claim_ttl } => {
@@ -487,7 +473,6 @@ impl SagaStore for SqlSagaStore {
                         .bind(&saga_id)
                         .bind(&claim_token)
                         .bind(ttl_millis(*claim_ttl))
-                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?
@@ -499,7 +484,6 @@ impl SagaStore for SqlSagaStore {
                         .bind(&saga_id)
                         .bind(&claim_token)
                         .bind(ttl_millis(*claim_ttl))
-                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?
@@ -507,12 +491,12 @@ impl SagaStore for SqlSagaStore {
                 }
                 #[cfg(feature = "mysql")]
                 Self::Mysql { pool, claim_ttl } => {
-                    // Why: MySQL positional `?` binds `ttl_ms`, `saga_id`, `claim_token`, then `now_ms`.
+                    // Why: MySQL positional `?` binds `ttl_ms`, `saga_id`, then `claim_token`;
+                    // lease expiry comparison uses the DB server clock (`RC-01`).
                     sqlx::query(rume_data::sql::MYSQL_SAGA_RENEW_CLAIM)
                         .bind(ttl_millis(*claim_ttl))
                         .bind(&saga_id)
                         .bind(&claim_token)
-                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?

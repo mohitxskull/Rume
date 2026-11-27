@@ -652,6 +652,21 @@ pub const SQLITE_USAGE_METERING_LIST_NONZERO: &str =
 /// Decrement a usage counter after flush in SQLite.
 pub const SQLITE_USAGE_METERING_DECREMENT: &str =
     include_str!("../sql/sqlite/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_release_claim.sql");
 
 /// Increment a usage counter in PostgreSQL.
 pub const PG_USAGE_METERING_INCREMENT: &str =
@@ -664,6 +679,21 @@ pub const PG_USAGE_METERING_LIST_NONZERO: &str =
 /// Decrement a usage counter after flush in PostgreSQL.
 pub const PG_USAGE_METERING_DECREMENT: &str =
     include_str!("../sql/postgres/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/postgres/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/postgres/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/postgres/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/postgres/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/postgres/usage_metering_batch_release_claim.sql");
 
 /// Increment a usage counter in MySQL.
 pub const MYSQL_USAGE_METERING_INCREMENT: &str =
@@ -676,6 +706,21 @@ pub const MYSQL_USAGE_METERING_LIST_NONZERO: &str =
 /// Decrement a usage counter after flush in MySQL.
 pub const MYSQL_USAGE_METERING_DECREMENT: &str =
     include_str!("../sql/mysql/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/mysql/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/mysql/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/mysql/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/mysql/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/mysql/usage_metering_batch_release_claim.sql");
 
 // Milestone E: Webhook deliveries (SQLite, PostgreSQL, MySQL).
 

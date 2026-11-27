@@ -226,15 +226,23 @@ pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
         }
     }
 
-    // 2. Text / markup / script signatures (strip optional UTF-8 BOM and leading ASCII whitespace).
-    let trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let prefix_len = trimmed.len().min(512);
-    let prefix = std::str::from_utf8(&trimmed[..prefix_len])
-        .ok()
-        .map(|s| s.trim_start())?;
-    if prefix.is_empty() {
+    // 2. Text / markup / script signatures: strip optional UTF-8 BOM and leading ASCII
+    //    whitespace on raw bytes BEFORE bounding to 512 bytes, and decode lossily so
+    //    invalid trailing UTF-8 (e.g. `\xff`) or >=512 leading spaces cannot bypass
+    //    HTML/script/SVG/XML detection (`RC-05`).
+    let mut trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    while let Some((&b, rest)) = trimmed.split_first() {
+        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+            trimmed = rest;
+        } else {
+            break;
+        }
+    }
+    if trimmed.is_empty() {
         return None;
     }
+    let prefix_len = trimmed.len().min(512);
+    let prefix = String::from_utf8_lossy(&trimmed[..prefix_len]);
     let lower = prefix.to_ascii_lowercase();
 
     let starts_with_tag = |tag: &str| -> bool {
@@ -276,9 +284,51 @@ fn requires_magic_signature(mime: &str) -> bool {
             | "image/jpeg"
             | "image/gif"
             | "image/webp"
+            | "image/bmp"
+            | "image/tiff"
+            | "image/avif"
+            | "image/x-icon"
+            | "image/vnd.microsoft.icon"
             | "application/pdf"
             | "application/zip"
             | "application/gzip"
+            | "application/x-tar"
+            | "application/x-rar-compressed"
+            | "application/vnd.rar"
+            | "application/x-7z-compressed"
+            | "application/x-bzip2"
+            | "application/x-xz"
+            | "application/zstd"
+            | "application/wasm"
+            | "video/mp4"
+            | "video/webm"
+            | "video/x-matroska"
+            | "video/quicktime"
+            | "video/x-msvideo"
+            | "audio/mpeg"
+            | "audio/ogg"
+            | "audio/wav"
+            | "audio/x-wav"
+            | "audio/flac"
+            | "audio/x-flac"
+            | "audio/aac"
+            | "font/woff"
+            | "font/woff2"
+            | "font/ttf"
+            | "font/otf"
+    ) || mime.starts_with("application/vnd.openxmlformats-officedocument.")
+}
+
+fn mime_types_equivalent(a: &str, b: &str) -> bool {
+    if a.eq_ignore_ascii_case(b) {
+        return true;
+    }
+    matches!(
+        (
+            a.to_ascii_lowercase().as_str(),
+            b.to_ascii_lowercase().as_str()
+        ),
+        ("text/xml", "application/xml") | ("application/xml", "text/xml")
     )
 }
 
@@ -297,13 +347,15 @@ fn validate_sniffed_mime_type(
 
     // Why: client-supplied `Content-Type` headers are untrusted; sniff magic bytes
     // and markup signatures so HTML/script payloads disguised as `image/png` (or
-    // binary mismatches) are rejected with 415 Unsupported Media Type (`RC-16`).
+    // binary mismatches) are rejected with 415 Unsupported Media Type (`RC-16`, `RC-05`).
     match sniff_mime_type(bytes) {
         Some(detected) => {
             let detected_allowed = allowed_mime_types
                 .iter()
-                .any(|a| a.eq_ignore_ascii_case(detected));
-            let matches_declared = declared.as_deref().is_none_or(|d| d == detected);
+                .any(|a| mime_types_equivalent(a, detected));
+            let matches_declared = declared
+                .as_deref()
+                .is_none_or(|d| mime_types_equivalent(d, detected));
             if !detected_allowed || !matches_declared {
                 return Err(AppError::Public {
                     status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
@@ -716,6 +768,113 @@ mod tests {
                         format!("multipart/form-data; boundary={boundary}"),
                     )
                     .body(Body::from(valid_png))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn multipart_sniffing_rejects_invalid_utf8_and_padded_html_and_accepts_text_xml() {
+        let img_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec!["image/png".to_string()],
+            allowed_extensions: vec!["png".to_string()],
+            ..Default::default()
+        };
+
+        let img_app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(img_config));
+
+        let boundary = "----rume-rc05-boundary";
+
+        // 1. HTML script with invalid UTF-8 trailing byte `\xff` pretending to be image/png -> 415
+        let invalid_utf8_xss = build_multipart_body(
+            boundary,
+            "file",
+            "evil.png",
+            "image/png",
+            b"<script>alert(1)</script>\xff",
+        );
+        let resp = img_app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(invalid_utf8_xss))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // 2. >=512 leading spaces before `<html><body>xss</body></html>` -> 415
+        let mut padded_html = vec![b' '; 512];
+        padded_html.extend_from_slice(b"<html><body>xss</body></html>");
+        let padded_body =
+            build_multipart_body(boundary, "file", "padded.png", "image/png", &padded_html);
+        let resp = img_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(padded_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // 3. Legitimate XML uploaded as `text/xml` when `text/xml` is allowed -> 200 OK
+        let xml_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec!["text/xml".to_string()],
+            allowed_extensions: vec!["xml".to_string()],
+            ..Default::default()
+        };
+        let xml_app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(xml_config));
+        let xml_body = build_multipart_body(
+            boundary,
+            "file",
+            "feed.xml",
+            "text/xml",
+            b"<?xml version=\"1.0\"?><root/>",
+        );
+        let resp = xml_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(xml_body))
                     .unwrap(),
             )
             .await

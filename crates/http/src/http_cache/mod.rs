@@ -553,32 +553,33 @@ fn derive_generation_key(req: &Request<Body>) -> String {
     key
 }
 
-async fn load_generation(backend: &dyn CacheBackend, gen_key: &str) -> u64 {
+async fn load_generation(backend: &dyn CacheBackend, gen_key: &str) -> u128 {
     backend
         .get(gen_key)
         .await
         .ok()
         .flatten()
-        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
-        .map(u64::from_be_bytes)
+        .and_then(|bytes| <[u8; 16]>::try_from(bytes.as_slice()).ok())
+        .map(u128::from_be_bytes)
         .unwrap_or(0)
 }
 
 async fn bump_generation(backend: &dyn CacheBackend, gen_key: &str, ttl: Duration) {
-    let next = load_generation(backend, gen_key).await.wrapping_add(1);
-    // Why: keep the generation counter alive at least twice as long as cached entries so
-    // it never expires before entries written under the previous generation, guaranteeing
-    // O(1) atomic invalidation across all `Vary` variants without scanning backend keys.
+    // Why: write a random 128-bit UUID v4 generation token directly without reading
+    // any prior counter. A sequential `u64` RMW counter resets to `1` whenever `gen_key`
+    // expires or is evicted, which can collide with a still-live entry cached under
+    // generation `1` and resurrect stale data (`RC-03`).
+    let token = uuid::Uuid::new_v4().as_u128();
     let _ = backend
         .set(
             gen_key,
-            next.to_be_bytes().to_vec(),
+            token.to_be_bytes().to_vec(),
             Some(ttl.saturating_mul(2)),
         )
         .await;
 }
 
-fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u64) -> String {
+fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u128) -> String {
     let pq = req
         .uri()
         .path_and_query()
@@ -1794,6 +1795,98 @@ mod tests {
             r2.status(),
             StatusCode::NOT_MODIFIED,
             "second If-None-Match header line must be evaluated"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn expired_generation_key_never_resurrects_stale_cached_entry() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let version = Arc::new(AtomicUsize::new(1));
+        let v_get = Arc::clone(&version);
+        let v_put = Arc::clone(&version);
+
+        let app = Router::new()
+            .route(
+                "/doc",
+                get(move || {
+                    let v = v_get.load(Ordering::SeqCst);
+                    async move { format!("v{v}") }
+                })
+                .put(move || {
+                    let v_put = Arc::clone(&v_put);
+                    async move {
+                        v_put.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(
+                backend,
+                HttpCacheConfig::new().with_ttl(Duration::from_secs(10)),
+            ));
+
+        // t = 0s: PUT sets v=2 and writes gen_key (expires at t=20s).
+        let r_put1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_put1.status(), StatusCode::NO_CONTENT);
+
+        // t = 15s: GET caches "v2" under gen_1 (entry expires at t=25s).
+        tokio::time::advance(Duration::from_secs(15)).await;
+        let r_get1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_get1.into_body(), usize::MAX).await.unwrap(),
+            b"v2".as_slice()
+        );
+
+        // t = 21s: gen_key expired at t=20s while the cached "v2" entry still lives until t=25s.
+        // PUT bumps to v=3 and writes a fresh random UUID v4 generation token (never colliding with gen_1).
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let r_put2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_put2.status(), StatusCode::NO_CONTENT);
+
+        // GET at t=21s MUST return "v3" and never resurrect stale "v2".
+        let r_get2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_get2.into_body(), usize::MAX).await.unwrap(),
+            b"v3".as_slice()
         );
     }
 }

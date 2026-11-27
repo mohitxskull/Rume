@@ -65,7 +65,7 @@ pub trait CacheBackend: Debug + Send + Sync + 'static {
 }
 
 type CacheMap = std::sync::Arc<
-    tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<std::time::Instant>)>>,
+    tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<tokio::time::Instant>)>>,
 >;
 
 #[derive(Debug, Default)]
@@ -134,7 +134,7 @@ impl CacheBackend for InMemoryCacheBackend {
     fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let expired = {
                 let map = self.entries.read().await;
                 if let Some((val, expires_at)) = map.get(&key) {
@@ -157,7 +157,7 @@ impl CacheBackend for InMemoryCacheBackend {
                 let mut map = self.entries.write().await;
                 if map
                     .get(&key)
-                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| tokio::time::Instant::now() >= e))
                 {
                     map.remove(&key);
                     tag_index.remove_key(&key);
@@ -175,7 +175,7 @@ impl CacheBackend for InMemoryCacheBackend {
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             // Why: use `checked_add` so huge TTLs (e.g. `Duration::MAX`) never panic
             // on `Instant` overflow; an unrepresentably distant expiry is treated as no TTL.
             let expires_at = ttl.and_then(|t| now.checked_add(t));
@@ -201,7 +201,7 @@ impl CacheBackend for InMemoryCacheBackend {
             // publish a value without its tag memberships.
             let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let expires_at = ttl.and_then(|t| now.checked_add(t));
             map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
@@ -230,7 +230,7 @@ impl CacheBackend for InMemoryCacheBackend {
     fn exists(&self, key: &str) -> BoxFuture<'_, Result<bool, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let expired = {
                 let map = self.entries.read().await;
                 if let Some((_, expires_at)) = map.get(&key) {
@@ -250,7 +250,7 @@ impl CacheBackend for InMemoryCacheBackend {
                 let mut map = self.entries.write().await;
                 if map
                     .get(&key)
-                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| tokio::time::Instant::now() >= e))
                 {
                     map.remove(&key);
                     tag_index.remove_key(&key);
@@ -277,7 +277,7 @@ impl CacheBackend for InMemoryCacheBackend {
             for key in keys {
                 if let Some((_, expires_at)) = map.remove(&key) {
                     if let Some(exp) = expires_at
-                        && std::time::Instant::now() >= exp
+                        && tokio::time::Instant::now() >= exp
                     {
                         continue;
                     }

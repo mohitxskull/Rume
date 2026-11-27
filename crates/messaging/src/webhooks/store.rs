@@ -105,13 +105,15 @@ pub trait WebhookDeliveryStore: std::fmt::Debug + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>>;
 
     /// Conditionally updates a webhook delivery record only if its persisted status is still
-    /// [`WebhookDeliveryStatus::InFlight`].
+    /// [`WebhookDeliveryStatus::InFlight`] AND its persisted lease timestamp (`next_attempt_at`)
+    /// still matches `expected_lease`.
     ///
     /// Returns `Ok(true)` if the record was transitioned, or `Ok(false)` if another worker
-    /// already finalized the record (e.g. marked it `Delivered`) after this worker's lease expired.
+    /// already reclaimed or finalized the record after this worker's lease expired (`RC-02`).
     fn complete_delivery(
         &self,
         record: WebhookDeliveryRecord,
+        expected_lease: Option<DateTime<Utc>>,
     ) -> BoxFuture<'_, Result<bool, WebhookError>>;
 }
 
@@ -237,6 +239,7 @@ impl WebhookDeliveryStore for InMemoryWebhookDeliveryStore {
     fn complete_delivery(
         &self,
         record: WebhookDeliveryRecord,
+        expected_lease: Option<DateTime<Utc>>,
     ) -> BoxFuture<'_, Result<bool, WebhookError>> {
         Box::pin(async move {
             let mut guard = self
@@ -244,7 +247,10 @@ impl WebhookDeliveryStore for InMemoryWebhookDeliveryStore {
                 .write()
                 .map_err(|_| WebhookError::Store("webhook store lock poisoned".into()))?;
             match guard.get_mut(&record.id) {
-                Some(existing) if existing.status == WebhookDeliveryStatus::InFlight => {
+                Some(existing)
+                    if existing.status == WebhookDeliveryStatus::InFlight
+                        && existing.next_attempt_at == expected_lease =>
+                {
                     *existing = record;
                     Ok(true)
                 }
@@ -529,6 +535,7 @@ impl<B: DatabaseBackend> WebhookDeliveryStore for SqlWebhookDeliveryStore<B> {
     fn complete_delivery(
         &self,
         record: WebhookDeliveryRecord,
+        expected_lease: Option<DateTime<Utc>>,
     ) -> BoxFuture<'_, Result<bool, WebhookError>> {
         Box::pin(async move {
             let dialect = self.backend.dialect();
@@ -546,14 +553,24 @@ impl<B: DatabaseBackend> WebhookDeliveryStore for SqlWebhookDeliveryStore<B> {
                 Some(s) => DbValue::Text(s),
                 None => DbValue::Null,
             };
-            let params = [
+            let expected_lease_val = match expected_lease {
+                Some(dt) => DbValue::Text(format_ts(dialect, dt)),
+                None => DbValue::Null,
+            };
+            let mut params = vec![
                 DbValue::Text(record.status.as_str().to_string()),
                 DbValue::Int(i64::from(record.attempt)),
                 next_attempt_val,
                 last_response_val,
                 DbValue::Text(format_ts(dialect, record.updated_at)),
                 DbValue::Text(record.id),
+                expected_lease_val.clone(),
             ];
+            if dialect == "mysql" {
+                // Why: MySQL positional `?` references `expected_lease` twice in
+                // `((? IS NULL AND next_attempt_at IS NULL) OR next_attempt_at = CAST(? AS DATETIME(6)))`.
+                params.push(expected_lease_val);
+            }
             let affected = self
                 .backend
                 .execute_params(stmt, &params)

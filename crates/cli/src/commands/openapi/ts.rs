@@ -261,9 +261,13 @@ fn emit_operation_method(
     let return_type = extract_response_type(op);
 
     // Why: deduplicate all emitted parameter identifiers (path params, `query` bag, `body`)
-    // so routes such as `/search/{query}` with query parameters never emit duplicate
-    // parameter names (`query, query?: ...`) in TypeScript (`RC-20`).
-    let mut used_param_names = HashSet::new();
+    // AND reserve body-local `const` names (`url`, `res`, `searchParams`, `qs`) so routes
+    // such as `/search/{query}`, `/proxy/{url}`, or `/items/{res}` never emit duplicate
+    // parameter names or shadow method-body `const` bindings (`TS2451`, `RC-20`, `RC-06`).
+    let mut used_param_names: HashSet<String> = ["url", "res", "searchParams", "qs"]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
     let mut required_params = Vec::new();
     let mut optional_params = Vec::new();
     for p in &mut path_params {
@@ -1052,6 +1056,52 @@ mod tests {
         assert!(
             ts.contains("query_2?.limit"),
             "query bag body must reference deduplicated query_2 identifier:\n{ts}"
+        );
+    }
+
+    #[test]
+    fn reserves_body_local_names_so_path_params_never_shadow_url_or_res() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Local Shadowing Test", "version": "1.0.0" },
+            "paths": {
+                "/proxy/{url}": {
+                    "get": {
+                        "operationId": "proxyTarget",
+                        "parameters": [
+                            { "name": "url", "in": "path", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                },
+                "/items/{res}": {
+                    "get": {
+                        "operationId": "getItemByRes",
+                        "parameters": [
+                            { "name": "res", "in": "path", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        assert!(
+            ts.contains("async proxyTarget(url_2: string): Promise<void>"),
+            "path param `url` must be renamed so it does not shadow `const url`:\n{ts}"
+        );
+        assert!(
+            ts.contains("${encodeURIComponent(String(url_2))}"),
+            "URL template must reference renamed `url_2`:\n{ts}"
+        );
+        assert!(
+            ts.contains("async getItemByRes(res_2: string): Promise<void>"),
+            "path param `res` must be renamed so it does not shadow `const res`:\n{ts}"
+        );
+        assert!(
+            ts.contains("${encodeURIComponent(String(res_2))}"),
+            "URL template must reference renamed `res_2`:\n{ts}"
         );
     }
 }

@@ -312,6 +312,7 @@ async fn e2e_read_write_pool_routing_and_ryow_fallback() {
     // After the RYOW window expires, reads route back to the replica.
     tokio::time::pause();
     tokio::time::advance(Duration::from_millis(120)).await;
+    tokio::time::resume();
     assert!(!rw.is_within_ryow_window());
     let row_after = rw
         .fetch_one("SELECT source FROM markers", &[])
