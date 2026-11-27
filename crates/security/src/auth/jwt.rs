@@ -972,7 +972,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
     use hmac::{Hmac, KeyInit, Mac};
     use p256::ecdsa::SigningKey as P256SigningKey;
     use rsa::PrivateKey as RsaPrivateKey;
