@@ -248,12 +248,11 @@ where
 
 #[cfg(feature = "static-embed")]
 fn mime_type_for_path(path: &str) -> &'static str {
-    let ext = path
-        .rsplit('.')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    match ext.as_str() {
+    let ext = std::path::Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref().unwrap_or_default() {
         "html" | "htm" => "text/html; charset=utf-8",
         "js" | "mjs" => "application/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -370,5 +369,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+    }
+
+    #[cfg(feature = "static-embed")]
+    #[test]
+    fn mime_type_for_path_treats_extensionless_names_as_octet_stream() {
+        assert_eq!(mime_type_for_path("html"), "application/octet-stream");
+        assert_eq!(mime_type_for_path("svg"), "application/octet-stream");
+        assert_eq!(mime_type_for_path("js"), "application/octet-stream");
+        assert_eq!(mime_type_for_path("dir/html"), "application/octet-stream");
+        assert_eq!(mime_type_for_path("index.html"), "text/html; charset=utf-8");
+        assert_eq!(mime_type_for_path("logo.svg"), "image/svg+xml");
     }
 }

@@ -111,6 +111,11 @@ impl SamlParser {
                 Ok((_, Event::End(_))) => {
                     depth = depth.saturating_sub(1);
                 }
+                Ok((_, Event::DocType(_))) => {
+                    return Err(SamlError::Malformed(
+                        "DOCTYPE declarations are forbidden in SAML XML".into(),
+                    ));
+                }
                 Ok((_, Event::Eof)) => {
                     if depth != 0 {
                         return Err(SamlError::Malformed(

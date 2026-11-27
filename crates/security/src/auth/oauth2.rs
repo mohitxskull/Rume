@@ -4,6 +4,7 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 #[cfg(feature = "http-client")]
 use std::time::Duration;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -23,6 +24,7 @@ const MAX_DISCOVERY_RESPONSE_BYTES: usize = 1024 * 1024;
 #[cfg(feature = "http-client")]
 const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 
+#[cfg(test)]
 fn current_epoch_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -267,8 +269,12 @@ impl std::fmt::Debug for OAuth2AuthState {
 
 /// Async store for single-use OAuth2 authorization state.
 pub trait OAuth2StateStore: Send + Sync + 'static {
-    /// Saves an authorization state entry.
-    fn save(&self, state: OAuth2AuthState) -> BoxFuture<'_, Result<(), AuthError>>;
+    /// Saves an authorization state entry, pruning expired entries against `now_epoch_sec`.
+    fn save(
+        &self,
+        state: OAuth2AuthState,
+        now_epoch_sec: u64,
+    ) -> BoxFuture<'_, Result<(), AuthError>>;
 
     /// Atomically consumes and removes the entry for `state`.
     fn consume<'a>(
@@ -347,11 +353,14 @@ impl InMemoryOAuth2StateStore {
 }
 
 impl OAuth2StateStore for InMemoryOAuth2StateStore {
-    fn save(&self, state: OAuth2AuthState) -> BoxFuture<'_, Result<(), AuthError>> {
+    fn save(
+        &self,
+        state: OAuth2AuthState,
+        now_epoch_sec: u64,
+    ) -> BoxFuture<'_, Result<(), AuthError>> {
         Box::pin(async move {
-            let now = current_epoch_secs();
             let mut map = self.inner.write().await;
-            map.prune_expired(now);
+            map.prune_expired(now_epoch_sec);
             if !map.entries.contains_key(&state.state) && map.entries.len() >= self.max_entries {
                 return Err(AuthError::ProviderError(format!(
                     "OAuth2 state store capacity ({}) exceeded",
@@ -394,6 +403,17 @@ impl OAuth2Client {
         now_epoch_sec: u64,
         redirect_to: Option<String>,
     ) -> Result<(Url, OAuth2AuthState), AuthError> {
+        if let Some(ref target) = redirect_to {
+            let valid = target.starts_with('/')
+                && !target.starts_with("//")
+                && !target.bytes().any(|b| b == b'\\' || b.is_ascii_control());
+            if !valid {
+                return Err(AuthError::InvalidCredentials(
+                    "redirect_to must be a relative path starting with '/'".to_owned(),
+                ));
+            }
+        }
+
         let state = random_b64_token();
         let nonce = random_b64_token();
         let pkce = PkceChallenge::generate();
@@ -424,7 +444,7 @@ impl OAuth2Client {
             pairs.append_pair("code_challenge_method", "S256");
         }
 
-        store.save(auth_state.clone()).await?;
+        store.save(auth_state.clone(), now_epoch_sec).await?;
         Ok((url, auth_state))
     }
 
@@ -946,14 +966,17 @@ mod tests {
             expires_at,
         };
 
-        store.save(make("s1", now + 300)).await.unwrap();
-        store.save(make("s2", now + 300)).await.unwrap();
-        let err = store.save(make("s3", now + 300)).await.unwrap_err();
+        store.save(make("s1", now + 300), now).await.unwrap();
+        store.save(make("s2", now + 300), now).await.unwrap();
+        let err = store.save(make("s3", now + 300), now).await.unwrap_err();
         assert!(matches!(err, AuthError::ProviderError(ref m) if m.contains("capacity")));
 
         // Updating an existing key to expired and saving a new key prunes s1 and admits s3.
-        store.save(make("s1", now.saturating_sub(1))).await.unwrap();
-        store.save(make("s3", now + 300)).await.unwrap();
+        store
+            .save(make("s1", now.saturating_sub(1)), now)
+            .await
+            .unwrap();
+        store.save(make("s3", now + 300), now).await.unwrap();
     }
 
     #[test]
@@ -1004,5 +1027,55 @@ mod tests {
                 "unexpected error for {invalid}: {err:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn begin_authorization_rejects_unsafe_redirect_to_and_prunes_with_caller_clock() {
+        let client = OAuth2Client::new(OAuth2Config {
+            client_id: "rume-web".to_owned(),
+            client_secret: None,
+            authorization_endpoint: "https://idp.example.com/oauth2/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/oauth2/token".to_owned(),
+            redirect_uri: "https://app.example.com/callback".to_owned(),
+            scopes: vec!["openid".to_owned()],
+            issuer: Some("https://idp.example.com".to_owned()),
+            jwks_uri: None,
+        });
+        let store = InMemoryOAuth2StateStore::new().with_max_entries(1);
+
+        for bad in [
+            "https://evil.example/phish",
+            "//evil.example/phish",
+            "/\\evil.example",
+            "/ok\r\nSet-Cookie: a=b",
+            "relative/no-leading-slash",
+        ] {
+            let err = client
+                .begin_authorization(&store, 300, 1_000, Some(bad.to_owned()))
+                .await
+                .expect_err(&format!("expected redirect_to rejection for {bad:?}"));
+            assert!(matches!(err, AuthError::InvalidCredentials(_)));
+        }
+
+        // Caller-supplied clock `1_000` must not be prematurely pruned by wall-clock time.
+        let (_, s1) = client
+            .begin_authorization(&store, 300, 1_000, Some("/dashboard".to_owned()))
+            .await
+            .unwrap();
+        // Still live at t = 1_100 -> capacity 1 rejects a second state.
+        let cap_err = client
+            .begin_authorization(&store, 300, 1_100, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(cap_err, AuthError::ProviderError(_)));
+
+        // At t = 1_301, s1 is expired against the caller's clock and pruned cleanly.
+        let (_, s2) = client
+            .begin_authorization(&store, 300, 1_301, None)
+            .await
+            .unwrap();
+        assert_ne!(s1.state, s2.state);
+        assert!(store.consume(&s1.state).await.unwrap().is_none());
+        assert!(store.consume(&s2.state).await.unwrap().is_some());
     }
 }

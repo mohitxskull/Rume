@@ -38,11 +38,14 @@ pub fn resolve_rume_dependency(
 
     match path {
         Some(p) => {
-            let dep = format!("rume = {{ version = \"{version}\", path = \"{p}\" }}");
+            let version_lit = toml::Value::String(version.to_owned()).to_string();
+            let path_lit = toml::Value::String(p.clone()).to_string();
+            let dep = format!("rume = {{ version = {version_lit}, path = {path_lit} }}");
             (dep, Some(p))
         }
         None => {
-            let dep = format!("rume = \"{version}\"");
+            let version_lit = toml::Value::String(version.to_owned()).to_string();
+            let dep = format!("rume = {version_lit}");
             (dep, None)
         }
     }

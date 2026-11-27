@@ -776,10 +776,18 @@ where
                 return Ok(AppError::Unauthorized.into_response());
             };
 
-            let tenant_id = req
-                .extensions()
-                .get::<Tenant>()
-                .map(|t| t.id.clone())
+            let request_tenant = req.extensions().get::<Tenant>().map(|t| t.id.as_str());
+            // Why: fail closed whenever both the resolved request `Tenant` and the
+            // authenticated user's `tenant_id` are present and disagree, providing
+            // defense-in-depth independent of `TenantMembershipLayer` ordering (`RC-17`).
+            if let (Some(req_tid), Some(user_tid)) = (request_tenant, user.tenant_id.as_deref())
+                && req_tid != user_tid
+            {
+                return Ok(AppError::Forbidden.into_response());
+            }
+
+            let tenant_id = request_tenant
+                .map(str::to_owned)
                 .or_else(|| user.tenant_id.clone());
 
             let ctx = AbacContext {
@@ -1157,5 +1165,54 @@ mod tests {
                 .unwrap(),
             BTreeSet::from(["global:read".to_string()])
         );
+    }
+
+    #[tokio::test]
+    async fn dynamic_policy_service_fails_closed_on_tenant_mismatch() {
+        let store = Arc::new(InMemoryRoleStore::new());
+        store
+            .create_role(&Role {
+                id: "role-global".into(),
+                tenant_id: None,
+                name: "global-editor".into(),
+                description: String::new(),
+                permissions: vec!["invoice:write".into()],
+            })
+            .await
+            .unwrap();
+        store
+            .assign_role("user-1", None, "role-global")
+            .await
+            .unwrap();
+
+        let policy = Arc::new(RequireDynamicPermission::new(store, "invoice:write"));
+        let layer = DynamicPolicyLayer::new(policy, "write", "invoice");
+        let make_svc = || {
+            layer.layer(tower::service_fn(|_req: Request<Body>| async {
+                Ok::<_, std::convert::Infallible>(Response::new(Body::from("ok")))
+            }))
+        };
+
+        // User belongs to tenant-a, request targets tenant-b -> 403 Forbidden even with global role.
+        let mut mismatched = Request::builder().body(Body::empty()).unwrap();
+        mismatched
+            .extensions_mut()
+            .insert(AuthUser::new("user-1").with_tenant_id("tenant-a"));
+        mismatched
+            .extensions_mut()
+            .insert(Tenant::new("tenant-b", "tb"));
+        let resp = make_svc().oneshot(mismatched).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Matching tenant -> 200 OK.
+        let mut matched = Request::builder().body(Body::empty()).unwrap();
+        matched
+            .extensions_mut()
+            .insert(AuthUser::new("user-1").with_tenant_id("tenant-a"));
+        matched
+            .extensions_mut()
+            .insert(Tenant::new("tenant-a", "ta"));
+        let resp_ok = make_svc().oneshot(matched).await.unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
     }
 }

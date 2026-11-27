@@ -10,6 +10,6 @@ pub mod error;
 pub mod event;
 
 pub use bus::EventBus;
-pub use distributed::{DistributedEventBus, DistributedEventEnvelope};
+pub use distributed::{BridgeHandle, DistributedEventBus, DistributedEventEnvelope};
 pub use error::EventError;
 pub use event::{BoxFuture, Event, EventHandler};

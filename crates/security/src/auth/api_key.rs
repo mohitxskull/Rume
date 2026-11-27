@@ -9,10 +9,11 @@ use rand::distr::Alphanumeric;
 use rand::{Rng as _, RngExt as _};
 use rume_data::persistence::{DatabaseBackend, DatabaseTransaction, DbRow, DbValue};
 use rume_data::sql;
-use secrecy::{ExposeSecret, SecretString};
+use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
+use zeroize::Zeroizing;
 
 use crate::auth::error::AuthError;
 use crate::auth::session::BoxFuture;
@@ -141,10 +142,10 @@ fn generate_api_key(
     let prefix_rand: String = (0..12)
         .map(|_| char::from(rng.sample(Alphanumeric)))
         .collect();
-    let mut secret_bytes = [0u8; 32];
-    rng.fill_bytes(&mut secret_bytes);
-    let secret_b64 = URL_SAFE_NO_PAD.encode(secret_bytes);
-    let plaintext = format!("rk_{prefix_rand}_{secret_b64}");
+    let mut secret_bytes = Zeroizing::new([0u8; 32]);
+    rng.fill_bytes(secret_bytes.as_mut());
+    let secret_b64 = Zeroizing::new(URL_SAFE_NO_PAD.encode(*secret_bytes));
+    let plaintext = format!("rk_{prefix_rand}_{}", &*secret_b64);
     let prefix = plaintext[..12].to_string();
     let key_hash: [u8; 32] = Sha256::digest(plaintext.as_bytes()).into();
 
@@ -573,7 +574,6 @@ impl<B: DatabaseBackend> ApiKeyStore for SqlApiKeyStore<B> {
             tx.commit()
                 .await
                 .map_err(|e| AuthError::ProviderError(e.to_string()))?;
-            let _ = issued.plaintext.expose_secret();
             Ok(issued)
         })
     }

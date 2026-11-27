@@ -14,8 +14,11 @@ fn check_managed_tx_control_keywords(words: &[String]) -> Result<(), Persistence
     let third = words.get(2).map(String::as_str);
 
     let is_tx_control = match first {
-        "COMMIT" | "END" | "ABORT" | "BEGIN" => true,
-        "START" | "PREPARE" => second == Some("TRANSACTION"),
+        // Why: reject SQL-level `PREPARE`/`EXECUTE`/`DEALLOCATE` unconditionally so a raw
+        // batch cannot smuggle `PREPARE stmt FROM 'COMMIT'; EXECUTE stmt;` past static
+        // transaction-control validation (`RC-09`).
+        "COMMIT" | "END" | "ABORT" | "BEGIN" | "PREPARE" | "EXECUTE" | "DEALLOCATE" => true,
+        "START" => second == Some("TRANSACTION"),
         "ROLLBACK" => {
             let is_savepoint = second == Some("TO")
                 || (matches!(second, Some("WORK" | "TRANSACTION")) && third == Some("TO"));
@@ -525,7 +528,8 @@ fn is_mysql_implicit_commit_head(words: &[String]) -> bool {
         "CREATE" | "DROP" => second != Some("TEMPORARY"),
         "ALTER" | "TRUNCATE" | "RENAME" | "LOCK" | "UNLOCK" | "LOAD" | "GRANT" | "REVOKE"
         | "ANALYZE" | "CACHE" | "CHECK" | "FLUSH" | "OPTIMIZE" | "REPAIR" | "RESET" | "INSTALL"
-        | "UNINSTALL" | "XA" => true,
+        | "UNINSTALL" | "XA" | "STOP" | "CHANGE" | "IMPORT" | "CLONE" | "SHUTDOWN" => true,
+        "START" => matches!(second, Some("REPLICA" | "SLAVE" | "GROUP_REPLICATION")),
         "SET" => second == Some("PASSWORD"),
         _ => false,
     }
@@ -771,7 +775,7 @@ pub mod fuzz_support {
         let _ = validate_managed_transaction_sql(statement, &sqlparser::dialect::SQLiteDialect {});
         let _ = validate_managed_mysql_transaction_sql(statement);
         let _ = mysql_sql_causes_implicit_commit(statement);
-        let _ = crate::persistence::sqlite::reject_unbound_sqlite_placeholders(statement);
+        let _ = crate::persistence::sqlite::validate_sqlite_placeholders(statement, 0);
     }
 }
 
@@ -1247,6 +1251,66 @@ mod data_sql_scanners_proptests {
                 )
                 .is_ok(),
                 "valid MySQL DEFINER trigger must be allowed: {valid_definer_trigger}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_mysql_implicit_commit_admin_statements_and_dynamic_sql_prepare_execute() {
+        // MySQL 8.4 §15.3.3 implicit-commit replication/admin statements (`RC-09`).
+        for stmt in [
+            "STOP REPLICA;",
+            "STOP SLAVE;",
+            "CHANGE REPLICATION SOURCE TO SOURCE_HOST='127.0.0.1';",
+            "IMPORT TABLE FROM '/tmp/t.sdi';",
+            "CLONE LOCAL DATA DIRECTORY = '/tmp/clone';",
+            "SHUTDOWN;",
+            "START REPLICA;",
+            "START SLAVE;",
+            "START GROUP_REPLICATION;",
+        ] {
+            assert!(
+                matches!(
+                    validate_managed_mysql_transaction_sql(stmt),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "expected TransactionError in managed MySQL tx for: {stmt}"
+            );
+            assert!(
+                mysql_sql_causes_implicit_commit(stmt).expect("classify migration"),
+                "expected mysql_sql_causes_implicit_commit == true for: {stmt}"
+            );
+        }
+
+        // Dynamic SQL prepared statements (`PREPARE`/`EXECUTE`/`DEALLOCATE`) blocked across dialects (`RC-09`).
+        for stmt in [
+            "PREPARE stmt FROM 'COMMIT';",
+            "EXECUTE stmt;",
+            "DEALLOCATE PREPARE stmt;",
+        ] {
+            assert!(
+                matches!(
+                    validate_managed_mysql_transaction_sql(stmt),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "expected MySQL TransactionError for: {stmt}"
+            );
+            assert!(
+                matches!(
+                    mysql_sql_causes_implicit_commit(stmt),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "expected MySQL migration error for: {stmt}"
+            );
+            assert!(
+                matches!(
+                    validate_managed_transaction_sql(
+                        stmt,
+                        &sqlparser::dialect::PostgreSqlDialect {}
+                    ),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "expected Postgres TransactionError for: {stmt}"
             );
         }
     }

@@ -340,6 +340,12 @@ impl SamlParser {
                     .into(),
             ));
         }
+        if config.expected_issuer.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_issuer (IdP entity ID) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
         if config.expected_recipient.is_none() {
             return Err(SamlError::Malformed(
                 "expected_recipient (ACS URL) is required for SAML Web Browser SSO validation"
@@ -351,7 +357,17 @@ impl SamlParser {
                 "replay_cache is required for HTTP POST SAML Web Browser SSO validation".into(),
             ));
         }
+        // Why: SAML 2.0 HTTP POST Binding §3.5.5.2 requires verifying `<Response Destination="...">`
+        // whenever present; default to `expected_recipient` (ACS URL) when `expected_destination`
+        // was not explicitly configured (`RC-14`).
+        let effective_destination = config.expected_destination.or_else(|| {
+            assertion
+                .destination
+                .as_ref()
+                .and(config.expected_recipient)
+        });
         let enforced = SamlValidationConfig {
+            expected_destination: effective_destination,
             require_bearer_confirmation: true,
             ..*config
         };
@@ -651,13 +667,26 @@ impl SamlParser {
                     .into(),
             ));
         }
+        if config.expected_issuer.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_issuer (IdP entity ID) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
         if config.expected_recipient.is_none() {
             return Err(SamlError::Malformed(
                 "expected_recipient (ACS URL) is required for SAML Web Browser SSO validation"
                     .into(),
             ));
         }
+        let effective_destination = config.expected_destination.or_else(|| {
+            assertion
+                .destination
+                .as_ref()
+                .and(config.expected_recipient)
+        });
         let enforced = SamlValidationConfig {
+            expected_destination: effective_destination,
             require_bearer_confirmation: true,
             ..*config
         };

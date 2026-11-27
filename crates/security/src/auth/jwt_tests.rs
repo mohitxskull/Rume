@@ -763,3 +763,68 @@ fn parse_jwk_set_skips_malformed_key_when_valid_key_exists_and_fails_if_none_val
     .expect("all-malformed keyset must fail");
     assert!(matches!(err, AuthError::InvalidCredentials(_)));
 }
+
+#[test]
+fn jwk_debug_redacts_symmetric_key_material() {
+    let secret = "super-secret-oct-key-material";
+    let jwk = Jwk {
+        kty: "oct".to_owned(),
+        kid: Some("oct-1".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: None,
+        alg: Some("HS256".to_owned()),
+        n: None,
+        e: None,
+        crv: None,
+        x: None,
+        y: None,
+        k: Some(secret.to_owned()),
+    };
+    let dbg = format!("{jwk:?}");
+    assert!(dbg.contains("[REDACTED]"), "expected [REDACTED] in {dbg}");
+    assert!(
+        !dbg.contains(secret),
+        "Jwk Debug leaked symmetric key material: {dbg}"
+    );
+}
+
+#[test]
+fn parse_single_jwk_rejects_1024_bit_rsa_modulus() {
+    let mut rng = rand::rng();
+    let weak_key = RsaPrivateKey::new(&mut rng, 1024).unwrap();
+    let pub_key = weak_key.to_public_key();
+    let raw_n = pub_key.n().as_ref().to_be_bytes();
+    assert_eq!(raw_n.len(), 128);
+
+    // Raw 1024-bit modulus must be rejected.
+    let weak_jwk = Jwk {
+        kty: "RSA".to_owned(),
+        kid: Some("rsa-1024".to_owned()),
+        key_use: Some("sig".to_owned()),
+        key_ops: Some(vec!["verify".to_owned()]),
+        alg: Some("RS256".to_owned()),
+        n: Some(b64(&raw_n)),
+        e: Some(b64(&pub_key.e().to_be_bytes())),
+        crv: None,
+        x: None,
+        y: None,
+        k: None,
+    };
+    assert!(
+        parse_single_jwk(&weak_jwk).is_err(),
+        "1024-bit RSA JWK must be rejected"
+    );
+
+    // Leading-zero-padded 1024-bit modulus (256 bytes total) must also be rejected.
+    let mut padded_n = vec![0u8; 128];
+    padded_n.extend_from_slice(&raw_n);
+    assert_eq!(padded_n.len(), 256);
+    let padded_jwk = Jwk {
+        n: Some(b64(&padded_n)),
+        ..weak_jwk
+    };
+    assert!(
+        parse_single_jwk(&padded_jwk).is_err(),
+        "zero-padded 1024-bit RSA JWK must be rejected"
+    );
+}

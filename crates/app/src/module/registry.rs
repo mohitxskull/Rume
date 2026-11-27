@@ -143,13 +143,6 @@ impl ModuleRegistry {
         }
         Ok(order.into_iter().map(|name| map[name].clone()).collect())
     }
-
-    /// Resolve all registered modules in reverse topological shutdown order.
-    pub fn resolve_shutdown_modules(&self) -> Result<Vec<Arc<dyn Module>>, ModuleError> {
-        let mut modules = self.resolve_startup_modules()?;
-        modules.reverse();
-        Ok(modules)
-    }
 }
 
 #[cfg(test)]

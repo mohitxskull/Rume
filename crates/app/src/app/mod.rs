@@ -14,7 +14,8 @@ pub use builder::{BuildError, IntoBindAddr, MiddlewareConfigError, Rume, RumeBui
 pub use context::{AppContext, AppContextBuilder};
 pub use observability::{
     ObservabilityLayer, RequestId, TRACEPARENT, TRACESTATE, TraceContext, X_REQUEST_ID,
-    init_tracing, shutdown_global_observability, try_init_tracing,
+    init_tracing, shutdown_global_observability, shutdown_global_observability_async,
+    try_init_tracing,
 };
 pub use paths::ProjectPaths;
 pub use state::{

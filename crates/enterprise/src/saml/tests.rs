@@ -1048,6 +1048,21 @@ mod saml_parser_and_iso8601_proptests {
                 &full,
                 500,
                 &SamlValidationConfig {
+                    expected_issuer: Some("https://idp.example.com"),
+                    expected_recipient: Some("https://sp.example/acs"),
+                    replay_cache: Some(&cache),
+                    ..Default::default()
+                },
+            ),
+            Err(SamlError::Malformed(_))
+        ));
+        // 3b. Missing issuer fails closed (`RC-14`).
+        assert!(matches!(
+            SamlParser::validate_browser_sso(
+                &full,
+                500,
+                &SamlValidationConfig {
+                    expected_audience: Some("https://sp.example"),
                     expected_recipient: Some("https://sp.example/acs"),
                     replay_cache: Some(&cache),
                     ..Default::default()
@@ -1062,6 +1077,7 @@ mod saml_parser_and_iso8601_proptests {
                 500,
                 &SamlValidationConfig {
                     expected_audience: Some("https://sp.example"),
+                    expected_issuer: Some("https://idp.example.com"),
                     replay_cache: Some(&cache),
                     ..Default::default()
                 },
@@ -1075,6 +1091,7 @@ mod saml_parser_and_iso8601_proptests {
                 500,
                 &SamlValidationConfig {
                     expected_audience: Some("https://sp.example"),
+                    expected_issuer: Some("https://idp.example.com"),
                     expected_recipient: Some("https://sp.example/acs"),
                     ..Default::default()
                 },
@@ -1087,6 +1104,7 @@ mod saml_parser_and_iso8601_proptests {
         // and must still be rejected as `AssertionReplayed`.
         let cfg_skew_0 = SamlValidationConfig {
             expected_audience: Some("https://sp.example"),
+            expected_issuer: Some("https://idp.example.com"),
             expected_recipient: Some("https://sp.example/acs"),
             clock_skew_secs: 0,
             replay_cache: Some(&cache),
@@ -1094,6 +1112,7 @@ mod saml_parser_and_iso8601_proptests {
         };
         let cfg_skew_30 = SamlValidationConfig {
             expected_audience: Some("https://sp.example"),
+            expected_issuer: Some("https://idp.example.com"),
             expected_recipient: Some("https://sp.example/acs"),
             clock_skew_secs: 30,
             replay_cache: Some(&cache),
@@ -1113,6 +1132,7 @@ mod saml_parser_and_iso8601_proptests {
                 999,
                 &SamlValidationConfig {
                     expected_audience: Some("https://sp.example"),
+                    expected_issuer: Some("https://idp.example.com"),
                     expected_recipient: Some("https://sp.example/acs"),
                     clock_skew_secs: 60,
                     replay_cache: Some(&cache),
@@ -1129,6 +1149,83 @@ mod saml_parser_and_iso8601_proptests {
             SamlParser::validate_browser_sso(&full, 1029, &cfg_skew_30),
             Err(SamlError::Expired { .. })
         ));
+    }
+
+    #[test]
+    fn saml_rejects_doctype_and_defaults_response_destination_to_recipient() {
+        struct AcceptVerifier;
+        impl SamlSignatureVerifier for AcceptVerifier {
+            fn verify_assertion_signature(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<(), SamlError> {
+                Ok(())
+            }
+        }
+
+        // 1. DOCTYPE rejected in assertion parser and metadata discovery parser (`RC-14`).
+        let assertion_with_doctype = r##"<!DOCTYPE saml:Assertion [<!ENTITY xxe "boom">]>
+            <saml:Assertion xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" ID="_a_dt">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <saml:Subject><saml:NameID>alice@example.org</saml:NameID></saml:Subject>
+                <saml:Conditions NotOnOrAfter="1970-01-01T00:16:40Z"/>
+            </saml:Assertion>"##;
+        assert!(matches!(
+            SamlParser::parse_unverified(assertion_with_doctype),
+            Err(SamlError::Malformed(ref msg)) if msg.contains("DOCTYPE")
+        ));
+
+        let metadata_with_doctype = r##"<!DOCTYPE EntityDescriptor>
+            <md:EntityDescriptor xmlns:md="urn:oasis:names:tc:SAML:2.0:metadata" entityID="https://idp.example.com"/>"##;
+        assert!(matches!(
+            SamlParser::parse_entity_id(metadata_with_doctype),
+            Err(SamlError::Malformed(ref msg)) if msg.contains("DOCTYPE")
+        ));
+
+        // 2. When `<Response Destination="...">` is present and `expected_destination` is `None`,
+        // `validate_browser_sso` checks `Destination` against `expected_recipient`.
+        let xml_mismatched_dest = r##"<samlp:Response xmlns:samlp="urn:oasis:names:tc:SAML:2.0:protocol" xmlns:saml="urn:oasis:names:tc:SAML:2.0:assertion" xmlns:ds="http://www.w3.org/2000/09/xmldsig#" ID="_r_dest" Destination="https://other-sp.example/acs">
+            <saml:Assertion ID="_a_dest">
+                <saml:Issuer>https://idp.example.com</saml:Issuer>
+                <ds:Signature><ds:SignedInfo><ds:Reference URI="#_a_dest"/></ds:SignedInfo></ds:Signature>
+                <saml:Subject>
+                    <saml:NameID>alice@example.org</saml:NameID>
+                    <saml:SubjectConfirmation Method="urn:oasis:names:tc:SAML:2.0:cm:bearer">
+                        <saml:SubjectConfirmationData Recipient="https://sp.example/acs" NotOnOrAfter="1970-01-01T00:16:40Z"/>
+                    </saml:SubjectConfirmation>
+                </saml:Subject>
+                <saml:Conditions NotBefore="1970-01-01T00:00:01Z" NotOnOrAfter="1970-01-01T00:16:40Z">
+                    <saml:AudienceRestriction><saml:Audience>https://sp.example</saml:Audience></saml:AudienceRestriction>
+                </saml:Conditions>
+                <saml:AuthnStatement AuthnInstant="1970-01-01T00:00:05Z">
+                    <saml:AuthnContext>
+                        <saml:AuthnContextClassRef>urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport</saml:AuthnContextClassRef>
+                    </saml:AuthnContext>
+                </saml:AuthnStatement>
+            </saml:Assertion>
+        </samlp:Response>"##;
+        let parsed = SamlParser::parse_signed(xml_mismatched_dest, &AcceptVerifier).unwrap();
+        let cache = InMemorySamlReplayCache::new();
+        let err = SamlParser::validate_browser_sso(
+            &parsed,
+            500,
+            &SamlValidationConfig {
+                expected_audience: Some("https://sp.example"),
+                expected_issuer: Some("https://idp.example.com"),
+                expected_destination: None,
+                expected_recipient: Some("https://sp.example/acs"),
+                replay_cache: Some(&cache),
+                ..Default::default()
+            },
+        )
+        .expect_err("mismatched Response/@Destination must fail when expected_destination is None");
+        assert!(
+            matches!(err, SamlError::DestinationMismatch { ref expected, ref received }
+                if expected == "https://sp.example/acs" && received == "https://other-sp.example/acs"),
+            "expected DestinationMismatch, got {err:?}"
+        );
     }
 }
 
@@ -1528,6 +1625,27 @@ mod xmldsig_and_async_replay_tests {
         .await
         .expect_err("excessive clock skew must fail closed");
         assert!(matches!(skew_err, SamlError::Malformed(_)));
+
+        // Missing expected_issuer must fail closed in async browser SSO validation (`RC-14`).
+        let no_issuer_cfg = SamlValidationConfig {
+            expected_issuer: None,
+            ..cfg
+        };
+        let issuer_err =
+            SamlParser::validate_browser_sso_async(&assertion, 503, &no_issuer_cfg, &async_cache)
+                .await
+                .expect_err("missing expected_issuer must fail closed");
+        assert!(matches!(issuer_err, SamlError::Malformed(_)));
+
+        // XmlDsigSamlVerifier must reject DOCTYPE directly even if called outside SamlParser.
+        let doctype_xml = format!("<!DOCTYPE samlp:Response>{signed_xml}");
+        let doctype_err = verifier
+            .verify_assertion_signature(&doctype_xml, "_a_async_sso", &doctype_xml)
+            .expect_err("XmlDsigSamlVerifier must reject DOCTYPE");
+        assert!(matches!(
+            doctype_err,
+            SamlError::Malformed(ref msg) if msg.contains("DOCTYPE")
+        ));
     }
 
     #[cfg(feature = "redis")]

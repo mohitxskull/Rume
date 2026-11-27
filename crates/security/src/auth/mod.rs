@@ -36,7 +36,7 @@ pub use jwt::{
 pub use layer::{AuthLayer, FromExtension, PolicyLayer, PolicyResource};
 pub use mfa::{
     RecoveryCodeSet, TotpAlgorithm, TotpConfig, TotpSecret, WebAuthnAssertion, WebAuthnChallenge,
-    WebAuthnVerification, WebAuthnVerifier,
+    WebAuthnVerification,
 };
 #[cfg(feature = "http-client")]
 pub use oauth2::ReqwestOidcDiscoveryClient;

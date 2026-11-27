@@ -75,6 +75,8 @@ impl SamlSignatureVerifier for XmlDsigSamlVerifier {
             ));
         }
 
+        reject_doctype(raw_xml)?;
+
         let doc = uppsala::parse(raw_xml)
             .map_err(|e| SamlError::Malformed(format!("invalid XML document: {e}")))?;
 
@@ -150,6 +152,24 @@ impl SamlSignatureVerifier for XmlDsigSamlVerifier {
         Err(SamlError::InvalidSignature(
             last_invalid_reason.unwrap_or_else(|| "no valid XML-DSig signature found".into()),
         ))
+    }
+}
+
+fn reject_doctype(raw_xml: &str) -> Result<(), SamlError> {
+    let mut reader = quick_xml::Reader::from_str(raw_xml);
+    loop {
+        match reader.read_event() {
+            Ok(quick_xml::events::Event::DocType(_)) => {
+                return Err(SamlError::Malformed(
+                    "DOCTYPE declarations are forbidden in SAML XML".into(),
+                ));
+            }
+            Ok(quick_xml::events::Event::Eof) => return Ok(()),
+            Err(err) => {
+                return Err(SamlError::Malformed(format!("invalid XML document: {err}")));
+            }
+            _ => {}
+        }
     }
 }
 

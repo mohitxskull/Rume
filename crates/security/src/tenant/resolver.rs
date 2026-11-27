@@ -173,11 +173,12 @@ impl SubdomainTenantResolver {
 
     /// Attempts to register a tenant associated with a subdomain slug, returning an error on conflict.
     pub fn try_add_tenant(&self, tenant: Tenant) -> Result<(), TenantError> {
+        let slug_key = tenant.slug.to_ascii_lowercase();
         let mut map = self
             .tenants
             .write()
             .map_err(|e| TenantError::Internal(e.to_string()))?;
-        if let Some(existing) = map.get(&tenant.slug)
+        if let Some(existing) = map.get(&slug_key)
             && existing.id != tenant.id
         {
             return Err(TenantError::Conflict(format!(
@@ -185,7 +186,7 @@ impl SubdomainTenantResolver {
                 tenant.slug, existing.id
             )));
         }
-        map.insert(tenant.slug.clone(), tenant);
+        map.insert(slug_key, tenant);
         Ok(())
     }
 

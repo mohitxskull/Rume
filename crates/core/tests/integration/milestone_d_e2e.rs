@@ -485,7 +485,7 @@ async fn milestone_d_distributed_events_saga_and_broker_e2e() {
                 Ok(())
             }
         });
-    node_b
+    let _bridge_b = node_b
         .bridge::<OrderCreatedEvent>()
         .await
         .expect("bridge node_b");

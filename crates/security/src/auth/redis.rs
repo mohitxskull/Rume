@@ -92,18 +92,41 @@ impl Debug for RedisSessionStore {
     }
 }
 
+/// Ensures a Redis key prefix carries a non-empty `{...}` cluster hash tag so multi-key
+/// Lua scripts (`REGENERATE_ID_SCRIPT`) always map `KEYS[1]` and `KEYS[2]` to the same
+/// Redis Cluster hash slot and never fail with `CROSSSLOT` (`RC-04`).
+fn ensure_cluster_hash_tag(prefix: &str) -> String {
+    if let Some(open) = prefix.find('{')
+        && let Some(close_rel) = prefix[open + 1..].find('}')
+        && close_rel > 0
+    {
+        return prefix.to_string();
+    }
+    let trimmed = prefix.trim_end_matches(':');
+    if trimmed.is_empty() {
+        "{rume:session}:".to_string()
+    } else if prefix.ends_with(':') {
+        format!("{{{trimmed}}}:")
+    } else {
+        format!("{{{trimmed}}}")
+    }
+}
+
 impl RedisSessionStore {
     /// Creates a new session store using a `deadpool_redis::Pool`.
     pub fn new(pool: Pool) -> Self {
         Self {
             pool,
-            prefix: "rume:session:".to_string(),
+            prefix: "{rume:session}:".to_string(),
         }
     }
 
     /// Configures a custom key prefix for session isolation.
+    ///
+    /// Automatically wraps untagged prefixes in a Redis Cluster `{...}` hash tag so
+    /// [`SessionStore::regenerate_id`] never triggers `CROSSSLOT`.
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
-        self.prefix = prefix.into();
+        self.prefix = ensure_cluster_hash_tag(&prefix.into());
         self
     }
 
@@ -278,6 +301,31 @@ mod tests {
                 serde_json::from_str::<Session>(required_missing).is_err(),
                 "missing core field in {required_missing} must fail deserialization"
             );
+        }
+    }
+
+    #[test]
+    fn session_keys_share_identical_redis_cluster_hash_tag() {
+        fn extract_hash_tag(key: &str) -> Option<&str> {
+            let start = key.find('{')? + 1;
+            let end = start + key[start..].find('}')?;
+            (end > start).then_some(&key[start..end])
+        }
+
+        let pool = deadpool_redis::Config::from_url("redis://127.0.0.1:6379")
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool");
+
+        for store in [
+            RedisSessionStore::new(pool.clone()),
+            RedisSessionStore::new(pool.clone()).with_prefix("myapp:sess:"),
+            RedisSessionStore::new(pool).with_prefix("ns:{custom-slot}:sess:"),
+        ] {
+            let k1 = store.key("old-session-id-1");
+            let k2 = store.key("new-session-id-2");
+            let t1 = extract_hash_tag(&k1).expect("old key must carry a non-empty hash tag");
+            let t2 = extract_hash_tag(&k2).expect("new key must carry a non-empty hash tag");
+            assert_eq!(t1, t2, "regenerate_id keys must hash to the same slot");
         }
     }
 }

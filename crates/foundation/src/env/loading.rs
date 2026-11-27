@@ -259,7 +259,7 @@ where
     // happens here, per value, before interpolation.
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
-    let mut single_quoted_keys: BTreeSet<String> = BTreeSet::new();
+    let mut literal_file_keys: BTreeSet<String> = BTreeSet::new();
 
     for (path, label) in dotenv_candidates(dir, env_name) {
         if !path.is_file() {
@@ -272,15 +272,19 @@ where
         })?;
 
         for (key, raw_value, is_single_quoted) in parse_dotenv(&content, &path)? {
-            let value = resolve_value(raw_value, dir).map_err(|source| EnvError::Io {
-                path: path.clone(),
-                source,
-            })?;
+            let (value, is_file_sourced) =
+                resolve_value(raw_value, dir).map_err(|source| EnvError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
 
-            if is_single_quoted {
-                single_quoted_keys.insert(key.clone());
+            // Why: both single-quoted values and `file:`-sourced secrets must be treated
+            // as literal values so `${...}` sequences inside secret files are never
+            // interpolated or rejected at boot (`RC-15`).
+            if is_single_quoted || is_file_sourced {
+                literal_file_keys.insert(key.clone());
             } else {
-                single_quoted_keys.remove(&key);
+                literal_file_keys.remove(&key);
             }
             merged.insert(key.clone(), (value, label.clone()));
             file_keys.insert(key);
@@ -293,7 +297,7 @@ where
     // take precedence over file values. Process env keys are not added to
     // `file_keys` because they did not originate from an env file.
     for (key, value) in process_vars {
-        single_quoted_keys.remove(&key);
+        literal_file_keys.remove(&key);
         merged.insert(key, (value, "process env".to_string()));
     }
 
@@ -304,32 +308,31 @@ where
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
         .collect();
-    // Why: single-quoted `.env` values (`KEY='val${literal}'`) and process env
-    // variables must never be interpolated (`RC-36`).
+    // Why: single-quoted `.env` values (`KEY='val${literal}'`), `file:`-sourced
+    // secrets (`RC-15`), and process env variables must never be interpolated (`RC-36`).
     let mut literal_keys: BTreeSet<String> = merged
         .iter()
         .filter(|(_, (_, source))| source == "process env")
         .map(|(key, _)| key.clone())
         .collect();
-    literal_keys.extend(single_quoted_keys.iter().cloned());
+    literal_keys.extend(literal_file_keys.iter().cloned());
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
     // Why: only interpolate values whose winning source is an env file
-    // (`file_keys`, not overridden by `"process env"`, and not single-quoted). Inherited OS
-    // variables (e.g. `PS1`, shell prompts, CI runner vars, or a process
-    // `DATABASE_URL` whose password contains `${...}`) frequently contain
-    // literal `${...}` syntax unrelated to Rume; interpolating them would
-    // fail boot or corrupt credentials on healthy environments.
-    // Process-env and single-quoted values still remain in `vars` as lookup targets so file
-    // variables can reference them, and `literal_keys` ensures they are substituted verbatim
-    // without recursive `${...}` expansion.
+    // (`file_keys`, not overridden by `"process env"`, and not marked literal via
+    // single quotes or `file:` loading). Inherited OS variables and mounted secret files
+    // frequently contain literal `${...}` syntax unrelated to Rume; interpolating them
+    // would fail boot or corrupt credentials on healthy environments.
+    // Process-env, single-quoted, and `file:` values still remain in `vars` as lookup
+    // targets so file variables can reference them, and `literal_keys` ensures they are
+    // substituted verbatim without recursive `${...}` expansion.
     for (key, (value, source)) in &merged {
         let resolved_value = if file_keys.contains(key)
             && source != "process env"
-            && !single_quoted_keys.contains(key)
+            && !literal_file_keys.contains(key)
         {
             interpolate_value_with_literals(value, &vars, &literal_keys)?
         } else {
@@ -553,10 +556,10 @@ fn dotenv_candidates(dir: &Path, env_name: &str) -> Vec<(PathBuf, String)> {
     candidates
 }
 
-fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
+fn resolve_value(value: String, dir: &Path) -> std::io::Result<(String, bool)> {
     // Escaped literal: "file\:not-a-path" -> "file:not-a-path".
     if let Some(rest) = value.strip_prefix("file\\:") {
-        return Ok(format!("file:{rest}"));
+        return Ok((format!("file:{rest}"), false));
     }
 
     if let Some(path) = value.strip_prefix("file:") {
@@ -582,12 +585,15 @@ fn resolve_value(value: String, dir: &Path) -> std::io::Result<String> {
 
         let contents = fs::read_to_string(&canonical_full)?;
         // Environment values conventionally do not carry a trailing newline.
-        Ok(contents
-            .trim_end_matches('\n')
-            .trim_end_matches('\r')
-            .to_string())
+        Ok((
+            contents
+                .trim_end_matches('\n')
+                .trim_end_matches('\r')
+                .to_string(),
+            true,
+        ))
     } else {
-        Ok(value)
+        Ok((value, false))
     }
 }
 
@@ -644,7 +650,26 @@ mod tests {
         std::fs::write(&file_path, "test content").unwrap();
         let result = resolve_value("file:rume_env_test_file.txt".to_string(), dir.path());
         assert!(result.is_ok());
-        assert_eq!(result.unwrap(), "test content");
+        assert_eq!(result.unwrap(), ("test content".to_string(), true));
+    }
+
+    #[test]
+    fn file_secret_containing_interpolation_syntax_is_preserved_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("db.secret"), "p@ss${OTHER_VAR}word\n").unwrap();
+        std::fs::write(
+            dir.path().join(".env"),
+            "OTHER_VAR=expanded\nDB_PASSWORD=file:db.secret\nCONN_STR=postgres://u:${DB_PASSWORD}@h/db\n",
+        )
+        .unwrap();
+
+        let resolved =
+            load_merged_map_for_env_with_vars(dir.path(), "test", std::iter::empty()).unwrap();
+        assert_eq!(resolved.get("DB_PASSWORD"), Some("p@ss${OTHER_VAR}word"));
+        assert_eq!(
+            resolved.get("CONN_STR"),
+            Some("postgres://u:p@ss${OTHER_VAR}word@h/db")
+        );
     }
 
     #[test]

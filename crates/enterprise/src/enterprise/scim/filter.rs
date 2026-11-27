@@ -567,8 +567,8 @@ fn compare_f64(a: f64, op: ScimFilterOp, b: f64) -> bool {
         return false;
     }
     match op {
-        ScimFilterOp::Eq => (a - b).abs() <= f64::EPSILON,
-        ScimFilterOp::Ne => (a - b).abs() > f64::EPSILON,
+        ScimFilterOp::Eq => a == b,
+        ScimFilterOp::Ne => a != b,
         ScimFilterOp::Gt => a > b,
         ScimFilterOp::Ge => a >= b,
         ScimFilterOp::Lt => a < b,

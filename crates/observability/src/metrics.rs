@@ -56,7 +56,7 @@ fn http_method_label(method: &str) -> &'static str {
 // `opentelemetry_sdk`'s `testing` feature from production dependencies. Revisit when
 // `ManualReader` stabilizes without the `experimental_*` feature flag.
 #[derive(Debug)]
-struct SharedManualReader(Arc<ManualReader>);
+pub(crate) struct SharedManualReader(pub(crate) Arc<ManualReader>);
 
 impl MetricReader for SharedManualReader {
     fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
@@ -78,6 +78,30 @@ impl MetricReader for SharedManualReader {
     fn temporality(&self, kind: InstrumentKind) -> Temporality {
         self.0.temporality(kind)
     }
+}
+
+/// Attaches the shared [`ManualReader`] and the `http_request_duration_seconds` explicit-bucket
+/// histogram view to an [`SdkMeterProvider`] builder so both [`crate::otel::ObservabilityBuilder`]
+/// and standalone [`MetricsRegistry`] share identical metric instrumentation (`RC-06`).
+pub(crate) fn configure_meter_provider_builder(
+    builder: opentelemetry_sdk::metrics::MeterProviderBuilder,
+    manual_reader: Arc<ManualReader>,
+) -> opentelemetry_sdk::metrics::MeterProviderBuilder {
+    builder
+        .with_reader(SharedManualReader(manual_reader))
+        .with_view(|instrument: &Instrument| {
+            if instrument.name() == "http_request_duration_seconds" {
+                Stream::builder()
+                    .with_aggregation(Aggregation::ExplicitBucketHistogram {
+                        boundaries: HISTOGRAM_BUCKETS.to_vec(),
+                        record_min_max: true,
+                    })
+                    .build()
+                    .ok()
+            } else {
+                None
+            }
+        })
 }
 
 /// Trait for types that can export database connection pool metrics into [`MetricsRegistry`].
@@ -157,6 +181,7 @@ impl std::fmt::Debug for MetricsRegistry {
 struct Inner {
     manual_reader: Arc<ManualReader>,
     meter_provider: SdkMeterProvider,
+    owns_provider: bool,
     shut_down: AtomicBool,
     #[cfg(feature = "otel")]
     has_otlp_exporter: bool,
@@ -177,6 +202,9 @@ struct Inner {
 
 impl Drop for Inner {
     fn drop(&mut self) {
+        if !self.owns_provider {
+            return;
+        }
         if self.shut_down.swap(true, Ordering::AcqRel) {
             return;
         }
@@ -198,50 +226,70 @@ impl Drop for Inner {
 }
 
 impl MetricsRegistry {
-    /// Creates a new metrics registry backed by an OpenTelemetry `SdkMeterProvider`
-    /// with a [`ManualReader`] (and OTLP periodic exporter when `feature = "otel"`
-    /// is enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
+    /// Creates a new metrics registry backed by an OpenTelemetry `SdkMeterProvider`.
+    ///
+    /// When [`crate::otel::init_tracing`] / [`crate::otel::try_init_tracing`] has installed a
+    /// live global [`crate::otel::ObservabilityGuard`], this registry reuses its unified
+    /// `SdkMeterProvider` and [`ManualReader`] (with `owns_provider: false`) instead of
+    /// constructing a duplicate provider (`RC-06`). Otherwise it builds a standalone
+    /// `SdkMeterProvider` (attaching an OTLP periodic exporter when `feature = "otel"` is
+    /// enabled and `OTEL_EXPORTER_OTLP_ENDPOINT` is set).
     pub fn new() -> Self {
-        let manual_reader = Arc::new(ManualReader::builder().build());
-        let builder = SdkMeterProvider::builder()
-            .with_reader(SharedManualReader(Arc::clone(&manual_reader)))
-            .with_view(|instrument: &Instrument| {
-                if instrument.name() == "http_request_duration_seconds" {
-                    Stream::builder()
-                        .with_aggregation(Aggregation::ExplicitBucketHistogram {
-                            boundaries: HISTOGRAM_BUCKETS.to_vec(),
-                            record_min_max: true,
-                        })
+        let (manual_reader, meter_provider, owns_provider, has_otlp_exporter) = if let Some(guard) =
+            crate::otel::global_observability_guard().filter(|g| !g.is_shut_down())
+        {
+            (
+                guard.manual_reader(),
+                guard.meter_provider().clone(),
+                false,
+                false,
+            )
+        } else {
+            let manual_reader = Arc::new(ManualReader::builder().build());
+            let builder = configure_meter_provider_builder(
+                SdkMeterProvider::builder(),
+                Arc::clone(&manual_reader),
+            );
+
+            #[cfg(feature = "otel")]
+            let (builder, has_otlp_exporter) = {
+                use opentelemetry_otlp::{Protocol, WithExportConfig};
+                let mut builder = builder;
+                let mut attached = false;
+                if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                    && !endpoint.trim().is_empty()
+                {
+                    let normalized =
+                        crate::otel::normalize_otlp_http_endpoint(&endpoint, "/v1/metrics");
+                    match opentelemetry_otlp::MetricExporter::builder()
+                        .with_http()
+                        .with_protocol(Protocol::HttpBinary)
+                        .with_endpoint(normalized.clone())
                         .build()
-                        .ok()
-                } else {
-                    None
+                    {
+                        Ok(otlp_exporter) => {
+                            builder = builder.with_periodic_exporter(otlp_exporter);
+                            attached = true;
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                endpoint = %normalized,
+                                error = %err,
+                                "failed to build OTLP metric exporter for standalone MetricsRegistry; continuing with ManualReader only"
+                            );
+                        }
+                    }
                 }
-            });
+                (builder, attached)
+            };
+            #[cfg(not(feature = "otel"))]
+            let has_otlp_exporter = false;
 
-        #[cfg(feature = "otel")]
-        let (builder, has_otlp_exporter) = {
-            use opentelemetry_otlp::{Protocol, WithExportConfig};
-            let mut builder = builder;
-            let mut attached = false;
-            if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
-                && !endpoint.trim().is_empty()
-                && let Ok(otlp_exporter) = opentelemetry_otlp::MetricExporter::builder()
-                    .with_http()
-                    .with_protocol(Protocol::HttpBinary)
-                    .with_endpoint(crate::otel::normalize_otlp_http_endpoint(
-                        &endpoint,
-                        "/v1/metrics",
-                    ))
-                    .build()
-            {
-                builder = builder.with_periodic_exporter(otlp_exporter);
-                attached = true;
-            }
-            (builder, attached)
+            (manual_reader, builder.build(), true, has_otlp_exporter)
         };
+        #[cfg(not(feature = "otel"))]
+        let _ = has_otlp_exporter;
 
-        let meter_provider = builder.build();
         let meter = meter_provider.meter("rume");
 
         let requests_total = meter
@@ -307,6 +355,7 @@ impl MetricsRegistry {
             inner: Arc::new(Inner {
                 manual_reader,
                 meter_provider,
+                owns_provider,
                 shut_down: AtomicBool::new(false),
                 #[cfg(feature = "otel")]
                 has_otlp_exporter,
@@ -332,8 +381,13 @@ impl MetricsRegistry {
     /// before runtime teardown cannot deadlock a `current_thread` Tokio runtime
     /// and ensures final OTLP exports complete before process exit.
     ///
-    /// Subsequent calls (including [`Drop`]) are no-ops.
+    /// When this registry shares the global provider installed by [`crate::otel::init_tracing`],
+    /// shutdown is managed by [`crate::otel::shutdown_global_observability_async`] and this
+    /// method is a no-op. Subsequent calls (including [`Drop`]) are no-ops.
     pub async fn shutdown(&self) -> OTelSdkResult {
+        if !self.inner.owns_provider {
+            return Ok(());
+        }
         if self.inner.shut_down.swap(true, Ordering::AcqRel) {
             return Ok(());
         }

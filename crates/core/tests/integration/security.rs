@@ -223,6 +223,7 @@ async fn test_csrf_signed_tokens_and_cookie_tossing_protection() {
     let secret = b"super-secret-hmac-key-for-csrf-protection";
     let csrf_config = CsrfConfig::new()
         .with_secret(*secret)
+        .unwrap()
         .with_auto_inject_cookie(true)
         .with_same_site("Strict");
 
@@ -382,6 +383,7 @@ async fn test_csrf_split_cookie_headers() {
     let secret = b"super-secret-hmac-key-for-split-cookies";
     let csrf_config = CsrfConfig::new()
         .with_secret(secret.to_vec())
+        .unwrap()
         .with_header("x-csrf-token")
         .with_cookie("csrf_token");
 

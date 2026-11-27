@@ -8,7 +8,6 @@ use sha2::{Digest, Sha256, Sha512};
 use zeroize::Zeroizing;
 
 use crate::auth::error::AuthError;
-use crate::auth::session::BoxFuture;
 
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const RECOVERY_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
@@ -409,16 +408,6 @@ pub struct WebAuthnVerification {
     pub user_id: String,
     /// Updated signature counter.
     pub sign_count: u32,
-}
-
-/// Pluggable async boundary for WebAuthn / FIDO2 assertion verification.
-pub trait WebAuthnVerifier: Send + Sync + 'static {
-    /// Verifies a WebAuthn assertion against a previously issued challenge.
-    fn verify_assertion<'a>(
-        &'a self,
-        challenge: &'a WebAuthnChallenge,
-        assertion: &'a WebAuthnAssertion,
-    ) -> BoxFuture<'a, Result<WebAuthnVerification, AuthError>>;
 }
 
 #[cfg(test)]

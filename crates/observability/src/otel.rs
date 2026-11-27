@@ -1,6 +1,7 @@
 //! OpenTelemetry subscriber initialization (`SdkTracerProvider`, `SdkMeterProvider`, `SdkLoggerProvider`)
 //! and optional OTLP export (`feature = "otel"`).
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use opentelemetry::global;
@@ -8,12 +9,19 @@ use opentelemetry::trace::TracerProvider as _;
 use opentelemetry_appender_tracing::layer::OpenTelemetryTracingBridge;
 use opentelemetry_sdk::Resource;
 use opentelemetry_sdk::logs::SdkLoggerProvider;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
+use opentelemetry_sdk::metrics::{ManualReader, SdkMeterProvider};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
+
+type BuiltProviders = (
+    SdkTracerProvider,
+    SdkMeterProvider,
+    SdkLoggerProvider,
+    Arc<ManualReader>,
+);
 
 /// Guard that shuts down OpenTelemetry providers when dropped.
 #[derive(Debug)]
@@ -21,6 +29,7 @@ pub struct ObservabilityGuard {
     tracer_provider: SdkTracerProvider,
     meter_provider: SdkMeterProvider,
     logger_provider: SdkLoggerProvider,
+    manual_reader: Arc<ManualReader>,
     shut_down: AtomicBool,
 }
 
@@ -38,6 +47,16 @@ impl ObservabilityGuard {
     /// Returns a reference to the underlying [`SdkLoggerProvider`].
     pub fn logger_provider(&self) -> &SdkLoggerProvider {
         &self.logger_provider
+    }
+
+    /// Returns a shared handle to the [`ManualReader`] attached to [`Self::meter_provider`].
+    pub fn manual_reader(&self) -> Arc<ManualReader> {
+        Arc::clone(&self.manual_reader)
+    }
+
+    /// Returns `true` if this guard has already been shut down.
+    pub fn is_shut_down(&self) -> bool {
+        self.shut_down.load(Ordering::Acquire)
     }
 
     /// Explicitly shuts down all OpenTelemetry providers synchronously.
@@ -160,7 +179,8 @@ impl ObservabilityBuilder {
             .with_service_name(self.service_name.clone())
             .build();
 
-        let (tracer_provider, meter_provider, logger_provider) = self.build_providers(resource)?;
+        let (tracer_provider, meter_provider, logger_provider, manual_reader) =
+            self.build_providers(resource)?;
 
         let tracer = tracer_provider.tracer("rume");
         let otel_trace_layer = tracing_opentelemetry::layer().with_tracer(tracer);
@@ -200,6 +220,7 @@ impl ObservabilityBuilder {
             tracer_provider,
             meter_provider,
             logger_provider,
+            manual_reader,
             shut_down: AtomicBool::new(false),
         })
     }
@@ -208,29 +229,33 @@ impl ObservabilityBuilder {
     fn build_providers(
         &self,
         resource: Resource,
-    ) -> Result<
-        (SdkTracerProvider, SdkMeterProvider, SdkLoggerProvider),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<BuiltProviders, Box<dyn std::error::Error + Send + Sync>> {
+        let manual_reader = Arc::new(ManualReader::builder().build());
         let tracer_provider = SdkTracerProvider::builder()
             .with_resource(resource.clone())
             .build();
-        let meter_provider = SdkMeterProvider::builder()
-            .with_resource(resource.clone())
-            .build();
+        let meter_provider = crate::metrics::configure_meter_provider_builder(
+            SdkMeterProvider::builder().with_resource(resource.clone()),
+            Arc::clone(&manual_reader),
+        )
+        .build();
         let logger_provider = SdkLoggerProvider::builder().with_resource(resource).build();
-        Ok((tracer_provider, meter_provider, logger_provider))
+        Ok((
+            tracer_provider,
+            meter_provider,
+            logger_provider,
+            manual_reader,
+        ))
     }
 
     #[cfg(feature = "otel")]
     fn build_providers(
         &self,
         resource: Resource,
-    ) -> Result<
-        (SdkTracerProvider, SdkMeterProvider, SdkLoggerProvider),
-        Box<dyn std::error::Error + Send + Sync>,
-    > {
+    ) -> Result<BuiltProviders, Box<dyn std::error::Error + Send + Sync>> {
         use opentelemetry_otlp::{Protocol, WithExportConfig};
+
+        let manual_reader = Arc::new(ManualReader::builder().build());
 
         let Some(endpoint) = self
             .otlp_endpoint
@@ -241,11 +266,18 @@ impl ObservabilityBuilder {
             let tracer_provider = SdkTracerProvider::builder()
                 .with_resource(resource.clone())
                 .build();
-            let meter_provider = SdkMeterProvider::builder()
-                .with_resource(resource.clone())
-                .build();
+            let meter_provider = crate::metrics::configure_meter_provider_builder(
+                SdkMeterProvider::builder().with_resource(resource.clone()),
+                Arc::clone(&manual_reader),
+            )
+            .build();
             let logger_provider = SdkLoggerProvider::builder().with_resource(resource).build();
-            return Ok((tracer_provider, meter_provider, logger_provider));
+            return Ok((
+                tracer_provider,
+                meter_provider,
+                logger_provider,
+                manual_reader,
+            ));
         };
 
         let trace_endpoint = normalize_otlp_http_endpoint(endpoint, "/v1/traces");
@@ -274,10 +306,12 @@ impl ObservabilityBuilder {
                 return Err(err.into());
             }
         };
-        let meter_provider = SdkMeterProvider::builder()
-            .with_resource(resource.clone())
-            .with_periodic_exporter(metric_exporter)
-            .build();
+        let meter_provider = crate::metrics::configure_meter_provider_builder(
+            SdkMeterProvider::builder().with_resource(resource.clone()),
+            Arc::clone(&manual_reader),
+        )
+        .with_periodic_exporter(metric_exporter)
+        .build();
 
         let log_endpoint = normalize_otlp_http_endpoint(endpoint, "/v1/logs");
         let log_exporter = match opentelemetry_otlp::LogExporter::builder()
@@ -298,7 +332,12 @@ impl ObservabilityBuilder {
             .with_batch_exporter(log_exporter)
             .build();
 
-        Ok((tracer_provider, meter_provider, logger_provider))
+        Ok((
+            tracer_provider,
+            meter_provider,
+            logger_provider,
+            manual_reader,
+        ))
     }
 }
 
@@ -323,12 +362,26 @@ pub(crate) fn normalize_otlp_http_endpoint(base: &str, signal_path: &str) -> Str
 static GLOBAL_OBSERVABILITY_GUARD: std::sync::OnceLock<ObservabilityGuard> =
     std::sync::OnceLock::new();
 
+pub(crate) fn global_observability_guard() -> Option<&'static ObservabilityGuard> {
+    GLOBAL_OBSERVABILITY_GUARD.get()
+}
+
 /// Flushes and shuts down the global observability providers installed by [`try_init_tracing`].
 ///
 /// Safe to call multiple times or when [`try_init_tracing`] was never called.
 pub fn shutdown_global_observability() {
     if let Some(guard) = GLOBAL_OBSERVABILITY_GUARD.get() {
         guard.shutdown();
+    }
+}
+
+/// Asynchronously flushes and shuts down the global observability providers installed by
+/// [`try_init_tracing`] without blocking the calling Tokio runtime thread (`RC-06`).
+///
+/// Safe to call multiple times or when [`try_init_tracing`] was never called.
+pub async fn shutdown_global_observability_async() {
+    if let Some(guard) = GLOBAL_OBSERVABILITY_GUARD.get() {
+        guard.shutdown_async().await;
     }
 }
 
@@ -401,15 +454,41 @@ mod tests {
     async fn dropping_observability_guard_in_current_thread_runtime_does_not_deadlock() {
         let resource = Resource::builder().with_service_name("test").build();
         let builder = ObservabilityBuilder::new();
-        let (tracer_provider, meter_provider, logger_provider) =
+        let (tracer_provider, meter_provider, logger_provider, manual_reader) =
             builder.build_providers(resource).expect("build providers");
         let guard = ObservabilityGuard {
             tracer_provider,
             meter_provider,
             logger_provider,
+            manual_reader,
             shut_down: AtomicBool::new(false),
         };
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn metrics_registry_shares_global_provider_and_async_shutdown_is_idempotent() {
+        let _global_guard = test_global_otel_lock().lock().await;
+        init_tracing();
+
+        // MetricsRegistry::new() works seamlessly with init_tracing(), records HTTP metrics,
+        // and dropping it does not shut down the global provider.
+        let registry = crate::metrics::MetricsRegistry::new();
+        registry.record_http_request("GET", 200, std::time::Duration::from_millis(15));
+        let snap = registry.snapshot();
+        assert!(
+            snap.counter_u64(
+                "http_requests_total",
+                &[("method", "GET"), ("status", "200")]
+            )
+            .unwrap_or(0)
+                >= 1
+        );
+        drop(registry);
+
+        // Async global shutdown is safe and idempotent.
+        shutdown_global_observability_async().await;
+        shutdown_global_observability_async().await;
     }
 
     #[cfg(feature = "otel")]
@@ -418,7 +497,7 @@ mod tests {
         let builder = ObservabilityBuilder::new().with_otlp_endpoint("   ");
         assert!(builder.otlp_endpoint.is_none());
         let resource = Resource::builder().with_service_name("test").build();
-        let (t, m, l) = builder.build_providers(resource).expect("build providers");
+        let (t, m, l, _reader) = builder.build_providers(resource).expect("build providers");
         let _ = t.shutdown();
         let _ = m.shutdown();
         let _ = l.shutdown();
@@ -476,7 +555,7 @@ mod tests {
 
         let resource = Resource::builder().with_service_name("otel-test").build();
         let builder = ObservabilityBuilder::new().with_otlp_endpoint(format!("http://{addr}"));
-        let (tracer_provider, meter_provider, logger_provider) =
+        let (tracer_provider, meter_provider, logger_provider, _reader) =
             builder.build_providers(resource).expect("build providers");
 
         // Emit one span, one metric observation, and one log record, then flush/shutdown.

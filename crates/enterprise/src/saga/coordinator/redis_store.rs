@@ -14,6 +14,8 @@ use crate::saga::error::SagaError;
 // and the incomplete index set so multi-key Lua scripts (`CAS_SAVE_LUA`) and `MGET`
 // in `list_incomplete` always map to the same hash slot and never trigger `CROSSSLOT`.
 const INCOMPLETE_SET_KEY: &str = "{rume:saga}:incomplete";
+/// Maximum number of saga record keys fetched per `MGET` round-trip in `list_incomplete` (`RC-23`).
+const MGET_BATCH_SIZE: usize = 500;
 
 const CAS_SAVE_LUA: &str = r#"
 local raw = redis.call('GET', KEYS[1])
@@ -249,20 +251,16 @@ impl SagaStore for RedisSagaStore {
                 return Ok(Vec::new());
             }
 
-            let keys: Vec<String> = ids.iter().map(|id| Self::record_key(id)).collect();
-            let values: Vec<Option<String>> = deadpool_redis::redis::cmd("MGET")
-                .arg(&keys)
-                .query_async(&mut conn)
-                .await
-                .map_err(|e| storage_err(None, e))?;
-
             let mut records = Vec::new();
-            for raw in values.into_iter().flatten() {
-                let record: SagaRecord =
-                    serde_json::from_str(&raw).map_err(|e| storage_err(None, e))?;
-                if !record.status.is_terminal() {
-                    records.push(record);
-                }
+            for id_chunk in ids.chunks(MGET_BATCH_SIZE) {
+                let keys: Vec<String> = id_chunk.iter().map(|id| Self::record_key(id)).collect();
+                let values: Vec<Option<String>> = deadpool_redis::redis::cmd("MGET")
+                    .arg(&keys)
+                    .query_async(&mut conn)
+                    .await
+                    .map_err(|e| storage_err(None, e))?;
+
+                records.extend(parse_incomplete_batch(id_chunk, values));
             }
             records.sort_by_key(|r| r.updated_at);
             Ok(records)
@@ -355,5 +353,79 @@ impl SagaStore for RedisSagaStore {
 
             Ok(())
         })
+    }
+}
+
+/// Parses a single `MGET` chunk of saga records, logging and skipping individual corrupt JSON
+/// payloads so one poisoned record cannot abort the entire recovery sweep (`RC-23`).
+fn parse_incomplete_batch(ids: &[String], values: Vec<Option<String>>) -> Vec<SagaRecord> {
+    let mut records = Vec::new();
+    for (saga_id, raw_opt) in ids.iter().zip(values) {
+        let Some(raw) = raw_opt else {
+            continue;
+        };
+        match serde_json::from_str::<SagaRecord>(&raw) {
+            Ok(record) => {
+                if !record.status.is_terminal() {
+                    records.push(record);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    saga_id = %saga_id,
+                    error = %err,
+                    "skipping corrupt saga record JSON in Redis during list_incomplete"
+                );
+            }
+        }
+    }
+    records
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::saga::coordinator::store::SagaStatus;
+
+    #[test]
+    fn parse_incomplete_batch_skips_corrupt_json_and_terminal_records() {
+        let valid_running = SagaRecord {
+            saga_id: "s-ok".into(),
+            saga_name: "order".into(),
+            status: SagaStatus::Running {
+                current_step: "charge".into(),
+            },
+            completed_steps: vec!["reserve".into()],
+            compensated_steps: vec![],
+            updated_at: 100,
+            version: 2,
+        };
+        let valid_done = SagaRecord {
+            saga_id: "s-done".into(),
+            saga_name: "order".into(),
+            status: SagaStatus::Success,
+            completed_steps: vec!["reserve".into(), "charge".into()],
+            compensated_steps: vec![],
+            updated_at: 101,
+            version: 3,
+        };
+
+        let ids = vec![
+            "s-corrupt".to_string(),
+            "s-missing".to_string(),
+            "s-ok".to_string(),
+            "s-done".to_string(),
+        ];
+        let values = vec![
+            Some("{not-valid-json".to_string()),
+            None,
+            Some(serde_json::to_string(&valid_running).unwrap()),
+            Some(serde_json::to_string(&valid_done).unwrap()),
+        ];
+
+        let parsed = parse_incomplete_batch(&ids, values);
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].saga_id, "s-ok");
+        assert_eq!(MGET_BATCH_SIZE, 500);
     }
 }

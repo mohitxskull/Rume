@@ -335,15 +335,22 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 .map(|_| Arc::new(AtomicBool::new(false)))
                 .collect(),
         );
-        // Tracks the first index in `pending` that has not yet been finalized; guarded by a
-        // mutex so advancing `next_idx` before `mark_published`/`mark_failed` never races with
-        // an in-flight heartbeat renewal tick for that message.
+        // Tracks per-index finalization so an in-flight heartbeat renewal RPC that returns
+        // an error after the dispatcher has already finished and begun/completed
+        // `mark_published`/`mark_failed` never logs a spurious lease-loss error or trips
+        // `hb_lost[idx]` (`RC-12`).
+        let finalized_flags: Arc<Vec<AtomicBool>> =
+            Arc::new((0..pending.len()).map(|_| AtomicBool::new(false)).collect());
+        // Tracks the first index in `pending` not yet processed so subsequent heartbeat ticks
+        // skip already-completed prefixes; does not serialize in-flight renewal RPCs (see
+        // `finalized_flags` above).
         let batch_cursor = Arc::new(tokio::sync::Mutex::new(0usize));
         let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
 
         let hb_repo = Arc::clone(&self.repository);
         let hb_leases = Arc::clone(&batch_leases);
         let hb_lost = Arc::clone(&lease_lost_flags);
+        let hb_finalized = Arc::clone(&finalized_flags);
         let hb_cursor = Arc::clone(&batch_cursor);
         let renew_timeout = hb_interval.max(Duration::from_secs(1));
         let heartbeat_handle = tokio::spawn(async move {
@@ -358,7 +365,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         // finalization from advancing `batch_cursor` (`P2-13`).
                         let start_idx = *hb_cursor.lock().await;
                         for idx in start_idx..hb_leases.len() {
-                            if idx < *hb_cursor.lock().await || hb_lost[idx].load(Ordering::SeqCst) {
+                            if hb_finalized[idx].load(Ordering::Acquire)
+                                || idx < *hb_cursor.lock().await
+                                || hb_lost[idx].load(Ordering::SeqCst)
+                            {
                                 continue;
                             }
                             if let Some((ref msg_id, ref token)) = hb_leases[idx] {
@@ -372,20 +382,24 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                                 {
                                     Ok(Ok(())) => {}
                                     Ok(Err(e)) => {
-                                        tracing::error!(
-                                            message_id = %msg_id,
-                                            error = %e,
-                                            "Failed to renew outbox lease heartbeat; lease ownership lost during batch dispatch"
-                                        );
-                                        hb_lost[idx].store(true, Ordering::SeqCst);
+                                        if !hb_finalized[idx].load(Ordering::Acquire) {
+                                            tracing::error!(
+                                                message_id = %msg_id,
+                                                error = %e,
+                                                "Failed to renew outbox lease heartbeat; lease ownership lost during batch dispatch"
+                                            );
+                                            hb_lost[idx].store(true, Ordering::SeqCst);
+                                        }
                                     }
                                     Err(_) => {
-                                        tracing::error!(
-                                            message_id = %msg_id,
-                                            timeout = ?renew_timeout,
-                                            "Timed out renewing outbox lease heartbeat; lease ownership lost during batch dispatch"
-                                        );
-                                        hb_lost[idx].store(true, Ordering::SeqCst);
+                                        if !hb_finalized[idx].load(Ordering::Acquire) {
+                                            tracing::error!(
+                                                message_id = %msg_id,
+                                                timeout = ?renew_timeout,
+                                                "Timed out renewing outbox lease heartbeat; lease ownership lost during batch dispatch"
+                                            );
+                                            hb_lost[idx].store(true, Ordering::SeqCst);
+                                        }
                                     }
                                 }
                             }
@@ -410,6 +424,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 Some(t) => t,
                 None => {
                     tracing::error!(message_id = %message.id, "Claimed outbox message is missing lease token");
+                    finalized_flags[idx].store(true, Ordering::Release);
                     *batch_cursor.lock().await = idx + 1;
                     result.failed_transitions += 1;
                     continue;
@@ -422,6 +437,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     message_id = %message.id,
                     "Outbox message lease was lost while waiting in batch; skipping dispatch"
                 );
+                finalized_flags[idx].store(true, Ordering::Release);
                 *batch_cursor.lock().await = idx + 1;
                 result.failed_transitions += 1;
                 continue;
@@ -445,6 +461,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         "Failed to renew outbox message lease before dispatch; lease expired or token mismatch"
                     );
                     lease_lost.store(true, Ordering::SeqCst);
+                    finalized_flags[idx].store(true, Ordering::Release);
                     *batch_cursor.lock().await = idx + 1;
                     result.failed_transitions += 1;
                     continue;
@@ -456,6 +473,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                         "Timed out renewing outbox message lease before dispatch"
                     );
                     lease_lost.store(true, Ordering::SeqCst);
+                    finalized_flags[idx].store(true, Ordering::Release);
                     *batch_cursor.lock().await = idx + 1;
                     result.failed_transitions += 1;
                     continue;
@@ -507,8 +525,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
             };
 
-            // Advance the batch cursor under `batch_cursor` so any in-flight heartbeat tick
-            // finishes before we inspect `lease_lost` and transition the message state.
+            // Mark this index finalized before advancing `batch_cursor` and calling
+            // `mark_published`/`mark_failed`, so any already-in-flight heartbeat renewal RPC
+            // that observes the cleared lease token does not spuriously trip `lease_lost` (`RC-12`).
+            finalized_flags[idx].store(true, Ordering::Release);
             {
                 let mut cursor_guard = batch_cursor.lock().await;
                 *cursor_guard = idx + 1;
@@ -1401,5 +1421,129 @@ mod tests {
         assert_eq!(poll.published, 0);
         assert_eq!(poll.failed_transitions, 1);
         assert_eq!(dispatched.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn finalized_flag_suppresses_spurious_lease_loss_from_late_heartbeat_error() {
+        use tokio::sync::Notify;
+
+        #[derive(Debug)]
+        struct LateHeartbeatErrorRepo {
+            messages: std::sync::Mutex<Vec<OutboxMessage>>,
+            renew_calls: AtomicU32,
+            hb_started: Arc<Notify>,
+            hb_release: Arc<Notify>,
+        }
+
+        impl OutboxRepository for LateHeartbeatErrorRepo {
+            fn save(&self, _message: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fetch_pending(
+                &self,
+                _limit: usize,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn claim_pending_with_lease(
+                &self,
+                _batch_size: usize,
+                _lease_duration_secs: u64,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                let msgs = std::mem::take(&mut *self.messages.lock().unwrap());
+                Box::pin(async move { Ok(msgs) })
+            }
+            fn renew_outbox_lease(
+                &self,
+                _message_id: &str,
+                _lease_token: &str,
+                _lease_duration_secs: u64,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                let call = self.renew_calls.fetch_add(1, Ordering::SeqCst);
+                let started = Arc::clone(&self.hb_started);
+                let release = Arc::clone(&self.hb_release);
+                Box::pin(async move {
+                    if call == 0 {
+                        // Pre-dispatch renewal succeeds.
+                        Ok(())
+                    } else {
+                        // In-flight heartbeat tick blocks until after finalization, then fails
+                        // as if `mark_published` already cleared the lease token.
+                        started.notify_one();
+                        release.notified().await;
+                        Err(OutboxError::Repository("lease already cleared".into()))
+                    }
+                })
+            }
+            fn mark_published(
+                &self,
+                _message_id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                self.hb_release.notify_one();
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed(
+                &self,
+                _message_id: &str,
+                _lease_token: &str,
+                _error: String,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed_with_max_retries(
+                &self,
+                _message_id: &str,
+                _lease_token: &str,
+                _error: String,
+                _max_retries: u32,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn recover_expired_claims(
+                &self,
+                _max_lease_age_secs: u64,
+            ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let hb_started = Arc::new(Notify::new());
+        let hb_release = Arc::new(Notify::new());
+        let mut msg = OutboxMessage::new("m-late-hb", "evt.late", b"{}".to_vec());
+        msg.lease_token = Some("tok-1".into());
+        let repo = Arc::new(LateHeartbeatErrorRepo {
+            messages: std::sync::Mutex::new(vec![msg]),
+            renew_calls: AtomicU32::new(0),
+            hb_started: Arc::clone(&hb_started),
+            hb_release: Arc::clone(&hb_release),
+        });
+
+        let hb_started_disp = Arc::clone(&hb_started);
+        let relay = OutboxRelay::new(repo, move |_msg| {
+            let started = Arc::clone(&hb_started_disp);
+            async move {
+                // Wait until the background heartbeat tick is in-flight before completing dispatch.
+                let _ = tokio::time::timeout(Duration::from_secs(2), started.notified()).await;
+                Ok(())
+            }
+        })
+        .with_config(OutboxRelayConfig {
+            lease_duration_secs: 1,
+            ..Default::default()
+        });
+
+        let poll = relay
+            .poll_and_dispatch(10)
+            .await
+            .expect("poll must succeed");
+        assert_eq!(poll.published, 1);
+        assert_eq!(poll.failed_transitions, 0);
     }
 }

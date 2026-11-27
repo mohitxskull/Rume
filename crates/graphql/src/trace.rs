@@ -42,7 +42,9 @@ impl Extension for RumeTraceExtensionImpl {
                 "graphql.execute",
                 operation = operation_name.unwrap_or("<anonymous>")
             );
-            if let Some(tc) = TraceContext::current() {
+            if let Some(tc) =
+                TraceContext::current().or_else(|| ctx.data_opt::<TraceContext>().cloned())
+            {
                 tc.scope_future(span, next.run(ctx, operation_name)).await
             } else {
                 next.run(ctx, operation_name).instrument(span).await

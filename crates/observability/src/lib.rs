@@ -16,7 +16,7 @@ pub use metrics::{
 };
 pub use otel::{
     ObservabilityBuilder, ObservabilityGuard, init_tracing, shutdown_global_observability,
-    try_init_tracing,
+    shutdown_global_observability_async, try_init_tracing,
 };
 pub use prometheus::{
     OPENMETRICS_CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE, PrometheusFormat, render_metrics,
