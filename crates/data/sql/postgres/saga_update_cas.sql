@@ -8,4 +8,4 @@ SET saga_name = $2,
     version = version + 1
 WHERE saga_id = $1
   AND version = $8
-  AND ($9::TEXT IS NULL OR claim_token = $9);
+  AND ($9::TEXT IS NULL OR (claim_token = $9 AND claim_expires_at > $10));

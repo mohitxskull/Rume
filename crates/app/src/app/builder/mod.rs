@@ -283,8 +283,8 @@ where
     applied_middleware: BTreeSet<String>,
     /// Group names marked for application via `use_group`.
     applied_groups: BTreeSet<String>,
-    /// Deferred Tower layers registered via [`layer`](Self::layer) or
-    /// [`http_cache`](Self::http_cache), applied after module routes are merged.
+    /// Deferred Tower layers registered via [`layer`](Self::layer), applied after
+    /// module routes are merged and outside [`http_cache`](Self::http_cache).
     layers: Vec<
         Box<
             dyn FnOnce(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>>
@@ -293,6 +293,9 @@ where
                 + 'static,
         >,
     >,
+    /// Optional HTTP response cache layer applied strictly inside all user `.layer()`
+    /// and `.middleware()` layers so tenant/auth layers always execute first.
+    http_cache: Option<rume_http::http_cache::HttpCacheLayer>,
     /// Maximum time to wait for all shutdown hooks before force-terminating.
     shutdown_timeout: Duration,
     /// Transport-level maximum request body size in bytes (default: 2 MiB; `None` disables the cap).
@@ -342,6 +345,7 @@ where
             applied_middleware: BTreeSet::new(),
             applied_groups: BTreeSet::new(),
             layers: Vec::new(),
+            http_cache: None,
             shutdown_timeout: Duration::from_secs(30),
             body_limit: Some(rume_http::transport::DEFAULT_BODY_LIMIT_BYTES),
             cors: None,
@@ -539,10 +543,10 @@ where
         self
     }
 
-    /// Apply an [`rume_http::http_cache::HttpCacheLayer`] to the application router.
+    /// Apply an [`rume_http::http_cache::HttpCacheLayer`] strictly inside all user
+    /// `.layer()` and `.middleware()` layers so tenant/auth extractors always run first.
     pub fn http_cache(mut self, layer: rume_http::http_cache::HttpCacheLayer) -> Self {
-        self.layers
-            .push(Box::new(move |router| router.layer(layer)));
+        self.http_cache = Some(layer);
         self
     }
 

@@ -8,4 +8,4 @@ SET saga_name = ?,
     version = version + 1
 WHERE saga_id = ?
   AND version = ?
-  AND (? IS NULL OR claim_token = ?);
+  AND (? IS NULL OR (claim_token = ? AND claim_expires_at > ?));

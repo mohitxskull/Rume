@@ -284,7 +284,7 @@ impl SagaStore for RedisSagaStore {
         &self,
         saga_id: &str,
         claim_token: &str,
-    ) -> BoxFuture<'_, Result<(), SagaError>> {
+    ) -> BoxFuture<'_, Result<bool, SagaError>> {
         let saga_id = saga_id.to_string();
         let claim_token = claim_token.to_string();
         let ttl_ms = u64::try_from(self.claim_ttl.as_millis().max(1)).unwrap_or(u64::MAX);
@@ -303,13 +303,7 @@ impl SagaStore for RedisSagaStore {
                 .await
                 .map_err(|e| storage_err(Some(&saga_id), e))?;
 
-            if renewed == 0 {
-                return Err(SagaError::Storage {
-                    saga_id: Some(saga_id),
-                    message: "saga execution claim lost or expired".into(),
-                });
-            }
-            Ok(())
+            Ok(renewed != 0)
         })
     }
 

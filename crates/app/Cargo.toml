@@ -24,6 +24,8 @@ acme = ["tls", "rume-http/acme"]
 static-embed = ["rume-http/static-embed"]
 
 [dev-dependencies]
+rume-data.workspace = true
+rume-security.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rustls-pki-types.workspace = true

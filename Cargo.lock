@@ -5618,9 +5618,11 @@ name = "rume-app"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "rume-data",
  "rume-foundation",
  "rume-http",
  "rume-observability",
+ "rume-security",
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",

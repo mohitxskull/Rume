@@ -451,6 +451,7 @@ struct DynamicJwks {
     cache_ttl: Duration,
     min_refresh_interval: Duration,
     cache: RwLock<JwksCache>,
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 enum VerifierBackend {
@@ -557,6 +558,7 @@ impl JwtVerifier {
                 cache_ttl,
                 min_refresh_interval,
                 cache: RwLock::new(JwksCache::default()),
+                refresh_lock: tokio::sync::Mutex::new(()),
             })),
             config,
         })
@@ -687,16 +689,25 @@ impl JwtVerifier {
         };
 
         if needs_initial_or_ttl_refresh {
-            let mut cache = dynamic.cache.write().await;
-            let now_w = Instant::now();
-            if cache
-                .fetched_at
-                .is_none_or(|fetched| now_w.saturating_duration_since(fetched) >= dynamic.cache_ttl)
-            {
+            let _refresh_guard = dynamic.refresh_lock.lock().await;
+            let still_needs_refresh = {
+                let cache = dynamic.cache.read().await;
+                let now_r = Instant::now();
+                cache.fetched_at.is_none_or(|fetched| {
+                    now_r.saturating_duration_since(fetched) >= dynamic.cache_ttl
+                })
+            };
+            if still_needs_refresh {
+                // Why: perform network I/O with NO lock held on `cache` so concurrent
+                // verifications for already-cached keys remain non-blocking while a
+                // refresh is in flight.
                 let set = dynamic.fetcher.fetch_jwks().await?;
-                cache.keys = parse_jwk_set(&set)?;
-                cache.fetched_at = Some(now_w);
-                cache.last_refresh_attempt = Some(now_w);
+                let parsed = parse_jwk_set(&set)?;
+                let refreshed_at = Instant::now();
+                let mut cache = dynamic.cache.write().await;
+                cache.keys = parsed;
+                cache.fetched_at = Some(refreshed_at);
+                cache.last_refresh_attempt = Some(refreshed_at);
             }
         }
 
@@ -717,22 +728,39 @@ impl JwtVerifier {
         };
 
         // Unknown `kid`: rate-limited forced refresh to prevent cache-miss DoS amplification.
-        let mut cache = dynamic.cache.write().await;
-        if !has_key_candidate(&cache.keys, alg, Some(kid_str)) {
-            let now_w = Instant::now();
-            let allowed = cache.last_refresh_attempt.is_none_or(|last| {
-                now_w.saturating_duration_since(last) >= dynamic.min_refresh_interval
-            });
-            if allowed {
-                // Why: record attempt timestamp before awaiting fetch so concurrent or failing
-                // misses still respect `min_refresh_interval`.
-                cache.last_refresh_attempt = Some(now_w);
+        {
+            let _refresh_guard = dynamic.refresh_lock.lock().await;
+            let should_fetch = {
+                let mut cache = dynamic.cache.write().await;
+                if has_key_candidate(&cache.keys, alg, Some(kid_str)) {
+                    false
+                } else {
+                    let now_w = Instant::now();
+                    let allowed = cache.last_refresh_attempt.is_none_or(|last| {
+                        now_w.saturating_duration_since(last) >= dynamic.min_refresh_interval
+                    });
+                    if allowed {
+                        // Why: record attempt timestamp before releasing `cache` and awaiting
+                        // fetch so concurrent or failing misses still respect `min_refresh_interval`
+                        // without blocking readers on `cache` during network I/O.
+                        cache.last_refresh_attempt = Some(now_w);
+                        true
+                    } else {
+                        false
+                    }
+                }
+            };
+
+            if should_fetch {
                 let set = dynamic.fetcher.fetch_jwks().await?;
-                cache.keys = parse_jwk_set(&set)?;
+                let parsed = parse_jwk_set(&set)?;
+                let mut cache = dynamic.cache.write().await;
+                cache.keys = parsed;
                 cache.fetched_at = Some(Instant::now());
             }
         }
 
+        let cache = dynamic.cache.read().await;
         verify_with_key_slice(&cache.keys, alg, Some(kid_str), signing_input, sig_bytes)
     }
 
@@ -1329,6 +1357,102 @@ mod tests {
             ));
         }
         assert_eq!(fetcher.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn jwt_verifier_cached_kid_succeeds_while_unknown_kid_refresh_is_blocked_on_network() {
+        use tokio::sync::Notify;
+
+        struct BlockingJwksFetcher {
+            calls: AtomicUsize,
+            initial: JwkSet,
+            refreshed: JwkSet,
+            fetch_started: Arc<Notify>,
+            release_fetch: Arc<Notify>,
+        }
+
+        impl JwksFetcher for BlockingJwksFetcher {
+            fn fetch_jwks(&self) -> BoxFuture<'_, Result<JwkSet, AuthError>> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let initial = self.initial.clone();
+                let refreshed = self.refreshed.clone();
+                let started = Arc::clone(&self.fetch_started);
+                let release = Arc::clone(&self.release_fetch);
+                Box::pin(async move {
+                    if call == 0 {
+                        Ok(initial)
+                    } else {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(refreshed)
+                    }
+                })
+            }
+        }
+
+        let now = 1_700_000_000;
+        let claims = json!({ "sub": "alice", "exp": now + 300 });
+        let (jwk1, signer1) = generate_rsa_jwk_and_signer("kid-cached");
+        let (jwk2, signer2) = generate_rsa_jwk_and_signer("kid-new");
+
+        let fetch_started = Arc::new(Notify::new());
+        let release_fetch = Arc::new(Notify::new());
+        let fetcher = BlockingJwksFetcher {
+            calls: AtomicUsize::new(0),
+            initial: JwkSet {
+                keys: vec![jwk1.clone()],
+            },
+            refreshed: JwkSet {
+                keys: vec![jwk1, jwk2],
+            },
+            fetch_started: Arc::clone(&fetch_started),
+            release_fetch: Arc::clone(&release_fetch),
+        };
+
+        let verifier = Arc::new(
+            JwtVerifier::from_jwks_fetcher(
+                fetcher,
+                config_with(&[JwtAlgorithm::Rs256]),
+                Duration::from_secs(300),
+                Duration::ZERO,
+            )
+            .unwrap(),
+        );
+
+        let tok_cached = sign_rs256(
+            &signer1,
+            &json!({"alg": "RS256", "kid": "kid-cached"}),
+            &claims,
+        );
+        let tok_unknown = sign_rs256(
+            &signer2,
+            &json!({"alg": "RS256", "kid": "kid-new"}),
+            &claims,
+        );
+
+        // Warm the cache with kid-cached.
+        assert!(verifier.verify(&tok_cached, now).await.is_ok());
+
+        // Start a refresh for unknown kid-new; wait until it is blocked on network I/O.
+        let v_bg = Arc::clone(&verifier);
+        let tok_bg = tok_unknown.clone();
+        let bg_task = tokio::spawn(async move { v_bg.verify(&tok_bg, now).await });
+        fetch_started.notified().await;
+
+        // While the unknown-kid refresh is blocked on the network, verifying an already-cached
+        // kid MUST succeed immediately without blocking on the refresh lock or cache write lock.
+        let cached_res = tokio::time::timeout(
+            Duration::from_millis(200),
+            verifier.verify(&tok_cached, now),
+        )
+        .await
+        .expect("cached kid verification must not block on in-flight JWKS refresh");
+        assert!(cached_res.is_ok());
+
+        // Unblock the network fetch and ensure the unknown-kid verification completes cleanly.
+        release_fetch.notify_one();
+        let new_res = bg_task.await.unwrap();
+        assert!(new_res.is_ok());
     }
 
     #[cfg(feature = "http-client")]

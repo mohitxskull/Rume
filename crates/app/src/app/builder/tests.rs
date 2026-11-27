@@ -1542,3 +1542,107 @@ async fn plain_http_shutdown_completes_within_shutdown_timeout_with_stalled_conn
     );
     drop(tcp);
 }
+
+#[tokio::test]
+async fn builder_layer_before_http_cache_isolates_tenant_cached_responses() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{HeaderName, Request, StatusCode};
+    use rume_data::cache::InMemoryCacheBackend;
+    use rume_http::http_cache::{HttpCacheConfig, HttpCacheLayer};
+    use rume_security::tenant::Tenant;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    let backend = Arc::new(InMemoryCacheBackend::new());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&hits);
+
+    let inject_tenant_layer = axum::middleware::from_fn(
+        |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if let Some(tid) = req
+                .headers()
+                .get(HeaderName::from_static("x-tenant-id"))
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned)
+            {
+                req.extensions_mut().insert(Tenant::new(tid.clone(), tid));
+            }
+            next.run(req).await
+        },
+    );
+
+    let cache = HttpCacheLayer::new(backend, HttpCacheConfig::default());
+
+    let router = RumeBuilder::new(test_ctx())
+        .get("/tenant-data", move |req: axum::extract::Request| {
+            let hits = Arc::clone(&hits_clone);
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let tid = req
+                    .extensions()
+                    .get::<Tenant>()
+                    .map(|t| t.id.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                format!("tenant={tid},hit={n}")
+            }
+        })
+        .layer(inject_tenant_layer)
+        .http_cache(cache)
+        .build_router(test_ctx())
+        .expect("build_router should succeed");
+
+    let app = router.with_state(test_ctx());
+
+    let r_a1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_a1.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_a1.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-a,hit=1".as_slice()
+    );
+
+    // Second tenant must NOT receive tenant-a's cached response.
+    let r_b1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_b1.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_b1.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-b,hit=2".as_slice()
+    );
+
+    // Repeat request for tenant-a hits tenant-a's cache entry.
+    let r_a2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_a2.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_a2.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-a,hit=1".as_slice()
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}

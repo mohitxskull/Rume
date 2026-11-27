@@ -382,6 +382,7 @@ where
             applied_middleware,
             applied_groups,
             layers,
+            http_cache,
             route_registry,
             body_limit,
             cors,
@@ -466,9 +467,19 @@ where
         // and `on_shutdown` in sync with module routes and health checks.
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx.clone());
 
-        // 0. Apply deferred `.layer()` and `.http_cache()` closures so they wrap
-        // both application routes and merged module routes.
-        for layer_fn in layers {
+        // 0a. Apply `HttpCacheLayer` strictly inside all user `.layer()` and `.middleware()`
+        // layers so `TenantLayer` and auth middleware always run before cache key derivation.
+        if let Some(cache_layer) = http_cache {
+            router = router.layer(cache_layer);
+        }
+
+        // 0b. Apply deferred `.layer()` closures in reverse registration order so
+        // `.layer(A).layer(B)` executes `A` outside `B` on request entry, matching
+        // `.middleware(A).middleware(B)` top-to-bottom ordering.
+        // Why: Tower/Axum's `Router::layer` wraps inner-to-outer, so reversing `layers`
+        // establishes one unified top-to-bottom ordering contract across `.layer()` and
+        // `.middleware()`.
+        for layer_fn in layers.into_iter().rev() {
             router = layer_fn(router);
         }
 

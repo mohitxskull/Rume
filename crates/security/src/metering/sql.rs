@@ -50,16 +50,12 @@ fn counter_id(tenant_id: &str, metric: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct SqlUsageMeter<B: DatabaseBackend> {
     backend: Arc<B>,
-    flush_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl<B: DatabaseBackend> SqlUsageMeter<B> {
     /// Creates a new [`SqlUsageMeter`] backed by `backend`.
     pub fn new(backend: Arc<B>) -> Self {
-        Self {
-            backend,
-            flush_lock: Arc::new(tokio::sync::Mutex::new(())),
-        }
+        Self { backend }
     }
 
     /// Ensures the `rume_usage_counters` schema exists on the underlying backend.
@@ -149,9 +145,17 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
         sink: &'a dyn BillingSink,
     ) -> BoxFuture<'a, Result<usize, MeteringError>> {
         Box::pin(async move {
-            // Why: serialize concurrent `flush()` calls on the same meter so two
-            // tasks cannot snapshot and export the same un-decremented rows (`RC-15`).
-            let _flush_guard = self.flush_lock.lock().await;
+            // Why: serialize concurrent `flush()` calls across replicas at the database
+            // layer rather than with an in-process mutex. `begin_immediate_transaction()`
+            // acquires SQLite's RESERVED write lock up front (`BEGIN IMMEDIATE`), while
+            // Postgres/MySQL lock the snapshotted counter rows via `SELECT ... FOR UPDATE`
+            // in deterministic `(tenant_id, metric)` order. Rolling back on sink failure
+            // preserves all counts without double-billing or losing concurrent increments.
+            let tx = self
+                .backend
+                .begin_immediate_transaction()
+                .await
+                .map_err(|e| MeteringError::Store(e.to_string()))?;
 
             let list_stmt = select_sql(
                 self.backend.dialect(),
@@ -159,31 +163,44 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                 sql::MYSQL_USAGE_METERING_LIST_NONZERO,
                 sql::SQLITE_USAGE_METERING_LIST_NONZERO,
             );
-            let rows = self
-                .backend
-                .fetch_all(list_stmt, &[])
-                .await
-                .map_err(|e| MeteringError::Store(e.to_string()))?;
+            let rows = match tx.fetch_all(list_stmt, &[]).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    let _ = tx.rollback().await;
+                    return Err(MeteringError::Store(e.to_string()));
+                }
+            };
 
             if rows.is_empty() {
+                let _ = tx.rollback().await;
                 return Ok(0);
             }
 
             let now = current_epoch_secs();
             let mut ids_and_records = Vec::with_capacity(rows.len());
             for row in &rows {
-                let id: String = row
-                    .get("id")
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
-                let tenant_id: String = row
-                    .get("tenant_id")
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
-                let metric: String = row
-                    .get("metric")
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
-                let count: i64 = row
-                    .get("count")
-                    .map_err(|e| MeteringError::Store(e.to_string()))?;
+                let parsed = (|| -> Result<(String, String, String, i64), MeteringError> {
+                    let id: String = row
+                        .get("id")
+                        .map_err(|e| MeteringError::Store(e.to_string()))?;
+                    let tenant_id: String = row
+                        .get("tenant_id")
+                        .map_err(|e| MeteringError::Store(e.to_string()))?;
+                    let metric: String = row
+                        .get("metric")
+                        .map_err(|e| MeteringError::Store(e.to_string()))?;
+                    let count: i64 = row
+                        .get("count")
+                        .map_err(|e| MeteringError::Store(e.to_string()))?;
+                    Ok((id, tenant_id, metric, count))
+                })();
+                let (id, tenant_id, metric, count) = match parsed {
+                    Ok(v) => v,
+                    Err(err) => {
+                        let _ = tx.rollback().await;
+                        return Err(err);
+                    }
+                };
                 let quantity = u64::try_from(count.max(0)).unwrap_or(0);
                 if quantity > 0 {
                     ids_and_records.push((
@@ -200,12 +217,16 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
             }
 
             if ids_and_records.is_empty() {
+                let _ = tx.rollback().await;
                 return Ok(0);
             }
 
             let records: Vec<UsageRecord> =
                 ids_and_records.iter().map(|(_, _, r)| r.clone()).collect();
-            sink.export_batch(&records).await?;
+            if let Err(err) = sink.export_batch(&records).await {
+                let _ = tx.rollback().await;
+                return Err(err);
+            }
 
             let dec_stmt = select_sql(
                 self.backend.dialect(),
@@ -213,14 +234,6 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                 sql::MYSQL_USAGE_METERING_DECREMENT,
                 sql::SQLITE_USAGE_METERING_DECREMENT,
             );
-            // Why: execute all checkpoint decrements atomically in a single transaction so
-            // a partial failure mid-loop rolls back instead of leaving half-checkpointed
-            // counters that would be partially double-billed on retry (`RC-15`).
-            let tx = self
-                .backend
-                .begin_transaction()
-                .await
-                .map_err(|e| MeteringError::Store(e.to_string()))?;
             for (id, count, _) in &ids_and_records {
                 let params = [
                     DbValue::from(*count),
@@ -318,5 +331,128 @@ mod tests {
             sql::SQLITE_USAGE_METERING_INCREMENT.contains("\"window\""),
             "SQLite usage_metering_increment.sql must double-quote \"window\""
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_independent_sql_usage_meters_serialize_flush_without_double_billing() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::time::Duration;
+
+        use rume_data::persistence::{DatabaseConfig, SqliteBackend};
+        use tokio::sync::Barrier;
+
+        struct DelayedSink {
+            exported: Mutex<Vec<UsageRecord>>,
+            fail_next: AtomicBool,
+            delay: Duration,
+        }
+
+        impl BillingSink for DelayedSink {
+            fn export_batch<'a>(
+                &'a self,
+                records: &'a [UsageRecord],
+            ) -> BoxFuture<'a, Result<(), MeteringError>> {
+                let records = records.to_vec();
+                Box::pin(async move {
+                    if !self.delay.is_zero() {
+                        tokio::time::sleep(self.delay).await;
+                    }
+                    if self.fail_next.swap(false, Ordering::SeqCst) {
+                        return Err(MeteringError::BillingSink(
+                            "transient billing sink error".into(),
+                        ));
+                    }
+                    self.exported.lock().unwrap().extend(records);
+                    Ok(())
+                })
+            }
+        }
+
+        let db_path = std::env::temp_dir().join(format!(
+            "rume-metering-rc12-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let cfg = DatabaseConfig::new(db_path.to_string_lossy().as_ref()).with_max_connections(4);
+        let backend = Arc::new(SqliteBackend::new(&cfg).await.expect("open sqlite"));
+
+        let meter_a = SqlUsageMeter::new(Arc::clone(&backend));
+        let meter_b = SqlUsageMeter::new(Arc::clone(&backend));
+        meter_a.ensure_schema().await.expect("ensure_schema");
+
+        // Record initial usage.
+        meter_a
+            .record_usage("tenant-1", "api_calls", 10)
+            .await
+            .expect("record 10");
+        meter_b
+            .record_usage("tenant-1", "api_calls", 5)
+            .await
+            .expect("record 5");
+
+        // Two independent SqlUsageMeter instances flush concurrently across a Barrier.
+        let sink = Arc::new(DelayedSink {
+            exported: Mutex::new(Vec::new()),
+            fail_next: AtomicBool::new(false),
+            delay: Duration::from_millis(30),
+        });
+        let barrier = Arc::new(Barrier::new(2));
+
+        let m_a = meter_a.clone();
+        let s_a = Arc::clone(&sink);
+        let b_a = Arc::clone(&barrier);
+        let t_a = tokio::spawn(async move {
+            b_a.wait().await;
+            m_a.flush(s_a.as_ref()).await
+        });
+
+        let m_b = meter_b.clone();
+        let s_b = Arc::clone(&sink);
+        let b_b = Arc::clone(&barrier);
+        let t_b = tokio::spawn(async move {
+            b_b.wait().await;
+            m_b.flush(s_b.as_ref()).await
+        });
+
+        // Concurrent increment while flush is in flight.
+        let m_inc = meter_a.clone();
+        let t_inc = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            m_inc.record_usage("tenant-1", "api_calls", 7).await
+        });
+
+        t_a.await.unwrap().expect("flush a");
+        t_b.await.unwrap().expect("flush b");
+        t_inc.await.unwrap().expect("concurrent increment");
+
+        // Final flush drains any increment that landed after the first two flushes.
+        meter_a.flush(sink.as_ref()).await.expect("final flush");
+
+        let total_billed: u64 = sink
+            .exported
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.quantity)
+            .sum();
+        assert_eq!(
+            total_billed, 22,
+            "total billed must equal exact recorded usage (10 + 5 + 7) with zero double-billing or lost increments"
+        );
+        assert_eq!(meter_a.get_usage("tenant-1", "api_calls").await.unwrap(), 0);
+
+        // Verify rollback on export failure preserves counts for retry.
+        meter_a
+            .record_usage("tenant-1", "api_calls", 4)
+            .await
+            .expect("record 4");
+        sink.fail_next.store(true, Ordering::SeqCst);
+        assert!(meter_a.flush(sink.as_ref()).await.is_err());
+        assert_eq!(meter_a.get_usage("tenant-1", "api_calls").await.unwrap(), 4);
+
+        backend.close().await;
+        let _ = std::fs::remove_file(&db_path);
+        let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
+        let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
     }
 }

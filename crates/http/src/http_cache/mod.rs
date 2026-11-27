@@ -161,7 +161,9 @@ where
 
         Box::pin(async move {
             let method = req.method().clone();
-            let cache_key = derive_cache_key(&req, &config);
+            let gen_key = derive_generation_key(&req);
+            let generation = load_generation(backend.as_ref(), &gen_key).await;
+            let cache_key = derive_cache_key(&req, &config, generation);
 
             if method == Method::GET || method == Method::HEAD {
                 let has_auth_headers = req.headers().contains_key(header::AUTHORIZATION)
@@ -170,7 +172,7 @@ where
                     return Ok(inner.call(req).await?.into_response());
                 }
 
-                let if_none_match = header_str(req.headers().get(header::IF_NONE_MATCH));
+                let if_none_match = joined_header_values(req.headers(), &header::IF_NONE_MATCH);
                 if let Ok(Some(raw)) = backend.get(&cache_key).await
                     && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
                 {
@@ -216,21 +218,31 @@ where
                     }
                 };
 
+                // Why: Per RFC 9110 §9.3.2, a HEAD response must emit the same ETag as GET.
+                // On a cold HEAD miss without a handler-provided ETag, the body is empty, so
+                // synthesizing an ETag from `b""` would emit a bogus validator that disagrees
+                // with GET. Only compute an ETag from buffered bytes for GET responses.
                 let etag = parts
                     .headers
                     .get(header::ETAG)
                     .and_then(|v| v.to_str().ok())
                     .map(ToString::to_string)
-                    .unwrap_or_else(|| compute_etag(&bytes, config.weak_etags));
+                    .or_else(|| {
+                        (method != Method::HEAD).then(|| compute_etag(&bytes, config.weak_etags))
+                    });
 
-                if let Ok(val) = HeaderValue::from_str(&etag) {
+                if let Some(ref etag_val) = etag
+                    && let Ok(val) = HeaderValue::from_str(etag_val)
+                {
                     parts.headers.insert(header::ETAG, val);
                 }
                 apply_cache_headers(&mut parts.headers, &config, has_auth_headers);
 
                 // Why: HEAD responses carry an empty body, so caching a HEAD miss
                 // would poison the shared GET cache entry with an empty body and ETag.
-                if method == Method::GET {
+                if method == Method::GET
+                    && let Some(ref etag_val) = etag
+                {
                     let serialized_headers = parts
                         .headers
                         .iter()
@@ -241,7 +253,7 @@ where
                         status: parts.status.as_u16(),
                         headers: serialized_headers,
                         body: bytes.to_vec(),
-                        etag: etag.clone(),
+                        etag: etag_val.clone(),
                     };
                     if let Ok(encoded) = serde_json::to_vec(&cached) {
                         let _ = backend.set(&cache_key, encoded, Some(config.ttl)).await;
@@ -249,9 +261,10 @@ where
                 }
 
                 if let Some(ref inm) = if_none_match
-                    && etag_matches_weak(inm, &etag)
+                    && let Some(ref etag_val) = etag
+                    && etag_matches_weak(inm, etag_val)
                 {
-                    return Ok(not_modified_response(&etag, &config, has_auth_headers));
+                    return Ok(not_modified_response(etag_val, &config, has_auth_headers));
                 }
 
                 let out_body = if method == Method::HEAD {
@@ -263,7 +276,7 @@ where
             }
 
             if matches!(method, Method::PUT | Method::PATCH | Method::DELETE) {
-                if let Some(if_match) = header_str(req.headers().get(header::IF_MATCH))
+                if let Some(if_match) = joined_header_values(req.headers(), &header::IF_MATCH)
                     && let Ok(Some(raw)) = backend.get(&cache_key).await
                     && let Ok(cached) = serde_json::from_slice::<CachedHttpResponse>(&raw)
                     && !etag_matches_strong(&if_match, &cached.etag)
@@ -274,6 +287,7 @@ where
                 let res = inner.call(req).await?.into_response();
                 if res.status().is_success() {
                     let _ = backend.delete(&cache_key).await;
+                    bump_generation(backend.as_ref(), &gen_key, config.ttl).await;
                 }
                 return Ok(res);
             }
@@ -346,7 +360,7 @@ where
                 return Ok(inner.call(req).await?.into_response());
             }
 
-            let if_none_match = header_str(req.headers().get(header::IF_NONE_MATCH));
+            let if_none_match = joined_header_values(req.headers(), &header::IF_NONE_MATCH);
             let res = inner.call(req).await?.into_response();
             if res.status() != StatusCode::OK {
                 return Ok(res);
@@ -375,19 +389,22 @@ where
                 .get(header::ETAG)
                 .and_then(|v| v.to_str().ok())
                 .map(ToString::to_string)
-                .unwrap_or_else(|| compute_etag(&bytes, weak_etags));
+                .or_else(|| (method != Method::HEAD).then(|| compute_etag(&bytes, weak_etags)));
 
             if let Some(ref inm) = if_none_match
-                && etag_matches_weak(inm, &etag)
+                && let Some(ref etag_val) = etag
+                && etag_matches_weak(inm, etag_val)
             {
                 let mut res = StatusCode::NOT_MODIFIED.into_response();
-                if let Ok(val) = HeaderValue::from_str(&etag) {
+                if let Ok(val) = HeaderValue::from_str(etag_val) {
                     res.headers_mut().insert(header::ETAG, val);
                 }
                 return Ok(res);
             }
 
-            if let Ok(val) = HeaderValue::from_str(&etag) {
+            if let Some(ref etag_val) = etag
+                && let Ok(val) = HeaderValue::from_str(etag_val)
+            {
                 parts.headers.insert(header::ETAG, val);
             }
             let out_body = if method == Method::HEAD {
@@ -512,23 +529,66 @@ fn hash_header_values(headers: &axum::http::HeaderMap, name: &HeaderName) -> Opt
     Some(hex::encode(hasher.finalize()))
 }
 
-fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig) -> String {
-    let pq = req
-        .uri()
-        .path_and_query()
-        .map(|v| v.as_str())
-        .unwrap_or_else(|| req.uri().path());
-    let tenant_id = req
-        .extensions()
+fn extract_tenant_id(req: &Request<Body>) -> Option<&str> {
+    req.extensions()
         .get::<rume_security::tenant::Tenant>()
         .map(|t| t.id.as_str())
         .or_else(|| {
             req.extensions()
                 .get::<rume_security::tenant::TenantContext>()
                 .map(|tc| tc.id.as_str())
-        });
+        })
+}
+
+fn derive_generation_key(req: &Request<Body>) -> String {
+    let mut key = String::from("rume:http_cache_gen:");
+    match extract_tenant_id(req) {
+        Some(tid) => {
+            key.push_str("1:");
+            push_framed(&mut key, tid);
+        }
+        None => key.push_str("0:|"),
+    }
+    push_framed(&mut key, req.uri().path());
+    key
+}
+
+async fn load_generation(backend: &dyn CacheBackend, gen_key: &str) -> u64 {
+    backend
+        .get(gen_key)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| <[u8; 8]>::try_from(bytes.as_slice()).ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
+}
+
+async fn bump_generation(backend: &dyn CacheBackend, gen_key: &str, ttl: Duration) {
+    let next = load_generation(backend, gen_key).await.wrapping_add(1);
+    // Why: keep the generation counter alive at least twice as long as cached entries so
+    // it never expires before entries written under the previous generation, guaranteeing
+    // O(1) atomic invalidation across all `Vary` variants without scanning backend keys.
+    let _ = backend
+        .set(
+            gen_key,
+            next.to_be_bytes().to_vec(),
+            Some(ttl.saturating_mul(2)),
+        )
+        .await;
+}
+
+fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig, generation: u64) -> String {
+    let pq = req
+        .uri()
+        .path_and_query()
+        .map(|v| v.as_str())
+        .unwrap_or_else(|| req.uri().path());
+    let tenant_id = extract_tenant_id(req);
 
     let mut key = String::from("rume:http_cache:");
+    key.push_str(&generation.to_string());
+    key.push(':');
     match tenant_id {
         Some(tid) => {
             key.push_str("1:");
@@ -539,12 +599,8 @@ fn derive_cache_key(req: &Request<Body>, config: &HttpCacheConfig) -> String {
     push_framed(&mut key, pq);
     for name in &config.vary_headers {
         push_framed(&mut key, name.as_str());
-        let val = req
-            .headers()
-            .get(name)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("");
-        push_framed(&mut key, val);
+        let val = joined_header_values(req.headers(), name).unwrap_or_default();
+        push_framed(&mut key, &val);
     }
     if config.cache_authenticated {
         match hash_header_values(req.headers(), &header::AUTHORIZATION) {
@@ -575,8 +631,19 @@ fn compute_etag(body: &[u8], weak: bool) -> String {
     }
 }
 
-fn header_str(val: Option<&HeaderValue>) -> Option<String> {
-    val.and_then(|v| v.to_str().ok()).map(ToString::to_string)
+fn joined_header_values(headers: &axum::http::HeaderMap, name: &HeaderName) -> Option<String> {
+    let mut joined = String::new();
+    let mut found = false;
+    for val in headers.get_all(name) {
+        if let Ok(s) = val.to_str() {
+            if found {
+                joined.push_str(", ");
+            }
+            joined.push_str(s);
+            found = true;
+        }
+    }
+    found.then_some(joined)
 }
 
 fn etag_matches_weak(header_val: &str, current_etag: &str) -> bool {
@@ -632,10 +699,8 @@ fn apply_cache_headers(
     is_authenticated: bool,
 ) {
     if is_authenticated {
-        if let Some(existing) = headers
-            .get(header::CACHE_CONTROL)
-            .and_then(|v| v.to_str().ok())
-            .map(rewrite_cache_control_private)
+        if let Some(existing) = joined_header_values(headers, &header::CACHE_CONTROL)
+            .map(|s| rewrite_cache_control_private(&s))
             .and_then(|s| HeaderValue::from_str(&s).ok())
         {
             headers.insert(header::CACHE_CONTROL, existing);
@@ -1541,5 +1606,194 @@ mod tests {
             b"lang=fr,hit=2".as_slice()
         );
         assert_eq!(hits.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cold_head_does_not_synthesize_empty_body_etag() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let app = Router::new()
+            .route("/doc", get(|| async { "actual-document-body" }))
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::HEAD)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert!(
+            res.headers().get(header::ETAG).is_none(),
+            "cold HEAD without handler ETag must not synthesize a bogus empty-body ETag: {:?}",
+            res.headers().get(header::ETAG)
+        );
+    }
+
+    #[tokio::test]
+    async fn put_without_vary_header_invalidates_all_vary_variants() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let version = Arc::new(AtomicUsize::new(1));
+        let v_get = Arc::clone(&version);
+        let v_put = Arc::clone(&version);
+
+        let app = Router::new()
+            .route(
+                "/doc",
+                get(move |req: Request<Body>| {
+                    let v = Arc::clone(&v_get);
+                    async move {
+                        let lang = req
+                            .headers()
+                            .get(header::ACCEPT_LANGUAGE)
+                            .and_then(|val| val.to_str().ok())
+                            .unwrap_or("default")
+                            .to_owned();
+                        format!("lang={lang},v={}", v.load(Ordering::SeqCst))
+                    }
+                })
+                .put(move || {
+                    let v = Arc::clone(&v_put);
+                    async move {
+                        v.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::NO_CONTENT
+                    }
+                }),
+            )
+            .layer(HttpCacheLayer::new(
+                backend,
+                HttpCacheConfig::default().with_vary_headers(vec![header::ACCEPT_LANGUAGE]),
+            ));
+
+        // Populate cache for Accept-Language: en and fr.
+        let r_en1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .header(header::ACCEPT_LANGUAGE, "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_en1.into_body(), usize::MAX).await.unwrap(),
+            b"lang=en,v=1".as_slice()
+        );
+
+        let r_fr1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .header(header::ACCEPT_LANGUAGE, "fr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_fr1.into_body(), usize::MAX).await.unwrap(),
+            b"lang=fr,v=1".as_slice()
+        );
+
+        // PUT /doc WITHOUT Accept-Language header must invalidate BOTH en and fr variants.
+        let r_put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::PUT)
+                    .uri("/doc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r_put.status(), StatusCode::NO_CONTENT);
+
+        let r_en2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .header(header::ACCEPT_LANGUAGE, "en")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_en2.into_body(), usize::MAX).await.unwrap(),
+            b"lang=en,v=2".as_slice()
+        );
+
+        let r_fr2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/doc")
+                    .header(header::ACCEPT_LANGUAGE, "fr")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            to_bytes(r_fr2.into_body(), usize::MAX).await.unwrap(),
+            b"lang=fr,v=2".as_slice()
+        );
+    }
+
+    #[tokio::test]
+    async fn multi_value_if_none_match_header_lines_match_etag() {
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let app = Router::new()
+            .route("/multi", get(|| async { "payload" }))
+            .layer(HttpCacheLayer::new(backend, HttpCacheConfig::default()));
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/multi")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let etag = r1
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Send two separate If-None-Match header lines where the matching ETag is on the second line.
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/multi")
+                    .header(header::IF_NONE_MATCH, "\"unrelated-etag\"")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            r2.status(),
+            StatusCode::NOT_MODIFIED,
+            "second If-None-Match header line must be evaluated"
+        );
     }
 }

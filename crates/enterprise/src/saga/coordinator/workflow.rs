@@ -274,8 +274,26 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
-                    if store.renew_execution(&saga_id, &token).await.is_err() {
-                        break;
+                    match store.renew_execution(&saga_id, &token).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                saga_id = %saga_id,
+                                "saga execution claim lost or expired; stopping renewal loop"
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            // Why: a single transient DB/Redis blip must not permanently abort
+                            // lease renewal while the step is still running; retry on the next
+                            // tick and only break on explicit claim loss (`Ok(false)`) or guard
+                            // cancellation.
+                            tracing::warn!(
+                                saga_id = %saga_id,
+                                error = %err,
+                                "transient error renewing saga execution claim; retrying on next tick"
+                            );
+                        }
                     }
                 }
             })

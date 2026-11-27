@@ -198,6 +198,15 @@ fn ttl_millis(ttl: Duration) -> i64 {
 }
 
 #[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+fn now_millis() -> i64 {
+    let ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
 impl SagaStore for SqlSagaStore {
     fn save_record_cas(
         &self,
@@ -220,6 +229,7 @@ impl SagaStore for SqlSagaStore {
             let is_terminal = record.status.is_terminal();
             let updated_at = i64::try_from(record.updated_at).unwrap_or(i64::MAX);
             let expected_ver = i64::try_from(expected_version).unwrap_or(i64::MAX);
+            let now_ms = now_millis();
 
             let rows_affected = match self {
                 #[cfg(feature = "sqlite")]
@@ -249,6 +259,7 @@ impl SagaStore for SqlSagaStore {
                             .bind(updated_at)
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
+                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -281,6 +292,7 @@ impl SagaStore for SqlSagaStore {
                             .bind(updated_at)
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
+                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -304,8 +316,9 @@ impl SagaStore for SqlSagaStore {
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
                             .rows_affected()
                     } else {
-                        // Why: MySQL uses positional `?` placeholders, so `SET` columns precede `WHERE`
-                        // and `claim_token` is bound twice for `(? IS NULL OR claim_token = ?)`.
+                        // Why: MySQL uses positional `?` placeholders, so `SET` columns precede `WHERE`,
+                        // `claim_token` is bound twice for `(? IS NULL OR (claim_token = ? AND claim_expires_at > ?))`,
+                        // and `now_ms` enforces lease freshness even before another worker overwrites `claim_token`.
                         sqlx::query(rume_data::sql::MYSQL_SAGA_UPDATE_CAS)
                             .bind(&record.saga_name)
                             .bind(&status_json)
@@ -317,6 +330,7 @@ impl SagaStore for SqlSagaStore {
                             .bind(expected_ver)
                             .bind(claim_token.as_deref())
                             .bind(claim_token.as_deref())
+                            .bind(now_ms)
                             .execute(pool)
                             .await
                             .map_err(|e| storage_err(Some(&record.saga_id), e))?
@@ -461,10 +475,11 @@ impl SagaStore for SqlSagaStore {
         &self,
         saga_id: &str,
         claim_token: &str,
-    ) -> BoxFuture<'_, Result<(), SagaError>> {
+    ) -> BoxFuture<'_, Result<bool, SagaError>> {
         let saga_id = saga_id.to_string();
         let claim_token = claim_token.to_string();
         Box::pin(async move {
+            let now_ms = now_millis();
             let rows_affected = match self {
                 #[cfg(feature = "sqlite")]
                 Self::Sqlite { pool, claim_ttl } => {
@@ -472,6 +487,7 @@ impl SagaStore for SqlSagaStore {
                         .bind(&saga_id)
                         .bind(&claim_token)
                         .bind(ttl_millis(*claim_ttl))
+                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?
@@ -483,6 +499,7 @@ impl SagaStore for SqlSagaStore {
                         .bind(&saga_id)
                         .bind(&claim_token)
                         .bind(ttl_millis(*claim_ttl))
+                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?
@@ -490,11 +507,12 @@ impl SagaStore for SqlSagaStore {
                 }
                 #[cfg(feature = "mysql")]
                 Self::Mysql { pool, claim_ttl } => {
-                    // Why: MySQL positional `?` binds `ttl_ms`, `saga_id`, then `claim_token`.
+                    // Why: MySQL positional `?` binds `ttl_ms`, `saga_id`, `claim_token`, then `now_ms`.
                     sqlx::query(rume_data::sql::MYSQL_SAGA_RENEW_CLAIM)
                         .bind(ttl_millis(*claim_ttl))
                         .bind(&saga_id)
                         .bind(&claim_token)
+                        .bind(now_ms)
                         .execute(pool)
                         .await
                         .map_err(|e| storage_err(Some(&saga_id), e))?
@@ -502,13 +520,7 @@ impl SagaStore for SqlSagaStore {
                 }
             };
 
-            if rows_affected == 0 {
-                return Err(SagaError::Storage {
-                    saga_id: Some(saga_id),
-                    message: "saga execution claim lost or expired".into(),
-                });
-            }
-            Ok(())
+            Ok(rows_affected > 0)
         })
     }
 
@@ -746,10 +758,12 @@ mod tests {
             .try_acquire_execution("saga-fence")
             .await
             .expect("worker A acquires claim");
-        store
-            .renew_execution("saga-fence", &token_a)
-            .await
-            .expect("worker A renews active claim");
+        assert!(
+            store
+                .renew_execution("saga-fence", &token_a)
+                .await
+                .expect("worker A renews active claim")
+        );
 
         // Worker A releases and Worker B takes over the claim.
         store
@@ -775,7 +789,10 @@ mod tests {
             "stale claim_token CAS must be rejected when another worker holds the claim"
         );
         assert!(
-            store.renew_execution("saga-fence", &token_a).await.is_err(),
+            !store
+                .renew_execution("saga-fence", &token_a)
+                .await
+                .expect("stale claim_token renewal should return Ok(false)"),
             "stale claim_token renewal must be rejected"
         );
 
@@ -791,5 +808,55 @@ mod tests {
             .expect("load")
             .expect("record exists");
         assert_eq!(loaded.version, 2);
+    }
+
+    #[tokio::test]
+    async fn sql_saga_store_rejects_renew_and_cas_after_claim_ttl_expiry() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("connect sqlite::memory:");
+        let store = SqlSagaStore::sqlite(pool).with_claim_ttl(Duration::from_millis(20));
+        store.init_schema().await.expect("init_schema");
+
+        let rec1 = SagaRecord {
+            saga_id: "saga-expire".into(),
+            saga_name: "order_flow".into(),
+            status: SagaStatus::Pending,
+            completed_steps: vec![],
+            compensated_steps: vec![],
+            updated_at: 400,
+            version: 1,
+        };
+        store.save_record_cas(&rec1, 0).await.expect("insert");
+
+        let token = store
+            .try_acquire_execution("saga-expire")
+            .await
+            .expect("acquire claim");
+
+        // Wait past the 20ms claim TTL without any second worker taking over.
+        tokio::time::sleep(Duration::from_millis(45)).await;
+
+        let renew_res = store
+            .renew_execution("saga-expire", &token)
+            .await
+            .expect("expired renewal should return Ok(false)");
+        assert!(
+            !renew_res,
+            "expired worker must not be able to renew its own claim"
+        );
+
+        let mut rec2 = rec1.clone();
+        rec2.status = SagaStatus::Running {
+            current_step: "step_1".into(),
+        };
+        rec2.version = 2;
+        assert!(
+            store
+                .save_record_cas_with_claim(&rec2, 1, Some(&token))
+                .await
+                .is_err(),
+            "expired worker must not be able to commit a CAS update even when no second worker overwrote claim_token"
+        );
     }
 }

@@ -118,14 +118,16 @@ pub trait SagaStore: Send + Sync + 'static {
 
     /// Renews the lease for an active execution claim held under `claim_token`.
     ///
-    /// Returns [`SagaError::Storage`] if the claim was lost or expired.
+    /// Returns `Ok(true)` if the lease was extended, `Ok(false)` if the claim was
+    /// explicitly lost or expired, or `Err(SagaError::Storage)` on a transient
+    /// storage/transport failure.
     fn renew_execution(
         &self,
         saga_id: &str,
         claim_token: &str,
-    ) -> BoxFuture<'_, Result<(), SagaError>> {
+    ) -> BoxFuture<'_, Result<bool, SagaError>> {
         let _ = (saga_id, claim_token);
-        Box::pin(async { Ok(()) })
+        Box::pin(async { Ok(true) })
     }
 
     /// Returns the claim lease TTL if this store uses time-bounded execution leases
