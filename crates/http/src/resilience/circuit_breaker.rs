@@ -34,6 +34,9 @@ pub struct CircuitBreakerConfig {
     pub success_threshold: u32,
     /// Cooldown duration before transitioning from Open to HalfOpen.
     pub reset_timeout: Duration,
+    /// Whether dropping an uncompleted `HalfOpen` [`TrialPermit`] (e.g. due to an outer
+    /// `TimeoutLayer` cancelling a hanging probe) re-opens the circuit (default: `true`).
+    pub count_cancellation_as_failure: bool,
 }
 
 impl Default for CircuitBreakerConfig {
@@ -42,6 +45,7 @@ impl Default for CircuitBreakerConfig {
             failure_threshold: 5,
             success_threshold: 2,
             reset_timeout: Duration::from_secs(10),
+            count_cancellation_as_failure: true,
         }
     }
 }
@@ -97,6 +101,14 @@ impl Drop for TrialPermit {
             {
                 inner.half_open_in_flight = false;
                 inner.active_half_open_permit = None;
+                if self.breaker.config.count_cancellation_as_failure {
+                    // Why: when an outer `TimeoutLayer` cancels a hanging `HalfOpen` probe,
+                    // merely clearing `half_open_in_flight` would immediately admit another
+                    // hanging probe; re-opening enforces the `reset_timeout` cooldown (`P2-10`).
+                    inner.state = CircuitState::Open;
+                    inner.consecutive_successes = 0;
+                    inner.opened_at = Some(Instant::now());
+                }
             }
         }
     }
@@ -398,6 +410,7 @@ mod tests {
             failure_threshold: 1,
             success_threshold: 1,
             reset_timeout: Duration::from_millis(40),
+            count_cancellation_as_failure: false,
         });
 
         breaker.on_failure();
@@ -431,7 +444,8 @@ mod tests {
         let second_resp = svc.call(second_req).await.unwrap();
         assert_eq!(second_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 
-        // Dropping/aborting the pending trial releases the slot immediately.
+        // Dropping/aborting the pending trial releases the slot immediately when
+        // `count_cancellation_as_failure` is `false`.
         trial_fut.abort();
         let _ = (&mut trial_fut).await;
 
@@ -444,11 +458,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_half_open_probe_reopens_circuit_by_default() {
+        tokio::time::pause();
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            success_threshold: 1,
+            reset_timeout: Duration::from_millis(40),
+            ..Default::default()
+        });
+
+        // Open -> wait reset_timeout -> HalfOpen.
+        breaker.on_failure();
+        assert_eq!(breaker.state(), CircuitState::Open);
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+
+        let gate = Arc::new(Notify::new());
+        let mut svc = CircuitBreakerService::new(
+            ControlledService {
+                gate: Arc::clone(&gate),
+            },
+            breaker.clone(),
+        );
+
+        // Simulate an outer TimeoutLayer cancelling a hanging HalfOpen probe.
+        let req = Request::builder().body(Body::empty()).unwrap();
+        let timed_out = tokio::time::timeout(Duration::from_millis(10), svc.call(req)).await;
+        assert!(timed_out.is_err(), "hanging probe should time out");
+
+        // Circuit must be re-opened (NOT left in HalfOpen admitting unlimited hanging probes).
+        assert_eq!(breaker.state(), CircuitState::Open);
+        let immediate_req = Request::builder().body(Body::empty()).unwrap();
+        let immediate_resp = svc.call(immediate_req).await.unwrap();
+        assert_eq!(immediate_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // After reset_timeout elapses, a new probe is admitted and closes the circuit on success.
+        tokio::time::advance(Duration::from_millis(50)).await;
+        assert_eq!(breaker.state(), CircuitState::HalfOpen);
+        gate.notify_one();
+        let recovery_req = Request::builder().body(Body::empty()).unwrap();
+        let recovery_resp = svc.call(recovery_req).await.unwrap();
+        assert_eq!(recovery_resp.status(), StatusCode::OK);
+        assert_eq!(breaker.state(), CircuitState::Closed);
+    }
+
+    #[tokio::test]
     async fn superseded_half_open_permit_completion_is_ignored() {
         let breaker = CircuitBreaker::new(CircuitBreakerConfig {
             failure_threshold: 1,
             success_threshold: 1,
             reset_timeout: Duration::from_millis(0),
+            ..Default::default()
         });
 
         // Trip to Open and immediately transition to HalfOpen.

@@ -803,6 +803,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sqlite_renew_lease_rejects_already_expired_lease() {
+        #[derive(Debug, Serialize, Deserialize)]
+        struct ShortLeaseJob;
+
+        impl Job for ShortLeaseJob {
+            const NAME: &'static str = "test.short_lease";
+        }
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        let queue = SqliteJobQueue::new(pool).with_lease_duration(Duration::from_millis(25));
+        queue.init_schema().await.unwrap();
+
+        queue.enqueue(ShortLeaseJob).await.unwrap();
+        let claimed = queue.dequeue_for("worker-1").await.unwrap().unwrap();
+        let tok = claimed.lease_token.clone().unwrap();
+
+        // Wait past the 25ms lease expiry without any peer reclaiming the job yet.
+        tokio::time::sleep(Duration::from_millis(60)).await;
+
+        let err = queue
+            .renew_lease(&claimed.id, &tok, Duration::from_secs(30))
+            .await
+            .expect_err("renewing an already-expired lease must fail");
+        assert!(
+            matches!(err, JobError::Fatal(_)),
+            "expected Fatal error on expired lease renewal, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn sqlite_poison_pill_job_dead_letters_without_reexecuting_handler() {
         use std::sync::Arc;
         use std::sync::atomic::{AtomicUsize, Ordering};

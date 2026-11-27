@@ -936,6 +936,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_from_handle_reconciles_version_zero_forward_handle_against_persisted_saga() {
+        use crate::saga::coordinator::workflow::{Saga, SagaRecoveryPhase};
+        use std::sync::Arc;
+
+        let (_pool, store) = sqlite_store().await;
+        let store_arc = Arc::new(store.clone());
+
+        // Persist a saga at version 2 with step_1 already completed and currently Running.
+        let v1 = SagaRecord {
+            saga_id: "saga-v0-forward".into(),
+            saga_name: "forward_reconcile".into(),
+            status: SagaStatus::Pending,
+            completed_steps: vec![],
+            compensated_steps: vec![],
+            updated_at: 500,
+            version: 1,
+        };
+        store.save_record_cas(&v1, 0).await.unwrap();
+        let v2 = SagaRecord {
+            status: SagaStatus::Running {
+                current_step: "step_2".into(),
+            },
+            completed_steps: vec!["step_1".into()],
+            version: 2,
+            ..v1
+        };
+        store.save_record_cas(&v2, 1).await.unwrap();
+
+        // Worker A holds the execution claim; Worker B calls `resume_recoverable`, which fails
+        // claim acquisition and produces a stale `version == 0 && Forward` handle (`P2-05`).
+        let worker_a_token = store
+            .try_acquire_execution("saga-v0-forward")
+            .await
+            .expect("worker A acquires claim");
+
+        let saga = Saga::<Vec<&'static str>>::new("forward_reconcile")
+            .with_store(store_arc)
+            .step(
+                "step_1",
+                |ctx| {
+                    ctx.push("exec_1");
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            )
+            .step(
+                "step_2",
+                |ctx| {
+                    ctx.push("exec_2");
+                    async { Ok(()) }
+                },
+                |_| async { Ok(()) },
+            );
+
+        let contended_err = match saga
+            .resume_recoverable("saga-v0-forward", vec!["ctx"])
+            .await
+        {
+            Err(err) => err,
+            Ok(_) => panic!("worker B must fail while worker A holds claim"),
+        };
+        assert_eq!(contended_err.handle.version, 0);
+        assert!(matches!(
+            contended_err.handle.phase,
+            SagaRecoveryPhase::Forward
+        ));
+
+        // Worker A releases its claim; retrying via `resume_from_handle` MUST reconcile
+        // the persisted version=2 record and finish step_2 cleanly (no infinite CAS loop).
+        store
+            .release_execution("saga-v0-forward", &worker_a_token)
+            .await
+            .unwrap();
+
+        let report = saga
+            .resume_from_handle(*contended_err.handle)
+            .await
+            .expect("resume_from_handle must reconcile version == 0 Forward handle");
+        assert!(matches!(report.status, SagaStatus::Success));
+        assert_eq!(report.context, vec!["ctx", "exec_2"]);
+        assert_eq!(
+            report.completed_steps,
+            vec!["step_1".to_string(), "step_2".to_string()]
+        );
+    }
+
+    #[tokio::test]
     async fn sql_saga_store_rejects_renew_and_cas_after_claim_ttl_expiry() {
         let pool = sqlx::SqlitePool::connect("sqlite::memory:")
             .await

@@ -460,17 +460,87 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
 
     fn upsert<'a>(&'a self, tenant: &'a Tenant) -> BoxFuture<'a, Result<(), TenantError>> {
         Box::pin(async move {
-            let sql = match self.backend.dialect() {
-                "postgres" => rume_data::sql::PG_AUTH_TENANT_UPSERT,
-                "mysql" => rume_data::sql::MYSQL_AUTH_TENANT_UPSERT,
-                _ => rume_data::sql::SQLITE_AUTH_TENANT_UPSERT,
-            };
             let metadata_json = serde_json::to_string(&tenant.metadata)
                 .map_err(|e| TenantError::Internal(format!("failed to serialize metadata: {e}")))?;
             let created_at = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs() as i64;
+
+            if self.backend.dialect() == "mysql" {
+                use rume_data::persistence::DatabaseTransaction;
+
+                // Why: MySQL `ON DUPLICATE KEY UPDATE` triggers on ANY unique index collision,
+                // including `UNIQUE KEY uq_rume_tenants_slug (slug)`, which would silently
+                // overwrite and reactivate another tenant row (`P2-01`). Lock and check slug
+                // conflicts in a transaction and split `UPDATE WHERE id = ?` vs plain `INSERT`.
+                let tx = self
+                    .backend
+                    .begin_transaction()
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+
+                let conflict = tx
+                    .fetch_optional(
+                        rume_data::sql::MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT,
+                        &[
+                            rume_data::persistence::DbValue::from(tenant.slug.as_str()),
+                            rume_data::persistence::DbValue::from(tenant.id.as_str()),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                if conflict.is_some() {
+                    let _ = tx.rollback().await;
+                    return Err(TenantError::Conflict(format!(
+                        "tenant slug '{}' already belongs to another tenant",
+                        tenant.slug
+                    )));
+                }
+
+                let existing = tx
+                    .fetch_optional(
+                        rume_data::sql::MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE,
+                        &[rume_data::persistence::DbValue::from(tenant.id.as_str())],
+                    )
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+
+                if existing.is_some() {
+                    tx.execute_params(
+                        rume_data::sql::MYSQL_AUTH_TENANT_UPDATE,
+                        &[
+                            rume_data::persistence::DbValue::from(tenant.slug.as_str()),
+                            rume_data::persistence::DbValue::from(metadata_json),
+                            rume_data::persistence::DbValue::from(tenant.id.as_str()),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                } else {
+                    tx.execute_params(
+                        rume_data::sql::MYSQL_AUTH_TENANT_INSERT,
+                        &[
+                            rume_data::persistence::DbValue::from(tenant.id.as_str()),
+                            rume_data::persistence::DbValue::from(tenant.slug.as_str()),
+                            rume_data::persistence::DbValue::from(metadata_json),
+                            rume_data::persistence::DbValue::from(created_at),
+                        ],
+                    )
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                }
+
+                tx.commit()
+                    .await
+                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                return Ok(());
+            }
+
+            let sql = match self.backend.dialect() {
+                "postgres" => rume_data::sql::PG_AUTH_TENANT_UPSERT,
+                _ => rume_data::sql::SQLITE_AUTH_TENANT_UPSERT,
+            };
             let params = [
                 rume_data::persistence::DbValue::from(tenant.id.as_str()),
                 rume_data::persistence::DbValue::from(tenant.slug.as_str()),
@@ -1033,6 +1103,275 @@ mod tests {
         assert_eq!(
             resolver.resolve(&parts_ok).await.unwrap(),
             Some(acme_recreated)
+        );
+    }
+
+    #[tokio::test]
+    async fn sql_tenant_store_rejects_duplicate_slug_for_different_id_on_sqlite_and_mysql() {
+        use rume_data::persistence::backend::BoxFuture as DbBoxFuture;
+        use rume_data::persistence::sqlite::SqliteBackend;
+        use rume_data::persistence::{
+            DatabaseBackend, DatabaseTransaction, DbRow, DbValue, PersistenceError,
+        };
+
+        let make_tenant = |id: &str, slug: &str, tier: &str| {
+            let mut t = Tenant::new(id, slug);
+            t.metadata.insert("tier".to_string(), tier.to_string());
+            t
+        };
+
+        // 1. SQLite: duplicate slug with different id must error and leave deactivated t1 inactive.
+        let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
+        backend
+            .execute(rume_data::sql::SQLITE_AUTH_SCHEMA)
+            .await
+            .unwrap();
+        let store = SqlTenantStore::new(Arc::clone(&backend));
+
+        let t1 = make_tenant("t1", "acme", "enterprise");
+        store.upsert(&t1).await.unwrap();
+        assert!(store.deactivate("t1").await.unwrap());
+
+        let t2 = make_tenant("t2", "acme", "free");
+        assert!(
+            store.upsert(&t2).await.is_err(),
+            "duplicate slug for different id must fail"
+        );
+        assert_eq!(
+            store.find_by_id("t1").await.unwrap(),
+            None,
+            "deactivated t1 must remain inactive after rejected duplicate-slug upsert"
+        );
+
+        // 2. MySQL dialect path (`P2-01`): verify transaction checks slug conflict and never
+        //    falls through to `ON DUPLICATE KEY UPDATE` when another tenant owns `slug`.
+        type FakeTenantRowMap =
+            Arc<std::sync::Mutex<std::collections::HashMap<String, (String, String, bool)>>>;
+
+        #[derive(Debug, Clone)]
+        struct FakeMysqlState {
+            rows: FakeTenantRowMap,
+            executed_sql: Arc<std::sync::Mutex<Vec<String>>>,
+        }
+
+        #[derive(Debug, Clone)]
+        struct FakeMysqlTx {
+            state: FakeMysqlState,
+        }
+
+        impl DatabaseTransaction for FakeMysqlTx {
+            fn dialect(&self) -> &'static str {
+                "mysql"
+            }
+
+            fn execute_params(
+                &self,
+                statement: &str,
+                params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<u64, PersistenceError>> {
+                let stmt = statement.to_string();
+                let params = params.to_vec();
+                Box::pin(async move {
+                    self.state.executed_sql.lock().unwrap().push(stmt.clone());
+                    let mut rows = self.state.rows.lock().unwrap();
+                    if stmt == rume_data::sql::MYSQL_AUTH_TENANT_INSERT {
+                        let (DbValue::Text(id), DbValue::Text(slug), DbValue::Text(meta)) =
+                            (&params[0], &params[1], &params[2])
+                        else {
+                            return Err(PersistenceError::QueryFailed("bad insert params".into()));
+                        };
+                        rows.insert(id.clone(), (slug.clone(), meta.clone(), true));
+                        Ok(1)
+                    } else if stmt == rume_data::sql::MYSQL_AUTH_TENANT_UPDATE {
+                        let (DbValue::Text(slug), DbValue::Text(meta), DbValue::Text(id)) =
+                            (&params[0], &params[1], &params[2])
+                        else {
+                            return Err(PersistenceError::QueryFailed("bad update params".into()));
+                        };
+                        rows.insert(id.clone(), (slug.clone(), meta.clone(), true));
+                        Ok(1)
+                    } else {
+                        Err(PersistenceError::QueryFailed(format!(
+                            "unexpected SQL in MySQL upsert: {stmt}"
+                        )))
+                    }
+                })
+            }
+
+            fn query_scalar_params(
+                &self,
+                _query: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Option<String>, PersistenceError>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn fetch_all(
+                &self,
+                _statement: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn fetch_optional(
+                &self,
+                statement: &str,
+                params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+                let stmt = statement.to_string();
+                let params = params.to_vec();
+                Box::pin(async move {
+                    let rows = self.state.rows.lock().unwrap();
+                    if stmt == rume_data::sql::MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT {
+                        let (DbValue::Text(slug), DbValue::Text(id)) = (&params[0], &params[1])
+                        else {
+                            return Ok(None);
+                        };
+                        let found = rows
+                            .iter()
+                            .find(|(existing_id, (existing_slug, _, _))| {
+                                existing_slug == slug && existing_id.as_str() != id.as_str()
+                            })
+                            .map(|(existing_id, _)| {
+                                DbRow::new(
+                                    vec!["id".to_string()],
+                                    vec![DbValue::Text(existing_id.clone())],
+                                )
+                            });
+                        Ok(found)
+                    } else if stmt == rume_data::sql::MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE {
+                        let DbValue::Text(id) = &params[0] else {
+                            return Ok(None);
+                        };
+                        let found = rows.get(id).map(|_| {
+                            DbRow::new(vec!["id".to_string()], vec![DbValue::Text(id.clone())])
+                        });
+                        Ok(found)
+                    } else {
+                        Ok(None)
+                    }
+                })
+            }
+
+            fn commit(&self) -> DbBoxFuture<'_, Result<(), PersistenceError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn rollback(&self) -> DbBoxFuture<'_, Result<(), PersistenceError>> {
+                Box::pin(async { Ok(()) })
+            }
+        }
+
+        #[derive(Debug)]
+        struct FakeMysqlBackend {
+            state: FakeMysqlState,
+        }
+
+        impl DatabaseBackend for FakeMysqlBackend {
+            type Transaction = FakeMysqlTx;
+
+            fn dialect(&self) -> &'static str {
+                "mysql"
+            }
+
+            fn ping(&self) -> DbBoxFuture<'_, Result<(), PersistenceError>> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn execute_params(
+                &self,
+                _statement: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<u64, PersistenceError>> {
+                Box::pin(async {
+                    Err(PersistenceError::QueryFailed(
+                        "MySQL upsert must run inside a transaction".into(),
+                    ))
+                })
+            }
+
+            fn query_scalar_params(
+                &self,
+                _query: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Option<String>, PersistenceError>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn fetch_all(
+                &self,
+                _statement: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Vec<DbRow>, PersistenceError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+
+            fn fetch_optional(
+                &self,
+                _statement: &str,
+                _params: &[DbValue],
+            ) -> DbBoxFuture<'_, Result<Option<DbRow>, PersistenceError>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn begin_transaction(
+                &self,
+            ) -> DbBoxFuture<'_, Result<Self::Transaction, PersistenceError>> {
+                let tx = FakeMysqlTx {
+                    state: self.state.clone(),
+                };
+                Box::pin(async move { Ok(tx) })
+            }
+        }
+
+        let mut initial = std::collections::HashMap::new();
+        initial.insert(
+            "t1".to_string(),
+            (
+                "acme".to_string(),
+                r#"{"tier":"enterprise"}"#.to_string(),
+                false,
+            ),
+        );
+        let state = FakeMysqlState {
+            rows: Arc::new(std::sync::Mutex::new(initial)),
+            executed_sql: Arc::new(std::sync::Mutex::new(Vec::new())),
+        };
+        let mysql_store = SqlTenantStore::new(Arc::new(FakeMysqlBackend {
+            state: state.clone(),
+        }));
+
+        // Upserting t2 with t1's slug must fail with Conflict and leave t1 deactivated & intact.
+        let err = mysql_store
+            .upsert(&make_tenant("t2", "acme", "free"))
+            .await
+            .expect_err("duplicate slug on MySQL must return Conflict");
+        assert!(matches!(err, TenantError::Conflict(_)), "got {err:?}");
+        {
+            let rows = state.rows.lock().unwrap();
+            let (slug, meta, active) = rows.get("t1").unwrap();
+            assert_eq!(slug, "acme");
+            assert_eq!(meta, r#"{"tier":"enterprise"}"#);
+            assert!(!active, "deactivated t1 must remain inactive");
+        }
+
+        // Upserting t1 itself updates via UPDATE WHERE id = ?, and inserting t3 uses INSERT.
+        mysql_store
+            .upsert(&make_tenant("t1", "acme", "pro"))
+            .await
+            .unwrap();
+        mysql_store
+            .upsert(&Tenant::new("t3", "beta"))
+            .await
+            .unwrap();
+        let sqls = state.executed_sql.lock().unwrap().clone();
+        assert_eq!(
+            sqls,
+            vec![
+                rume_data::sql::MYSQL_AUTH_TENANT_UPDATE.to_string(),
+                rume_data::sql::MYSQL_AUTH_TENANT_INSERT.to_string(),
+            ]
         );
     }
 

@@ -164,10 +164,30 @@ pub fn sanitize_filename(raw: &str) -> String {
     };
 
     if out.len() > MAX_FILENAME_BYTES {
-        out = truncate_utf8_bytes(&out, MAX_FILENAME_BYTES)
-            .trim_end_matches('.')
-            .trim_end()
-            .to_string();
+        // Why: truncate ONLY the stem while preserving the trailing `.ext` so an attacker
+        // cannot smuggle a disallowed extension (e.g. `a...a.png.html` -> `a...a.png`) past
+        // `validate_extension` via 255-byte truncation (`P2-09`).
+        out = if let Some((raw_stem, ext)) = out.rsplit_once('.')
+            && !raw_stem.is_empty()
+            && !ext.is_empty()
+            && ext.len() + 1 < MAX_FILENAME_BYTES
+        {
+            let max_stem = MAX_FILENAME_BYTES - ext.len() - 1;
+            let truncated_stem = truncate_utf8_bytes(raw_stem, max_stem)
+                .trim_end_matches('.')
+                .trim_end();
+            let safe_stem = if truncated_stem.is_empty() {
+                "upload"
+            } else {
+                truncated_stem
+            };
+            format!("{safe_stem}.{ext}")
+        } else {
+            truncate_utf8_bytes(&out, MAX_FILENAME_BYTES)
+                .trim_end_matches('.')
+                .trim_end()
+                .to_string()
+        };
         if out.is_empty() {
             return "upload.bin".to_string();
         }
@@ -289,7 +309,77 @@ pub async fn extract_multipart_files(
 /// Maximum bytes inspected during text/markup MIME sniffing (8 KiB).
 const TEXT_SNIFF_WINDOW_BYTES: usize = 8192;
 
-fn strip_leading_ws_and_comments(mut slice: &[u8]) -> &[u8] {
+/// Maximum raw bytes decoded when normalizing UTF-16 BOM payloads for markup sniffing.
+const MAX_UTF16_SNIFF_BYTES: usize = 256 * 1024;
+
+fn decode_utf16_bom(bytes: &[u8]) -> Option<Vec<u8>> {
+    let (le, body) = if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
+        (true, rest)
+    } else if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
+        (false, rest)
+    } else {
+        return None;
+    };
+    let bounded = &body[..body.len().min(MAX_UTF16_SNIFF_BYTES)];
+    let units: Vec<u16> = bounded
+        .chunks_exact(2)
+        .map(|c| {
+            if le {
+                u16::from_le_bytes([c[0], c[1]])
+            } else {
+                u16::from_be_bytes([c[0], c[1]])
+            }
+        })
+        .collect();
+    Some(String::from_utf16_lossy(&units).into_bytes())
+}
+
+/// Skips a `<!DOCTYPE ...>` declaration including any `[ ... ]` internal subset containing
+/// nested `<!ENTITY ...>` / `<!-- ... -->` declarations (`P2-09`).
+fn skip_doctype_declaration(slice: &[u8]) -> Option<&[u8]> {
+    if slice.len() < 9 || !slice[..9].eq_ignore_ascii_case(b"<!doctype") {
+        return None;
+    }
+    let mut i = 9;
+    let mut bracket_depth: usize = 0;
+    let mut quote: Option<u8> = None;
+    while i < slice.len() {
+        let b = slice[i];
+        if let Some(q) = quote {
+            if b == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        if slice[i..].starts_with(b"<!--") {
+            if let Some(end_rel) = slice[i + 4..].windows(3).position(|w| w == b"-->") {
+                i += 4 + end_rel + 3;
+                continue;
+            }
+            return None;
+        }
+        match b {
+            b'"' | b'\'' => quote = Some(b),
+            b'[' => bracket_depth = bracket_depth.saturating_add(1),
+            b']' => bracket_depth = bracket_depth.saturating_sub(1),
+            b'>' if bracket_depth == 0 => return Some(&slice[i + 1..]),
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+struct StrippedProlog<'a> {
+    rest: &'a [u8],
+    saw_xml_prolog: bool,
+    saw_html_doctype: bool,
+}
+
+fn strip_leading_ws_and_prolog(mut slice: &[u8]) -> StrippedProlog<'_> {
+    let mut saw_xml_prolog = false;
+    let mut saw_html_doctype = false;
     loop {
         while let Some((&b, rest)) = slice.split_first() {
             if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c') {
@@ -304,9 +394,42 @@ fn strip_leading_ws_and_comments(mut slice: &[u8]) -> &[u8] {
             slice = &after_open[end_idx + 3..];
             continue;
         }
+        if let Some(after_pi) = slice.strip_prefix(b"<?")
+            && let Some(end_idx) = after_pi.windows(2).position(|w| w == b"?>")
+        {
+            if slice.len() >= 5 && slice[..5].eq_ignore_ascii_case(b"<?xml") {
+                saw_xml_prolog = true;
+            }
+            slice = &after_pi[end_idx + 2..];
+            continue;
+        }
+        if slice.len() >= 9 && slice[..9].eq_ignore_ascii_case(b"<!doctype") {
+            let after_kw = &slice[9..];
+            let ws_skipped = after_kw
+                .iter()
+                .position(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c'))
+                .map(|idx| &after_kw[idx..])
+                .unwrap_or(&[]);
+            if ws_skipped.len() >= 4
+                && ws_skipped[..4].eq_ignore_ascii_case(b"html")
+                && ws_skipped
+                    .get(4)
+                    .is_none_or(|b| b.is_ascii_whitespace() || *b == b'>')
+            {
+                saw_html_doctype = true;
+            }
+            if let Some(after_doctype) = skip_doctype_declaration(slice) {
+                slice = after_doctype;
+                continue;
+            }
+        }
         break;
     }
-    slice
+    StrippedProlog {
+        rest: slice,
+        saw_xml_prolog,
+        saw_html_doctype,
+    }
 }
 
 /// Sniffs the MIME type of `bytes` using `infer` for binary magic signatures (100+ formats)
@@ -331,17 +454,30 @@ pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
         }
     }
 
-    // 2. Text / markup / script signatures: strip optional UTF-8 BOM, leading ASCII
-    //    whitespace, and leading HTML/XML comments (`<!-- ... -->`) on raw bytes BEFORE
-    //    bounding to 8 KiB, and decode lossily so invalid trailing UTF-8 or >512B padded
-    //    comments cannot bypass HTML/script/SVG detection (`RC-05`, `RC-16`).
-    let after_bom = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
-    let trimmed = strip_leading_ws_and_comments(after_bom);
-    if trimmed.is_empty() {
+    // 2. Text / markup / script signatures: decode optional UTF-16LE/BE BOM or strip UTF-8 BOM,
+    //    then strip leading whitespace, HTML/XML comments (`<!-- ... -->`), processing
+    //    instructions (`<?...?>`), and `<!DOCTYPE ...>` declarations BEFORE bounding to 8 KiB
+    //    so padded prologs/DOCTYPE subsets or UTF-16 payloads cannot bypass detection (`RC-05`, `RC-16`, `P2-09`).
+    let utf16_decoded = decode_utf16_bom(bytes);
+    let after_bom: &[u8] = if let Some(ref decoded) = utf16_decoded {
+        decoded.as_slice()
+    } else {
+        bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
+    };
+
+    let prolog = strip_leading_ws_and_prolog(after_bom);
+    if prolog.rest.is_empty() {
+        if prolog.saw_html_doctype {
+            return Some("text/html");
+        }
+        if prolog.saw_xml_prolog {
+            return Some("application/xml");
+        }
         return infer_html_fallback;
     }
-    let prefix_len = trimmed.len().min(TEXT_SNIFF_WINDOW_BYTES);
-    let prefix = String::from_utf8_lossy(&trimmed[..prefix_len]);
+
+    let prefix_len = prolog.rest.len().min(TEXT_SNIFF_WINDOW_BYTES);
+    let prefix = String::from_utf8_lossy(&prolog.rest[..prefix_len]);
     let lower = prefix.to_ascii_lowercase();
 
     let starts_with_tag = |s: &str, tag: &str| -> bool {
@@ -351,7 +487,11 @@ pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
         })
     };
 
+    if starts_with_tag(&lower, "<svg") {
+        return Some("image/svg+xml");
+    }
     if lower.starts_with("<!doctype html")
+        || prolog.saw_html_doctype
         || starts_with_tag(&lower, "<html")
         || starts_with_tag(&lower, "<script")
         || starts_with_tag(&lower, "<head")
@@ -363,24 +503,7 @@ pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
     {
         return Some("text/html");
     }
-    if starts_with_tag(&lower, "<svg") {
-        return Some("image/svg+xml");
-    }
-    if lower.starts_with("<?xml") {
-        // Also strip `<?xml ...?>` + any following comments so arbitrarily long comments
-        // between the XML prolog and `<svg>` / `<html>` / `<script>` still get classified.
-        if let Some(prolog_end) = trimmed.windows(2).position(|w| w == b"?>") {
-            let after_prolog = strip_leading_ws_and_comments(&trimmed[prolog_end + 2..]);
-            let after_len = after_prolog.len().min(TEXT_SNIFF_WINDOW_BYTES);
-            let after_lower =
-                String::from_utf8_lossy(&after_prolog[..after_len]).to_ascii_lowercase();
-            if starts_with_tag(&after_lower, "<svg") || after_lower.contains("<svg") {
-                return Some("image/svg+xml");
-            }
-            if starts_with_tag(&after_lower, "<html") || starts_with_tag(&after_lower, "<script") {
-                return Some("text/html");
-            }
-        }
+    if prolog.saw_xml_prolog || lower.starts_with("<?xml") {
         if lower.contains("<svg") {
             return Some("image/svg+xml");
         }
@@ -584,7 +707,11 @@ fn validate_sniffed_mime_type(
                     ),
                 });
             }
-            (None, Some(detected @ ("text/html" | "image/svg+xml"))) => {
+            // Why: unmapped/text extensions (`txt`, `csv`, `json`, `md`, etc.) have no
+            // magic-byte mapping in `expected_mime_for_extension`; detecting ANY binary or
+            // markup signature (ELF, PE, PDF, ZIP, HTML, SVG, XML, etc.) means the payload
+            // is being smuggled under a text extension (`P2-09`).
+            (None, Some(detected)) => {
                 return Err(AppError::Public {
                     status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
                     code: "UNSUPPORTED_MEDIA_TYPE",
@@ -1296,5 +1423,132 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp_ok.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn p2_09_upload_hardening_preserves_ext_blocks_text_smuggling_and_sniffs_doctype_utf16_svg()
+     {
+        // 1. 255-byte truncation must preserve the real trailing extension (`.html`), not mutate it into `.png`.
+        let crafted = format!("{}.png.html", "a".repeat(251));
+        let sanitized = sanitize_filename(&crafted);
+        assert!(sanitized.len() <= MAX_FILENAME_BYTES);
+        assert!(
+            sanitized.ends_with(".html"),
+            "truncation must preserve `.html` extension, got '{sanitized}'"
+        );
+        assert!(
+            validate_extension(&sanitized, &["png".to_string()]).is_err(),
+            "truncated `.png.html` must still be rejected when only `png` is allowed"
+        );
+
+        // 2. `allowed_extensions: ["txt"]` with empty `allowed_mime_types` rejects binary/PDF/ELF smuggling.
+        let txt_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec![],
+            allowed_extensions: vec!["txt".to_string()],
+            ..Default::default()
+        };
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(txt_config));
+        let boundary = "----rume-p209-boundary";
+
+        // PDF smuggled as notes.txt -> 415
+        let pdf_as_txt = build_multipart_body(
+            boundary,
+            "file",
+            "notes.txt",
+            "text/plain",
+            b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n",
+        );
+        let resp_pdf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(pdf_as_txt))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_pdf.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // ELF binary smuggled as notes.txt -> 415
+        let mut elf = vec![0x7f, b'E', b'L', b'F', 2, 1, 1, 0];
+        elf.resize(64, 0);
+        let elf_as_txt = build_multipart_body(boundary, "file", "notes.txt", "text/plain", &elf);
+        let resp_elf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(elf_as_txt))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_elf.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Genuine plain text still succeeds -> 200 OK
+        let ok_txt = build_multipart_body(
+            boundary,
+            "file",
+            "notes.txt",
+            "text/plain",
+            b"plain text notes",
+        );
+        let resp_ok = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(ok_txt))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        // 3. `<!DOCTYPE svg [<!-- 9000 bytes -->]><svg/>` and UTF-16LE/BE BOM SVGs are detected.
+        let padded_doctype_svg = format!(
+            "<?xml version=\"1.0\"?><!DOCTYPE svg [<!-- {} -->]><svg xmlns=\"http://www.w3.org/2000/svg\"/>",
+            "x".repeat(9000)
+        );
+        assert_eq!(
+            sniff_mime_type(padded_doctype_svg.as_bytes()),
+            Some("image/svg+xml")
+        );
+
+        let mut utf16le_svg = vec![0xFF, 0xFE];
+        for unit in "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".encode_utf16() {
+            utf16le_svg.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(sniff_mime_type(&utf16le_svg), Some("image/svg+xml"));
+
+        let mut utf16be_html = vec![0xFE, 0xFF];
+        for unit in "<script>alert(1)</script>".encode_utf16() {
+            utf16be_html.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(sniff_mime_type(&utf16be_html), Some("text/html"));
     }
 }

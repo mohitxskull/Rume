@@ -308,6 +308,16 @@ pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
     include_str!("../sql/mysql/auth_user_effective_permissions.sql");
 /// Upsert a tenant record in MySQL.
 pub const MYSQL_AUTH_TENANT_UPSERT: &str = include_str!("../sql/mysql/auth_tenant_upsert.sql");
+/// Find another tenant row holding `slug` (locked `FOR UPDATE`) in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT: &str =
+    include_str!("../sql/mysql/auth_tenant_find_slug_conflict.sql");
+/// Lock an existing tenant row by `id` (`FOR UPDATE`) in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE: &str =
+    include_str!("../sql/mysql/auth_tenant_find_id_for_update.sql");
+/// Insert a new tenant row in MySQL without `ON DUPLICATE KEY UPDATE`.
+pub const MYSQL_AUTH_TENANT_INSERT: &str = include_str!("../sql/mysql/auth_tenant_insert.sql");
+/// Update an existing tenant row by `id` in MySQL.
+pub const MYSQL_AUTH_TENANT_UPDATE: &str = include_str!("../sql/mysql/auth_tenant_update.sql");
 /// Find an active tenant by ID in MySQL.
 pub const MYSQL_AUTH_TENANT_FIND_BY_ID: &str =
     include_str!("../sql/mysql/auth_tenant_find_by_id.sql");
@@ -887,5 +897,28 @@ mod tests {
             !MYSQL_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
             "MYSQL_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
         );
+    }
+
+    #[test]
+    fn mysql_tenant_upsert_uses_row_alias_and_jobs_renew_lease_guards_expiry() {
+        assert!(
+            MYSQL_AUTH_TENANT_UPSERT.contains("AS new"),
+            "MYSQL_AUTH_TENANT_UPSERT must use MySQL 8 row alias `AS new`"
+        );
+        assert!(
+            !MYSQL_AUTH_TENANT_UPSERT.contains("VALUES(slug)")
+                && !MYSQL_AUTH_TENANT_UPSERT.contains("VALUES(metadata_json)"),
+            "MYSQL_AUTH_TENANT_UPSERT must not use deprecated VALUES() function"
+        );
+        for (name, sql) in [
+            ("PG_JOBS_RENEW_LEASE", PG_JOBS_RENEW_LEASE),
+            ("MYSQL_JOBS_RENEW_LEASE", MYSQL_JOBS_RENEW_LEASE),
+            ("SQLITE_JOBS_RENEW_LEASE", SQLITE_JOBS_RENEW_LEASE),
+        ] {
+            assert!(
+                sql.contains("lease_expires_at >"),
+                "{name} must guard against renewing an already-expired lease"
+            );
+        }
     }
 }

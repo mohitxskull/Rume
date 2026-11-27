@@ -446,7 +446,12 @@ impl OAuth2Client {
             return Err(AuthError::Expired);
         }
 
-        let requires_nonce = self.config.scopes.iter().any(|s| s == "openid");
+        let requires_nonce = self
+            .config
+            .scopes
+            .iter()
+            .flat_map(|s| s.split_whitespace())
+            .any(|s| s == "openid");
         match id_token_nonce {
             Some(nonce) => {
                 if !bool::from(nonce.as_bytes().ct_eq(auth_state.nonce.as_bytes())) {
@@ -728,6 +733,30 @@ mod tests {
                 .validate_callback(&store, &oauth2_state.state, None, now + 10)
                 .await
                 .is_ok()
+        );
+
+        // Space-delimited single scope string containing `openid` must also enforce nonce (`P2-10`).
+        let space_delimited_oidc = OAuth2Client::new(OAuth2Config {
+            client_id: "rume-web".to_owned(),
+            client_secret: None,
+            authorization_endpoint: "https://idp.example.com/oauth2/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/oauth2/token".to_owned(),
+            redirect_uri: "https://app.example.com/callback".to_owned(),
+            scopes: vec!["openid profile email".to_owned()],
+            issuer: Some("https://idp.example.com".to_owned()),
+            jwks_uri: None,
+        });
+        let (_, space_state) = space_delimited_oidc
+            .begin_authorization(&store, 300, now, None)
+            .await
+            .unwrap();
+        let err = space_delimited_oidc
+            .validate_callback(&store, &space_state.state, None, now + 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials(ref msg) if msg == "missing required OIDC nonce"),
+            "expected missing required OIDC nonce for space-delimited scope, got {err:?}"
         );
     }
 

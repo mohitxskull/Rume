@@ -410,6 +410,7 @@ mod tests {
         #[derive(Debug, Default)]
         struct CapturingQueue {
             keys: Mutex<Vec<(Option<String>, Instant)>>,
+            enqueued: tokio::sync::Notify,
         }
 
         impl JobQueue for CapturingQueue {
@@ -423,6 +424,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((job.idempotency_key(), Instant::now()));
+                self.enqueued.notify_one();
                 Box::pin(async { Ok("job-1".to_string()) })
             }
 
@@ -564,39 +566,43 @@ mod tests {
         );
 
         let takeover_unix_ts = Utc::now().timestamp();
+        let first_tick = queue.enqueued.notified();
         elector.allow_leader.store(true, Ordering::SeqCst);
 
-        // Wait for one legitimate future tick after takeover.
-        tokio::time::sleep(Duration::from_millis(1250)).await;
-
-        let recorded = queue.keys.lock().unwrap().clone();
-        assert_eq!(
-            recorded.len(),
-            1,
-            "standby takeover must fire only the next future tick (no bogus catch-up), got {recorded:?}"
-        );
-        let key = recorded[0]
-            .0
-            .as_deref()
-            .expect("enqueued cron job must carry deterministic idempotency key");
-        assert!(
-            key.starts_with("cron:heartbeat:"),
-            "expected key prefix 'cron:heartbeat:', got '{key}'"
-        );
-        let key_ts: i64 = key
-            .strip_prefix("cron:heartbeat:")
-            .unwrap()
-            .parse()
-            .expect("unix timestamp suffix");
-        assert!(
-            key_ts > takeover_unix_ts,
-            "scheduled tick timestamp {key_ts} must be strictly after takeover {takeover_unix_ts} (not a stale pre-takeover tick)"
-        );
+        // Wait deterministically for the first enqueued tick after takeover, then shut down
+        // immediately so wall-clock alignment or runner jitter cannot cross into a second tick.
+        tokio::time::timeout(Duration::from_secs(3), first_tick)
+            .await
+            .expect("standby takeover must fire a future tick within 3s");
 
         handle
             .shutdown(Duration::from_secs(1))
             .await
             .expect("shutdown");
+
+        let recorded = queue.keys.lock().unwrap().clone();
+        assert!(
+            !recorded.is_empty(),
+            "standby takeover must fire at least one future tick"
+        );
+        for (raw_key, _) in &recorded {
+            let key = raw_key
+                .as_deref()
+                .expect("enqueued cron job must carry deterministic idempotency key");
+            assert!(
+                key.starts_with("cron:heartbeat:"),
+                "expected key prefix 'cron:heartbeat:', got '{key}'"
+            );
+            let key_ts: i64 = key
+                .strip_prefix("cron:heartbeat:")
+                .unwrap()
+                .parse()
+                .expect("unix timestamp suffix");
+            assert!(
+                key_ts > takeover_unix_ts,
+                "scheduled tick timestamp {key_ts} must be strictly after takeover {takeover_unix_ts} (not a stale pre-takeover tick)"
+            );
+        }
     }
 
     #[tokio::test]

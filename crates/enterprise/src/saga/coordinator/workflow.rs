@@ -633,12 +633,30 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         }
         if handle.version == 0 && matches!(handle.phase, SagaRecoveryPhase::Forward) {
             // Why: When the initial `persist_state(Pending)` failed before any row existed
-            // (`version == 0`), calling `acquire_execution_claim` on a non-existent row
-            // fails in `SqlSagaStore` with 0 rows updated. Delegate to `run_with_id_recoverable`
-            // so the initial row is created and execution runs with the preserved context.
-            return self
-                .run_with_id_recoverable(&handle.saga_id, handle.context)
-                .await;
+            // (`version == 0`), delegate to `run_with_id_recoverable` so the initial row is
+            // created. However, a `version == 0 && Forward` handle can also come from
+            // contention against an ALREADY-persisted saga (`P2-05`); check `load_record`
+            // first and delegate ONLY when no record exists, otherwise fall through into
+            // claim + authoritative reconciliation.
+            let should_create = match &self.store {
+                None => true,
+                Some(store) => match store.load_record(&handle.saga_id).await {
+                    Ok(None) => true,
+                    Ok(Some(_)) => false,
+                    Err(err) => {
+                        let saga_id = handle.saga_id.clone();
+                        return Err(SagaRecoveryError::new(
+                            attach_saga_id(err, &saga_id),
+                            handle,
+                        ));
+                    }
+                },
+            };
+            if should_create {
+                return self
+                    .run_with_id_recoverable(&handle.saga_id, handle.context)
+                    .await;
+            }
         }
         if let Err(err) = self.resolve_completed_indices(&handle.completed_steps) {
             return Err(SagaRecoveryError::new(err, handle));

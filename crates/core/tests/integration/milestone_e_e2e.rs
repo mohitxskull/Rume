@@ -604,14 +604,31 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
     assert_eq!(mailer.sent().len(), 1);
     assert_eq!(mailer.sent()[0].subject, "Welcome");
 
-    // 6. SCIM 2.0 /scim/v2/Users & /scim/v2/Groups CRUD + RFC 7644 filter
-    let scim_app = scim_routes(InMemoryScimStore::new());
+    // 6. SCIM 2.0 /scim/v2/Users & /scim/v2/Groups CRUD + RFC 7644 filter + auth enforcement
+    let scim_app = scim_routes(
+        InMemoryScimStore::new(),
+        ScimBearerAuthLayer::new("e2e-scim-token"),
+    );
+    let unauth_res = scim_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/scim/v2/Users")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+
     let create_user = scim_app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/scim/v2/Users")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .header(header::CONTENT_TYPE, "application/scim+json")
                 .body(Body::from(
                     serde_json::to_vec(&ScimUser::new("", "alice@example.com")).unwrap(),
@@ -631,6 +648,7 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
             Request::builder()
                 .method("POST")
                 .uri("/scim/v2/Groups")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .header(header::CONTENT_TYPE, "application/scim+json")
                 .body(Body::from(
                     serde_json::to_vec(&ScimGroup::new("", "Engineering")).unwrap(),
@@ -645,6 +663,7 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
         .oneshot(
             Request::builder()
                 .uri("/scim/v2/Users?filter=userName%20sw%20%22alice%22")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .body(Body::empty())
                 .unwrap(),
         )
