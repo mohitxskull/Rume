@@ -103,6 +103,16 @@ pub trait WebhookDeliveryStore: std::fmt::Debug + Send + Sync + 'static {
         limit: usize,
         lease_duration: Duration,
     ) -> BoxFuture<'_, Result<Vec<WebhookDeliveryRecord>, WebhookError>>;
+
+    /// Conditionally updates a webhook delivery record only if its persisted status is still
+    /// [`WebhookDeliveryStatus::InFlight`].
+    ///
+    /// Returns `Ok(true)` if the record was transitioned, or `Ok(false)` if another worker
+    /// already finalized the record (e.g. marked it `Delivered`) after this worker's lease expired.
+    fn complete_delivery(
+        &self,
+        record: WebhookDeliveryRecord,
+    ) -> BoxFuture<'_, Result<bool, WebhookError>>;
 }
 
 /// In-memory [`WebhookDeliveryStore`] for tests and single-node development.
@@ -221,6 +231,25 @@ impl WebhookDeliveryStore for InMemoryWebhookDeliveryStore {
                 }
             }
             Ok(claimed)
+        })
+    }
+
+    fn complete_delivery(
+        &self,
+        record: WebhookDeliveryRecord,
+    ) -> BoxFuture<'_, Result<bool, WebhookError>> {
+        Box::pin(async move {
+            let mut guard = self
+                .records
+                .write()
+                .map_err(|_| WebhookError::Store("webhook store lock poisoned".into()))?;
+            match guard.get_mut(&record.id) {
+                Some(existing) if existing.status == WebhookDeliveryStatus::InFlight => {
+                    *existing = record;
+                    Ok(true)
+                }
+                _ => Ok(false),
+            }
         })
     }
 }
@@ -494,6 +523,43 @@ impl<B: DatabaseBackend> WebhookDeliveryStore for SqlWebhookDeliveryStore<B> {
                 .collect::<Result<_, _>>()?;
             claimed.sort_by_key(|r| r.created_at);
             Ok(claimed)
+        })
+    }
+
+    fn complete_delivery(
+        &self,
+        record: WebhookDeliveryRecord,
+    ) -> BoxFuture<'_, Result<bool, WebhookError>> {
+        Box::pin(async move {
+            let dialect = self.backend.dialect();
+            let stmt = select_sql(
+                dialect,
+                sql::PG_WEBHOOK_DELIVERIES_COMPLETE,
+                sql::MYSQL_WEBHOOK_DELIVERIES_COMPLETE,
+                sql::SQLITE_WEBHOOK_DELIVERIES_COMPLETE,
+            );
+            let next_attempt_val = match record.next_attempt_at {
+                Some(dt) => DbValue::Text(format_ts(dialect, dt)),
+                None => DbValue::Null,
+            };
+            let last_response_val = match record.last_response {
+                Some(s) => DbValue::Text(s),
+                None => DbValue::Null,
+            };
+            let params = [
+                DbValue::Text(record.status.as_str().to_string()),
+                DbValue::Int(i64::from(record.attempt)),
+                next_attempt_val,
+                last_response_val,
+                DbValue::Text(format_ts(dialect, record.updated_at)),
+                DbValue::Text(record.id),
+            ];
+            let affected = self
+                .backend
+                .execute_params(stmt, &params)
+                .await
+                .map_err(|e| WebhookError::Store(e.to_string()))?;
+            Ok(affected > 0)
         })
     }
 }

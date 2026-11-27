@@ -184,18 +184,21 @@ fn parse_single_duration_token(
             .parse()
             .map_err(|_| ParseDurationError::InvalidNumber(num_str.to_string()))?;
 
-        match (val as u128).checked_mul(nanos_per_unit) {
-            Some(nanos) if nanos <= u64::MAX as u128 => Ok(Duration::from_nanos(nanos as u64)),
+        // Why: construct sub-second units directly via `Duration::from_{nanos,micros,millis}`
+        // so large valid millisecond/microsecond values (e.g. `"20000000000000ms"`) do not
+        // spuriously overflow `u64` nanoseconds (`RC-19`).
+        match unit_str {
+            "ns" | "nanos" | "nanosecond" | "nanoseconds" => Ok(Duration::from_nanos(val)),
+            "us" | "µs" | "micros" | "microsecond" | "microseconds" => {
+                Ok(Duration::from_micros(val))
+            }
+            "ms" | "millis" | "millisecond" | "milliseconds" => Ok(Duration::from_millis(val)),
             _ => {
-                let secs_multiplier = nanos_per_unit / 1_000_000_000;
-                if secs_multiplier > 0 {
-                    let secs = val
-                        .checked_mul(secs_multiplier as u64)
-                        .ok_or(ParseDurationError::Overflow)?;
-                    Ok(Duration::from_secs(secs))
-                } else {
-                    Err(ParseDurationError::Overflow)
-                }
+                let secs_multiplier = (nanos_per_unit / 1_000_000_000) as u64;
+                let secs = val
+                    .checked_mul(secs_multiplier)
+                    .ok_or(ParseDurationError::Overflow)?;
+                Ok(Duration::from_secs(secs))
             }
         }
     }
@@ -265,6 +268,18 @@ mod tests {
         assert_eq!(
             parse_duration("1000000000000000000.5d"),
             Err(ParseDurationError::Overflow)
+        );
+    }
+
+    #[test]
+    fn parse_duration_large_integer_subsecond_units_do_not_overflow_u64_nanos() {
+        assert_eq!(
+            parse_duration("20000000000000ms").unwrap(),
+            Duration::from_millis(20_000_000_000_000)
+        );
+        assert_eq!(
+            parse_duration("20000000000000000us").unwrap(),
+            Duration::from_micros(20_000_000_000_000_000)
         );
     }
 }

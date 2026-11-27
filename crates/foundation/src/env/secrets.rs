@@ -51,13 +51,22 @@ pub fn is_secret_key(key: &str) -> bool {
         || upper.starts_with("PRIVATE_KEY")
 }
 
-/// Heuristic: does this value look like a URL containing credentials?
+/// Heuristic: does this value look like a URL (or list of URLs) containing credentials?
 pub fn value_looks_sensitive(value: &str) -> bool {
-    if let Some(rest) = value.split("://").nth(1)
-        && let Some(authority) = rest.split('/').next()
-        && let Some(at_pos) = authority.rfind('@')
-    {
-        return !authority[..at_pos].is_empty();
+    // Why: scan every `://` occurrence (not just the first) so comma/whitespace-separated
+    // multi-URL values detect credentials in non-first URLs, and stop authority scanning
+    // at RFC 3986 authority delimiters (`/`, `?`, `#`) as well as `,` and whitespace so
+    // query/fragment `@` characters (e.g. `?email=a@b.com`) are not mistaken for userinfo (`RC-19`).
+    for rest in value.split("://").skip(1) {
+        let end_authority = rest
+            .find(|c: char| matches!(c, '/' | '?' | '#' | ',') || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let authority = &rest[..end_authority];
+        if let Some(at_pos) = authority.rfind('@')
+            && !authority[..at_pos].is_empty()
+        {
+            return true;
+        }
     }
     false
 }
@@ -87,11 +96,15 @@ pub fn redact_credential_urls_in_text(text: &str) -> String {
         out.push_str(before);
         rest = &rest[proto_pos + 3..];
 
-        // Find the boundary of the authority/URL
+        // Find the boundary of the authority/URL per RFC 3986 (`/` / `?` / `#`) plus
+        // common list/punctuation delimiters so `?email=a@b.com` is never corrupted (`RC-19`).
         let end_authority = rest
-            .find([
-                '/', ' ', '"', '\'', '\n', '\r', '\t', '>', '<', ')', ']', '}',
-            ])
+            .find(|c: char| {
+                matches!(
+                    c,
+                    '/' | '?' | '#' | ',' | '"' | '\'' | '>' | '<' | ')' | ']' | '}'
+                ) || c.is_whitespace()
+            })
             .unwrap_or(rest.len());
         let authority = &rest[..end_authority];
 
@@ -394,5 +407,27 @@ mod tests {
             "clone failed: https://[redacted]@github.com/org/repo.git"
         );
         assert!(!redacted.contains("ghp_secret_token_123"));
+    }
+
+    #[test]
+    fn value_looks_sensitive_detects_credentials_in_non_first_url() {
+        let multi = "https://public.example.com,https://u:secret@priv.example.com";
+        assert!(value_looks_sensitive(multi));
+        assert_eq!(redact_value("ENDPOINTS", multi), "[redacted]");
+        assert_eq!(
+            redact_credential_urls_in_text(multi),
+            "https://public.example.com,https://u:[redacted]@priv.example.com"
+        );
+    }
+
+    #[test]
+    fn url_authority_scanning_stops_at_query_and_fragment_delimiters() {
+        let query_email = "https://example.com?email=a@b.com";
+        assert!(!value_looks_sensitive(query_email));
+        assert_eq!(redact_credential_urls_in_text(query_email), query_email);
+
+        let frag_email = "https://example.com#contact=a@b.com";
+        assert!(!value_looks_sensitive(frag_email));
+        assert_eq!(redact_credential_urls_in_text(frag_email), frag_email);
     }
 }

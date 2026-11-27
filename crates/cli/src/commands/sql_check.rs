@@ -262,10 +262,15 @@ fn collect_target_sql_files(target: &Path) -> Result<Vec<PathBuf>, String> {
 fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
         for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
             let path = entry.path();
-            if path.is_dir() {
+            // Why: `entry.file_type()` does not follow symlinks, preventing
+            // infinite recursion / stack overflow on symlink cycles (`RC-20`).
+            if ft.is_dir() {
                 collect_sql_files(&path, files);
-            } else if path.extension().and_then(|s| s.to_str()) == Some("sql") {
+            } else if ft.is_file() && path.extension().and_then(|s| s.to_str()) == Some("sql") {
                 files.push(path);
             }
         }
@@ -646,5 +651,20 @@ mod tests {
             validate_sql_file(temp.path(), effective).is_err(),
             "postgres db dialect should reject '?' placeholder when --dialect is omitted"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn collect_target_sql_files_skips_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("queries");
+        fs::create_dir_all(&sub).unwrap();
+        let sql_file = sub.join("list.sql");
+        fs::write(&sql_file, "SELECT 1;").unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let files = collect_target_sql_files(dir.path())
+            .expect("collect_target_sql_files must not hang on symlink cycles");
+        assert_eq!(files, vec![sql_file]);
     }
 }

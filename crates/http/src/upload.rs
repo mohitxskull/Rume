@@ -195,6 +195,8 @@ pub async fn extract_multipart_files(
             bytes.extend_from_slice(&chunk);
         }
 
+        validate_sniffed_mime_type(&bytes, content_type.as_deref(), &config.allowed_mime_types)?;
+
         files.push(UploadedFile {
             field_name,
             file_name: raw_file_name,
@@ -205,6 +207,142 @@ pub async fn extract_multipart_files(
     }
 
     Ok(files)
+}
+
+/// Sniffs the MIME type of `bytes` from common binary magic headers and leading
+/// HTML/SVG/XML script signatures.
+///
+/// Returns `None` for unrecognized or plain-text payloads without a distinctive
+/// signature.
+pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
+    // Binary magic-byte signatures.
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(&[0x1F, 0x8B]) {
+        return Some("application/gzip");
+    }
+    if bytes.starts_with(b"PK\x03\x04")
+        || bytes.starts_with(b"PK\x05\x06")
+        || bytes.starts_with(b"PK\x07\x08")
+    {
+        return Some("application/zip");
+    }
+
+    // Text / markup / script signatures (strip optional UTF-8 BOM and leading ASCII whitespace).
+    let trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
+    let prefix_len = trimmed.len().min(512);
+    let prefix = std::str::from_utf8(&trimmed[..prefix_len])
+        .ok()
+        .map(|s| s.trim_start())?;
+    if prefix.is_empty() {
+        return None;
+    }
+    let lower = prefix.to_ascii_lowercase();
+
+    let starts_with_tag = |tag: &str| -> bool {
+        lower.strip_prefix(tag).is_some_and(|rest| {
+            rest.is_empty()
+                || rest.starts_with(|c: char| c.is_ascii_whitespace() || matches!(c, '>' | '/'))
+        })
+    };
+
+    if lower.starts_with("<!doctype html")
+        || starts_with_tag("<html")
+        || starts_with_tag("<script")
+        || starts_with_tag("<head")
+        || starts_with_tag("<body")
+        || starts_with_tag("<iframe")
+        || starts_with_tag("<object")
+        || starts_with_tag("<embed")
+        || starts_with_tag("<style")
+    {
+        return Some("text/html");
+    }
+    if starts_with_tag("<svg") {
+        return Some("image/svg+xml");
+    }
+    if lower.starts_with("<?xml") {
+        if lower.contains("<svg") {
+            return Some("image/svg+xml");
+        }
+        return Some("application/xml");
+    }
+
+    None
+}
+
+fn requires_magic_signature(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png"
+            | "image/jpeg"
+            | "image/gif"
+            | "image/webp"
+            | "application/pdf"
+            | "application/zip"
+            | "application/gzip"
+    )
+}
+
+fn validate_sniffed_mime_type(
+    bytes: &[u8],
+    content_type: Option<&str>,
+    allowed_mime_types: &[String],
+) -> Result<(), AppError> {
+    if allowed_mime_types.is_empty() {
+        return Ok(());
+    }
+
+    let declared = content_type
+        .and_then(|ct| ct.split(';').next())
+        .map(|s| s.trim().to_ascii_lowercase());
+
+    // Why: client-supplied `Content-Type` headers are untrusted; sniff magic bytes
+    // and markup signatures so HTML/script payloads disguised as `image/png` (or
+    // binary mismatches) are rejected with 415 Unsupported Media Type (`RC-16`).
+    match sniff_mime_type(bytes) {
+        Some(detected) => {
+            let detected_allowed = allowed_mime_types
+                .iter()
+                .any(|a| a.eq_ignore_ascii_case(detected));
+            let matches_declared = declared.as_deref().is_none_or(|d| d == detected);
+            if !detected_allowed || !matches_declared {
+                return Err(AppError::Public {
+                    status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    code: "UNSUPPORTED_MEDIA_TYPE",
+                    message: format!(
+                        "uploaded file content (detected {detected}) does not match allowed MIME types"
+                    ),
+                });
+            }
+        }
+        None => {
+            if let Some(ref d) = declared
+                && requires_magic_signature(d)
+            {
+                return Err(AppError::Public {
+                    status: StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                    code: "UNSUPPORTED_MEDIA_TYPE",
+                    message: format!("uploaded file content does not match declared MIME type {d}"),
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn validate_mime_type(
@@ -527,5 +665,76 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn multipart_extractor_rejects_html_payload_disguised_as_image_png() {
+        let config = MultipartUploadConfig {
+            max_file_size_bytes: 1024,
+            max_files: 1,
+            allowed_mime_types: vec!["image/png".to_string()],
+            allowed_extensions: vec!["png".to_string()],
+            ..Default::default()
+        };
+
+        let app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(config));
+
+        let boundary = "----rume-sniff-boundary";
+
+        // HTML/script payload pretending to be image/png -> 415 Unsupported Media Type
+        let spoofed_body = build_multipart_body(
+            boundary,
+            "file",
+            "evil.png",
+            "image/png",
+            b"<html><script>alert(1)</script></html>",
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(spoofed_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // Genuine PNG magic header -> 200 OK
+        let valid_png = build_multipart_body(
+            boundary,
+            "file",
+            "ok.png",
+            "image/png",
+            b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR",
+        );
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(valid_png))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

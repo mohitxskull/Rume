@@ -916,10 +916,20 @@ impl<Q: JobQueue> JobWorker<Q> {
                         job_id = %job_id,
                         "Job execution completed after lease was lost; routing to dead letter queue"
                     );
-                    if let Err(err) = queue
-                        .dead_letter(job, &token, "lease lost during execution".into())
-                        .await
-                    {
+                    let dl_res = {
+                        // Why: hold `hb.tick_lock` across the queue transition and
+                        // `queue_committed.store(true)` so a concurrent heartbeat tick cannot
+                        // observe the finalized row before `queue_committed` is set (`RC-17`).
+                        let _tick_guard = hb.tick_lock.lock().await;
+                        let res = queue
+                            .dead_letter(job, &token, "lease lost during execution".into())
+                            .await;
+                        if res.is_ok() {
+                            hb.queue_committed.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    };
+                    if let Err(err) = dl_res {
                         tracing::error!(
                             job_id = %job_id,
                             error = %err,
@@ -928,11 +938,13 @@ impl<Q: JobQueue> JobWorker<Q> {
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
                     } else {
-                        hb.queue_committed.store(true, Ordering::SeqCst);
                         // Why: release the deduplication reservation only after `dead_letter`
                         // commits; if dead-lettering fails, preserving the reservation blocks
                         // another worker from re-executing a handler that already succeeded.
+                        // Disable idempotency extension and drain any in-flight tick before
+                        // releasing, without holding `tick_lock` across slow store I/O (`RC-17`).
                         hb.extend_idempotency.store(false, Ordering::SeqCst);
+                        drop(hb.tick_lock.lock().await);
                         if release_idempotency_token(
                             &idempotency_store,
                             &effective_key,
@@ -974,7 +986,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                     };
                     match complete_res {
                         Ok(Ok(())) => {
-                            if let Err(err) = queue.ack(&job_id, &token).await {
+                            let ack_res = {
+                                let _tick_guard = hb.tick_lock.lock().await;
+                                let res = queue.ack(&job_id, &token).await;
+                                if res.is_ok() {
+                                    hb.queue_committed.store(true, Ordering::SeqCst);
+                                }
+                                res
+                            };
+                            if let Err(err) = ack_res {
                                 tracing::error!(
                                     job_id = %job_id,
                                     error = %err,
@@ -982,8 +1002,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                                 );
                                 transition_errors.fetch_add(1, Ordering::SeqCst);
                                 lost_leases.fetch_add(1, Ordering::SeqCst);
-                            } else {
-                                hb.queue_committed.store(true, Ordering::SeqCst);
                             }
                         }
                         Ok(Err(JobError::IdempotencyLockLost(err))) => {
@@ -997,22 +1015,27 @@ impl<Q: JobQueue> JobWorker<Q> {
                             );
                             transition_errors.fetch_add(1, Ordering::SeqCst);
                             lost_leases.fetch_add(1, Ordering::SeqCst);
-                            if let Err(dl_err) = queue
-                                .dead_letter(
-                                    job,
-                                    &token,
-                                    format!("idempotency completion rejected: {err}"),
-                                )
-                                .await
-                            {
+                            let dl_res = {
+                                let _tick_guard = hb.tick_lock.lock().await;
+                                let res = queue
+                                    .dead_letter(
+                                        job,
+                                        &token,
+                                        format!("idempotency completion rejected: {err}"),
+                                    )
+                                    .await;
+                                if res.is_ok() {
+                                    hb.queue_committed.store(true, Ordering::SeqCst);
+                                }
+                                res
+                            };
+                            if let Err(dl_err) = dl_res {
                                 tracing::error!(
                                     job_id = %job_id,
                                     error = %dl_err,
                                     "Failed to dead-letter job after idempotency token rejection"
                                 );
                                 transition_errors.fetch_add(1, Ordering::SeqCst);
-                            } else {
-                                hb.queue_committed.store(true, Ordering::SeqCst);
                             }
                         }
                         Ok(Err(err)) => {
@@ -1048,7 +1071,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                                 }
                             };
                             if reconciled {
-                                if let Err(ack_err) = queue.ack(&job_id, &token).await {
+                                let ack_res = {
+                                    let _tick_guard = hb.tick_lock.lock().await;
+                                    let res = queue.ack(&job_id, &token).await;
+                                    if res.is_ok() {
+                                        hb.queue_committed.store(true, Ordering::SeqCst);
+                                    }
+                                    res
+                                };
+                                if let Err(ack_err) = ack_res {
                                     tracing::error!(
                                         job_id = %job_id,
                                         error = %ack_err,
@@ -1056,8 +1087,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                                     );
                                     transition_errors.fetch_add(1, Ordering::SeqCst);
                                     lost_leases.fetch_add(1, Ordering::SeqCst);
-                                } else {
-                                    hb.queue_committed.store(true, Ordering::SeqCst);
                                 }
                             } else {
                                 tracing::error!(
@@ -1083,22 +1112,34 @@ impl<Q: JobQueue> JobWorker<Q> {
                             lost_leases.fetch_add(1, Ordering::SeqCst);
                         }
                     }
-                } else if let Err(err) = queue.ack(&job_id, &token).await {
-                    tracing::error!(
-                        job_id = %job_id,
-                        error = %err,
-                        "Failed to ack job; lease may have expired or state mismatch"
-                    );
-                    transition_errors.fetch_add(1, Ordering::SeqCst);
-                    lost_leases.fetch_add(1, Ordering::SeqCst);
                 } else {
-                    hb.queue_committed.store(true, Ordering::SeqCst);
+                    let ack_res = {
+                        let _tick_guard = hb.tick_lock.lock().await;
+                        let res = queue.ack(&job_id, &token).await;
+                        if res.is_ok() {
+                            hb.queue_committed.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    };
+                    if let Err(err) = ack_res {
+                        tracing::error!(
+                            job_id = %job_id,
+                            error = %err,
+                            "Failed to ack job; lease may have expired or state mismatch"
+                        );
+                        transition_errors.fetch_add(1, Ordering::SeqCst);
+                        lost_leases.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
             Err(JobError::Fatal(msg))
             | Err(JobError::UnknownJob(msg))
             | Err(JobError::Serialization(msg)) => {
+                // Why: disable idempotency extension and drain any in-flight heartbeat tick
+                // before releasing the token, then drop `tick_lock` so queue lease renewals
+                // continue uninterrupted if `release_with_token` is slow (`RC-17`).
                 hb.extend_idempotency.store(false, Ordering::SeqCst);
+                drop(hb.tick_lock.lock().await);
                 if release_idempotency_token(
                     &idempotency_store,
                     &effective_key,
@@ -1110,7 +1151,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                 {
                     hb.idemp_committed.store(true, Ordering::SeqCst);
                 }
-                if let Err(err) = queue.dead_letter(job, &token, msg).await {
+                let dl_res = {
+                    let _tick_guard = hb.tick_lock.lock().await;
+                    let res = queue.dead_letter(job, &token, msg).await;
+                    if res.is_ok() {
+                        hb.queue_committed.store(true, Ordering::SeqCst);
+                    }
+                    res
+                };
+                if let Err(err) = dl_res {
                     tracing::error!(
                         job_id = %job_id,
                         error = %err,
@@ -1118,8 +1167,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                     );
                     transition_errors.fetch_add(1, Ordering::SeqCst);
                     lost_leases.fetch_add(1, Ordering::SeqCst);
-                } else {
-                    hb.queue_committed.store(true, Ordering::SeqCst);
                 }
             }
             Err(err) => {
@@ -1132,6 +1179,7 @@ impl<Q: JobQueue> JobWorker<Q> {
                 // never by `job.id`.
                 if let Some(backoff) = job.retry_policy.next_backoff(job.attempt) {
                     hb.extend_idempotency.store(false, Ordering::SeqCst);
+                    drop(hb.tick_lock.lock().await);
                     if release_idempotency_token(
                         &idempotency_store,
                         &effective_key,
@@ -1143,7 +1191,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                     {
                         hb.idemp_committed.store(true, Ordering::SeqCst);
                     }
-                    if let Err(nack_err) = queue.nack(job, &token, backoff).await {
+                    let nack_res = {
+                        let _tick_guard = hb.tick_lock.lock().await;
+                        let res = queue.nack(job, &token, backoff).await;
+                        if res.is_ok() {
+                            hb.queue_committed.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    };
+                    if let Err(nack_err) = nack_res {
                         tracing::error!(
                             job_id = %job_id,
                             error = %nack_err,
@@ -1151,11 +1207,10 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        hb.queue_committed.store(true, Ordering::SeqCst);
                     }
                 } else {
                     hb.extend_idempotency.store(false, Ordering::SeqCst);
+                    drop(hb.tick_lock.lock().await);
                     if release_idempotency_token(
                         &idempotency_store,
                         &effective_key,
@@ -1168,7 +1223,15 @@ impl<Q: JobQueue> JobWorker<Q> {
                         hb.idemp_committed.store(true, Ordering::SeqCst);
                     }
                     let reason = format!("max retries exceeded ({}) - error: {err}", job.attempt);
-                    if let Err(dl_err) = queue.dead_letter(job, &token, reason).await {
+                    let dl_res = {
+                        let _tick_guard = hb.tick_lock.lock().await;
+                        let res = queue.dead_letter(job, &token, reason).await;
+                        if res.is_ok() {
+                            hb.queue_committed.store(true, Ordering::SeqCst);
+                        }
+                        res
+                    };
+                    if let Err(dl_err) = dl_res {
                         tracing::error!(
                             job_id = %job_id,
                             error = %dl_err,
@@ -1176,8 +1239,6 @@ impl<Q: JobQueue> JobWorker<Q> {
                         );
                         transition_errors.fetch_add(1, Ordering::SeqCst);
                         lost_leases.fetch_add(1, Ordering::SeqCst);
-                    } else {
-                        hb.queue_committed.store(true, Ordering::SeqCst);
                     }
                 }
             }

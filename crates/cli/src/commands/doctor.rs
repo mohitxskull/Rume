@@ -412,10 +412,15 @@ fn check_module_dag_in(src_dir: &Path) -> (String, bool) {
     fn visit_dirs(dir: &Path, files: &mut Vec<PathBuf>) {
         if let Ok(entries) = std::fs::read_dir(dir) {
             for entry in entries.flatten() {
+                let Ok(ft) = entry.file_type() else {
+                    continue;
+                };
                 let path = entry.path();
-                if path.is_dir() {
+                // Why: `entry.file_type()` does not follow symlinks, preventing
+                // infinite recursion / stack overflow on symlink cycles (`RC-20`).
+                if ft.is_dir() {
                     visit_dirs(&path, files);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
+                } else if ft.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rs") {
                     files.push(path);
                 }
             }
@@ -895,5 +900,28 @@ impl Module for OrdersB {
             err_msg.contains("syntax error") && err_msg.contains("broken.rs"),
             "expected syntax error diagnostic, got: {err_msg}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_module_dag_skips_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("mod_a");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("mod.rs"),
+            r#"
+impl Module for ModA {
+    fn name(&self) -> &str { "mod_a" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let (msg, ok) = check_module_dag_in(dir.path());
+        assert!(ok, "symlink cycle must not fail or hang DAG check: {msg}");
+        assert!(msg.contains("1 module(s) verified acyclic"), "got: {msg}");
     }
 }

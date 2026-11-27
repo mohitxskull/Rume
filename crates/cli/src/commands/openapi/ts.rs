@@ -42,11 +42,13 @@ fn emit_component_schemas(spec: &Value, out: &mut String) {
 }
 
 fn is_object_schema(schema: &Value) -> bool {
+    // Why: require non-empty `properties` before emitting an `interface`, so
+    // `type: "object"` + `additionalProperties` schemas fall through to `schema_to_ts`
+    // and emit `export type Foo = Record<string, ...>;` instead of empty `interface Foo {}` (`RC-20`).
     schema
         .get("properties")
         .and_then(Value::as_object)
-        .is_some()
-        || schema.get("type").and_then(Value::as_str) == Some("object")
+        .is_some_and(|props| !props.is_empty())
 }
 
 fn emit_object_fields(schema: &Value, out: &mut String, indent: &str) {
@@ -254,17 +256,23 @@ fn emit_operation_method(
         .unwrap_or_else(|| sanitize_camel_ident(&format!("{method}_{path}")));
 
     let method_name = deduplicate_name(raw_name, used_names);
-    let (path_params, query_params) = collect_parameters(path, op);
+    let (mut path_params, query_params) = collect_parameters(path, op);
     let request_body = extract_request_body(op);
     let return_type = extract_response_type(op);
 
+    // Why: deduplicate all emitted parameter identifiers (path params, `query` bag, `body`)
+    // so routes such as `/search/{query}` with query parameters never emit duplicate
+    // parameter names (`query, query?: ...`) in TypeScript (`RC-20`).
+    let mut used_param_names = HashSet::new();
     let mut required_params = Vec::new();
     let mut optional_params = Vec::new();
-    for p in &path_params {
+    for p in &mut path_params {
+        p.ts_name = deduplicate_name(p.ts_name.clone(), &mut used_param_names);
         required_params.push(format!("{}: {}", p.ts_name, p.ts_type));
     }
 
-    if !query_params.is_empty() {
+    let query_param_name = if !query_params.is_empty() {
+        let name = deduplicate_name("query".to_string(), &mut used_param_names);
         let any_required = query_params.iter().any(|q| q.required);
         let q_opt = if any_required { "" } else { "?" };
         let q_fields: Vec<String> = query_params
@@ -274,23 +282,30 @@ fn emit_operation_method(
                 format!("{}{}: {};", format_prop_key(&q.name), opt, q.ts_type)
             })
             .collect();
-        let param = format!("query{q_opt}: {{ {} }}", q_fields.join(" "));
+        let param = format!("{name}{q_opt}: {{ {} }}", q_fields.join(" "));
         if any_required {
             required_params.push(param);
         } else {
             optional_params.push(param);
         }
-    }
+        Some(name)
+    } else {
+        None
+    };
 
-    if let Some((required, body_ts)) = &request_body {
+    let body_param_name = if let Some((required, body_ts)) = &request_body {
+        let name = deduplicate_name("body".to_string(), &mut used_param_names);
         let opt = if *required { "" } else { "?" };
-        let param = format!("body{opt}: {body_ts}");
+        let param = format!("{name}{opt}: {body_ts}");
         if *required {
             required_params.push(param);
         } else {
             optional_params.push(param);
         }
-    }
+        Some(name)
+    } else {
+        None
+    };
 
     // Why: TypeScript rejects a required parameter after an optional parameter (TS1016),
     // so emit all required parameters (path, required query, required body) before optional ones.
@@ -304,15 +319,13 @@ fn emit_operation_method(
     );
 
     let url_expr = build_url_template(path, &path_params);
-    if query_params.is_empty() {
-        let _ = writeln!(out, "    const url = `{url_expr}`;");
-    } else {
+    if let Some(ref q_param) = query_param_name {
         let _ = writeln!(out, "    const searchParams = new URLSearchParams();");
         for q in &query_params {
             let prop_access = if is_valid_js_ident(&q.name) {
-                format!("query?.{}", q.name)
+                format!("{q_param}?.{}", q.name)
             } else {
-                format!("query?.[{:?}]", q.name)
+                format!("{q_param}?.[{:?}]", q.name)
             };
             let _ = writeln!(
                 out,
@@ -325,19 +338,21 @@ fn emit_operation_method(
             out,
             "    const url = qs ? `{url_expr}?${{qs}}` : `{url_expr}`;"
         );
+    } else {
+        let _ = writeln!(out, "    const url = `{url_expr}`;");
     }
 
     let upper_method = method.to_ascii_uppercase();
-    if request_body.is_some() {
+    if let Some(ref b_param) = body_param_name {
         let _ = writeln!(out, "    const res = await this.fetchImpl(url, {{");
         let _ = writeln!(out, "      method: {upper_method:?},");
         let _ = writeln!(
             out,
-            "      headers: body !== undefined ? {{ \"Content-Type\": \"application/json\" }} : undefined,"
+            "      headers: {b_param} !== undefined ? {{ \"Content-Type\": \"application/json\" }} : undefined,"
         );
         let _ = writeln!(
             out,
-            "      body: body !== undefined ? JSON.stringify(body) : undefined,"
+            "      body: {b_param} !== undefined ? JSON.stringify({b_param}) : undefined,"
         );
         let _ = writeln!(out, "    }});");
     } else {
@@ -554,24 +569,83 @@ fn sanitize_pascal_ident(raw: &str) -> String {
     out
 }
 
+fn is_ts_reserved_keyword(ident: &str) -> bool {
+    matches!(
+        ident,
+        "await"
+            | "break"
+            | "case"
+            | "catch"
+            | "class"
+            | "const"
+            | "continue"
+            | "debugger"
+            | "default"
+            | "delete"
+            | "do"
+            | "else"
+            | "enum"
+            | "export"
+            | "extends"
+            | "false"
+            | "finally"
+            | "for"
+            | "function"
+            | "if"
+            | "implements"
+            | "import"
+            | "in"
+            | "instanceof"
+            | "interface"
+            | "let"
+            | "new"
+            | "null"
+            | "package"
+            | "private"
+            | "protected"
+            | "public"
+            | "return"
+            | "static"
+            | "super"
+            | "switch"
+            | "this"
+            | "throw"
+            | "true"
+            | "try"
+            | "type"
+            | "typeof"
+            | "var"
+            | "void"
+            | "while"
+            | "with"
+            | "yield"
+    )
+}
+
 fn sanitize_param_ident(raw: &str) -> String {
-    if is_valid_js_ident(raw) {
-        return raw.to_string();
-    }
-    let cleaned: String = raw
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if cleaned.is_empty() || cleaned.starts_with(|c: char| c.is_ascii_digit()) {
-        format!("_{cleaned}")
+    let candidate = if is_valid_js_ident(raw) {
+        raw.to_string()
     } else {
-        cleaned
+        let cleaned: String = raw
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '$' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .collect();
+        if cleaned.is_empty() || cleaned.starts_with(|c: char| c.is_ascii_digit()) {
+            format!("_{cleaned}")
+        } else {
+            cleaned
+        }
+    };
+    if is_ts_reserved_keyword(&candidate) {
+        format!("{candidate}_")
+    } else {
+        candidate
     }
 }
 
@@ -907,6 +981,77 @@ mod tests {
                 r#"`${this.baseUrl}/items/\`raw\`/\${injected}/${encodeURIComponent(String(id))}`"#
             ),
             "backticks and ${{...}} in static path segments must be escaped:\n{ts}"
+        );
+    }
+
+    #[test]
+    fn emits_record_type_for_additional_properties_only_schemas() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Map Schema Test", "version": "1.0.0" },
+            "paths": {},
+            "components": {
+                "schemas": {
+                    "Labels": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        assert!(
+            ts.contains("export type Labels = Record<string, string>;"),
+            "additionalProperties-only schema must emit Record<string, ...>:\n{ts}"
+        );
+        assert!(
+            !ts.contains("export interface Labels"),
+            "must not emit empty interface for additionalProperties-only schema:\n{ts}"
+        );
+    }
+
+    #[test]
+    fn escapes_reserved_keyword_params_and_deduplicates_colliding_param_names() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Param Hygiene Test", "version": "1.0.0" },
+            "paths": {
+                "/search/{query}/{default}/{class}": {
+                    "post": {
+                        "operationId": "searchItems",
+                        "parameters": [
+                            { "name": "query", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "default", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "class", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer" } }
+                        ],
+                        "requestBody": {
+                            "required": true,
+                            "content": {
+                                "application/json": {
+                                    "schema": { "type": "string" }
+                                }
+                            }
+                        },
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        assert!(
+            ts.contains("async searchItems(query: string, default_: string, class_: string, body: string, query_2?: { limit?: number; }): Promise<void>"),
+            "must escape reserved keywords and deduplicate colliding query param:\n{ts}"
+        );
+        assert!(
+            ts.contains("${encodeURIComponent(String(query))}/${encodeURIComponent(String(default_))}/${encodeURIComponent(String(class_))}"),
+            "URL template must reference escaped path param names:\n{ts}"
+        );
+        assert!(
+            ts.contains("query_2?.limit"),
+            "query bag body must reference deduplicated query_2 identifier:\n{ts}"
         );
     }
 }

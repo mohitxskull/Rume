@@ -180,20 +180,48 @@ impl Parser {
     }
 
     fn parse_or(&mut self, depth: usize) -> Result<ScimFilter, ScimFilterError> {
+        if depth > self.max_depth {
+            return Err(ScimFilterError::MaxDepthExceeded {
+                max_depth: self.max_depth,
+            });
+        }
         let mut left = self.parse_and(depth)?;
+        let mut current_depth = depth;
         while self.peek_word_eq("or") {
+            // Why: each chained binary `or` adds a level of AST nesting; enforce
+            // `max_depth` in the loop so flat chains cannot bypass the depth bound (`RC-21`).
+            current_depth += 1;
+            if current_depth > self.max_depth {
+                return Err(ScimFilterError::MaxDepthExceeded {
+                    max_depth: self.max_depth,
+                });
+            }
             self.next();
-            let right = self.parse_and(depth)?;
+            let right = self.parse_and(current_depth)?;
             left = ScimFilter::Or(Box::new(left), Box::new(right));
         }
         Ok(left)
     }
 
     fn parse_and(&mut self, depth: usize) -> Result<ScimFilter, ScimFilterError> {
+        if depth > self.max_depth {
+            return Err(ScimFilterError::MaxDepthExceeded {
+                max_depth: self.max_depth,
+            });
+        }
         let mut left = self.parse_not(depth)?;
+        let mut current_depth = depth;
         while self.peek_word_eq("and") {
+            // Why: each chained binary `and` adds a level of AST nesting; enforce
+            // `max_depth` in the loop so flat chains cannot bypass the depth bound (`RC-21`).
+            current_depth += 1;
+            if current_depth > self.max_depth {
+                return Err(ScimFilterError::MaxDepthExceeded {
+                    max_depth: self.max_depth,
+                });
+            }
             self.next();
-            let right = self.parse_not(depth)?;
+            let right = self.parse_not(current_depth)?;
             left = ScimFilter::And(Box::new(left), Box::new(right));
         }
         Ok(left)
@@ -622,5 +650,20 @@ mod tests {
         let user_with_email = user.with_email("bob@example.com", true);
         assert!(!emails_eq_null.matches_user(&user_with_email));
         assert!(emails_ne_null.matches_user(&user_with_email));
+    }
+
+    #[test]
+    fn scim_chained_or_and_enforce_max_depth() {
+        let deep_or = format!("{}a pr", "a pr or ".repeat(40));
+        assert_eq!(
+            ScimFilter::parse(&deep_or),
+            Err(ScimFilterError::MaxDepthExceeded { max_depth: 32 })
+        );
+
+        let deep_and = format!("{}a pr", "a pr and ".repeat(40));
+        assert_eq!(
+            ScimFilter::parse(&deep_and),
+            Err(ScimFilterError::MaxDepthExceeded { max_depth: 32 })
+        );
     }
 }

@@ -331,8 +331,17 @@ impl RealtimeHub {
             return Ok(());
         };
         let key = (tenant_id.to_string(), room.to_string());
-        if self.inner.pubsub_tasks.lock().contains_key(&key) {
-            return Ok(());
+        {
+            let mut tasks = self.inner.pubsub_tasks.lock();
+            if let Some(existing) = tasks.get(&key) {
+                // Why: a pub/sub pump task may exit on broker error or stream EOF while
+                // local subscribers remain attached. Only treat an existing handle as active
+                // if it has not finished; otherwise evict and respawn cleanly (`RC-17`).
+                if !existing.is_finished() {
+                    return Ok(());
+                }
+                tasks.remove(&key);
+            }
         }
 
         let topic = Self::topic_for(tenant_id, room);
@@ -396,10 +405,17 @@ impl RealtimeHub {
             handle.abort();
             return Err(RealtimeError::ShuttingDown);
         }
-        if let std::collections::hash_map::Entry::Vacant(entry) = tasks.entry(key) {
-            entry.insert(handle);
-        } else {
-            handle.abort();
+        match tasks.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(handle);
+            }
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                if entry.get().is_finished() {
+                    entry.insert(handle);
+                } else {
+                    handle.abort();
+                }
+            }
         }
         Ok(())
     }
@@ -661,5 +677,136 @@ mod tests {
             hub.inner.pubsub_tasks.lock().is_empty(),
             "pubsub_tasks must remain empty after shutdown race"
         );
+    }
+
+    #[tokio::test]
+    async fn ensure_pubsub_pump_respawns_finished_pump_task() {
+        use rume_messaging::pubsub::{PubSubError, PubSubMessage, PubSubSubscription};
+        use std::sync::atomic::AtomicUsize;
+
+        #[derive(Debug)]
+        struct OneShotEofSubscription;
+
+        impl PubSubSubscription for OneShotEofSubscription {
+            fn recv(
+                &mut self,
+            ) -> rume_messaging::outbox::repository::BoxFuture<
+                '_,
+                Result<Option<PubSubMessage>, PubSubError>,
+            > {
+                Box::pin(async { Ok(None) })
+            }
+        }
+
+        #[derive(Debug)]
+        struct LiveSubscription {
+            sent: bool,
+            payload: Vec<u8>,
+        }
+
+        impl PubSubSubscription for LiveSubscription {
+            fn recv(
+                &mut self,
+            ) -> rume_messaging::outbox::repository::BoxFuture<
+                '_,
+                Result<Option<PubSubMessage>, PubSubError>,
+            > {
+                if !self.sent {
+                    self.sent = true;
+                    let payload = self.payload.clone();
+                    Box::pin(async move {
+                        Ok(Some(PubSubMessage {
+                            topic: "realtime:acme:room-respawn".to_string(),
+                            payload,
+                        }))
+                    })
+                } else {
+                    Box::pin(async { std::future::pending().await })
+                }
+            }
+        }
+
+        #[derive(Debug)]
+        struct FlakyOncePubSub {
+            calls: AtomicUsize,
+            payload: Vec<u8>,
+        }
+
+        impl PubSub for FlakyOncePubSub {
+            fn publish<'a>(
+                &'a self,
+                _topic: &'a str,
+                _payload: &'a [u8],
+            ) -> rume_messaging::outbox::repository::BoxFuture<'a, Result<(), PubSubError>>
+            {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn subscribe<'a>(
+                &'a self,
+                _topic: &'a str,
+            ) -> rume_messaging::outbox::repository::BoxFuture<
+                'a,
+                Result<Box<dyn PubSubSubscription>, PubSubError>,
+            > {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let payload = self.payload.clone();
+                Box::pin(async move {
+                    if n == 0 {
+                        Ok(Box::new(OneShotEofSubscription) as Box<dyn PubSubSubscription>)
+                    } else {
+                        Ok(Box::new(LiveSubscription {
+                            sent: false,
+                            payload,
+                        }) as Box<dyn PubSubSubscription>)
+                    }
+                })
+            }
+        }
+
+        let envelope = PubSubEnvelope {
+            origin_node_id: "remote-node".to_string(),
+            event: RealtimeEvent::new("ping", serde_json::json!({"ok": true})),
+        };
+        let pubsub = Arc::new(FlakyOncePubSub {
+            calls: AtomicUsize::new(0),
+            payload: serde_json::to_vec(&envelope).unwrap(),
+        });
+        let hub = RealtimeHub::new(RealtimeConfig::default()).with_pubsub(pubsub.clone());
+
+        // First subscriber triggers pump 1, which immediately exits on EOF.
+        let mut sub1 = hub
+            .subscribe("acme", "room-respawn")
+            .await
+            .expect("first subscribe");
+        for _ in 0..20 {
+            let finished = hub
+                .inner
+                .pubsub_tasks
+                .lock()
+                .get(&("acme".to_string(), "room-respawn".to_string()))
+                .is_some_and(tokio::task::JoinHandle::is_finished);
+            if finished {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(pubsub.calls.load(Ordering::SeqCst), 1);
+
+        // Second subscriber while `sub1` is still alive must detect the finished pump and respawn it.
+        let mut sub2 = hub
+            .subscribe("acme", "room-respawn")
+            .await
+            .expect("second subscribe");
+        assert_eq!(pubsub.calls.load(Ordering::SeqCst), 2);
+
+        let ev1 = tokio::time::timeout(Duration::from_secs(1), sub1.recv())
+            .await
+            .expect("sub1 should receive event from respawned pump");
+        let ev2 = tokio::time::timeout(Duration::from_secs(1), sub2.recv())
+            .await
+            .expect("sub2 should receive event from respawned pump");
+        assert!(matches!(ev1, RealtimeRecv::Event(e) if e.event == "ping"));
+        assert!(matches!(ev2, RealtimeRecv::Event(e) if e.event == "ping"));
     }
 }

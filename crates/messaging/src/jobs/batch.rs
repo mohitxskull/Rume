@@ -62,12 +62,16 @@ pub struct JobBatch {
 }
 
 impl JobBatch {
-    fn callback_specs(&self) -> Vec<(String, Vec<u8>)> {
+    fn callback_specs(&self) -> Vec<(String, Vec<u8>, String)> {
         let mut specs = Vec::new();
         if self.status == BatchStatus::Completed
             && let (Some(name), Some(payload)) = (&self.then_job_name, &self.then_job_payload)
         {
-            specs.push((name.clone(), payload.clone()));
+            specs.push((
+                name.clone(),
+                payload.clone(),
+                format!("batch:{}:then", self.id.0),
+            ));
         }
         if matches!(
             self.status,
@@ -75,7 +79,11 @@ impl JobBatch {
         ) && let (Some(name), Some(payload)) =
             (&self.finally_job_name, &self.finally_job_payload)
         {
-            specs.push((name.clone(), payload.clone()));
+            specs.push((
+                name.clone(),
+                payload.clone(),
+                format!("batch:{}:finally", self.id.0),
+            ));
         }
         specs
     }
@@ -91,7 +99,7 @@ impl JobBatch {
         if specs.is_empty() || !store.try_claim_callbacks(&self.id).await? {
             return Ok(());
         }
-        for (name, payload) in specs {
+        for (name, payload, idemp_key) in specs {
             let queued = QueuedJob {
                 id: Uuid::new_v4().to_string(),
                 name,
@@ -101,7 +109,7 @@ impl JobBatch {
                 attempt: 1,
                 retry_policy: RetryPolicy::default(),
                 timeout: Some(Duration::from_secs(60)),
-                idempotency_key: None,
+                idempotency_key: Some(idemp_key),
                 tenant_id: None,
                 assigned_worker: None,
                 lease_token: None,
@@ -128,7 +136,10 @@ impl JobBatch {
         if specs.is_empty() || !store.try_claim_callbacks(&self.id).await? {
             return Ok(());
         }
-        for (name, payload) in specs {
+        for (name, payload, idemp_key) in specs {
+            // Why: attach deterministic `batch:{id}:{then|finally}` idempotency keys so
+            // retrying after a partial callback enqueue failure (e.g. `then` enqueued,
+            // `finally` failed, claim released) cannot duplicate `then` execution (`RC-17`).
             let raw = RawJob {
                 name,
                 queue: "default".to_string(),
@@ -136,7 +147,7 @@ impl JobBatch {
                 payload,
                 retry_policy: RetryPolicy::default(),
                 timeout: Some(Duration::from_secs(60)),
-                idempotency_key: None,
+                idempotency_key: Some(idemp_key),
                 tenant_id: None,
                 trace_context: None,
             };
@@ -1172,5 +1183,115 @@ mod tests {
             .await
             .expect("callback retry must succeed after claim rollback");
         assert_eq!(queue.enqueued.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_callbacks_attach_deterministic_idempotency_keys() {
+        #[derive(Debug, Default)]
+        struct CapturingQueue {
+            enqueued: Mutex<Vec<RawJob>>,
+        }
+
+        impl JobQueue for CapturingQueue {
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                job: J,
+                delay: Duration,
+                trace_context: Option<String>,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                match RawJob::from_job(job, trace_context) {
+                    Ok(raw) => self.enqueue_raw(raw, delay),
+                    Err(err) => Box::pin(async move { Err(err) }),
+                }
+            }
+            fn enqueue_raw(
+                &self,
+                job: RawJob,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async move {
+                    let mut guard = self.enqueued.lock().unwrap();
+                    let idx = guard.len();
+                    guard.push(job);
+                    Ok(format!("job-{idx}"))
+                })
+            }
+            fn dequeue(&self) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn ack(&self, _job_id: &str, _token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _reason: String,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(self.enqueued.lock().unwrap().len()) })
+            }
+            fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let store = InMemoryBatchStore::new();
+        let queue = CapturingQueue::default();
+
+        let batch = BatchBuilder::new("idempotent-callbacks")
+            .add_job(WorkItem { id: 1 })
+            .then(ThenCallback {
+                label: "done".into(),
+            })
+            .finally(FinallyCallback {
+                label: "cleanup".into(),
+            })
+            .create_in_store(&store)
+            .await
+            .expect("create batch");
+
+        let done = store
+            .record_success(&batch.id)
+            .await
+            .expect("record_success");
+        done.dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect("dispatch callbacks");
+
+        let jobs = queue.enqueued.lock().unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(jobs[0].name, ThenCallback::NAME);
+        assert_eq!(
+            jobs[0].idempotency_key.as_deref(),
+            Some(format!("batch:{}:then", batch.id.0).as_str())
+        );
+        assert_eq!(jobs[1].name, FinallyCallback::NAME);
+        assert_eq!(
+            jobs[1].idempotency_key.as_deref(),
+            Some(format!("batch:{}:finally", batch.id.0).as_str())
+        );
     }
 }

@@ -1,5 +1,9 @@
-//! Instrumented outbound HTTP client (`RumeClient`) with W3C trace propagation,
-//! circuit breaking, retries, timeouts, and service discovery.
+//! Instrumented outbound HTTP client ([`RumeClient`]) with W3C trace propagation,
+//! circuit breaking, retries, and timeouts.
+//!
+//! Service discovery abstractions ([`ServiceDiscovery`], [`StaticDiscovery`], and
+//! [`DnsSrvDiscovery`] under the `dns-srv` feature) live in [`discovery`] so callers
+//! can resolve target endpoints before building requests.
 
 pub mod discovery;
 
@@ -59,7 +63,7 @@ impl Default for RetryConfig {
 }
 
 /// Builder for [`RumeClient`].
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct RumeClientBuilder {
     client: Option<reqwest::Client>,
     circuit_breaker: Option<Arc<CircuitBreaker>>,
@@ -71,21 +75,6 @@ pub struct RumeClientBuilder {
     redirect_policy: Option<reqwest::redirect::Policy>,
 }
 
-impl Default for RumeClientBuilder {
-    fn default() -> Self {
-        Self {
-            client: None,
-            circuit_breaker: None,
-            retry: RetryConfig::default(),
-            attempt_timeout: None,
-            total_timeout: None,
-            connect_timeout: Some(DEFAULT_CONNECT_TIMEOUT),
-            request_timeout: Some(DEFAULT_REQUEST_TIMEOUT),
-            redirect_policy: None,
-        }
-    }
-}
-
 impl RumeClientBuilder {
     /// Creates a new [`RumeClientBuilder`] with default settings.
     pub fn new() -> Self {
@@ -93,6 +82,10 @@ impl RumeClientBuilder {
     }
 
     /// Uses a pre-configured `reqwest::Client`.
+    ///
+    /// Passing a pre-built `reqwest::Client` overrides any [`Self::connect_timeout`],
+    /// [`Self::request_timeout`], and [`Self::redirect_policy`] settings configured on this
+    /// builder (a `tracing::warn!` is emitted at [`Self::build`] time if both are set).
     pub fn client(mut self, client: reqwest::Client) -> Self {
         self.client = Some(client);
         self
@@ -149,20 +142,25 @@ impl RumeClientBuilder {
     /// Builds the [`RumeClient`].
     pub fn build(self) -> Result<RumeClient, OutboundHttpError> {
         let inner = match self.client {
-            Some(client) => client,
-            None => {
-                let mut builder = reqwest::Client::builder().redirect(
+            Some(client) => {
+                if self.connect_timeout.is_some()
+                    || self.request_timeout.is_some()
+                    || self.redirect_policy.is_some()
+                {
+                    tracing::warn!(
+                        "RumeClientBuilder::client() overrides builder connect_timeout, request_timeout, and redirect_policy settings"
+                    );
+                }
+                client
+            }
+            None => reqwest::Client::builder()
+                .redirect(
                     self.redirect_policy
                         .unwrap_or_else(reqwest::redirect::Policy::none),
-                );
-                if let Some(connect_timeout) = self.connect_timeout {
-                    builder = builder.connect_timeout(connect_timeout);
-                }
-                if let Some(request_timeout) = self.request_timeout {
-                    builder = builder.timeout(request_timeout);
-                }
-                builder.build()?
-            }
+                )
+                .connect_timeout(self.connect_timeout.unwrap_or(DEFAULT_CONNECT_TIMEOUT))
+                .timeout(self.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT))
+                .build()?,
         };
         Ok(RumeClient {
             inner,

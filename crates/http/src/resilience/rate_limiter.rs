@@ -367,12 +367,17 @@ where
         // semantically equivalent to joining them in order with `, `. Reading
         // only `.get("x-forwarded-for")` ignores subsequent header lines appended
         // by a reverse proxy and lets an attacker spoof the first header line.
-        let folded_xff = fold_forwarded_headers(req.headers());
-        let ip_key = resolve_forwarded_client_ip(
-            socket_ip,
-            folded_xff.as_deref(),
-            &limiter.config().trusted_proxies,
-        );
+        // Fail closed to `peer` if any header line is empty or non-UTF-8 (`RC-16`).
+        let ip_key = match fold_forwarded_headers(req.headers()) {
+            Ok(folded_xff) => resolve_forwarded_client_ip(
+                socket_ip,
+                folded_xff.as_deref(),
+                &limiter.config().trusted_proxies,
+            ),
+            Err(()) => {
+                resolve_forwarded_client_ip(socket_ip, None, &limiter.config().trusted_proxies)
+            }
+        };
 
         // Why: `TenantLayer` resolves `Tenant` from untrusted request input (e.g. `X-Tenant-ID`)
         // before authentication or `RateLimitLayer` runs. Keying by `tenant:<id>` without
@@ -492,20 +497,24 @@ pub fn resolve_forwarded_client_ip(
     format!("ip:{peer}")
 }
 
-fn fold_forwarded_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+fn fold_forwarded_headers(headers: &axum::http::HeaderMap) -> Result<Option<String>, ()> {
     let mut parts = Vec::new();
     for val in headers.get_all("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                parts.push(trimmed);
-            }
+        // Why: fail closed on any non-UTF-8 or empty/whitespace-only `X-Forwarded-For`
+        // line rather than skipping it and exposing an earlier attacker-controlled line.
+        let Ok(s) = val.to_str() else {
+            return Err(());
+        };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(());
         }
+        parts.push(trimmed);
     }
     if parts.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(parts.join(", "))
+        Ok(Some(parts.join(", ")))
     }
 }
 
@@ -544,10 +553,41 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
         headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
-        let folded = fold_forwarded_headers(&headers);
+        let folded = fold_forwarded_headers(&headers).expect("valid xff headers");
         let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ip = resolve_forwarded_client_ip(Some(proxy), folded.as_deref(), &[proxy]);
         assert_eq!(ip, "ip:203.0.113.99");
+    }
+
+    #[test]
+    fn fold_forwarded_headers_fails_closed_on_empty_or_non_utf8_header_line() {
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Empty trailing X-Forwarded-For line must fail closed to `peer`, not fall back to `1.2.3.4`.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        headers.append("x-forwarded-for", HeaderValue::from_static(""));
+        assert!(fold_forwarded_headers(&headers).is_err());
+        let ip = match fold_forwarded_headers(&headers) {
+            Ok(folded) => resolve_forwarded_client_ip(Some(proxy), folded.as_deref(), &[proxy]),
+            Err(()) => resolve_forwarded_client_ip(Some(proxy), None, &[proxy]),
+        };
+        assert_eq!(ip, "ip:10.0.0.1");
+
+        // Whitespace-only line must also fail closed.
+        let mut ws_headers = axum::http::HeaderMap::new();
+        ws_headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        ws_headers.append("x-forwarded-for", HeaderValue::from_static("   "));
+        assert!(fold_forwarded_headers(&ws_headers).is_err());
+
+        // Non-UTF-8 header value must also fail closed.
+        let mut non_utf8 = axum::http::HeaderMap::new();
+        non_utf8.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        non_utf8.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
+        assert!(fold_forwarded_headers(&non_utf8).is_err());
     }
 
     #[test]

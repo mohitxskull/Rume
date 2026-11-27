@@ -125,6 +125,34 @@ fn sanitize_ident(name: &str) -> String {
     }
 }
 
+fn validate_namespace_ident(
+    namespace: &str,
+    rel_path: &str,
+    span: proc_macro2::Span,
+) -> Result<Ident, syn::Error> {
+    // Why: `syn::parse_str::<Ident>("r#type")` succeeds for raw identifiers, whereas
+    // `Ident::new("r#type", ...)` panics. Construct raw idents via `Ident::new_raw`
+    // (or return `syn::Error` if invalid, e.g. `r#self`) so codegen never panics (`RC-18`).
+    let mut ident = syn::parse_str::<Ident>(namespace).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!(
+                "sql_assets!: subdirectory namespace '{namespace}' (from '{rel_path}') is not a valid Rust identifier",
+            ),
+        )
+    })?;
+    ident.set_span(span);
+    Ok(ident)
+}
+
+fn ident_from_validated(name: &str, span: proc_macro2::Span) -> Ident {
+    if let Some(raw) = name.strip_prefix("r#") {
+        Ident::new_raw(raw, span)
+    } else {
+        Ident::new(name, span)
+    }
+}
+
 fn validate_query_ident(
     file_name: &str,
     query_name: &str,
@@ -427,15 +455,10 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
             } else {
                 "common".to_string()
             };
-            if syn::parse_str::<syn::Ident>(&namespace).is_err() {
-                return syn::Error::new(
-                    args.dir_path.span(),
-                    format!(
-                        "sql_assets!: subdirectory namespace '{namespace}' (from '{full_rel_from_manifest}') is not a valid Rust identifier",
-                    ),
-                )
-                .to_compile_error()
-                .into();
+            if let Err(err) =
+                validate_namespace_ident(&namespace, &full_rel_from_manifest, args.dir_path.span())
+            {
+                return err.to_compile_error().into();
             }
 
             let logical_name = match &dialect {
@@ -462,7 +485,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
     let dialect_mods = by_dialect.iter().map(|(dialect_name, namespaces)| {
         let dialect_ident = Ident::new(dialect_name, proc_macro2::Span::call_site());
         let ns_mods = namespaces.iter().map(|(ns_name, query_items)| {
-            let ns_ident = Ident::new(ns_name, proc_macro2::Span::call_site());
+            let ns_ident = ident_from_validated(ns_name, proc_macro2::Span::call_site());
             let query_consts = query_items.iter().map(|q| {
                 let const_ident = Ident::new(&q.query_ident, proc_macro2::Span::call_site());
                 let logical_name = &q.logical_name;
@@ -496,7 +519,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
     // Generate flat namespace submodules
     let flat_ns_mods = by_namespace.iter().map(|(ns_name, queries)| {
-        let ns_ident = Ident::new(ns_name, proc_macro2::Span::call_site());
+        let ns_ident = ident_from_validated(ns_name, proc_macro2::Span::call_site());
         let query_consts = queries.iter().map(|(q_ident_str, q)| {
             let const_ident = Ident::new(q_ident_str, proc_macro2::Span::call_site());
             let logical_name = &q.logical_name;
@@ -761,8 +784,8 @@ pub fn derive_from_row(input: TokenStream) -> TokenStream {
 #[cfg(test)]
 mod tests {
     use super::{
-        SqlFileItem, extract_migration_version, organize_sql_items, resolve_manifest_subdir,
-        validate_query_ident, walk_sql_files,
+        SqlFileItem, extract_migration_version, ident_from_validated, organize_sql_items,
+        resolve_manifest_subdir, validate_namespace_ident, validate_query_ident, walk_sql_files,
     };
 
     #[test]
@@ -896,5 +919,19 @@ mod tests {
         assert!(out[0].ends_with("users/list.sql"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_ident_namespace_directory_does_not_panic() {
+        let span = proc_macro2::Span::call_site();
+        let validated = validate_namespace_ident("r#type", "sql/r#type/list.sql", span)
+            .expect("r#type is a valid raw Rust identifier");
+        assert_eq!(validated.to_string(), "r#type");
+
+        let generated = ident_from_validated("r#type", span);
+        assert_eq!(generated.to_string(), "r#type");
+
+        // Non-raw-eligible keyword like `r#self` must return a clean syn::Error.
+        assert!(validate_namespace_ident("r#self", "sql/r#self/list.sql", span).is_err());
     }
 }
