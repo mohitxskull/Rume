@@ -269,25 +269,32 @@ fn collect_top_level_statement_heads_from_tokens(
                         leading_words.push(upper.clone());
                     }
                     // Why: only enter a compound SQL block (`BEGIN ... END`) when the
-                    // enclosing `CREATE` statement explicitly declares a compound object
-                    // (`TRIGGER`, `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(`
-                    // and before any non-compound DDL keyword (`TABLE`, `VIEW`, `INDEX`,
-                    // `SCHEMA`, `TYPE`, `SEQUENCE`), so `CREATE TABLE trigger (...) BEGIN ...`
-                    // or `CREATE TABLE t (event INT)` cannot enable compound blocks (`RC-13`, `P2-20`).
-                    if !seen_lparen && leading_words.first().map(String::as_str) == Some("CREATE") {
+                    // enclosing `CREATE` statement declares a compound object (`TRIGGER`,
+                    // `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(` and with
+                    // only valid pre-target `CREATE` modifiers in between (allowlist, not
+                    // denylist), so `CREATE DATABASE trigger BEGIN ...` or `CREATE TABLE
+                    // trigger (...) BEGIN ...` cannot enable compound blocks (`RC-13`, `P3-04`).
+                    if !seen_lparen
+                        && !in_compound_create_decl
+                        && !seen_non_compound_create_target
+                        && leading_words.len() > 1
+                        && leading_words.first().map(String::as_str) == Some("CREATE")
+                    {
                         if matches!(
                             upper.as_str(),
-                            "TABLE" | "VIEW" | "INDEX" | "SCHEMA" | "TYPE" | "SEQUENCE"
+                            "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
+                        ) {
+                            in_compound_create_decl = true;
+                        } else if !matches!(
+                            upper.as_str(),
+                            "OR" | "REPLACE"
+                                | "TEMP"
+                                | "TEMPORARY"
+                                | "CONSTRAINT"
+                                | "DEFINER"
+                                | "CURRENT_USER"
                         ) {
                             seen_non_compound_create_target = true;
-                            in_compound_create_decl = false;
-                        } else if !seen_non_compound_create_target
-                            && matches!(
-                                upper.as_str(),
-                                "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
-                            )
-                        {
-                            in_compound_create_decl = true;
                         }
                     }
                     if upper == "BEGIN" && in_compound_create_decl {

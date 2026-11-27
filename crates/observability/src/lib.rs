@@ -14,7 +14,10 @@ pub use metrics::{
     DynamicPoolExporter, MetricsLayer, MetricsRegistry, MetricsService, MetricsSnapshot,
     PoolMetricsExporter,
 };
-pub use otel::{ObservabilityBuilder, ObservabilityGuard, init_tracing, try_init_tracing};
+pub use otel::{
+    ObservabilityBuilder, ObservabilityGuard, init_tracing, shutdown_global_observability,
+    try_init_tracing,
+};
 pub use prometheus::{
     OPENMETRICS_CONTENT_TYPE, PROMETHEUS_CONTENT_TYPE, PrometheusFormat, render_metrics,
     render_openmetrics, render_prometheus, render_registry,

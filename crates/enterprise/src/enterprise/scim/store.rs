@@ -933,6 +933,7 @@ impl ScimStore for InMemoryScimStore {
             if group.schemas.is_empty() {
                 group.schemas.push(SCIM_GROUP_SCHEMA.to_string());
             }
+            group.members = dedup_members(group.members);
             let ver = inner.next_version(&format!("group:{}", group.id));
             group.meta = stamp_meta(
                 group.meta.take(),
@@ -1009,6 +1010,7 @@ impl ScimStore for InMemoryScimStore {
             if group.schemas.is_empty() {
                 group.schemas.push(SCIM_GROUP_SCHEMA.to_string());
             }
+            group.members = dedup_members(group.members);
             let ver = inner.next_version(&format!("group:{id}"));
             group.meta = stamp_meta(
                 group.meta.take(),

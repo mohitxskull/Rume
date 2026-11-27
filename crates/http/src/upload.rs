@@ -177,7 +177,7 @@ pub fn sanitize_filename(raw: &str) -> String {
                 .trim_end_matches('.')
                 .trim_end();
             let safe_stem = if truncated_stem.is_empty() {
-                "upload"
+                &"upload"[..max_stem.min("upload".len())]
             } else {
                 truncated_stem
             };
@@ -315,19 +315,20 @@ const MAX_UTF16_SNIFF_BYTES: usize = 256 * 1024;
 fn decode_utf16_bom(bytes: &[u8]) -> Option<Vec<u8>> {
     let (le, body) = if let Some(rest) = bytes.strip_prefix(b"\xFF\xFE") {
         (true, rest)
-    } else if let Some(rest) = bytes.strip_prefix(b"\xFE\xFF") {
-        (false, rest)
     } else {
-        return None;
+        let rest = bytes.strip_prefix(b"\xFE\xFF")?;
+        (false, rest)
     };
     let bounded = &body[..body.len().min(MAX_UTF16_SNIFF_BYTES)];
     let units: Vec<u16> = bounded
-        .chunks_exact(2)
-        .map(|c| {
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&[a, b]| {
             if le {
-                u16::from_le_bytes([c[0], c[1]])
+                u16::from_le_bytes([a, b])
             } else {
-                u16::from_be_bytes([c[0], c[1]])
+                u16::from_be_bytes([a, b])
             }
         })
         .collect();

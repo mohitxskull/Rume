@@ -46,11 +46,23 @@ impl FromRow for User {
 }
 
 /// Request payload to create a new user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct CreateUserRequest {
     pub id: String,
     pub email: String,
     pub name: String,
     pub role: String,
     pub api_token: String,
+}
+
+impl fmt::Debug for CreateUserRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CreateUserRequest")
+            .field("id", &self.id)
+            .field("email", &self.email)
+            .field("name", &self.name)
+            .field("role", &self.role)
+            .field("api_token", &"[REDACTED]")
+            .finish()
+    }
 }

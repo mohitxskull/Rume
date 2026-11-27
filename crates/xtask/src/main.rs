@@ -48,15 +48,15 @@ enum Commands {
         containers: bool,
     },
 
-    /// Verify isolated backend feature combinations (sqlite, postgres, mysql, redis)
+    /// Verify isolated backend and optional feature combinations for `rume`
     Features,
 
     /// Run workspace doc-tests and build rustdoc documentation
     Doc,
 
-    /// Run security advisory audit via cargo-audit
+    /// Run security advisory and dependency policy checks via cargo-audit and cargo-deny
     Audit {
-        /// Treat missing cargo-audit binary as fatal error
+        /// Treat missing cargo-audit or cargo-deny binary as fatal error
         #[arg(long)]
         strict: bool,
     },

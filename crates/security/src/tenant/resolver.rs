@@ -483,36 +483,40 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
                 .unwrap_or_default()
                 .as_secs() as i64;
 
+            fn map_tenant_upsert_error(
+                err: rume_data::persistence::PersistenceError,
+                slug: &str,
+            ) -> TenantError {
+                let msg = err.to_string();
+                let lower = msg.to_ascii_lowercase();
+                if lower.contains("1062")
+                    || lower.contains("duplicate entry")
+                    || lower.contains("uq_rume_tenants_slug")
+                    || lower.contains("unique constraint")
+                    || lower.contains("duplicate key")
+                    || lower.contains("23505")
+                {
+                    TenantError::Conflict(format!(
+                        "tenant slug '{slug}' already belongs to another tenant"
+                    ))
+                } else {
+                    TenantError::Internal(msg)
+                }
+            }
             if self.backend.dialect() == "mysql" {
                 use rume_data::persistence::DatabaseTransaction;
 
-                // Why: MySQL `ON DUPLICATE KEY UPDATE` triggers on ANY unique index collision,
-                // including `UNIQUE KEY uq_rume_tenants_slug (slug)`, which would silently
-                // overwrite and reactivate another tenant row (`P2-01`). Lock and check slug
-                // conflicts in a transaction and split `UPDATE WHERE id = ?` vs plain `INSERT`.
+                // Why: MySQL `ON DUPLICATE KEY UPDATE` triggers on ANY unique index collision
+                // (`P2-01`), while a pre-check `SELECT ... WHERE slug = ? FOR UPDATE` causes
+                // InnoDB gap-lock deadlocks (1213) under `REPEATABLE READ` (`P3-02`). Lock the
+                // primary key `id` first, run `UPDATE` or `INSERT`, and let `UNIQUE KEY
+                // uq_rume_tenants_slug` enforce slug uniqueness atomically (mapping 1062 to
+                // `TenantError::Conflict`).
                 let tx = self
                     .backend
                     .begin_transaction()
                     .await
                     .map_err(|e| TenantError::Internal(e.to_string()))?;
-
-                let conflict = tx
-                    .fetch_optional(
-                        rume_data::sql::MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT,
-                        &[
-                            rume_data::persistence::DbValue::from(tenant.slug.as_str()),
-                            rume_data::persistence::DbValue::from(tenant.id.as_str()),
-                        ],
-                    )
-                    .await
-                    .map_err(|e| TenantError::Internal(e.to_string()))?;
-                if conflict.is_some() {
-                    let _ = tx.rollback().await;
-                    return Err(TenantError::Conflict(format!(
-                        "tenant slug '{}' already belongs to another tenant",
-                        tenant.slug
-                    )));
-                }
 
                 let existing = tx
                     .fetch_optional(
@@ -532,7 +536,7 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
                         ],
                     )
                     .await
-                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                    .map_err(|e| map_tenant_upsert_error(e, &tenant.slug))?;
                 } else {
                     tx.execute_params(
                         rume_data::sql::MYSQL_AUTH_TENANT_INSERT,
@@ -544,12 +548,12 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
                         ],
                     )
                     .await
-                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                    .map_err(|e| map_tenant_upsert_error(e, &tenant.slug))?;
                 }
 
                 tx.commit()
                     .await
-                    .map_err(|e| TenantError::Internal(e.to_string()))?;
+                    .map_err(|e| map_tenant_upsert_error(e, &tenant.slug))?;
                 return Ok(());
             }
 
@@ -566,7 +570,7 @@ impl<B: rume_data::persistence::DatabaseBackend> TenantStore for SqlTenantStore<
             self.backend
                 .execute_params(sql, &params)
                 .await
-                .map_err(|e| TenantError::Internal(e.to_string()))?;
+                .map_err(|e| map_tenant_upsert_error(e, &tenant.slug))?;
             Ok(())
         })
     }
@@ -1196,6 +1200,13 @@ mod tests {
                         else {
                             return Err(PersistenceError::QueryFailed("bad insert params".into()));
                         };
+                        if rows.iter().any(|(existing_id, (existing_slug, _, _))| {
+                            existing_slug == slug && existing_id != id
+                        }) {
+                            return Err(PersistenceError::QueryFailed(format!(
+                                "1062 (23000): Duplicate entry '{slug}' for key 'rume_tenants.uq_rume_tenants_slug'"
+                            )));
+                        }
                         rows.insert(id.clone(), (slug.clone(), meta.clone(), true));
                         Ok(1)
                     } else if stmt == rume_data::sql::MYSQL_AUTH_TENANT_UPDATE {
@@ -1204,6 +1215,13 @@ mod tests {
                         else {
                             return Err(PersistenceError::QueryFailed("bad update params".into()));
                         };
+                        if rows.iter().any(|(existing_id, (existing_slug, _, _))| {
+                            existing_slug == slug && existing_id != id
+                        }) {
+                            return Err(PersistenceError::QueryFailed(format!(
+                                "1062 (23000): Duplicate entry '{slug}' for key 'rume_tenants.uq_rume_tenants_slug'"
+                            )));
+                        }
                         rows.insert(id.clone(), (slug.clone(), meta.clone(), true));
                         Ok(1)
                     } else {
@@ -1239,24 +1257,7 @@ mod tests {
                 let params = params.to_vec();
                 Box::pin(async move {
                     let rows = self.state.rows.lock().unwrap();
-                    if stmt == rume_data::sql::MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT {
-                        let (DbValue::Text(slug), DbValue::Text(id)) = (&params[0], &params[1])
-                        else {
-                            return Ok(None);
-                        };
-                        let found = rows
-                            .iter()
-                            .find(|(existing_id, (existing_slug, _, _))| {
-                                existing_slug == slug && existing_id.as_str() != id.as_str()
-                            })
-                            .map(|(existing_id, _)| {
-                                DbRow::new(
-                                    vec!["id".to_string()],
-                                    vec![DbValue::Text(existing_id.clone())],
-                                )
-                            });
-                        Ok(found)
-                    } else if stmt == rume_data::sql::MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE {
+                    if stmt == rume_data::sql::MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE {
                         let DbValue::Text(id) = &params[0] else {
                             return Ok(None);
                         };
@@ -1385,6 +1386,7 @@ mod tests {
         assert_eq!(
             sqls,
             vec![
+                rume_data::sql::MYSQL_AUTH_TENANT_INSERT.to_string(),
                 rume_data::sql::MYSQL_AUTH_TENANT_UPDATE.to_string(),
                 rume_data::sql::MYSQL_AUTH_TENANT_INSERT.to_string(),
             ]

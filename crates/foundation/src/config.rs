@@ -192,9 +192,7 @@ where
     T: DeserializeOwned,
 {
     let (figment, map) = build_figment_and_source_map(dir)?;
-    let val = figment
-        .extract::<T>()
-        .map_err(|err| ConfigError::Validation(err.to_string()))?;
+    let val = figment.extract::<T>().map_err(ConfigError::from)?;
     Ok((val, map))
 }
 
@@ -240,7 +238,7 @@ fn build_figment_and_source_map(dir: &Path) -> Result<(Figment, ConfigSourceMap)
 
     let raw = figment
         .extract::<toml::Value>()
-        .map_err(|err| ConfigError::Validation(err.to_string()))?;
+        .map_err(ConfigError::from)?;
 
     Ok((
         figment,

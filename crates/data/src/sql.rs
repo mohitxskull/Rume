@@ -300,9 +300,6 @@ pub const MYSQL_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/mysql/auth_use
 /// List effective permissions for a user in MySQL.
 pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
     include_str!("../sql/mysql/auth_user_effective_permissions.sql");
-/// Find another tenant row holding `slug` (locked `FOR UPDATE`) in MySQL.
-pub const MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT: &str =
-    include_str!("../sql/mysql/auth_tenant_find_slug_conflict.sql");
 /// Lock an existing tenant row by `id` (`FOR UPDATE`) in MySQL.
 pub const MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE: &str =
     include_str!("../sql/mysql/auth_tenant_find_id_for_update.sql");

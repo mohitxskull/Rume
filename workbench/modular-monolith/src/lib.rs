@@ -136,6 +136,11 @@ impl Module for CatalogModule {
                                 });
                             }
                             p.stock -= qty;
+                        } else {
+                            return Err(rume::events::EventError::ListenerError {
+                                event_type: "OrderPlacedEvent",
+                                message: format!("unknown product {pid}"),
+                            });
                         }
                     }
                     if let Some(n) = notify {

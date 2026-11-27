@@ -30,6 +30,10 @@ use crate::routing::Router;
 pub const DEFAULT_SCALAR_SCRIPT_URL: &str =
     "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.28.30";
 
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SCALAR_SCRIPT_URL`].
+pub const DEFAULT_SCALAR_SCRIPT_INTEGRITY: &str =
+    "sha384-OPOrTQgyJRwezF8mF7ed3lLSCm93IABC2Pxcm+eJ0SxnDvIcGdoqVkghDdu76/6U";
+
 /// Pinned CDN script URL for the Swagger UI bundle.
 ///
 /// Why: pinned CDN versions guarantee reproducible docs rendering and prevent
@@ -38,6 +42,10 @@ pub const DEFAULT_SCALAR_SCRIPT_URL: &str =
 pub const DEFAULT_SWAGGER_UI_SCRIPT_URL: &str =
     "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.20.1/swagger-ui-bundle.js";
 
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SWAGGER_UI_SCRIPT_URL`].
+pub const DEFAULT_SWAGGER_UI_SCRIPT_INTEGRITY: &str =
+    "sha384-ruKaPGhHK3meQYE2qpbX6DhkLiJYbj2qrIqVpEZKKw6B8B6CkJYtFBOyg7DVxV01";
+
 /// Pinned CDN stylesheet URL for Swagger UI.
 ///
 /// Why: pinned CDN versions guarantee reproducible docs rendering and prevent
@@ -45,6 +53,10 @@ pub const DEFAULT_SWAGGER_UI_SCRIPT_URL: &str =
 /// [`OpenApiDocsConfig::with_stylesheet_url`] for self-hosted deployments.
 pub const DEFAULT_SWAGGER_UI_STYLESHEET_URL: &str =
     "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.20.1/swagger-ui.css";
+
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SWAGGER_UI_STYLESHEET_URL`].
+pub const DEFAULT_SWAGGER_UI_STYLESHEET_INTEGRITY: &str =
+    "sha384-19U5QfIgtj822TyFqWtYKqauOZosmdEalgX8htxti5Pkm6oyuyR9ePwNbSaBclKA";
 
 /// Selectable documentation UI renderer for OpenAPI specifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -246,11 +258,14 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
     match config.ui {
         OpenApiUi::Scalar => {
             let spec_url = escape_html(safe_spec_url);
-            let script_url = escape_html(safe_asset_url(
-                config.script_url.as_deref(),
-                DEFAULT_SCALAR_SCRIPT_URL,
-            ));
-            let script_sri = sri_attrs(config.script_integrity.as_deref());
+            let raw_script_url =
+                safe_asset_url(config.script_url.as_deref(), DEFAULT_SCALAR_SCRIPT_URL);
+            let script_url = escape_html(raw_script_url);
+            let effective_script_sri = config.script_integrity.as_deref().or_else(|| {
+                (raw_script_url == DEFAULT_SCALAR_SCRIPT_URL)
+                    .then_some(DEFAULT_SCALAR_SCRIPT_INTEGRITY)
+            });
+            let script_sri = sri_attrs(effective_script_sri);
 
             format!(
                 concat!(
@@ -275,16 +290,24 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
         }
         OpenApiUi::SwaggerUi => {
             let spec_url_js = escape_js_string(safe_spec_url);
-            let script_url = escape_html(safe_asset_url(
-                config.script_url.as_deref(),
-                DEFAULT_SWAGGER_UI_SCRIPT_URL,
-            ));
-            let stylesheet_url = escape_html(safe_asset_url(
+            let raw_script_url =
+                safe_asset_url(config.script_url.as_deref(), DEFAULT_SWAGGER_UI_SCRIPT_URL);
+            let raw_stylesheet_url = safe_asset_url(
                 config.stylesheet_url.as_deref(),
                 DEFAULT_SWAGGER_UI_STYLESHEET_URL,
-            ));
-            let script_sri = sri_attrs(config.script_integrity.as_deref());
-            let stylesheet_sri = sri_attrs(config.stylesheet_integrity.as_deref());
+            );
+            let script_url = escape_html(raw_script_url);
+            let stylesheet_url = escape_html(raw_stylesheet_url);
+            let effective_script_sri = config.script_integrity.as_deref().or_else(|| {
+                (raw_script_url == DEFAULT_SWAGGER_UI_SCRIPT_URL)
+                    .then_some(DEFAULT_SWAGGER_UI_SCRIPT_INTEGRITY)
+            });
+            let effective_stylesheet_sri = config.stylesheet_integrity.as_deref().or_else(|| {
+                (raw_stylesheet_url == DEFAULT_SWAGGER_UI_STYLESHEET_URL)
+                    .then_some(DEFAULT_SWAGGER_UI_STYLESHEET_INTEGRITY)
+            });
+            let script_sri = sri_attrs(effective_script_sri);
+            let stylesheet_sri = sri_attrs(effective_stylesheet_sri);
 
             format!(
                 concat!(
