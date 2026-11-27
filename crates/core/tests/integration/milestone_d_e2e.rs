@@ -240,7 +240,7 @@ async fn milestone_d_job_queue_priority_batch_and_cron_e2e() {
             .await
             .expect("ack batch item");
         batch_store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, &job.id)
             .await
             .expect("record completion");
     }
@@ -403,6 +403,7 @@ async fn milestone_d_rume_client_tracing_resilience_e2e() {
         failure_threshold: 3,
         success_threshold: 1,
         reset_timeout: Duration::from_secs(30),
+        ..Default::default()
     }));
 
     let client = RumeClient::builder()

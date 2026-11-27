@@ -181,9 +181,9 @@ fn sanitize_non_nested_block_comments_inner<'a>(
     }
 
     Ok(match out {
-        Some(vec) => std::borrow::Cow::Owned(
-            String::from_utf8(vec).expect("replacing ASCII '*' with ' ' preserves valid UTF-8"),
-        ),
+        Some(vec) => std::borrow::Cow::Owned(String::from_utf8(vec).expect(
+            "replacing non-newline bytes inside block comment with ASCII ' ' preserves valid UTF-8",
+        )),
         None => std::borrow::Cow::Borrowed(statement),
     })
 }
@@ -234,20 +234,75 @@ fn tokenize_sql_filtered(
 #[cfg(any(feature = "postgres", feature = "mysql", feature = "sqlite", test))]
 fn collect_top_level_statement_heads_from_tokens(
     tokens: &[sqlparser::tokenizer::Token],
-) -> Vec<Vec<String>> {
+) -> Result<Vec<Vec<String>>, PersistenceError> {
     use sqlparser::tokenizer::Token;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum DefinerState {
+        None,
+        ExpectEq,
+        ExpectUser,
+        AfterUser,
+        ExpectHost,
+        AfterCurrentUser,
+        InCurrentUserParens,
+    }
 
     let mut heads: Vec<Vec<String>> = Vec::new();
     let mut leading_words: Vec<String> = Vec::with_capacity(3);
+    let mut in_compound_create_decl = false;
+    let mut seen_non_compound_create_target = false;
+    let mut seen_lparen = false;
+    let mut definer_state = DefinerState::None;
     let mut block_depth: usize = 0;
 
     let mut i = 0;
     while i < tokens.len() {
         match &tokens[i] {
             Token::SemiColon => {
-                if block_depth == 0 && !leading_words.is_empty() {
-                    heads.push(std::mem::take(&mut leading_words));
+                if block_depth == 0 {
+                    if !leading_words.is_empty() {
+                        heads.push(std::mem::take(&mut leading_words));
+                    }
+                    in_compound_create_decl = false;
+                    seen_non_compound_create_target = false;
+                    seen_lparen = false;
+                    definer_state = DefinerState::None;
                 }
+            }
+            Token::Eq if block_depth == 0 && definer_state == DefinerState::ExpectEq => {
+                definer_state = DefinerState::ExpectUser;
+            }
+            Token::AtSign if block_depth == 0 && definer_state == DefinerState::AfterUser => {
+                definer_state = DefinerState::ExpectHost;
+            }
+            Token::SingleQuotedString(_) | Token::DoubleQuotedString(_)
+                if block_depth == 0
+                    && matches!(
+                        definer_state,
+                        DefinerState::ExpectUser | DefinerState::ExpectHost
+                    ) =>
+            {
+                definer_state = if definer_state == DefinerState::ExpectUser {
+                    DefinerState::AfterUser
+                } else {
+                    DefinerState::None
+                };
+            }
+            Token::LParen => {
+                if block_depth == 0 {
+                    if definer_state == DefinerState::AfterCurrentUser {
+                        definer_state = DefinerState::InCurrentUserParens;
+                    } else {
+                        definer_state = DefinerState::None;
+                        seen_lparen = true;
+                    }
+                }
+            }
+            Token::RParen
+                if block_depth == 0 && definer_state == DefinerState::InCurrentUserParens =>
+            {
+                definer_state = DefinerState::None;
             }
             Token::Word(word) if word.quote_style.is_none() => {
                 let upper = word.value.to_ascii_uppercase();
@@ -255,14 +310,58 @@ fn collect_top_level_statement_heads_from_tokens(
                     if leading_words.len() < 3 {
                         leading_words.push(upper.clone());
                     }
-                    // Enter a compound body only when `BEGIN` appears inside an already-started
-                    // `CREATE` statement (e.g. SQLite `CREATE TRIGGER ... BEGIN ... END;` or
-                    // PostgreSQL `CREATE FUNCTION ... BEGIN ATOMIC ... END;`). A standalone
-                    // `BEGIN` at statement start stays at `block_depth == 0` so it is caught
-                    // as transaction control.
-                    if upper == "BEGIN"
+                    // Why: handle MySQL `CREATE DEFINER = root@localhost TRIGGER` and
+                    // `CREATE DEFINER = CURRENT_USER() TRIGGER` without confusing the
+                    // definer user/host/parens for a non-compound DDL target or table
+                    // column list (`P3-04`).
+                    let consumed_by_definer = match definer_state {
+                        DefinerState::ExpectUser => {
+                            definer_state = if upper == "CURRENT_USER" {
+                                DefinerState::AfterCurrentUser
+                            } else {
+                                DefinerState::AfterUser
+                            };
+                            true
+                        }
+                        DefinerState::ExpectHost => {
+                            definer_state = DefinerState::None;
+                            true
+                        }
+                        DefinerState::AfterUser | DefinerState::AfterCurrentUser => {
+                            definer_state = DefinerState::None;
+                            false
+                        }
+                        _ => false,
+                    };
+
+                    // Why: only enter a compound SQL block (`BEGIN ... END`) when the
+                    // enclosing `CREATE` statement declares a compound object (`TRIGGER`,
+                    // `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(` and with
+                    // only valid pre-target `CREATE` modifiers in between (allowlist, not
+                    // denylist), so `CREATE DATABASE trigger BEGIN ...` or `CREATE TABLE
+                    // trigger (...) BEGIN ...` cannot enable compound blocks (`RC-13`, `P3-04`).
+                    if !consumed_by_definer
+                        && !seen_lparen
+                        && !in_compound_create_decl
+                        && !seen_non_compound_create_target
+                        && leading_words.len() > 1
                         && leading_words.first().map(String::as_str) == Some("CREATE")
                     {
+                        if matches!(
+                            upper.as_str(),
+                            "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
+                        ) {
+                            in_compound_create_decl = true;
+                        } else if upper == "DEFINER" {
+                            definer_state = DefinerState::ExpectEq;
+                        } else if !matches!(
+                            upper.as_str(),
+                            "OR" | "REPLACE" | "TEMP" | "TEMPORARY" | "CONSTRAINT"
+                        ) {
+                            seen_non_compound_create_target = true;
+                        }
+                    }
+                    if upper == "BEGIN" && in_compound_create_decl {
                         block_depth = 1;
                     }
                 } else {
@@ -304,11 +403,20 @@ fn collect_top_level_statement_heads_from_tokens(
         i += 1;
     }
 
+    // Why: fail closed if a compound `BEGIN` block is still open at EOF so an
+    // attacker cannot leave `block_depth > 0` to hide trailing `; COMMIT;` (`RC-13`).
+    if block_depth > 0 {
+        return Err(PersistenceError::TransactionError(
+            "unclosed compound SQL block (`BEGIN` without matching `END`) is not allowed inside a managed transaction"
+                .into(),
+        ));
+    }
+
     if !leading_words.is_empty() {
         heads.push(leading_words);
     }
 
-    heads
+    Ok(heads)
 }
 
 /// Inspects a parsed `sqlparser::ast::Statement` for explicit transaction control.
@@ -398,7 +506,7 @@ pub(crate) fn validate_managed_transaction_sql(
             check_ast_tx_control(stmt)?;
         }
     }
-    for words in collect_top_level_statement_heads_from_tokens(&tokens) {
+    for words in collect_top_level_statement_heads_from_tokens(&tokens)? {
         check_managed_tx_control_keywords(&words)?;
     }
     Ok(())
@@ -598,7 +706,7 @@ pub(crate) fn mysql_sql_causes_implicit_commit(statement: &str) -> Result<bool, 
         }
     }
 
-    let heads = collect_top_level_statement_heads_from_tokens(&tokens);
+    let heads = collect_top_level_statement_heads_from_tokens(&tokens)?;
     for words in &heads {
         check_managed_tx_control_keywords(words)?;
     }
@@ -633,7 +741,7 @@ pub(crate) fn validate_managed_mysql_transaction_sql(
         }
     }
 
-    let heads = collect_top_level_statement_heads_from_tokens(&tokens);
+    let heads = collect_top_level_statement_heads_from_tokens(&tokens)?;
     for words in &heads {
         check_managed_tx_control_keywords(words)?;
         if is_mysql_implicit_commit_head(words) {
@@ -736,7 +844,14 @@ mod tests {
         let dialects: [(&str, &dyn sqlparser::dialect::Dialect); 3] =
             [("postgres", &pg), ("mysql", &mysql), ("sqlite", &sqlite)];
         for (name, dialect) in dialects {
-            for sql in ["COMMIT", "ROLLBACK", "BEGIN", "START TRANSACTION"] {
+            for sql in [
+                "COMMIT",
+                "ROLLBACK",
+                "BEGIN",
+                "START TRANSACTION",
+                "CREATE TABLE t (x INT) BEGIN; COMMIT;",
+                "CREATE TRIGGER t BEFORE INSERT ON foo BEGIN INSERT INTO log VALUES (1); COMMIT;",
+            ] {
                 let err = validate_managed_transaction_sql(sql, dialect)
                     .expect_err(&format!("{name} must reject raw '{sql}'"));
                 assert!(
@@ -745,6 +860,16 @@ mod tests {
                 );
             }
         }
+        assert!(matches!(
+            validate_managed_mysql_transaction_sql("CREATE TABLE t (x INT) BEGIN; COMMIT;"),
+            Err(PersistenceError::TransactionError(_))
+        ));
+        assert!(matches!(
+            validate_managed_mysql_transaction_sql(
+                "CREATE TRIGGER t BEFORE INSERT ON foo BEGIN INSERT INTO log VALUES (1); COMMIT;"
+            ),
+            Err(PersistenceError::TransactionError(_))
+        ));
 
         #[cfg(feature = "sqlite")]
         {
@@ -1071,6 +1196,57 @@ mod data_sql_scanners_proptests {
             assert!(
                 validate_managed_mysql_transaction_sql(ok).is_ok(),
                 "valid MySQL line comment must be allowed: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn create_table_column_named_event_does_not_enable_compound_begin_block() {
+        // `CREATE TABLE t (event INT)` is valid DDL by itself.
+        assert!(
+            validate_managed_transaction_sql(
+                "CREATE TABLE t (event INT);",
+                &sqlparser::dialect::SQLiteDialect {},
+            )
+            .is_ok()
+        );
+        // However, `event` inside `(...)` must NOT set `in_compound_create_decl` so a
+        // trailing `BEGIN ... ; COMMIT; END;` cannot be hidden inside it.
+        let smuggled = "CREATE TABLE t (event INT) BEGIN SELECT 1; COMMIT; END;";
+        let res = validate_managed_transaction_sql(smuggled, &sqlparser::dialect::SQLiteDialect {});
+        assert!(
+            matches!(res, Err(PersistenceError::TransactionError(_))),
+            "column name `event` inside CREATE TABLE (...) must not enable compound BEGIN block"
+        );
+
+        // `P2-20` & `P3-04`: non-compound CREATE targets (including unlisted DDL targets like
+        // `DATABASE` / `ROLE`) must NOT enable compound BEGIN blocks, while valid MySQL
+        // `CREATE DEFINER = ... TRIGGER` declarations remain allowed.
+        for bypass in [
+            "CREATE TABLE trigger (id INT) BEGIN SELECT 1; COMMIT; END;",
+            "CREATE VIEW event AS SELECT 1 BEGIN SELECT 1; ROLLBACK; END;",
+            "CREATE DATABASE trigger BEGIN SELECT 1; COMMIT; END;",
+            "CREATE ROLE event BEGIN SELECT 1; COMMIT; END;",
+        ] {
+            let res =
+                validate_managed_transaction_sql(bypass, &sqlparser::dialect::SQLiteDialect {});
+            assert!(
+                matches!(res, Err(PersistenceError::TransactionError(_))),
+                "non-compound CREATE target must not enable compound BEGIN block: {bypass}"
+            );
+        }
+
+        for valid_definer_trigger in [
+            "CREATE DEFINER = root@localhost TRIGGER t_ins AFTER INSERT ON items FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END;",
+            "CREATE DEFINER = CURRENT_USER() TRIGGER t_ins AFTER INSERT ON items FOR EACH ROW BEGIN INSERT INTO log VALUES (1); END;",
+        ] {
+            assert!(
+                validate_managed_transaction_sql(
+                    valid_definer_trigger,
+                    &sqlparser::dialect::MySqlDialect {}
+                )
+                .is_ok(),
+                "valid MySQL DEFINER trigger must be allowed: {valid_definer_trigger}"
             );
         }
     }

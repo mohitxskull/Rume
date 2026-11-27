@@ -68,6 +68,8 @@ pub enum ScimStoreError {
     },
     #[error("conflict: {detail}")]
     Conflict { detail: String },
+    #[error("precondition failed: {detail}")]
+    PreconditionFailed { detail: String },
     #[error("bad request: {detail}")]
     BadRequest {
         scim_type: Option<&'static str>,
@@ -83,6 +85,7 @@ impl ScimStoreError {
         match self {
             Self::NotFound { .. } => 404,
             Self::Conflict { .. } => 409,
+            Self::PreconditionFailed { .. } => 412,
             Self::BadRequest { .. } => 400,
             Self::Internal(_) => 500,
         }
@@ -95,6 +98,7 @@ impl ScimStoreError {
             Self::Conflict { detail } => {
                 ScimErrorResponse::new(409, Some("uniqueness"), Some(detail))
             }
+            Self::PreconditionFailed { detail } => ScimErrorResponse::new(412, None, Some(detail)),
             Self::BadRequest { scim_type, detail } => {
                 ScimErrorResponse::new(400, *scim_type, Some(detail))
             }
@@ -103,21 +107,86 @@ impl ScimStoreError {
     }
 }
 
+/// Evaluates an RFC 9110 / RFC 7644 `If-Match` header value (possibly comma-folded from
+/// multiple header lines) against a resource's current ETag using quote-aware splitting
+/// so commas inside quoted entity tags (e.g. `"v1,2"`) are preserved intact (`P2-08`).
+pub fn if_match_satisfies(if_match: &str, current_etag: Option<&str>) -> bool {
+    let mut candidates: Vec<&str> = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let bytes = if_match.as_bytes();
+    for (idx, &b) in bytes.iter().enumerate() {
+        match b {
+            b'"' => in_quotes = !in_quotes,
+            b',' if !in_quotes => {
+                let token = if_match[start..idx].trim();
+                if !token.is_empty() {
+                    candidates.push(token);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    if in_quotes {
+        return false;
+    }
+    let tail = if_match[start..].trim();
+    if !tail.is_empty() {
+        candidates.push(tail);
+    }
+    if candidates.is_empty() {
+        return false;
+    }
+
+    let Some(current) = current_etag else {
+        return candidates.contains(&"*");
+    };
+    let current_norm = current.trim().strip_prefix("W/").unwrap_or(current.trim());
+    candidates.into_iter().any(|candidate| {
+        if candidate == "*" {
+            return true;
+        }
+        let cand_norm = candidate.strip_prefix("W/").unwrap_or(candidate);
+        cand_norm == current_norm
+    })
+}
+
+fn check_expected_version(
+    expected_version: Option<&str>,
+    current_version: Option<&str>,
+) -> Result<(), ScimStoreError> {
+    if let Some(expected) = expected_version
+        && !if_match_satisfies(expected, current_version)
+    {
+        return Err(ScimStoreError::PreconditionFailed {
+            detail: "resource version does not match If-Match precondition".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Asynchronous SCIM 2.0 User and Group persistence interface.
 pub trait ScimStore: Send + Sync {
     fn create_user(&self, user: ScimUser) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>>;
     fn get_user(&self, id: &str) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>>;
-    fn replace_user(
-        &self,
-        id: &str,
+    fn replace_user<'a>(
+        &'a self,
+        id: &'a str,
         user: ScimUser,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>>;
-    fn patch_user(
-        &self,
-        id: &str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>>;
+    fn patch_user<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>>;
-    fn delete_user(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>>;
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>>;
+    fn delete_user<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>>;
     fn list_users(
         &self,
         query: ScimListQuery,
@@ -125,17 +194,23 @@ pub trait ScimStore: Send + Sync {
 
     fn create_group(&self, group: ScimGroup) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>>;
     fn get_group(&self, id: &str) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>>;
-    fn replace_group(
-        &self,
-        id: &str,
+    fn replace_group<'a>(
+        &'a self,
+        id: &'a str,
         group: ScimGroup,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>>;
-    fn patch_group(
-        &self,
-        id: &str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>>;
+    fn patch_group<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>>;
-    fn delete_group(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>>;
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>>;
+    fn delete_group<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>>;
     fn list_groups(
         &self,
         query: ScimListQuery,
@@ -149,22 +224,28 @@ impl<T: ScimStore + ?Sized> ScimStore for Arc<T> {
     fn get_user(&self, id: &str) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
         (**self).get_user(id)
     }
-    fn replace_user(
-        &self,
-        id: &str,
+    fn replace_user<'a>(
+        &'a self,
+        id: &'a str,
         user: ScimUser,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
-        (**self).replace_user(id, user)
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>> {
+        (**self).replace_user(id, user, expected_version)
     }
-    fn patch_user(
-        &self,
-        id: &str,
+    fn patch_user<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
-        (**self).patch_user(id, patch)
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>> {
+        (**self).patch_user(id, patch, expected_version)
     }
-    fn delete_user(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>> {
-        (**self).delete_user(id)
+    fn delete_user<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>> {
+        (**self).delete_user(id, expected_version)
     }
     fn list_users(
         &self,
@@ -178,22 +259,28 @@ impl<T: ScimStore + ?Sized> ScimStore for Arc<T> {
     fn get_group(&self, id: &str) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>> {
         (**self).get_group(id)
     }
-    fn replace_group(
-        &self,
-        id: &str,
+    fn replace_group<'a>(
+        &'a self,
+        id: &'a str,
         group: ScimGroup,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>> {
-        (**self).replace_group(id, group)
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>> {
+        (**self).replace_group(id, group, expected_version)
     }
-    fn patch_group(
-        &self,
-        id: &str,
+    fn patch_group<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>> {
-        (**self).patch_group(id, patch)
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>> {
+        (**self).patch_group(id, patch, expected_version)
     }
-    fn delete_group(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>> {
-        (**self).delete_group(id)
+    fn delete_group<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>> {
+        (**self).delete_group(id, expected_version)
     }
     fn list_groups(
         &self,
@@ -303,14 +390,27 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                     detail: "patch without path requires an object value".into(),
                 })?;
             for (k, v) in obj {
-                apply_user_patch_op(
-                    user,
-                    &ScimPatchOp {
-                        op: op.op.clone(),
-                        path: Some(k.clone()),
-                        value: Some(v.clone()),
-                    },
-                )?;
+                if let Some(sub_obj) = v.as_object() {
+                    for (sub_k, sub_v) in sub_obj {
+                        apply_user_patch_op(
+                            user,
+                            &ScimPatchOp {
+                                op: op.op.clone(),
+                                path: Some(format!("{k}.{sub_k}")),
+                                value: Some(sub_v.clone()),
+                            },
+                        )?;
+                    }
+                } else {
+                    apply_user_patch_op(
+                        user,
+                        &ScimPatchOp {
+                            op: op.op.clone(),
+                            path: Some(k.clone()),
+                            value: Some(v.clone()),
+                        },
+                    )?;
+                }
             }
             Ok(())
         }
@@ -334,15 +434,18 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                     detail: "userName cannot be removed".into(),
                 });
             }
-            user.user_name = op
+            let new_name = op
                 .value
                 .as_ref()
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
-                    detail: "userName must be a string".into(),
+                    detail: "userName must be a non-empty string".into(),
                 })?;
+            user.user_name = new_name;
             Ok(())
         }
         Some("displayname") => {
@@ -505,15 +608,18 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
                     detail: "displayName cannot be removed".into(),
                 });
             }
-            group.display_name = op
+            let new_name = op
                 .value
                 .as_ref()
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
-                    detail: "displayName must be a string".into(),
+                    detail: "displayName must be a non-empty string".into(),
                 })?;
+            group.display_name = new_name;
             Ok(())
         }
         Some("members") => {
@@ -534,9 +640,17 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
                         })
                     })?;
                 if verb == "add" {
-                    group.members.extend(members);
+                    for member in members {
+                        if !group
+                            .members
+                            .iter()
+                            .any(|existing| existing.value == member.value)
+                        {
+                            group.members.push(member);
+                        }
+                    }
                 } else {
-                    group.members = members;
+                    group.members = dedup_members(members);
                 }
             }
             Ok(())
@@ -548,6 +662,19 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
     }
 }
 
+fn dedup_members(members: Vec<ScimMember>) -> Vec<ScimMember> {
+    let mut deduped: Vec<ScimMember> = Vec::with_capacity(members.len());
+    for member in members {
+        if !deduped
+            .iter()
+            .any(|existing| existing.value == member.value)
+        {
+            deduped.push(member);
+        }
+    }
+    deduped
+}
+
 impl ScimStore for InMemoryScimStore {
     fn create_user(&self, mut user: ScimUser) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
         Box::pin(async move {
@@ -556,6 +683,13 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
+            user.user_name = user.user_name.trim().to_string();
+            if user.user_name.is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "userName cannot be empty".into(),
+                });
+            }
             if user.id.is_empty() {
                 user.id = uuid::Uuid::new_v4().to_string();
             }
@@ -606,23 +740,36 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn replace_user(
-        &self,
-        id: &str,
+    fn replace_user<'a>(
+        &'a self,
+        id: &'a str,
         mut user: ScimUser,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            if !inner.users.contains_key(&id) {
-                return Err(ScimStoreError::NotFound {
-                    resource_type: "User",
-                    id,
+            user.user_name = user.user_name.trim().to_string();
+            if user.user_name.is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "userName cannot be empty".into(),
                 });
             }
+            let existing = inner
+                .users
+                .get(&id)
+                .ok_or_else(|| ScimStoreError::NotFound {
+                    resource_type: "User",
+                    id: id.clone(),
+                })?;
+            check_expected_version(
+                expected_version,
+                existing.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
             if inner
                 .users
                 .values()
@@ -648,11 +795,12 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn patch_user(
-        &self,
-        id: &str,
+    fn patch_user<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
@@ -668,6 +816,10 @@ impl ScimStore for InMemoryScimStore {
                         resource_type: "User",
                         id: id.clone(),
                     })?;
+            check_expected_version(
+                expected_version,
+                user.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
             for op in &patch.operations {
                 apply_user_patch_op(&mut user, op)?;
             }
@@ -692,21 +844,31 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn delete_user(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>> {
+    fn delete_user<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            inner
+            let existing = inner
                 .users
-                .remove(&id)
-                .map(|_| ())
-                .ok_or(ScimStoreError::NotFound {
+                .get(&id)
+                .ok_or_else(|| ScimStoreError::NotFound {
                     resource_type: "User",
-                    id,
-                })
+                    id: id.clone(),
+                })?;
+            check_expected_version(
+                expected_version,
+                existing.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
+            inner.users.remove(&id);
+            inner.versions.remove(&format!("user:{id}"));
+            Ok(())
         })
     }
 
@@ -741,6 +903,13 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
+            group.display_name = group.display_name.trim().to_string();
+            if group.display_name.is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "displayName cannot be empty".into(),
+                });
+            }
             if group.id.is_empty() {
                 group.id = uuid::Uuid::new_v4().to_string();
             }
@@ -764,6 +933,7 @@ impl ScimStore for InMemoryScimStore {
             if group.schemas.is_empty() {
                 group.schemas.push(SCIM_GROUP_SCHEMA.to_string());
             }
+            group.members = dedup_members(group.members);
             let ver = inner.next_version(&format!("group:{}", group.id));
             group.meta = stamp_meta(
                 group.meta.take(),
@@ -794,23 +964,36 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn replace_group(
-        &self,
-        id: &str,
+    fn replace_group<'a>(
+        &'a self,
+        id: &'a str,
         mut group: ScimGroup,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>> {
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            if !inner.groups.contains_key(&id) {
-                return Err(ScimStoreError::NotFound {
-                    resource_type: "Group",
-                    id,
+            group.display_name = group.display_name.trim().to_string();
+            if group.display_name.is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "displayName cannot be empty".into(),
                 });
             }
+            let existing = inner
+                .groups
+                .get(&id)
+                .ok_or_else(|| ScimStoreError::NotFound {
+                    resource_type: "Group",
+                    id: id.clone(),
+                })?;
+            check_expected_version(
+                expected_version,
+                existing.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
             if inner
                 .groups
                 .values()
@@ -827,6 +1010,7 @@ impl ScimStore for InMemoryScimStore {
             if group.schemas.is_empty() {
                 group.schemas.push(SCIM_GROUP_SCHEMA.to_string());
             }
+            group.members = dedup_members(group.members);
             let ver = inner.next_version(&format!("group:{id}"));
             group.meta = stamp_meta(
                 group.meta.take(),
@@ -839,11 +1023,12 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn patch_group(
-        &self,
-        id: &str,
+    fn patch_group<'a>(
+        &'a self,
+        id: &'a str,
         patch: ScimPatchRequest,
-    ) -> BoxFuture<'_, Result<ScimGroup, ScimStoreError>> {
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
@@ -859,6 +1044,10 @@ impl ScimStore for InMemoryScimStore {
                         resource_type: "Group",
                         id: id.clone(),
                     })?;
+            check_expected_version(
+                expected_version,
+                group.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
             for op in &patch.operations {
                 apply_group_patch_op(&mut group, op)?;
             }
@@ -886,21 +1075,31 @@ impl ScimStore for InMemoryScimStore {
         })
     }
 
-    fn delete_group(&self, id: &str) -> BoxFuture<'_, Result<(), ScimStoreError>> {
+    fn delete_group<'a>(
+        &'a self,
+        id: &'a str,
+        expected_version: Option<&'a str>,
+    ) -> BoxFuture<'a, Result<(), ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
             let mut inner = self
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            inner
+            let existing = inner
                 .groups
-                .remove(&id)
-                .map(|_| ())
-                .ok_or(ScimStoreError::NotFound {
+                .get(&id)
+                .ok_or_else(|| ScimStoreError::NotFound {
                     resource_type: "Group",
-                    id,
-                })
+                    id: id.clone(),
+                })?;
+            check_expected_version(
+                expected_version,
+                existing.meta.as_ref().and_then(|m| m.version.as_deref()),
+            )?;
+            inner.groups.remove(&id);
+            inner.versions.remove(&format!("group:{id}"));
+            Ok(())
         })
     }
 
@@ -923,5 +1122,139 @@ impl ScimStore for InMemoryScimStore {
             matched.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(paginate(matched, &query))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scim_store_cleans_versions_validates_names_patches_nested_and_dedups_members() {
+        let store = InMemoryScimStore::new();
+
+        // Empty userName / displayName rejected on create
+        assert!(matches!(
+            store.create_user(ScimUser::new("", "   ")).await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            store.create_group(ScimGroup::new("", "")).await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        let user = store.create_user(ScimUser::new("", "alice")).await.unwrap();
+        // Empty userName rejected on replace
+        assert!(matches!(
+            store
+                .replace_user(&user.id, ScimUser::new(&user.id, ""), None)
+                .await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        // Nested object traversal in pathless PATCH
+        let patched = store
+            .patch_user(
+                &user.id,
+                ScimPatchRequest {
+                    schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+                    operations: vec![ScimPatchOp {
+                        op: "replace".to_string(),
+                        path: None,
+                        value: Some(serde_json::json!({
+                            "name": { "givenName": "Alice", "familyName": "Smith" }
+                        })),
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.name.as_ref().and_then(|n| n.given_name.as_deref()),
+            Some("Alice")
+        );
+        assert_eq!(
+            patched.name.as_ref().and_then(|n| n.family_name.as_deref()),
+            Some("Smith")
+        );
+
+        // Stale expected_version fails atomically with PreconditionFailed (412)
+        assert!(matches!(
+            store.delete_user(&user.id, Some("W/\"v1\"")).await,
+            Err(ScimStoreError::PreconditionFailed { .. })
+        ));
+
+        // Delete removes version entry (no memory leak)
+        let current_ver = patched
+            .meta
+            .as_ref()
+            .and_then(|m| m.version.as_deref())
+            .unwrap();
+        store
+            .delete_user(&user.id, Some(current_ver))
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .inner
+                .read()
+                .unwrap()
+                .versions
+                .contains_key(&format!("user:{}", user.id))
+        );
+
+        // Group member deduplication on `add` PATCH and version cleanup on delete
+        let group = store.create_group(ScimGroup::new("", "Eng")).await.unwrap();
+        assert!(matches!(
+            store
+                .replace_group(&group.id, ScimGroup::new(&group.id, "  "), None)
+                .await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        let add_member = || ScimPatchRequest {
+            schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+            operations: vec![ScimPatchOp {
+                op: "add".to_string(),
+                path: Some("members".to_string()),
+                value: Some(serde_json::json!([{ "value": "u1", "display": "Alice" }])),
+            }],
+        };
+        let g1 = store
+            .patch_group(&group.id, add_member(), None)
+            .await
+            .unwrap();
+        let g2 = store
+            .patch_group(&group.id, add_member(), None)
+            .await
+            .unwrap();
+        assert_eq!(g1.members.len(), 1);
+        assert_eq!(g2.members.len(), 1);
+
+        store.delete_group(&group.id, None).await.unwrap();
+        assert!(
+            !store
+                .inner
+                .read()
+                .unwrap()
+                .versions
+                .contains_key(&format!("group:{}", group.id))
+        );
+    }
+
+    #[test]
+    fn if_match_satisfies_handles_quoted_commas_and_folded_lists() {
+        // Comma inside quoted ETag must NOT split the entity tag.
+        assert!(if_match_satisfies("\"v1,2\"", Some("\"v1,2\"")));
+        assert!(!if_match_satisfies("\"v1,2\"", Some("\"v1\"")));
+        assert!(!if_match_satisfies("\"v1,2\"", Some("\"2\"")));
+        // Folded list with multiple ETags and weak prefix.
+        assert!(if_match_satisfies(
+            "\"other\", W/\"v1,2\", \"third\"",
+            Some("\"v1,2\"")
+        ));
+        assert!(if_match_satisfies("*", Some("W/\"v1\"")));
+        assert!(!if_match_satisfies("\"unclosed", Some("\"unclosed")));
     }
 }

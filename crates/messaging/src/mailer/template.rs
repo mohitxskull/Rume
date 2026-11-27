@@ -39,20 +39,43 @@ impl TemplateRenderer {
         Self::default()
     }
 
-    /// Registers a named [`EmailTemplate`].
+    /// Registers a named [`EmailTemplate`] atomically: all template parts are compiled and
+    /// validated before mutating `self.env`, so a syntax error in any part leaves `self`
+    /// completely unchanged (`RC-22`).
     pub fn register_template(
         &mut self,
         name: impl Into<String>,
         template: EmailTemplate,
     ) -> Result<(), MailerError> {
         let name = name.into();
+        let subject_key = format!("{name}.subject");
+        let text_key = format!("{name}.text");
+        let html_key = format!("{name}.html");
+
+        // Pre-validate all parts in a staging environment before mutating `self.env`.
+        let mut staging = minijinja::Environment::new();
+        staging
+            .add_template(&subject_key, &template.subject)
+            .map_err(|e| MailerError::Template(e.to_string()))?;
+        if let Some(ref text) = template.text_body {
+            staging
+                .add_template(&text_key, text)
+                .map_err(|e| MailerError::Template(e.to_string()))?;
+        }
+        if let Some(ref html) = template.html_body {
+            staging
+                .add_template(&html_key, html)
+                .map_err(|e| MailerError::Template(e.to_string()))?;
+        }
+
+        // All parts compiled cleanly; commit into `self.env`.
         self.env
-            .add_template_owned(format!("{name}.subject"), template.subject)
+            .add_template_owned(subject_key, template.subject)
             .map_err(|e| MailerError::Template(e.to_string()))?;
 
         let has_text = if let Some(text) = template.text_body {
             self.env
-                .add_template_owned(format!("{name}.text"), text)
+                .add_template_owned(text_key, text)
                 .map_err(|e| MailerError::Template(e.to_string()))?;
             true
         } else {
@@ -61,7 +84,7 @@ impl TemplateRenderer {
 
         let has_html = if let Some(html) = template.html_body {
             self.env
-                .add_template_owned(format!("{name}.html"), html)
+                .add_template_owned(html_key, html)
                 .map_err(|e| MailerError::Template(e.to_string()))?;
             true
         } else {
@@ -146,5 +169,40 @@ fn json_to_minijinja(value: &serde_json::Value) -> minijinja::Value {
                 .collect();
             minijinja::Value::from(entries)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn register_template_rolls_back_atomically_on_html_syntax_error() {
+        let mut renderer = TemplateRenderer::new();
+        let res = renderer.register_template(
+            "broken",
+            EmailTemplate {
+                subject: "Welcome {{ name }}".into(),
+                text_body: Some("Plain {{ name }}".into()),
+                html_body: Some("<p>{% if unclosed %}".into()),
+            },
+        );
+        assert!(
+            matches!(res, Err(MailerError::Template(_))),
+            "syntax error in html_body must fail registration"
+        );
+        assert!(
+            renderer.env.get_template("broken.subject").is_err(),
+            "failed registration must not leave orphaned .subject template in env"
+        );
+        assert!(
+            renderer.env.get_template("broken.text").is_err(),
+            "failed registration must not leave orphaned .text template in env"
+        );
+        assert!(
+            renderer
+                .render("broken", &serde_json::json!({"name": "Alice"}))
+                .is_err()
+        );
     }
 }

@@ -409,24 +409,28 @@ fn check_module_dag_in(src_dir: &Path) -> (String, bool) {
     }
 
     let mut files = Vec::new();
+    let mut diagnostics: Vec<String> = Vec::new();
     // Why: `walkdir::WalkDir` with `follow_links(false)` avoids symlink cycles cleanly
-    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`).
-    for entry in walkdir::WalkDir::new(src_dir)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-    {
-        if entry.file_type().is_file()
-            && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
-        {
-            files.push(entry.into_path());
+    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`), and surfacing
+    // `WalkDir` errors avoids silently skipping unreadable directories (`RC-42`).
+    for entry_res in walkdir::WalkDir::new(src_dir).follow_links(false) {
+        match entry_res {
+            Ok(entry) => {
+                if entry.file_type().is_file()
+                    && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
+                {
+                    files.push(entry.into_path());
+                }
+            }
+            Err(err) => {
+                diagnostics.push(format!("failed to traverse {}: {err}", src_dir.display()));
+            }
         }
     }
     files.sort();
 
     let mut deps_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut module_origins: BTreeMap<String, PathBuf> = BTreeMap::new();
-    let mut diagnostics: Vec<String> = Vec::new();
 
     for file_path in files {
         let content = match std::fs::read_to_string(&file_path) {
@@ -664,17 +668,35 @@ impl<'ast> Visit<'ast> for ModuleExtractor {
 }
 
 /// Parse one comma-separated segment of a `vec![...]` macro body and, if it is
-/// a string literal, append its value to `deps`.
+/// a string literal (or `.into()` / `.to_string()` / `.to_owned()` call on one),
+/// append its value to `deps` (`RC-42`).
 fn push_dependency_literal(tokens: &[proc_macro2::TokenTree], deps: &mut Vec<String>) {
     if tokens.is_empty() {
         return;
     }
     let stream: proc_macro2::TokenStream = tokens.iter().cloned().collect();
-    if let Ok(expr) = syn::parse2::<syn::Expr>(stream)
-        && let syn::Expr::Lit(lit) = &expr
-        && let syn::Lit::Str(s) = &lit.lit
-    {
-        deps.push(s.value());
+    if let Ok(mut expr) = syn::parse2::<syn::Expr>(stream) {
+        loop {
+            match expr {
+                syn::Expr::Lit(lit) => {
+                    if let syn::Lit::Str(s) = lit.lit {
+                        deps.push(s.value());
+                    }
+                    break;
+                }
+                syn::Expr::MethodCall(call)
+                    if matches!(
+                        call.method.to_string().as_str(),
+                        "into" | "to_string" | "to_owned"
+                    ) =>
+                {
+                    expr = *call.receiver;
+                }
+                syn::Expr::Group(g) => expr = *g.expr,
+                syn::Expr::Paren(p) => expr = *p.expr,
+                _ => break,
+            }
+        }
     }
 }
 

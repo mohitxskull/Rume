@@ -3,23 +3,19 @@ services:
     image: postgres:16-alpine
     container_name: rume-workbench-postgres-prod
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: workbench
-    ports:
-      - "5433:5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
+      POSTGRES_DB: ${POSTGRES_DB:-workbench}
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d workbench"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-workbench}"]
       interval: 2s
       timeout: 2s
       retries: 25
       start_period: 2s
 
   redis:
-    image: redis:alpine
+    image: redis:7-alpine
     container_name: rume-workbench-redis-prod
-    ports:
-      - "6380:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -36,9 +32,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8080
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/workbench
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info,workbench=debug,rume=debug
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      RUST_LOG: info
     ports:
       - "8081:8080"
     depends_on:
@@ -62,9 +58,9 @@ services:
     environment:
       HOST: 0.0.0.0
       PORT: 8080
-      DATABASE_URL: postgres://postgres:postgres@postgres:5432/workbench
-      REDIS_URL: redis://redis:6379
-      RUST_LOG: info,workbench=debug,rume=debug
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      RUST_LOG: info
     ports:
       - "8082:8080"
     depends_on:

@@ -3,9 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use super::preflight::{
     MYSQL_CLOCK, MYSQL_CORE_DOWN, MYSQL_MIGRATION_DELETE, MYSQL_MIGRATION_FIND_CHECKSUM,
-    MYSQL_MIGRATION_FIND_ID, MYSQL_MIGRATION_INSERT, NEXT_APPLIED_ORDER_SQL, PG_CORE_DOWN,
-    SQLITE_CORE_DOWN, SQLITE_MIGRATION_FIND_CHECKSUM, SQLITE_MIGRATION_INSERT,
-    select_rollback_target,
+    MYSQL_MIGRATION_INSERT, NEXT_APPLIED_ORDER_SQL, PG_CORE_DOWN, SQLITE_CORE_DOWN,
+    SQLITE_MIGRATION_FIND_CHECKSUM, SQLITE_MIGRATION_INSERT, select_rollback_target,
 };
 use super::*;
 use crate::persistence::backend::{BoxFuture, DatabaseBackend, DatabaseTransaction, DbValue};
@@ -130,10 +129,6 @@ impl DatabaseBackend for MockMysqlBackend {
             if query == MYSQL_MIGRATION_FIND_CHECKSUM {
                 if let Some(DbValue::Text(id)) = params.first() {
                     return Ok(ledger.lock().unwrap().get(id).cloned());
-                }
-            } else if query == MYSQL_MIGRATION_FIND_ID {
-                if let Some(DbValue::Text(id)) = params.first() {
-                    return Ok(ledger.lock().unwrap().contains_key(id).then(|| id.clone()));
                 }
             } else if query == MYSQL_CLOCK {
                 return Ok(Some("1700000000".to_string()));

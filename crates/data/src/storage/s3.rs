@@ -1,13 +1,15 @@
 //! Pure-Rust SigV4 S3-compatible object store backend.
 
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::storage::{
     BoxFuture, ObjectKey, ObjectMeta, ObjectStore, ObjectStoreError, PresignedUrl, PutObjectOptions,
@@ -15,16 +17,35 @@ use crate::storage::{
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Default TCP connect timeout for [`S3ObjectStore`] HTTP requests (10 seconds).
+pub const DEFAULT_S3_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Default end-to-end request timeout for [`S3ObjectStore`] HTTP requests (60 seconds).
+pub const DEFAULT_S3_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Default maximum number of `ListObjectsV2` pages fetched in a single `list()` call.
+pub const DEFAULT_S3_MAX_LIST_PAGES: usize = 10_000;
+/// Default maximum object body size accepted by `get()` (100 MiB).
+pub const DEFAULT_S3_MAX_GET_BYTES: usize = 100 * 1024 * 1024;
+/// Maximum AWS SigV4 presigned URL lifetime (7 days in seconds).
+const MAX_PRESIGN_EXPIRES_SECS: u64 = 604_800;
+
 /// Configuration for [`S3ObjectStore`].
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct S3Config {
     pub endpoint: String,
     pub region: String,
     pub bucket: String,
     pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
+    pub secret_access_key: SecretString,
+    pub session_token: Option<SecretString>,
     pub path_style: bool,
+    /// Optional TCP connect timeout (defaults to [`DEFAULT_S3_CONNECT_TIMEOUT`]).
+    pub connect_timeout: Option<Duration>,
+    /// Optional per-request timeout (defaults to [`DEFAULT_S3_REQUEST_TIMEOUT`]).
+    pub request_timeout: Option<Duration>,
+    /// Optional maximum pages fetched in `list()` (defaults to [`DEFAULT_S3_MAX_LIST_PAGES`]).
+    pub max_list_pages: Option<usize>,
+    /// Optional maximum bytes buffered in `get()` (defaults to [`DEFAULT_S3_MAX_GET_BYTES`]).
+    pub max_get_bytes: Option<usize>,
 }
 
 impl std::fmt::Debug for S3Config {
@@ -40,6 +61,10 @@ impl std::fmt::Debug for S3Config {
                 &self.session_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("path_style", &self.path_style)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
+            .field("max_list_pages", &self.max_list_pages)
+            .field("max_get_bytes", &self.max_get_bytes)
             .finish()
     }
 }
@@ -68,12 +93,31 @@ impl S3ObjectStore {
         if config.bucket.is_empty()
             || config.region.is_empty()
             || config.access_key_id.is_empty()
-            || config.secret_access_key.is_empty()
+            || config.secret_access_key.expose_secret().is_empty()
         {
             return Err(ObjectStoreError::Configuration(
                 "S3 bucket, region, access_key_id, and secret_access_key must be non-empty"
                     .to_string(),
             ));
+        }
+
+        // Why: strict DNS-label allowlist (`[a-z0-9.-]`, no leading/trailing `.`/`-`, no `..`)
+        // prevents userinfo (`user:pass@`), port (`:`), path, and query injection into
+        // virtual-hosted (`https://{bucket}.{base_host}`) and path-style S3 URLs (`P2-22`).
+        let bucket = config.bucket.as_str();
+        let valid_bucket = !bucket.starts_with('.')
+            && !bucket.ends_with('.')
+            && !bucket.starts_with('-')
+            && !bucket.ends_with('-')
+            && !bucket.contains("..")
+            && bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+        if !valid_bucket {
+            return Err(ObjectStoreError::Configuration(format!(
+                "invalid S3 bucket name '{}'",
+                config.bucket
+            )));
         }
 
         let base_url = Url::parse(&config.endpoint).map_err(|e| {
@@ -85,9 +129,15 @@ impl S3ObjectStore {
             ));
         }
 
-        let client = Client::builder().build().map_err(|e| {
-            ObjectStoreError::Configuration(format!("failed to build HTTP client: {e}"))
-        })?;
+        let connect_timeout = config.connect_timeout.unwrap_or(DEFAULT_S3_CONNECT_TIMEOUT);
+        let request_timeout = config.request_timeout.unwrap_or(DEFAULT_S3_REQUEST_TIMEOUT);
+        let client = Client::builder()
+            .connect_timeout(connect_timeout)
+            .timeout(request_timeout)
+            .build()
+            .map_err(|e| {
+                ObjectStoreError::Configuration(format!("failed to build HTTP client: {e}"))
+            })?;
 
         Ok(Self {
             config,
@@ -129,7 +179,10 @@ impl S3ObjectStore {
     }
 
     fn signing_key(&self, date_stamp: &str) -> [u8; 32] {
-        let k_secret = format!("AWS4{}", self.config.secret_access_key);
+        let k_secret = Zeroizing::new(format!(
+            "AWS4{}",
+            self.config.secret_access_key.expose_secret()
+        ));
         let k_date = hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
         let k_region = hmac_sha256(&k_date, self.config.region.as_bytes());
         let k_service = hmac_sha256(&k_region, b"s3");
@@ -152,7 +205,8 @@ impl S3ObjectStore {
         let mut signed_headers = String::from("host;x-amz-content-sha256;x-amz-date");
 
         if let Some(token) = &self.config.session_token {
-            canonical_headers.push_str(&format!("x-amz-security-token:{token}\n"));
+            canonical_headers
+                .push_str(&format!("x-amz-security-token:{}\n", token.expose_secret()));
             signed_headers.push_str(";x-amz-security-token");
         }
 
@@ -190,7 +244,7 @@ impl S3ObjectStore {
         if let Some(token) = &self.config.session_token {
             headers.insert(
                 HeaderName::from_static("x-amz-security-token"),
-                HeaderValue::from_str(token)
+                HeaderValue::from_str(token.expose_secret())
                     .map_err(|e| ObjectStoreError::Configuration(e.to_string()))?,
             );
         }
@@ -230,6 +284,18 @@ impl S3ObjectStore {
         content_type: Option<&str>,
         now: DateTime<Utc>,
     ) -> Result<PresignedUrl, ObjectStoreError> {
+        if !(1..=MAX_PRESIGN_EXPIRES_SECS).contains(&expires_in_secs) {
+            return Err(ObjectStoreError::Configuration(format!(
+                "S3 presigned URL expires_in_secs ({expires_in_secs}) must be in 1..={MAX_PRESIGN_EXPIRES_SECS}"
+            )));
+        }
+        if let Some(ct) = content_type
+            && ct.chars().any(|c| matches!(c, '\r' | '\n' | '\0'))
+        {
+            return Err(ObjectStoreError::Configuration(
+                "S3 presigned URL content_type must not contain CR, LF, or NUL".to_string(),
+            ));
+        }
         let (host, canonical_uri, base_url) = self.host_and_path(Some(key.as_str()));
         let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
         let date_stamp = now.format("%Y%m%d").to_string();
@@ -255,7 +321,10 @@ impl S3ObjectStore {
             ),
         ];
         if let Some(token) = &self.config.session_token {
-            query_params.push(("X-Amz-Security-Token", percent_encode_component(token)));
+            query_params.push((
+                "X-Amz-Security-Token",
+                percent_encode_component(token.expose_secret()),
+            ));
         }
         query_params.sort_by(|a, b| a.0.cmp(b.0));
 
@@ -361,8 +430,12 @@ impl ObjectStore for S3ObjectStore {
 
     fn get(&self, key: &ObjectKey) -> BoxFuture<'_, Result<Vec<u8>, ObjectStoreError>> {
         let key = key.clone();
+        let max_bytes = self
+            .config
+            .max_get_bytes
+            .unwrap_or(DEFAULT_S3_MAX_GET_BYTES);
         Box::pin(async move {
-            let resp = self
+            let mut resp = self
                 .send_signed(Method::GET, Some(key.as_str()), "", Vec::new(), None)
                 .await?;
 
@@ -370,10 +443,30 @@ impl ObjectStore for S3ObjectStore {
                 return Err(map_status_error(resp.status(), key.as_str()));
             }
 
-            resp.bytes()
+            if let Some(len) = resp.content_length()
+                && len > max_bytes as u64
+            {
+                return Err(ObjectStoreError::Http(format!(
+                    "S3 object '{}' size ({len} bytes) exceeds max_get_bytes ({max_bytes})",
+                    key.as_str()
+                )));
+            }
+
+            let mut out = Vec::new();
+            while let Some(chunk) = resp
+                .chunk()
                 .await
-                .map(|b| b.to_vec())
-                .map_err(|e| ObjectStoreError::Http(e.to_string()))
+                .map_err(|e| ObjectStoreError::Http(e.to_string()))?
+            {
+                if out.len().saturating_add(chunk.len()) > max_bytes {
+                    return Err(ObjectStoreError::Http(format!(
+                        "S3 object '{}' exceeded max_get_bytes ({max_bytes})",
+                        key.as_str()
+                    )));
+                }
+                out.extend_from_slice(&chunk);
+            }
+            Ok(out)
         })
     }
 
@@ -429,11 +522,24 @@ impl ObjectStore for S3ObjectStore {
 
     fn list(&self, prefix: &str) -> BoxFuture<'_, Result<Vec<ObjectMeta>, ObjectStoreError>> {
         let prefix = prefix.to_string();
+        let max_pages = self
+            .config
+            .max_list_pages
+            .unwrap_or(DEFAULT_S3_MAX_LIST_PAGES)
+            .max(1);
         Box::pin(async move {
             let mut all_items = Vec::new();
             let mut continuation_token: Option<String> = None;
+            let mut page_count: usize = 0;
 
             loop {
+                page_count += 1;
+                if page_count > max_pages {
+                    return Err(ObjectStoreError::Http(format!(
+                        "S3 ListObjectsV2 pagination exceeded max_list_pages ({max_pages})"
+                    )));
+                }
+
                 let mut params = Vec::with_capacity(3);
                 if let Some(ref token) = continuation_token {
                     params.push(("continuation-token", percent_encode_component(token)));
@@ -460,13 +566,26 @@ impl ObjectStore for S3ObjectStore {
                     .text()
                     .await
                     .map_err(|e| ObjectStoreError::Http(e.to_string()))?;
-                let page = parse_list_objects_v2_page(&xml);
+                let page = parse_list_objects_v2_page(&xml)?;
                 all_items.extend(page.items);
 
                 if page.is_truncated {
                     match page.next_continuation_token {
-                        Some(next) if !next.is_empty() => continuation_token = Some(next),
-                        _ => break,
+                        Some(next) if !next.is_empty() => {
+                            if continuation_token.as_deref() == Some(next.as_str()) {
+                                return Err(ObjectStoreError::Http(
+                                    "S3 ListObjectsV2 returned repeating NextContinuationToken"
+                                        .to_string(),
+                                ));
+                            }
+                            continuation_token = Some(next);
+                        }
+                        _ => {
+                            return Err(ObjectStoreError::Http(
+                                "S3 ListObjectsV2 returned IsTruncated=true without NextContinuationToken"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 } else {
                     break;
@@ -551,7 +670,7 @@ struct ListObjectsV2Page {
     next_continuation_token: Option<String>,
 }
 
-fn parse_list_objects_v2_page(xml: &str) -> ListObjectsV2Page {
+fn parse_list_objects_v2_page(xml: &str) -> Result<ListObjectsV2Page, ObjectStoreError> {
     use quick_xml::Reader;
     use quick_xml::events::Event;
 
@@ -648,21 +767,28 @@ fn parse_list_objects_v2_page(xml: &str) -> ListObjectsV2Page {
                     current_text.clear();
                 }
             }
-            Ok(Event::Eof) | Err(_) => break,
+            Ok(Event::Eof) => break,
+            Err(e) => {
+                return Err(ObjectStoreError::Http(format!(
+                    "failed to parse S3 ListObjectsV2 XML: {e}"
+                )));
+            }
             _ => {}
         }
     }
 
-    ListObjectsV2Page {
+    Ok(ListObjectsV2Page {
         items,
         is_truncated,
         next_continuation_token,
-    }
+    })
 }
 
 #[cfg(test)]
 fn parse_list_objects_v2_xml(xml: &str) -> Vec<ObjectMeta> {
-    parse_list_objects_v2_page(xml).items
+    parse_list_objects_v2_page(xml)
+        .expect("valid ListObjectsV2 XML")
+        .items
 }
 
 #[cfg(test)]

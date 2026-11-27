@@ -10,4 +10,4 @@ CREATE TABLE IF NOT EXISTS rume_feature_flags (
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE UNIQUE INDEX IF NOT EXISTS rume_feature_flags_tenant_key
-    ON rume_feature_flags (tenant_id, flag_key);
+    ON rume_feature_flags (COALESCE(tenant_id, ''), flag_key);

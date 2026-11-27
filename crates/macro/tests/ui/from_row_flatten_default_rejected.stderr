@@ -1,0 +1,5 @@
+error: #[from_row(flatten)] cannot be combined with `rename`, `json`, or `default`
+  --> tests/ui/from_row_flatten_default_rejected.rs:12:5
+   |
+12 |     #[from_row(flatten, default)]
+   |     ^

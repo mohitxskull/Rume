@@ -90,24 +90,24 @@ graphql = ["dep:rume-graphql"]
 # when tests enable `postgres`, `sqlite`, or `mysql`.
 tokio = { workspace = true, features = ["test-util"] }
 sqlx.workspace = true
-uuid = { version = "=1.29.3", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 deadpool-redis.workspace = true
 futures-util.workspace = true
 garde = { workspace = true, features = ["derive", "email", "url"] }
 redis.workspace = true
-serde_json = "=1.0.154"
-tower = "=0.5.3"
+serde_json = "1.0.154"
+tower = "0.5.3"
 tower-http = { workspace = true, features = ["decompression-gzip", "decompression-br", "decompression-zstd"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
-tempfile = "=3.27.0"
+tempfile = "3.27.0"
 testcontainers-modules = { workspace = true }
-insta = { version = "=1.49.0", features = ["json"] }
-rstest = "=0.29.0"
-wiremock = "=0.6.5"
-ureq = "=3.5.2"
+insta = { version = "1.49.0", features = ["json"] }
+rstest = "0.29.0"
+wiremock = "0.6.5"
+ureq = "3.5.2"
 proptest.workspace = true
-criterion = { version = "=0.8.2", features = ["async_tokio"] }
+criterion = { version = "0.8.2", features = ["async_tokio"] }
 base64.workspace = true
 bergshamra.workspace = true
 rand.workspace = true
@@ -118,7 +118,6 @@ signature.workspace = true
 sea-query.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
 rustls-pki-types.workspace = true
 tonic.workspace = true
 async-graphql.workspace = true

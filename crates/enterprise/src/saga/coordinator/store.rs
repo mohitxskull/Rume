@@ -102,6 +102,23 @@ pub trait SagaStore: Send + Sync + 'static {
         self.save_record_cas(record, expected_version)
     }
 
+    /// Atomically inserts an initial `Pending` saga record (`expected_version == 0`)
+    /// and acquires its exclusive execution claim, returning the opaque claim token.
+    ///
+    /// Why: eliminates the race window between initial `Pending` row insertion
+    /// (`claim_token = NULL`) and `try_acquire_execution` (`RC-09`). Stores that
+    /// support claim-fenced inserts (`InMemorySagaStore`, `SqlSagaStore`,
+    /// `RedisSagaStore`) override this to perform insert + claim in one atomic operation.
+    fn create_and_claim_record<'a>(
+        &'a self,
+        record: &'a SagaRecord,
+    ) -> BoxFuture<'a, Result<String, SagaError>> {
+        Box::pin(async move {
+            self.save_record_cas(record, 0).await?;
+            self.try_acquire_execution(&record.saga_id).await
+        })
+    }
+
     /// Loads a saga execution record by its unique ID.
     fn load_record(&self, saga_id: &str) -> BoxFuture<'_, Result<Option<SagaRecord>, SagaError>>;
 
@@ -223,20 +240,6 @@ impl SagaStore for InMemorySagaStore {
         let max_retained = self.max_retained_terminal;
         Box::pin(async move {
             let mut map = records.write().await;
-            if expected_version > 0
-                && let Some(token) = claim_token.as_deref()
-            {
-                let claims = active_claims.lock().map_err(|_| SagaError::Storage {
-                    saga_id: Some(record.saga_id.clone()),
-                    message: "saga claim lock poisoned".into(),
-                })?;
-                if claims.get(&record.saga_id).map(String::as_str) != Some(token) {
-                    return Err(SagaError::Storage {
-                        saga_id: Some(record.saga_id.clone()),
-                        message: "saga execution claim mismatch".into(),
-                    });
-                }
-            }
             let current_version = map.get(&record.saga_id).map(|r| r.version).unwrap_or(0);
             if current_version != expected_version {
                 return Err(SagaError::Storage {
@@ -246,12 +249,46 @@ impl SagaStore for InMemorySagaStore {
                     ),
                 });
             }
+            if let Some(token) = claim_token.as_deref() {
+                let mut claims = active_claims.lock().map_err(|_| SagaError::Storage {
+                    saga_id: Some(record.saga_id.clone()),
+                    message: "saga claim lock poisoned".into(),
+                })?;
+                if expected_version > 0 {
+                    if claims.get(&record.saga_id).map(String::as_str) != Some(token) {
+                        return Err(SagaError::Storage {
+                            saga_id: Some(record.saga_id.clone()),
+                            message: "saga execution claim mismatch".into(),
+                        });
+                    }
+                } else {
+                    if claims.contains_key(&record.saga_id) {
+                        return Err(SagaError::Storage {
+                            saga_id: Some(record.saga_id.clone()),
+                            message: "saga execution already claimed by another worker".into(),
+                        });
+                    }
+                    claims.insert(record.saga_id.clone(), token.to_string());
+                }
+            }
             let is_terminal = record.status.is_terminal();
             map.insert(record.saga_id.clone(), record);
             if is_terminal && let Some(max) = max_retained {
                 Self::prune_terminal_locked(&mut map, max);
             }
             Ok(())
+        })
+    }
+
+    fn create_and_claim_record<'a>(
+        &'a self,
+        record: &'a SagaRecord,
+    ) -> BoxFuture<'a, Result<String, SagaError>> {
+        let token = uuid::Uuid::new_v4().to_string();
+        Box::pin(async move {
+            self.save_record_cas_with_claim(record, 0, Some(&token))
+                .await?;
+            Ok(token)
         })
     }
 

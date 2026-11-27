@@ -18,8 +18,8 @@ figment.workspace = true
 toml.workspace = true
 subtle.workspace = true
 parking_lot.workspace = true
-uuid = { version = "=1.29.3", features = ["v4"] }
-schemars = { version = "=1.2.3", optional = true, features = ["derive"] }
+uuid = { version = "1.29.3", features = ["v4"] }
+schemars = { version = "1.2.3", optional = true, features = ["derive"] }
 
 [features]
 schemars = ["dep:schemars"]
@@ -27,3 +27,4 @@ schemars = ["dep:schemars"]
 [dev-dependencies]
 proptest.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

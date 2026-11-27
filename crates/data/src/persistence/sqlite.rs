@@ -47,6 +47,17 @@ impl SqliteBackend {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            // Why: reset `PRAGMA busy_timeout = 5000` on every connection release so even a
+            // cancelled or panicked `begin_immediate_transaction` never leaks `busy_timeout = 60000`
+            // back into the pool.
+            .after_release(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout = 5000")
+                        .execute(conn)
+                        .await?;
+                    Ok(true)
+                })
+            })
             .connect_with(opts)
             .await
             .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
@@ -81,7 +92,18 @@ impl SqliteBackend {
             let mut pool_opts = SqlitePoolOptions::new()
                 .max_connections(config.max_connections.max(1))
                 .min_connections(config.min_connections)
-                .acquire_timeout(config.connect_timeout());
+                .acquire_timeout(config.connect_timeout())
+                // Why: reset `PRAGMA busy_timeout = 5000` on every connection release so even a
+                // cancelled or panicked `begin_immediate_transaction` never leaks
+                // `busy_timeout = 60000` back into the pool.
+                .after_release(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 5000")
+                            .execute(conn)
+                            .await?;
+                        Ok(true)
+                    })
+                });
             if let Some(idle) = config.idle_timeout() {
                 pool_opts = pool_opts.idle_timeout(idle);
             }
@@ -289,6 +311,7 @@ impl DatabaseBackend for SqliteBackend {
             let tx = self.pool.begin().await.map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                restore_busy_timeout: false,
             })
         })
     }
@@ -314,6 +337,7 @@ impl DatabaseBackend for SqliteBackend {
                     .map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                restore_busy_timeout: true,
             })
         })
     }
@@ -345,6 +369,10 @@ impl DatabaseBackend for SqliteBackend {
 #[derive(Clone)]
 pub struct SqliteTransaction {
     tx: Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Sqlite>>>>,
+    /// When `true`, restore `PRAGMA busy_timeout = 5000` before returning the connection
+    /// to the pool so `begin_immediate_transaction` never leaves pooled connections stuck
+    /// at 60000ms (`RC-42`).
+    restore_busy_timeout: bool,
 }
 
 impl SqliteTransaction {
@@ -494,11 +522,17 @@ impl DatabaseTransaction for SqliteTransaction {
 
     fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
+        let restore = self.restore_busy_timeout;
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard.take().ok_or_else(|| {
+            let mut tx = guard.take().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            if restore {
+                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *tx)
+                    .await;
+            }
             tx.commit()
                 .await
                 .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
@@ -508,11 +542,17 @@ impl DatabaseTransaction for SqliteTransaction {
 
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
+        let restore = self.restore_busy_timeout;
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard.take().ok_or_else(|| {
+            let mut tx = guard.take().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            if restore {
+                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *tx)
+                    .await;
+            }
             tx.rollback()
                 .await
                 .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;

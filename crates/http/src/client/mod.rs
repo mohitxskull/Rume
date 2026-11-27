@@ -602,6 +602,7 @@ mod tests {
             failure_threshold: 2,
             success_threshold: 1,
             reset_timeout: Duration::from_millis(50),
+            ..Default::default()
         }));
         let client = RumeClient::builder()
             .circuit_breaker(Arc::clone(&breaker))
@@ -687,6 +688,7 @@ mod tests {
             failure_threshold: 1,
             success_threshold: 1,
             reset_timeout: Duration::from_secs(30),
+            ..Default::default()
         }));
         let client = RumeClient::builder()
             .circuit_breaker(Arc::clone(&breaker))

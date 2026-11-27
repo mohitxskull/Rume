@@ -8,6 +8,7 @@ use tonic::Status;
 pub fn app_error_to_status(err: &AppError) -> Status {
     match err {
         AppError::NotFound => Status::not_found("not found"),
+        AppError::NotFoundWithDetail { message } => Status::not_found(message),
         AppError::BadRequest { message, .. } => Status::invalid_argument(message),
         AppError::Unauthorized => Status::unauthenticated("unauthorized"),
         AppError::Forbidden => Status::permission_denied("forbidden"),

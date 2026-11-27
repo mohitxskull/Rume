@@ -59,7 +59,7 @@ pub use crate::saga::RedisSagaStore;
 pub use crate::saga::SqlSagaStore;
 pub use crate::saga::{InMemorySagaStore, Saga, SagaStore};
 #[cfg(feature = "scim")]
-pub use crate::scim::scim_routes;
+pub use crate::scim::{ScimBearerAuthLayer, scim_routes};
 pub use crate::static_files::{StaticFilesConfig, static_files_router};
 pub use crate::storage::ObjectStore;
 #[cfg(feature = "testing")]

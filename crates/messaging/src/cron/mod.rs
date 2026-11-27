@@ -377,13 +377,22 @@ mod tests {
             .expect("register");
 
         let handle = sched.start();
-        // Wait > 1.3s: if renew wasn't bounded / deadline-fenced, the 1s tick would fire.
-        tokio::time::sleep(Duration::from_millis(1350)).await;
+        // Wait past the initial 150ms lease TTL (during which at most 1 tick could legitimately
+        // fire if the test happened to start within 150ms of a wall-clock second boundary).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let fires_after_expiry = fires.load(Ordering::SeqCst);
+        assert!(
+            fires_after_expiry <= 1,
+            "at most one tick may fire during the initial valid 150ms lease"
+        );
 
+        // Wait > 1.2s past lease expiry: with renew() stalled, the scheduler MUST have stepped
+        // down and MUST NOT fire any additional ticks.
+        tokio::time::sleep(Duration::from_millis(1250)).await;
         assert_eq!(
             fires.load(Ordering::SeqCst),
-            0,
-            "scheduler with stalled renew() past lease_ttl must NOT fire ticks"
+            fires_after_expiry,
+            "scheduler with stalled renew() past lease_ttl must NOT fire ticks after lease expiry"
         );
 
         handle
@@ -410,9 +419,18 @@ mod tests {
         #[derive(Debug, Default)]
         struct CapturingQueue {
             keys: Mutex<Vec<(Option<String>, Instant)>>,
+            enqueued: tokio::sync::Notify,
         }
 
         impl JobQueue for CapturingQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,
@@ -423,6 +441,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .push((job.idempotency_key(), Instant::now()));
+                self.enqueued.notify_one();
                 Box::pin(async { Ok("job-1".to_string()) })
             }
 
@@ -564,38 +583,96 @@ mod tests {
         );
 
         let takeover_unix_ts = Utc::now().timestamp();
+        let first_tick = queue.enqueued.notified();
         elector.allow_leader.store(true, Ordering::SeqCst);
 
-        // Wait for one legitimate future tick after takeover.
-        tokio::time::sleep(Duration::from_millis(1250)).await;
-
-        let recorded = queue.keys.lock().unwrap().clone();
-        assert_eq!(
-            recorded.len(),
-            1,
-            "standby takeover must fire only the next future tick (no bogus catch-up), got {recorded:?}"
-        );
-        let key = recorded[0]
-            .0
-            .as_deref()
-            .expect("enqueued cron job must carry deterministic idempotency key");
-        assert!(
-            key.starts_with("cron:heartbeat:"),
-            "expected key prefix 'cron:heartbeat:', got '{key}'"
-        );
-        let key_ts: i64 = key
-            .strip_prefix("cron:heartbeat:")
-            .unwrap()
-            .parse()
-            .expect("unix timestamp suffix");
-        assert!(
-            key_ts > takeover_unix_ts,
-            "scheduled tick timestamp {key_ts} must be strictly after takeover {takeover_unix_ts} (not a stale pre-takeover tick)"
-        );
+        // Wait deterministically for the first enqueued tick after takeover, then shut down
+        // immediately so wall-clock alignment or runner jitter cannot cross into a second tick.
+        tokio::time::timeout(Duration::from_secs(3), first_tick)
+            .await
+            .expect("standby takeover must fire a future tick within 3s");
 
         handle
             .shutdown(Duration::from_secs(1))
             .await
             .expect("shutdown");
+
+        let recorded = queue.keys.lock().unwrap().clone();
+        assert!(
+            !recorded.is_empty(),
+            "standby takeover must fire at least one future tick"
+        );
+        for (raw_key, _) in &recorded {
+            let key = raw_key
+                .as_deref()
+                .expect("enqueued cron job must carry deterministic idempotency key");
+            assert!(
+                key.starts_with("cron:heartbeat:"),
+                "expected key prefix 'cron:heartbeat:', got '{key}'"
+            );
+            let key_ts: i64 = key
+                .strip_prefix("cron:heartbeat:")
+                .unwrap()
+                .parse()
+                .expect("unix timestamp suffix");
+            assert!(
+                key_ts > takeover_unix_ts,
+                "scheduled tick timestamp {key_ts} must be strictly after takeover {takeover_unix_ts} (not a stale pre-takeover tick)"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cron_scheduler_isolates_handler_panics_and_continues_next_tick() {
+        let elector = Arc::new(InMemoryLeaderElector::new());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+
+        let mut sched = CronScheduler::new(
+            elector,
+            "cron-panic-isolation",
+            "node-1",
+            Duration::from_secs(5),
+        );
+        let spec = CronJobSpec::new("panicky", "* * * * * *").expect("valid 6-field cron");
+        let attempts_cb = Arc::clone(&attempts);
+        let completed_cb = Arc::clone(&completed);
+        sched
+            .register(spec, move || {
+                let n = attempts_cb.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // Synchronous panic during future construction on tick 0.
+                    panic!("sync panic on tick 0");
+                }
+                let completed_inner = Arc::clone(&completed_cb);
+                async move {
+                    if n == 1 {
+                        // Asynchronous panic during future polling on tick 1.
+                        panic!("async panic on tick 1");
+                    }
+                    completed_inner.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+            .expect("register");
+
+        let handle = sched.start();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while completed.load(Ordering::SeqCst) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        handle
+            .shutdown(Duration::from_secs(1))
+            .await
+            .expect("shutdown");
+
+        assert!(
+            attempts.load(Ordering::SeqCst) >= 3,
+            "scheduler must survive both sync and async panics and fire subsequent ticks"
+        );
+        assert!(
+            completed.load(Ordering::SeqCst) >= 1,
+            "tick after panics must execute cleanly"
+        );
     }
 }

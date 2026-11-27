@@ -43,13 +43,13 @@ jobs:
         # CodeQL uses rust-analyzer; no `cargo build` step is required.
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v7
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
     # Initializes the CodeQL tools for scanning.
     # `build-mode: none` is correct and sufficient for Rust — no cargo build step needed.
     # `dependency-caching: true` caches/restores build dependencies to speed up rust-analyzer resolution.
     - name: Initialize CodeQL
-      uses: github/codeql-action/init@v4
+      uses: github/codeql-action/init@915412ff23e8b7659517e607487dbeae018f2934 # v4
       with:
         languages: ${{ matrix.language }}
         build-mode: none
@@ -57,6 +57,6 @@ jobs:
         config-file: ./.github/codeql/codeql-config.yml
 
     - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v4
+      uses: github/codeql-action/analyze@915412ff23e8b7659517e607487dbeae018f2934 # v4
       with:
         category: "/language:${{matrix.language}}"

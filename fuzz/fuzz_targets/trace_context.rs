@@ -1,9 +1,11 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
+use rume_observability::redaction::RedactionConfig;
 use rume_observability::trace_context::TraceContext;
 
 fuzz_target!(|data: &[u8]| {
+    let _ = RedactionConfig::default().redact_json_bytes(data);
     if let Ok(input) = std::str::from_utf8(data) {
         let tc = TraceContext::from_traceparent(input);
         let _ = tc.to_otel_context();

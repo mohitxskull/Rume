@@ -24,7 +24,9 @@ use rume::cache::InMemoryCacheBackend;
 use rume::enterprise::scim::{ScimGroup, ScimListResponse, ScimUser};
 use rume::env::{ExternalSecretBackend, SecretProviderError, VaultSecretProvider};
 use rume::flags::{TargetingRule, evaluate_flag};
-use rume::graphql::{GraphQlConfig, RumeTraceExtension, app_error_to_graphql, graphql_routes};
+use rume::graphql::{
+    GraphQlConfig, RumeTraceExtension, app_error_to_graphql, graphql_routes_from_builder,
+};
 use rume::grpc::{RumeTraceInterceptor, app_error_to_status};
 use rume::metering::{MeteringError, UsageRecord};
 use rume::persistence::SqliteBackend;
@@ -65,9 +67,9 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
 ";
 
 fn tls_connector_for_test_cert() -> tokio_rustls::TlsConnector {
+    use rustls_pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
-    for cert in rustls_pemfile::certs(&mut cert_reader) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(TEST_CERT_PEM) {
         root_store.add(cert.expect("valid test cert")).unwrap();
     }
     let provider = rustls::crypto::CryptoProvider::get_default()
@@ -604,14 +606,31 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
     assert_eq!(mailer.sent().len(), 1);
     assert_eq!(mailer.sent()[0].subject, "Welcome");
 
-    // 6. SCIM 2.0 /scim/v2/Users & /scim/v2/Groups CRUD + RFC 7644 filter
-    let scim_app = scim_routes(InMemoryScimStore::new());
+    // 6. SCIM 2.0 /scim/v2/Users & /scim/v2/Groups CRUD + RFC 7644 filter + auth enforcement
+    let scim_app = scim_routes(
+        InMemoryScimStore::new(),
+        ScimBearerAuthLayer::new("e2e-scim-token"),
+    );
+    let unauth_res = scim_app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/scim/v2/Users")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(unauth_res.status(), StatusCode::UNAUTHORIZED);
+
     let create_user = scim_app
         .clone()
         .oneshot(
             Request::builder()
                 .method("POST")
                 .uri("/scim/v2/Users")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .header(header::CONTENT_TYPE, "application/scim+json")
                 .body(Body::from(
                     serde_json::to_vec(&ScimUser::new("", "alice@example.com")).unwrap(),
@@ -631,6 +650,7 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
             Request::builder()
                 .method("POST")
                 .uri("/scim/v2/Groups")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .header(header::CONTENT_TYPE, "application/scim+json")
                 .body(Body::from(
                     serde_json::to_vec(&ScimGroup::new("", "Engineering")).unwrap(),
@@ -645,6 +665,7 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
         .oneshot(
             Request::builder()
                 .uri("/scim/v2/Users?filter=userName%20sw%20%22alice%22")
+                .header(header::AUTHORIZATION, "Bearer e2e-scim-token")
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -687,10 +708,9 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
             .is_some()
     );
 
-    let schema = Schema::build(GraphQlQueryRoot, EmptyMutation, EmptySubscription)
-        .extension(RumeTraceExtension)
-        .finish();
-    let gql_app = graphql_routes(schema, GraphQlConfig::default());
+    let builder = Schema::build(GraphQlQueryRoot, EmptyMutation, EmptySubscription)
+        .extension(RumeTraceExtension);
+    let gql_app = graphql_routes_from_builder(builder, GraphQlConfig::default());
     let gql_res = gql_app
         .oneshot(
             Request::builder()

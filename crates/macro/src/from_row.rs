@@ -318,10 +318,10 @@ fn parse_field_attrs(attrs: &[Attribute]) -> syn::Result<FieldAttrs> {
             "#[from_row(skip)] cannot be combined with `rename`, `flatten`, or `json`",
         ));
     }
-    if parsed.flatten && (parsed.rename.is_some() || parsed.json) {
+    if parsed.flatten && (parsed.rename.is_some() || parsed.json || parsed.default) {
         return Err(syn::Error::new(
             span,
-            "#[from_row(flatten)] cannot be combined with `rename` or `json`",
+            "#[from_row(flatten)] cannot be combined with `rename`, `json`, or `default`",
         ));
     }
 

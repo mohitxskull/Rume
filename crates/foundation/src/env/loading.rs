@@ -259,6 +259,7 @@ where
     // happens here, per value, before interpolation.
     let mut merged: BTreeMap<String, (String, String)> = BTreeMap::new();
     let mut file_keys: BTreeSet<String> = BTreeSet::new();
+    let mut single_quoted_keys: BTreeSet<String> = BTreeSet::new();
 
     for (path, label) in dotenv_candidates(dir, env_name) {
         if !path.is_file() {
@@ -270,12 +271,17 @@ where
             source,
         })?;
 
-        for (key, raw_value) in parse_dotenv(&content, &path)? {
+        for (key, raw_value, is_single_quoted) in parse_dotenv(&content, &path)? {
             let value = resolve_value(raw_value, dir).map_err(|source| EnvError::Io {
                 path: path.clone(),
                 source,
             })?;
 
+            if is_single_quoted {
+                single_quoted_keys.insert(key.clone());
+            } else {
+                single_quoted_keys.remove(&key);
+            }
             merged.insert(key.clone(), (value, label.clone()));
             file_keys.insert(key);
         }
@@ -287,6 +293,7 @@ where
     // take precedence over file values. Process env keys are not added to
     // `file_keys` because they did not originate from an env file.
     for (key, value) in process_vars {
+        single_quoted_keys.remove(&key);
         merged.insert(key, (value, "process env".to_string()));
     }
 
@@ -297,27 +304,33 @@ where
         .iter()
         .map(|(key, (value, _))| (key.clone(), value.clone()))
         .collect();
-    let literal_keys: BTreeSet<String> = merged
+    // Why: single-quoted `.env` values (`KEY='val${literal}'`) and process env
+    // variables must never be interpolated (`RC-36`).
+    let mut literal_keys: BTreeSet<String> = merged
         .iter()
         .filter(|(_, (_, source))| source == "process env")
         .map(|(key, _)| key.clone())
         .collect();
+    literal_keys.extend(single_quoted_keys.iter().cloned());
 
     let mut values: BTreeMap<String, String> = BTreeMap::new();
     let mut secrets: BTreeMap<String, SecretBox<String>> = BTreeMap::new();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
 
     // Why: only interpolate values whose winning source is an env file
-    // (`file_keys` and not overridden by `"process env"`). Inherited OS
+    // (`file_keys`, not overridden by `"process env"`, and not single-quoted). Inherited OS
     // variables (e.g. `PS1`, shell prompts, CI runner vars, or a process
     // `DATABASE_URL` whose password contains `${...}`) frequently contain
     // literal `${...}` syntax unrelated to Rume; interpolating them would
     // fail boot or corrupt credentials on healthy environments.
-    // Process-env values still remain in `vars` as lookup targets so file
-    // variables can reference process-overridden variables, and `literal_keys`
-    // ensures they are substituted verbatim without recursive `${...}` expansion.
+    // Process-env and single-quoted values still remain in `vars` as lookup targets so file
+    // variables can reference them, and `literal_keys` ensures they are substituted verbatim
+    // without recursive `${...}` expansion.
     for (key, (value, source)) in &merged {
-        let resolved_value = if file_keys.contains(key) && source != "process env" {
+        let resolved_value = if file_keys.contains(key)
+            && source != "process env"
+            && !single_quoted_keys.contains(key)
+        {
             interpolate_value_with_literals(value, &vars, &literal_keys)?
         } else {
             value.clone()
@@ -338,8 +351,11 @@ where
     })
 }
 
-/// Parse a `.env` file into raw `(key, value)` pairs without expanding `${VAR}` references.
-pub(crate) fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, String)>, EnvError> {
+/// Parse a `.env` file into raw `(key, value, is_single_quoted)` triples without expanding `${VAR}` references.
+pub(crate) fn parse_dotenv(
+    content: &str,
+    path: &Path,
+) -> Result<Vec<(String, String, bool)>, EnvError> {
     let mut entries = Vec::new();
     for (idx, raw_line) in content.lines().enumerate() {
         let line_no = idx + 1;
@@ -371,13 +387,17 @@ pub(crate) fn parse_dotenv(content: &str, path: &Path) -> Result<Vec<(String, St
             });
         }
 
-        let value = parse_dotenv_value(raw_val, path, line_no)?;
-        entries.push((key.to_string(), value));
+        let (value, is_single_quoted) = parse_dotenv_value(raw_val, path, line_no)?;
+        entries.push((key.to_string(), value, is_single_quoted));
     }
     Ok(entries)
 }
 
-fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<String, EnvError> {
+fn parse_dotenv_value(
+    raw_val: &str,
+    path: &Path,
+    line_no: usize,
+) -> Result<(String, bool), EnvError> {
     let val = raw_val.trim_start();
     if let Some(rest) = val.strip_prefix('"') {
         let mut out = String::new();
@@ -419,7 +439,7 @@ fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<Stri
                 message: "unexpected trailing characters".to_string(),
             });
         }
-        Ok(out)
+        Ok((out, false))
     } else if let Some(rest) = val.strip_prefix('\'') {
         let Some((inner, trailing)) = rest.split_once('\'') else {
             return Err(EnvError::Dotenv {
@@ -436,7 +456,7 @@ fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<Stri
                 message: "unexpected trailing characters".to_string(),
             });
         }
-        Ok(inner.to_string())
+        Ok((inner.to_string(), true))
     } else {
         // Strip inline `# comment` only when preceded by whitespace.
         let mut end = val.len();
@@ -448,7 +468,7 @@ fn parse_dotenv_value(raw_val: &str, path: &Path, line_no: usize) -> Result<Stri
             }
             prev_ws = ch.is_whitespace();
         }
-        Ok(val[..end].trim_end().to_string())
+        Ok((val[..end].trim_end().to_string(), false))
     }
 }
 
@@ -586,6 +606,23 @@ mod tests {
         let resolved = load_merged_map_in(dir.path()).unwrap();
 
         assert_eq!(resolved.get("APP_KEY").unwrap(), "super-secret-value");
+    }
+
+    #[test]
+    fn single_quoted_dotenv_values_are_never_interpolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_file = dir.path().join(".env");
+        std::fs::write(
+            &env_file,
+            "OTHER=expanded\nLITERAL='val${OTHER}'\nREF_LITERAL=\"pre-${LITERAL}\"\nDOUBLE=\"val${OTHER}\"\n",
+        )
+        .unwrap();
+
+        let resolved =
+            load_merged_map_for_env_with_vars(dir.path(), "test", std::iter::empty()).unwrap();
+        assert_eq!(resolved.get("LITERAL"), Some("val${OTHER}"));
+        assert_eq!(resolved.get("REF_LITERAL"), Some("pre-val${OTHER}"));
+        assert_eq!(resolved.get("DOUBLE"), Some("valexpanded"));
     }
 
     #[test]

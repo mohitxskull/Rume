@@ -12,6 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::persistence::backend::DatabaseBackend;
 use crate::persistence::builder::DynamicSelect;
@@ -168,7 +169,9 @@ pub enum CursorCodec {
     /// Unsigned URL-safe base64url JSON payload.
     Opaque,
     /// HMAC-SHA256 signed URL-safe base64url JSON payload (`<payload_b64>.<sig_b64>`).
-    HmacSha256 { key: Vec<u8> },
+    ///
+    /// Why: wrapped in [`Zeroizing`] so key material is scrubbed from memory on drop (`RC-42`).
+    HmacSha256 { key: Zeroizing<Vec<u8>> },
 }
 
 impl std::fmt::Debug for CursorCodec {
@@ -190,8 +193,16 @@ impl CursorCodec {
     }
 
     /// Creates an HMAC-SHA256 authenticated cursor codec using `key`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `key` is empty (`RC-42`).
     pub fn hmac_sha256(key: impl Into<Vec<u8>>) -> Self {
-        Self::HmacSha256 { key: key.into() }
+        let key = key.into();
+        assert!(!key.is_empty(), "HMAC cursor signing key must not be empty");
+        Self::HmacSha256 {
+            key: Zeroizing::new(key),
+        }
     }
 
     /// Serializes `payload` into a cursor token string.
@@ -203,7 +214,12 @@ impl CursorCodec {
         match self {
             Self::Opaque => Ok(payload_b64),
             Self::HmacSha256 { key } => {
-                let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| {
+                if key.is_empty() {
+                    return Err(PersistenceError::QueryFailed(
+                        "HMAC cursor key must not be empty".to_string(),
+                    ));
+                }
+                let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice()).map_err(|e| {
                     PersistenceError::QueryFailed(format!("invalid HMAC cursor key: {e}"))
                 })?;
                 mac.update(payload_b64.as_bytes());
@@ -218,6 +234,11 @@ impl CursorCodec {
         let payload_b64 = match self {
             Self::Opaque => token,
             Self::HmacSha256 { key } => {
+                if key.is_empty() {
+                    return Err(PersistenceError::QueryFailed(
+                        "HMAC cursor key must not be empty".to_string(),
+                    ));
+                }
                 let (payload_part, sig_part) = token.split_once('.').ok_or_else(|| {
                     PersistenceError::QueryFailed("invalid signed cursor format".to_string())
                 })?;
@@ -225,7 +246,7 @@ impl CursorCodec {
                     PersistenceError::QueryFailed(format!("invalid cursor signature encoding: {e}"))
                 })?;
 
-                let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|e| {
+                let mut mac = Hmac::<Sha256>::new_from_slice(key.as_slice()).map_err(|e| {
                     PersistenceError::QueryFailed(format!("invalid HMAC cursor key: {e}"))
                 })?;
                 mac.update(payload_part.as_bytes());
@@ -495,5 +516,11 @@ mod tests {
         assert!(!dbg.contains("top-secret"));
         assert!(!dbg.contains("116, 111, 112"));
         assert_eq!(format!("{:?}", CursorCodec::opaque()), "Opaque");
+    }
+
+    #[test]
+    #[should_panic(expected = "HMAC cursor signing key must not be empty")]
+    fn hmac_cursor_codec_rejects_empty_key() {
+        let _ = CursorCodec::hmac_sha256(Vec::<u8>::new());
     }
 }

@@ -1,7 +1,7 @@
 -- Schema DDL for rume_webhook_deliveries in MySQL.
 CREATE TABLE IF NOT EXISTS rume_webhook_deliveries (
-    id              VARCHAR(36)  NOT NULL PRIMARY KEY,
-    endpoint_id     VARCHAR(36)  NOT NULL,
+    id              VARCHAR(128) NOT NULL PRIMARY KEY,
+    endpoint_id     VARCHAR(255) NOT NULL,
     event_type      VARCHAR(255) NOT NULL,
     payload         JSON         NOT NULL,
     status          VARCHAR(32)  NOT NULL DEFAULT 'pending',

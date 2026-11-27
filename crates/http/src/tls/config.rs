@@ -1,15 +1,16 @@
 //! TLS configuration (`TlsConfig`, PEM loading, and error types).
 
-use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
+use rustls_pki_types::pem::PemObject;
 use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_CONNECTIONS: usize = 4096;
 
 /// Errors returned while loading or configuring TLS.
 #[derive(Debug, thiserror::Error)]
@@ -47,6 +48,7 @@ pub struct TlsConfig {
     kind: TlsConfigKind,
     alpn_protocols: Vec<Vec<u8>>,
     pub(crate) handshake_timeout: Duration,
+    pub(crate) max_connections: usize,
 }
 
 impl TlsConfig {
@@ -78,6 +80,7 @@ impl TlsConfig {
             kind: TlsConfigKind::Static(Arc::new(server_config)),
             alpn_protocols,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         })
     }
 
@@ -88,6 +91,7 @@ impl TlsConfig {
             kind: TlsConfigKind::Acme(config),
             alpn_protocols: default_alpn_protocols(),
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            max_connections: DEFAULT_MAX_CONNECTIONS,
         }
     }
 
@@ -97,9 +101,26 @@ impl TlsConfig {
         self
     }
 
+    /// Set the maximum number of concurrent TLS connections and in-flight handshakes (default: 4096).
+    pub fn max_connections(mut self, max: usize) -> Self {
+        self.max_connections = max.max(1);
+        self
+    }
+
     /// Return the configured ALPN protocols in preference order.
     pub fn alpn_protocols(&self) -> &[Vec<u8>] {
         &self.alpn_protocols
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_extra_alpn_for_tests(mut self, proto: Vec<u8>) -> Self {
+        self.alpn_protocols.push(proto);
+        if let TlsConfigKind::Static(ref server_cfg) = self.kind {
+            let mut updated = (**server_cfg).clone();
+            updated.alpn_protocols = self.alpn_protocols.clone();
+            self.kind = TlsConfigKind::Static(Arc::new(updated));
+        }
+        self
     }
 
     pub(crate) fn build_acceptor(
@@ -138,8 +159,7 @@ pub(crate) fn default_crypto_provider() -> Arc<CryptoProvider> {
 }
 
 fn parse_certs(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError> {
-    let mut reader = BufReader::new(cert_pem);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(cert_pem)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|err| TlsError::InvalidCertificate(err.to_string()))?;
     if certs.is_empty() {
@@ -149,8 +169,9 @@ fn parse_certs(cert_pem: &[u8]) -> Result<Vec<CertificateDer<'static>>, TlsError
 }
 
 fn parse_private_key(key_pem: &[u8]) -> Result<PrivateKeyDer<'static>, TlsError> {
-    let mut reader = BufReader::new(key_pem);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|err| TlsError::InvalidPrivateKey(err.to_string()))?
-        .ok_or(TlsError::MissingPrivateKey)
+    match PrivateKeyDer::from_pem_slice(key_pem) {
+        Ok(key) => Ok(key),
+        Err(rustls_pki_types::pem::Error::NoItemsFound) => Err(TlsError::MissingPrivateKey),
+        Err(err) => Err(TlsError::InvalidPrivateKey(err.to_string())),
+    }
 }

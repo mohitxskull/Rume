@@ -236,4 +236,40 @@ mod tests {
         assert_eq!(left, "t:3:a:b:c");
         assert_eq!(right, "t:1:a:b:c");
     }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_feature_flags_schema_prevents_duplicate_global_flag_keys() {
+        use rume_data::persistence::sqlite::SqliteBackend;
+
+        let backend = Arc::new(SqliteBackend::in_memory().await.unwrap());
+        let flags = SqlFeatureFlags::new(Arc::clone(&backend));
+        flags.ensure_schema().await.unwrap();
+
+        let f1 = FeatureFlag::new("global_checkout", true);
+        flags.upsert_flag(f1).await.unwrap();
+
+        // Direct duplicate INSERT with a different `id` and `(NULL, 'global_checkout')`
+        // must fail the unique index on `(COALESCE(tenant_id, ''), flag_key)` (`P2-15`).
+        let dup_insert = backend
+            .execute_params(
+                "INSERT INTO rume_feature_flags (id, tenant_id, flag_key, enabled, rollout_pct) VALUES (?, NULL, ?, 1, 100)",
+                &[DbValue::from("other-id"), DbValue::from("global_checkout")],
+            )
+            .await;
+        assert!(
+            dup_insert.is_err(),
+            "schema unique index must reject duplicate global (NULL, flag_key) rows"
+        );
+
+        // Idempotent upsert via `SqlFeatureFlags::upsert_flag` still updates the single row cleanly.
+        let f2 = FeatureFlag::new("global_checkout", false);
+        flags.upsert_flag(f2).await.unwrap();
+        let loaded = flags
+            .get_flag("global_checkout", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!loaded.enabled);
+    }
 }

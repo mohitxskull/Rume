@@ -300,6 +300,106 @@ RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_back
         })
     }
 
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        if excluded_queues.is_empty() {
+            return self.dequeue_for(worker_id);
+        }
+        let wid = worker_id.to_string();
+        let excluded: Vec<String> = excluded_queues.to_vec();
+        Box::pin(async move {
+            let lease_duration_ms =
+                i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
+            let new_lease_token = Uuid::new_v4().to_string();
+
+            let row: Option<PgRow> = sqlx::query(
+                "UPDATE rume_jobs
+SET status = 'in_flight',
+    assigned_worker = $1,
+    attempt = attempt + 1,
+    lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+    lease_token = $3
+WHERE id IN (
+    SELECT id FROM rume_jobs
+    WHERE NOT (queue = ANY($4))
+      AND ((status = 'pending' AND available_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+       OR (status = 'in_flight' AND lease_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT))
+    ORDER BY priority DESC, available_at ASC, created_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority;",
+            )
+            .bind(&wid)
+            .bind(lease_duration_ms)
+            .bind(&new_lease_token)
+            .bind(excluded)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|e| JobError::Fatal(e.to_string()))?;
+
+            if let Some(r) = row {
+                let id: String = r.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let name: String = r.try_get(1).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let payload: Vec<u8> = r.try_get(2).map_err(|e| JobError::Fatal(e.to_string()))?;
+                let attempt: i32 = r.try_get(3).unwrap_or(0);
+                let max_attempts: i32 = r.try_get(4).unwrap_or(3);
+                let initial_backoff_ms: i64 = r.try_get(5).unwrap_or(1000);
+                let max_backoff_ms: i64 = r.try_get(6).unwrap_or(60000);
+                let backoff_factor: f64 = r.try_get(7).unwrap_or(2.0);
+                let timeout_ms: Option<i64> = r.try_get(8).ok();
+                let idempotency_key: Option<String> = r.try_get(9).ok();
+                let tenant_id: Option<String> = r.try_get(10).ok();
+                let assigned_worker: Option<String> = r.try_get(11).ok();
+                let available_at_ms: i64 = r.try_get(12).unwrap_or(0);
+                let lease_token: Option<String> = r.try_get(13).ok();
+                let trace_context: Option<String> = r
+                    .try_get(14)
+                    .ok()
+                    .or_else(|| r.try_get("trace_context").ok());
+                let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+                let priority: i32 = r.try_get(16).unwrap_or(0);
+
+                let retry_policy = RetryPolicy {
+                    max_attempts: max_attempts.max(1) as u32,
+                    initial_backoff_ms: initial_backoff_ms.max(0) as u64,
+                    max_backoff_ms: max_backoff_ms.max(0) as u64,
+                    backoff_factor,
+                };
+                let timeout = timeout_ms.map(|ms| Duration::from_millis(ms.max(0) as u64));
+                let now = current_epoch_millis();
+                let available_at = if available_at_ms <= now {
+                    Instant::now()
+                } else {
+                    Instant::now() + Duration::from_millis((available_at_ms - now).max(0) as u64)
+                };
+
+                Ok(Some(QueuedJob {
+                    id,
+                    name,
+                    queue,
+                    priority,
+                    payload,
+                    attempt: attempt.max(1) as u32,
+                    retry_policy,
+                    timeout,
+                    idempotency_key,
+                    tenant_id,
+                    assigned_worker,
+                    lease_token,
+                    available_at,
+                    lease_duration: self.default_lease_duration,
+                    trace_context,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
     fn ack(&self, job_id: &str, lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
         let jid = job_id.to_string();
         let token = lease_token.to_string();

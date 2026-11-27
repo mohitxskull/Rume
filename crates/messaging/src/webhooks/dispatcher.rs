@@ -6,6 +6,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use chrono::Utc;
+use futures_util::stream::{self, StreamExt};
 use rume_foundation::ssrf::{is_forbidden_ip, validate_host};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -22,6 +23,8 @@ const DEFAULT_WEBHOOK_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_WEBHOOK_TIMEOUT: Duration = Duration::from_secs(15);
 const DEFAULT_WEBHOOK_CLAIM_LEASE: Duration = Duration::from_secs(60);
 const MAX_WEBHOOK_RESPONSE_BYTES: usize = 4096;
+/// Maximum number of concurrent endpoint deliveries during a single `dispatch_event` fan-out.
+const MAX_CONCURRENT_WEBHOOK_FANOUT: usize = 8;
 
 fn validate_webhook_url(
     url: &str,
@@ -324,7 +327,9 @@ impl WebhookDispatcher {
         self.endpoints.read().ok()?.get(id).cloned()
     }
 
-    /// Dispatches `event_type` with `payload` to all active matching endpoints scoped to `tenant_id`.
+    /// Dispatches `event_type` with `payload` to all active matching endpoints scoped to `tenant_id`
+    /// with bounded concurrency (`MAX_CONCURRENT_WEBHOOK_FANOUT = 8`) so one slow or hung endpoint
+    /// cannot stall delivery to other endpoints (`RC-41`).
     pub async fn dispatch_event(
         &self,
         tenant_id: Option<&str>,
@@ -334,27 +339,42 @@ impl WebhookDispatcher {
         let payload_str = serde_json::to_string(&payload)
             .map_err(|e| WebhookError::Serialization(e.to_string()))?;
         let endpoints = self.matching_endpoints(tenant_id, event_type);
-        let mut results = Vec::with_capacity(endpoints.len());
+        let event_type = event_type.to_string();
 
-        for endpoint in endpoints {
-            let now = Utc::now();
-            let lease_until =
-                now + chrono::Duration::from_std(DEFAULT_WEBHOOK_CLAIM_LEASE).unwrap_or_default();
-            let mut record = WebhookDeliveryRecord {
-                id: Uuid::new_v4().to_string(),
-                endpoint_id: endpoint.id.clone(),
-                event_type: event_type.to_string(),
-                payload: payload_str.clone(),
-                status: WebhookDeliveryStatus::InFlight,
-                attempt: 0,
-                next_attempt_at: Some(lease_until),
-                last_response: None,
-                created_at: now,
-                updated_at: now,
-            };
-            self.store.upsert(record.clone()).await?;
-            self.attempt_delivery(&endpoint, &mut record).await?;
-            results.push(record);
+        let delivery_results: Vec<Result<WebhookDeliveryRecord, WebhookError>> =
+            stream::iter(endpoints)
+                .map(|endpoint| {
+                    let event_type = event_type.clone();
+                    let payload_str = payload_str.clone();
+                    async move {
+                        let now = Utc::now();
+                        let lease_until = now
+                            + chrono::Duration::from_std(DEFAULT_WEBHOOK_CLAIM_LEASE)
+                                .unwrap_or_default();
+                        let mut record = WebhookDeliveryRecord {
+                            id: Uuid::new_v4().to_string(),
+                            endpoint_id: endpoint.id.clone(),
+                            event_type,
+                            payload: payload_str,
+                            status: WebhookDeliveryStatus::InFlight,
+                            attempt: 0,
+                            next_attempt_at: Some(lease_until),
+                            last_response: None,
+                            created_at: now,
+                            updated_at: now,
+                        };
+                        self.store.upsert(record.clone()).await?;
+                        self.attempt_delivery(&endpoint, &mut record).await?;
+                        Ok(record)
+                    }
+                })
+                .buffer_unordered(MAX_CONCURRENT_WEBHOOK_FANOUT)
+                .collect()
+                .await;
+
+        let mut results = Vec::with_capacity(delivery_results.len());
+        for res in delivery_results {
+            results.push(res?);
         }
 
         Ok(results)
@@ -451,20 +471,37 @@ impl WebhookDispatcher {
     }
 
     /// Builds an [`OutboxRelay`](crate::outbox::OutboxRelay) dispatcher closure that forwards
-    /// outbox messages to this [`WebhookDispatcher`].
+    /// global (`tenant_id = None`) outbox messages to this [`WebhookDispatcher`].
+    ///
+    /// For multi-tenant outbox delivery, use [`Self::outbox_dispatcher_with_tenant`].
     pub fn outbox_dispatcher(
         dispatcher: Arc<WebhookDispatcher>,
     ) -> impl Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static
     {
+        Self::outbox_dispatcher_with_tenant(dispatcher, |_| None)
+    }
+
+    /// Builds an [`OutboxRelay`](crate::outbox::OutboxRelay) dispatcher closure that extracts
+    /// an optional `tenant_id` from each [`OutboxMessage`] and forwards the event to
+    /// tenant-scoped endpoints registered on `dispatcher` (`RC-41`).
+    pub fn outbox_dispatcher_with_tenant<F>(
+        dispatcher: Arc<WebhookDispatcher>,
+        tenant_extractor: F,
+    ) -> impl Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static
+    where
+        F: Fn(&OutboxMessage) -> Option<String> + Send + Sync + 'static,
+    {
+        let extractor = Arc::new(tenant_extractor);
         move |msg: &OutboxMessage| {
             let dispatcher = Arc::clone(&dispatcher);
+            let tenant_id = extractor(msg);
             let event_type = msg.event_type.clone();
             let payload_bytes = msg.payload.clone();
             Box::pin(async move {
                 let payload: serde_json::Value = serde_json::from_slice(&payload_bytes)
                     .map_err(|e| OutboxError::Dispatch(format!("invalid JSON payload: {e}")))?;
                 dispatcher
-                    .dispatch_event(None, &event_type, payload)
+                    .dispatch_event(tenant_id.as_deref(), &event_type, payload)
                     .await
                     .map(|_| ())
                     .map_err(|e| OutboxError::Dispatch(e.to_string()))

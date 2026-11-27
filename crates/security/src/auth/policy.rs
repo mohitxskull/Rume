@@ -59,6 +59,11 @@ pub struct RequireAllPermissions(pub &'static [&'static str]);
 
 impl<R> Policy<AuthUser, R> for RequireAllPermissions {
     fn is_authorized(&self, identity: &AuthUser, _resource: &R) -> bool {
+        // Why: fail closed when no permissions are specified rather than vacuously
+        // authorizing every authenticated user (`RC-27`).
+        if self.0.is_empty() {
+            return false;
+        }
         identity.has_all_permissions(self.0)
     }
 }
@@ -96,5 +101,18 @@ where
 {
     fn is_authorized(&self, identity: &AuthUser, resource: &R) -> bool {
         (self.func)(identity, resource)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn require_all_permissions_fails_closed_when_empty() {
+        let user = AuthUser::new("u1").with_permission("docs:read");
+        assert!(!RequireAllPermissions(&[]).is_authorized(&user, &()));
+        assert!(RequireAllPermissions(&["docs:read"]).is_authorized(&user, &()));
+        assert!(!RequireAllPermissions(&["docs:read", "docs:write"]).is_authorized(&user, &()));
     }
 }

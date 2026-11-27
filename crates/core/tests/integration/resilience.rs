@@ -13,6 +13,7 @@ async fn circuit_breaker_state_transitions_and_trip() {
         failure_threshold: 3,
         success_threshold: 2,
         reset_timeout: Duration::from_millis(50),
+        ..Default::default()
     };
     let breaker = CircuitBreaker::new(config);
 
@@ -214,6 +215,7 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
         failure_threshold: 2,
         success_threshold: 2,
         reset_timeout: Duration::from_millis(40),
+        ..Default::default()
     };
     let breaker = CircuitBreaker::new(config);
 
@@ -248,37 +250,49 @@ async fn test_circuit_breaker_half_open_single_trial_probe() {
 #[tokio::test]
 async fn test_circuit_breaker_half_open_abandoned_trial_released() {
     tokio::time::pause();
-    let config = CircuitBreakerConfig {
+    // 1. Default (`count_cancellation_as_failure: true`): abandoning a HalfOpen permit
+    //    re-opens the circuit so timed-out probes respect `reset_timeout` (`P2-10`).
+    let breaker = CircuitBreaker::new(CircuitBreakerConfig {
         failure_threshold: 2,
         success_threshold: 2,
         reset_timeout: Duration::from_millis(40),
-    };
-    let breaker = CircuitBreaker::new(config);
+        ..Default::default()
+    });
 
-    // Trip the breaker to Open
     breaker.on_failure();
     breaker.on_failure();
     assert_eq!(breaker.state(), CircuitState::Open);
 
-    // Fast-forward past reset timeout -> HalfOpen
     tokio::time::advance(Duration::from_millis(50)).await;
     assert_eq!(breaker.state(), CircuitState::HalfOpen);
 
-    // First request is allowed as trial probe
     let permit = breaker
         .try_acquire()
         .expect("first request allowed as trial probe");
-
-    // Abandon the trial: drop the permit without calling complete_success/complete_failure
-    // (simulates client disconnect or future cancellation). The half_open_in_flight slot
-    // is released immediately by TrialPermit::drop, never wedging the circuit.
     drop(permit);
+    assert_eq!(breaker.state(), CircuitState::Open);
+    assert!(breaker.try_acquire().is_none());
 
-    // A subsequent trial must be permitted (not wedged HalfOpen)
+    // After cooldown elapses, the circuit transitions back to HalfOpen (never wedged).
+    tokio::time::advance(Duration::from_millis(50)).await;
     assert!(
         breaker.try_acquire().is_some(),
-        "abandoned HalfOpen trial should release the slot, not wedge the circuit"
+        "abandoned HalfOpen trial should re-open and recover after reset_timeout"
     );
+
+    // 2. Opt-out (`count_cancellation_as_failure: false`): releases slot immediately.
+    let breaker_no_reopen = CircuitBreaker::new(CircuitBreakerConfig {
+        failure_threshold: 2,
+        success_threshold: 2,
+        reset_timeout: Duration::from_millis(40),
+        count_cancellation_as_failure: false,
+    });
+    breaker_no_reopen.on_failure();
+    breaker_no_reopen.on_failure();
+    tokio::time::advance(Duration::from_millis(50)).await;
+    let permit = breaker_no_reopen.try_acquire().expect("trial probe");
+    drop(permit);
+    assert!(breaker_no_reopen.try_acquire().is_some());
 }
 
 #[tokio::test]
@@ -315,6 +329,7 @@ async fn circuit_breaker_trips_on_service_transport_errors() {
         failure_threshold: 2,
         success_threshold: 1,
         reset_timeout: Duration::from_secs(60),
+        ..Default::default()
     };
     let breaker = CircuitBreaker::new(config);
 
@@ -636,11 +651,12 @@ async fn test_rate_limiter_with_tenant_layer_scopes_anonymous_requests_by_client
         "anonymous client IP A must not drain tenant 'acme' rate-limit bucket for IP B"
     );
 
-    // Authenticated member of tenant `acme:198.51.100.10` must NOT share a bucket with
-    // anonymous requests to `acme` from `198.51.100.10`.
+    // Authenticated member of tenant `acme:198.51.100.10` (resolved via its safe slug
+    // `acme-ip-suffix`, since `X-Tenant-ID` rejects `:` delimiter characters per RC-17)
+    // must NOT share a bucket with anonymous requests to `acme` from `198.51.100.10`.
     let mut req_auth_suffix = axum::http::Request::builder()
         .uri("/api/tenant-scoped")
-        .header("x-tenant-id", "acme:198.51.100.10")
+        .header("x-tenant-id", "acme-ip-suffix")
         .body(axum::body::Body::empty())
         .unwrap();
     req_auth_suffix

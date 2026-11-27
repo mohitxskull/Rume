@@ -10,9 +10,10 @@ async fn s3_sigv4_presigned_urls_match_canonical_format() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        secret_access_key: SecretString::from("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         session_token: None,
         path_style: false,
+        ..Default::default()
     })
     .expect("s3 config");
 
@@ -94,9 +95,10 @@ async fn s3_store_put_get_head_delete_against_mock_server() {
         region: "us-east-1".to_string(),
         bucket: "test-bucket".to_string(),
         access_key_id: "test-key".to_string(),
-        secret_access_key: "test-secret".to_string(),
+        secret_access_key: SecretString::from("test-secret"),
         session_token: None,
         path_style: true,
+        ..Default::default()
     })
     .expect("s3 store");
 
@@ -131,9 +133,10 @@ async fn s3_presign_put_includes_content_type_in_signed_headers() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        secret_access_key: SecretString::from("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         session_token: None,
         path_style: false,
+        ..Default::default()
     })
     .expect("s3 config");
 
@@ -210,9 +213,10 @@ async fn s3_list_paginates_truncated_responses_with_continuation_token() {
         region: "us-east-1".to_string(),
         bucket: "test-bucket".to_string(),
         access_key_id: "test-key".to_string(),
-        secret_access_key: "test-secret".to_string(),
+        secret_access_key: SecretString::from("test-secret"),
         session_token: None,
         path_style: true,
+        ..Default::default()
     })
     .expect("s3 store");
 
@@ -240,12 +244,118 @@ fn s3_config_debug_redacts_secret_access_key_and_session_token() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "super_secret_aws_key".to_string(),
-        session_token: Some("super_secret_session_token".to_string()),
+        secret_access_key: SecretString::from("super_secret_aws_key"),
+        session_token: Some(SecretString::from("super_secret_session_token")),
         path_style: false,
+        ..Default::default()
     };
     let dbg = format!("{cfg:?}");
     assert!(dbg.contains("[REDACTED]"));
     assert!(!dbg.contains("super_secret_aws_key"));
     assert!(!dbg.contains("super_secret_session_token"));
+}
+
+#[test]
+fn s3_rejects_malformed_xml_invalid_bucket_and_invalid_presign_params() {
+    // 1. Malformed XML returns Err instead of silent truncation
+    let xml_err =
+        parse_list_objects_v2_page("<ListBucketResult><Contents><Key>a</Wrong></ListBucketResult>")
+            .err()
+            .expect("malformed XML must return Err");
+    assert!(matches!(xml_err, ObjectStoreError::Http(_)));
+
+    // 2. Invalid bucket names rejected
+    for bad_bucket in [
+        "bad/bucket",
+        "bad\\bucket",
+        "bad?q",
+        "bad#f",
+        "bad..b",
+        "bad bucket",
+        "user:pass@evil",
+        "bucket:8080",
+        ".leading-dot",
+        "trailing-dot.",
+        "-leading-dash",
+        "trailing-dash-",
+        "UPPERCASE",
+    ] {
+        let err = S3ObjectStore::new(S3Config {
+            endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+            region: "us-east-1".to_string(),
+            bucket: bad_bucket.to_string(),
+            access_key_id: "ak".to_string(),
+            secret_access_key: SecretString::from("sk"),
+            ..Default::default()
+        })
+        .unwrap_err();
+        assert!(
+            matches!(err, ObjectStoreError::Configuration(_)),
+            "expected Configuration error for bucket {bad_bucket:?}"
+        );
+    }
+
+    // 3. Invalid presign TTL (0, 604_801) and CRLF content_type rejected
+    let store = S3ObjectStore::new(S3Config {
+        endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
+        region: "us-east-1".to_string(),
+        bucket: "my-bucket".to_string(),
+        access_key_id: "ak".to_string(),
+        secret_access_key: SecretString::from("sk"),
+        ..Default::default()
+    })
+    .unwrap();
+    let key = ObjectKey::new("a.txt").unwrap();
+    let now = DateTime::<Utc>::from(std::time::SystemTime::now());
+
+    assert!(matches!(
+        store.presign_at("GET", &key, 0, now),
+        Err(ObjectStoreError::Configuration(_))
+    ));
+    assert!(matches!(
+        store.presign_at("GET", &key, 604_801, now),
+        Err(ObjectStoreError::Configuration(_))
+    ));
+    assert!(matches!(
+        store.presign_at_with_content_type("PUT", &key, 60, Some("text/plain\r\nX-Evil: 1"), now),
+        Err(ObjectStoreError::Configuration(_))
+    ));
+}
+
+#[tokio::test]
+async fn s3_list_rejects_repeating_continuation_token() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+
+    let server = tokio::spawn(async move {
+        let stuck_page = r#"<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>stuck-tok</NextContinuationToken><Contents><Key>a.txt</Key><Size>1</Size></Contents></ListBucketResult>"#;
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await.expect("read");
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\n\r\n{stuck_page}",
+                stuck_page.len()
+            );
+            socket.write_all(response.as_bytes()).await.expect("write");
+        }
+    });
+
+    let store = S3ObjectStore::new(S3Config {
+        endpoint: format!("http://{addr}"),
+        region: "us-east-1".to_string(),
+        bucket: "test-bucket".to_string(),
+        access_key_id: "ak".to_string(),
+        secret_access_key: SecretString::from("sk"),
+        path_style: true,
+        ..Default::default()
+    })
+    .unwrap();
+
+    let err = store
+        .list("")
+        .await
+        .expect_err("repeating continuation token must fail");
+    assert!(matches!(err, ObjectStoreError::Http(ref msg) if msg.contains("repeating")));
+    server.await.expect("server");
 }

@@ -13,6 +13,9 @@ use crate::auth::session::BoxFuture;
 const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 const RECOVERY_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
+/// Maximum allowed TOTP clock-skew window in time steps (`+/- 10` steps).
+pub const MAX_SKEW_STEPS: u64 = 10;
+
 /// Hash algorithm used by RFC 6238 TOTP.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TotpAlgorithm {
@@ -79,17 +82,25 @@ impl TotpSecret {
                 "TOTP period_secs must be positive".to_owned(),
             ));
         }
+        // Why: unbounded `skew_steps` turns TOTP verification into a CPU DoS vector
+        // and widens the replay window indefinitely (`RC-05`).
+        if config.skew_steps > MAX_SKEW_STEPS {
+            return Err(AuthError::InvalidCredentials(format!(
+                "TOTP skew_steps must be at most {MAX_SKEW_STEPS}"
+            )));
+        }
         Ok(())
     }
 
-    /// Generates a fresh 20-byte CSPRNG TOTP secret.
-    pub fn generate(config: TotpConfig) -> Self {
+    /// Generates a fresh 20-byte CSPRNG TOTP secret after validating `config`.
+    pub fn generate(config: TotpConfig) -> Result<Self, AuthError> {
+        Self::validate_config(&config)?;
         let mut bytes = vec![0u8; 20];
         rand::rng().fill_bytes(&mut bytes);
-        Self {
+        Ok(Self {
             bytes: Zeroizing::new(bytes),
             config,
-        }
+        })
     }
 
     /// Creates a [`TotpSecret`] from raw secret bytes.
@@ -181,7 +192,11 @@ impl TotpSecret {
     }
 
     /// Verifies a TOTP code within the configured skew window, returning the matched step.
-    pub fn verify_code(&self, code: &str, timestamp_secs: u64) -> Option<u64> {
+    ///
+    /// Why: restricted to `pub(crate)` so external callers must use [`Self::verify_code_after`]
+    /// with replay tracking (`last_used_step`) instead of accepting replayed codes within the
+    /// skew window (`P2-19`).
+    pub(crate) fn verify_code(&self, code: &str, timestamp_secs: u64) -> Option<u64> {
         if Self::validate_config(&self.config).is_err() {
             return None;
         }
@@ -198,6 +213,25 @@ impl TotpSecret {
             }
         }
         matched
+    }
+
+    /// Verifies a TOTP code within the configured skew window while preventing replay of
+    /// previously consumed time steps.
+    ///
+    /// Returns `Some(matched_step)` only when `matched_step` is strictly greater than
+    /// `last_used_step` (or `last_used_step` is `None`). Callers should persist the returned
+    /// step as the new `last_used_step`.
+    pub fn verify_code_after(
+        &self,
+        code: &str,
+        timestamp_secs: u64,
+        last_used_step: Option<u64>,
+    ) -> Option<u64> {
+        let matched = self.verify_code(code, timestamp_secs)?;
+        if last_used_step.is_some_and(|last| matched <= last) {
+            return None;
+        }
+        Some(matched)
     }
 }
 

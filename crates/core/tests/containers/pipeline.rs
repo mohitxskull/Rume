@@ -699,6 +699,7 @@ async fn test_postgres_unified_enterprise_failure_pipeline() {
         lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     });
 
     // Pass 1: Fails after publish -> schedules retry with 1s backoff
@@ -1025,6 +1026,7 @@ async fn test_postgres_phase5_resilience_matrix_disconnection_leader_crash_drain
         lease_duration_secs: 2,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     });
 
     let poll_result = relay_2.poll_and_dispatch(5).await.expect("relay 2 poll");

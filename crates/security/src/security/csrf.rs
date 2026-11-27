@@ -14,6 +14,9 @@ use zeroize::Zeroizing;
 use rume_foundation::error::AppError;
 use rume_foundation::util::safe_equal;
 
+/// Maximum number of matching CSRF cookie candidates inspected per request.
+const MAX_CSRF_COOKIE_CANDIDATES: usize = 8;
+
 fn to_hex(bytes: &[u8]) -> String {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -341,19 +344,21 @@ where
                 // If auto_inject_cookie is enabled, ensure the client has a valid cookie token
                 let mut token_to_inject = None;
                 if config.auto_inject_cookie {
+                    // Why: cap candidate CSRF cookies before HMAC verification on safe methods
+                    // too, matching the mutating-method branch so a `GET` carrying thousands of
+                    // forged CSRF cookies cannot trigger unbounded HMAC work.
                     let has_valid_cookie = req
                         .headers()
                         .get_all(COOKIE)
                         .iter()
                         .filter_map(|val| val.to_str().ok())
                         .flat_map(|cookies| cookies.split(';'))
-                        .any(|pair| {
-                            if let Some((name, value)) = pair.trim().split_once('=') {
-                                name == config.cookie_name && config.verify_token(value)
-                            } else {
-                                false
-                            }
-                        });
+                        .filter_map(|pair| {
+                            let (name, value) = pair.trim().split_once('=')?;
+                            (name == config.cookie_name).then_some(value)
+                        })
+                        .take(MAX_CSRF_COOKIE_CANDIDATES)
+                        .any(|value| config.verify_token(value));
 
                     if !has_valid_cookie {
                         token_to_inject = Some(config.generate_token());
@@ -404,15 +409,19 @@ where
                 return Ok(err.into_response());
             };
 
-            // Extract matching tokens from Cookie headers (inspect all matching cookies across split headers to avoid subdomain cookie-tossing denial of service)
-            let mut matching_cookies = Vec::new();
-            for header_val in req.headers().get_all(COOKIE) {
+            // Extract matching tokens from Cookie headers, capped to prevent CPU/allocation
+            // amplification from cookie-flooding attacks while tolerating subdomain cookie tossing.
+            let mut matching_cookies = Vec::with_capacity(MAX_CSRF_COOKIE_CANDIDATES);
+            'cookie_scan: for header_val in req.headers().get_all(COOKIE) {
                 if let Ok(cookies) = header_val.to_str() {
                     for pair in cookies.split(';') {
                         if let Some((name, value)) = pair.trim().split_once('=')
                             && name == config.cookie_name
                         {
                             matching_cookies.push(value);
+                            if matching_cookies.len() >= MAX_CSRF_COOKIE_CANDIDATES {
+                                break 'cookie_scan;
+                            }
                         }
                     }
                 }
@@ -427,25 +436,22 @@ where
                 return Ok(err.into_response());
             }
 
-            // 1. Verify if ANY matching cookie has a valid signature (guards against invalid tossed cookies)
-            let any_valid = matching_cookies
-                .iter()
-                .any(|&cookie_token| config.verify_token(cookie_token));
-
-            if !any_valid {
+            // Why: verify `header_token` once with HMAC before comparing against cookie
+            // candidates with `safe_equal`. Any cookie equal to a verified `header_token`
+            // is guaranteed to carry the same valid signature, eliminating 2x per-cookie
+            // HMAC recomputation (`RC-28`).
+            if !config.verify_token(header_token) {
                 let err = AppError::Public {
                     status: StatusCode::FORBIDDEN,
                     code: "CSRF_TOKEN_INVALID",
-                    message: "CSRF cookie signature verification failed".into(),
+                    message: "CSRF token signature verification failed".into(),
                 };
                 return Ok(err.into_response());
             }
 
-            // 2. Verify if ANY valid matching cookie matches the header token in constant time
-            let has_valid_match = matching_cookies.iter().any(|&cookie_token| {
-                config.verify_token(cookie_token)
-                    && safe_equal(header_token.as_bytes(), cookie_token.as_bytes())
-            });
+            let has_valid_match = matching_cookies
+                .iter()
+                .any(|&cookie_token| safe_equal(header_token.as_bytes(), cookie_token.as_bytes()));
 
             if !has_valid_match {
                 let err = AppError::Public {
@@ -504,5 +510,118 @@ mod tests {
             ..Default::default()
         };
         assert!(!empty_struct.verify_token("anything.deadbeef"));
+    }
+
+    #[tokio::test]
+    async fn test_csrf_caps_matching_cookie_candidates() {
+        use axum::Router;
+        use axum::routing::post;
+        use tower::ServiceExt;
+
+        let secret = b"0123456789abcdef0123456789abcdef".to_vec();
+        let config = CsrfConfig::default().with_secret(secret.clone());
+        let valid_token = config.generate_token();
+
+        let app = Router::new()
+            .route("/mutate", post(|| async { StatusCode::OK }))
+            .layer(CsrfLayer::new(secret));
+
+        // 7 tossed cookies + 1 valid cookie (8th candidate, within cap) -> 200 OK
+        let mut within_cap: Vec<String> = (0..7)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        within_cap.push(format!("csrf_token={valid_token}"));
+        let resp_ok = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mutate")
+                    .header("x-csrf-token", &valid_token)
+                    .header(COOKIE, within_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_ok.status(), StatusCode::OK);
+
+        // 8 tossed cookies + 1 valid cookie (9th candidate, beyond cap) -> 403 Forbidden
+        let mut beyond_cap: Vec<String> = (0..8)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        beyond_cap.push(format!("csrf_token={valid_token}"));
+        let resp_denied = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/mutate")
+                    .header("x-csrf-token", &valid_token)
+                    .header(COOKIE, beyond_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn safe_method_auto_inject_cookie_caps_csrf_cookie_candidates() {
+        use tower::ServiceExt;
+
+        let mut config =
+            CsrfConfig::default().with_secret(b"0123456789abcdef0123456789abcdef".to_vec());
+        config.auto_inject_cookie = true;
+        let valid_token = config.generate_token();
+
+        let app = axum::Router::new()
+            .route("/read", axum::routing::get(|| async { "ok" }))
+            .layer(CsrfLayer::with_config(config));
+
+        // 7 invalid CSRF cookies + 1 valid CSRF cookie (8th candidate, within cap) -> no Set-Cookie needed.
+        let mut within_cap: Vec<String> = (0..7)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        within_cap.push(format!("csrf_token={valid_token}"));
+        let resp_within = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/read")
+                    .header(COOKIE, within_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_within.status(), StatusCode::OK);
+        assert!(
+            resp_within.headers().get(SET_COOKIE).is_none(),
+            "valid CSRF cookie within candidate cap must be recognized on GET"
+        );
+
+        // 8 invalid CSRF cookies + 1 valid CSRF cookie (9th candidate, beyond cap) -> stops at cap and injects fresh cookie.
+        let mut beyond_cap: Vec<String> = (0..8)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        beyond_cap.push(format!("csrf_token={valid_token}"));
+        let resp_beyond = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/read")
+                    .header(COOKIE, beyond_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_beyond.status(), StatusCode::OK);
+        assert!(
+            resp_beyond.headers().get(SET_COOKIE).is_some(),
+            "GET must cap CSRF cookie verification at MAX_CSRF_COOKIE_CANDIDATES"
+        );
     }
 }

@@ -2,6 +2,7 @@
 name = "workbench-simple-api"
 version = "0.1.0"
 edition = "2024"
+publish = false
 license.workspace = true
 
 [[bin]]
@@ -15,8 +16,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-garde = { version = "=0.23.0", features = ["derive"] }
-uuid = { version = "=1.29.3", features = ["v4"] }
+garde = { version = "0.23.0", features = ["derive"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 
 [dev-dependencies]
-reqwest = { version = "=0.13.5", default-features = false, features = ["json"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["json"] }

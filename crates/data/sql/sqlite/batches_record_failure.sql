@@ -14,4 +14,4 @@ SET failed_jobs = failed_jobs + 1,
 WHERE id = ?1
 RETURNING id, name, total_jobs, pending_jobs, completed_jobs, failed_jobs, status,
           then_job_name, then_job_payload, finally_job_name, finally_job_payload,
-          callbacks_dispatched, created_at, finished_at;
+          then_dispatched, finally_dispatched, created_at, finished_at;

@@ -132,6 +132,9 @@ pub enum AppError {
     #[error("not found")]
     NotFound,
 
+    #[error("not found: {message}")]
+    NotFoundWithDetail { message: String },
+
     #[error("bad request: {message}")]
     BadRequest { code: &'static str, message: String },
 
@@ -178,11 +181,11 @@ impl AppError {
         }
     }
 
-    /// Creates a 404 Not Found error with a custom message.
+    /// Creates a 404 Not Found error with a diagnostic message (redacted in production,
+    /// matching [`Self::bad_request`] and [`Self::conflict`]; use [`Self::Public`] for
+    /// explicitly client-facing 404 messages) (`RC-42`).
     pub fn not_found(msg: impl Into<String>) -> Self {
-        Self::Public {
-            status: StatusCode::NOT_FOUND,
-            code: "NOT_FOUND",
+        Self::NotFoundWithDetail {
             message: msg.into(),
         }
     }
@@ -198,7 +201,7 @@ impl AppError {
     /// The HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
-            Self::NotFound => StatusCode::NOT_FOUND,
+            Self::NotFound | Self::NotFoundWithDetail { .. } => StatusCode::NOT_FOUND,
             Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
@@ -266,6 +269,18 @@ impl AppError {
                     None,
                 ),
             ),
+            Self::NotFoundWithDetail { message } => {
+                warn!("not found: {}", message);
+                let detail = if env.in_development() {
+                    message
+                } else {
+                    "The requested resource was not found.".to_string()
+                };
+                problem_details_response(
+                    status,
+                    &problem(status, "Not Found", detail, "NOT_FOUND", None, None),
+                )
+            }
             Self::BadRequest { code, message } => {
                 warn!("bad request: {}", message);
                 let detail = if env.in_development() {
@@ -705,5 +720,27 @@ mod tests {
             dev_value["detail"].as_str(),
             Some("version mismatch on secret_entity")
         );
+    }
+
+    #[tokio::test]
+    async fn app_error_not_found_redacts_detail_in_production_and_shows_in_development() {
+        let prod_env = crate::state::Environment::new("production");
+        let dev_env = crate::state::Environment::new("development");
+
+        let prod_resp =
+            AppError::not_found("internal row id 42 missing").into_response_in_env(&prod_env);
+        assert_eq!(prod_resp.status(), StatusCode::NOT_FOUND);
+        let prod_bytes = to_bytes(prod_resp.into_body(), usize::MAX).await.unwrap();
+        let prod_json: serde_json::Value = serde_json::from_slice(&prod_bytes).unwrap();
+        assert_eq!(prod_json["code"], "NOT_FOUND");
+        assert_eq!(prod_json["detail"], "The requested resource was not found.");
+
+        let dev_resp =
+            AppError::not_found("internal row id 42 missing").into_response_in_env(&dev_env);
+        assert_eq!(dev_resp.status(), StatusCode::NOT_FOUND);
+        let dev_bytes = to_bytes(dev_resp.into_body(), usize::MAX).await.unwrap();
+        let dev_json: serde_json::Value = serde_json::from_slice(&dev_bytes).unwrap();
+        assert_eq!(dev_json["code"], "NOT_FOUND");
+        assert_eq!(dev_json["detail"], "internal row id 42 missing");
     }
 }

@@ -91,9 +91,14 @@ pub fn build_app(pool: DatabasePool<SqliteBackend>) -> Router {
 async fn create_item(
     State(pool): State<DatabasePool<SqliteBackend>>,
     Json(payload): Json<CreateItemRequest>,
-) -> Result<(StatusCode, Json<Item>), (StatusCode, String)> {
+) -> Result<(StatusCode, Json<Item>), rume::error::AppError> {
     if let Err(e) = payload.validate() {
-        return Err((StatusCode::UNPROCESSABLE_ENTITY, e.to_string()));
+        return Err(rume::error::AppError::Validation {
+            details: vec![rume::error::ValidationErrorDetail {
+                field: "request".to_string(),
+                message: e.to_string(),
+            }],
+        });
     }
 
     let item = Item {
@@ -115,7 +120,7 @@ async fn create_item(
         ],
     )
     .await
-    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    .map_err(|_| rume::error::AppError::internal("failed to create item"))?;
 
     Ok((StatusCode::CREATED, Json(item)))
 }
@@ -137,14 +142,14 @@ async fn get_item(
 
 async fn list_items(
     State(pool): State<DatabasePool<SqliteBackend>>,
-) -> Result<Json<Vec<Item>>, (StatusCode, String)> {
+) -> Result<Json<Vec<Item>>, rume::error::AppError> {
     let items: Vec<Item> = pool
         .fetch_all_as(
             "SELECT id, title, description, price_cents, created_at FROM items ORDER BY created_at ASC",
             &[],
         )
         .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        .map_err(|_| rume::error::AppError::internal("failed to list items"))?;
 
     Ok(Json(items))
 }

@@ -57,49 +57,55 @@ pub struct JobBatch {
     pub finally_job_name: Option<String>,
     /// Serialized payload for `finally` callback job.
     pub finally_job_payload: Option<Vec<u8>>,
-    /// Whether terminal callbacks have already been dispatched.
-    pub callbacks_dispatched: bool,
+    /// Whether the `then` callback has already been claimed/dispatched.
+    pub then_dispatched: bool,
+    /// Whether the `finally` callback has already been claimed/dispatched.
+    pub finally_dispatched: bool,
 }
 
 impl JobBatch {
-    fn callback_specs(&self) -> Vec<(String, Vec<u8>, String)> {
-        let mut specs = Vec::new();
+    fn then_callback_spec(&self) -> Option<(String, Vec<u8>, String)> {
         if self.status == BatchStatus::Completed
             && let (Some(name), Some(payload)) = (&self.then_job_name, &self.then_job_payload)
         {
-            specs.push((
+            Some((
                 name.clone(),
                 payload.clone(),
                 format!("batch:{}:then", self.id.0),
-            ));
+            ))
+        } else {
+            None
         }
+    }
+
+    fn finally_callback_spec(&self) -> Option<(String, Vec<u8>, String)> {
         if matches!(
             self.status,
             BatchStatus::Completed | BatchStatus::Failed | BatchStatus::Cancelled
         ) && let (Some(name), Some(payload)) =
             (&self.finally_job_name, &self.finally_job_payload)
         {
-            specs.push((
+            Some((
                 name.clone(),
                 payload.clone(),
                 format!("batch:{}:finally", self.id.0),
-            ));
+            ))
+        } else {
+            None
         }
-        specs
     }
 
     /// Dispatches terminal callbacks (`then` if all succeeded, `finally` on any terminal state)
-    /// directly via `registry`, claiming the one-shot dispatch lock in `store`.
+    /// directly via `registry`, claiming `then` and `finally` independently in `store` so a
+    /// `finally` failure after `then` succeeded never re-executes `then` on retry (`RC-14`).
     pub async fn dispatch_callbacks<S: BatchStore>(
         &self,
         store: &S,
         registry: &JobRegistry,
     ) -> Result<(), JobError> {
-        let specs = self.callback_specs();
-        if specs.is_empty() || !store.try_claim_callbacks(&self.id).await? {
-            return Ok(());
-        }
-        for (name, payload, idemp_key) in specs {
+        if let Some((name, payload, idemp_key)) = self.then_callback_spec()
+            && store.try_claim_then(&self.id).await?
+        {
             let queued = QueuedJob {
                 id: Uuid::new_v4().to_string(),
                 name,
@@ -118,7 +124,53 @@ impl JobBatch {
                 trace_context: None,
             };
             if let Err(err) = registry.dispatch(&queued).await {
-                let _ = store.release_callbacks_claim(&self.id).await;
+                if let Err(release_err) = store.release_then_claim(&self.id).await {
+                    tracing::error!(
+                        batch_id = %self.id.0,
+                        dispatch_error = %err,
+                        release_error = %release_err,
+                        "Failed to release batch `then` callback claim after dispatch failure"
+                    );
+                    return Err(JobError::Fatal(format!(
+                        "batch `then` callback dispatch failed ({err}); release claim failed ({release_err})"
+                    )));
+                }
+                return Err(err);
+            }
+        }
+
+        if let Some((name, payload, idemp_key)) = self.finally_callback_spec()
+            && store.try_claim_finally(&self.id).await?
+        {
+            let queued = QueuedJob {
+                id: Uuid::new_v4().to_string(),
+                name,
+                queue: "default".to_string(),
+                priority: 0,
+                payload,
+                attempt: 1,
+                retry_policy: RetryPolicy::default(),
+                timeout: Some(Duration::from_secs(60)),
+                idempotency_key: Some(idemp_key),
+                tenant_id: None,
+                assigned_worker: None,
+                lease_token: None,
+                available_at: Instant::now(),
+                lease_duration: Duration::from_secs(60),
+                trace_context: None,
+            };
+            if let Err(err) = registry.dispatch(&queued).await {
+                if let Err(release_err) = store.release_finally_claim(&self.id).await {
+                    tracing::error!(
+                        batch_id = %self.id.0,
+                        dispatch_error = %err,
+                        release_error = %release_err,
+                        "Failed to release batch `finally` callback claim after dispatch failure"
+                    );
+                    return Err(JobError::Fatal(format!(
+                        "batch `finally` callback dispatch failed ({err}); release claim failed ({release_err})"
+                    )));
+                }
                 return Err(err);
             }
         }
@@ -126,20 +178,15 @@ impl JobBatch {
     }
 
     /// Enqueues terminal callbacks (`then` if all succeeded, `finally` on any terminal state)
-    /// onto `queue`, claiming the one-shot dispatch lock in `store`.
+    /// onto `queue`, claiming `then` and `finally` independently in `store` (`RC-14`).
     pub async fn dispatch_callbacks_to_queue<S: BatchStore, Q: JobQueue>(
         &self,
         store: &S,
         queue: &Q,
     ) -> Result<(), JobError> {
-        let specs = self.callback_specs();
-        if specs.is_empty() || !store.try_claim_callbacks(&self.id).await? {
-            return Ok(());
-        }
-        for (name, payload, idemp_key) in specs {
-            // Why: attach deterministic `batch:{id}:{then|finally}` idempotency keys so
-            // retrying after a partial callback enqueue failure (e.g. `then` enqueued,
-            // `finally` failed, claim released) cannot duplicate `then` execution (`RC-17`).
+        if let Some((name, payload, idemp_key)) = self.then_callback_spec()
+            && store.try_claim_then(&self.id).await?
+        {
             let raw = RawJob {
                 name,
                 queue: "default".to_string(),
@@ -152,7 +199,47 @@ impl JobBatch {
                 trace_context: None,
             };
             if let Err(err) = queue.enqueue_raw(raw, Duration::ZERO).await {
-                let _ = store.release_callbacks_claim(&self.id).await;
+                if let Err(release_err) = store.release_then_claim(&self.id).await {
+                    tracing::error!(
+                        batch_id = %self.id.0,
+                        dispatch_error = %err,
+                        release_error = %release_err,
+                        "Failed to release batch `then` callback claim after enqueue failure"
+                    );
+                    return Err(JobError::Fatal(format!(
+                        "batch `then` callback enqueue failed ({err}); release claim failed ({release_err})"
+                    )));
+                }
+                return Err(err);
+            }
+        }
+
+        if let Some((name, payload, idemp_key)) = self.finally_callback_spec()
+            && store.try_claim_finally(&self.id).await?
+        {
+            let raw = RawJob {
+                name,
+                queue: "default".to_string(),
+                priority: 0,
+                payload,
+                retry_policy: RetryPolicy::default(),
+                timeout: Some(Duration::from_secs(60)),
+                idempotency_key: Some(idemp_key),
+                tenant_id: None,
+                trace_context: None,
+            };
+            if let Err(err) = queue.enqueue_raw(raw, Duration::ZERO).await {
+                if let Err(release_err) = store.release_finally_claim(&self.id).await {
+                    tracing::error!(
+                        batch_id = %self.id.0,
+                        dispatch_error = %err,
+                        release_error = %release_err,
+                        "Failed to release batch `finally` callback claim after enqueue failure"
+                    );
+                    return Err(JobError::Fatal(format!(
+                        "batch `finally` callback enqueue failed ({err}); release claim failed ({release_err})"
+                    )));
+                }
                 return Err(err);
             }
         }
@@ -168,18 +255,33 @@ pub trait BatchStore: Debug + Send + Sync + 'static {
     /// Loads a batch record by ID.
     fn load_batch(&self, id: &BatchId) -> BoxFuture<'_, Result<Option<JobBatch>, JobError>>;
 
-    /// Atomically records a successful job completion in the batch.
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>>;
+    /// Idempotently records a successful completion for `(batch_id, job_id)` so duplicate
+    /// redeliveries of the same job never decrement `pending_jobs` more than once (`RC-14`).
+    fn record_job_success(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>>;
 
-    /// Atomically records a failed job in the batch.
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>>;
+    /// Idempotently records a failure for `(batch_id, job_id)` so duplicate redeliveries of
+    /// the same job never decrement `pending_jobs` more than once (`RC-14`).
+    fn record_job_failure(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>>;
 
-    /// Atomically claims the right to dispatch terminal callbacks (`true` on first claim).
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>>;
+    /// Atomically claims the right to dispatch the `then` callback (`true` on first claim).
+    fn try_claim_then(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>>;
 
-    /// Releases a previously claimed callback dispatch lock after a failed dispatch attempt
-    /// so a retry can re-claim and deliver callbacks instead of dropping them permanently.
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
+    /// Releases a previously claimed `then` callback lock after a failed dispatch attempt.
+    fn release_then_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
+
+    /// Atomically claims the right to dispatch the `finally` callback (`true` on first claim).
+    fn try_claim_finally(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>>;
+
+    /// Releases a previously claimed `finally` callback lock after a failed dispatch attempt.
+    fn release_finally_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
 
     /// Marks a running batch as cancelled.
     fn cancel(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>>;
@@ -189,6 +291,7 @@ pub trait BatchStore: Debug + Send + Sync + 'static {
 #[derive(Debug, Default)]
 pub struct InMemoryBatchStore {
     batches: Mutex<HashMap<BatchId, JobBatch>>,
+    outcomes: Mutex<HashMap<(BatchId, String), &'static str>>,
 }
 
 impl InMemoryBatchStore {
@@ -227,8 +330,13 @@ impl BatchStore for InMemoryBatchStore {
         })
     }
 
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
+    fn record_job_success(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>> {
         let id = id.clone();
+        let job_id = job_id.to_string();
         Box::pin(async move {
             let mut guard = self
                 .batches
@@ -237,6 +345,14 @@ impl BatchStore for InMemoryBatchStore {
             let batch = guard
                 .get_mut(&id)
                 .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
+            let mut outcomes = self
+                .outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if outcomes.contains_key(&(id.clone(), job_id.clone())) {
+                return Ok(batch.clone());
+            }
+            outcomes.insert((id, job_id), "success");
             batch.completed_jobs = batch.completed_jobs.saturating_add(1);
             batch.pending_jobs = batch.pending_jobs.saturating_sub(1);
             if batch.status != BatchStatus::Cancelled && batch.pending_jobs == 0 {
@@ -250,8 +366,13 @@ impl BatchStore for InMemoryBatchStore {
         })
     }
 
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
+    fn record_job_failure(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>> {
         let id = id.clone();
+        let job_id = job_id.to_string();
         Box::pin(async move {
             let mut guard = self
                 .batches
@@ -260,6 +381,14 @@ impl BatchStore for InMemoryBatchStore {
             let batch = guard
                 .get_mut(&id)
                 .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
+            let mut outcomes = self
+                .outcomes
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if outcomes.contains_key(&(id.clone(), job_id.clone())) {
+                return Ok(batch.clone());
+            }
+            outcomes.insert((id, job_id), "failure");
             batch.failed_jobs = batch.failed_jobs.saturating_add(1);
             batch.pending_jobs = batch.pending_jobs.saturating_sub(1);
             if batch.status != BatchStatus::Cancelled && batch.pending_jobs == 0 {
@@ -269,7 +398,7 @@ impl BatchStore for InMemoryBatchStore {
         })
     }
 
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
+    fn try_claim_then(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
         let id = id.clone();
         Box::pin(async move {
             let mut guard = self
@@ -279,16 +408,16 @@ impl BatchStore for InMemoryBatchStore {
             let batch = guard
                 .get_mut(&id)
                 .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
-            if batch.callbacks_dispatched {
+            if batch.then_dispatched {
                 Ok(false)
             } else {
-                batch.callbacks_dispatched = true;
+                batch.then_dispatched = true;
                 Ok(true)
             }
         })
     }
 
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+    fn release_then_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
         let id = id.clone();
         Box::pin(async move {
             let mut guard = self
@@ -296,7 +425,40 @@ impl BatchStore for InMemoryBatchStore {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(batch) = guard.get_mut(&id) {
-                batch.callbacks_dispatched = false;
+                batch.then_dispatched = false;
+            }
+            Ok(())
+        })
+    }
+
+    fn try_claim_finally(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut guard = self
+                .batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let batch = guard
+                .get_mut(&id)
+                .ok_or_else(|| JobError::Fatal(format!("batch {} not found", id.0)))?;
+            if batch.finally_dispatched {
+                Ok(false)
+            } else {
+                batch.finally_dispatched = true;
+                Ok(true)
+            }
+        })
+    }
+
+    fn release_finally_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+        let id = id.clone();
+        Box::pin(async move {
+            let mut guard = self
+                .batches
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(batch) = guard.get_mut(&id) {
+                batch.finally_dispatched = false;
             }
             Ok(())
         })
@@ -359,7 +521,8 @@ macro_rules! map_batch_row {
         let then_job_payload: Option<Vec<u8>> = $row.try_get(8).ok();
         let finally_job_name: Option<String> = $row.try_get(9).ok();
         let finally_job_payload: Option<Vec<u8>> = $row.try_get(10).ok();
-        let callbacks_dispatched: bool = $row.try_get(11).unwrap_or(false);
+        let then_dispatched: bool = $row.try_get(11).unwrap_or(false);
+        let finally_dispatched: bool = $row.try_get(12).unwrap_or(false);
 
         Ok::<JobBatch, JobError>(JobBatch {
             id: BatchId(id),
@@ -373,7 +536,8 @@ macro_rules! map_batch_row {
             then_job_payload,
             finally_job_name,
             finally_job_payload,
-            callbacks_dispatched,
+            then_dispatched,
+            finally_dispatched,
         })
     }};
 }
@@ -516,28 +680,85 @@ impl BatchStore for SqlBatchStore {
         })
     }
 
-    fn record_success(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
+    fn record_job_success(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>> {
         let id = id.0.clone();
+        let job_id = job_id.to_string();
         Box::pin(async move {
             match self {
                 #[cfg(feature = "sqlite")]
                 Self::Sqlite(pool) => {
-                    let row = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_SUCCESS)
+                    let mut tx = pool
+                        .begin()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    let inserted = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
-                        .fetch_optional(pool)
+                        .bind(&job_id)
+                        .bind("success")
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
+                        .rows_affected();
+                    let row = if inserted == 0 {
+                        sqlx::query(rume_data::sql::SQLITE_BATCHES_LOAD)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    } else {
+                        sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_SUCCESS)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    };
+                    let Some(row) = row else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
+                    tx.commit()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                     map_batch_row!(&row)
                 }
                 #[cfg(feature = "postgres")]
                 Self::Postgres(pool) => {
-                    let row = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_SUCCESS)
+                    let mut tx = pool
+                        .begin()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    let inserted = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
-                        .fetch_optional(pool)
+                        .bind(&job_id)
+                        .bind("success")
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
+                        .rows_affected();
+                    let row = if inserted == 0 {
+                        sqlx::query(rume_data::sql::PG_BATCHES_LOAD)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    } else {
+                        sqlx::query(rume_data::sql::PG_BATCHES_RECORD_SUCCESS)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    };
+                    let Some(row) = row else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
+                    tx.commit()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                     map_batch_row!(&row)
                 }
                 #[cfg(feature = "mysql")]
@@ -546,19 +767,34 @@ impl BatchStore for SqlBatchStore {
                         .begin()
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_SUCCESS)
+                    let inserted = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
+                        .bind(&job_id)
+                        .bind("success")
                         .execute(&mut *tx)
                         .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    if res.rows_affected() == 0 {
-                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                        .map_err(|e| JobError::Fatal(e.to_string()))?
+                        .rows_affected();
+                    if inserted > 0 {
+                        let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_SUCCESS)
+                            .bind(&id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?;
+                        if res.rows_affected() == 0 {
+                            let _ = tx.rollback().await;
+                            return Err(JobError::Fatal(format!("batch {id} not found")));
+                        }
                     }
-                    let row = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
+                    let Some(row) = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
                         .bind(&id)
-                        .fetch_one(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                        .map_err(|e| JobError::Fatal(e.to_string()))?
+                    else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
                     tx.commit()
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -568,28 +804,85 @@ impl BatchStore for SqlBatchStore {
         })
     }
 
-    fn record_failure(&self, id: &BatchId) -> BoxFuture<'_, Result<JobBatch, JobError>> {
+    fn record_job_failure(
+        &self,
+        id: &BatchId,
+        job_id: &str,
+    ) -> BoxFuture<'_, Result<JobBatch, JobError>> {
         let id = id.0.clone();
+        let job_id = job_id.to_string();
         Box::pin(async move {
             match self {
                 #[cfg(feature = "sqlite")]
                 Self::Sqlite(pool) => {
-                    let row = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_FAILURE)
+                    let mut tx = pool
+                        .begin()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    let inserted = sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
-                        .fetch_optional(pool)
+                        .bind(&job_id)
+                        .bind("failure")
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
+                        .rows_affected();
+                    let row = if inserted == 0 {
+                        sqlx::query(rume_data::sql::SQLITE_BATCHES_LOAD)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    } else {
+                        sqlx::query(rume_data::sql::SQLITE_BATCHES_RECORD_FAILURE)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    };
+                    let Some(row) = row else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
+                    tx.commit()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                     map_batch_row!(&row)
                 }
                 #[cfg(feature = "postgres")]
                 Self::Postgres(pool) => {
-                    let row = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_FAILURE)
+                    let mut tx = pool
+                        .begin()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    let inserted = sqlx::query(rume_data::sql::PG_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
-                        .fetch_optional(pool)
+                        .bind(&job_id)
+                        .bind("failure")
+                        .execute(&mut *tx)
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .ok_or_else(|| JobError::Fatal(format!("batch {id} not found")))?;
+                        .rows_affected();
+                    let row = if inserted == 0 {
+                        sqlx::query(rume_data::sql::PG_BATCHES_LOAD)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    } else {
+                        sqlx::query(rume_data::sql::PG_BATCHES_RECORD_FAILURE)
+                            .bind(&id)
+                            .fetch_optional(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?
+                    };
+                    let Some(row) = row else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
+                    tx.commit()
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                     map_batch_row!(&row)
                 }
                 #[cfg(feature = "mysql")]
@@ -598,19 +891,34 @@ impl BatchStore for SqlBatchStore {
                         .begin()
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_FAILURE)
+                    let inserted = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_JOB_OUTCOME)
                         .bind(&id)
+                        .bind(&job_id)
+                        .bind("failure")
                         .execute(&mut *tx)
                         .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
-                    if res.rows_affected() == 0 {
-                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                        .map_err(|e| JobError::Fatal(e.to_string()))?
+                        .rows_affected();
+                    if inserted > 0 {
+                        let res = sqlx::query(rume_data::sql::MYSQL_BATCHES_RECORD_FAILURE)
+                            .bind(&id)
+                            .execute(&mut *tx)
+                            .await
+                            .map_err(|e| JobError::Fatal(e.to_string()))?;
+                        if res.rows_affected() == 0 {
+                            let _ = tx.rollback().await;
+                            return Err(JobError::Fatal(format!("batch {id} not found")));
+                        }
                     }
-                    let row = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
+                    let Some(row) = sqlx::query(rume_data::sql::MYSQL_BATCHES_LOAD)
                         .bind(&id)
-                        .fetch_one(&mut *tx)
+                        .fetch_optional(&mut *tx)
                         .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                        .map_err(|e| JobError::Fatal(e.to_string()))?
+                    else {
+                        let _ = tx.rollback().await;
+                        return Err(JobError::Fatal(format!("batch {id} not found")));
+                    };
                     tx.commit()
                         .await
                         .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -620,75 +928,126 @@ impl BatchStore for SqlBatchStore {
         })
     }
 
-    fn try_claim_callbacks(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
+    fn try_claim_then(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
         let id = id.0.clone();
         Box::pin(async move {
             let affected = match self {
                 #[cfg(feature = "sqlite")]
-                Self::Sqlite(pool) => {
-                    sqlx::query(rume_data::sql::SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
+                Self::Sqlite(pool) => sqlx::query(rume_data::sql::SQLITE_BATCHES_CLAIM_THEN)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
                 #[cfg(feature = "postgres")]
-                Self::Postgres(pool) => {
-                    sqlx::query(rume_data::sql::PG_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
+                Self::Postgres(pool) => sqlx::query(rume_data::sql::PG_BATCHES_CLAIM_THEN)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
                 #[cfg(feature = "mysql")]
-                Self::Mysql(pool) => {
-                    sqlx::query(rume_data::sql::MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED)
-                        .bind(&id)
-                        .execute(pool)
-                        .await
-                        .map_err(|e| JobError::Fatal(e.to_string()))?
-                        .rows_affected()
-                }
+                Self::Mysql(pool) => sqlx::query(rume_data::sql::MYSQL_BATCHES_CLAIM_THEN)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
             };
             Ok(affected > 0)
         })
     }
 
-    fn release_callbacks_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+    fn release_then_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
         let id = id.0.clone();
         Box::pin(async move {
             match self {
                 #[cfg(feature = "sqlite")]
                 Self::Sqlite(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET callbacks_dispatched = 0 WHERE id = ?1",
-                    )
-                    .bind(&id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    sqlx::query(rume_data::sql::SQLITE_BATCHES_RELEASE_THEN)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                 }
                 #[cfg(feature = "postgres")]
                 Self::Postgres(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET callbacks_dispatched = FALSE WHERE id = $1",
-                    )
-                    .bind(&id)
-                    .execute(pool)
-                    .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    sqlx::query(rume_data::sql::PG_BATCHES_RELEASE_THEN)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                 }
                 #[cfg(feature = "mysql")]
                 Self::Mysql(pool) => {
-                    sqlx::query(
-                        "UPDATE rume_job_batches SET callbacks_dispatched = 0 WHERE id = ?",
-                    )
+                    sqlx::query(rume_data::sql::MYSQL_BATCHES_RELEASE_THEN)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn try_claim_finally(&self, id: &BatchId) -> BoxFuture<'_, Result<bool, JobError>> {
+        let id = id.0.clone();
+        Box::pin(async move {
+            let affected = match self {
+                #[cfg(feature = "sqlite")]
+                Self::Sqlite(pool) => sqlx::query(rume_data::sql::SQLITE_BATCHES_CLAIM_FINALLY)
                     .bind(&id)
                     .execute(pool)
                     .await
-                    .map_err(|e| JobError::Fatal(e.to_string()))?;
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
+                #[cfg(feature = "postgres")]
+                Self::Postgres(pool) => sqlx::query(rume_data::sql::PG_BATCHES_CLAIM_FINALLY)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
+                #[cfg(feature = "mysql")]
+                Self::Mysql(pool) => sqlx::query(rume_data::sql::MYSQL_BATCHES_CLAIM_FINALLY)
+                    .bind(&id)
+                    .execute(pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+                    .rows_affected(),
+            };
+            Ok(affected > 0)
+        })
+    }
+
+    fn release_finally_claim(&self, id: &BatchId) -> BoxFuture<'_, Result<(), JobError>> {
+        let id = id.0.clone();
+        Box::pin(async move {
+            match self {
+                #[cfg(feature = "sqlite")]
+                Self::Sqlite(pool) => {
+                    sqlx::query(rume_data::sql::SQLITE_BATCHES_RELEASE_FINALLY)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+                #[cfg(feature = "postgres")]
+                Self::Postgres(pool) => {
+                    sqlx::query(rume_data::sql::PG_BATCHES_RELEASE_FINALLY)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
+                }
+                #[cfg(feature = "mysql")]
+                Self::Mysql(pool) => {
+                    sqlx::query(rume_data::sql::MYSQL_BATCHES_RELEASE_FINALLY)
+                        .bind(&id)
+                        .execute(pool)
+                        .await
+                        .map_err(|e| JobError::Fatal(e.to_string()))?;
                 }
             }
             Ok(())
@@ -822,7 +1181,8 @@ impl BatchBuilder {
             then_job_payload,
             finally_job_name,
             finally_job_payload,
-            callbacks_dispatched: false,
+            then_dispatched: false,
+            finally_dispatched: false,
         };
         Ok((batch, self.jobs))
     }
@@ -847,8 +1207,10 @@ impl BatchBuilder {
                 // Why: account for every job that was never enqueued so `pending_jobs`,
                 // `failed_jobs`, and `status` stay accurate instead of hanging forever
                 // waiting on jobs that never entered the queue.
-                for _ in idx..total {
-                    let _ = store.record_failure(&created.id).await;
+                for failed_idx in idx..total {
+                    let _ = store
+                        .record_job_failure(&created.id, &format!("enqueue-failed-{failed_idx}"))
+                        .await;
                 }
                 return Err(err);
             }
@@ -931,11 +1293,17 @@ mod tests {
             .await
             .expect("create batch");
 
-        let b1 = store.record_success(&batch.id).await.expect("success 1");
+        let b1 = store
+            .record_job_success(&batch.id, "job-1")
+            .await
+            .expect("success 1");
         assert_eq!(b1.status, BatchStatus::Running);
         assert_eq!(b1.pending_jobs, 1);
 
-        let b2 = store.record_success(&batch.id).await.expect("success 2");
+        let b2 = store
+            .record_job_success(&batch.id, "job-2")
+            .await
+            .expect("success 2");
         assert_eq!(b2.status, BatchStatus::Completed);
         assert_eq!(b2.pending_jobs, 0);
 
@@ -974,10 +1342,16 @@ mod tests {
             .await
             .expect("create batch");
 
-        let b1 = store.record_failure(&batch.id).await.expect("failure 1");
+        let b1 = store
+            .record_job_failure(&batch.id, "job-1")
+            .await
+            .expect("failure 1");
         assert_eq!(b1.status, BatchStatus::Running);
 
-        let b2 = store.record_success(&batch.id).await.expect("success 2");
+        let b2 = store
+            .record_job_success(&batch.id, "job-2")
+            .await
+            .expect("success 2");
         assert_eq!(b2.status, BatchStatus::Failed);
         assert_eq!(b2.pending_jobs, 0);
 
@@ -1020,8 +1394,8 @@ mod tests {
         assert_eq!(loaded.pending_jobs, 2);
         assert_eq!(loaded.status, BatchStatus::Running);
 
-        let _ = store.record_success(&batch.id).await.unwrap();
-        let done = store.record_success(&batch.id).await.unwrap();
+        let _ = store.record_job_success(&batch.id, "job-1").await.unwrap();
+        let done = store.record_job_success(&batch.id, "job-2").await.unwrap();
         assert_eq!(done.status, BatchStatus::Completed);
 
         done.dispatch_callbacks_to_queue(&store, &queue)
@@ -1056,6 +1430,14 @@ mod tests {
         }
 
         impl JobQueue for FlakyQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,
@@ -1161,9 +1543,9 @@ mod tests {
 
         // When the 1 enqueued job finishes, the batch transitions cleanly to Failed.
         let terminal = store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, "job-0")
             .await
-            .expect("record_success");
+            .expect("record_job_success");
         assert_eq!(terminal.pending_jobs, 0);
         assert_eq!(terminal.status, BatchStatus::Failed);
 
@@ -1193,6 +1575,14 @@ mod tests {
         }
 
         impl JobQueue for CapturingQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,
@@ -1274,9 +1664,9 @@ mod tests {
             .expect("create batch");
 
         let done = store
-            .record_success(&batch.id)
+            .record_job_success(&batch.id, "job-1")
             .await
-            .expect("record_success");
+            .expect("record_job_success");
         done.dispatch_callbacks_to_queue(&store, &queue)
             .await
             .expect("dispatch callbacks");
@@ -1292,6 +1682,182 @@ mod tests {
         assert_eq!(
             jobs[1].idempotency_key.as_deref(),
             Some(format!("batch:{}:finally", batch.id.0).as_str())
+        );
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn sqlite_batch_deduplicates_job_outcomes_and_splits_then_finally_claims() {
+        use std::sync::atomic::AtomicBool;
+
+        #[derive(Debug)]
+        struct FailFinallyOnceQueue {
+            fail_finally: AtomicBool,
+            enqueued_names: Mutex<Vec<String>>,
+        }
+
+        impl JobQueue for FailFinallyOnceQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
+            fn enqueue_delayed_with_trace<J: Job>(
+                &self,
+                job: J,
+                delay: Duration,
+                trace_context: Option<String>,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                match RawJob::from_job(job, trace_context) {
+                    Ok(raw) => self.enqueue_raw(raw, delay),
+                    Err(err) => Box::pin(async move { Err(err) }),
+                }
+            }
+            fn enqueue_raw(
+                &self,
+                job: RawJob,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<String, JobError>> {
+                Box::pin(async move {
+                    if job.name == FinallyCallback::NAME
+                        && self.fail_finally.swap(false, Ordering::SeqCst)
+                    {
+                        return Err(JobError::Fatal("transient finally enqueue error".into()));
+                    }
+                    let mut guard = self.enqueued_names.lock().unwrap();
+                    guard.push(job.name);
+                    Ok(format!("job-{}", guard.len()))
+                })
+            }
+            fn dequeue_for(
+                &self,
+                _worker_id: &str,
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                Box::pin(async { Ok(None) })
+            }
+            fn ack(&self, _job_id: &str, _token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn nack(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _delay: Duration,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn dead_letter(
+                &self,
+                _job: QueuedJob,
+                _token: &str,
+                _reason: String,
+            ) -> BoxFuture<'_, Result<(), JobError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn reclaim_abandoned_jobs(
+                &self,
+                _dead_workers: &[String],
+            ) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .expect("sqlite memory");
+        let store = SqlBatchStore::Sqlite(pool);
+        store.init_schema().await.expect("init batches schema");
+
+        let batch = BatchBuilder::new("rc14-dedup-split")
+            .add_job(WorkItem { id: 1 })
+            .add_job(WorkItem { id: 2 })
+            .then(ThenCallback {
+                label: "done".into(),
+            })
+            .finally(FinallyCallback {
+                label: "cleanup".into(),
+            })
+            .create_in_store(&store)
+            .await
+            .expect("create batch");
+
+        // Duplicate redelivery of "job-1" in a 2-job batch MUST leave pending_jobs == 1.
+        let after_first = store
+            .record_job_success(&batch.id, "job-1")
+            .await
+            .expect("first job-1");
+        assert_eq!(after_first.pending_jobs, 1);
+        assert_eq!(after_first.completed_jobs, 1);
+        assert_eq!(after_first.status, BatchStatus::Running);
+
+        let after_dup = store
+            .record_job_success(&batch.id, "job-1")
+            .await
+            .expect("duplicate job-1");
+        assert_eq!(
+            after_dup.pending_jobs, 1,
+            "duplicate record_job_success must not decrement pending_jobs twice"
+        );
+        assert_eq!(after_dup.completed_jobs, 1);
+        assert_eq!(after_dup.status, BatchStatus::Running);
+
+        // Neither callback should fire while batch is still Running.
+        let queue = FailFinallyOnceQueue {
+            fail_finally: AtomicBool::new(true),
+            enqueued_names: Mutex::new(Vec::new()),
+        };
+        after_dup
+            .dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect("running batch dispatches nothing");
+        assert!(queue.enqueued_names.lock().unwrap().is_empty());
+
+        // Second distinct job completes the batch.
+        let completed = store
+            .record_job_success(&batch.id, "job-2")
+            .await
+            .expect("job-2");
+        assert_eq!(completed.pending_jobs, 0);
+        assert_eq!(completed.completed_jobs, 2);
+        assert_eq!(completed.status, BatchStatus::Completed);
+
+        // First callback dispatch: `then` succeeds, `finally` fails -> error returned,
+        // `then_dispatched` stays true, `finally_dispatched` is released to false.
+        let err = completed
+            .dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect_err("finally failure must surface");
+        assert!(err.to_string().contains("transient finally enqueue error"));
+        let mid = store.load_batch(&batch.id).await.unwrap().unwrap();
+        assert!(mid.then_dispatched);
+        assert!(!mid.finally_dispatched);
+
+        // Retry dispatches ONLY `finally`, NOT `then` a second time!
+        completed
+            .dispatch_callbacks_to_queue(&store, &queue)
+            .await
+            .expect("retry succeeds");
+        let final_state = store.load_batch(&batch.id).await.unwrap().unwrap();
+        assert!(final_state.then_dispatched);
+        assert!(final_state.finally_dispatched);
+
+        let enqueued = queue.enqueued_names.lock().unwrap().clone();
+        assert_eq!(
+            enqueued,
+            vec![
+                ThenCallback::NAME.to_string(),
+                FinallyCallback::NAME.to_string()
+            ],
+            "retrying after `finally` failure must not re-run `then`"
         );
     }
 }

@@ -9,7 +9,10 @@ pub fn run(name: &str) {
     let struct_name = rume::util::pascal_case(&module_name);
 
     let dir = "src/services";
-    let _ = std::fs::create_dir_all(dir);
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        eprintln!("error: failed to create directory {dir}: {err}");
+        std::process::exit(1);
+    }
     let service_path = format!("{dir}/{module_name}.rs");
     if std::path::Path::new(&service_path).exists() {
         eprintln!("error: service `{module_name}` already exists");
@@ -32,11 +35,15 @@ pub fn run(name: &str) {
             }
         }
         Ok(_) => {}
-        Err(_) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if let Err(err) = fs::write(&mod_path, mod_entry.clone()) {
                 eprintln!("error: failed to create {mod_path}: {err}");
                 std::process::exit(1);
             }
+        }
+        Err(err) => {
+            eprintln!("error: failed to read {mod_path}: {err}");
+            std::process::exit(1);
         }
     }
 

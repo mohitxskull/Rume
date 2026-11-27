@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use futures_util::FutureExt;
 use rume_data::coordination::LeaderElector;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use tokio::sync::watch;
@@ -428,12 +429,27 @@ async fn run_job_loop(
         match job.spec.evaluate_tick(scheduled_at, eval_now) {
             Ok(decision) => {
                 next_scheduled = decision.next_scheduled;
-                if decision.should_run
-                    && is_leader_valid(leader_rx)
-                    && !*shutdown_rx.borrow()
-                    && let Err(err) = (job.handler)(scheduled_at).await
-                {
-                    error!(job = %job.spec.name, error = %err, "cron job handler failed");
+                if decision.should_run && is_leader_valid(leader_rx) && !*shutdown_rx.borrow() {
+                    // Why: isolate panics in BOTH synchronous handler invocation and async
+                    // future polling so a buggy cron handler cannot silently kill its
+                    // scheduler task for all subsequent ticks (`RC-21`).
+                    let fut_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        (job.handler)(scheduled_at)
+                    }));
+                    match fut_res {
+                        Ok(fut) => match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => {
+                                error!(job = %job.spec.name, error = %err, "cron job handler failed");
+                            }
+                            Err(_) => {
+                                error!(job = %job.spec.name, "cron job handler panicked during execution");
+                            }
+                        },
+                        Err(_) => {
+                            error!(job = %job.spec.name, "cron job handler panicked during invocation");
+                        }
+                    }
                 }
             }
             Err(err) => {

@@ -162,6 +162,8 @@ pub struct OutboxRelayConfig {
     pub poll_interval: Duration,
     /// Maximum number of dispatch retries before transitioning a message to failed.
     pub max_retries: u32,
+    /// Optional per-message dispatch timeout (default: `Some(30s)`).
+    pub dispatch_timeout: Option<Duration>,
 }
 
 impl Default for OutboxRelayConfig {
@@ -171,6 +173,7 @@ impl Default for OutboxRelayConfig {
             lease_duration_secs: 30,
             poll_interval: Duration::from_millis(500),
             max_retries: 5,
+            dispatch_timeout: Some(Duration::from_secs(30)),
         }
     }
 }
@@ -179,6 +182,12 @@ impl OutboxRelayConfig {
     /// Sets a custom retry limit before a message is marked as failed.
     pub fn with_max_retries(mut self, max_retries: u32) -> Self {
         self.max_retries = max_retries;
+        self
+    }
+
+    /// Sets an optional per-message dispatch timeout.
+    pub fn with_dispatch_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.dispatch_timeout = timeout;
         self
     }
 }
@@ -336,6 +345,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         let hb_leases = Arc::clone(&batch_leases);
         let hb_lost = Arc::clone(&lease_lost_flags);
         let hb_cursor = Arc::clone(&batch_cursor);
+        let renew_timeout = hb_interval.max(Duration::from_secs(1));
         let heartbeat_handle = tokio::spawn(async move {
             let mut interval = tokio::time::interval(hb_interval);
             interval.tick().await; // first tick immediate
@@ -343,23 +353,41 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 tokio::select! {
                     _ = &mut cancel_rx => break,
                     _ = interval.tick() => {
-                        let cursor_guard = hb_cursor.lock().await;
-                        let start_idx = *cursor_guard;
+                        // Why: snapshot `batch_cursor` and release the lock before awaiting
+                        // `renew_outbox_lease` so `N` sequential DB renewals never block message
+                        // finalization from advancing `batch_cursor` (`P2-13`).
+                        let start_idx = *hb_cursor.lock().await;
                         for idx in start_idx..hb_leases.len() {
-                            if hb_lost[idx].load(Ordering::SeqCst) {
+                            if idx < *hb_cursor.lock().await || hb_lost[idx].load(Ordering::SeqCst) {
                                 continue;
                             }
-                            if let Some((ref msg_id, ref token)) = hb_leases[idx]
-                                && let Err(e) = hb_repo
-                                    .renew_outbox_lease(msg_id, token, renew_extension_secs)
-                                    .await
-                            {
-                                tracing::error!(
-                                    message_id = %msg_id,
-                                    error = %e,
-                                    "Failed to renew outbox lease heartbeat; lease ownership lost during batch dispatch"
-                                );
-                                hb_lost[idx].store(true, Ordering::SeqCst);
+                            if let Some((ref msg_id, ref token)) = hb_leases[idx] {
+                                // Why: bound each renewal RPC so a stalled DB cannot hang the
+                                // heartbeat task indefinitely (`RC-12`).
+                                match tokio::time::timeout(
+                                    renew_timeout,
+                                    hb_repo.renew_outbox_lease(msg_id, token, renew_extension_secs),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(())) => {}
+                                    Ok(Err(e)) => {
+                                        tracing::error!(
+                                            message_id = %msg_id,
+                                            error = %e,
+                                            "Failed to renew outbox lease heartbeat; lease ownership lost during batch dispatch"
+                                        );
+                                        hb_lost[idx].store(true, Ordering::SeqCst);
+                                    }
+                                    Err(_) => {
+                                        tracing::error!(
+                                            message_id = %msg_id,
+                                            timeout = ?renew_timeout,
+                                            "Timed out renewing outbox lease heartbeat; lease ownership lost during batch dispatch"
+                                        );
+                                        hb_lost[idx].store(true, Ordering::SeqCst);
+                                    }
+                                }
                             }
                         }
                     }
@@ -399,21 +427,39 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 continue;
             }
 
-            // Renew the lease before dispatching to refresh it after waiting in batch
-            if let Err(e) = self
-                .repository
-                .renew_outbox_lease(&message.id, token, renew_extension_secs)
-                .await
+            // Renew the lease before dispatching to refresh it after waiting in batch.
+            // Why: bound pre-dispatch lease renewal with `renew_timeout` so a stalled DB
+            // cannot wedge `poll_and_dispatch` indefinitely (`P2-13`).
+            match tokio::time::timeout(
+                renew_timeout,
+                self.repository
+                    .renew_outbox_lease(&message.id, token, renew_extension_secs),
+            )
+            .await
             {
-                tracing::warn!(
-                    message_id = %message.id,
-                    error = %e,
-                    "Failed to renew outbox message lease before dispatch; lease expired or token mismatch"
-                );
-                lease_lost.store(true, Ordering::SeqCst);
-                *batch_cursor.lock().await = idx + 1;
-                result.failed_transitions += 1;
-                continue;
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        message_id = %message.id,
+                        error = %e,
+                        "Failed to renew outbox message lease before dispatch; lease expired or token mismatch"
+                    );
+                    lease_lost.store(true, Ordering::SeqCst);
+                    *batch_cursor.lock().await = idx + 1;
+                    result.failed_transitions += 1;
+                    continue;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        message_id = %message.id,
+                        timeout = ?renew_timeout,
+                        "Timed out renewing outbox message lease before dispatch"
+                    );
+                    lease_lost.store(true, Ordering::SeqCst);
+                    *batch_cursor.lock().await = idx + 1;
+                    result.failed_transitions += 1;
+                    continue;
+                }
             }
 
             let cancel_signal = Arc::clone(&lease_lost);
@@ -439,12 +485,23 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             let dispatch_result = match fut_result {
                 Ok(fut) => {
                     let scoped_fut = tc.scope_future(span, fut);
-                    match std::panic::AssertUnwindSafe(scoped_fut)
-                        .catch_unwind()
-                        .await
-                    {
-                        Ok(res) => res,
-                        Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
+                    let guarded = std::panic::AssertUnwindSafe(scoped_fut).catch_unwind();
+                    match self.config.dispatch_timeout {
+                        Some(limit) => match tokio::time::timeout(limit, guarded).await {
+                            Ok(Ok(res)) => res,
+                            Ok(Err(_)) => {
+                                Err(OutboxError::Dispatch("outbox dispatcher panicked".into()))
+                            }
+                            Err(_) => Err(OutboxError::Dispatch(format!(
+                                "outbox dispatcher timed out after {limit:?}"
+                            ))),
+                        },
+                        None => match guarded.await {
+                            Ok(res) => res,
+                            Err(_) => {
+                                Err(OutboxError::Dispatch("outbox dispatcher panicked".into()))
+                            }
+                        },
                     }
                 }
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
@@ -658,11 +715,14 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         // Why: `send_replace(true)` retains the shutdown flag even when no background loop
         // has subscribed yet, whereas `send(true)` drops the value when `receiver_count() == 0`.
         self.shutdown_tx.send_replace(true);
-        let start = std::time::Instant::now();
+        // Why: use `tokio::time::Instant` so `try_drain` respects paused virtual time in tests
+        // and aligns with `tokio::time::timeout` / `tokio::time::sleep` (`RC-35`).
+        let start = tokio::time::Instant::now();
         let deadline = start + timeout;
+        let mut idle_backoff = Duration::from_millis(20);
 
         loop {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             if now >= deadline {
                 tracing::warn!("Outbox relay drain timed out");
                 return Ok(false);
@@ -683,7 +743,7 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 return Ok(true);
             }
 
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             if now >= deadline {
                 tracing::warn!(
                     remaining = count,
@@ -717,16 +777,26 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 )));
             }
 
-            let now = std::time::Instant::now();
+            if res.total_processed() > 0 {
+                // Progress was made; reset backoff and immediately check/drain the next batch.
+                idle_backoff = Duration::from_millis(20);
+                continue;
+            }
+
+            // Why: `pending_count > 0` but `poll_and_dispatch` claimed 0 rows (only
+            // future-retry or peer-inflight rows remain). Use bounded exponential backoff
+            // instead of 20ms busy-spinning (`RC-35`).
+            let now = tokio::time::Instant::now();
             if now >= deadline {
                 return Ok(false);
             }
             let remaining = deadline.saturating_duration_since(now);
-            let sleep_dur = Duration::from_millis(20).min(remaining);
+            let sleep_dur = idle_backoff.min(remaining);
             if sleep_dur.is_zero() {
                 return Ok(false);
             }
             sleep(sleep_dur).await;
+            idle_backoff = (idle_backoff * 2).min(Duration::from_millis(500));
         }
     }
 
@@ -1078,6 +1148,7 @@ mod tests {
             lease_duration_secs: 0, // clamps hb_interval to 50ms
             poll_interval: Duration::from_millis(50),
             max_retries: 3,
+            ..Default::default()
         });
 
         let res = relay
@@ -1131,5 +1202,204 @@ mod tests {
             tp, &child_tc.traceparent,
             "broker_dispatcher must capture the async scoped span, not the synchronous ambient span"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn outbox_relay_enforces_dispatch_timeout_and_try_drain_uses_tokio_time() {
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct TimeoutAndIdleRepo {
+            messages: Mutex<Vec<OutboxMessage>>,
+            pending_always: AtomicU32,
+            poll_calls: AtomicU32,
+        }
+
+        impl OutboxRepository for TimeoutAndIdleRepo {
+            fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fetch_pending(
+                &self,
+                _limit: usize,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn claim_pending_with_lease(
+                &self,
+                _limit: usize,
+                _lease_duration_secs: u64,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                self.poll_calls.fetch_add(1, Ordering::SeqCst);
+                let batch = std::mem::take(&mut *self.messages.lock().unwrap());
+                Box::pin(async move { Ok(batch) })
+            }
+            fn renew_outbox_lease(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+                _extension_secs: u64,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_published(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed_with_max_retries(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+                _error: String,
+                _max_retries: u32,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn recover_expired_claims(
+                &self,
+                _max_lease_age_secs: u64,
+            ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                let c = self.pending_always.load(Ordering::SeqCst) as usize;
+                Box::pin(async move { Ok(c) })
+            }
+            fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let mut msg = OutboxMessage::new("m-hang", "evt.hang", b"{}".to_vec());
+        msg.lease_token = Some("tok-hang".into());
+        let repo = Arc::new(TimeoutAndIdleRepo {
+            messages: Mutex::new(vec![msg]),
+            pending_always: AtomicU32::new(1),
+            poll_calls: AtomicU32::new(0),
+        });
+
+        let relay = OutboxRelay::new(Arc::clone(&repo), |_msg| async {
+            std::future::pending::<Result<(), OutboxError>>().await
+        })
+        .with_config(OutboxRelayConfig {
+            dispatch_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+
+        // Hanging dispatcher must time out and schedule a retry instead of blocking forever.
+        let poll = relay.poll_and_dispatch(10).await.expect("poll");
+        assert_eq!(poll.published, 0);
+        assert_eq!(poll.retried, 1);
+
+        // With 1 unclaimable future-retry row remaining, `try_drain(2s)` must finish via
+        // paused tokio time with exponential backoff (far fewer polls than 20ms spinning = 100 polls).
+        repo.poll_calls.store(0, Ordering::SeqCst);
+        let drained = relay
+            .try_drain(Duration::from_secs(2))
+            .await
+            .expect("drain");
+        assert!(!drained);
+        let calls = repo.poll_calls.load(Ordering::SeqCst);
+        assert!(
+            calls < 15,
+            "try_drain should back off when no rows are claimable instead of 20ms spinning (got {calls} polls)"
+        );
+    }
+
+    #[tokio::test]
+    async fn outbox_relay_bounds_pre_dispatch_lease_renewal_with_timeout() {
+        tokio::time::pause();
+
+        #[derive(Debug)]
+        struct HangingRenewRepo {
+            messages: std::sync::Mutex<Vec<OutboxMessage>>,
+        }
+
+        impl OutboxRepository for HangingRenewRepo {
+            fn save(&self, _message: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fetch_pending(
+                &self,
+                _limit: usize,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                Box::pin(async { Ok(Vec::new()) })
+            }
+            fn claim_pending_with_lease(
+                &self,
+                _limit: usize,
+                _lease_duration_secs: u64,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                let msgs = std::mem::take(&mut *self.messages.lock().unwrap());
+                Box::pin(async move { Ok(msgs) })
+            }
+            fn renew_outbox_lease(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+                _extension_secs: u64,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                // Hang forever to verify pre-dispatch renewal is bounded by `renew_timeout` (`P2-13`).
+                Box::pin(async {
+                    std::future::pending::<()>().await;
+                    Ok(())
+                })
+            }
+            fn mark_published(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed_with_max_retries(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+                _error: String,
+                _max_retries: u32,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn recover_expired_claims(
+                &self,
+                _max_lease_age_secs: u64,
+            ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let mut msg = OutboxMessage::new("m-renew-hang", "evt.hang", b"{}".to_vec());
+        msg.lease_token = Some("tok-1".into());
+        let repo = Arc::new(HangingRenewRepo {
+            messages: std::sync::Mutex::new(vec![msg]),
+        });
+        let dispatched = Arc::new(AtomicU32::new(0));
+        let dispatched_clone = Arc::clone(&dispatched);
+
+        let relay = OutboxRelay::new(repo, move |_msg| {
+            let d = Arc::clone(&dispatched_clone);
+            async move {
+                d.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        });
+
+        let poll = relay
+            .poll_and_dispatch(10)
+            .await
+            .expect("poll must not hang");
+        assert_eq!(poll.published, 0);
+        assert_eq!(poll.failed_transitions, 1);
+        assert_eq!(dispatched.load(Ordering::SeqCst), 0);
     }
 }

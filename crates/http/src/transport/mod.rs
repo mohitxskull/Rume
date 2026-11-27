@@ -7,5 +7,6 @@ pub mod cors;
 pub use body_limit::{BodyLimitConfig, BodyLimitLayer, DEFAULT_BODY_LIMIT_BYTES};
 pub use compression::{
     CompressionConfig, CompressionLayer, CompressionPredicate, DEFAULT_COMPRESSION_MIN_SIZE_BYTES,
+    SkipSensitiveHeaders,
 };
 pub use cors::{CorsAllowList, CorsConfig, CorsConfigError, CorsLayer};

@@ -250,8 +250,9 @@ impl SecretProvider for CachedSecretProvider {
             let secret = self.inner.get_secret(key).await?;
             if !self.ttl.is_zero() {
                 let mut cache = self.cache.write();
-                if self.generation.load(Ordering::Acquire) == observed_gen {
-                    let expires_at = Instant::now() + self.ttl;
+                if self.generation.load(Ordering::Acquire) == observed_gen
+                    && let Some(expires_at) = Instant::now().checked_add(self.ttl)
+                {
                     cache.insert(
                         key.to_string(),
                         CachedEntry {
@@ -275,8 +276,9 @@ impl SecretProvider for CachedSecretProvider {
                     {
                         let mut cache = self.cache.write();
                         self.generation.fetch_add(1, Ordering::AcqRel);
-                        if !self.ttl.is_zero() {
-                            let expires_at = Instant::now() + self.ttl;
+                        if !self.ttl.is_zero()
+                            && let Some(expires_at) = Instant::now().checked_add(self.ttl)
+                        {
                             cache.insert(
                                 key.to_string(),
                                 CachedEntry {
@@ -284,6 +286,8 @@ impl SecretProvider for CachedSecretProvider {
                                     expires_at,
                                 },
                             );
+                        } else {
+                            cache.remove(key);
                         }
                     }
                     if let Some(cb) = &self.on_rotation {
@@ -350,13 +354,29 @@ impl VaultSecretProvider {
         self
     }
 
-    fn resolve_path(&self, key: &str) -> String {
-        let mount = self.mount.trim_end_matches('/');
-        let key = key.trim_start_matches('/');
-        match &self.namespace {
-            Some(ns) => format!("{}/{mount}/{key}", ns.trim_matches('/')),
-            None => format!("{mount}/{key}"),
+    fn resolve_path(&self, key: &str) -> Result<String, SecretProviderError> {
+        // Why: reject path traversal segments (`.`, `..`), backslashes, NUL bytes,
+        // query strings, and fragments so untrusted secret keys cannot escape the
+        // configured Vault mount or namespace (`RC-36`).
+        if key.is_empty()
+            || key.chars().any(|c| matches!(c, '\\' | '\0' | '?' | '#'))
+            || key.split('/').any(|seg| seg == "." || seg == "..")
+        {
+            return Err(SecretProviderError::Backend(format!(
+                "invalid Vault secret key path: '{key}'"
+            )));
         }
+        let mount = self.mount.trim_end_matches('/');
+        let trimmed_key = key.trim_start_matches('/');
+        if trimmed_key.is_empty() {
+            return Err(SecretProviderError::Backend(
+                "invalid Vault secret key path: empty after trimming".to_string(),
+            ));
+        }
+        Ok(match &self.namespace {
+            Some(ns) => format!("{}/{mount}/{trimmed_key}", ns.trim_matches('/')),
+            None => format!("{mount}/{trimmed_key}"),
+        })
     }
 }
 
@@ -376,7 +396,7 @@ impl SecretProvider for VaultSecretProvider {
         key: &'a str,
     ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
         Box::pin(async move {
-            let path = self.resolve_path(key);
+            let path = self.resolve_path(key)?;
             self.backend.fetch_secret(&path).await
         })
     }
@@ -386,7 +406,7 @@ impl SecretProvider for VaultSecretProvider {
         key: &'a str,
     ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
         Box::pin(async move {
-            let path = self.resolve_path(key);
+            let path = self.resolve_path(key)?;
             self.backend.rotate_secret(&path).await
         })
     }
@@ -650,5 +670,54 @@ mod tests {
         // Subsequent cached read must return v2 (v1 must NOT have overwritten v2).
         let cached = provider.get_secret("db_pass").await.unwrap();
         assert_eq!(cached.expose_secret(), "v2");
+    }
+
+    #[tokio::test]
+    async fn cached_secret_provider_duration_max_ttl_does_not_panic() {
+        let inner = Arc::new(RotatingMockProvider::new());
+        let provider = CachedSecretProvider::new(inner, Duration::MAX);
+        let s1 = provider.get_secret("k").await.unwrap();
+        assert_eq!(s1.expose_secret(), "k-v1-supersecret");
+        let s2 = provider.rotate("k").await.unwrap();
+        assert_eq!(s2.expose_secret(), "k-v2-supersecret");
+    }
+
+    #[tokio::test]
+    async fn vault_secret_provider_rejects_path_traversal_and_unsafe_chars() {
+        struct DenyAllBackend;
+        impl ExternalSecretBackend for DenyAllBackend {
+            fn name(&self) -> &str {
+                "deny-all"
+            }
+            fn fetch_secret<'a>(
+                &'a self,
+                _path: &'a str,
+            ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
+                Box::pin(async { panic!("backend must not be called for invalid path") })
+            }
+        }
+
+        let vault =
+            VaultSecretProvider::new(Arc::new(DenyAllBackend), "secret/data").with_namespace("ns");
+
+        for bad in [
+            "",
+            "/",
+            ".",
+            "..",
+            "../admin/root",
+            "a/../b",
+            "a/./b",
+            "a\\b",
+            "a\0b",
+            "a?version=1",
+            "a#frag",
+        ] {
+            let err = vault.get_secret(bad).await.unwrap_err();
+            assert!(
+                matches!(err, SecretProviderError::Backend(_)),
+                "expected Backend error for Vault key {bad:?}, got {err:?}"
+            );
+        }
     }
 }

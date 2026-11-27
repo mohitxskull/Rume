@@ -570,8 +570,25 @@ impl<Q: JobQueue> JobWorker<Q> {
                 }
                 continue;
             }
+            let excluded_queues: Vec<String> =
+                if self.queues.is_none() && !self.queue_concurrency.is_empty() {
+                    self.queue_concurrency
+                        .iter()
+                        .filter(|(_, sem)| sem.available_permits() == 0)
+                        .map(|(q, _)| q.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
             let dequeue_fut = match queue_refs.as_deref() {
                 Some(qs) => self.queue.dequeue_from(&run_worker_id, Some(qs)),
+                // Why: when `queues == None` and some queues are at their per-queue
+                // concurrency cap, exclude those saturated queues in SQL/queue selection
+                // so a saturated high-priority queue cannot starve other queues or churn
+                // DB deferrals (`RC-30`).
+                None if !excluded_queues.is_empty() => self
+                    .queue
+                    .dequeue_excluding(&run_worker_id, &excluded_queues),
                 None => self.queue.dequeue_for(&run_worker_id),
             };
             match dequeue_fut.await {

@@ -9,7 +9,7 @@ pub mod trace;
 
 pub use error::app_error_to_status;
 pub use router::{GrpcRouterExt, mount_grpc_routes};
-pub use trace::RumeTraceInterceptor;
+pub use trace::{RumeGrpcTraceLayer, RumeGrpcTraceService, RumeTraceInterceptor};
 
 #[cfg(test)]
 mod tests {
@@ -91,5 +91,37 @@ mod tests {
             out_meta.get("tracestate").and_then(|v| v.to_str().ok()),
             Some(ts)
         );
+    }
+
+    #[tokio::test]
+    async fn grpc_trace_layer_scopes_task_local_trace_context_in_async_service() {
+        use std::convert::Infallible;
+        use tower::{Layer, ServiceExt};
+
+        let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let svc = RumeGrpcTraceLayer.layer(tower::service_fn(
+            |req: axum::http::Request<()>| async move {
+                let current_tc = TraceContext::current()
+                    .expect("TraceContext::current() must be Some inside RumeGrpcTraceLayer");
+                let ext_req_id = req
+                    .extensions()
+                    .get::<RequestId>()
+                    .expect("RequestId must be in extensions")
+                    .as_str()
+                    .to_string();
+                Ok::<_, Infallible>((current_tc.trace_id().to_string(), ext_req_id))
+            },
+        ));
+
+        let req = axum::http::Request::builder()
+            .uri("/rume.v1.Echo/Ping")
+            .header("traceparent", tp)
+            .header("x-request-id", "grpc-req-7")
+            .body(())
+            .unwrap();
+
+        let (trace_id, req_id) = svc.oneshot(req).await.unwrap();
+        assert_eq!(trace_id, "4bf92f3577b34da6a3ce929d0e0e4736");
+        assert_eq!(req_id, "grpc-req-7");
     }
 }

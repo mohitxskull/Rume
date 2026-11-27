@@ -99,12 +99,32 @@ pub fn is_forbidden_ip(ip: IpAddr) -> bool {
     }
 }
 
+fn is_numeric_ipv4_label(part: &str) -> bool {
+    if part.is_empty() {
+        return false;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit());
+    }
+    part.bytes().all(|b| b.is_ascii_digit())
+}
+
+fn looks_like_non_canonical_ipv4(host: &str) -> bool {
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    parts.iter().all(|p| is_numeric_ipv4_label(p))
+}
+
 /// Validates a URL host string (domain name or IP literal, optionally bracketed
 /// for IPv6) against SSRF rules.
 ///
-/// Rejects empty hosts, RFC 6890 special-purpose IP literals, and reserved
-/// local/internal hostnames (`localhost`, `*.localhost`, `*.local`, `*.internal`)
-/// after stripping any trailing DNS root dot(s).
+/// Rejects empty hosts, IPv6 zone IDs (`%`), invalid bracketed hosts,
+/// non-canonical IPv4 shorthands (decimal/hex/octal/short forms), RFC 6890
+/// special-purpose IP literals, and reserved local/internal hostnames
+/// (`localhost`, `*.localhost`, `*.local`, `*.internal`) after stripping any
+/// trailing DNS root dot(s).
 pub fn validate_host(host: &str) -> Result<(), String> {
     let trimmed = host.trim();
     if trimmed.is_empty() {
@@ -116,15 +136,41 @@ pub fn validate_host(host: &str) -> Result<(), String> {
         return Err(format!("forbidden host '{host}'"));
     }
 
-    let unbracketed = normalized
-        .strip_prefix('[')
-        .and_then(|s| s.strip_suffix(']'))
-        .unwrap_or(normalized);
-    if let Ok(ip) = unbracketed.parse::<IpAddr>() {
+    // Why: reject IPv6 zone IDs (e.g. `[fe80::1%eth0]`, `[::1%lo0]`) because
+    // `std::net::IpAddr::from_str` rejects `%` and would otherwise fall through
+    // to the hostname branch (`RC-36`).
+    if normalized.contains('%') {
+        return Err(format!("forbidden IPv6 zone ID in host '{host}'"));
+    }
+
+    if normalized.contains('[') || normalized.contains(']') {
+        let Some(inner) = normalized
+            .strip_prefix('[')
+            .and_then(|s| s.strip_suffix(']'))
+        else {
+            return Err(format!("invalid bracketed host '{host}'"));
+        };
+        let Ok(v6) = inner.parse::<Ipv6Addr>() else {
+            return Err(format!("invalid bracketed IPv6 host '{host}'"));
+        };
+        if is_forbidden_ipv6(v6) {
+            return Err(format!("forbidden IP '{v6}'"));
+        }
+        return Ok(());
+    }
+
+    if let Ok(ip) = normalized.parse::<IpAddr>() {
         if is_forbidden_ip(ip) {
             return Err(format!("forbidden IP '{ip}'"));
         }
         return Ok(());
+    }
+
+    // Why: OS resolvers (`getaddrinfo`) accept non-canonical IPv4 forms such as
+    // decimal integers (`2130706433`), hex (`0x7f000001`), octal (`0177.0.0.1`),
+    // and short dotted forms (`127.1`) that fail `Ipv4Addr::from_str` (`RC-36`).
+    if looks_like_non_canonical_ipv4(normalized) {
+        return Err(format!("forbidden non-canonical IPv4 host '{host}'"));
     }
 
     let lower = normalized.to_ascii_lowercase();
@@ -264,6 +310,30 @@ mod tests {
             assert!(
                 validate_host(allowed).is_ok(),
                 "expected host {allowed:?} to be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_ipv6_zone_ids_invalid_brackets_and_non_canonical_ipv4() {
+        for blocked in [
+            "[fe80::1%eth0]",
+            "[::1%lo0]",
+            "fe80::1%eth0",
+            "[not-an-ip]",
+            "[127.0.0.1]",
+            "foo[bar]",
+            "2130706433",
+            "0x7f000001",
+            "0X7F000001",
+            "0177.0.0.1",
+            "127.1",
+            "127.0.1",
+            "0x7f.0.0.1",
+        ] {
+            assert!(
+                is_forbidden_host(blocked),
+                "expected host {blocked:?} to be blocked"
             );
         }
     }

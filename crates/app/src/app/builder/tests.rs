@@ -1041,9 +1041,9 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
 
     wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
 
+    use rustls_pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
-    for cert in rustls_pemfile::certs(&mut cert_reader) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(TEST_CERT_PEM) {
         root_store.add(cert.unwrap()).unwrap();
     }
     let provider = rustls::crypto::CryptoProvider::get_default()
@@ -1137,9 +1137,9 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
 
     wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
 
+    use rustls_pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
-    for cert in rustls_pemfile::certs(&mut cert_reader) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(TEST_CERT_PEM) {
         root_store.add(cert.unwrap()).unwrap();
     }
     let provider = rustls::crypto::CryptoProvider::get_default()

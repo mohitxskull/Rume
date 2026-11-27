@@ -600,7 +600,7 @@ impl std::fmt::Debug for AllOfPolicy {
 }
 
 impl AllOfPolicy {
-    /// Creates an empty [`AllOfPolicy`].
+    /// Creates an [`AllOfPolicy`] from the given inner policies.
     pub fn new(policies: Vec<Arc<dyn AbacPolicy>>) -> Self {
         Self { policies }
     }
@@ -609,6 +609,11 @@ impl AllOfPolicy {
 impl AbacPolicy for AllOfPolicy {
     fn evaluate<'a>(&'a self, ctx: &'a AbacContext) -> BoxFuture<'a, Result<bool, AuthError>> {
         Box::pin(async move {
+            // Why: fail closed when no inner policies are configured rather than
+            // vacuously granting access (`RC-27`).
+            if self.policies.is_empty() {
+                return Ok(false);
+            }
             for policy in &self.policies {
                 if !policy.evaluate(ctx).await? {
                     return Ok(false);
@@ -634,7 +639,7 @@ impl std::fmt::Debug for AnyOfPolicy {
 }
 
 impl AnyOfPolicy {
-    /// Creates an empty [`AnyOfPolicy`].
+    /// Creates an [`AnyOfPolicy`] from the given inner policies.
     pub fn new(policies: Vec<Arc<dyn AbacPolicy>>) -> Self {
         Self { policies }
     }
@@ -1029,6 +1034,12 @@ mod tests {
             ..ctx_partial
         };
         assert!(all.evaluate(&ctx_full).await.unwrap());
+
+        // Empty AllOfPolicy and AnyOfPolicy must both fail closed.
+        let empty_all = AllOfPolicy::new(vec![]);
+        let empty_any = AnyOfPolicy::new(vec![]);
+        assert!(!empty_all.evaluate(&ctx_full).await.unwrap());
+        assert!(!empty_any.evaluate(&ctx_full).await.unwrap());
     }
 
     #[tokio::test]

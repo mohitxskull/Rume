@@ -126,7 +126,21 @@ impl Module for CatalogModule {
                     {
                         let mut lock = products_clone.write().await;
                         if let Some(p) = lock.get_mut(&pid) {
-                            p.stock = p.stock.saturating_sub(qty);
+                            if p.stock < qty {
+                                return Err(rume::events::EventError::ListenerError {
+                                    event_type: "OrderPlacedEvent",
+                                    message: format!(
+                                        "insufficient stock for product {pid}: requested {qty}, available {}",
+                                        p.stock
+                                    ),
+                                });
+                            }
+                            p.stock -= qty;
+                        } else {
+                            return Err(rume::events::EventError::ListenerError {
+                                event_type: "OrderPlacedEvent",
+                                message: format!("unknown product {pid}"),
+                            });
                         }
                     }
                     if let Some(n) = notify {
@@ -252,7 +266,11 @@ impl Module for OrdersModule {
 async fn create_order(
     State(state): State<OrdersState>,
     Json(payload): Json<CreateOrderPayload>,
-) -> (StatusCode, Json<Order>) {
+) -> Result<(StatusCode, Json<Order>), StatusCode> {
+    if payload.quantity == 0 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+
     let order_id = format!("ord_{}", uuid::Uuid::new_v4().simple());
     let order = Order {
         id: order_id.clone(),
@@ -267,17 +285,22 @@ async fn create_order(
         .await
         .insert(order_id.clone(), order.clone());
 
-    // Publish inter-module decoupled domain event synchronously
-    let _ = state
+    // Publish inter-module decoupled domain event synchronously; roll back order on failure
+    if state
         .event_bus
         .publish_sync(&OrderPlacedEvent {
-            order_id,
+            order_id: order_id.clone(),
             product_id: payload.product_id,
             quantity: payload.quantity,
         })
-        .await;
+        .await
+        .is_err()
+    {
+        state.orders.write().await.remove(&order_id);
+        return Err(StatusCode::CONFLICT);
+    }
 
-    (StatusCode::CREATED, Json(order))
+    Ok((StatusCode::CREATED, Json(order)))
 }
 
 async fn list_orders(State(state): State<OrdersState>) -> Json<Vec<Order>> {

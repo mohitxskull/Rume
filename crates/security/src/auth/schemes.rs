@@ -114,9 +114,15 @@ impl AuthenticationScheme for BearerTokenScheme {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<AuthUser>, AuthError>> {
         Box::pin(async move {
-            let Some(auth_header) = parts.headers.get(AUTHORIZATION) else {
+            let mut auth_headers = parts.headers.get_all(AUTHORIZATION).iter();
+            let Some(auth_header) = auth_headers.next() else {
                 return Ok(None);
             };
+            if auth_headers.next().is_some() {
+                return Err(AuthError::InvalidCredentials(
+                    "duplicate authorization header".into(),
+                ));
+            }
 
             let Ok(auth_str) = auth_header.to_str() else {
                 return Err(AuthError::InvalidCredentials(
@@ -124,7 +130,10 @@ impl AuthenticationScheme for BearerTokenScheme {
                 ));
             };
 
-            if let Some(token) = auth_str.strip_prefix("Bearer ").map(str::trim) {
+            if let Some((scheme, rest)) = auth_str.trim_start().split_once(' ')
+                && scheme.eq_ignore_ascii_case("bearer")
+            {
+                let token = rest.trim();
                 if token.is_empty() {
                     return Err(AuthError::InvalidCredentials("empty bearer token".into()));
                 }
@@ -191,9 +200,15 @@ impl AuthenticationScheme for ApiKeyScheme {
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<AuthUser>, AuthError>> {
         Box::pin(async move {
-            let Some(key_header) = parts.headers.get(&self.header_name) else {
+            let mut key_headers = parts.headers.get_all(&self.header_name).iter();
+            let Some(key_header) = key_headers.next() else {
                 return Ok(None);
             };
+            if key_headers.next().is_some() {
+                return Err(AuthError::InvalidCredentials(
+                    "duplicate api key header".into(),
+                ));
+            }
 
             let Ok(key_str) = key_header.to_str() else {
                 return Err(AuthError::InvalidCredentials(

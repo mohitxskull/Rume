@@ -61,13 +61,13 @@ impl RateLimitConfig {
 
     /// Adds a trusted reverse proxy IP address for client IP resolution.
     pub fn with_trusted_proxy(mut self, ip: std::net::IpAddr) -> Self {
-        self.trusted_proxies.push(ip);
+        self.trusted_proxies.push(canonicalize_ip(ip));
         self
     }
 
     /// Sets the list of trusted reverse proxy IP addresses.
     pub fn with_trusted_proxies(mut self, ips: Vec<std::net::IpAddr>) -> Self {
-        self.trusted_proxies = ips;
+        self.trusted_proxies = ips.into_iter().map(canonicalize_ip).collect();
         self
     }
 }
@@ -459,16 +459,32 @@ where
 /// 3. Any IP belonging to `trusted_proxies` is an internal proxy hop and is safely skipped.
 /// 4. The **first untrusted IP** encountered from the right is the genuine client IP that connected to our trusted proxy edge.
 /// 5. If all IPs in the chain belong to trusted proxies, the leftmost valid IP is used as the originator.
+fn canonicalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(ip),
+        v4 => v4,
+    }
+}
+
 pub fn resolve_forwarded_client_ip(
     socket_ip: Option<std::net::IpAddr>,
     forwarded_header: Option<&str>,
     trusted_proxies: &[std::net::IpAddr],
 ) -> String {
-    let Some(peer) = socket_ip else {
+    let Some(raw_peer) = socket_ip else {
         return "client_default".to_string();
     };
+    // Why: dual-stack sockets represent IPv4 peers as IPv4-mapped IPv6 (`::ffff:a.b.c.d`).
+    // Canonicalizing to IPv4 ensures trusted-proxy matching and rate-limit buckets are
+    // identical across IPv4 and dual-stack IPv6 representations (`RC-07`).
+    let peer = canonicalize_ip(raw_peer);
+    let is_trusted = |candidate: std::net::IpAddr| {
+        trusted_proxies
+            .iter()
+            .any(|&proxy| canonicalize_ip(proxy) == candidate)
+    };
 
-    if trusted_proxies.is_empty() || !trusted_proxies.contains(&peer) {
+    if trusted_proxies.is_empty() || !is_trusted(peer) {
         return format!("ip:{peer}");
     }
 
@@ -481,10 +497,11 @@ pub fn resolve_forwarded_client_ip(
             if trimmed.is_empty() {
                 return format!("ip:{peer}");
             }
-            let Ok(ip) = trimmed.parse::<std::net::IpAddr>() else {
+            let Ok(raw_ip) = trimmed.parse::<std::net::IpAddr>() else {
                 return format!("ip:{peer}");
             };
-            if !trusted_proxies.contains(&ip) {
+            let ip = canonicalize_ip(raw_ip);
+            if !is_trusted(ip) {
                 return format!("ip:{ip}");
             }
             last_valid_ip = Some(ip);
@@ -606,5 +623,31 @@ mod tests {
         let ip_empty =
             resolve_forwarded_client_ip(Some(proxy), Some("1.2.3.4, , 10.0.0.1"), &[proxy]);
         assert_eq!(ip_empty, "ip:10.0.0.1");
+    }
+
+    #[test]
+    fn ipv4_mapped_ipv6_matches_trusted_proxy_and_shares_rate_limit_bucket() {
+        let proxy_v4 = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        let proxy_v6_mapped: IpAddr = "::ffff:10.0.0.1".parse().unwrap();
+        let client_v4: IpAddr = "203.0.113.5".parse().unwrap();
+        let client_v6_mapped: IpAddr = "::ffff:203.0.113.5".parse().unwrap();
+
+        // Dual-stack peer `::ffff:10.0.0.1` matches IPv4 trusted proxy `10.0.0.1`
+        let resolved_via_mapped_proxy = resolve_forwarded_client_ip(
+            Some(proxy_v6_mapped),
+            Some("1.1.1.1, ::ffff:203.0.113.5, ::ffff:10.0.0.1"),
+            &[proxy_v4],
+        );
+        assert_eq!(resolved_via_mapped_proxy, "ip:203.0.113.5");
+
+        // Direct peer `::ffff:203.0.113.5` produces the exact same bucket key as `203.0.113.5`
+        let key_v4 = resolve_forwarded_client_ip(Some(client_v4), None, &[]);
+        let key_v6_mapped = resolve_forwarded_client_ip(Some(client_v6_mapped), None, &[]);
+        assert_eq!(key_v4, "ip:203.0.113.5");
+        assert_eq!(key_v6_mapped, key_v4);
+
+        // Builder canonicalizes trusted proxies too
+        let cfg = RateLimitConfig::default().with_trusted_proxy(proxy_v6_mapped);
+        assert_eq!(cfg.trusted_proxies, vec![proxy_v4]);
     }
 }

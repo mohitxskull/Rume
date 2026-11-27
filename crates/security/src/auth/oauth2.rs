@@ -446,12 +446,29 @@ impl OAuth2Client {
             return Err(AuthError::Expired);
         }
 
-        if let Some(nonce) = id_token_nonce
-            && !bool::from(nonce.as_bytes().ct_eq(auth_state.nonce.as_bytes()))
-        {
-            return Err(AuthError::InvalidCredentials(
-                "OAuth2 nonce mismatch".to_owned(),
-            ));
+        let requires_nonce = self
+            .config
+            .scopes
+            .iter()
+            .flat_map(|s| s.split_whitespace())
+            .any(|s| s == "openid");
+        match id_token_nonce {
+            Some(nonce) => {
+                if !bool::from(nonce.as_bytes().ct_eq(auth_state.nonce.as_bytes())) {
+                    return Err(AuthError::InvalidCredentials(
+                        "OAuth2 nonce mismatch".to_owned(),
+                    ));
+                }
+            }
+            // Why: OIDC flows (`openid` scope) issue an ID token bound to `auth_state.nonce`
+            // to prevent replay/mix-up; accepting `None` would let a caller bypass nonce
+            // verification completely (`RC-04`).
+            None if requires_nonce => {
+                return Err(AuthError::InvalidCredentials(
+                    "missing required OIDC nonce".to_owned(),
+                ));
+            }
+            None => {}
         }
 
         Ok(auth_state)
@@ -665,6 +682,82 @@ mod tests {
                 .await,
             Err(AuthError::InvalidCredentials(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn oidc_validate_callback_rejects_missing_nonce_when_openid_scope_requested() {
+        let store = InMemoryOAuth2StateStore::new();
+        let oidc_client = OAuth2Client::new(OAuth2Config {
+            client_id: "rume-web".to_owned(),
+            client_secret: None,
+            authorization_endpoint: "https://idp.example.com/oauth2/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/oauth2/token".to_owned(),
+            redirect_uri: "https://app.example.com/callback".to_owned(),
+            scopes: vec!["openid".to_owned(), "email".to_owned()],
+            issuer: Some("https://idp.example.com".to_owned()),
+            jwks_uri: None,
+        });
+
+        let now = current_epoch_secs();
+        let (_, oidc_state) = oidc_client
+            .begin_authorization(&store, 300, now, None)
+            .await
+            .unwrap();
+
+        let err = oidc_client
+            .validate_callback(&store, &oidc_state.state, None, now + 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials(ref msg) if msg == "missing required OIDC nonce"),
+            "expected missing required OIDC nonce error, got {err:?}"
+        );
+
+        // Plain OAuth2 (without `openid` scope) may still omit `id_token_nonce`.
+        let oauth2_client = OAuth2Client::new(OAuth2Config {
+            client_id: "rume-api".to_owned(),
+            client_secret: None,
+            authorization_endpoint: "https://idp.example.com/oauth2/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/oauth2/token".to_owned(),
+            redirect_uri: "https://app.example.com/callback".to_owned(),
+            scopes: vec!["read:profile".to_owned()],
+            issuer: None,
+            jwks_uri: None,
+        });
+        let (_, oauth2_state) = oauth2_client
+            .begin_authorization(&store, 300, now, None)
+            .await
+            .unwrap();
+        assert!(
+            oauth2_client
+                .validate_callback(&store, &oauth2_state.state, None, now + 10)
+                .await
+                .is_ok()
+        );
+
+        // Space-delimited single scope string containing `openid` must also enforce nonce (`P2-10`).
+        let space_delimited_oidc = OAuth2Client::new(OAuth2Config {
+            client_id: "rume-web".to_owned(),
+            client_secret: None,
+            authorization_endpoint: "https://idp.example.com/oauth2/authorize".to_owned(),
+            token_endpoint: "https://idp.example.com/oauth2/token".to_owned(),
+            redirect_uri: "https://app.example.com/callback".to_owned(),
+            scopes: vec!["openid profile email".to_owned()],
+            issuer: Some("https://idp.example.com".to_owned()),
+            jwks_uri: None,
+        });
+        let (_, space_state) = space_delimited_oidc
+            .begin_authorization(&store, 300, now, None)
+            .await
+            .unwrap();
+        let err = space_delimited_oidc
+            .validate_callback(&store, &space_state.state, None, now + 10)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidCredentials(ref msg) if msg == "missing required OIDC nonce"),
+            "expected missing required OIDC nonce for space-delimited scope, got {err:?}"
+        );
     }
 
     #[test]

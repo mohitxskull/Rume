@@ -8,7 +8,10 @@ pub fn run(name: &str) {
     let module_name = name.to_ascii_lowercase().replace('-', "_");
 
     let dir = "src/middleware";
-    let _ = std::fs::create_dir_all(dir);
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        eprintln!("error: failed to create directory {dir}: {err}");
+        std::process::exit(1);
+    }
     let middleware_path = format!("{dir}/{module_name}.rs");
     if std::path::Path::new(&middleware_path).exists() {
         eprintln!("error: middleware `{module_name}` already exists");
@@ -30,11 +33,15 @@ pub fn run(name: &str) {
             }
         }
         Ok(_) => {}
-        Err(_) => {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             if let Err(err) = fs::write(&mod_path, mod_entry.clone()) {
                 eprintln!("error: failed to create {mod_path}: {err}");
                 std::process::exit(1);
             }
+        }
+        Err(err) => {
+            eprintln!("error: failed to read {mod_path}: {err}");
+            std::process::exit(1);
         }
     }
 

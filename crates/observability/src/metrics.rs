@@ -229,7 +229,10 @@ impl MetricsRegistry {
                 && let Ok(otlp_exporter) = opentelemetry_otlp::MetricExporter::builder()
                     .with_http()
                     .with_protocol(Protocol::HttpBinary)
-                    .with_endpoint(endpoint)
+                    .with_endpoint(crate::otel::normalize_otlp_http_endpoint(
+                        &endpoint,
+                        "/v1/metrics",
+                    ))
                     .build()
             {
                 builder = builder.with_periodic_exporter(otlp_exporter);
@@ -999,5 +1002,21 @@ mod tests {
             .await
             .expect("second shutdown must be a no-op");
         drop(registry);
+    }
+
+    #[cfg(feature = "otel")]
+    #[test]
+    fn otlp_metrics_endpoint_is_normalized_with_v1_metrics_path() {
+        assert_eq!(
+            crate::otel::normalize_otlp_http_endpoint("http://collector:4318", "/v1/metrics"),
+            "http://collector:4318/v1/metrics"
+        );
+        assert_eq!(
+            crate::otel::normalize_otlp_http_endpoint(
+                "http://collector:4318/v1/metrics",
+                "/v1/metrics"
+            ),
+            "http://collector:4318/v1/metrics"
+        );
     }
 }

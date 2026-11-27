@@ -7,8 +7,43 @@
 #![cfg(all(feature = "postgres", feature = "redis"))]
 
 use std::io::{BufRead, BufReader};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::time::Duration;
+
+/// RAII guard ensuring a spawned `rume-crash` child process is terminated and reaped
+/// even if a test assertion panics before explicit `kill()` (`RC-40`).
+struct ChildGuard(Child);
+
+impl ChildGuard {
+    fn new(child: Child) -> Self {
+        Self(child)
+    }
+
+    fn kill_and_wait(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+impl std::ops::Deref for ChildGuard {
+    type Target = Child;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for ChildGuard {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        self.kill_and_wait();
+    }
+}
 
 use rume::jobs::{Job, JobQueue, PostgresJobQueue, RetryPolicy};
 use serde::{Deserialize, Serialize};
@@ -134,19 +169,21 @@ async fn test_process_crash_during_worker_execution_and_recovery() {
     let bin = crash_harness_binary();
 
     // 2. Spawn Child Process A to claim the job and hold the lease
-    let mut child_a = Command::new(&bin)
-        .arg("worker")
-        .arg("claim-and-hold")
-        .arg("--db-url")
-        .arg(&config.url)
-        .arg("--lease-ms")
-        .arg("400")
-        .arg("--worker-id")
-        .arg("worker-process-a")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn process a");
+    let mut child_a = ChildGuard::new(
+        Command::new(&bin)
+            .arg("worker")
+            .arg("claim-and-hold")
+            .arg("--db-url")
+            .arg(&config.url)
+            .arg("--lease-ms")
+            .arg("400")
+            .arg("--worker-id")
+            .arg("worker-process-a")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn process a"),
+    );
 
     let stdout_a = child_a.stdout.take().expect("capture child a stdout");
     let mut reader_a = BufReader::new(stdout_a);
@@ -162,8 +199,7 @@ async fn test_process_crash_during_worker_execution_and_recovery() {
     );
 
     // 3. Abruptly kill Process A (simulating SIGKILL / crash)
-    child_a.kill().expect("kill process a");
-    let _ = child_a.wait();
+    child_a.kill_and_wait();
 
     // 4. Wait for the 400ms lease to expire in PostgreSQL
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -247,17 +283,19 @@ async fn test_process_crash_after_business_tx_and_outbox_recovery() {
     assert_eq!(order_count.0, 1, "business transaction must be committed");
 
     // 2. Process A2 claims the outbox message, then gets killed via SIGKILL
-    let mut child_a2 = Command::new(&bin)
-        .arg("outbox")
-        .arg("claim-and-hold")
-        .arg("--db-url")
-        .arg(&config.url)
-        .arg("--lease-secs")
-        .arg("1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn process a2");
+    let mut child_a2 = ChildGuard::new(
+        Command::new(&bin)
+            .arg("outbox")
+            .arg("claim-and-hold")
+            .arg("--db-url")
+            .arg(&config.url)
+            .arg("--lease-secs")
+            .arg("1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn process a2"),
+    );
 
     let stdout_a2 = child_a2.stdout.take().expect("capture child a2 stdout");
     let mut reader_a2 = BufReader::new(stdout_a2);
@@ -271,8 +309,7 @@ async fn test_process_crash_after_business_tx_and_outbox_recovery() {
     );
 
     // Terminate Process A2 abruptly
-    child_a2.kill().expect("kill process a2");
-    let _ = child_a2.wait();
+    child_a2.kill_and_wait();
 
     // 3. Wait for 1-second outbox lease to expire
     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -327,23 +364,25 @@ async fn test_process_crash_distributed_leader_takeover() {
     let test_elector = RedisLeaderElector::new(backend.pool().clone()).with_prefix(prefix.clone());
 
     // 1. Process A acquires leader lease through Rume with 600ms TTL
-    let mut child_a = Command::new(&bin)
-        .arg("leader")
-        .arg("acquire-and-hold")
-        .arg("--redis-url")
-        .arg(&redis_url)
-        .arg("--prefix")
-        .arg(&prefix)
-        .arg("--role")
-        .arg(role)
-        .arg("--ttl-ms")
-        .arg("600")
-        .arg("--identity")
-        .arg("leader-node-a")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("spawn child a");
+    let mut child_a = ChildGuard::new(
+        Command::new(&bin)
+            .arg("leader")
+            .arg("acquire-and-hold")
+            .arg("--redis-url")
+            .arg(&redis_url)
+            .arg("--prefix")
+            .arg(&prefix)
+            .arg("--role")
+            .arg(role)
+            .arg("--ttl-ms")
+            .arg("600")
+            .arg("--identity")
+            .arg("leader-node-a")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("spawn child a"),
+    );
 
     let stdout_a = child_a.stdout.take().expect("capture child a stdout");
     let mut reader_a = BufReader::new(stdout_a);
@@ -375,8 +414,7 @@ async fn test_process_crash_distributed_leader_takeover() {
     assert_eq!(initial_leader.term, term_a);
 
     // 2. Kill Process A abruptly via OS SIGKILL
-    child_a.kill().expect("kill child a");
-    let _ = child_a.wait();
+    child_a.kill_and_wait();
 
     // 3. Wait for TTL (600ms) to expire
     tokio::time::sleep(Duration::from_millis(700)).await;

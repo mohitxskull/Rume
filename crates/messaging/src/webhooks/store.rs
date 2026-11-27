@@ -274,10 +274,14 @@ fn select_sql(
 }
 
 fn format_ts(dialect: &str, dt: DateTime<Utc>) -> String {
-    if dialect == "mysql" {
-        dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-    } else {
-        dt.to_rfc3339()
+    match dialect {
+        "mysql" => dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string(),
+        "postgres" => dt.to_rfc3339(),
+        // Why: SQLite compares `TEXT` timestamps lexicographically. `DateTime::to_rfc3339`
+        // omits fractional seconds when subsec == 0 (`...00Z` vs `...00.500000Z`), and
+        // `'Z'` (ASCII 90) > `'.'` (ASCII 46), which inverts chronological ordering (`RC-31`).
+        // Fixed-width 6-digit fractional UTC ensures strict lexicographic ordering.
+        _ => dt.format("%Y-%m-%dT%H:%M:%S%.6fZ").to_string(),
     }
 }
 
@@ -578,5 +582,74 @@ impl<B: DatabaseBackend> WebhookDeliveryStore for SqlWebhookDeliveryStore<B> {
                 .map_err(|e| WebhookError::Store(e.to_string()))?;
             Ok(affected > 0)
         })
+    }
+}
+
+#[cfg(all(test, feature = "sqlite"))]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use rume_data::persistence::{DatabaseConfig, SqliteBackend};
+
+    #[tokio::test]
+    async fn sqlite_webhook_timestamps_compare_chronologically_across_whole_and_fractional_seconds()
+    {
+        let backend = Arc::new(
+            SqliteBackend::new(&DatabaseConfig::new(":memory:"))
+                .await
+                .expect("sqlite memory"),
+        );
+        let store = SqlWebhookDeliveryStore::new(backend);
+        store.ensure_schema().await.expect("ensure_schema");
+
+        // Whole-second timestamp (12:00:00.000000Z) vs fractional (12:00:00.500000Z).
+        // With unpadded RFC 3339, "...00Z" > "...00.250000Z" because ASCII 'Z' (90) > '.' (46),
+        // which would falsely hide the whole-second record from `list_due` at 12:00:00.250Z.
+        let t_whole = Utc.with_ymd_and_hms(2026, 11, 27, 12, 0, 0).unwrap();
+        let t_query = t_whole + chrono::Duration::milliseconds(250);
+        let t_later = t_whole + chrono::Duration::milliseconds(500);
+
+        assert_eq!(format_ts("sqlite", t_whole), "2026-11-27T12:00:00.000000Z");
+        assert!(format_ts("sqlite", t_whole) < format_ts("sqlite", t_query));
+        assert!(format_ts("sqlite", t_query) < format_ts("sqlite", t_later));
+
+        let due_record = WebhookDeliveryRecord {
+            id: "wh-whole".into(),
+            endpoint_id: "ep-1".into(),
+            event_type: "order.created".into(),
+            payload: "{}".into(),
+            status: WebhookDeliveryStatus::Pending,
+            attempt: 0,
+            next_attempt_at: Some(t_whole),
+            last_response: None,
+            created_at: t_whole,
+            updated_at: t_whole,
+        };
+        let future_record = WebhookDeliveryRecord {
+            id: "wh-future".into(),
+            endpoint_id: "ep-1".into(),
+            event_type: "order.created".into(),
+            payload: "{}".into(),
+            status: WebhookDeliveryStatus::Pending,
+            attempt: 0,
+            next_attempt_at: Some(t_later),
+            last_response: None,
+            created_at: t_later,
+            updated_at: t_later,
+        };
+
+        store.upsert(due_record).await.expect("upsert due");
+        store.upsert(future_record).await.expect("upsert future");
+
+        let due = store.list_due(t_query, 10).await.expect("list_due");
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "wh-whole");
+
+        let claimed = store
+            .claim_due(t_query, 10, Duration::from_secs(30))
+            .await
+            .expect("claim_due");
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, "wh-whole");
     }
 }

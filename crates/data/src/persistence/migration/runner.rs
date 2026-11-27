@@ -7,9 +7,8 @@ use super::preflight::{
     PG_JOBS, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT, SQLITE_AUTH_DOWN, SQLITE_AUTH_SCHEMA,
     SQLITE_BUSY_TIMEOUT, SQLITE_CLOCK, SQLITE_CORE_DOWN, SQLITE_OUTBOX, delete_migration_query,
     ensure_applied_order_column_backend, ensure_applied_order_column_tx,
-    fetch_applied_order_rows_tx, find_checksum_query, find_migration_id_query,
-    insert_migration_query, migrations_schema_ddl, next_applied_order_tx, parse_clock_or_now,
-    select_rollback_target,
+    fetch_applied_order_rows_tx, find_checksum_query, insert_migration_query,
+    migrations_schema_ddl, next_applied_order_tx, parse_clock_or_now, select_rollback_target,
 };
 #[cfg(feature = "mysql")]
 use super::preflight::{
@@ -580,7 +579,6 @@ impl Migrator {
     ) -> Result<Option<String>, PersistenceError> {
         let dialect = backend.dialect();
         let ddl = migrations_schema_ddl(dialect);
-        let check_sql = find_migration_id_query(dialect);
         let delete_sql = delete_migration_query(dialect);
 
         if dialect == "postgres" {
@@ -724,29 +722,27 @@ impl Migrator {
 
         backend.execute(ddl).await?;
 
-        for migration in self.migrations.iter().rev() {
+        let tx = backend.begin_transaction().await?;
+        ensure_applied_order_column_tx(&tx, dialect).await?;
+        let applied_rows = fetch_applied_order_rows_tx(&tx).await?;
+        if let Some(migration) = select_rollback_target(&self.migrations, &applied_rows) {
+            let Some(sql) = &migration.down_sql else {
+                return Err(PersistenceError::IrreversibleMigration(
+                    migration.id.clone(),
+                ));
+            };
             let id_param = [DbValue::from(migration.id.as_str())];
-            let exists = backend.query_scalar_params(check_sql, &id_param).await?;
-            if exists.is_some() {
-                let Some(sql) = &migration.down_sql else {
-                    return Err(PersistenceError::IrreversibleMigration(
-                        migration.id.clone(),
-                    ));
-                };
-
-                let tx = backend.begin_transaction().await?;
-                tx.execute(sql)
-                    .await
-                    .map_err(|err| PersistenceError::MigrationError {
-                        migration: migration.id.clone(),
-                        message: err.to_string(),
-                    })?;
-
-                tx.execute_params(delete_sql, &id_param).await?;
-                tx.commit().await?;
-                return Ok(Some(migration.id.clone()));
-            }
+            tx.execute(sql)
+                .await
+                .map_err(|err| PersistenceError::MigrationError {
+                    migration: migration.id.clone(),
+                    message: err.to_string(),
+                })?;
+            tx.execute_params(delete_sql, &id_param).await?;
+            tx.commit().await?;
+            return Ok(Some(migration.id.clone()));
         }
+        tx.commit().await?;
 
         Ok(None)
     }

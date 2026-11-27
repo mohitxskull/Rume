@@ -103,6 +103,7 @@ fn bench_circuit_breaker_closed_fast_path(c: &mut Criterion) {
         failure_threshold: 5,
         success_threshold: 2,
         reset_timeout: Duration::from_secs(30),
+        ..Default::default()
     });
 
     c.bench_function("hot_path/circuit_breaker_try_acquire_closed", |b| {

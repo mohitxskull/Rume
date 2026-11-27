@@ -82,6 +82,13 @@ impl BrokerPublisher for NatsBroker {
                     .await
                     .map_err(|e| BrokerError::Transport(e.to_string()))?;
             }
+            // Why: `async_nats::Client::publish` only buffers into the outbound write
+            // queue. Flushing ensures the NATS server has received the frame before
+            // `OutboxRelay` marks the outbox row as published (`RC-11`).
+            self.client
+                .flush()
+                .await
+                .map_err(|e| BrokerError::Transport(e.to_string()))?;
             Ok(())
         })
     }

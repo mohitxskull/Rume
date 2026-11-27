@@ -1,5 +1,7 @@
 //! HTTP response compression (gzip, brotli, zstd) backed by `tower-http`.
 
+use axum::body::HttpBody;
+use axum::http::{Response, header};
 use tower_http::compression::predicate::{And, NotForContentType, Predicate, SizeAbove};
 
 /// Default minimum response size in bytes eligible for compression (1 KiB).
@@ -10,10 +12,54 @@ use tower_http::compression::predicate::{And, NotForContentType, Predicate, Size
 /// `0` bytes for tests or small-payload endpoints.
 pub const DEFAULT_COMPRESSION_MIN_SIZE_BYTES: u16 = 1024;
 
-/// Compression predicate combining a configurable minimum body size with
-/// `tower-http`'s standard exclusions (gRPC, images, and Server-Sent Events).
-pub type CompressionPredicate =
-    And<And<And<SizeAbove, NotForContentType>, NotForContentType>, NotForContentType>;
+/// Compression predicate that skips responses carrying `Set-Cookie` or
+/// `Cache-Control: no-store` / `private` as a default-on BREACH defense over TLS (`RC-41`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SkipSensitiveHeaders;
+
+impl Predicate for SkipSensitiveHeaders {
+    fn should_compress<B>(&self, response: &Response<B>) -> bool
+    where
+        B: HttpBody,
+    {
+        if response.headers().contains_key(header::SET_COOKIE) {
+            return false;
+        }
+        for val in response.headers().get_all(header::CACHE_CONTROL) {
+            let Ok(s) = val.to_str() else {
+                // Why: fail closed on non-UTF-8 Cache-Control so malformed headers cannot
+                // bypass BREACH compression suppression (`P2-23`).
+                return false;
+            };
+            for directive in s.split(',') {
+                let d = directive.trim().to_ascii_lowercase();
+                if d == "no-store" || d == "private" || d.starts_with("private=") {
+                    return false;
+                }
+            }
+        }
+        for val in response.headers().get_all(header::VARY) {
+            let Ok(s) = val.to_str() else {
+                return false;
+            };
+            for field in s.split(',') {
+                let f = field.trim();
+                if f.eq_ignore_ascii_case("cookie") || f.eq_ignore_ascii_case("authorization") {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
+/// Compression predicate combining a configurable minimum body size,
+/// `tower-http`'s standard exclusions (gRPC, images, and Server-Sent Events),
+/// and [`SkipSensitiveHeaders`] BREACH protection.
+pub type CompressionPredicate = And<
+    And<And<And<SizeAbove, NotForContentType>, NotForContentType>, NotForContentType>,
+    SkipSensitiveHeaders,
+>;
 
 /// Tower layer compressing HTTP responses according to `Accept-Encoding`.
 pub type CompressionLayer = tower_http::compression::CompressionLayer<CompressionPredicate>;
@@ -77,7 +123,8 @@ impl CompressionConfig {
         let predicate = SizeAbove::new(u64::from(self.min_size_bytes))
             .and(NotForContentType::GRPC)
             .and(NotForContentType::IMAGES)
-            .and(NotForContentType::SSE);
+            .and(NotForContentType::SSE)
+            .and(SkipSensitiveHeaders);
 
         tower_http::compression::CompressionLayer::new()
             .gzip(self.gzip)
@@ -228,5 +275,52 @@ mod tests {
         );
         let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
         assert_eq!(body.as_ref(), expected.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn compression_skips_set_cookie_and_private_or_no_store_responses_for_breach_defense() {
+        let payload = "rume-sensitive-secret-payload-".repeat(128);
+        assert!(payload.len() > 1024);
+        let layer = CompressionConfig::new().build_layer();
+
+        let p1 = payload.clone();
+        let p2 = payload.clone();
+        let p3 = payload.clone();
+        let app = Router::new()
+            .route(
+                "/cookie",
+                get(move || async move { ([(header::SET_COOKIE, "sid=abc; HttpOnly")], p1) }),
+            )
+            .route(
+                "/private",
+                get(move || async move { ([(header::CACHE_CONTROL, "private, max-age=60")], p2) }),
+            )
+            .route(
+                "/no-store",
+                get(move || async move { ([(header::CACHE_CONTROL, "no-store")], p3) }),
+            )
+            .layer(layer);
+
+        for uri in ["/cookie", "/private", "/no-store"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .header(header::ACCEPT_ENCODING, "gzip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                response.headers().get(header::CONTENT_ENCODING).is_none(),
+                "response at {uri} must not be compressed (BREACH defense)"
+            );
+            let body = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+            assert_eq!(body.as_ref(), payload.as_bytes());
+        }
     }
 }

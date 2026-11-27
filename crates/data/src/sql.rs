@@ -225,9 +225,6 @@ pub const PG_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in PostgreSQL.
 pub const PG_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/postgres/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in PostgreSQL.
-pub const PG_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/postgres/auth_role_permissions_list.sql");
 /// Assign a role to a user in PostgreSQL.
 pub const PG_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/postgres/auth_user_role_assign.sql");
@@ -292,9 +289,6 @@ pub const MYSQL_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in MySQL.
 pub const MYSQL_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/mysql/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in MySQL.
-pub const MYSQL_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/mysql/auth_role_permissions_list.sql");
 /// Assign a role to a user in MySQL.
 pub const MYSQL_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/mysql/auth_user_role_assign.sql");
@@ -306,8 +300,13 @@ pub const MYSQL_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/mysql/auth_use
 /// List effective permissions for a user in MySQL.
 pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
     include_str!("../sql/mysql/auth_user_effective_permissions.sql");
-/// Upsert a tenant record in MySQL.
-pub const MYSQL_AUTH_TENANT_UPSERT: &str = include_str!("../sql/mysql/auth_tenant_upsert.sql");
+/// Lock an existing tenant row by `id` (`FOR UPDATE`) in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_ID_FOR_UPDATE: &str =
+    include_str!("../sql/mysql/auth_tenant_find_id_for_update.sql");
+/// Insert a new tenant row in MySQL without `ON DUPLICATE KEY UPDATE`.
+pub const MYSQL_AUTH_TENANT_INSERT: &str = include_str!("../sql/mysql/auth_tenant_insert.sql");
+/// Update an existing tenant row by `id` in MySQL.
+pub const MYSQL_AUTH_TENANT_UPDATE: &str = include_str!("../sql/mysql/auth_tenant_update.sql");
 /// Find an active tenant by ID in MySQL.
 pub const MYSQL_AUTH_TENANT_FIND_BY_ID: &str =
     include_str!("../sql/mysql/auth_tenant_find_by_id.sql");
@@ -359,9 +358,6 @@ pub const SQLITE_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in SQLite.
 pub const SQLITE_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/sqlite/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in SQLite.
-pub const SQLITE_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/sqlite/auth_role_permissions_list.sql");
 /// Assign a role to a user in SQLite.
 pub const SQLITE_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/sqlite/auth_user_role_assign.sql");
@@ -476,9 +472,20 @@ pub const SQLITE_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in SQLite.
 pub const SQLITE_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/sqlite/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in SQLite.
-pub const SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/sqlite/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in SQLite.
+pub const SQLITE_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/sqlite/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_CLAIM_THEN: &str = include_str!("../sql/sqlite/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_RELEASE_THEN: &str =
+    include_str!("../sql/sqlite/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/sqlite/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in SQLite.
+pub const SQLITE_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/sqlite/batches_release_finally.sql");
 /// Cancel a running batch in SQLite.
 pub const SQLITE_BATCHES_CANCEL: &str = include_str!("../sql/sqlite/batches_cancel.sql");
 
@@ -494,9 +501,19 @@ pub const PG_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in PostgreSQL.
 pub const PG_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/postgres/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in PostgreSQL.
-pub const PG_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/postgres/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in PostgreSQL.
+pub const PG_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/postgres/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_CLAIM_THEN: &str = include_str!("../sql/postgres/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_RELEASE_THEN: &str = include_str!("../sql/postgres/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/postgres/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in PostgreSQL.
+pub const PG_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/postgres/batches_release_finally.sql");
 /// Cancel a running batch in PostgreSQL.
 pub const PG_BATCHES_CANCEL: &str = include_str!("../sql/postgres/batches_cancel.sql");
 
@@ -512,9 +529,19 @@ pub const MYSQL_BATCHES_RECORD_SUCCESS: &str =
 /// Record a failed job in a batch in MySQL.
 pub const MYSQL_BATCHES_RECORD_FAILURE: &str =
     include_str!("../sql/mysql/batches_record_failure.sql");
-/// Mark batch callbacks as dispatched in MySQL.
-pub const MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
-    include_str!("../sql/mysql/batches_mark_callbacks_dispatched.sql");
+/// Record an idempotent per-job outcome in MySQL.
+pub const MYSQL_BATCHES_RECORD_JOB_OUTCOME: &str =
+    include_str!("../sql/mysql/batches_record_job_outcome.sql");
+/// Claim the `then` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_CLAIM_THEN: &str = include_str!("../sql/mysql/batches_claim_then.sql");
+/// Release the `then` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_RELEASE_THEN: &str = include_str!("../sql/mysql/batches_release_then.sql");
+/// Claim the `finally` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_CLAIM_FINALLY: &str =
+    include_str!("../sql/mysql/batches_claim_finally.sql");
+/// Release the `finally` callback dispatch lock in MySQL.
+pub const MYSQL_BATCHES_RELEASE_FINALLY: &str =
+    include_str!("../sql/mysql/batches_release_finally.sql");
 /// Cancel a running batch in MySQL.
 pub const MYSQL_BATCHES_CANCEL: &str = include_str!("../sql/mysql/batches_cancel.sql");
 
@@ -847,5 +874,38 @@ mod tests {
             !MYSQL_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
             "MYSQL_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
         );
+    }
+
+    #[test]
+    fn mysql_tenant_sql_avoids_on_duplicate_key_and_jobs_renew_lease_guards_expiry() {
+        assert!(
+            !MYSQL_AUTH_TENANT_INSERT
+                .to_ascii_uppercase()
+                .contains("ON DUPLICATE KEY"),
+            "MYSQL_AUTH_TENANT_INSERT must not use ON DUPLICATE KEY UPDATE"
+        );
+        assert!(
+            MYSQL_AUTH_TENANT_UPDATE.contains("WHERE id = ?"),
+            "MYSQL_AUTH_TENANT_UPDATE must update strictly by primary key id"
+        );
+        for (name, sql) in [
+            ("PG_JOBS_RENEW_LEASE", PG_JOBS_RENEW_LEASE),
+            ("MYSQL_JOBS_RENEW_LEASE", MYSQL_JOBS_RENEW_LEASE),
+            ("SQLITE_JOBS_RENEW_LEASE", SQLITE_JOBS_RENEW_LEASE),
+        ] {
+            assert!(
+                sql.contains("lease_expires_at >"),
+                "{name} must guard against renewing an already-expired lease"
+            );
+        }
+
+        // `P2-15`: feature flag schemas enforce uniqueness for global (NULL tenant_id) rows
+        // and MySQL upsert uses MySQL 8 row alias `AS new`.
+        assert!(PG_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(SQLITE_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(MYSQL_FEATURE_FLAGS_SCHEMA.contains("COALESCE(tenant_id, '')"));
+        assert!(MYSQL_FEATURE_FLAGS_SCHEMA.contains("STORED"));
+        assert!(MYSQL_FEATURE_FLAGS_UPSERT.contains("AS new"));
+        assert!(!MYSQL_FEATURE_FLAGS_UPSERT.contains("VALUES(enabled)"));
     }
 }

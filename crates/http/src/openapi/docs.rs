@@ -30,6 +30,10 @@ use crate::routing::Router;
 pub const DEFAULT_SCALAR_SCRIPT_URL: &str =
     "https://cdn.jsdelivr.net/npm/@scalar/api-reference@1.28.30";
 
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SCALAR_SCRIPT_URL`].
+pub const DEFAULT_SCALAR_SCRIPT_INTEGRITY: &str =
+    "sha384-OPOrTQgyJRwezF8mF7ed3lLSCm93IABC2Pxcm+eJ0SxnDvIcGdoqVkghDdu76/6U";
+
 /// Pinned CDN script URL for the Swagger UI bundle.
 ///
 /// Why: pinned CDN versions guarantee reproducible docs rendering and prevent
@@ -38,6 +42,10 @@ pub const DEFAULT_SCALAR_SCRIPT_URL: &str =
 pub const DEFAULT_SWAGGER_UI_SCRIPT_URL: &str =
     "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.20.1/swagger-ui-bundle.js";
 
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SWAGGER_UI_SCRIPT_URL`].
+pub const DEFAULT_SWAGGER_UI_SCRIPT_INTEGRITY: &str =
+    "sha384-ruKaPGhHK3meQYE2qpbX6DhkLiJYbj2qrIqVpEZKKw6B8B6CkJYtFBOyg7DVxV01";
+
 /// Pinned CDN stylesheet URL for Swagger UI.
 ///
 /// Why: pinned CDN versions guarantee reproducible docs rendering and prevent
@@ -45,6 +53,10 @@ pub const DEFAULT_SWAGGER_UI_SCRIPT_URL: &str =
 /// [`OpenApiDocsConfig::with_stylesheet_url`] for self-hosted deployments.
 pub const DEFAULT_SWAGGER_UI_STYLESHEET_URL: &str =
     "https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.20.1/swagger-ui.css";
+
+/// Verified SHA-384 Subresource Integrity hash for [`DEFAULT_SWAGGER_UI_STYLESHEET_URL`].
+pub const DEFAULT_SWAGGER_UI_STYLESHEET_INTEGRITY: &str =
+    "sha384-19U5QfIgtj822TyFqWtYKqauOZosmdEalgX8htxti5Pkm6oyuyR9ePwNbSaBclKA";
 
 /// Selectable documentation UI renderer for OpenAPI specifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -69,6 +81,10 @@ pub struct OpenApiDocsConfig {
     pub script_url: Option<String>,
     /// Optional override for the Swagger UI stylesheet URL (unused for Scalar).
     pub stylesheet_url: Option<String>,
+    /// Optional Subresource Integrity (SRI) hash for the UI `<script>` tag.
+    pub script_integrity: Option<String>,
+    /// Optional Subresource Integrity (SRI) hash for the Swagger UI `<link rel="stylesheet">` tag.
+    pub stylesheet_integrity: Option<String>,
 }
 
 impl Default for OpenApiDocsConfig {
@@ -79,8 +95,25 @@ impl Default for OpenApiDocsConfig {
             ui: OpenApiUi::default(),
             script_url: None,
             stylesheet_url: None,
+            script_integrity: None,
+            stylesheet_integrity: None,
         }
     }
+}
+
+/// Error returned when configuring [`OpenApiDocsConfig`] with an unsafe or invalid URL.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid OpenAPI docs {field}: must use https://, http://, or a relative / path")]
+pub struct OpenApiDocsError {
+    /// Name of the invalid configuration field.
+    pub field: &'static str,
+}
+
+fn is_allowed_asset_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    trimmed.starts_with("https://")
+        || trimmed.starts_with("http://")
+        || (trimmed.starts_with('/') && !trimmed.starts_with("//"))
 }
 
 impl OpenApiDocsConfig {
@@ -91,6 +124,16 @@ impl OpenApiDocsConfig {
             spec_url: spec_url.into(),
             ..Self::default()
         }
+    }
+
+    /// Sets the OpenAPI specification URL, rejecting unsafe schemes such as `javascript:` or `data:`.
+    pub fn with_spec_url(mut self, spec_url: impl Into<String>) -> Result<Self, OpenApiDocsError> {
+        let url = spec_url.into();
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError { field: "spec_url" });
+        }
+        self.spec_url = url;
+        Ok(self)
     }
 
     /// Sets the HTML document `<title>`.
@@ -108,17 +151,70 @@ impl OpenApiDocsConfig {
     }
 
     /// Overrides the default pinned CDN `<script>` URL.
-    #[must_use]
-    pub fn with_script_url(mut self, script_url: impl Into<String>) -> Self {
-        self.script_url = Some(script_url.into());
-        self
+    ///
+    /// Returns an error if `script_url` does not use `https://`, `http://`, or a relative `/` path.
+    pub fn with_script_url(
+        mut self,
+        script_url: impl Into<String>,
+    ) -> Result<Self, OpenApiDocsError> {
+        let url = script_url.into();
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError {
+                field: "script_url",
+            });
+        }
+        self.script_url = Some(url);
+        Ok(self)
     }
 
     /// Overrides the default pinned CDN `<link rel="stylesheet">` URL (Swagger UI only).
+    ///
+    /// Returns an error if `stylesheet_url` does not use `https://`, `http://`, or a relative `/` path.
+    pub fn with_stylesheet_url(
+        mut self,
+        stylesheet_url: impl Into<String>,
+    ) -> Result<Self, OpenApiDocsError> {
+        let url = stylesheet_url.into();
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError {
+                field: "stylesheet_url",
+            });
+        }
+        self.stylesheet_url = Some(url);
+        Ok(self)
+    }
+
+    /// Sets an optional Subresource Integrity (`integrity`) attribute for the `<script>` tag
+    /// (also emits `crossorigin="anonymous"`).
     #[must_use]
-    pub fn with_stylesheet_url(mut self, stylesheet_url: impl Into<String>) -> Self {
-        self.stylesheet_url = Some(stylesheet_url.into());
+    pub fn with_script_integrity(mut self, integrity: impl Into<String>) -> Self {
+        self.script_integrity = Some(integrity.into());
         self
+    }
+
+    /// Sets an optional Subresource Integrity (`integrity`) attribute for the Swagger UI
+    /// `<link rel="stylesheet">` tag (also emits `crossorigin="anonymous"`).
+    #[must_use]
+    pub fn with_stylesheet_integrity(mut self, integrity: impl Into<String>) -> Self {
+        self.stylesheet_integrity = Some(integrity.into());
+        self
+    }
+}
+
+fn sri_attrs(integrity: Option<&str>) -> String {
+    match integrity {
+        Some(hash) if !hash.trim().is_empty() => format!(
+            " integrity=\"{}\" crossorigin=\"anonymous\"",
+            escape_html(hash.trim())
+        ),
+        _ => String::new(),
+    }
+}
+
+fn safe_asset_url<'a>(configured: Option<&'a str>, default: &'a str) -> &'a str {
+    match configured {
+        Some(url) if is_allowed_asset_url(url) => url,
+        _ => default,
     }
 }
 
@@ -157,15 +253,19 @@ fn escape_js_string(value: &str) -> String {
 pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
     let title = escape_html(&config.title);
 
+    let safe_spec_url = safe_asset_url(Some(config.spec_url.as_str()), "/openapi.json");
+
     match config.ui {
         OpenApiUi::Scalar => {
-            let spec_url = escape_html(&config.spec_url);
-            let script_url = escape_html(
-                config
-                    .script_url
-                    .as_deref()
-                    .unwrap_or(DEFAULT_SCALAR_SCRIPT_URL),
-            );
+            let spec_url = escape_html(safe_spec_url);
+            let raw_script_url =
+                safe_asset_url(config.script_url.as_deref(), DEFAULT_SCALAR_SCRIPT_URL);
+            let script_url = escape_html(raw_script_url);
+            let effective_script_sri = config.script_integrity.as_deref().or_else(|| {
+                (raw_script_url == DEFAULT_SCALAR_SCRIPT_URL)
+                    .then_some(DEFAULT_SCALAR_SCRIPT_INTEGRITY)
+            });
+            let script_sri = sri_attrs(effective_script_sri);
 
             format!(
                 concat!(
@@ -178,29 +278,36 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
                     "</head>\n",
                     "<body>\n",
                     "  <script id=\"api-reference\" data-url=\"{spec_url}\"></script>\n",
-                    "  <script src=\"{script_url}\"></script>\n",
+                    "  <script src=\"{script_url}\"{script_sri}></script>\n",
                     "</body>\n",
                     "</html>\n",
                 ),
                 title = title,
                 spec_url = spec_url,
                 script_url = script_url,
+                script_sri = script_sri,
             )
         }
         OpenApiUi::SwaggerUi => {
-            let spec_url_js = escape_js_string(&config.spec_url);
-            let script_url = escape_html(
-                config
-                    .script_url
-                    .as_deref()
-                    .unwrap_or(DEFAULT_SWAGGER_UI_SCRIPT_URL),
+            let spec_url_js = escape_js_string(safe_spec_url);
+            let raw_script_url =
+                safe_asset_url(config.script_url.as_deref(), DEFAULT_SWAGGER_UI_SCRIPT_URL);
+            let raw_stylesheet_url = safe_asset_url(
+                config.stylesheet_url.as_deref(),
+                DEFAULT_SWAGGER_UI_STYLESHEET_URL,
             );
-            let stylesheet_url = escape_html(
-                config
-                    .stylesheet_url
-                    .as_deref()
-                    .unwrap_or(DEFAULT_SWAGGER_UI_STYLESHEET_URL),
-            );
+            let script_url = escape_html(raw_script_url);
+            let stylesheet_url = escape_html(raw_stylesheet_url);
+            let effective_script_sri = config.script_integrity.as_deref().or_else(|| {
+                (raw_script_url == DEFAULT_SWAGGER_UI_SCRIPT_URL)
+                    .then_some(DEFAULT_SWAGGER_UI_SCRIPT_INTEGRITY)
+            });
+            let effective_stylesheet_sri = config.stylesheet_integrity.as_deref().or_else(|| {
+                (raw_stylesheet_url == DEFAULT_SWAGGER_UI_STYLESHEET_URL)
+                    .then_some(DEFAULT_SWAGGER_UI_STYLESHEET_INTEGRITY)
+            });
+            let script_sri = sri_attrs(effective_script_sri);
+            let stylesheet_sri = sri_attrs(effective_stylesheet_sri);
 
             format!(
                 concat!(
@@ -210,11 +317,11 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
                     "  <meta charset=\"utf-8\" />\n",
                     "  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n",
                     "  <title>{title}</title>\n",
-                    "  <link rel=\"stylesheet\" href=\"{stylesheet_url}\" />\n",
+                    "  <link rel=\"stylesheet\" href=\"{stylesheet_url}\"{stylesheet_sri} />\n",
                     "</head>\n",
                     "<body>\n",
                     "  <div id=\"swagger-ui\"></div>\n",
-                    "  <script src=\"{script_url}\"></script>\n",
+                    "  <script src=\"{script_url}\"{script_sri}></script>\n",
                     "  <script>\n",
                     "    window.onload = function () {{\n",
                     "      SwaggerUIBundle({{\n",
@@ -228,7 +335,9 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
                 ),
                 title = title,
                 stylesheet_url = stylesheet_url,
+                stylesheet_sri = stylesheet_sri,
                 script_url = script_url,
+                script_sri = script_sri,
                 spec_url_js = spec_url_js,
             )
         }
@@ -317,7 +426,9 @@ mod tests {
 
     #[test]
     fn openapi_docs_respects_custom_script_and_stylesheet_urls() {
-        let scalar = OpenApiDocsConfig::default().with_script_url("/static/scalar.js");
+        let scalar = OpenApiDocsConfig::default()
+            .with_script_url("/static/scalar.js")
+            .unwrap();
         let scalar_html = openapi_docs_html(&scalar);
         assert!(!scalar_html.contains(DEFAULT_SCALAR_SCRIPT_URL));
         assert!(scalar_html.contains(r#"src="/static/scalar.js""#));
@@ -325,7 +436,9 @@ mod tests {
         let swagger = OpenApiDocsConfig::default()
             .with_ui(OpenApiUi::SwaggerUi)
             .with_script_url("/static/swagger-ui-bundle.js")
-            .with_stylesheet_url("/static/swagger-ui.css");
+            .unwrap()
+            .with_stylesheet_url("/static/swagger-ui.css")
+            .unwrap();
         let swagger_html = openapi_docs_html(&swagger);
         assert!(!swagger_html.contains(DEFAULT_SWAGGER_UI_SCRIPT_URL));
         assert!(!swagger_html.contains(DEFAULT_SWAGGER_UI_STYLESHEET_URL));
@@ -336,13 +449,14 @@ mod tests {
     #[test]
     fn openapi_docs_escapes_title_and_spec_url_against_html_injection() {
         let evil_title = "<script>alert(1)</script>";
-        let evil_spec = r#""</script><img onerror=1>""#;
+        let evil_spec = r#"/openapi.json"</script><img onerror=1>""#;
         let evil_script = r#"https://cdn.example/a.js" onload="alert(1)"#;
         let evil_css = r#"https://cdn.example/a.css" onload="alert(1)"#;
 
         let scalar = OpenApiDocsConfig::new(evil_spec)
             .with_title(evil_title)
-            .with_script_url(evil_script);
+            .with_script_url(evil_script)
+            .unwrap();
         let scalar_html = openapi_docs_html(&scalar);
         assert!(!scalar_html.contains(evil_title));
         assert!(!scalar_html.contains("<script>alert(1)"));
@@ -354,7 +468,9 @@ mod tests {
             .with_title(evil_title)
             .with_ui(OpenApiUi::SwaggerUi)
             .with_script_url(evil_script)
-            .with_stylesheet_url(evil_css);
+            .unwrap()
+            .with_stylesheet_url(evil_css)
+            .unwrap();
         let swagger_html = openapi_docs_html(&swagger);
         assert!(!swagger_html.contains(evil_title));
         assert!(!swagger_html.contains("<script>alert(1)"));
@@ -390,5 +506,51 @@ mod tests {
             .unwrap();
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert_eq!(text, expected_html);
+    }
+
+    #[test]
+    fn openapi_docs_emits_sri_and_falls_back_on_unsafe_direct_urls() {
+        let cfg = OpenApiDocsConfig::default()
+            .with_ui(OpenApiUi::SwaggerUi)
+            .with_script_integrity("sha384-abc123")
+            .with_stylesheet_integrity("sha384-def456");
+        let html = openapi_docs_html(&cfg);
+        assert!(html.contains(r#"integrity="sha384-abc123" crossorigin="anonymous""#));
+        assert!(html.contains(r#"integrity="sha384-def456" crossorigin="anonymous""#));
+
+        // Direct struct mutation with unsafe scheme falls back to pinned default
+        let unsafe_cfg = OpenApiDocsConfig {
+            spec_url: "javascript:alert(1)".to_string(),
+            script_url: Some("javascript:alert(1)".to_string()),
+            ..OpenApiDocsConfig::default()
+        };
+        let fallback_html = openapi_docs_html(&unsafe_cfg);
+        assert!(!fallback_html.contains("javascript:"));
+        assert!(fallback_html.contains(DEFAULT_SCALAR_SCRIPT_URL));
+        assert!(fallback_html.contains(r#"data-url="/openapi.json""#));
+    }
+
+    #[test]
+    fn openapi_docs_rejects_unsafe_urls_with_error() {
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_script_url("javascript:alert(1)")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_stylesheet_url("data:text/css,body{}")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_spec_url("javascript:alert(1)")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_spec_url("data:application/json,{}")
+                .is_err()
+        );
     }
 }

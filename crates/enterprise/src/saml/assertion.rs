@@ -217,6 +217,7 @@ impl SamlParser {
         let mut response_issuer: Option<String> = None;
         let mut active_capture: Option<ActiveTextCapture> = None;
         let mut fields = AssertionFields::default();
+        let mut has_conditions = false;
         let mut not_before: Option<u64> = None;
         let mut not_before_subsec_nanos: u32 = 0;
         let mut not_on_or_after: Option<u64> = None;
@@ -459,6 +460,12 @@ impl SamlParser {
                         } else if local_name == "Conditions"
                             && matches!(parent, Some(("Assertion", XmlNs::Assertion)))
                         {
+                            if has_conditions {
+                                return Err(SamlError::Malformed(
+                                    "duplicate <Conditions> element in SAML Assertion".into(),
+                                ));
+                            }
+                            has_conditions = true;
                             for (k, v) in &parsed_attrs {
                                 if k == "NotBefore" {
                                     let (secs, nanos) = parse_iso8601_strict_parts(v)?;

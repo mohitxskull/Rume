@@ -28,9 +28,16 @@ end
 if current_version ~= tonumber(ARGV[1]) then
     return {0, current_version}
 end
-if ARGV[5] ~= '' and tonumber(ARGV[1]) > 0 then
-    if redis.call('GET', KEYS[3]) ~= ARGV[5] then
-        return {-2, current_version}
+if ARGV[5] ~= '' then
+    if tonumber(ARGV[1]) > 0 then
+        if redis.call('GET', KEYS[3]) ~= ARGV[5] then
+            return {-2, current_version}
+        end
+    else
+        local claim_ttl_ms = tonumber(ARGV[7]) or 60000
+        if not redis.call('SET', KEYS[3], ARGV[5], 'NX', 'PX', claim_ttl_ms) then
+            return {-2, current_version}
+        end
     end
 end
 if ARGV[4] == '1' then
@@ -144,6 +151,7 @@ impl SagaStore for RedisSagaStore {
             .terminal_ttl
             .map(|d| u64::try_from(d.as_millis().max(1)).unwrap_or(u64::MAX))
             .unwrap_or(0);
+        let claim_ttl_ms = u64::try_from(self.claim_ttl.as_millis().max(1)).unwrap_or(u64::MAX);
         Box::pin(async move {
             let payload = serde_json::to_string(&record)
                 .map_err(|e| storage_err(Some(&record.saga_id), e))?;
@@ -169,6 +177,7 @@ impl SagaStore for RedisSagaStore {
                 .arg(is_terminal)
                 .arg(&claim_token)
                 .arg(terminal_ttl_ms)
+                .arg(claim_ttl_ms)
                 .invoke_async(&mut conn)
                 .await
                 .map_err(|e| storage_err(Some(&record.saga_id), e))?;
@@ -190,6 +199,18 @@ impl SagaStore for RedisSagaStore {
                     ),
                 }),
             }
+        })
+    }
+
+    fn create_and_claim_record<'a>(
+        &'a self,
+        record: &'a SagaRecord,
+    ) -> BoxFuture<'a, Result<String, SagaError>> {
+        let token = uuid::Uuid::new_v4().to_string();
+        Box::pin(async move {
+            self.save_record_cas_with_claim(record, 0, Some(&token))
+                .await?;
+            Ok(token)
         })
     }
 

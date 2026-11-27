@@ -175,11 +175,16 @@ impl CacheBackend for InMemoryCacheBackend {
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
+            // Why: acquire `tag_index` before `entries` (global lock order) and clear any
+            // prior tag memberships on overwrite so stale tag invalidations cannot evict
+            // the newly written value (`RC-34`).
+            let mut tag_index = self.tag_index.write().await;
+            let mut map = self.entries.write().await;
             let now = tokio::time::Instant::now();
             // Why: use `checked_add` so huge TTLs (e.g. `Duration::MAX`) never panic
             // on `Instant` overflow; an unrepresentably distant expiry is treated as no TTL.
             let expires_at = ttl.and_then(|t| now.checked_add(t));
-            let mut map = self.entries.write().await;
+            tag_index.remove_key(&key);
             map.insert(key, (value, expires_at));
             Ok(())
         })
@@ -196,13 +201,14 @@ impl CacheBackend for InMemoryCacheBackend {
         let tags_vec: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
         Box::pin(async move {
             // Why: acquire `tag_index` before `entries` (matching `invalidate_tag_keys` and
-            // `clear` to prevent lock-order inversion) and hold both guards across the
-            // synchronous inserts so future cancellation while waiting for a lock can never
-            // publish a value without its tag memberships.
+            // `clear` to prevent lock-order inversion), clear prior tag memberships so stale
+            // tags never evict the overwritten value (`RC-34`), and hold both guards across
+            // the synchronous inserts so cancellation can never publish mismatched state.
             let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
             let now = tokio::time::Instant::now();
             let expires_at = ttl.and_then(|t| now.checked_add(t));
+            tag_index.remove_key(&key);
             map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
                 tag_index.insert(tag, key.clone());
@@ -404,5 +410,34 @@ mod tests {
             backend.get("k_tag_max").await.unwrap(),
             Some(b"v2".to_vec())
         );
+    }
+
+    #[tokio::test]
+    async fn overwriting_tagged_key_clears_prior_tag_membership() {
+        let backend = InMemoryCacheBackend::new();
+        backend
+            .set_with_tags("k", b"v1".to_vec(), &["old_tag"], None)
+            .await
+            .unwrap();
+
+        // Overwrite with `set` (no tags) -> invalidating `old_tag` must NOT evict `k`.
+        backend.set("k", b"v2".to_vec(), None).await.unwrap();
+        assert_eq!(backend.invalidate_tag("old_tag").await.unwrap(), 0);
+        assert_eq!(backend.get("k").await.unwrap(), Some(b"v2".to_vec()));
+
+        // Overwrite with `set_with_tags` using `new_tag` -> invalidating `old_tag` must NOT evict,
+        // while invalidating `new_tag` evicts `k`.
+        backend
+            .set_with_tags("k", b"v3".to_vec(), &["tag_1"], None)
+            .await
+            .unwrap();
+        backend
+            .set_with_tags("k", b"v4".to_vec(), &["tag_2"], None)
+            .await
+            .unwrap();
+        assert_eq!(backend.invalidate_tag("tag_1").await.unwrap(), 0);
+        assert_eq!(backend.get("k").await.unwrap(), Some(b"v4".to_vec()));
+        assert_eq!(backend.invalidate_tag("tag_2").await.unwrap(), 1);
+        assert_eq!(backend.get("k").await.unwrap(), None);
     }
 }

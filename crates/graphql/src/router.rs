@@ -5,19 +5,22 @@ use async_graphql::{ObjectType, Schema, SchemaBuilder, SubscriptionType};
 use async_graphql_axum::{GraphQLRequest, GraphQLResponse};
 use axum::Router;
 use axum::extract::State;
+use axum::http::Extensions;
 use axum::response::Html;
 use axum::routing::{get, post};
+use rume_foundation::RequestId;
+use rume_observability::TraceContext;
+use rume_security::auth::AuthUser;
+use rume_security::tenant::Tenant;
 
-/// Configuration for [`graphql_routes`] and [`graphql_routes_from_builder`].
+/// Configuration for [`graphql_routes_from_builder`] and [`GraphQlConfig::apply_limits`].
 ///
-/// Note: [`graphql_routes`] accepts a pre-built [`Schema`] and cannot
-/// retroactively apply `max_depth` or `max_complexity`. Use
-/// [`graphql_routes_from_builder`] or [`GraphQlConfig::apply_limits`] to
-/// enforce these limits on a [`SchemaBuilder`].
+/// Enforces `max_depth`, `max_complexity`, and `introspection` limits on a [`SchemaBuilder`].
 #[derive(Debug, Clone)]
 pub struct GraphQlConfig {
     pub path: String,
     pub graphiql_enabled: bool,
+    pub introspection: bool,
     pub max_depth: Option<usize>,
     pub max_complexity: Option<usize>,
 }
@@ -27,6 +30,7 @@ impl Default for GraphQlConfig {
         Self {
             path: "/graphql".to_string(),
             graphiql_enabled: false,
+            introspection: false,
             max_depth: Some(16),
             max_complexity: Some(256),
         }
@@ -48,6 +52,12 @@ impl GraphQlConfig {
         self
     }
 
+    /// Enables or disables GraphQL schema introspection (default: `false` for production hardening).
+    pub fn with_introspection(mut self, enabled: bool) -> Self {
+        self.introspection = enabled;
+        self
+    }
+
     /// Configures maximum query depth.
     pub fn with_max_depth(mut self, max_depth: Option<usize>) -> Self {
         self.max_depth = max_depth;
@@ -60,12 +70,15 @@ impl GraphQlConfig {
         self
     }
 
-    /// Applies configured `max_depth` and `max_complexity` limits to an
+    /// Applies configured `max_depth`, `max_complexity`, and `introspection` limits to an
     /// `async-graphql` [`SchemaBuilder`].
     pub fn apply_limits<Q, M, S>(
         &self,
         mut builder: SchemaBuilder<Q, M, S>,
     ) -> SchemaBuilder<Q, M, S> {
+        if !self.introspection {
+            builder = builder.disable_introspection();
+        }
         if let Some(max_depth) = self.max_depth {
             builder = builder.limit_depth(max_depth);
         }
@@ -78,6 +91,7 @@ impl GraphQlConfig {
 
 async fn graphql_handler<Q, M, S>(
     State(schema): State<Schema<Q, M, S>>,
+    extensions: Extensions,
     req: GraphQLRequest,
 ) -> GraphQLResponse
 where
@@ -85,16 +99,30 @@ where
     M: ObjectType + 'static,
     S: SubscriptionType + 'static,
 {
-    schema.execute(req.into_inner()).await.into()
+    // Why: forward Axum middleware context (`AuthUser`, `Tenant`, `RequestId`, `TraceContext`)
+    // into `async_graphql::Request::data(...)` so resolvers can enforce auth/tenant boundaries
+    // and correlate traces without re-parsing HTTP headers (`RC-24`).
+    let mut gql_req = req.into_inner();
+    if let Some(request_id) = extensions.get::<RequestId>().cloned() {
+        gql_req = gql_req.data(request_id);
+    }
+    if let Some(trace_ctx) = extensions
+        .get::<TraceContext>()
+        .cloned()
+        .or_else(TraceContext::current)
+    {
+        gql_req = gql_req.data(trace_ctx);
+    }
+    if let Some(user) = extensions.get::<AuthUser>().cloned() {
+        gql_req = gql_req.data(user);
+    }
+    if let Some(tenant) = extensions.get::<Tenant>().cloned() {
+        gql_req = gql_req.data(tenant);
+    }
+    schema.execute(gql_req).await.into()
 }
 
-/// Builds an Axum [`Router`] serving GraphQL POST queries/mutations and optional GraphiQL GET UI
-/// from a pre-built [`Schema`].
-///
-/// Pre-built schemas do not automatically inherit [`GraphQlConfig::max_depth`] or
-/// [`GraphQlConfig::max_complexity`]; use [`graphql_routes_from_builder`] or
-/// [`GraphQlConfig::apply_limits`] when building the schema to enforce DoS limits.
-pub fn graphql_routes<Q, M, S>(schema: Schema<Q, M, S>, config: GraphQlConfig) -> Router
+fn build_graphql_router<Q, M, S>(schema: Schema<Q, M, S>, config: GraphQlConfig) -> Router
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
@@ -117,8 +145,9 @@ where
 }
 
 /// Builds an Axum [`Router`] from a [`SchemaBuilder`], applying
-/// [`GraphQlConfig::max_depth`] and [`GraphQlConfig::max_complexity`] via
-/// [`GraphQlConfig::apply_limits`] before finishing the schema.
+/// [`GraphQlConfig::max_depth`], [`GraphQlConfig::max_complexity`], and
+/// [`GraphQlConfig::introspection`] via [`GraphQlConfig::apply_limits`] before
+/// finishing the schema.
 pub fn graphql_routes_from_builder<Q, M, S>(
     builder: SchemaBuilder<Q, M, S>,
     config: GraphQlConfig,
@@ -129,5 +158,5 @@ where
     S: SubscriptionType + 'static,
 {
     let schema = config.apply_limits(builder).finish();
-    graphql_routes(schema, config)
+    build_graphql_router(schema, config)
 }

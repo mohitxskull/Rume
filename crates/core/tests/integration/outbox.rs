@@ -1029,6 +1029,7 @@ async fn sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_dispatch_valid
         lease_duration_secs: 1,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     // Dispatcher runs for 1200ms (> initial 1s lease)
@@ -1133,6 +1134,7 @@ async fn database_pool_sqlite_outbox_relay_heartbeat_renewal_keeps_long_running_
         lease_duration_secs: 1,
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     let relay = OutboxRelay::new(Arc::clone(&pool), move |_msg: &OutboxMessage| {
@@ -1177,6 +1179,7 @@ async fn test_outbox_relay_heartbeat_failure_during_active_dispatch_propagates_c
         lease_duration_secs: 1, // 1s lease -> heartbeat interval 333ms
         poll_interval: Duration::from_millis(50),
         max_retries: 3,
+        ..Default::default()
     };
 
     let observed_cancellation = Arc::new(AtomicBool::new(false));
