@@ -543,10 +543,11 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
 
     for (dialect, expected_core_checksum) in expected_digests {
         let migrator = Migrator::new().with_rume_core(dialect);
+        let expected_len = if dialect == "postgres" { 3 } else { 2 };
         assert_eq!(
             migrator.migrations().len(),
-            2,
-            "{dialect} core migrator must register 2 migrations"
+            expected_len,
+            "{dialect} core migrator must register {expected_len} migrations"
         );
         assert_eq!(
             migrator.migrations()[0].id,
@@ -561,6 +562,13 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
             migrator.migrations()[1].id,
             rume::persistence::migration::RUME_AUDIT_MIGRATION_ID
         );
+        if dialect == "postgres" {
+            assert_eq!(
+                migrator.migrations()[2].id,
+                rume::persistence::migration::RUME_JOBS_QUEUE_PRIORITY_MIGRATION_ID
+            );
+            assert!(migrator.migrations()[2].down_sql.is_none());
+        }
     }
 
     let backend = SqliteBackend::in_memory().await.expect("sqlite in memory");

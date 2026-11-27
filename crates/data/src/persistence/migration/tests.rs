@@ -217,10 +217,11 @@ fn with_rume_core_registers_core_and_audit_ahead_of_app_migrations() {
             .with_rume_core(dialect);
 
         let migrations = migrator.migrations();
+        let expected_len = if dialect == "postgres" { 4 } else { 3 };
         assert_eq!(
             migrations.len(),
-            3,
-            "{dialect} must register 2 core migrations before app migrations"
+            expected_len,
+            "{dialect} must register core migrations before app migrations"
         );
         assert_eq!(migrations[0].id, RUME_CORE_MIGRATION_ID);
         assert_eq!(
@@ -233,7 +234,16 @@ fn with_rume_core_registers_core_and_audit_ahead_of_app_migrations() {
             migrations[1].down_sql.is_none(),
             "{dialect} audit migration must be irreversible to protect pre-existing audit history"
         );
-        assert_eq!(migrations[2].id, "20261105_001_app");
+        if dialect == "postgres" {
+            assert_eq!(migrations[2].id, RUME_JOBS_QUEUE_PRIORITY_MIGRATION_ID);
+            assert!(
+                migrations[2].down_sql.is_none(),
+                "postgres jobs queue/priority migration must be irreversible"
+            );
+            assert_eq!(migrations[3].id, "20261105_001_app");
+        } else {
+            assert_eq!(migrations[2].id, "20261105_001_app");
+        }
     }
 
     let unknown = Migrator::new().with_rume_core("unknown_dialect");
