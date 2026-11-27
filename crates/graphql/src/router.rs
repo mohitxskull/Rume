@@ -13,12 +13,9 @@ use rume_observability::TraceContext;
 use rume_security::auth::AuthUser;
 use rume_security::tenant::Tenant;
 
-/// Configuration for [`graphql_routes`] and [`graphql_routes_from_builder`].
+/// Configuration for [`graphql_routes_from_builder`] and [`GraphQlConfig::apply_limits`].
 ///
-/// Note: [`graphql_routes`] accepts a pre-built [`Schema`] and cannot
-/// retroactively apply `max_depth`, `max_complexity`, or `introspection`. Use
-/// [`graphql_routes_from_builder`] or [`GraphQlConfig::apply_limits`] to
-/// enforce these settings on a [`SchemaBuilder`].
+/// Enforces `max_depth`, `max_complexity`, and `introspection` limits on a [`SchemaBuilder`].
 #[derive(Debug, Clone)]
 pub struct GraphQlConfig {
     pub path: String,

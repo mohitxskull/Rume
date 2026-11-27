@@ -300,8 +300,6 @@ pub const MYSQL_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/mysql/auth_use
 /// List effective permissions for a user in MySQL.
 pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
     include_str!("../sql/mysql/auth_user_effective_permissions.sql");
-/// Upsert a tenant record in MySQL.
-pub const MYSQL_AUTH_TENANT_UPSERT: &str = include_str!("../sql/mysql/auth_tenant_upsert.sql");
 /// Find another tenant row holding `slug` (locked `FOR UPDATE`) in MySQL.
 pub const MYSQL_AUTH_TENANT_FIND_SLUG_CONFLICT: &str =
     include_str!("../sql/mysql/auth_tenant_find_slug_conflict.sql");
@@ -882,15 +880,16 @@ mod tests {
     }
 
     #[test]
-    fn mysql_tenant_upsert_uses_row_alias_and_jobs_renew_lease_guards_expiry() {
+    fn mysql_tenant_sql_avoids_on_duplicate_key_and_jobs_renew_lease_guards_expiry() {
         assert!(
-            MYSQL_AUTH_TENANT_UPSERT.contains("AS new"),
-            "MYSQL_AUTH_TENANT_UPSERT must use MySQL 8 row alias `AS new`"
+            !MYSQL_AUTH_TENANT_INSERT
+                .to_ascii_uppercase()
+                .contains("ON DUPLICATE KEY"),
+            "MYSQL_AUTH_TENANT_INSERT must not use ON DUPLICATE KEY UPDATE"
         );
         assert!(
-            !MYSQL_AUTH_TENANT_UPSERT.contains("VALUES(slug)")
-                && !MYSQL_AUTH_TENANT_UPSERT.contains("VALUES(metadata_json)"),
-            "MYSQL_AUTH_TENANT_UPSERT must not use deprecated VALUES() function"
+            MYSQL_AUTH_TENANT_UPDATE.contains("WHERE id = ?"),
+            "MYSQL_AUTH_TENANT_UPDATE must update strictly by primary key id"
         );
         for (name, sql) in [
             ("PG_JOBS_RENEW_LEASE", PG_JOBS_RENEW_LEASE),

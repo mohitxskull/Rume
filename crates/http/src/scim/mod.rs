@@ -248,15 +248,20 @@ where
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        let authorized = req
-            .headers()
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|s| {
-                s.strip_prefix("Bearer ")
-                    .or_else(|| s.strip_prefix("bearer "))
-            })
-            .is_some_and(|presented| constant_time_eq(presented.as_bytes(), self.token.as_bytes()));
+        let mut auth_headers = req.headers().get_all(header::AUTHORIZATION).iter();
+        let authorized = match (auth_headers.next(), auth_headers.next()) {
+            (Some(val), None) => val
+                .to_str()
+                .ok()
+                .and_then(|s| s.split_once(' '))
+                .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+                .map(|(_, token)| token.trim())
+                .filter(|token| !token.is_empty())
+                .is_some_and(|presented| {
+                    constant_time_eq(presented.as_bytes(), self.token.as_bytes())
+                }),
+            _ => false,
+        };
 
         if !authorized {
             let mut res = scim_status_error(
