@@ -87,12 +87,6 @@ impl PostgresJobQueue {
             .execute(&self.pool)
             .await
             .map_err(|e| JobError::Fatal(format!("failed to init schema: {e}")))?;
-        sqlx::raw_sql(rume_data::sql::PG_JOBS_QUEUE_PRIORITY)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| {
-                JobError::Fatal(format!("failed to apply queue/priority migration: {e}"))
-            })?;
         Ok(())
     }
 }

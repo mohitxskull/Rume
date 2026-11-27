@@ -9,8 +9,6 @@
 
 /// Schema DDL for the durable `rume_jobs` table in PostgreSQL.
 pub const PG_JOBS_SCHEMA: &str = include_str!("../sql/postgres/jobs_schema.sql");
-/// Additive migration adding `queue` and `priority` columns to `rume_jobs` in PostgreSQL.
-pub const PG_JOBS_QUEUE_PRIORITY: &str = include_str!("../sql/postgres/jobs_queue_priority.sql");
 
 /// Schema DDL for the `rume_audit_log` table in PostgreSQL.
 pub const PG_AUDIT_SCHEMA: &str = include_str!("../sql/postgres/audit_schema.sql");

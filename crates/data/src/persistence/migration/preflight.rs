@@ -11,8 +11,6 @@ use super::runner::{mysql_conn_execute_raw, mysql_conn_query_scalar_params};
 
 pub(super) const PG_OUTBOX: &str = include_str!("../../../sql/postgres/outbox_schema.sql");
 pub(super) const PG_JOBS: &str = include_str!("../../../sql/postgres/jobs_schema.sql");
-pub(super) const PG_JOBS_QUEUE_PRIORITY: &str =
-    include_str!("../../../sql/postgres/jobs_queue_priority.sql");
 pub(super) const PG_LOCKS: &str = include_str!("../../../sql/postgres/locks_schema.sql");
 pub(super) const PG_LEADER: &str = include_str!("../../../sql/postgres/leader_schema.sql");
 pub(super) const PG_AUDIT: &str = include_str!("../../../sql/postgres/audit_schema.sql");

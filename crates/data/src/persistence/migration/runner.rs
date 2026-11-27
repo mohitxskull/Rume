@@ -4,12 +4,12 @@
 use super::preflight::{
     LIST_APPLIED_MIGRATIONS_SQL, MYSQL_AUDIT, MYSQL_AUTH_DOWN, MYSQL_AUTH_SCHEMA, MYSQL_CORE_DOWN,
     MYSQL_OUTBOX, PG_ADVISORY_LOCK, PG_AUDIT, PG_AUTH_DOWN, PG_AUTH_SCHEMA, PG_CLOCK, PG_CORE_DOWN,
-    PG_JOBS, PG_JOBS_QUEUE_PRIORITY, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT,
-    SQLITE_AUTH_DOWN, SQLITE_AUTH_SCHEMA, SQLITE_BUSY_TIMEOUT, SQLITE_CLOCK, SQLITE_CORE_DOWN,
-    SQLITE_OUTBOX, delete_migration_query, ensure_applied_order_column_backend,
-    ensure_applied_order_column_tx, fetch_applied_order_rows_tx, find_checksum_query,
-    find_migration_id_query, insert_migration_query, migrations_schema_ddl, next_applied_order_tx,
-    parse_clock_or_now, select_rollback_target,
+    PG_JOBS, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT, SQLITE_AUTH_DOWN, SQLITE_AUTH_SCHEMA,
+    SQLITE_BUSY_TIMEOUT, SQLITE_CLOCK, SQLITE_CORE_DOWN, SQLITE_OUTBOX, delete_migration_query,
+    ensure_applied_order_column_backend, ensure_applied_order_column_tx,
+    fetch_applied_order_rows_tx, find_checksum_query, find_migration_id_query,
+    insert_migration_query, migrations_schema_ddl, next_applied_order_tx, parse_clock_or_now,
+    select_rollback_target,
 };
 #[cfg(feature = "mysql")]
 use super::preflight::{
@@ -27,9 +27,6 @@ pub const RUME_AUDIT_MIGRATION_ID: &str = "20261104_002_rume_audit_schema";
 
 /// Canonical migration identifier for the Rume auth and multi-tenancy schemas.
 pub const RUME_AUTH_MIGRATION_ID: &str = "20261126_001_rume_auth_schemas";
-
-/// Canonical migration identifier for adding Postgres `rume_jobs` `queue` and `priority` columns.
-pub const RUME_JOBS_QUEUE_PRIORITY_MIGRATION_ID: &str = "20261127_001_rume_jobs_queue_priority";
 
 /// A single versioned database migration step.
 #[derive(Clone)]
@@ -159,21 +156,6 @@ impl Migrator {
                 audit_up_sql,
             ),
         );
-        if dialect == "postgres" {
-            // Why: `jobs_insert.sql` and `jobs_claim.sql` require `rume_jobs.queue` and
-            // `rume_jobs.priority`, while `20261104_001_rume_core_schemas` must stay byte-for-byte
-            // immutable to avoid `MigrationChecksumMismatch` on deployed databases. Registered as
-            // an append-only, irreversible migration at index 2 using `ADD COLUMN IF NOT EXISTS`
-            // so upgrades from `PostgresJobQueue::init_table()` also succeed idempotently.
-            self.migrations.insert(
-                2,
-                Migration::from_sql(
-                    RUME_JOBS_QUEUE_PRIORITY_MIGRATION_ID,
-                    "Add queue and priority columns to rume_jobs",
-                    PG_JOBS_QUEUE_PRIORITY,
-                ),
-            );
-        }
         self
     }
 

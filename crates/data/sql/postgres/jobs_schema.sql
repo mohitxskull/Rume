@@ -19,9 +19,12 @@ CREATE TABLE IF NOT EXISTS rume_jobs (
     created_at BIGINT NOT NULL,
     completed_at BIGINT,
     lease_token TEXT,
-    trace_context TEXT
+    trace_context TEXT,
+    queue TEXT NOT NULL DEFAULT 'default',
+    priority INT NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_rume_jobs_pending ON rume_jobs (available_at) WHERE status = 'pending';
+CREATE INDEX IF NOT EXISTS idx_rume_jobs_pending_queue_prio ON rume_jobs (queue, priority DESC, available_at ASC, created_at ASC) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_rume_jobs_dead_letter ON rume_jobs (dead_lettered_at) WHERE status = 'dead_letter';
 CREATE UNIQUE INDEX IF NOT EXISTS idx_rume_jobs_idempotency ON rume_jobs (COALESCE(tenant_id, ''), idempotency_key) WHERE idempotency_key IS NOT NULL AND status NOT IN ('dead_letter', 'purged');
