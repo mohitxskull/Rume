@@ -1430,6 +1430,14 @@ mod tests {
         }
 
         impl JobQueue for FlakyQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,
@@ -1567,6 +1575,14 @@ mod tests {
         }
 
         impl JobQueue for CapturingQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,
@@ -1681,6 +1697,14 @@ mod tests {
         }
 
         impl JobQueue for FailFinallyOnceQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,

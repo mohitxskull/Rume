@@ -193,6 +193,7 @@ async fn test_compose_multi_instance_system_qualification() {
 
     let create_org_resp = client
         .post("http://127.0.0.1:8081/api/v1/organizations")
+        .header("Authorization", "Bearer admin-token")
         .json(&org_payload)
         .send()
         .await
@@ -202,6 +203,7 @@ async fn test_compose_multi_instance_system_qualification() {
     // Read organization on Instance 2
     let get_org_resp = client
         .get("http://127.0.0.1:8082/api/v1/organizations/org-stark")
+        .header("Authorization", "Bearer admin-token")
         .send()
         .await
         .expect("failed to get organization on instance 2");

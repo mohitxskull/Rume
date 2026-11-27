@@ -320,6 +320,9 @@ pub(crate) fn normalize_otlp_http_endpoint(base: &str, signal_path: &str) -> Str
     }
 }
 
+static GLOBAL_OBSERVABILITY_GUARD: std::sync::OnceLock<ObservabilityGuard> =
+    std::sync::OnceLock::new();
+
 /// Non-panicking initializer for the default global tracing subscriber with OpenTelemetry
 /// trace/log bridging and W3C `TraceContextPropagator`.
 ///
@@ -327,10 +330,7 @@ pub(crate) fn normalize_otlp_http_endpoint(base: &str, signal_path: &str) -> Str
 /// has already been set.
 pub fn try_init_tracing() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let guard = ObservabilityBuilder::new().try_init()?;
-    // Why: `try_init_tracing` has no guard return type for backwards compatibility;
-    // keeping providers alive for the process lifetime prevents premature shutdown
-    // of the global tracer/meter/logger providers.
-    std::mem::forget(guard);
+    let _ = GLOBAL_OBSERVABILITY_GUARD.set(guard);
     Ok(())
 }
 

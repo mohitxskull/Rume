@@ -9,7 +9,7 @@ use workbench_simple_api::{build_app, load_config, migrator};
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 1. Load application configuration through Rume's configuration system
-    let config = load_config(Path::new(".")).unwrap_or_default();
+    let config = load_config(Path::new("."))?;
     println!("Starting {} on port {}", config.app_name, config.port);
 
     // 2. Initialize persistence
@@ -23,10 +23,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 4. Build application router
     let app = build_app(pool);
 
-    // 5. Run HTTP server
+    // 5. Run HTTP server with graceful shutdown
     let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", config.port)).await?;
     println!("Listening on http://{}", listener.local_addr()?);
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
 
     Ok(())
 }

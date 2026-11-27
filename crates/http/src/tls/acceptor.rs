@@ -178,7 +178,11 @@ where
                     // `acme-tls/1` and MUST close immediately after the handshake without
                     // carrying HTTP application data (`RC-06`).
                     if tls_stream.get_ref().1.alpn_protocol() == Some(ACME_TLS_ALPN) {
-                        let _ = tls_stream.shutdown().await;
+                        tokio::select! {
+                            biased;
+                            _ = task_shutdown.changed() => {}
+                            _ = tokio::time::timeout(handshake_timeout, tls_stream.shutdown()) => {}
+                        }
                         return;
                     }
 

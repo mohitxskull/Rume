@@ -101,17 +101,19 @@ impl S3ObjectStore {
             ));
         }
 
-        // Why: validate bucket name against path/query/host-injection characters (`RC-33`).
-        if config.bucket.contains('/')
-            || config.bucket.contains('\\')
-            || config.bucket.contains('?')
-            || config.bucket.contains('#')
-            || config.bucket.contains("..")
-            || config
-                .bucket
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control())
-        {
+        // Why: strict DNS-label allowlist (`[a-z0-9.-]`, no leading/trailing `.`/`-`, no `..`)
+        // prevents userinfo (`user:pass@`), port (`:`), path, and query injection into
+        // virtual-hosted (`https://{bucket}.{base_host}`) and path-style S3 URLs (`P2-22`).
+        let bucket = config.bucket.as_str();
+        let valid_bucket = !bucket.starts_with('.')
+            && !bucket.ends_with('.')
+            && !bucket.starts_with('-')
+            && !bucket.ends_with('-')
+            && !bucket.contains("..")
+            && bucket
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-');
+        if !valid_bucket {
             return Err(ObjectStoreError::Configuration(format!(
                 "invalid S3 bucket name '{}'",
                 config.bucket
@@ -578,7 +580,12 @@ impl ObjectStore for S3ObjectStore {
                             }
                             continuation_token = Some(next);
                         }
-                        _ => break,
+                        _ => {
+                            return Err(ObjectStoreError::Http(
+                                "S3 ListObjectsV2 returned IsTruncated=true without NextContinuationToken"
+                                    .to_string(),
+                            ));
+                        }
                     }
                 } else {
                     break;

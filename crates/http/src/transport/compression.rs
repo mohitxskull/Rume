@@ -26,12 +26,26 @@ impl Predicate for SkipSensitiveHeaders {
             return false;
         }
         for val in response.headers().get_all(header::CACHE_CONTROL) {
-            if let Ok(s) = val.to_str() {
-                for directive in s.split(',') {
-                    let d = directive.trim().to_ascii_lowercase();
-                    if d == "no-store" || d == "private" || d.starts_with("private=") {
-                        return false;
-                    }
+            let Ok(s) = val.to_str() else {
+                // Why: fail closed on non-UTF-8 Cache-Control so malformed headers cannot
+                // bypass BREACH compression suppression (`P2-23`).
+                return false;
+            };
+            for directive in s.split(',') {
+                let d = directive.trim().to_ascii_lowercase();
+                if d == "no-store" || d == "private" || d.starts_with("private=") {
+                    return false;
+                }
+            }
+        }
+        for val in response.headers().get_all(header::VARY) {
+            let Ok(s) = val.to_str() else {
+                return false;
+            };
+            for field in s.split(',') {
+                let f = field.trim();
+                if f.eq_ignore_ascii_case("cookie") || f.eq_ignore_ascii_case("authorization") {
+                    return false;
                 }
             }
         }

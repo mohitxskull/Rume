@@ -8,12 +8,12 @@ publish = false
 cargo-fuzz = true
 
 [dependencies]
-libfuzzer-sys = "=0.4.13"
+libfuzzer-sys = "0.4.13"
 rume-data = { path = "../crates/data", features = ["fuzzing"] }
 rume-enterprise = { path = "../crates/enterprise", features = ["enterprise"] }
 rume-foundation = { path = "../crates/foundation" }
 rume-observability = { path = "../crates/observability" }
-serde_json = "=1.0.154"
+serde_json = "1.0.154"
 
 [[bin]]
 name = "saml_parser"

@@ -18,8 +18,17 @@ pub fn build_api_router(
     tenant_resolver: HeaderTenantResolver,
 ) -> Router<WorkbenchState> {
     let auth_pool = pool.clone();
+    let org_auth_pool = pool.clone();
     let auth_scheme = BearerTokenScheme::new(move |token: String| {
         let pool = auth_pool.clone();
+        async move {
+            UserRepository::find_by_token(&pool, &token)
+                .await
+                .map_err(|e| rume::auth::error::AuthError::ProviderError(e.to_string()))
+        }
+    });
+    let org_auth_scheme = BearerTokenScheme::new(move |token: String| {
+        let pool = org_auth_pool.clone();
         async move {
             UserRepository::find_by_token(&pool, &token)
                 .await
@@ -51,17 +60,19 @@ pub fn build_api_router(
 
     let org_limiter = RateLimiter::new(RateLimitConfig::default());
 
-    let public_org_routes = Router::new()
+    let admin_org_routes = Router::new()
         .route(
             "/organizations",
             post(organizations::create_organization).get(organizations::list_organizations),
         )
         .route("/organizations/{id}", get(organizations::get_organization))
+        .layer(PolicyLayer::new(RequireAnyRole(&["admin"])))
+        .layer(AuthLayer::required().scheme(org_auth_scheme))
         .layer(RateLimitLayer::new(org_limiter));
 
     Router::new()
         .nest("/api/v1", tenant_scoped_routes)
-        .nest("/api/v1", public_org_routes)
+        .nest("/api/v1", admin_org_routes)
         .route("/health", get(health::health))
         .layer(ObservabilityLayer::new())
 }

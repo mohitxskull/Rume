@@ -192,7 +192,11 @@ impl TotpSecret {
     }
 
     /// Verifies a TOTP code within the configured skew window, returning the matched step.
-    pub fn verify_code(&self, code: &str, timestamp_secs: u64) -> Option<u64> {
+    ///
+    /// Why: restricted to `pub(crate)` so external callers must use [`Self::verify_code_after`]
+    /// with replay tracking (`last_used_step`) instead of accepting replayed codes within the
+    /// skew window (`P2-19`).
+    pub(crate) fn verify_code(&self, code: &str, timestamp_secs: u64) -> Option<u64> {
         if Self::validate_config(&self.config).is_err() {
             return None;
         }

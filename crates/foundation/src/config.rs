@@ -179,6 +179,26 @@ pub fn load_raw_pretty(dir: &Path) -> Result<String> {
 
 /// Load the configuration source map rooted at `dir`, tracking winning provenance per key.
 pub fn source_map(dir: &Path) -> Result<ConfigSourceMap> {
+    let (_figment, map) = build_figment_and_source_map(dir)?;
+    Ok(map)
+}
+
+/// Load and validate a typed configuration along with its source provenance map.
+///
+/// Reads each configuration file from disk once and extracts both the typed value
+/// and its provenance map from the same merged `Figment` (`P2-28`).
+pub fn load_with_provenance<T>(dir: &Path) -> Result<(T, ConfigSourceMap)>
+where
+    T: DeserializeOwned,
+{
+    let (figment, map) = build_figment_and_source_map(dir)?;
+    let val = figment
+        .extract::<T>()
+        .map_err(|err| ConfigError::Validation(err.to_string()))?;
+    Ok((val, map))
+}
+
+fn build_figment_and_source_map(dir: &Path) -> Result<(Figment, ConfigSourceMap)> {
     let env_name = crate::env::resolve_env_name();
     validate_config_env_name(&env_name)?;
 
@@ -190,17 +210,23 @@ pub fn source_map(dir: &Path) -> Result<ConfigSourceMap> {
             .join(format!("app.{env_name}.local.toml")),
     ];
 
+    let mut figment = Figment::new();
     let mut sources = BTreeMap::new();
     let mut loaded_files = Vec::new();
     let mut found = false;
 
     for path in candidates {
         if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path)
-                && let Ok(val) = toml::from_str::<toml::Value>(&content)
-            {
+            let content = std::fs::read_to_string(&path).map_err(|err| {
+                ConfigError::Validation(format!(
+                    "failed to read config file {}: {err}",
+                    path.display()
+                ))
+            })?;
+            if let Ok(val) = toml::from_str::<toml::Value>(&content) {
                 flatten_toml("", &val, &mut sources, &path);
             }
+            figment = figment.merge(Toml::string(&content));
             loaded_files.push(path);
             found = true;
         }
@@ -212,23 +238,18 @@ pub fn source_map(dir: &Path) -> Result<ConfigSourceMap> {
         });
     }
 
-    let raw = load_raw(dir)?;
+    let raw = figment
+        .extract::<toml::Value>()
+        .map_err(|err| ConfigError::Validation(err.to_string()))?;
 
-    Ok(ConfigSourceMap {
-        sources,
-        loaded_files,
-        raw,
-    })
-}
-
-/// Load and validate a typed configuration along with its source provenance map.
-pub fn load_with_provenance<T>(dir: &Path) -> Result<(T, ConfigSourceMap)>
-where
-    T: DeserializeOwned,
-{
-    let val = load_in::<T>(dir)?;
-    let map = source_map(dir)?;
-    Ok((val, map))
+    Ok((
+        figment,
+        ConfigSourceMap {
+            sources,
+            loaded_files,
+            raw,
+        },
+    ))
 }
 
 fn build_figment(dir: &Path) -> Result<Figment> {

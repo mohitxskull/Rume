@@ -8,7 +8,7 @@ pub mod router;
 pub mod trace;
 
 pub use error::app_error_to_graphql;
-pub use router::{GraphQlConfig, graphql_routes, graphql_routes_from_builder};
+pub use router::{GraphQlConfig, graphql_routes_from_builder};
 pub use trace::RumeTraceExtension;
 
 #[cfg(test)]
@@ -53,11 +53,10 @@ mod tests {
 
     #[tokio::test]
     async fn graphql_router_executes_query_and_maps_app_error_extensions() {
-        let schema = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
-            .extension(RumeTraceExtension)
-            .finish();
+        let builder = Schema::build(QueryRoot, EmptyMutation, EmptySubscription)
+            .extension(RumeTraceExtension);
 
-        let app = graphql_routes(schema, GraphQlConfig::default());
+        let app = graphql_routes_from_builder(builder, GraphQlConfig::default());
 
         // 1. Successful query
         let res = app

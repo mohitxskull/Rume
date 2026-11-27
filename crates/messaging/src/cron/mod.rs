@@ -377,13 +377,22 @@ mod tests {
             .expect("register");
 
         let handle = sched.start();
-        // Wait > 1.3s: if renew wasn't bounded / deadline-fenced, the 1s tick would fire.
-        tokio::time::sleep(Duration::from_millis(1350)).await;
+        // Wait past the initial 150ms lease TTL (during which at most 1 tick could legitimately
+        // fire if the test happened to start within 150ms of a wall-clock second boundary).
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let fires_after_expiry = fires.load(Ordering::SeqCst);
+        assert!(
+            fires_after_expiry <= 1,
+            "at most one tick may fire during the initial valid 150ms lease"
+        );
 
+        // Wait > 1.2s past lease expiry: with renew() stalled, the scheduler MUST have stepped
+        // down and MUST NOT fire any additional ticks.
+        tokio::time::sleep(Duration::from_millis(1250)).await;
         assert_eq!(
             fires.load(Ordering::SeqCst),
-            0,
-            "scheduler with stalled renew() past lease_ttl must NOT fire ticks"
+            fires_after_expiry,
+            "scheduler with stalled renew() past lease_ttl must NOT fire ticks after lease expiry"
         );
 
         handle
@@ -414,6 +423,14 @@ mod tests {
         }
 
         impl JobQueue for CapturingQueue {
+            fn dequeue_excluding(
+                &self,
+                worker_id: &str,
+                _excluded_queues: &[String],
+            ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+                self.dequeue_for(worker_id)
+            }
+
             fn enqueue_delayed_with_trace<J: Job>(
                 &self,
                 job: J,

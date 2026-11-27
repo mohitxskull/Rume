@@ -58,8 +58,6 @@ pub(super) const PG_MIGRATION_INSERT: &str =
     include_str!("../../../sql/postgres/migration_insert.sql");
 pub(super) const PG_MIGRATION_DELETE: &str =
     include_str!("../../../sql/postgres/migration_delete.sql");
-pub(super) const PG_MIGRATION_FIND_ID: &str =
-    include_str!("../../../sql/postgres/migration_find_id.sql");
 pub(super) const PG_MIGRATION_LIST_APPLIED: &str =
     include_str!("../../../sql/common/migration_list_applied.sql");
 pub(super) const PG_ADVISORY_LOCK: &str =
@@ -72,8 +70,6 @@ pub(super) const MYSQL_MIGRATION_INSERT: &str =
     include_str!("../../../sql/mysql/migration_insert.sql");
 pub(super) const MYSQL_MIGRATION_DELETE: &str =
     include_str!("../../../sql/mysql/migration_delete.sql");
-pub(super) const MYSQL_MIGRATION_FIND_ID: &str =
-    include_str!("../../../sql/mysql/migration_find_id.sql");
 #[cfg(any(feature = "mysql", test))]
 pub(super) const MYSQL_CLOCK: &str = include_str!("../../../sql/mysql/mysql_clock.sql");
 #[cfg(feature = "mysql")]
@@ -89,8 +85,6 @@ pub(super) const SQLITE_MIGRATION_INSERT: &str =
     include_str!("../../../sql/sqlite/migration_insert.sql");
 pub(super) const SQLITE_MIGRATION_DELETE: &str =
     include_str!("../../../sql/sqlite/migration_delete.sql");
-pub(super) const SQLITE_MIGRATION_FIND_ID: &str =
-    include_str!("../../../sql/sqlite/migration_find_id.sql");
 pub(super) const SQLITE_CLOCK: &str = include_str!("../../../sql/sqlite/sqlite_clock.sql");
 pub(super) const SQLITE_BUSY_TIMEOUT: &str =
     include_str!("../../../sql/sqlite/sqlite_busy_timeout.sql");
@@ -116,14 +110,6 @@ pub(super) fn delete_migration_query(dialect: &str) -> &'static str {
         "postgres" => PG_MIGRATION_DELETE,
         "mysql" => MYSQL_MIGRATION_DELETE,
         _ => SQLITE_MIGRATION_DELETE,
-    }
-}
-
-pub(super) fn find_migration_id_query(dialect: &str) -> &'static str {
-    match dialect {
-        "postgres" => PG_MIGRATION_FIND_ID,
-        "mysql" => MYSQL_MIGRATION_FIND_ID,
-        _ => SQLITE_MIGRATION_FIND_ID,
     }
 }
 

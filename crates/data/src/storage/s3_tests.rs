@@ -272,6 +272,13 @@ fn s3_rejects_malformed_xml_invalid_bucket_and_invalid_presign_params() {
         "bad#f",
         "bad..b",
         "bad bucket",
+        "user:pass@evil",
+        "bucket:8080",
+        ".leading-dot",
+        "trailing-dot.",
+        "-leading-dash",
+        "trailing-dash-",
+        "UPPERCASE",
     ] {
         let err = S3ObjectStore::new(S3Config {
             endpoint: "https://s3.us-east-1.amazonaws.com".to_string(),
@@ -299,7 +306,7 @@ fn s3_rejects_malformed_xml_invalid_bucket_and_invalid_presign_params() {
     })
     .unwrap();
     let key = ObjectKey::new("a.txt").unwrap();
-    let now = chrono::Utc::now();
+    let now = DateTime::<Utc>::from(std::time::SystemTime::now());
 
     assert!(matches!(
         store.presign_at("GET", &key, 0, now),

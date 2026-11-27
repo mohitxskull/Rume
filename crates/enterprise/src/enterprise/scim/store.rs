@@ -650,7 +650,7 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
                         }
                     }
                 } else {
-                    group.members = members;
+                    group.members = dedup_members(members);
                 }
             }
             Ok(())
@@ -662,6 +662,19 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
     }
 }
 
+fn dedup_members(members: Vec<ScimMember>) -> Vec<ScimMember> {
+    let mut deduped: Vec<ScimMember> = Vec::with_capacity(members.len());
+    for member in members {
+        if !deduped
+            .iter()
+            .any(|existing| existing.value == member.value)
+        {
+            deduped.push(member);
+        }
+    }
+    deduped
+}
+
 impl ScimStore for InMemoryScimStore {
     fn create_user(&self, mut user: ScimUser) -> BoxFuture<'_, Result<ScimUser, ScimStoreError>> {
         Box::pin(async move {
@@ -670,7 +683,8 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
-            if user.user_name.trim().is_empty() {
+            user.user_name = user.user_name.trim().to_string();
+            if user.user_name.is_empty() {
                 return Err(ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
                     detail: "userName cannot be empty".into(),
@@ -738,7 +752,8 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            if user.user_name.trim().is_empty() {
+            user.user_name = user.user_name.trim().to_string();
+            if user.user_name.is_empty() {
                 return Err(ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
                     detail: "userName cannot be empty".into(),
@@ -888,7 +903,8 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
-            if group.display_name.trim().is_empty() {
+            group.display_name = group.display_name.trim().to_string();
+            if group.display_name.is_empty() {
                 return Err(ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
                     detail: "displayName cannot be empty".into(),
@@ -959,7 +975,8 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            if group.display_name.trim().is_empty() {
+            group.display_name = group.display_name.trim().to_string();
+            if group.display_name.is_empty() {
                 return Err(ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
                     detail: "displayName cannot be empty".into(),

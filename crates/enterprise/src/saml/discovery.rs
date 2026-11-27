@@ -26,6 +26,7 @@ impl SamlParser {
                         ResolveResult::Bound(ns) if ns.as_ref() == SAML_METADATA_NS
                     );
                     if entity_id.is_none()
+                        && depth == 1
                         && is_metadata_ns
                         && e.local_name().as_ref() == "EntityDescriptor"
                     {
@@ -51,11 +52,16 @@ impl SamlParser {
                                 break;
                             }
                         }
-                        entity_id = Some(found.ok_or_else(|| {
-                            SamlError::Malformed(
-                                "missing entityID attribute on EntityDescriptor".into(),
-                            )
-                        })?);
+                        let id = found
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                            .ok_or_else(|| {
+                                SamlError::Malformed(
+                                    "missing or empty entityID attribute on EntityDescriptor"
+                                        .into(),
+                                )
+                            })?;
+                        entity_id = Some(id);
                     }
                 }
                 Ok((res, Event::Empty(ref e))) => {
@@ -64,6 +70,7 @@ impl SamlParser {
                         ResolveResult::Bound(ns) if ns.as_ref() == SAML_METADATA_NS
                     );
                     if entity_id.is_none()
+                        && depth == 0
                         && is_metadata_ns
                         && e.local_name().as_ref() == "EntityDescriptor"
                     {
@@ -89,11 +96,16 @@ impl SamlParser {
                                 break;
                             }
                         }
-                        entity_id = Some(found.ok_or_else(|| {
-                            SamlError::Malformed(
-                                "missing entityID attribute on EntityDescriptor".into(),
-                            )
-                        })?);
+                        let id = found
+                            .map(|v| v.trim().to_string())
+                            .filter(|v| !v.is_empty())
+                            .ok_or_else(|| {
+                                SamlError::Malformed(
+                                    "missing or empty entityID attribute on EntityDescriptor"
+                                        .into(),
+                                )
+                            })?;
+                        entity_id = Some(id);
                     }
                 }
                 Ok((_, Event::End(_))) => {

@@ -84,15 +84,11 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
     /// Used when polling all queues (`queues == None`) while one or more queues have
     /// reached their per-queue concurrency cap, so saturated high-priority queues cannot
     /// starve other queues or churn DB deferrals (`RC-30`).
-    ///
-    /// Defaults to delegating to [`JobQueue::dequeue_for`] for backward compatibility.
     fn dequeue_excluding(
         &self,
         worker_id: &str,
-        _excluded_queues: &[String],
-    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
-        self.dequeue_for(worker_id)
-    }
+        excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
 
     /// Dequeues the next available job whose `available_at` time has passed.
     ///
@@ -234,6 +230,14 @@ mod tests {
     }
 
     impl JobQueue for MinimalQueue {
+        fn dequeue_excluding(
+            &self,
+            worker_id: &str,
+            _excluded_queues: &[String],
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.dequeue_for(worker_id)
+        }
+
         fn enqueue_delayed_with_trace<J: Job>(
             &self,
             _job: J,

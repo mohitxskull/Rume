@@ -225,9 +225,6 @@ pub const PG_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in PostgreSQL.
 pub const PG_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/postgres/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in PostgreSQL.
-pub const PG_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/postgres/auth_role_permissions_list.sql");
 /// Assign a role to a user in PostgreSQL.
 pub const PG_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/postgres/auth_user_role_assign.sql");
@@ -292,9 +289,6 @@ pub const MYSQL_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in MySQL.
 pub const MYSQL_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/mysql/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in MySQL.
-pub const MYSQL_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/mysql/auth_role_permissions_list.sql");
 /// Assign a role to a user in MySQL.
 pub const MYSQL_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/mysql/auth_user_role_assign.sql");
@@ -369,9 +363,6 @@ pub const SQLITE_AUTH_ROLE_GRANT_PERMISSION: &str =
 /// Revoke a permission from a role in SQLite.
 pub const SQLITE_AUTH_ROLE_REVOKE_PERMISSION: &str =
     include_str!("../sql/sqlite/auth_role_revoke_permission.sql");
-/// List permissions granted to a role in SQLite.
-pub const SQLITE_AUTH_ROLE_PERMISSIONS_LIST: &str =
-    include_str!("../sql/sqlite/auth_role_permissions_list.sql");
 /// Assign a role to a user in SQLite.
 pub const SQLITE_AUTH_USER_ROLE_ASSIGN: &str =
     include_str!("../sql/sqlite/auth_user_role_assign.sql");

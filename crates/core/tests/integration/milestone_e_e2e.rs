@@ -24,7 +24,9 @@ use rume::cache::InMemoryCacheBackend;
 use rume::enterprise::scim::{ScimGroup, ScimListResponse, ScimUser};
 use rume::env::{ExternalSecretBackend, SecretProviderError, VaultSecretProvider};
 use rume::flags::{TargetingRule, evaluate_flag};
-use rume::graphql::{GraphQlConfig, RumeTraceExtension, app_error_to_graphql, graphql_routes};
+use rume::graphql::{
+    GraphQlConfig, RumeTraceExtension, app_error_to_graphql, graphql_routes_from_builder,
+};
 use rume::grpc::{RumeTraceInterceptor, app_error_to_status};
 use rume::metering::{MeteringError, UsageRecord};
 use rume::persistence::SqliteBackend;
@@ -706,10 +708,9 @@ async fn milestone_e_platform_scim_and_rpc_e2e() {
             .is_some()
     );
 
-    let schema = Schema::build(GraphQlQueryRoot, EmptyMutation, EmptySubscription)
-        .extension(RumeTraceExtension)
-        .finish();
-    let gql_app = graphql_routes(schema, GraphQlConfig::default());
+    let builder = Schema::build(GraphQlQueryRoot, EmptyMutation, EmptySubscription)
+        .extension(RumeTraceExtension);
+    let gql_app = graphql_routes_from_builder(builder, GraphQlConfig::default());
     let gql_res = gql_app
         .oneshot(
             Request::builder()

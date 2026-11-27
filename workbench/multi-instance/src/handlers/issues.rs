@@ -39,7 +39,7 @@ pub async fn create_issue(
     let issue_id = format!("issue-{}", Uuid::new_v4());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as i64;
 
     let issue = Issue {
@@ -128,7 +128,7 @@ pub async fn update_issue(
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
+        .unwrap_or_default()
         .as_millis() as i64;
 
     if let Some(s) = &payload.status {

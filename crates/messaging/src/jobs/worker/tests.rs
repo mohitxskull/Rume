@@ -47,6 +47,14 @@ struct BlockingTestQueue {
 }
 
 impl JobQueue for BlockingTestQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed_with_trace<J: Job>(
         &self,
         _job: J,
@@ -783,6 +791,14 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
     }
 
     impl JobQueue for NotifyOnRenewQueue {
+        fn dequeue_excluding(
+            &self,
+            worker_id: &str,
+            _excluded_queues: &[String],
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.dequeue_for(worker_id)
+        }
+
         fn enqueue_delayed_with_trace<J: Job>(
             &self,
             job: J,
@@ -967,6 +983,14 @@ struct RecordingTestQueue {
 }
 
 impl JobQueue for RecordingTestQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed_with_trace<J: Job>(
         &self,
         _job: J,
@@ -1130,6 +1154,14 @@ struct LeaseLossOrderQueue {
 }
 
 impl JobQueue for LeaseLossOrderQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed<J: Job>(
         &self,
         _job: J,
@@ -1350,6 +1382,14 @@ struct LeaseTrackingQueue {
 }
 
 impl JobQueue for LeaseTrackingQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed<J: Job>(
         &self,
         _job: J,
@@ -1511,6 +1551,14 @@ struct DeferTrackingQueue {
 }
 
 impl JobQueue for DeferTrackingQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed<J: Job>(
         &self,
         _job: J,
@@ -1691,6 +1739,14 @@ struct BurstTestQueue {
 }
 
 impl JobQueue for BurstTestQueue {
+    fn dequeue_excluding(
+        &self,
+        worker_id: &str,
+        _excluded_queues: &[String],
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
+
     fn enqueue_delayed_with_trace<J: Job>(
         &self,
         _job: J,
@@ -2015,6 +2071,14 @@ async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
     }
 
     impl JobQueue for StalledRenewQueue {
+        fn dequeue_excluding(
+            &self,
+            worker_id: &str,
+            _excluded_queues: &[String],
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.dequeue_for(worker_id)
+        }
+
         fn enqueue<J: Job>(&self, _job: J) -> BoxFuture<'_, Result<String, JobError>> {
             Box::pin(async { Ok("id".into()) })
         }
@@ -2174,6 +2238,14 @@ async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
     }
 
     impl JobQueue for SlowRenewQueue {
+        fn dequeue_excluding(
+            &self,
+            worker_id: &str,
+            _excluded_queues: &[String],
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.dequeue_for(worker_id)
+        }
+
         fn enqueue_delayed_with_trace<J: Job>(
             &self,
             _job: J,
@@ -2350,6 +2422,14 @@ async fn job_worker_enforces_per_queue_concurrency_cap() {
     }
 
     impl JobQueue for MultiJobQueue {
+        fn dequeue_excluding(
+            &self,
+            worker_id: &str,
+            _excluded_queues: &[String],
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            self.dequeue_for(worker_id)
+        }
+
         fn enqueue_delayed_with_trace<J: Job>(
             &self,
             _job: J,

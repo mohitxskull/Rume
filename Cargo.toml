@@ -68,7 +68,7 @@ tempfile = "3.27.0"
 sqlx = { version = "0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
 sea-query = { version = "1.0.2", default-features = false, features = ["backend-sqlite", "backend-postgres", "backend-mysql", "thread-safe"] }
 # SQL parsing and validation used by `rume sql:check` and `rume-data` transaction/placeholder checks.
-# Pinned to an exact version so dialect-aware placeholder, statement, and comment lexing is deterministic.
+# SemVer caret pin (exact resolution locked in Cargo.lock) for dialect-aware placeholder/statement lexing.
 sqlparser = { version = "0.64.0", features = ["visitor"] }
 # RFC 3339 / ISO 8601 date-time parsing used by SAML assertion condition/instant validation.
 # Default features are disabled so consumers that only parse fixed-offset timestamps do not

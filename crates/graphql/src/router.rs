@@ -125,13 +125,7 @@ where
     schema.execute(gql_req).await.into()
 }
 
-/// Builds an Axum [`Router`] serving GraphQL POST queries/mutations and optional GraphiQL GET UI
-/// from a pre-built [`Schema`].
-///
-/// Pre-built schemas do not automatically inherit [`GraphQlConfig::max_depth`] or
-/// [`GraphQlConfig::max_complexity`]; use [`graphql_routes_from_builder`] or
-/// [`GraphQlConfig::apply_limits`] when building the schema to enforce DoS limits.
-pub fn graphql_routes<Q, M, S>(schema: Schema<Q, M, S>, config: GraphQlConfig) -> Router
+fn build_graphql_router<Q, M, S>(schema: Schema<Q, M, S>, config: GraphQlConfig) -> Router
 where
     Q: ObjectType + 'static,
     M: ObjectType + 'static,
@@ -154,8 +148,9 @@ where
 }
 
 /// Builds an Axum [`Router`] from a [`SchemaBuilder`], applying
-/// [`GraphQlConfig::max_depth`] and [`GraphQlConfig::max_complexity`] via
-/// [`GraphQlConfig::apply_limits`] before finishing the schema.
+/// [`GraphQlConfig::max_depth`], [`GraphQlConfig::max_complexity`], and
+/// [`GraphQlConfig::introspection`] via [`GraphQlConfig::apply_limits`] before
+/// finishing the schema.
 pub fn graphql_routes_from_builder<Q, M, S>(
     builder: SchemaBuilder<Q, M, S>,
     config: GraphQlConfig,
@@ -166,5 +161,5 @@ where
     S: SubscriptionType + 'static,
 {
     let schema = config.apply_limits(builder).finish();
-    graphql_routes(schema, config)
+    build_graphql_router(schema, config)
 }

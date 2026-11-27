@@ -89,6 +89,14 @@ impl Default for OpenApiDocsConfig {
     }
 }
 
+/// Error returned when configuring [`OpenApiDocsConfig`] with an unsafe or invalid URL.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("invalid OpenAPI docs {field}: must use https://, http://, or a relative / path")]
+pub struct OpenApiDocsError {
+    /// Name of the invalid configuration field.
+    pub field: &'static str,
+}
+
 fn is_allowed_asset_url(url: &str) -> bool {
     let trimmed = url.trim();
     trimmed.starts_with("https://")
@@ -104,6 +112,16 @@ impl OpenApiDocsConfig {
             spec_url: spec_url.into(),
             ..Self::default()
         }
+    }
+
+    /// Sets the OpenAPI specification URL, rejecting unsafe schemes such as `javascript:` or `data:`.
+    pub fn with_spec_url(mut self, spec_url: impl Into<String>) -> Result<Self, OpenApiDocsError> {
+        let url = spec_url.into();
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError { field: "spec_url" });
+        }
+        self.spec_url = url;
+        Ok(self)
     }
 
     /// Sets the HTML document `<title>`.
@@ -122,34 +140,36 @@ impl OpenApiDocsConfig {
 
     /// Overrides the default pinned CDN `<script>` URL.
     ///
-    /// # Panics
-    ///
-    /// Panics if `script_url` does not use `https://`, `http://`, or a relative `/` path.
-    #[must_use]
-    pub fn with_script_url(mut self, script_url: impl Into<String>) -> Self {
+    /// Returns an error if `script_url` does not use `https://`, `http://`, or a relative `/` path.
+    pub fn with_script_url(
+        mut self,
+        script_url: impl Into<String>,
+    ) -> Result<Self, OpenApiDocsError> {
         let url = script_url.into();
-        assert!(
-            is_allowed_asset_url(&url),
-            "OpenAPI docs script_url must use https://, http://, or a relative / path"
-        );
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError {
+                field: "script_url",
+            });
+        }
         self.script_url = Some(url);
-        self
+        Ok(self)
     }
 
     /// Overrides the default pinned CDN `<link rel="stylesheet">` URL (Swagger UI only).
     ///
-    /// # Panics
-    ///
-    /// Panics if `stylesheet_url` does not use `https://`, `http://`, or a relative `/` path.
-    #[must_use]
-    pub fn with_stylesheet_url(mut self, stylesheet_url: impl Into<String>) -> Self {
+    /// Returns an error if `stylesheet_url` does not use `https://`, `http://`, or a relative `/` path.
+    pub fn with_stylesheet_url(
+        mut self,
+        stylesheet_url: impl Into<String>,
+    ) -> Result<Self, OpenApiDocsError> {
         let url = stylesheet_url.into();
-        assert!(
-            is_allowed_asset_url(&url),
-            "OpenAPI docs stylesheet_url must use https://, http://, or a relative / path"
-        );
+        if !is_allowed_asset_url(&url) {
+            return Err(OpenApiDocsError {
+                field: "stylesheet_url",
+            });
+        }
         self.stylesheet_url = Some(url);
-        self
+        Ok(self)
     }
 
     /// Sets an optional Subresource Integrity (`integrity`) attribute for the `<script>` tag
@@ -221,9 +241,11 @@ fn escape_js_string(value: &str) -> String {
 pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
     let title = escape_html(&config.title);
 
+    let safe_spec_url = safe_asset_url(Some(config.spec_url.as_str()), "/openapi.json");
+
     match config.ui {
         OpenApiUi::Scalar => {
-            let spec_url = escape_html(&config.spec_url);
+            let spec_url = escape_html(safe_spec_url);
             let script_url = escape_html(safe_asset_url(
                 config.script_url.as_deref(),
                 DEFAULT_SCALAR_SCRIPT_URL,
@@ -252,7 +274,7 @@ pub fn openapi_docs_html(config: &OpenApiDocsConfig) -> String {
             )
         }
         OpenApiUi::SwaggerUi => {
-            let spec_url_js = escape_js_string(&config.spec_url);
+            let spec_url_js = escape_js_string(safe_spec_url);
             let script_url = escape_html(safe_asset_url(
                 config.script_url.as_deref(),
                 DEFAULT_SWAGGER_UI_SCRIPT_URL,
@@ -381,7 +403,9 @@ mod tests {
 
     #[test]
     fn openapi_docs_respects_custom_script_and_stylesheet_urls() {
-        let scalar = OpenApiDocsConfig::default().with_script_url("/static/scalar.js");
+        let scalar = OpenApiDocsConfig::default()
+            .with_script_url("/static/scalar.js")
+            .unwrap();
         let scalar_html = openapi_docs_html(&scalar);
         assert!(!scalar_html.contains(DEFAULT_SCALAR_SCRIPT_URL));
         assert!(scalar_html.contains(r#"src="/static/scalar.js""#));
@@ -389,7 +413,9 @@ mod tests {
         let swagger = OpenApiDocsConfig::default()
             .with_ui(OpenApiUi::SwaggerUi)
             .with_script_url("/static/swagger-ui-bundle.js")
-            .with_stylesheet_url("/static/swagger-ui.css");
+            .unwrap()
+            .with_stylesheet_url("/static/swagger-ui.css")
+            .unwrap();
         let swagger_html = openapi_docs_html(&swagger);
         assert!(!swagger_html.contains(DEFAULT_SWAGGER_UI_SCRIPT_URL));
         assert!(!swagger_html.contains(DEFAULT_SWAGGER_UI_STYLESHEET_URL));
@@ -400,13 +426,14 @@ mod tests {
     #[test]
     fn openapi_docs_escapes_title_and_spec_url_against_html_injection() {
         let evil_title = "<script>alert(1)</script>";
-        let evil_spec = r#""</script><img onerror=1>""#;
+        let evil_spec = r#"/openapi.json"</script><img onerror=1>""#;
         let evil_script = r#"https://cdn.example/a.js" onload="alert(1)"#;
         let evil_css = r#"https://cdn.example/a.css" onload="alert(1)"#;
 
         let scalar = OpenApiDocsConfig::new(evil_spec)
             .with_title(evil_title)
-            .with_script_url(evil_script);
+            .with_script_url(evil_script)
+            .unwrap();
         let scalar_html = openapi_docs_html(&scalar);
         assert!(!scalar_html.contains(evil_title));
         assert!(!scalar_html.contains("<script>alert(1)"));
@@ -418,7 +445,9 @@ mod tests {
             .with_title(evil_title)
             .with_ui(OpenApiUi::SwaggerUi)
             .with_script_url(evil_script)
-            .with_stylesheet_url(evil_css);
+            .unwrap()
+            .with_stylesheet_url(evil_css)
+            .unwrap();
         let swagger_html = openapi_docs_html(&swagger);
         assert!(!swagger_html.contains(evil_title));
         assert!(!swagger_html.contains("<script>alert(1)"));
@@ -468,23 +497,37 @@ mod tests {
 
         // Direct struct mutation with unsafe scheme falls back to pinned default
         let unsafe_cfg = OpenApiDocsConfig {
+            spec_url: "javascript:alert(1)".to_string(),
             script_url: Some("javascript:alert(1)".to_string()),
             ..OpenApiDocsConfig::default()
         };
         let fallback_html = openapi_docs_html(&unsafe_cfg);
         assert!(!fallback_html.contains("javascript:"));
         assert!(fallback_html.contains(DEFAULT_SCALAR_SCRIPT_URL));
+        assert!(fallback_html.contains(r#"data-url="/openapi.json""#));
     }
 
     #[test]
-    #[should_panic(expected = "script_url must use https://, http://, or a relative / path")]
-    fn openapi_docs_rejects_javascript_script_url() {
-        let _ = OpenApiDocsConfig::default().with_script_url("javascript:alert(1)");
-    }
-
-    #[test]
-    #[should_panic(expected = "stylesheet_url must use https://, http://, or a relative / path")]
-    fn openapi_docs_rejects_data_stylesheet_url() {
-        let _ = OpenApiDocsConfig::default().with_stylesheet_url("data:text/css,body{}");
+    fn openapi_docs_rejects_unsafe_urls_with_error() {
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_script_url("javascript:alert(1)")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_stylesheet_url("data:text/css,body{}")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_spec_url("javascript:alert(1)")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_spec_url("data:application/json,{}")
+                .is_err()
+        );
     }
 }
