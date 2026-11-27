@@ -240,6 +240,7 @@ fn collect_top_level_statement_heads_from_tokens(
     let mut heads: Vec<Vec<String>> = Vec::new();
     let mut leading_words: Vec<String> = Vec::with_capacity(3);
     let mut in_compound_create_decl = false;
+    let mut seen_lparen = false;
     let mut block_depth: usize = 0;
 
     let mut i = 0;
@@ -251,6 +252,12 @@ fn collect_top_level_statement_heads_from_tokens(
                         heads.push(std::mem::take(&mut leading_words));
                     }
                     in_compound_create_decl = false;
+                    seen_lparen = false;
+                }
+            }
+            Token::LParen => {
+                if block_depth == 0 {
+                    seen_lparen = true;
                 }
             }
             Token::Word(word) if word.quote_style.is_none() => {
@@ -261,10 +268,11 @@ fn collect_top_level_statement_heads_from_tokens(
                     }
                     // Why: only enter a compound SQL block (`BEGIN ... END`) when the
                     // enclosing `CREATE` statement explicitly declares a compound object
-                    // (`TRIGGER`, `FUNCTION`, `PROCEDURE`, or `EVENT`). Allowing arbitrary
-                    // `CREATE ... BEGIN` lets an unparseable prefix swallow subsequent
-                    // `; COMMIT;` statements (`RC-13`).
-                    if leading_words.first().map(String::as_str) == Some("CREATE")
+                    // (`TRIGGER`, `FUNCTION`, `PROCEDURE`, or `EVENT`) BEFORE the first `(`
+                    // so column definitions like `CREATE TABLE t (event INT)` never trigger
+                    // `in_compound_create_decl` (`RC-13`).
+                    if !seen_lparen
+                        && leading_words.first().map(String::as_str) == Some("CREATE")
                         && matches!(
                             upper.as_str(),
                             "TRIGGER" | "FUNCTION" | "PROCEDURE" | "EVENT"
@@ -1109,5 +1117,25 @@ mod data_sql_scanners_proptests {
                 "valid MySQL line comment must be allowed: {ok}"
             );
         }
+    }
+
+    #[test]
+    fn create_table_column_named_event_does_not_enable_compound_begin_block() {
+        // `CREATE TABLE t (event INT)` is valid DDL by itself.
+        assert!(
+            validate_managed_transaction_sql(
+                "CREATE TABLE t (event INT);",
+                &sqlparser::dialect::SQLiteDialect {},
+            )
+            .is_ok()
+        );
+        // However, `event` inside `(...)` must NOT set `in_compound_create_decl` so a
+        // trailing `BEGIN ... ; COMMIT; END;` cannot be hidden inside it.
+        let smuggled = "CREATE TABLE t (event INT) BEGIN SELECT 1; COMMIT; END;";
+        let res = validate_managed_transaction_sql(smuggled, &sqlparser::dialect::SQLiteDialect {});
+        assert!(
+            matches!(res, Err(PersistenceError::TransactionError(_))),
+            "column name `event` inside CREATE TABLE (...) must not enable compound BEGIN block"
+        );
     }
 }

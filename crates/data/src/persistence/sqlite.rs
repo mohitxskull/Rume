@@ -47,6 +47,17 @@ impl SqliteBackend {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
+            // Why: reset `PRAGMA busy_timeout = 5000` on every connection release so even a
+            // cancelled or panicked `begin_immediate_transaction` never leaks `busy_timeout = 60000`
+            // back into the pool.
+            .after_release(|conn, _meta| {
+                Box::pin(async move {
+                    sqlx::query("PRAGMA busy_timeout = 5000")
+                        .execute(conn)
+                        .await?;
+                    Ok(true)
+                })
+            })
             .connect_with(opts)
             .await
             .map_err(|e| PersistenceError::ConnectionFailed(e.to_string()))?;
@@ -81,7 +92,18 @@ impl SqliteBackend {
             let mut pool_opts = SqlitePoolOptions::new()
                 .max_connections(config.max_connections.max(1))
                 .min_connections(config.min_connections)
-                .acquire_timeout(config.connect_timeout());
+                .acquire_timeout(config.connect_timeout())
+                // Why: reset `PRAGMA busy_timeout = 5000` on every connection release so even a
+                // cancelled or panicked `begin_immediate_transaction` never leaks
+                // `busy_timeout = 60000` back into the pool.
+                .after_release(|conn, _meta| {
+                    Box::pin(async move {
+                        sqlx::query("PRAGMA busy_timeout = 5000")
+                            .execute(conn)
+                            .await?;
+                        Ok(true)
+                    })
+                });
             if let Some(idle) = config.idle_timeout() {
                 pool_opts = pool_opts.idle_timeout(idle);
             }

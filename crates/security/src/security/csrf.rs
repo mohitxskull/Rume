@@ -344,19 +344,21 @@ where
                 // If auto_inject_cookie is enabled, ensure the client has a valid cookie token
                 let mut token_to_inject = None;
                 if config.auto_inject_cookie {
+                    // Why: cap candidate CSRF cookies before HMAC verification on safe methods
+                    // too, matching the mutating-method branch so a `GET` carrying thousands of
+                    // forged CSRF cookies cannot trigger unbounded HMAC work.
                     let has_valid_cookie = req
                         .headers()
                         .get_all(COOKIE)
                         .iter()
                         .filter_map(|val| val.to_str().ok())
                         .flat_map(|cookies| cookies.split(';'))
-                        .any(|pair| {
-                            if let Some((name, value)) = pair.trim().split_once('=') {
-                                name == config.cookie_name && config.verify_token(value)
-                            } else {
-                                false
-                            }
-                        });
+                        .filter_map(|pair| {
+                            let (name, value) = pair.trim().split_once('=')?;
+                            (name == config.cookie_name).then_some(value)
+                        })
+                        .take(MAX_CSRF_COOKIE_CANDIDATES)
+                        .any(|value| config.verify_token(value));
 
                     if !has_valid_cookie {
                         token_to_inject = Some(config.generate_token());
@@ -562,5 +564,64 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp_denied.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn safe_method_auto_inject_cookie_caps_csrf_cookie_candidates() {
+        use tower::ServiceExt;
+
+        let mut config =
+            CsrfConfig::default().with_secret(b"0123456789abcdef0123456789abcdef".to_vec());
+        config.auto_inject_cookie = true;
+        let valid_token = config.generate_token();
+
+        let app = axum::Router::new()
+            .route("/read", axum::routing::get(|| async { "ok" }))
+            .layer(CsrfLayer::with_config(config));
+
+        // 7 invalid CSRF cookies + 1 valid CSRF cookie (8th candidate, within cap) -> no Set-Cookie needed.
+        let mut within_cap: Vec<String> = (0..7)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        within_cap.push(format!("csrf_token={valid_token}"));
+        let resp_within = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/read")
+                    .header(COOKIE, within_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_within.status(), StatusCode::OK);
+        assert!(
+            resp_within.headers().get(SET_COOKIE).is_none(),
+            "valid CSRF cookie within candidate cap must be recognized on GET"
+        );
+
+        // 8 invalid CSRF cookies + 1 valid CSRF cookie (9th candidate, beyond cap) -> stops at cap and injects fresh cookie.
+        let mut beyond_cap: Vec<String> = (0..8)
+            .map(|i| format!("csrf_token=tossed{i}.deadbeef"))
+            .collect();
+        beyond_cap.push(format!("csrf_token={valid_token}"));
+        let resp_beyond = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::GET)
+                    .uri("/read")
+                    .header(COOKIE, beyond_cap.join("; "))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp_beyond.status(), StatusCode::OK);
+        assert!(
+            resp_beyond.headers().get(SET_COOKIE).is_some(),
+            "GET must cap CSRF cookie verification at MAX_CSRF_COOKIE_CANDIDATES"
+        );
     }
 }

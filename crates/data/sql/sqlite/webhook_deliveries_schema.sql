@@ -8,8 +8,8 @@ CREATE TABLE IF NOT EXISTS rume_webhook_deliveries (
     attempt         INTEGER NOT NULL DEFAULT 0,
     next_attempt_at TEXT,
     last_response   TEXT,
-    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
-    updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now') || '000Z'),
+    updated_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f', 'now') || '000Z')
 );
 CREATE INDEX IF NOT EXISTS rume_webhook_deliveries_status
     ON rume_webhook_deliveries (status, next_attempt_at);
