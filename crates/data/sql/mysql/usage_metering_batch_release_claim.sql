@@ -1,3 +1,6 @@
 UPDATE rume_usage_export_batches
-SET claimed_until = NULL
-WHERE batch_id = ?;
+SET claim_token = NULL,
+    claimed_until = NULL
+WHERE batch_id = ?
+  AND claim_token = ?
+  AND exported_at IS NULL;

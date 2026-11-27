@@ -14,6 +14,7 @@ CREATE TABLE IF NOT EXISTS rume_usage_export_batches (
     batch_id      VARCHAR(64) NOT NULL PRIMARY KEY,
     payload_json  LONGTEXT    NOT NULL,
     created_at    DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+    claim_token   VARCHAR(64) NULL,
     claimed_until BIGINT      NULL,
     exported_at   DATETIME(6) NULL,
     KEY rume_usage_export_batches_pending (exported_at, claimed_until, created_at)

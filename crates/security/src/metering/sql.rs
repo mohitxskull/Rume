@@ -147,6 +147,7 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
         Box::pin(async move {
             const BATCH_CLAIM_LEASE_MS: i64 = 60_000;
             let dialect = self.backend.dialect();
+            let claim_token = uuid::Uuid::new_v4().to_string();
 
             // Phase 1 (short DB transaction — ZERO network I/O):
             // Why: decoupling DB locks from `BillingSink` network I/O prevents a slow
@@ -209,6 +210,7 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                     .execute_params(
                         claim_stmt,
                         &[
+                            DbValue::from(claim_token.as_str()),
                             DbValue::from(BATCH_CLAIM_LEASE_MS),
                             DbValue::from(batch_id.as_str()),
                         ],
@@ -317,6 +319,7 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
                             &[
                                 DbValue::from(batch_id.as_str()),
                                 DbValue::from(payload_json.as_str()),
+                                DbValue::from(claim_token.as_str()),
                                 DbValue::from(BATCH_CLAIM_LEASE_MS),
                             ],
                         )
@@ -355,13 +358,17 @@ impl<B: DatabaseBackend> UsageMeter for SqlUsageMeter<B> {
             for (idx, (batch_id, records)) in batches_to_export.iter().enumerate() {
                 if let Err(err) = sink.export_batch(records).await {
                     // Release claims on the failed batch and any remaining claimed batches
-                    // so the next `flush()` retries immediately without losing usage.
+                    // fenced by `claim_token` so a stalled worker whose lease expired can
+                    // never clear another replica's active claim (`RC-04a`).
                     for (pending_id, _) in &batches_to_export[idx..] {
                         let _ = self
                             .backend
                             .execute_params(
                                 release_claim_stmt,
-                                &[DbValue::from(pending_id.as_str())],
+                                &[
+                                    DbValue::from(pending_id.as_str()),
+                                    DbValue::from(claim_token.as_str()),
+                                ],
                             )
                             .await;
                     }
@@ -678,5 +685,68 @@ mod tests {
         let _ = std::fs::remove_file(&db_path);
         let _ = std::fs::remove_file(format!("{}-wal", db_path.display()));
         let _ = std::fs::remove_file(format!("{}-shm", db_path.display()));
+    }
+
+    #[tokio::test]
+    async fn stale_claim_token_cannot_release_reclaimed_usage_batch() {
+        use rume_data::persistence::{DatabaseConfig, SqliteBackend};
+
+        let backend = Arc::new(
+            SqliteBackend::new(&DatabaseConfig::new(":memory:"))
+                .await
+                .expect("open sqlite memory"),
+        );
+        let meter = SqlUsageMeter::new(Arc::clone(&backend));
+        meter.ensure_schema().await.expect("ensure_schema");
+
+        // Worker A inserts a staged batch with `tok-a`.
+        backend
+            .execute_params(
+                sql::SQLITE_USAGE_METERING_BATCH_INSERT,
+                &[
+                    DbValue::from("batch-1"),
+                    DbValue::from("[]"),
+                    DbValue::from("tok-a"),
+                    DbValue::from(60_000_i64),
+                ],
+            )
+            .await
+            .expect("insert batch");
+
+        // Worker B reclaims the batch with `tok-b`.
+        backend
+            .execute_params(
+                sql::SQLITE_USAGE_METERING_BATCH_CLAIM,
+                &[
+                    DbValue::from("tok-b"),
+                    DbValue::from(60_000_i64),
+                    DbValue::from("batch-1"),
+                ],
+            )
+            .await
+            .expect("reclaim batch");
+
+        // Stale Worker A attempts to release with `tok-a` -> 0 rows affected, claim stays owned by `tok-b`.
+        let affected_stale = backend
+            .execute_params(
+                sql::SQLITE_USAGE_METERING_BATCH_RELEASE_CLAIM,
+                &[DbValue::from("batch-1"), DbValue::from("tok-a")],
+            )
+            .await
+            .expect("stale release");
+        assert_eq!(
+            affected_stale, 0,
+            "stale claim_token must not clear another worker's active claim"
+        );
+
+        // Active Worker B releases with `tok-b` -> 1 row affected.
+        let affected_active = backend
+            .execute_params(
+                sql::SQLITE_USAGE_METERING_BATCH_RELEASE_CLAIM,
+                &[DbValue::from("batch-1"), DbValue::from("tok-b")],
+            )
+            .await
+            .expect("active release");
+        assert_eq!(affected_active, 1);
     }
 }

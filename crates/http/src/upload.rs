@@ -232,7 +232,7 @@ pub fn sniff_mime_type(bytes: &[u8]) -> Option<&'static str> {
     //    HTML/script/SVG/XML detection (`RC-05`).
     let mut trimmed = bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes);
     while let Some((&b, rest)) = trimmed.split_first() {
-        if matches!(b, b' ' | b'\t' | b'\r' | b'\n') {
+        if matches!(b, b' ' | b'\t' | b'\r' | b'\n' | b'\x0c') {
             trimmed = rest;
         } else {
             break;
@@ -328,7 +328,16 @@ fn mime_types_equivalent(a: &str, b: &str) -> bool {
             a.to_ascii_lowercase().as_str(),
             b.to_ascii_lowercase().as_str()
         ),
-        ("text/xml", "application/xml") | ("application/xml", "text/xml")
+        ("text/xml", "application/xml")
+            | ("application/xml", "text/xml")
+            | ("image/x-icon", "image/vnd.microsoft.icon")
+            | ("image/vnd.microsoft.icon", "image/x-icon")
+            | ("audio/wav", "audio/x-wav")
+            | ("audio/x-wav", "audio/wav")
+            | ("audio/flac", "audio/x-flac")
+            | ("audio/x-flac", "audio/flac")
+            | ("application/x-rar-compressed", "application/vnd.rar")
+            | ("application/vnd.rar", "application/x-rar-compressed")
     )
 }
 
@@ -875,6 +884,84 @@ mod tests {
                         format!("multipart/form-data; boundary={boundary}"),
                     )
                     .body(Body::from(xml_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // 4. Form-feed (`\x0c`) leading whitespace before `<script>` pretending to be image/png -> 415
+        let ff_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec!["image/png".to_string()],
+            allowed_extensions: vec!["png".to_string()],
+            ..Default::default()
+        };
+        let ff_app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(ff_config));
+        let ff_body = build_multipart_body(
+            boundary,
+            "file",
+            "ff.png",
+            "image/png",
+            b"\x0c<script>alert(1)</script>",
+        );
+        let resp = ff_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(ff_body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+        // 5. Genuine WAV uploaded with `audio/wav` when `infer` returns `audio/x-wav` -> 200 OK
+        let wav_config = MultipartUploadConfig {
+            max_file_size_bytes: 4096,
+            max_files: 1,
+            allowed_mime_types: vec!["audio/wav".to_string()],
+            allowed_extensions: vec!["wav".to_string()],
+            ..Default::default()
+        };
+        let wav_app = Router::new()
+            .route(
+                "/upload",
+                post(|ValidatedMultipart { files }| async move {
+                    Json(serde_json::json!({ "count": files.len() }))
+                }),
+            )
+            .layer(Extension(wav_config));
+        let wav_body = build_multipart_body(
+            boundary,
+            "file",
+            "clip.wav",
+            "audio/wav",
+            b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00",
+        );
+        let resp = wav_app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/upload")
+                    .header(
+                        header::CONTENT_TYPE,
+                        format!("multipart/form-data; boundary={boundary}"),
+                    )
+                    .body(Body::from(wav_body))
                     .unwrap(),
             )
             .await
