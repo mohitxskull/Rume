@@ -226,6 +226,11 @@ impl ObjectStore for LocalFsObjectStore {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(ObjectStoreError::Io(e));
             }
+            // Why: remove any stale sidecar BEFORE renaming the new object into place so
+            // concurrent `head()`/`list()` readers between `rename` and `write_sidecar`
+            // fall back to hashing the new file instead of pairing the new size with an
+            // old `etag`/`content_type` (`RC-34`).
+            self.remove_sidecar(key.as_str()).await?;
             if let Err(e) = tokio::fs::rename(&tmp_path, &target).await {
                 let _ = tokio::fs::remove_file(&tmp_path).await;
                 return Err(ObjectStoreError::Io(e));
@@ -664,5 +669,39 @@ mod tests {
             list_legacy[0].etag.as_deref(),
             Some(expected_digest.as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn local_fs_store_overwrite_updates_etag_and_content_type_cleanly() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalFsObjectStore::new(dir.path()).expect("store");
+        let key = ObjectKey::new("docs/item.dat").expect("valid key");
+
+        let meta1 = store
+            .put(
+                &key,
+                b"version-1".to_vec(),
+                PutObjectOptions {
+                    content_type: Some("text/plain".to_string()),
+                },
+            )
+            .await
+            .expect("put v1");
+        let meta2 = store
+            .put(
+                &key,
+                b"version-2-longer".to_vec(),
+                PutObjectOptions {
+                    content_type: Some("application/json".to_string()),
+                },
+            )
+            .await
+            .expect("put v2");
+        assert_ne!(meta1.etag, meta2.etag);
+
+        let head = store.head(&key).await.expect("head v2");
+        assert_eq!(head.size, 16);
+        assert_eq!(head.etag, meta2.etag);
+        assert_eq!(head.content_type.as_deref(), Some("application/json"));
     }
 }

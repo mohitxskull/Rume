@@ -614,6 +614,7 @@ async fn e2e_s3_object_store_with_wiremock_and_presigned_url() {
         secret_access_key: "test-secret-key".to_string(),
         session_token: None,
         path_style: true,
+        ..Default::default()
     })
     .expect("construct S3ObjectStore");
 

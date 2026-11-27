@@ -27,6 +27,16 @@ pub fn compensation_idempotency_key(saga_id: &str, step_name: &str) -> String {
     format!("saga:{saga_id}:compensate:{step_name}")
 }
 
+fn merge_step_lists(authoritative: &[String], handle_steps: &[String]) -> Vec<String> {
+    let mut merged = authoritative.to_vec();
+    for step in handle_steps {
+        if !merged.iter().any(|existing| existing == step) {
+            merged.push(step.clone());
+        }
+    }
+    merged
+}
+
 fn attach_saga_id(err: SagaError, saga_id: &str) -> SagaError {
     match err {
         SagaError::Storage {
@@ -248,17 +258,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self.name
     }
 
-    async fn acquire_execution_claim(
-        &self,
+    fn spawn_claim_guard(
+        store: &Arc<dyn SagaStore>,
         saga_id: &str,
-    ) -> Result<Option<ExecutionClaimGuard>, SagaError> {
-        let Some(store) = &self.store else {
-            return Ok(None);
-        };
-        let token = store
-            .try_acquire_execution(saga_id)
-            .await
-            .map_err(|err| attach_saga_id(err, saga_id))?;
+        token: String,
+    ) -> ExecutionClaimGuard {
         let renew_task = store.claim_ttl().map(|ttl| {
             let store = Arc::clone(store);
             let saga_id = saga_id.to_string();
@@ -298,12 +302,26 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 }
             })
         });
-        Ok(Some(ExecutionClaimGuard {
+        ExecutionClaimGuard {
             store: Some(Arc::clone(store)),
             saga_id: saga_id.to_string(),
             token,
             renew_task,
-        }))
+        }
+    }
+
+    async fn acquire_execution_claim(
+        &self,
+        saga_id: &str,
+    ) -> Result<Option<ExecutionClaimGuard>, SagaError> {
+        let Some(store) = &self.store else {
+            return Ok(None);
+        };
+        let token = store
+            .try_acquire_execution(saga_id)
+            .await
+            .map_err(|err| attach_saga_id(err, saga_id))?;
+        Ok(Some(Self::spawn_claim_guard(store, saga_id, token)))
     }
 
     async fn persist_state(
@@ -382,44 +400,38 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        // Why: `SqlSagaStore` stores execution claim leases on the `rume_sagas` row itself, so
-        // the initial `Pending` row (`expected_version = 0`) must be inserted before acquiring
-        // the execution claim; `INSERT` atomicity also fences concurrent starters for the same ID.
-        let mut version = 0u64;
-        if let Err(error) = self
-            .persist_state(saga_id, &mut version, None, SagaStatus::Pending, &[], &[])
-            .await
-        {
-            return Err(SagaRecoveryError::new(
-                error,
-                SagaRecoveryHandle {
-                    saga_id: saga_id.to_string(),
-                    saga_name: self.name.clone(),
-                    context: ctx,
-                    phase: SagaRecoveryPhase::Forward,
-                    completed_steps: Vec::new(),
-                    compensated_steps: Vec::new(),
-                    version,
-                },
-            ));
-        }
-
-        let claim = match self.acquire_execution_claim(saga_id).await {
-            Ok(c) => c,
-            Err(error) => {
-                return Err(SagaRecoveryError::new(
-                    error,
-                    SagaRecoveryHandle {
-                        saga_id: saga_id.to_string(),
-                        saga_name: self.name.clone(),
-                        context: ctx,
-                        phase: SagaRecoveryPhase::Forward,
-                        completed_steps: Vec::new(),
-                        compensated_steps: Vec::new(),
-                        version,
-                    },
-                ));
+        // Why: atomically insert the initial `Pending` row AND acquire its execution claim
+        // in one operation so no concurrent recovery worker can observe a `claim_token = NULL`
+        // window between `Pending` insertion and claim acquisition (`RC-09`).
+        let (version, claim) = if let Some(store) = &self.store {
+            let record = SagaRecord {
+                saga_id: saga_id.to_string(),
+                saga_name: self.name.clone(),
+                status: SagaStatus::Pending,
+                completed_steps: Vec::new(),
+                compensated_steps: Vec::new(),
+                updated_at: current_timestamp(),
+                version: 1,
+            };
+            match store.create_and_claim_record(&record).await {
+                Ok(token) => (1u64, Some(Self::spawn_claim_guard(store, saga_id, token))),
+                Err(error) => {
+                    return Err(SagaRecoveryError::new(
+                        attach_saga_id(error, saga_id),
+                        SagaRecoveryHandle {
+                            saga_id: saga_id.to_string(),
+                            saga_name: self.name.clone(),
+                            context: ctx,
+                            phase: SagaRecoveryPhase::Forward,
+                            completed_steps: Vec::new(),
+                            compensated_steps: Vec::new(),
+                            version: 0,
+                        },
+                    ));
+                }
             }
+        } else {
+            (0u64, None)
         };
 
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
@@ -628,18 +640,23 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 .run_with_id_recoverable(&handle.saga_id, handle.context)
                 .await;
         }
-        let completed_indices = match self.resolve_completed_indices(&handle.completed_steps) {
-            Ok(indices) => indices,
-            Err(err) => return Err(SagaRecoveryError::new(err, handle)),
-        };
+        if let Err(err) = self.resolve_completed_indices(&handle.completed_steps) {
+            return Err(SagaRecoveryError::new(err, handle));
+        }
         let claim = match self.acquire_execution_claim(&handle.saga_id).await {
             Ok(c) => c,
             Err(err) => return Err(SagaRecoveryError::new(err, handle)),
         };
 
-        // Why: validate the persisted record under the execution claim before dispatching
-        // a recovery handle so a `Compensating` handle cannot roll back an already-`Success`
-        // saga or overwrite an existing terminal outcome (`Compensated`/`CompensationFailed`).
+        let mut effective_version = handle.version;
+        let mut effective_completed_steps = handle.completed_steps.clone();
+        let mut effective_compensated_steps = handle.compensated_steps.clone();
+        let mut reconciled_trigger_error: Option<SagaError> = None;
+
+        // Why: validate AND reconcile the persisted record under the execution claim before
+        // dispatching a recovery handle so a `Compensating` handle cannot roll back an
+        // already-`Success` saga, overwrite an existing terminal outcome, or loop on a stale
+        // `handle.version` / `completed_steps` after contention (`RC-08`).
         if let Some(store) = &self.store {
             match store.load_record(&handle.saga_id).await {
                 Ok(Some(record)) => {
@@ -695,7 +712,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                 compensated_steps: record.compensated_steps,
                             });
                         }
-                        SagaStatus::Compensating { .. } => {
+                        SagaStatus::Compensating { error: rec_err, .. } => {
                             // Why: once a saga has persisted `Compensating`, a `Forward` recovery
                             // handle (e.g. from a cross-workflow `resume_recoverable` mismatch)
                             // must never resume forward execution after steps may already be undone.
@@ -715,11 +732,34 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                                     handle,
                                 ));
                             }
+                            reconciled_trigger_error = rec_err;
                         }
                         SagaStatus::Pending | SagaStatus::Running { .. } => {}
                     }
+
+                    effective_version = record.version;
+                    effective_completed_steps =
+                        merge_step_lists(&record.completed_steps, &handle.completed_steps);
+                    effective_compensated_steps =
+                        merge_step_lists(&record.compensated_steps, &handle.compensated_steps);
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if handle.version > 0
+                        || matches!(handle.phase, SagaRecoveryPhase::Compensating { .. })
+                    {
+                        if let Some(c) = claim {
+                            c.release().await;
+                        }
+                        let saga_id = handle.saga_id.clone();
+                        return Err(SagaRecoveryError::new(
+                            SagaError::Storage {
+                                saga_id: Some(saga_id.clone()),
+                                message: format!("saga record '{saga_id}' not found"),
+                            },
+                            handle,
+                        ));
+                    }
+                }
                 Err(err) => {
                     if let Some(c) = claim {
                         c.release().await;
@@ -733,19 +773,29 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             }
         }
 
+        let completed_indices = match self.resolve_completed_indices(&effective_completed_steps) {
+            Ok(indices) => indices,
+            Err(err) => {
+                if let Some(c) = claim {
+                    c.release().await;
+                }
+                return Err(SagaRecoveryError::new(err, handle));
+            }
+        };
+
         let claim_token = claim.as_ref().map(|c| c.token.as_str());
         let res = match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
                 self.execute_forward_from_recoverable(
                     &handle.saga_id,
-                    handle.version,
+                    effective_version,
                     claim_token,
                     handle.context,
                     start_idx,
                     completed_indices,
-                    handle.completed_steps,
-                    handle.compensated_steps,
+                    effective_completed_steps,
+                    effective_compensated_steps,
                 )
                 .await
             }
@@ -755,13 +805,13 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             } => {
                 self.compensate_completed_recoverable(
                     &handle.saga_id,
-                    handle.version,
+                    effective_version,
                     claim_token,
                     handle.context,
                     &completed_indices,
-                    &handle.completed_steps,
-                    handle.compensated_steps,
-                    error,
+                    &effective_completed_steps,
+                    effective_compensated_steps,
+                    error.or(reconciled_trigger_error),
                     compensation_errors,
                 )
                 .await
