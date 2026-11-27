@@ -9,13 +9,11 @@ description = "Optional tonic gRPC integration with W3C TraceContext and AppErro
 [dependencies]
 rume-foundation.workspace = true
 rume-observability.workspace = true
-rume-http.workspace = true
 axum.workspace = true
 tower.workspace = true
 tokio.workspace = true
 tonic.workspace = true
 prost.workspace = true
-tonic-prost.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

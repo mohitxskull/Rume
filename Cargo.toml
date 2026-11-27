@@ -138,7 +138,6 @@ lettre = { version = "=0.11.24", default-features = false, features = ["tokio1-r
 minijinja = "=3.1.0"
 tonic = "=0.14.9"
 prost = "=0.14.6"
-tonic-prost = "=0.14.9"
 async-graphql = "=7.2.1"
 async-graphql-axum = "=7.2.1"
 

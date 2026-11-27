@@ -457,10 +457,7 @@ impl WebhookTransport for InProcessWebhookTransport {
                 .header("X-Rume-Delivery", deliv)
                 .body(Body::from(body))
                 .map_err(|e| WebhookError::Transport(e.to_string()))?;
-            let resp = router
-                .oneshot(req)
-                .await
-                .map_err(|e| WebhookError::Transport(e.to_string()))?;
+            let Ok(resp) = router.oneshot(req).await;
             let status = resp.status().as_u16();
             let bytes = to_bytes(resp.into_body(), usize::MAX)
                 .await
