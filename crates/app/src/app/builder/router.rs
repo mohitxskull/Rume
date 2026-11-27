@@ -531,6 +531,23 @@ where
         //   4. `CompressionLayer` (outermost): compresses responses only after
         //      `ObservabilityLayer` has injected `request_id` into JSON bodies, and
         //      appends `Vary: accept-encoding` without clobbering `Vary: origin`.
+        //   0. `CatchPanicLayer`: sits inside `BodyLimitLayer`/`CorsLayer`/`ObservabilityLayer`
+        //      so handler panics are caught, logged, and converted into a redacted 500
+        //      `application/problem+json` response that still receives CORS headers and
+        //      `request_id` injection.
+        router = router.layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            |err: Box<dyn std::any::Any + Send + 'static>| {
+                let detail = err
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .or_else(|| err.downcast_ref::<String>().map(String::as_str))
+                    .unwrap_or("unknown panic payload");
+                tracing::error!(panic = %detail, "request handler panicked");
+                axum::response::IntoResponse::into_response(rume_foundation::AppError::internal(
+                    "request handler panicked",
+                ))
+            },
+        ));
         router = router.layer(axum::extract::DefaultBodyLimit::disable());
         if let Some(max_bytes) = body_limit {
             router =
@@ -677,4 +694,60 @@ fn check_and_record_route(
     }
     seen_routes.push((new_method, normalized_path));
     Ok(())
+}
+
+#[cfg(test)]
+mod catch_panic_tests {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{Request, StatusCode, header};
+    use tower::ServiceExt as _;
+
+    use crate::app::AppContext;
+    use crate::app::builder::RumeBuilder;
+    use crate::app::paths::ProjectPaths;
+    use crate::app::state::Availability;
+    use rume_http::routing::HealthChecks;
+
+    #[tokio::test]
+    async fn panicking_handler_returns_redacted_500_problem_json() {
+        let ctx = AppContext::new(
+            (),
+            (),
+            ProjectPaths::from_current_dir(),
+            Availability::new(),
+            HealthChecks::new(),
+            (),
+        );
+        let router = RumeBuilder::new(ctx.clone())
+            .get("/boom", || async {
+                panic!("sensitive internal secret: db-password-123");
+                #[allow(unreachable_code)]
+                "never"
+            })
+            .build_router(ctx.clone())
+            .expect("router should build")
+            .with_state(ctx);
+
+        let res = router
+            .oneshot(Request::builder().uri("/boom").body(Body::empty()).unwrap())
+            .await
+            .expect("request should not fail");
+
+        assert_eq!(res.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let content_type = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            content_type.starts_with("application/problem+json"),
+            "expected application/problem+json, got {content_type}"
+        );
+        let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("db-password-123"),
+            "panic payload must not leak into HTTP response: {text}"
+        );
+    }
 }

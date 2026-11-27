@@ -355,11 +355,13 @@ impl VaultSecretProvider {
     }
 
     fn resolve_path(&self, key: &str) -> Result<String, SecretProviderError> {
-        // Why: reject path traversal segments (`.`, `..`), backslashes, NUL bytes,
-        // query strings, and fragments so untrusted secret keys cannot escape the
-        // configured Vault mount or namespace (`RC-36`).
+        // Why: reject path traversal segments (`.`, `..`), percent-encoding, backslashes,
+        // ASCII control characters, query strings, and fragments so untrusted secret keys
+        // cannot escape the configured Vault mount or namespace (`RC-26`, `RC-36`).
         if key.is_empty()
-            || key.chars().any(|c| matches!(c, '\\' | '\0' | '?' | '#'))
+            || key
+                .chars()
+                .any(|c| matches!(c, '\\' | '?' | '#' | '%') || c.is_ascii_control())
             || key.split('/').any(|seg| seg == "." || seg == "..")
         {
             return Err(SecretProviderError::Backend(format!(
@@ -428,8 +430,18 @@ impl KmsSecretProvider {
         }
     }
 
-    fn resolve_path(&self, key: &str) -> String {
-        format!("{}:{key}", self.key_id)
+    fn resolve_path(&self, key: &str) -> Result<String, SecretProviderError> {
+        if key.is_empty()
+            || key
+                .chars()
+                .any(|c| matches!(c, '\\' | '?' | '#' | '%') || c.is_ascii_control())
+            || key.split('/').any(|seg| seg == "." || seg == "..")
+        {
+            return Err(SecretProviderError::Backend(format!(
+                "invalid KMS secret key: '{key}'"
+            )));
+        }
+        Ok(format!("{}:{key}", self.key_id))
     }
 }
 
@@ -448,7 +460,7 @@ impl SecretProvider for KmsSecretProvider {
         key: &'a str,
     ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
         Box::pin(async move {
-            let path = self.resolve_path(key);
+            let path = self.resolve_path(key)?;
             self.backend.fetch_secret(&path).await
         })
     }
@@ -458,7 +470,7 @@ impl SecretProvider for KmsSecretProvider {
         key: &'a str,
     ) -> BoxFuture<'a, Result<SecretString, SecretProviderError>> {
         Box::pin(async move {
-            let path = self.resolve_path(key);
+            let path = self.resolve_path(key)?;
             self.backend.rotate_secret(&path).await
         })
     }
@@ -710,6 +722,8 @@ mod tests {
             "a/./b",
             "a\\b",
             "a\0b",
+            "a\nb",
+            "a%2e%2e/b",
             "a?version=1",
             "a#frag",
         ] {
@@ -717,6 +731,15 @@ mod tests {
             assert!(
                 matches!(err, SecretProviderError::Backend(_)),
                 "expected Backend error for Vault key {bad:?}, got {err:?}"
+            );
+        }
+
+        let kms = KmsSecretProvider::new(Arc::new(DenyAllBackend), "arn:aws:kms:us-east-1:1:key/x");
+        for bad in ["", "../root", "a%2fb", "a\\b", "a\nb", "a?x=1", "a#frag"] {
+            let err = kms.get_secret(bad).await.unwrap_err();
+            assert!(
+                matches!(err, SecretProviderError::Backend(_)),
+                "expected Backend error for KMS key {bad:?}, got {err:?}"
             );
         }
     }

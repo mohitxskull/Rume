@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::extract::ConnectInfo;
 use axum::http::Request;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::{TokioExecutor, TokioIo, TokioTimer};
 use hyper_util::server::conn::auto::Builder as AutoConnBuilder;
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
@@ -92,7 +92,20 @@ where
     let mut acme_guard = AbortOnDrop(acme_driver);
 
     let graceful = GracefulShutdown::new();
-    let conn_builder = AutoConnBuilder::new(TokioExecutor::new());
+    // Why: configure explicit HTTP/1 header timeout and HTTP/2 concurrency/keep-alive
+    // limits so slowloris and rapid-reset/stream-flood peers cannot exhaust connection
+    // tasks or memory (`RC-20`).
+    let mut conn_builder = AutoConnBuilder::new(TokioExecutor::new());
+    conn_builder
+        .http1()
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30));
+    conn_builder
+        .http2()
+        .timer(TokioTimer::new())
+        .max_concurrent_streams(256)
+        .keep_alive_interval(Duration::from_secs(30))
+        .keep_alive_timeout(Duration::from_secs(20));
     let handshake_timeout = tls_config.handshake_timeout;
     // Why: bound concurrent TLS handshakes and active connections so a client flood
     // cannot spawn unbounded Tokio tasks before handshakes time out (`RC-06`).

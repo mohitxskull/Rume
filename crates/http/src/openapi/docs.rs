@@ -111,6 +111,9 @@ pub struct OpenApiDocsError {
 
 fn is_allowed_asset_url(url: &str) -> bool {
     let trimmed = url.trim();
+    if trimmed.is_empty() || trimmed.bytes().any(|b| b == b'\\' || b.is_ascii_control()) {
+        return false;
+    }
     trimmed.starts_with("https://")
         || trimmed.starts_with("http://")
         || (trimmed.starts_with('/') && !trimmed.starts_with("//"))
@@ -132,7 +135,7 @@ impl OpenApiDocsConfig {
         if !is_allowed_asset_url(&url) {
             return Err(OpenApiDocsError { field: "spec_url" });
         }
-        self.spec_url = url;
+        self.spec_url = url.trim().to_string();
         Ok(self)
     }
 
@@ -163,7 +166,7 @@ impl OpenApiDocsConfig {
                 field: "script_url",
             });
         }
-        self.script_url = Some(url);
+        self.script_url = Some(url.trim().to_string());
         Ok(self)
     }
 
@@ -180,7 +183,7 @@ impl OpenApiDocsConfig {
                 field: "stylesheet_url",
             });
         }
-        self.stylesheet_url = Some(url);
+        self.stylesheet_url = Some(url.trim().to_string());
         Ok(self)
     }
 
@@ -551,6 +554,32 @@ mod tests {
             OpenApiDocsConfig::default()
                 .with_spec_url("data:application/json,{}")
                 .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_spec_url("/\\evil.example/spec.json")
+                .is_err()
+        );
+        assert!(
+            OpenApiDocsConfig::default()
+                .with_script_url("https://cdn.example.com/a\nb.js")
+                .is_err()
+        );
+        let trimmed = OpenApiDocsConfig::default()
+            .with_spec_url("  /openapi.json  ")
+            .unwrap()
+            .with_script_url("  https://cdn.example.com/scalar.js  ")
+            .unwrap()
+            .with_stylesheet_url("  https://cdn.example.com/swagger.css  ")
+            .unwrap();
+        assert_eq!(trimmed.spec_url, "/openapi.json");
+        assert_eq!(
+            trimmed.script_url.as_deref(),
+            Some("https://cdn.example.com/scalar.js")
+        );
+        assert_eq!(
+            trimmed.stylesheet_url.as_deref(),
+            Some("https://cdn.example.com/swagger.css")
         );
     }
 }

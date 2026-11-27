@@ -756,7 +756,7 @@ impl<Q: JobQueue> JobWorker<Q> {
     }
 
     /// Executes a single dequeued job, handling acknowledgments, retries, and dead-lettering.
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[cfg(test)]
     pub(super) async fn execute_job(
         queue: Arc<Q>,
         registry: Arc<JobRegistry>,

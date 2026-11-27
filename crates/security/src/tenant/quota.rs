@@ -327,17 +327,30 @@ impl TenantQuotaStore for InMemoryTenantQuotaStore {
     fn count<'a>(&'a self, tenant_id: &'a str) -> BoxFuture<'a, Result<usize, CacheError>> {
         let tid = tenant_id.to_string();
         Box::pin(async move {
-            let map = self.keys.read().await;
             let now = tokio::time::Instant::now();
-            if let Some(tenant_map) = map.get(&tid) {
-                let active = tenant_map
-                    .values()
-                    .filter(|exp| exp.is_none_or(|t| t > now))
-                    .count();
-                Ok(active)
-            } else {
-                Ok(0)
+            let (active, needs_prune) = {
+                let map = self.keys.read().await;
+                if let Some(tenant_map) = map.get(&tid) {
+                    let active = tenant_map
+                        .values()
+                        .filter(|exp| exp.is_none_or(|t| t > now))
+                        .count();
+                    let needs_prune = tenant_map.is_empty() || active < tenant_map.len();
+                    (active, needs_prune)
+                } else {
+                    (0, false)
+                }
+            };
+            if needs_prune {
+                let mut map = self.keys.write().await;
+                if let Some(tenant_map) = map.get_mut(&tid) {
+                    Self::prune_expired_inline(tenant_map, now);
+                    if tenant_map.is_empty() {
+                        map.remove(&tid);
+                    }
+                }
             }
+            Ok(active)
         })
     }
 

@@ -16,7 +16,11 @@ pub enum CronError {
     Execution(String),
 }
 
-/// Policy governing how missed cron ticks are handled after leadership failover or delay.
+/// Policy governing how missed cron ticks are handled due to handler execution
+/// or clock delays within a leader's active term.
+///
+/// Leadership failover always recomputes the schedule from the next future tick
+/// so a newly elected leader does not replay stale or duplicate ticks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MissedTickPolicy {
     /// Skip any missed ticks and schedule the next future occurrence.
@@ -42,7 +46,9 @@ pub struct CronJobSpec {
     pub name: String,
     /// 5-field or 6-field cron expression.
     pub expression: String,
-    /// Timezone offset for evaluating the cron schedule (defaults to UTC).
+    /// Fixed UTC offset (`FixedOffset`) for evaluating the cron schedule (defaults to UTC).
+    ///
+    /// Uses a constant UTC offset with no daylight-saving time (DST) transitions.
     pub timezone: FixedOffset,
     /// Policy for missed ticks.
     pub missed_tick_policy: MissedTickPolicy,

@@ -188,34 +188,16 @@ pub struct ReqwestWebhookTransport {
     allow_private_networks: bool,
 }
 
-impl Default for ReqwestWebhookTransport {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ReqwestWebhookTransport {
     /// Creates a new [`ReqwestWebhookTransport`] with SSRF protection, disabled redirects,
     /// and bounded connect/request timeouts.
-    pub fn new() -> Self {
-        Self::builder()
-            .build()
-            .expect("valid default reqwest webhook client config")
+    pub fn try_new() -> Result<Self, WebhookError> {
+        Self::builder().build()
     }
 
     /// Returns a hardened [`ReqwestWebhookTransportBuilder`].
     pub fn builder() -> ReqwestWebhookTransportBuilder {
         ReqwestWebhookTransportBuilder::default()
-    }
-
-    /// Configures whether private, loopback, and link-local network targets are permitted.
-    ///
-    /// Defaults to `false`. Enable only for local integration tests.
-    pub fn with_allow_private_networks(self, allow: bool) -> Self {
-        Self::builder()
-            .allow_private_networks(allow)
-            .build()
-            .expect("valid reqwest webhook client config")
     }
 }
 
@@ -586,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn reqwest_webhook_transport_rejects_ssrf_ips_by_default() {
-        let transport = ReqwestWebhookTransport::new();
+        let transport = ReqwestWebhookTransport::try_new().expect("default webhook transport");
         for blocked in [
             "http://127.0.0.1:8080/hook",
             "http://169.254.169.254/latest/meta-data/",
@@ -623,7 +605,10 @@ mod tests {
         );
         let (redir_url, redir_hits) = spawn_raw_http_server(redirect_resp).await;
 
-        let transport = ReqwestWebhookTransport::new().with_allow_private_networks(true);
+        let transport = ReqwestWebhookTransport::builder()
+            .allow_private_networks(true)
+            .build()
+            .expect("webhook transport");
         let err = transport
             .send(&redir_url, "t=1,v1=abc", "evt", "del-1", b"{}".to_vec())
             .await
@@ -643,7 +628,10 @@ mod tests {
         );
         let (url, _) = spawn_raw_http_server(resp).await;
 
-        let transport = ReqwestWebhookTransport::new().with_allow_private_networks(true);
+        let transport = ReqwestWebhookTransport::builder()
+            .allow_private_networks(true)
+            .build()
+            .expect("webhook transport");
         let out = transport
             .send(&url, "t=1,v1=abc", "evt", "del-1", b"{}".to_vec())
             .await

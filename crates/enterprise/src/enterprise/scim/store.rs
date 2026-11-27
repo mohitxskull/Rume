@@ -364,6 +364,67 @@ fn stamp_meta(
     Some(m)
 }
 
+fn validate_patch_schemas(schemas: &[String]) -> Result<(), ScimStoreError> {
+    if !schemas.iter().any(|s| s == SCIM_PATCH_SCHEMA) {
+        return Err(ScimStoreError::BadRequest {
+            scim_type: Some("invalidSyntax"),
+            detail: format!("PATCH request must include schema '{SCIM_PATCH_SCHEMA}'"),
+        });
+    }
+    Ok(())
+}
+
+/// Parses a targeted SCIM value-path filter of the form `<attr>[value eq "<target>"]`
+/// (or single-quoted `'<target>'`), preserving the exact case of `<target>`.
+fn parse_value_eq_path(raw_path: &str) -> Option<(String, String)> {
+    let trimmed = raw_path.trim();
+    let open = trimmed.find('[')?;
+    if !trimmed.ends_with(']') {
+        return None;
+    }
+    let attr = trimmed[..open].trim().to_ascii_lowercase();
+    let expr = trimmed[open + 1..trimmed.len() - 1].trim();
+
+    let rest = expr
+        .get(..5)
+        .filter(|s| s.eq_ignore_ascii_case("value"))
+        .map(|_| &expr[5..])?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    let rest = rest
+        .get(..2)
+        .filter(|s| s.eq_ignore_ascii_case("eq"))
+        .map(|_| &rest[2..])?;
+    if !rest.chars().next().is_some_and(char::is_whitespace) {
+        return None;
+    }
+    let val_raw = rest.trim_start();
+    let quote = val_raw.chars().next()?;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = val_raw[1..].chars();
+    let mut closed = false;
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            let escaped = chars.next()?;
+            out.push(escaped);
+        } else if c == quote {
+            closed = true;
+            break;
+        } else {
+            out.push(c);
+        }
+    }
+    if !closed || !chars.as_str().trim().is_empty() {
+        return None;
+    }
+    Some((attr, out))
+}
+
 fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), ScimStoreError> {
     let verb = op.op.to_ascii_lowercase();
     if !matches!(verb.as_str(), "add" | "replace" | "remove") {
@@ -371,6 +432,33 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
             scim_type: Some("invalidSyntax"),
             detail: format!("unsupported patch op '{}'", op.op),
         });
+    }
+
+    if let Some(raw_path) = op.path.as_deref()
+        && let Some((attr, target)) = parse_value_eq_path(raw_path)
+    {
+        if verb != "remove" {
+            return Err(ScimStoreError::BadRequest {
+                scim_type: Some("invalidPath"),
+                detail: format!("filtered path '{raw_path}' is only supported for remove"),
+            });
+        }
+        return match attr.as_str() {
+            "emails" => {
+                user.emails
+                    .retain(|e| !e.value.eq_ignore_ascii_case(&target));
+                Ok(())
+            }
+            "roles" => {
+                user.roles
+                    .retain(|r| r.value.as_deref() != Some(target.as_str()));
+                Ok(())
+            }
+            _ => Err(ScimStoreError::BadRequest {
+                scim_type: Some("invalidPath"),
+                detail: format!("unsupported User patch path '{raw_path}'"),
+            }),
+        };
     }
 
     match op.path.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -525,7 +613,15 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                         })
                     })?;
                 if verb == "add" {
-                    user.emails.extend(emails);
+                    for email in emails {
+                        if !user
+                            .emails
+                            .iter()
+                            .any(|existing| existing.value.eq_ignore_ascii_case(&email.value))
+                        {
+                            user.emails.push(email);
+                        }
+                    }
                 } else {
                     user.emails = emails;
                 }
@@ -550,7 +646,15 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                         })
                     })?;
                 if verb == "add" {
-                    user.roles.extend(roles);
+                    for role in roles {
+                        if !user
+                            .roles
+                            .iter()
+                            .any(|existing| existing.value == role.value)
+                        {
+                            user.roles.push(role);
+                        }
+                    }
                 } else {
                     user.roles = roles;
                 }
@@ -571,6 +675,27 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
             scim_type: Some("invalidSyntax"),
             detail: format!("unsupported patch op '{}'", op.op),
         });
+    }
+
+    if let Some(raw_path) = op.path.as_deref()
+        && let Some((attr, target)) = parse_value_eq_path(raw_path)
+    {
+        if verb != "remove" {
+            return Err(ScimStoreError::BadRequest {
+                scim_type: Some("invalidPath"),
+                detail: format!("filtered path '{raw_path}' is only supported for remove"),
+            });
+        }
+        return match attr.as_str() {
+            "members" => {
+                group.members.retain(|m| m.value != target);
+                Ok(())
+            }
+            _ => Err(ScimStoreError::BadRequest {
+                scim_type: Some("invalidPath"),
+                detail: format!("unsupported Group patch path '{raw_path}'"),
+            }),
+        };
     }
 
     match op.path.as_deref().map(str::to_ascii_lowercase).as_deref() {
@@ -803,6 +928,7 @@ impl ScimStore for InMemoryScimStore {
     ) -> BoxFuture<'a, Result<ScimUser, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
+            validate_patch_schemas(&patch.schemas)?;
             let mut inner = self
                 .inner
                 .write()
@@ -868,6 +994,25 @@ impl ScimStore for InMemoryScimStore {
             )?;
             inner.users.remove(&id);
             inner.versions.remove(&format!("user:{id}"));
+            let mut affected_groups = Vec::new();
+            for (group_id, group) in &mut inner.groups {
+                let before = group.members.len();
+                group.members.retain(|m| m.value != id);
+                if group.members.len() != before {
+                    affected_groups.push(group_id.clone());
+                }
+            }
+            for group_id in affected_groups {
+                let ver = inner.next_version(&format!("group:{group_id}"));
+                if let Some(group) = inner.groups.get_mut(&group_id) {
+                    group.meta = stamp_meta(
+                        group.meta.take(),
+                        "Group",
+                        format!("/scim/v2/Groups/{group_id}"),
+                        ver,
+                    );
+                }
+            }
             Ok(())
         })
     }
@@ -1031,6 +1176,7 @@ impl ScimStore for InMemoryScimStore {
     ) -> BoxFuture<'a, Result<ScimGroup, ScimStoreError>> {
         let id = id.to_string();
         Box::pin(async move {
+            validate_patch_schemas(&patch.schemas)?;
             let mut inner = self
                 .inner
                 .write()
@@ -1256,5 +1402,171 @@ mod tests {
         ));
         assert!(if_match_satisfies("*", Some("W/\"v1\"")));
         assert!(!if_match_satisfies("\"unclosed", Some("\"unclosed")));
+    }
+
+    #[tokio::test]
+    async fn delete_user_prunes_group_memberships_and_bumps_group_version() {
+        let store = InMemoryScimStore::new();
+        let u1 = store
+            .create_user(ScimUser::new("", "alice@example.com"))
+            .await
+            .unwrap();
+        let u2 = store
+            .create_user(ScimUser::new("", "bob@example.com"))
+            .await
+            .unwrap();
+        let mut group = ScimGroup::new("", "Engineering");
+        group.members = vec![
+            ScimMember {
+                value: u1.id.clone(),
+                display: Some("Alice".into()),
+                reference: None,
+            },
+            ScimMember {
+                value: u2.id.clone(),
+                display: Some("Bob".into()),
+                reference: None,
+            },
+        ];
+        let created_group = store.create_group(group).await.unwrap();
+        let initial_ver = created_group
+            .meta
+            .as_ref()
+            .and_then(|m| m.version.clone())
+            .unwrap();
+
+        store.delete_user(&u1.id, None).await.unwrap();
+
+        let updated_group = store.get_group(&created_group.id).await.unwrap();
+        assert_eq!(updated_group.members.len(), 1);
+        assert_eq!(updated_group.members[0].value, u2.id);
+        let new_ver = updated_group
+            .meta
+            .as_ref()
+            .and_then(|m| m.version.clone())
+            .unwrap();
+        assert_ne!(initial_ver, new_ver);
+    }
+
+    #[tokio::test]
+    async fn patch_validates_schema_dedups_and_supports_targeted_value_remove() {
+        let store = InMemoryScimStore::new();
+        let user = store
+            .create_user(ScimUser::new("", "carol@example.com"))
+            .await
+            .unwrap();
+
+        // Missing or wrong PATCH schema fails closed.
+        assert!(matches!(
+            store
+                .patch_user(
+                    &user.id,
+                    ScimPatchRequest {
+                        schemas: vec!["urn:example:wrong".to_string()],
+                        operations: vec![],
+                    },
+                    None,
+                )
+                .await,
+            Err(ScimStoreError::BadRequest {
+                scim_type: Some("invalidSyntax"),
+                ..
+            })
+        ));
+
+        // Add duplicate emails and roles -> deduplicated.
+        let patched = store
+            .patch_user(
+                &user.id,
+                ScimPatchRequest {
+                    schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+                    operations: vec![
+                        ScimPatchOp {
+                            op: "add".into(),
+                            path: Some("emails".into()),
+                            value: Some(serde_json::json!([
+                                { "value": "carol@example.com", "primary": true },
+                                { "value": "CAROL@EXAMPLE.COM", "primary": false },
+                                { "value": "carol.alt@example.com", "primary": false }
+                            ])),
+                        },
+                        ScimPatchOp {
+                            op: "add".into(),
+                            path: Some("roles".into()),
+                            value: Some(serde_json::json!([
+                                { "value": "admin" },
+                                { "value": "admin" },
+                                { "value": "editor" }
+                            ])),
+                        },
+                    ],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(patched.emails.len(), 2);
+        assert_eq!(patched.roles.len(), 2);
+
+        // Targeted value-path remove deletes only the matching email/role.
+        let after_remove = store
+            .patch_user(
+                &user.id,
+                ScimPatchRequest {
+                    schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+                    operations: vec![
+                        ScimPatchOp {
+                            op: "remove".into(),
+                            path: Some("emails[value eq \"carol.alt@example.com\"]".into()),
+                            value: None,
+                        },
+                        ScimPatchOp {
+                            op: "remove".into(),
+                            path: Some("roles[value eq \"editor\"]".into()),
+                            value: None,
+                        },
+                    ],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_remove.emails.len(), 1);
+        assert_eq!(after_remove.emails[0].value, "carol@example.com");
+        assert_eq!(after_remove.roles.len(), 1);
+        assert_eq!(after_remove.roles[0].value.as_deref(), Some("admin"));
+
+        // Targeted value-path remove on group members removes only the targeted member.
+        let mut group = ScimGroup::new("", "Ops");
+        group.members = vec![
+            ScimMember {
+                value: "u-A".into(),
+                display: None,
+                reference: None,
+            },
+            ScimMember {
+                value: "u-B".into(),
+                display: None,
+                reference: None,
+            },
+        ];
+        let created_group = store.create_group(group).await.unwrap();
+        let after_group_remove = store
+            .patch_group(
+                &created_group.id,
+                ScimPatchRequest {
+                    schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+                    operations: vec![ScimPatchOp {
+                        op: "remove".into(),
+                        path: Some("members[value eq \"u-A\"]".into()),
+                        value: None,
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_group_remove.members.len(), 1);
+        assert_eq!(after_group_remove.members[0].value, "u-B");
     }
 }

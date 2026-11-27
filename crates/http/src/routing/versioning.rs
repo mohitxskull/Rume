@@ -145,19 +145,36 @@ where
 }
 
 fn parse_version_from_headers(headers: &HeaderMap) -> Result<Option<ApiVersion>, ()> {
-    if let Some(raw) = headers.get(&X_API_VERSION) {
+    let mut x_api_versions = headers.get_all(&X_API_VERSION).iter();
+    if let Some(raw) = x_api_versions.next() {
+        if x_api_versions.next().is_some() {
+            return Err(());
+        }
         let s = raw.to_str().map_err(|_| ())?;
         return ApiVersion::from_str(s).map(Some);
     }
 
-    if let Some(accept) = headers.get(header::ACCEPT) {
-        let accept_str = accept.to_str().map_err(|_| ())?;
-        for media_range in accept_str.split(',').map(str::trim) {
-            let media_type = media_range.split(';').next().unwrap_or("").trim();
-            if let Some(rest) = media_type.strip_prefix("application/vnd.rume.") {
-                let ver_str = rest.split('+').next().unwrap_or("");
-                return ApiVersion::from_str(ver_str).map(Some);
+    let mut accept_headers = headers.get_all(header::ACCEPT).iter();
+    if let Some(first_accept) = accept_headers.next() {
+        let mut found: Option<ApiVersion> = None;
+        for accept in std::iter::once(first_accept).chain(accept_headers) {
+            let accept_str = accept.to_str().map_err(|_| ())?;
+            for media_range in accept_str.split(',').map(str::trim) {
+                let media_type = media_range.split(';').next().unwrap_or("").trim();
+                if let Some(rest) = media_type.strip_prefix("application/vnd.rume.") {
+                    let ver_str = rest.split('+').next().unwrap_or("");
+                    let parsed = ApiVersion::from_str(ver_str)?;
+                    if let Some(ref prev) = found
+                        && prev != &parsed
+                    {
+                        return Err(());
+                    }
+                    found = Some(parsed);
+                }
             }
+        }
+        if let Some(ver) = found {
+            return Ok(Some(ver));
         }
     }
 
@@ -471,6 +488,7 @@ mod tests {
 
         // Malformed X-API-Version -> 400 Bad Request.
         let malformed = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/v1/users")
@@ -481,5 +499,34 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+
+        // Duplicate X-API-Version headers -> 400 Bad Request.
+        let dup_ver = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/users")
+                    .header("x-api-version", "v1")
+                    .header("x-api-version", "v2")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup_ver.status(), StatusCode::BAD_REQUEST);
+
+        // Conflicting Accept vendor versions across headers -> 400 Bad Request.
+        let conflict_accept = router
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/users")
+                    .header(header::ACCEPT, "application/vnd.rume.v1+json")
+                    .header(header::ACCEPT, "application/vnd.rume.v2+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(conflict_accept.status(), StatusCode::BAD_REQUEST);
     }
 }

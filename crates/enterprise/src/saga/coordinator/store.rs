@@ -171,12 +171,25 @@ pub trait SagaStore: Send + Sync + 'static {
     }
 }
 
+/// Default cap on terminal saga records retained by [`InMemorySagaStore`].
+const DEFAULT_MAX_RETAINED_TERMINAL_SAGAS: usize = 10_000;
+
 /// Thread-safe in-memory saga storage suitable for testing and single-instance deployments.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct InMemorySagaStore {
     pub(super) records: Arc<RwLock<HashMap<String, SagaRecord>>>,
     active_claims: Arc<std::sync::Mutex<HashMap<String, String>>>,
     max_retained_terminal: Option<usize>,
+}
+
+impl Default for InMemorySagaStore {
+    fn default() -> Self {
+        Self {
+            records: Arc::new(RwLock::new(HashMap::new())),
+            active_claims: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            max_retained_terminal: Some(DEFAULT_MAX_RETAINED_TERMINAL_SAGAS),
+        }
+    }
 }
 
 impl InMemorySagaStore {

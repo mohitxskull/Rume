@@ -35,7 +35,67 @@ pub fn run(dry_run: bool) {
     }
 }
 
+fn is_rust_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "as" | "async"
+            | "await"
+            | "break"
+            | "const"
+            | "continue"
+            | "crate"
+            | "dyn"
+            | "else"
+            | "enum"
+            | "extern"
+            | "false"
+            | "fn"
+            | "for"
+            | "gen"
+            | "if"
+            | "impl"
+            | "in"
+            | "let"
+            | "loop"
+            | "match"
+            | "mod"
+            | "move"
+            | "mut"
+            | "pub"
+            | "ref"
+            | "return"
+            | "self"
+            | "Self"
+            | "static"
+            | "struct"
+            | "super"
+            | "trait"
+            | "true"
+            | "type"
+            | "unsafe"
+            | "use"
+            | "where"
+            | "while"
+            | "abstract"
+            | "become"
+            | "box"
+            | "do"
+            | "final"
+            | "macro"
+            | "override"
+            | "priv"
+            | "try"
+            | "typeof"
+            | "unsized"
+            | "virtual"
+            | "yield"
+    )
+}
+
 fn is_valid_rust_identifier(s: &str) -> bool {
+    if s == "_" || is_rust_keyword(s) {
+        return false;
+    }
     let mut chars = s.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {
@@ -94,4 +154,27 @@ fn regenerate_dir(dir: &Path, label: &str, dry_run: bool) {
 
     println!("Regenerated {}", mod_path.display());
     println!("  {} {} module(s)", modules.len(), label);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_rust_identifier;
+
+    #[test]
+    fn rejects_underscore_and_rust_2024_keywords() {
+        for invalid in [
+            "_", "fn", "match", "async", "await", "gen", "try", "Self", "type",
+        ] {
+            assert!(
+                !is_valid_rust_identifier(invalid),
+                "expected '{invalid}' to be rejected as a module identifier"
+            );
+        }
+        for valid in ["users", "health_check", "_internal", "v1"] {
+            assert!(
+                is_valid_rust_identifier(valid),
+                "expected '{valid}' to be accepted as a module identifier"
+            );
+        }
+    }
 }

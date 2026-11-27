@@ -5649,6 +5649,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower",
+ "tower-http 0.7.1",
  "tracing",
 ]
 
@@ -7616,6 +7617,7 @@ dependencies = [
  "tokio-util",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

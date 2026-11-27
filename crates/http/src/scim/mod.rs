@@ -16,7 +16,9 @@ use rume_enterprise::enterprise::scim::{
     ScimErrorResponse, ScimGroup, ScimListQuery, ScimPatchRequest, ScimStore, ScimStoreError,
     ScimUser,
 };
+use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq as _;
 use tower::{Layer, Service};
 
 /// Media type required by RFC 7644 for SCIM 2.0 responses.
@@ -171,23 +173,12 @@ fn build_created_location(original_uri: &Uri, id: &str) -> String {
     }
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
-}
-
 /// Bearer-token authentication [`Layer`] for [`scim_routes`], validating
 /// `Authorization: Bearer <token>` in constant time and returning RFC 7644 `401 Unauthorized`
 /// responses on missing or invalid credentials.
 #[derive(Clone)]
 pub struct ScimBearerAuthLayer {
-    token: Arc<str>,
+    token: Arc<SecretString>,
 }
 
 impl std::fmt::Debug for ScimBearerAuthLayer {
@@ -211,7 +202,7 @@ impl ScimBearerAuthLayer {
             "ScimBearerAuthLayer token must be non-empty"
         );
         Self {
-            token: Arc::from(token),
+            token: Arc::new(SecretString::from(token)),
         }
     }
 }
@@ -231,7 +222,7 @@ impl<S> Layer<S> for ScimBearerAuthLayer {
 #[derive(Clone)]
 pub struct ScimBearerAuthService<S> {
     inner: S,
-    token: Arc<str>,
+    token: Arc<SecretString>,
 }
 
 impl<S> Service<Request<Body>> for ScimBearerAuthService<S>
@@ -258,7 +249,11 @@ where
                 .map(|(_, token)| token.trim())
                 .filter(|token| !token.is_empty())
                 .is_some_and(|presented| {
-                    constant_time_eq(presented.as_bytes(), self.token.as_bytes())
+                    bool::from(
+                        presented
+                            .as_bytes()
+                            .ct_eq(self.token.expose_secret().as_bytes()),
+                    )
                 }),
             _ => false,
         };
