@@ -190,8 +190,8 @@ where
                     if let Some(ref inm) = if_none_match
                         && etag_matches_weak(inm, &cached.etag)
                     {
-                        return Ok(not_modified_response(
-                            &cached.etag,
+                        return Ok(not_modified_response_from_cached(
+                            &cached,
                             &config,
                             has_auth_headers,
                         ));
@@ -277,7 +277,12 @@ where
                     && let Some(ref etag_val) = etag
                     && etag_matches_weak(inm, etag_val)
                 {
-                    return Ok(not_modified_response(etag_val, &config, has_auth_headers));
+                    return Ok(not_modified_response_from_headers(
+                        etag_val,
+                        &parts.headers,
+                        &config,
+                        has_auth_headers,
+                    ));
                 }
 
                 let out_body = if method == Method::HEAD {
@@ -797,23 +802,67 @@ fn joined_header_values(headers: &axum::http::HeaderMap, name: &HeaderName) -> O
     found.then_some(joined)
 }
 
+/// Splits a comma-separated ETag list without splitting on commas inside double quotes.
+fn split_etag_list(header_val: &str) -> Vec<&str> {
+    let mut items = Vec::new();
+    let mut in_quotes = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (idx, ch) in header_val.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_quotes => escaped = true,
+            '"' => in_quotes = !in_quotes,
+            ',' if !in_quotes => {
+                let slice = header_val[start..idx].trim();
+                if !slice.is_empty() {
+                    items.push(slice);
+                }
+                start = idx + 1;
+            }
+            _ => {}
+        }
+    }
+    let tail = header_val[start..].trim();
+    if !tail.is_empty() {
+        items.push(tail);
+    }
+    items
+}
+
+fn strip_single_weak_prefix(etag: &str) -> Option<&str> {
+    let trimmed = etag.trim();
+    let inner = trimmed.strip_prefix("W/").unwrap_or(trimmed);
+    // Must be a properly quoted entity-tag (`"..."`); rejects malformed `W/W/"x"`.
+    if inner.len() >= 2 && inner.starts_with('"') && inner.ends_with('"') {
+        Some(inner)
+    } else {
+        None
+    }
+}
+
 fn etag_matches_weak(header_val: &str, current_etag: &str) -> bool {
-    let current_norm = current_etag.trim().trim_start_matches("W/");
-    header_val
-        .split(',')
-        .map(str::trim)
-        .any(|candidate| candidate == "*" || candidate.trim_start_matches("W/") == current_norm)
+    let Some(current_norm) = strip_single_weak_prefix(current_etag) else {
+        return false;
+    };
+    split_etag_list(header_val).into_iter().any(|candidate| {
+        candidate == "*" || strip_single_weak_prefix(candidate) == Some(current_norm)
+    })
 }
 
 fn etag_matches_strong(header_val: &str, current_etag: &str) -> bool {
-    if current_etag.trim().starts_with("W/") {
+    let current = current_etag.trim();
+    if current.starts_with("W/") || strip_single_weak_prefix(current).is_none() {
         return false;
     }
-    header_val.split(',').map(str::trim).any(|candidate| {
+    split_etag_list(header_val).into_iter().any(|candidate| {
         if candidate == "*" {
             return true;
         }
-        !candidate.starts_with("W/") && candidate == current_etag.trim()
+        !candidate.starts_with("W/") && candidate == current
     })
 }
 
@@ -859,6 +908,11 @@ fn apply_cache_headers(
             && let Ok(val) = HeaderValue::from_str(&rewrite_cache_control_private(cc))
         {
             headers.insert(header::CACHE_CONTROL, val);
+        } else {
+            // Why: when `cache_authenticated == true` and `without_cache_control()` is
+            // configured, still emit `Cache-Control: private` so downstream CDNs never
+            // treat an authenticated response as publicly cacheable (`RC-37`).
+            headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("private"));
         }
     } else if let Some(ref cc) = config.cache_control
         && !headers.contains_key(header::CACHE_CONTROL)
@@ -879,13 +933,50 @@ fn apply_cache_headers(
     }
 }
 
-fn not_modified_response(etag: &str, config: &HttpCacheConfig, is_authenticated: bool) -> Response {
+/// RFC 9110 §15.4.5 headers that must be preserved on `304 Not Modified` responses.
+const NOT_MODIFIED_PRESERVED_HEADERS: [HeaderName; 6] = [
+    header::ETAG,
+    header::CACHE_CONTROL,
+    header::VARY,
+    header::EXPIRES,
+    header::CONTENT_LOCATION,
+    header::DATE,
+];
+
+fn not_modified_response_from_headers(
+    etag: &str,
+    source_headers: &axum::http::HeaderMap,
+    config: &HttpCacheConfig,
+    is_authenticated: bool,
+) -> Response {
     let mut res = StatusCode::NOT_MODIFIED.into_response();
+    for name in &NOT_MODIFIED_PRESERVED_HEADERS {
+        for val in source_headers.get_all(name) {
+            res.headers_mut().append(name.clone(), val.clone());
+        }
+    }
     if let Ok(val) = HeaderValue::from_str(etag) {
         res.headers_mut().insert(header::ETAG, val);
     }
     apply_cache_headers(res.headers_mut(), config, is_authenticated);
     res
+}
+
+fn not_modified_response_from_cached(
+    cached: &CachedHttpResponse,
+    config: &HttpCacheConfig,
+    is_authenticated: bool,
+) -> Response {
+    let mut source_headers = axum::http::HeaderMap::new();
+    for (k, v) in &cached.headers {
+        if let (Ok(name), Ok(val)) = (
+            HeaderName::from_bytes(k.as_bytes()),
+            HeaderValue::from_bytes(v),
+        ) {
+            source_headers.append(name, val);
+        }
+    }
+    not_modified_response_from_headers(&cached.etag, &source_headers, config, is_authenticated)
 }
 
 fn response_from_cached(
@@ -2323,5 +2414,99 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn etag_parsing_304_preserved_headers_and_authenticated_private_fallback() {
+        // 1. Quote-aware ETag list parsing handles commas inside quoted ETags & rejects `W/W/"x"`
+        assert!(etag_matches_weak(r#""a,b", "c""#, r#""a,b""#));
+        assert!(etag_matches_strong(r#""a,b", "c""#, r#""a,b""#));
+        assert!(!etag_matches_weak(r#"W/W/"x""#, r#""x""#));
+        assert!(!etag_matches_strong(r#"W/W/"x""#, r#""x""#));
+
+        // 2. 304 Not Modified preserves RFC 9110 §15.4.5 headers (Expires, Content-Location, Date)
+        let backend = Arc::new(InMemoryCacheBackend::new());
+        let app = Router::new()
+            .route(
+                "/meta",
+                get(|| async {
+                    (
+                        [
+                            (header::EXPIRES, "Wed, 21 Oct 2030 07:28:00 GMT"),
+                            (header::CONTENT_LOCATION, "/meta?v=1"),
+                            (header::DATE, "Wed, 21 Oct 2026 07:28:00 GMT"),
+                        ],
+                        "body",
+                    )
+                }),
+            )
+            .layer(HttpCacheLayer::new(
+                backend,
+                HttpCacheConfig::new()
+                    .with_cache_authenticated(true)
+                    .without_cache_control(),
+            ));
+
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/meta")
+                    .header(header::AUTHORIZATION, "Bearer tok")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        // 3. Authenticated response with `without_cache_control()` still emits `Cache-Control: private`
+        assert_eq!(
+            r1.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private")
+        );
+        let etag = r1
+            .headers()
+            .get(header::ETAG)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .uri("/meta")
+                    .header(header::AUTHORIZATION, "Bearer tok")
+                    .header(header::IF_NONE_MATCH, etag)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(
+            r2.headers()
+                .get(header::EXPIRES)
+                .and_then(|v| v.to_str().ok()),
+            Some("Wed, 21 Oct 2030 07:28:00 GMT")
+        );
+        assert_eq!(
+            r2.headers()
+                .get(header::CONTENT_LOCATION)
+                .and_then(|v| v.to_str().ok()),
+            Some("/meta?v=1")
+        );
+        assert_eq!(
+            r2.headers().get(header::DATE).and_then(|v| v.to_str().ok()),
+            Some("Wed, 21 Oct 2026 07:28:00 GMT")
+        );
+        assert_eq!(
+            r2.headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|v| v.to_str().ok()),
+            Some("private")
+        );
     }
 }

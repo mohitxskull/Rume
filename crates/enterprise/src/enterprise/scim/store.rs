@@ -303,14 +303,27 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                     detail: "patch without path requires an object value".into(),
                 })?;
             for (k, v) in obj {
-                apply_user_patch_op(
-                    user,
-                    &ScimPatchOp {
-                        op: op.op.clone(),
-                        path: Some(k.clone()),
-                        value: Some(v.clone()),
-                    },
-                )?;
+                if let Some(sub_obj) = v.as_object() {
+                    for (sub_k, sub_v) in sub_obj {
+                        apply_user_patch_op(
+                            user,
+                            &ScimPatchOp {
+                                op: op.op.clone(),
+                                path: Some(format!("{k}.{sub_k}")),
+                                value: Some(sub_v.clone()),
+                            },
+                        )?;
+                    }
+                } else {
+                    apply_user_patch_op(
+                        user,
+                        &ScimPatchOp {
+                            op: op.op.clone(),
+                            path: Some(k.clone()),
+                            value: Some(v.clone()),
+                        },
+                    )?;
+                }
             }
             Ok(())
         }
@@ -334,15 +347,18 @@ fn apply_user_patch_op(user: &mut ScimUser, op: &ScimPatchOp) -> Result<(), Scim
                     detail: "userName cannot be removed".into(),
                 });
             }
-            user.user_name = op
+            let new_name = op
                 .value
                 .as_ref()
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
-                    detail: "userName must be a string".into(),
+                    detail: "userName must be a non-empty string".into(),
                 })?;
+            user.user_name = new_name;
             Ok(())
         }
         Some("displayname") => {
@@ -505,15 +521,18 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
                     detail: "displayName cannot be removed".into(),
                 });
             }
-            group.display_name = op
+            let new_name = op
                 .value
                 .as_ref()
                 .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .ok_or_else(|| ScimStoreError::BadRequest {
                     scim_type: Some("invalidValue"),
-                    detail: "displayName must be a string".into(),
+                    detail: "displayName must be a non-empty string".into(),
                 })?;
+            group.display_name = new_name;
             Ok(())
         }
         Some("members") => {
@@ -534,7 +553,15 @@ fn apply_group_patch_op(group: &mut ScimGroup, op: &ScimPatchOp) -> Result<(), S
                         })
                     })?;
                 if verb == "add" {
-                    group.members.extend(members);
+                    for member in members {
+                        if !group
+                            .members
+                            .iter()
+                            .any(|existing| existing.value == member.value)
+                        {
+                            group.members.push(member);
+                        }
+                    }
                 } else {
                     group.members = members;
                 }
@@ -556,6 +583,12 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
+            if user.user_name.trim().is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "userName cannot be empty".into(),
+                });
+            }
             if user.id.is_empty() {
                 user.id = uuid::Uuid::new_v4().to_string();
             }
@@ -617,6 +650,12 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
+            if user.user_name.trim().is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "userName cannot be empty".into(),
+                });
+            }
             if !inner.users.contains_key(&id) {
                 return Err(ScimStoreError::NotFound {
                     resource_type: "User",
@@ -699,14 +738,15 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            inner
-                .users
-                .remove(&id)
-                .map(|_| ())
-                .ok_or(ScimStoreError::NotFound {
+            if inner.users.remove(&id).is_some() {
+                inner.versions.remove(&format!("user:{id}"));
+                Ok(())
+            } else {
+                Err(ScimStoreError::NotFound {
                     resource_type: "User",
                     id,
                 })
+            }
         })
     }
 
@@ -741,6 +781,12 @@ impl ScimStore for InMemoryScimStore {
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
 
+            if group.display_name.trim().is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "displayName cannot be empty".into(),
+                });
+            }
             if group.id.is_empty() {
                 group.id = uuid::Uuid::new_v4().to_string();
             }
@@ -805,6 +851,12 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
+            if group.display_name.trim().is_empty() {
+                return Err(ScimStoreError::BadRequest {
+                    scim_type: Some("invalidValue"),
+                    detail: "displayName cannot be empty".into(),
+                });
+            }
             if !inner.groups.contains_key(&id) {
                 return Err(ScimStoreError::NotFound {
                     resource_type: "Group",
@@ -893,14 +945,15 @@ impl ScimStore for InMemoryScimStore {
                 .inner
                 .write()
                 .map_err(|e| ScimStoreError::Internal(e.to_string()))?;
-            inner
-                .groups
-                .remove(&id)
-                .map(|_| ())
-                .ok_or(ScimStoreError::NotFound {
+            if inner.groups.remove(&id).is_some() {
+                inner.versions.remove(&format!("group:{id}"));
+                Ok(())
+            } else {
+                Err(ScimStoreError::NotFound {
                     resource_type: "Group",
                     id,
                 })
+            }
         })
     }
 
@@ -923,5 +976,103 @@ impl ScimStore for InMemoryScimStore {
             matched.sort_by(|a, b| a.id.cmp(&b.id));
             Ok(paginate(matched, &query))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn scim_store_cleans_versions_validates_names_patches_nested_and_dedups_members() {
+        let store = InMemoryScimStore::new();
+
+        // Empty userName / displayName rejected on create
+        assert!(matches!(
+            store.create_user(ScimUser::new("", "   ")).await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+        assert!(matches!(
+            store.create_group(ScimGroup::new("", "")).await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        let user = store.create_user(ScimUser::new("", "alice")).await.unwrap();
+        // Empty userName rejected on replace
+        assert!(matches!(
+            store
+                .replace_user(&user.id, ScimUser::new(&user.id, ""))
+                .await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        // Nested object traversal in pathless PATCH
+        let patched = store
+            .patch_user(
+                &user.id,
+                ScimPatchRequest {
+                    schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+                    operations: vec![ScimPatchOp {
+                        op: "replace".to_string(),
+                        path: None,
+                        value: Some(serde_json::json!({
+                            "name": { "givenName": "Alice", "familyName": "Smith" }
+                        })),
+                    }],
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            patched.name.as_ref().and_then(|n| n.given_name.as_deref()),
+            Some("Alice")
+        );
+        assert_eq!(
+            patched.name.as_ref().and_then(|n| n.family_name.as_deref()),
+            Some("Smith")
+        );
+
+        // Delete removes version entry (no memory leak)
+        store.delete_user(&user.id).await.unwrap();
+        assert!(
+            !store
+                .inner
+                .read()
+                .unwrap()
+                .versions
+                .contains_key(&format!("user:{}", user.id))
+        );
+
+        // Group member deduplication on `add` PATCH and version cleanup on delete
+        let group = store.create_group(ScimGroup::new("", "Eng")).await.unwrap();
+        assert!(matches!(
+            store
+                .replace_group(&group.id, ScimGroup::new(&group.id, "  "))
+                .await,
+            Err(ScimStoreError::BadRequest { .. })
+        ));
+
+        let add_member = || ScimPatchRequest {
+            schemas: vec![SCIM_PATCH_SCHEMA.to_string()],
+            operations: vec![ScimPatchOp {
+                op: "add".to_string(),
+                path: Some("members".to_string()),
+                value: Some(serde_json::json!([{ "value": "u1", "display": "Alice" }])),
+            }],
+        };
+        let g1 = store.patch_group(&group.id, add_member()).await.unwrap();
+        let g2 = store.patch_group(&group.id, add_member()).await.unwrap();
+        assert_eq!(g1.members.len(), 1);
+        assert_eq!(g2.members.len(), 1);
+
+        store.delete_group(&group.id).await.unwrap();
+        assert!(
+            !store
+                .inner
+                .read()
+                .unwrap()
+                .versions
+                .contains_key(&format!("group:{}", group.id))
+        );
     }
 }

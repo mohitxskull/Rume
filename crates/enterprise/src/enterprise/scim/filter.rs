@@ -314,7 +314,9 @@ impl Parser {
                     ScimFilterValue::Bool(false)
                 } else if w.eq_ignore_ascii_case("null") {
                     ScimFilterValue::Null
-                } else if let Ok(n) = w.parse::<f64>() {
+                } else if let Ok(n) = w.parse::<f64>()
+                    && n.is_finite()
+                {
                     ScimFilterValue::Number(n)
                 } else {
                     return Err(ScimFilterError::InvalidSyntax(format!(
@@ -560,6 +562,21 @@ fn resolve_group_attr<'a>(group: &'a ScimGroup, attr: &str) -> Vec<AttrVal<'a>> 
     out
 }
 
+fn compare_f64(a: f64, op: ScimFilterOp, b: f64) -> bool {
+    if !a.is_finite() || !b.is_finite() {
+        return false;
+    }
+    match op {
+        ScimFilterOp::Eq => (a - b).abs() <= f64::EPSILON,
+        ScimFilterOp::Ne => (a - b).abs() > f64::EPSILON,
+        ScimFilterOp::Gt => a > b,
+        ScimFilterOp::Ge => a >= b,
+        ScimFilterOp::Lt => a < b,
+        ScimFilterOp::Le => a <= b,
+        ScimFilterOp::Co | ScimFilterOp::Sw | ScimFilterOp::Ew => false,
+    }
+}
+
 fn compare_attr(attr: &AttrVal<'_>, op: ScimFilterOp, value: &ScimFilterValue) -> bool {
     match (attr, value) {
         (AttrVal::Str(a), ScimFilterValue::String(b)) => {
@@ -577,6 +594,11 @@ fn compare_attr(attr: &AttrVal<'_>, op: ScimFilterOp, value: &ScimFilterValue) -
                 ScimFilterOp::Le => a_low <= b_low,
             }
         }
+        (AttrVal::Str(a), ScimFilterValue::Number(b)) => a
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .is_some_and(|n| compare_f64(n, op, *b)),
         (AttrVal::Bool(a), ScimFilterValue::Bool(b)) => match op {
             ScimFilterOp::Eq => a == b,
             ScimFilterOp::Ne => a != b,
@@ -664,6 +686,47 @@ mod tests {
         assert_eq!(
             ScimFilter::parse(&deep_and),
             Err(ScimFilterError::MaxDepthExceeded { max_depth: 32 })
+        );
+    }
+
+    #[test]
+    fn scim_numeric_filter_compares_numbers_and_rejects_non_finite_floats() {
+        for bad in [
+            "externalId eq NaN",
+            "externalId gt inf",
+            "externalId lt -infinity",
+        ] {
+            assert!(
+                matches!(
+                    ScimFilter::parse(bad),
+                    Err(ScimFilterError::InvalidSyntax(_))
+                ),
+                "expected InvalidSyntax for {bad}"
+            );
+        }
+
+        let mut user = ScimUser::new("u1", "alice");
+        user.external_id = Some("42".to_string());
+
+        assert!(
+            ScimFilter::parse("externalId eq 42")
+                .unwrap()
+                .matches_user(&user)
+        );
+        assert!(
+            ScimFilter::parse("externalId gt 10")
+                .unwrap()
+                .matches_user(&user)
+        );
+        assert!(
+            ScimFilter::parse("externalId le 42.5")
+                .unwrap()
+                .matches_user(&user)
+        );
+        assert!(
+            !ScimFilter::parse("externalId lt 42")
+                .unwrap()
+                .matches_user(&user)
         );
     }
 }

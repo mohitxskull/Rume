@@ -87,22 +87,93 @@ where
     }
 }
 
+/// Maximum sanitized filename byte length (POSIX/NTFS component limit).
+const MAX_FILENAME_BYTES: usize = 255;
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+fn truncate_utf8_bytes(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 /// Sanitizes an untrusted client filename.
 ///
 /// Strips directory prefixes (`/` and `\`), control characters, null bytes,
-/// and leading dots, falling back to `"upload.bin"` if the result is empty.
+/// NTFS stream colons (`:`), and leading/trailing dots and whitespace, prefixes
+/// Windows reserved device names (`CON`, `NUL`, etc.), caps length to 255 UTF-8
+/// bytes, and falls back to `"upload.bin"` if the result is empty.
 pub fn sanitize_filename(raw: &str) -> String {
     let base = raw.rsplit(['/', '\\']).next().unwrap_or("");
     let cleaned: String = base
         .chars()
-        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':'))
         .collect();
-    let trimmed = cleaned.trim().trim_start_matches('.');
+
+    let mut trimmed = cleaned.as_str();
+    loop {
+        let next = trimmed.trim().trim_matches('.');
+        if next.len() == trimmed.len() {
+            break;
+        }
+        trimmed = next;
+    }
+
     if trimmed.is_empty() {
-        "upload.bin".to_string()
+        return "upload.bin".to_string();
+    }
+
+    let stem = trimmed.split('.').next().unwrap_or(trimmed);
+    let mut out = if is_windows_reserved_stem(stem) {
+        format!("_{trimmed}")
     } else {
         trimmed.to_string()
+    };
+
+    if out.len() > MAX_FILENAME_BYTES {
+        out = truncate_utf8_bytes(&out, MAX_FILENAME_BYTES)
+            .trim_end_matches('.')
+            .trim_end()
+            .to_string();
+        if out.is_empty() {
+            return "upload.bin".to_string();
+        }
     }
+
+    out
 }
 
 /// Streams and validates multipart file fields according to `config`.
@@ -597,8 +668,18 @@ mod tests {
         assert_eq!(sanitize_filename(r"..\..\secret.txt"), "secret.txt");
         assert_eq!(sanitize_filename(".hidden"), "hidden");
         assert_eq!(sanitize_filename(".."), "upload.bin");
+        assert_eq!(sanitize_filename(". .."), "upload.bin");
         assert_eq!(sanitize_filename(""), "upload.bin");
         assert_eq!(sanitize_filename("a\x00b\nc.txt"), "abc.txt");
+        assert_eq!(
+            sanitize_filename("file.txt:zone.identifier"),
+            "file.txtzone.identifier"
+        );
+        assert_eq!(sanitize_filename("CON.txt"), "_CON.txt");
+        assert_eq!(sanitize_filename("nul"), "_nul");
+        assert_eq!(sanitize_filename("LPT1.log"), "_LPT1.log");
+        let long = "a".repeat(400);
+        assert_eq!(sanitize_filename(&long).len(), 255);
     }
 
     fn build_multipart_body(

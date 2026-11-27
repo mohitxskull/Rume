@@ -65,9 +65,9 @@ Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
 ";
 
 fn tls_connector_for_test_cert() -> tokio_rustls::TlsConnector {
+    use rustls_pki_types::pem::PemObject;
     let mut root_store = rustls::RootCertStore::empty();
-    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
-    for cert in rustls_pemfile::certs(&mut cert_reader) {
+    for cert in rustls_pki_types::CertificateDer::pem_slice_iter(TEST_CERT_PEM) {
         root_store.add(cert.expect("valid test cert")).unwrap();
     }
     let provider = rustls::crypto::CryptoProvider::get_default()
