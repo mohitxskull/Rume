@@ -53,12 +53,19 @@ pub trait CacheBackend: Debug + Send + Sync + 'static {
     /// Evicts all entries from the cache.
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>>;
 
+    /// Evicts all entries whose keys (and associated tag indexes) start with `prefix`.
+    ///
+    /// Backends that do not support prefix-scoped clearing fall back to [`CacheBackend::clear`].
+    fn clear_prefix(&self, _prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        self.clear()
+    }
+
     /// Verifies cache connectivity.
     fn ping(&self) -> BoxFuture<'_, Result<(), CacheError>>;
 }
 
 type CacheMap = std::sync::Arc<
-    tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<std::time::Instant>)>>,
+    tokio::sync::RwLock<std::collections::HashMap<String, (Vec<u8>, Option<tokio::time::Instant>)>>,
 >;
 
 #[derive(Debug, Default)]
@@ -127,7 +134,7 @@ impl CacheBackend for InMemoryCacheBackend {
     fn get(&self, key: &str) -> BoxFuture<'_, Result<Option<Vec<u8>>, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let expired = {
                 let map = self.entries.read().await;
                 if let Some((val, expires_at)) = map.get(&key) {
@@ -150,7 +157,7 @@ impl CacheBackend for InMemoryCacheBackend {
                 let mut map = self.entries.write().await;
                 if map
                     .get(&key)
-                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| tokio::time::Instant::now() >= e))
                 {
                     map.remove(&key);
                     tag_index.remove_key(&key);
@@ -168,8 +175,10 @@ impl CacheBackend for InMemoryCacheBackend {
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
-            let expires_at = ttl.map(|t| now + t);
+            let now = tokio::time::Instant::now();
+            // Why: use `checked_add` so huge TTLs (e.g. `Duration::MAX`) never panic
+            // on `Instant` overflow; an unrepresentably distant expiry is treated as no TTL.
+            let expires_at = ttl.and_then(|t| now.checked_add(t));
             let mut map = self.entries.write().await;
             map.insert(key, (value, expires_at));
             Ok(())
@@ -192,7 +201,8 @@ impl CacheBackend for InMemoryCacheBackend {
             // publish a value without its tag memberships.
             let mut tag_index = self.tag_index.write().await;
             let mut map = self.entries.write().await;
-            let expires_at = ttl.map(|t| std::time::Instant::now() + t);
+            let now = tokio::time::Instant::now();
+            let expires_at = ttl.and_then(|t| now.checked_add(t));
             map.insert(key.clone(), (value, expires_at));
             for tag in tags_vec {
                 tag_index.insert(tag, key.clone());
@@ -220,7 +230,7 @@ impl CacheBackend for InMemoryCacheBackend {
     fn exists(&self, key: &str) -> BoxFuture<'_, Result<bool, CacheError>> {
         let key = key.to_string();
         Box::pin(async move {
-            let now = std::time::Instant::now();
+            let now = tokio::time::Instant::now();
             let expired = {
                 let map = self.entries.read().await;
                 if let Some((_, expires_at)) = map.get(&key) {
@@ -240,7 +250,7 @@ impl CacheBackend for InMemoryCacheBackend {
                 let mut map = self.entries.write().await;
                 if map
                     .get(&key)
-                    .is_some_and(|(_, exp)| exp.is_some_and(|e| std::time::Instant::now() >= e))
+                    .is_some_and(|(_, exp)| exp.is_some_and(|e| tokio::time::Instant::now() >= e))
                 {
                     map.remove(&key);
                     tag_index.remove_key(&key);
@@ -267,7 +277,7 @@ impl CacheBackend for InMemoryCacheBackend {
             for key in keys {
                 if let Some((_, expires_at)) = map.remove(&key) {
                     if let Some(exp) = expires_at
-                        && std::time::Instant::now() >= exp
+                        && tokio::time::Instant::now() >= exp
                     {
                         continue;
                     }
@@ -293,6 +303,34 @@ impl CacheBackend for InMemoryCacheBackend {
             let mut map = self.entries.write().await;
             map.clear();
             tag_index.clear();
+            Ok(())
+        })
+    }
+
+    fn clear_prefix(&self, prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        let prefix = prefix.to_string();
+        Box::pin(async move {
+            // Lock `tag_index` before `entries` to match `set_with_tags` and `invalidate_tag_keys`.
+            let mut tag_index = self.tag_index.write().await;
+            let mut map = self.entries.write().await;
+            let keys_to_remove: Vec<String> = map
+                .keys()
+                .filter(|k| k.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for key in keys_to_remove {
+                map.remove(&key);
+                tag_index.remove_key(&key);
+            }
+            let tags_to_remove: Vec<String> = tag_index
+                .tag_to_keys
+                .keys()
+                .filter(|t| t.starts_with(&prefix))
+                .cloned()
+                .collect();
+            for tag in tags_to_remove {
+                tag_index.remove_tag(&tag);
+            }
             Ok(())
         })
     }
@@ -346,6 +384,25 @@ mod tests {
             backend.tag_index.read().await.key_to_tags.len(),
             0,
             "expired key's reverse index entry should be pruned on get"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_with_duration_max_does_not_panic_on_instant_overflow() {
+        let backend = InMemoryCacheBackend::new();
+        backend
+            .set("k_max", b"v1".to_vec(), Some(Duration::MAX))
+            .await
+            .unwrap();
+        assert_eq!(backend.get("k_max").await.unwrap(), Some(b"v1".to_vec()));
+
+        backend
+            .set_with_tags("k_tag_max", b"v2".to_vec(), &["t1"], Some(Duration::MAX))
+            .await
+            .unwrap();
+        assert_eq!(
+            backend.get("k_tag_max").await.unwrap(),
+            Some(b"v2".to_vec())
         );
     }
 }

@@ -162,6 +162,8 @@ async fn worker_drain_while_dequeue_blocked_does_not_start_job_and_defers_withou
     let job = QueuedJob {
         id: "job-123".to_string(),
         name: BlockTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 0,
         retry_policy: RetryPolicy::new(),
@@ -439,6 +441,8 @@ async fn test_worker_heartbeat_loss_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-dlq-test".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -528,6 +532,8 @@ async fn test_idempotency_store_acquisition_failure_fails_closed_and_nacks() {
     let job = QueuedJob {
         id: "job-fail-closed".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -658,6 +664,8 @@ async fn test_worker_idempotency_renewal_failure_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-renew-fail".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -751,6 +759,8 @@ async fn test_worker_default_unsupported_idempotency_renewal_routes_to_dlq() {
     let job = QueuedJob {
         id: "job-unsupported-fail".to_string(),
         name: SlowTestJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1040,6 +1050,8 @@ async fn test_worker_retryable_failure_releases_idempotency_lock_before_nack() {
     let job = QueuedJob {
         id: "job-retry-lock".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: payload_bytes,
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1205,6 +1217,8 @@ async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
     let job_a = QueuedJob {
         id: "job-dlq-fail".to_string(),
         name: SlowOkJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&SlowOkJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1253,6 +1267,8 @@ async fn test_worker_lease_lost_releases_only_after_dead_letter_succeeds() {
     let job_b = QueuedJob {
         id: "job-dlq-ok".to_string(),
         name: SlowOkJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&SlowOkJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1419,6 +1435,8 @@ async fn test_worker_keeps_heartbeat_active_until_nack_completes_on_slow_release
     let job = QueuedJob {
         id: "job-slow-rel".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&RetryFailJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1576,6 +1594,8 @@ async fn test_worker_in_progress_idempotency_defers_without_burning_retry_budget
     let job = QueuedJob {
         id: "job-defer".to_string(),
         name: RetryFailJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&RetryFailJob).unwrap(),
         attempt: 2,
         retry_policy: RetryPolicy::new().with_max_attempts(3),
@@ -1736,6 +1756,8 @@ async fn worker_fast_completing_job_never_leaks_abort_handle() {
         jobs.push_back(QueuedJob {
             id: format!("fast-{idx}"),
             name: BurstOrHangJob::NAME.to_string(),
+            queue: "default".to_string(),
+            priority: 0,
             payload: serde_json::to_vec(&BurstOrHangJob { hang: false }).unwrap(),
             attempt: 1,
             retry_policy: RetryPolicy::new(),
@@ -1752,6 +1774,8 @@ async fn worker_fast_completing_job_never_leaks_abort_handle() {
     jobs.push_back(QueuedJob {
         id: "hang-job".to_string(),
         name: BurstOrHangJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&BurstOrHangJob { hang: true }).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -1921,6 +1945,8 @@ async fn in_flight_idempotency_loss_before_ack_routes_to_dead_letter() {
     let job = QueuedJob {
         id: "job-gated-idemp".to_string(),
         name: GatedIdempJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&GatedIdempJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -2103,6 +2129,8 @@ async fn stalled_heartbeat_renewal_times_out_and_does_not_hang_finalization() {
     let job = QueuedJob {
         id: "job-stalled-renew".to_string(),
         name: StalledRenewJob::NAME.to_string(),
+        queue: "default".to_string(),
+        priority: 0,
         payload: serde_json::to_vec(&StalledRenewJob).unwrap(),
         attempt: 1,
         retry_policy: RetryPolicy::new(),
@@ -2272,4 +2300,182 @@ async fn slow_renewal_within_lease_does_not_count_as_lost_lease() {
     );
 
     hb.finish().await;
+}
+
+#[tokio::test]
+async fn job_worker_enforces_per_queue_concurrency_cap() {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CappedJob {
+        idx: usize,
+    }
+
+    impl Job for CappedJob {
+        const NAME: &'static str = "capped_queue_job";
+
+        fn queue(&self) -> &str {
+            "emails"
+        }
+    }
+
+    struct ConcurrencyProbeHandler {
+        active: Arc<AtomicUsize>,
+        max_observed: Arc<AtomicUsize>,
+        done_tx: mpsc::Sender<()>,
+    }
+
+    impl JobHandler<CappedJob> for ConcurrencyProbeHandler {
+        fn handle<'a>(
+            &'a self,
+            _ctx: &'a JobContext,
+            _job: CappedJob,
+        ) -> BoxFuture<'a, Result<(), JobError>> {
+            let active = Arc::clone(&self.active);
+            let max_observed = Arc::clone(&self.max_observed);
+            let done_tx = self.done_tx.clone();
+            Box::pin(async move {
+                let prev = active.fetch_add(1, Ordering::SeqCst);
+                let current = prev + 1;
+                max_observed.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                let _ = done_tx.send(()).await;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct MultiJobQueue {
+        jobs: Mutex<Vec<QueuedJob>>,
+    }
+
+    impl JobQueue for MultiJobQueue {
+        fn enqueue_delayed_with_trace<J: Job>(
+            &self,
+            _job: J,
+            _delay: Duration,
+            _trace_context: Option<String>,
+        ) -> BoxFuture<'_, Result<String, JobError>> {
+            Box::pin(async move { Ok("id".into()) })
+        }
+
+        fn dequeue_for(
+            &self,
+            worker_id: &str,
+        ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+            let wid = worker_id.to_string();
+            Box::pin(async move {
+                let mut guard = self.jobs.lock().await;
+                if guard.is_empty() {
+                    Ok(None)
+                } else {
+                    let mut job = guard.remove(0);
+                    job.attempt += 1;
+                    job.assigned_worker = Some(wid);
+                    job.lease_token = Some("tok".into());
+                    Ok(Some(job))
+                }
+            })
+        }
+
+        fn reclaim_abandoned_jobs(
+            &self,
+            _dead_workers: &[String],
+        ) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn ack(&self, _job_id: &str, _lease_token: &str) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn nack(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn defer(
+            &self,
+            mut job: QueuedJob,
+            _lease_token: &str,
+            _delay: Duration,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async move {
+                job.attempt = job.attempt.saturating_sub(1);
+                job.assigned_worker = None;
+                job.lease_token = None;
+                self.jobs.lock().await.push(job);
+                Ok(())
+            })
+        }
+
+        fn dead_letter(
+            &self,
+            _job: QueuedJob,
+            _lease_token: &str,
+            _reason: String,
+        ) -> BoxFuture<'_, Result<(), JobError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn pending_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+
+        fn dead_letter_count(&self) -> BoxFuture<'_, Result<usize, JobError>> {
+            Box::pin(async { Ok(0) })
+        }
+    }
+
+    let queued: Vec<QueuedJob> = (0..6)
+        .map(|idx| QueuedJob {
+            id: format!("capped-{idx}"),
+            name: CappedJob::NAME.to_string(),
+            queue: "emails".to_string(),
+            priority: 0,
+            payload: serde_json::to_vec(&CappedJob { idx }).unwrap(),
+            attempt: 0,
+            retry_policy: RetryPolicy::default(),
+            timeout: Some(Duration::from_secs(5)),
+            idempotency_key: None,
+            tenant_id: None,
+            assigned_worker: None,
+            lease_token: None,
+            available_at: Instant::now(),
+            lease_duration: Duration::from_secs(30),
+            trace_context: None,
+        })
+        .collect();
+
+    let queue = Arc::new(MultiJobQueue {
+        jobs: Mutex::new(queued),
+    });
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_observed = Arc::new(AtomicUsize::new(0));
+    let (done_tx, mut done_rx) = mpsc::channel(10);
+
+    let mut registry = JobRegistry::new();
+    registry.register(ConcurrencyProbeHandler {
+        active: Arc::clone(&active),
+        max_observed: Arc::clone(&max_observed),
+        done_tx,
+    });
+
+    let worker = JobWorker::with_concurrency_limit(queue, Arc::new(registry), 10)
+        .with_queue_concurrency("emails", 2);
+    let handle = worker.start();
+
+    for _ in 0..6 {
+        tokio::time::timeout(Duration::from_secs(2), done_rx.recv())
+            .await
+            .expect("job completed in time")
+            .expect("channel open");
+    }
+
+    assert!(handle.shutdown(Duration::from_secs(2)).await);
+    assert_eq!(max_observed.load(Ordering::SeqCst), 2);
 }

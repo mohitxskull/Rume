@@ -169,33 +169,36 @@ fn parse_single_duration_token(
             .parse()
             .map_err(|_| ParseDurationError::InvalidNumber(num_str.to_string()))?;
 
-        if val < 0.0 || val.is_nan() || val.is_infinite() {
+        if val < 0.0 || !val.is_finite() {
             return Err(ParseDurationError::InvalidNumber(num_str.to_string()));
         }
 
-        let total_nanos = val * (nanos_per_unit as f64);
-        if total_nanos > (u64::MAX as f64 * 1_000_000_000.0) {
-            return Err(ParseDurationError::Overflow);
-        }
-
-        Ok(Duration::from_nanos(total_nanos.round() as u64))
+        // Why: `Duration::from_nanos((secs * 1e9) as u64)` silently saturates durations
+        // above `u64::MAX` nanoseconds (~584 years, e.g. `"1000000.5d"`). Convert via
+        // `Duration::try_from_secs_f64` so large valid durations stay accurate and true
+        // `Duration::MAX` overflows return `Err(ParseDurationError::Overflow)` (`RC-23`).
+        let secs = val * (nanos_per_unit as f64 / 1_000_000_000.0);
+        Duration::try_from_secs_f64(secs).map_err(|_| ParseDurationError::Overflow)
     } else {
         let val: u64 = num_str
             .parse()
             .map_err(|_| ParseDurationError::InvalidNumber(num_str.to_string()))?;
 
-        match (val as u128).checked_mul(nanos_per_unit) {
-            Some(nanos) if nanos <= u64::MAX as u128 => Ok(Duration::from_nanos(nanos as u64)),
+        // Why: construct sub-second units directly via `Duration::from_{nanos,micros,millis}`
+        // so large valid millisecond/microsecond values (e.g. `"20000000000000ms"`) do not
+        // spuriously overflow `u64` nanoseconds (`RC-19`).
+        match unit_str {
+            "ns" | "nanos" | "nanosecond" | "nanoseconds" => Ok(Duration::from_nanos(val)),
+            "us" | "µs" | "micros" | "microsecond" | "microseconds" => {
+                Ok(Duration::from_micros(val))
+            }
+            "ms" | "millis" | "millisecond" | "milliseconds" => Ok(Duration::from_millis(val)),
             _ => {
-                let secs_multiplier = nanos_per_unit / 1_000_000_000;
-                if secs_multiplier > 0 {
-                    let secs = val
-                        .checked_mul(secs_multiplier as u64)
-                        .ok_or(ParseDurationError::Overflow)?;
-                    Ok(Duration::from_secs(secs))
-                } else {
-                    Err(ParseDurationError::Overflow)
-                }
+                let secs_multiplier = (nanos_per_unit / 1_000_000_000) as u64;
+                let secs = val
+                    .checked_mul(secs_multiplier)
+                    .ok_or(ParseDurationError::Overflow)?;
+                Ok(Duration::from_secs(secs))
             }
         }
     }
@@ -252,5 +255,31 @@ mod tests {
             parse_duration("10 weeks"),
             Err(ParseDurationError::UnknownUnit(_))
         ));
+    }
+
+    #[test]
+    fn parse_duration_large_fractional_does_not_saturate_and_overflows_cleanly() {
+        // Previously `(secs * 1e9) as u64` saturated `"1000000.5d"` to `u64::MAX` nanos.
+        assert_eq!(
+            parse_duration("1000000.5d").unwrap(),
+            Duration::from_secs(86_400_043_200)
+        );
+        // Truly exceeding Duration::MAX returns Overflow.
+        assert_eq!(
+            parse_duration("1000000000000000000.5d"),
+            Err(ParseDurationError::Overflow)
+        );
+    }
+
+    #[test]
+    fn parse_duration_large_integer_subsecond_units_do_not_overflow_u64_nanos() {
+        assert_eq!(
+            parse_duration("20000000000000ms").unwrap(),
+            Duration::from_millis(20_000_000_000_000)
+        );
+        assert_eq!(
+            parse_duration("20000000000000000us").unwrap(),
+            Duration::from_micros(20_000_000_000_000_000)
+        );
     }
 }

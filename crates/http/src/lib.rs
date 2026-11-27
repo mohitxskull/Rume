@@ -2,10 +2,22 @@
 
 #![forbid(unsafe_code)]
 
+pub mod client;
+pub mod http_cache;
 pub mod openapi;
+pub mod pagination;
+pub mod realtime;
 pub mod resilience;
 pub mod routing;
+#[cfg(feature = "scim")]
+pub mod scim;
+pub mod static_files;
+#[cfg(feature = "tls")]
+pub mod tls;
+pub mod transport;
+pub mod upload;
 pub mod validation;
+pub mod webhooks;
 
 #[cfg(test)]
 mod tests {

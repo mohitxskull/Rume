@@ -6,11 +6,17 @@ use libfuzzer_sys::fuzz_target;
 use rume_foundation::env::interpolation::interpolate_value;
 
 fuzz_target!(|data: &[u8]| {
-    if let Ok(input) = std::str::from_utf8(data) {
+    if let Ok(text) = std::str::from_utf8(data) {
+        let mut lines = text.split('\n');
+        let input = lines.next().unwrap_or_default();
         let mut vars = BTreeMap::new();
-        vars.insert("A".to_string(), "${B}".to_string());
-        vars.insert("B".to_string(), "ok".to_string());
-        vars.insert("LOOP".to_string(), "${LOOP}".to_string());
+        for line in lines.take(32) {
+            if let Some((k, v)) = line.split_once('=')
+                && !k.is_empty()
+            {
+                vars.insert(k.to_string(), v.to_string());
+            }
+        }
         let _ = interpolate_value(input, &vars);
     }
 });

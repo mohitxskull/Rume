@@ -1,12 +1,15 @@
 mod codegen;
 mod config;
 mod db;
+mod dev;
 mod doctor;
 mod env;
 mod generate;
 mod list_routes;
 mod new;
+mod openapi;
 mod sql_check;
+mod task;
 
 use crate::cli::{Cli, Commands};
 pub fn require_rume_project() {
@@ -85,6 +88,10 @@ pub async fn run(cli: Cli) {
             require_rume_project();
             db::run(crate::cli::DbCommands::Rollback).await;
         }
+        Some(Commands::DbSeed { path, only }) => {
+            require_rume_project();
+            db::run(crate::cli::DbCommands::Seed { path, only }).await;
+        }
         Some(Commands::SqlCheck {
             path,
             dialect,
@@ -94,6 +101,22 @@ pub async fn run(cli: Cli) {
         }) => {
             require_rume_project();
             sql_check::run(&path, &format, json, dialect.as_deref(), db).await;
+        }
+        Some(Commands::Task { command }) => {
+            require_rume_project();
+            task::run(command);
+        }
+        Some(Commands::Openapi { command }) => {
+            openapi::run(command);
+        }
+        Some(Commands::Dev {
+            bin,
+            watch,
+            no_migrate,
+            debounce_ms,
+        }) => {
+            require_rume_project();
+            dev::run(bin, watch, no_migrate, debounce_ms).await;
         }
         Some(Commands::Completions { shell }) => {
             use clap::CommandFactory;

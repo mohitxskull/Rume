@@ -2,8 +2,9 @@
 //! loops over the dialect-specific backends and the MySQL session-locking helpers.
 
 use super::preflight::{
-    LIST_APPLIED_MIGRATIONS_SQL, MYSQL_AUDIT, MYSQL_CORE_DOWN, MYSQL_OUTBOX, PG_ADVISORY_LOCK,
-    PG_AUDIT, PG_CLOCK, PG_CORE_DOWN, PG_JOBS, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT,
+    LIST_APPLIED_MIGRATIONS_SQL, MYSQL_AUDIT, MYSQL_AUTH_DOWN, MYSQL_AUTH_SCHEMA, MYSQL_CORE_DOWN,
+    MYSQL_OUTBOX, PG_ADVISORY_LOCK, PG_AUDIT, PG_AUTH_DOWN, PG_AUTH_SCHEMA, PG_CLOCK, PG_CORE_DOWN,
+    PG_JOBS, PG_LEADER, PG_LOCKS, PG_OUTBOX, SQLITE_AUDIT, SQLITE_AUTH_DOWN, SQLITE_AUTH_SCHEMA,
     SQLITE_BUSY_TIMEOUT, SQLITE_CLOCK, SQLITE_CORE_DOWN, SQLITE_OUTBOX, delete_migration_query,
     ensure_applied_order_column_backend, ensure_applied_order_column_tx,
     fetch_applied_order_rows_tx, find_checksum_query, find_migration_id_query,
@@ -23,6 +24,9 @@ pub const RUME_CORE_MIGRATION_ID: &str = "20261104_001_rume_core_schemas";
 
 /// Canonical migration identifier for the Rume audit log schema.
 pub const RUME_AUDIT_MIGRATION_ID: &str = "20261104_002_rume_audit_schema";
+
+/// Canonical migration identifier for the Rume auth and multi-tenancy schemas.
+pub const RUME_AUTH_MIGRATION_ID: &str = "20261126_001_rume_auth_schemas";
 
 /// A single versioned database migration step.
 #[derive(Clone)]
@@ -151,6 +155,28 @@ impl Migrator {
                 "Initialize Rume audit log table",
                 audit_up_sql,
             ),
+        );
+        self
+    }
+
+    /// Registers the Rume auth and multi-tenancy migrations appropriate for the given dialect.
+    // Why: append-only migration ID separate from `RUME_CORE_MIGRATION_ID` and
+    // `RUME_AUDIT_MIGRATION_ID` so existing deployments never hit `MigrationChecksumMismatch`.
+    pub fn with_rume_auth(mut self, dialect: &str) -> Self {
+        let (up_sql, down_sql) = match dialect {
+            "postgres" => (PG_AUTH_SCHEMA, PG_AUTH_DOWN),
+            "mysql" => (MYSQL_AUTH_SCHEMA, MYSQL_AUTH_DOWN),
+            "sqlite" => (SQLITE_AUTH_SCHEMA, SQLITE_AUTH_DOWN),
+            _ => return self,
+        };
+
+        self.migrations.push(
+            Migration::from_sql(
+                RUME_AUTH_MIGRATION_ID,
+                "Initialize Rume auth and multi-tenancy tables",
+                up_sql,
+            )
+            .with_down(down_sql),
         );
         self
     }

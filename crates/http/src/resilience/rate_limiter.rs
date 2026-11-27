@@ -89,7 +89,12 @@ struct RateLimitEntry {
 
 #[derive(Debug, Clone)]
 enum RateLimiterBackend {
-    InMemory(Arc<[RwLock<BTreeMap<String, RateLimitEntry>>]>),
+    InMemory {
+        shards: Arc<[RwLock<BTreeMap<String, RateLimitEntry>>]>,
+        /// Per-instance randomized hasher state so attackers cannot precompute
+        /// hash collisions targeting a single shard (`RC-21`).
+        hasher_state: std::collections::hash_map::RandomState,
+    },
     #[cfg(feature = "redis")]
     Redis(crate::resilience::redis::RedisRateLimiter),
 }
@@ -113,7 +118,10 @@ impl RateLimiter {
         }
         Self {
             config,
-            backend: RateLimiterBackend::InMemory(shards.into()),
+            backend: RateLimiterBackend::InMemory {
+                shards: shards.into(),
+                hasher_state: std::collections::hash_map::RandomState::new(),
+            },
         }
     }
 
@@ -135,21 +143,21 @@ impl RateLimiter {
 
     fn shard_for<'a>(
         shards: &'a [RwLock<BTreeMap<String, RateLimitEntry>>],
+        hasher_state: &std::collections::hash_map::RandomState,
         key: &str,
     ) -> &'a RwLock<BTreeMap<String, RateLimitEntry>> {
-        use std::hash::{Hash, Hasher};
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        key.hash(&mut hasher);
-        let idx = (hasher.finish() as usize) % shards.len();
+        use std::hash::BuildHasher;
+        let idx = (hasher_state.hash_one(key) as usize) % shards.len();
         &shards[idx]
     }
 
     fn check_in_memory(
         config: &RateLimitConfig,
         shards: &[RwLock<BTreeMap<String, RateLimitEntry>>],
+        hasher_state: &std::collections::hash_map::RandomState,
         key: &str,
     ) -> Result<RateLimitStatus, ResilienceError> {
-        let mut clients = Self::shard_for(shards, key).write();
+        let mut clients = Self::shard_for(shards, hasher_state, key).write();
         let now = Instant::now();
         // Why: never use `now.checked_sub(config.window).unwrap_or(now)` — when
         // monotonic uptime (or paused Tokio clock) is shorter than `config.window`,
@@ -225,9 +233,10 @@ impl RateLimiter {
     /// runtime. Use `RateLimiter::check_async` for Redis-backed limiters.
     pub fn check(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
         match &self.backend {
-            RateLimiterBackend::InMemory(shards) => {
-                Self::check_in_memory(&self.config, shards, key)
-            }
+            RateLimiterBackend::InMemory {
+                shards,
+                hasher_state,
+            } => Self::check_in_memory(&self.config, shards, hasher_state, key),
             #[cfg(feature = "redis")]
             // Why: `check` is synchronous but the Redis backend is async. The previous code used
             // `tokio::task::block_in_place(|| Handle::current().block_on(r.check(key)))`, which
@@ -244,9 +253,10 @@ impl RateLimiter {
     /// Asynchronously evaluates if a request from `key` is within limits (compatible with async Redis backends).
     pub async fn check_async(&self, key: &str) -> Result<RateLimitStatus, ResilienceError> {
         match &self.backend {
-            RateLimiterBackend::InMemory(shards) => {
-                Self::check_in_memory(&self.config, shards, key)
-            }
+            RateLimiterBackend::InMemory {
+                shards,
+                hasher_state,
+            } => Self::check_in_memory(&self.config, shards, hasher_state, key),
             #[cfg(feature = "redis")]
             RateLimiterBackend::Redis(r) => r.check(key).await,
         }
@@ -255,7 +265,7 @@ impl RateLimiter {
     /// Prunes expired client entries whose recorded requests fall outside the sliding window.
     pub fn prune_expired(&self) {
         match &self.backend {
-            RateLimiterBackend::InMemory(shards) => {
+            RateLimiterBackend::InMemory { shards, .. } => {
                 let now = Instant::now();
                 let window = self.config.window;
                 for shard in shards.iter() {
@@ -357,12 +367,17 @@ where
         // semantically equivalent to joining them in order with `, `. Reading
         // only `.get("x-forwarded-for")` ignores subsequent header lines appended
         // by a reverse proxy and lets an attacker spoof the first header line.
-        let folded_xff = fold_forwarded_headers(req.headers());
-        let ip_key = resolve_forwarded_client_ip(
-            socket_ip,
-            folded_xff.as_deref(),
-            &limiter.config().trusted_proxies,
-        );
+        // Fail closed to `peer` if any header line is empty or non-UTF-8 (`RC-16`).
+        let ip_key = match fold_forwarded_headers(req.headers()) {
+            Ok(folded_xff) => resolve_forwarded_client_ip(
+                socket_ip,
+                folded_xff.as_deref(),
+                &limiter.config().trusted_proxies,
+            ),
+            Err(()) => {
+                resolve_forwarded_client_ip(socket_ip, None, &limiter.config().trusted_proxies)
+            }
+        };
 
         // Why: `TenantLayer` resolves `Tenant` from untrusted request input (e.g. `X-Tenant-ID`)
         // before authentication or `RateLimitLayer` runs. Keying by `tenant:<id>` without
@@ -461,15 +476,18 @@ pub fn resolve_forwarded_client_ip(
         let mut last_valid_ip = None;
         for hop in chain.rsplit(',') {
             let trimmed = hop.trim();
+            // Why: fail closed to `peer` on any empty or unparseable hop instead of skipping
+            // it and walking left into attacker-controlled `X-Forwarded-For` entries (`RC-21`).
             if trimmed.is_empty() {
-                continue;
+                return format!("ip:{peer}");
             }
-            if let Ok(ip) = trimmed.parse::<std::net::IpAddr>() {
-                if !trusted_proxies.contains(&ip) {
-                    return format!("ip:{ip}");
-                }
-                last_valid_ip = Some(ip);
+            let Ok(ip) = trimmed.parse::<std::net::IpAddr>() else {
+                return format!("ip:{peer}");
+            };
+            if !trusted_proxies.contains(&ip) {
+                return format!("ip:{ip}");
             }
+            last_valid_ip = Some(ip);
         }
         if let Some(leftmost) = last_valid_ip {
             return format!("ip:{leftmost}");
@@ -479,20 +497,24 @@ pub fn resolve_forwarded_client_ip(
     format!("ip:{peer}")
 }
 
-fn fold_forwarded_headers(headers: &axum::http::HeaderMap) -> Option<String> {
+fn fold_forwarded_headers(headers: &axum::http::HeaderMap) -> Result<Option<String>, ()> {
     let mut parts = Vec::new();
     for val in headers.get_all("x-forwarded-for") {
-        if let Ok(s) = val.to_str() {
-            let trimmed = s.trim();
-            if !trimmed.is_empty() {
-                parts.push(trimmed);
-            }
+        // Why: fail closed on any non-UTF-8 or empty/whitespace-only `X-Forwarded-For`
+        // line rather than skipping it and exposing an earlier attacker-controlled line.
+        let Ok(s) = val.to_str() else {
+            return Err(());
+        };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return Err(());
         }
+        parts.push(trimmed);
     }
     if parts.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(parts.join(", "))
+        Ok(Some(parts.join(", ")))
     }
 }
 
@@ -531,9 +553,58 @@ mod tests {
         let mut headers = axum::http::HeaderMap::new();
         headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
         headers.append("x-forwarded-for", HeaderValue::from_static("203.0.113.99"));
-        let folded = fold_forwarded_headers(&headers);
+        let folded = fold_forwarded_headers(&headers).expect("valid xff headers");
         let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
         let ip = resolve_forwarded_client_ip(Some(proxy), folded.as_deref(), &[proxy]);
         assert_eq!(ip, "ip:203.0.113.99");
+    }
+
+    #[test]
+    fn fold_forwarded_headers_fails_closed_on_empty_or_non_utf8_header_line() {
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+
+        // Empty trailing X-Forwarded-For line must fail closed to `peer`, not fall back to `1.2.3.4`.
+        let mut headers = axum::http::HeaderMap::new();
+        headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        headers.append("x-forwarded-for", HeaderValue::from_static(""));
+        assert!(fold_forwarded_headers(&headers).is_err());
+        let ip = match fold_forwarded_headers(&headers) {
+            Ok(folded) => resolve_forwarded_client_ip(Some(proxy), folded.as_deref(), &[proxy]),
+            Err(()) => resolve_forwarded_client_ip(Some(proxy), None, &[proxy]),
+        };
+        assert_eq!(ip, "ip:10.0.0.1");
+
+        // Whitespace-only line must also fail closed.
+        let mut ws_headers = axum::http::HeaderMap::new();
+        ws_headers.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        ws_headers.append("x-forwarded-for", HeaderValue::from_static("   "));
+        assert!(fold_forwarded_headers(&ws_headers).is_err());
+
+        // Non-UTF-8 header value must also fail closed.
+        let mut non_utf8 = axum::http::HeaderMap::new();
+        non_utf8.append("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
+        non_utf8.append(
+            "x-forwarded-for",
+            HeaderValue::from_bytes(b"\xff\xfe").unwrap(),
+        );
+        assert!(fold_forwarded_headers(&non_utf8).is_err());
+    }
+
+    #[test]
+    fn resolve_forwarded_client_ip_fails_closed_on_unparseable_hop() {
+        let proxy = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
+        // An attacker prepends `1.2.3.4` and an unparseable hop sits to the right.
+        // Failing closed must return `peer` rather than walking left into `1.2.3.4`.
+        let ip = resolve_forwarded_client_ip(
+            Some(proxy),
+            Some("1.2.3.4, not-an-ip, 10.0.0.1"),
+            &[proxy],
+        );
+        assert_eq!(ip, "ip:10.0.0.1");
+
+        // Empty hop also fails closed to `peer`.
+        let ip_empty =
+            resolve_forwarded_client_ip(Some(proxy), Some("1.2.3.4, , 10.0.0.1"), &[proxy]);
+        assert_eq!(ip_empty, "ip:10.0.0.1");
     }
 }

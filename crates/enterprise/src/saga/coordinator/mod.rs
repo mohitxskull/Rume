@@ -3,9 +3,17 @@
 use std::future::Future;
 use std::pin::Pin;
 
+#[cfg(feature = "redis")]
+mod redis_store;
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+mod sql_store;
 mod store;
 mod workflow;
 
+#[cfg(feature = "redis")]
+pub use redis_store::RedisSagaStore;
+#[cfg(any(feature = "sqlite", feature = "postgres", feature = "mysql"))]
+pub use sql_store::SqlSagaStore;
 pub use store::{InMemorySagaStore, SagaRecord, SagaStatus, SagaStore};
 pub use workflow::{
     Saga, SagaRecoveryError, SagaRecoveryHandle, SagaRecoveryPhase, SagaReport,

@@ -17,4 +17,8 @@ pub use model::{OptionalTenant, Tenant, TenantContext};
 #[cfg(feature = "redis")]
 pub use quota::RedisTenantQuotaStore;
 pub use quota::{InMemoryTenantQuotaStore, KeyReservation, LeaseId, TenantQuotaStore};
-pub use resolver::{HeaderTenantResolver, SubdomainTenantResolver, TenantResolver};
+pub use resolver::{
+    CachedDbTenantResolver, HeaderTenantResolver, PathPrefixTenantResolver, SqlTenantStore,
+    SubdomainTenantResolver, TenantKeyExtractor, TenantResolver, TenantStore,
+};
+pub use rume_data::persistence::{TenantIsolationStrategy, TenantPoolManager};

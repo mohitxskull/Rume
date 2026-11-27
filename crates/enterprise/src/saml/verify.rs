@@ -1,5 +1,6 @@
 use super::assertion::{SamlAssertion, SamlParser};
-use std::collections::HashMap;
+use super::redis_replay::AsyncSamlReplayCache;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -88,14 +89,37 @@ pub trait SamlReplayCache: Send + Sync {
 #[derive(Debug, Default)]
 struct ReplayCacheState {
     entries: HashMap<String, u64>,
+    /// Secondary expiry index `(expires_at, assertion_id)` so pruning expired entries
+    /// is `O(k log N)` for `k` expired entries instead of an `O(N)` full-map scan.
+    expiry_index: BTreeSet<(u64, String)>,
     last_pruned_at: u64,
 }
+
+impl ReplayCacheState {
+    fn prune_up_to(&mut self, cutoff: u64) {
+        self.last_pruned_at = self.last_pruned_at.max(cutoff);
+        let watermark = self.last_pruned_at;
+        while let Some((exp, _)) = self.expiry_index.first() {
+            if *exp > watermark {
+                break;
+            }
+            if let Some((exp, id)) = self.expiry_index.pop_first()
+                && self.entries.get(&id).copied() == Some(exp)
+            {
+                self.entries.remove(&id);
+            }
+        }
+    }
+}
+
+const DEFAULT_MAX_REPLAY_ENTRIES: usize = 100_000;
 
 /// Thread-safe in-memory [`SamlReplayCache`] suitable for single-instance deployments and tests.
 #[derive(Debug)]
 pub struct InMemorySamlReplayCache {
     state: Mutex<ReplayCacheState>,
     max_clock_skew_secs: u64,
+    max_entries: usize,
 }
 
 impl Default for InMemorySamlReplayCache {
@@ -103,6 +127,7 @@ impl Default for InMemorySamlReplayCache {
         Self {
             state: Mutex::new(ReplayCacheState::default()),
             max_clock_skew_secs: 300,
+            max_entries: DEFAULT_MAX_REPLAY_ENTRIES,
         }
     }
 }
@@ -119,16 +144,21 @@ impl InMemorySamlReplayCache {
         Self {
             state: Mutex::new(ReplayCacheState::default()),
             max_clock_skew_secs,
+            max_entries: DEFAULT_MAX_REPLAY_ENTRIES,
         }
+    }
+
+    /// Configures the maximum number of active assertion IDs retained before failing closed.
+    pub fn with_max_entries(mut self, max_entries: usize) -> Self {
+        self.max_entries = max_entries.max(1);
+        self
     }
 
     /// Evicts entries whose expiration is `<= now_epoch_sec` and advances the pruning
     /// watermark so concurrent late validations cannot re-insert an already-pruned ID.
     pub fn prune_expired(&self, now_epoch_sec: u64) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.last_pruned_at = guard.last_pruned_at.max(now_epoch_sec);
-            let cutoff = guard.last_pruned_at;
-            guard.entries.retain(|_, exp| *exp > cutoff);
+            guard.prune_up_to(now_epoch_sec);
         }
     }
 }
@@ -158,10 +188,24 @@ impl SamlReplayCache for InMemorySamlReplayCache {
                 current: effective_now,
             });
         }
+        // Why: advance `last_pruned_at` to `effective_now` before evicting expired entries so
+        // an evicted ID can never be re-accepted by a lagging/concurrent validation with an
+        // earlier `now_epoch_sec`, and prune via `expiry_index` in O(k log N) instead of an
+        // O(N) scan; fail closed at `max_entries` so unbounded traffic cannot OOM or evict
+        // active replay state.
+        guard.prune_up_to(effective_now);
         if guard.entries.contains_key(assertion_id) {
             return Ok(false);
         }
-        guard.entries.insert(assertion_id.to_string(), expires_at);
+        if guard.entries.len() >= self.max_entries {
+            return Err(SamlError::Malformed(format!(
+                "SAML replay cache capacity ({}) exceeded",
+                self.max_entries
+            )));
+        }
+        let id = assertion_id.to_string();
+        guard.entries.insert(id.clone(), expires_at);
+        guard.expiry_index.insert((expires_at, id));
         Ok(true)
     }
 }
@@ -547,5 +591,116 @@ impl SamlParser {
         }
 
         Ok(())
+    }
+
+    /// Validates a SAML assertion using an asynchronous replay-protection cache.
+    pub async fn validate_with_async_replay(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        config: &SamlValidationConfig<'_>,
+        cache: &dyn AsyncSamlReplayCache,
+    ) -> Result<(), SamlError> {
+        let sync_cfg = SamlValidationConfig {
+            replay_cache: None,
+            ..*config
+        };
+        Self::validate_with_config(assertion, current_epoch_sec, &sync_cfg)?;
+
+        let not_on_or_after = assertion
+            .not_on_or_after
+            .ok_or(SamlError::MissingExpirationCondition)?;
+        let max_skew = cache.max_clock_skew_secs();
+        if config.clock_skew_secs > max_skew {
+            return Err(SamlError::Malformed(format!(
+                "validator clock_skew_secs ({}) exceeds replay cache max_clock_skew_secs ({max_skew})",
+                config.clock_skew_secs
+            )));
+        }
+        let replay_expires_at = not_on_or_after
+            .saturating_add(max_skew)
+            .saturating_add(u64::from(assertion.not_on_or_after_subsec_nanos > 0));
+        let fresh = cache
+            .record_if_absent_async(&assertion.id, replay_expires_at, current_epoch_sec)
+            .await?;
+        if !fresh {
+            return Err(SamlError::AssertionReplayed(assertion.id.clone()));
+        }
+        Ok(())
+    }
+
+    /// Validates a SAML assertion against the full SAML 2.0 HTTP POST Web Browser SSO profile
+    /// using an asynchronous replay-protection cache (e.g. [`super::RedisSamlReplayCache`]).
+    pub async fn validate_browser_sso_async(
+        assertion: &SamlAssertion,
+        current_epoch_sec: u64,
+        config: &SamlValidationConfig<'_>,
+        cache: &dyn AsyncSamlReplayCache,
+    ) -> Result<(), SamlError> {
+        if !assertion.is_signature_verified() {
+            return Err(SamlError::MissingSignatureVerifier);
+        }
+        if !assertion.has_authn_statement {
+            return Err(SamlError::Malformed(
+                "missing required AuthnStatement (with AuthnInstant and AuthnContext) for SAML Web Browser SSO"
+                    .into(),
+            ));
+        }
+        if config.expected_audience.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_audience (SP entity ID) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
+        if config.expected_recipient.is_none() {
+            return Err(SamlError::Malformed(
+                "expected_recipient (ACS URL) is required for SAML Web Browser SSO validation"
+                    .into(),
+            ));
+        }
+        let enforced = SamlValidationConfig {
+            require_bearer_confirmation: true,
+            ..*config
+        };
+        Self::validate_with_async_replay(assertion, current_epoch_sec, &enforced, cache).await
+    }
+}
+
+#[cfg(test)]
+mod replay_cache_tests {
+    use super::*;
+
+    #[test]
+    fn in_memory_replay_cache_prunes_expired_inline_and_enforces_max_entries() {
+        let cache = InMemorySamlReplayCache::new().with_max_entries(2);
+        assert!(cache.record_if_absent("id-1", 100, 50).unwrap());
+        assert!(cache.record_if_absent("id-2", 200, 50).unwrap());
+
+        // At capacity (2 active entries): existing replay still returns Ok(false).
+        assert!(!cache.record_if_absent("id-1", 100, 60).unwrap());
+        // New unexpired entry fails closed when full.
+        assert!(matches!(
+            cache.record_if_absent("id-3", 200, 60),
+            Err(SamlError::Malformed(ref msg)) if msg.contains("capacity")
+        ));
+
+        // Once id-1 expires (now >= 100), inline pruning frees its slot for id-3.
+        assert!(cache.record_if_absent("id-3", 250, 100).unwrap());
+    }
+
+    #[test]
+    fn in_memory_replay_cache_advances_watermark_on_inline_prune() {
+        let cache = InMemorySamlReplayCache::new();
+        assert!(cache.record_if_absent("id-a", 120, 100).unwrap());
+        // Advances time past id-a's expiry (120) and evicts id-a inline.
+        assert!(cache.record_if_absent("id-b", 200, 125).unwrap());
+        // A lagging/concurrent validation with an earlier `now_epoch_sec` must NOT
+        // re-accept the evicted id-a; it must fail closed with Expired.
+        assert_eq!(
+            cache.record_if_absent("id-a", 120, 115),
+            Err(SamlError::Expired {
+                not_on_or_after: 120,
+                current: 125,
+            })
+        );
     }
 }

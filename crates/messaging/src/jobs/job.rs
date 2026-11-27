@@ -43,6 +43,16 @@ pub trait Job: Serialize + DeserializeOwned + Send + Sync + 'static {
     fn trace_context(&self) -> Option<String> {
         None
     }
+
+    /// Named queue to route this job into (defaults to `"default"`).
+    fn queue(&self) -> &str {
+        "default"
+    }
+
+    /// Numeric priority for this job (higher values dequeue first, defaults to `0`).
+    fn priority(&self) -> i32 {
+        0
+    }
 }
 
 use std::sync::Arc;
@@ -109,6 +119,10 @@ pub struct QueuedJob {
     pub id: String,
     /// Job type identifier.
     pub name: String,
+    /// Named queue this job belongs to (defaults to `"default"`).
+    pub queue: String,
+    /// Numeric priority (higher values dequeue first, defaults to `0`).
+    pub priority: i32,
     /// Serialized JSON payload.
     pub payload: Vec<u8>,
     /// Current attempt count.
@@ -131,4 +145,47 @@ pub struct QueuedJob {
     pub lease_duration: Duration,
     /// Optional W3C TraceContext traceparent string.
     pub trace_context: Option<String>,
+}
+
+/// Pre-serialized job specification used by [`crate::jobs::batch::BatchBuilder`] and
+/// [`crate::jobs::queue::JobQueue::enqueue_raw`].
+#[derive(Debug, Clone)]
+pub struct RawJob {
+    /// Job type identifier (`Job::NAME`).
+    pub name: String,
+    /// Named queue this job belongs to.
+    pub queue: String,
+    /// Numeric priority (higher values dequeue first).
+    pub priority: i32,
+    /// Serialized JSON payload.
+    pub payload: Vec<u8>,
+    /// Execution retry strategy.
+    pub retry_policy: RetryPolicy,
+    /// Execution timeout for a single attempt.
+    pub timeout: Option<Duration>,
+    /// Optional idempotency key for deduplication.
+    pub idempotency_key: Option<String>,
+    /// Optional tenant identifier.
+    pub tenant_id: Option<String>,
+    /// Optional W3C TraceContext traceparent string.
+    pub trace_context: Option<String>,
+}
+
+impl RawJob {
+    /// Serializes a typed [`Job`] into a [`RawJob`] envelope.
+    pub fn from_job<J: Job>(job: J, trace_context: Option<String>) -> Result<Self, JobError> {
+        let payload =
+            serde_json::to_vec(&job).map_err(|e| JobError::Serialization(e.to_string()))?;
+        Ok(Self {
+            name: J::NAME.to_string(),
+            queue: job.queue().to_string(),
+            priority: job.priority(),
+            payload,
+            retry_policy: job.retry_policy(),
+            timeout: job.timeout(),
+            idempotency_key: job.idempotency_key(),
+            tenant_id: job.tenant_id(),
+            trace_context: trace_context.or_else(|| job.trace_context()),
+        })
+    }
 }

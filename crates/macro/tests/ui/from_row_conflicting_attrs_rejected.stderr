@@ -1,0 +1,5 @@
+error: #[from_row(skip)] cannot be combined with `rename`, `flatten`, or `json`
+ --> tests/ui/from_row_conflicting_attrs_rejected.rs:6:5
+  |
+6 |     #[from_row(skip, rename = "x")]
+  |     ^

@@ -195,7 +195,7 @@ fn with_rume_core_registers_core_and_audit_ahead_of_app_migrations() {
     let expected_core_checksums = [
         (
             "postgres",
-            "cd9cef147434fa0efa944539bf0b33445546de6d78208bad2176804bd0bdb1c3",
+            "cc1b960472da3e3723fcfad0f97c331a17d8a996de5f077fce8016592ab8c62d",
         ),
         (
             "mysql",
@@ -540,5 +540,102 @@ async fn generic_backend_fallback_ensures_applied_order_column_before_insert() {
         count_alter(&log_after),
         alter_count_before,
         "second run must skip ALTER TABLE when applied_order already exists"
+    );
+}
+
+#[cfg(feature = "sqlite")]
+#[tokio::test]
+async fn rume_auth_migration_applies_and_rolls_back_on_sqlite() {
+    let backend = crate::persistence::SqliteBackend::in_memory()
+        .await
+        .expect("in-memory sqlite");
+    let migrator = Migrator::new().with_rume_auth("sqlite");
+
+    let summary = migrator
+        .run_pending(&backend)
+        .await
+        .expect("auth migration applies");
+    assert_eq!(summary.applied, vec![RUME_AUTH_MIGRATION_ID.to_string()]);
+
+    // Re-running is idempotent.
+    let summary_again = migrator
+        .run_pending(&backend)
+        .await
+        .expect("idempotent re-run succeeds");
+    assert!(summary_again.applied.is_empty());
+
+    // All 6 auth/tenancy tables exist.
+    for table in [
+        "rume_sessions",
+        "rume_api_keys",
+        "rume_roles",
+        "rume_role_permissions",
+        "rume_user_roles",
+        "rume_tenants",
+    ] {
+        let found = backend
+            .query_scalar_params(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[DbValue::from(table)],
+            )
+            .await
+            .expect("sqlite_master query");
+        assert_eq!(found.as_deref(), Some(table), "expected table {table}");
+    }
+
+    // Rollback drops all 6 tables cleanly.
+    let rolled_back = migrator
+        .rollback_last(&backend)
+        .await
+        .expect("rollback succeeds");
+    assert_eq!(rolled_back.as_deref(), Some(RUME_AUTH_MIGRATION_ID));
+
+    for table in [
+        "rume_sessions",
+        "rume_api_keys",
+        "rume_roles",
+        "rume_role_permissions",
+        "rume_user_roles",
+        "rume_tenants",
+    ] {
+        let found = backend
+            .query_scalar_params(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
+                &[DbValue::from(table)],
+            )
+            .await
+            .expect("sqlite_master query after rollback");
+        assert!(
+            found.is_none(),
+            "table {table} should be dropped on rollback"
+        );
+    }
+}
+
+#[test]
+fn rume_core_and_audit_migration_checksums_remain_unchanged() {
+    let sqlite_core = Migrator::new().with_rume_core("sqlite");
+    assert_eq!(sqlite_core.migrations().len(), 2);
+    assert_eq!(sqlite_core.migrations()[0].id, RUME_CORE_MIGRATION_ID);
+    assert_eq!(sqlite_core.migrations()[1].id, RUME_AUDIT_MIGRATION_ID);
+    assert_ne!(
+        sqlite_core.migrations()[0].checksum(),
+        Migrator::new().with_rume_auth("sqlite").migrations()[0].checksum()
+    );
+
+    let combined = Migrator::new()
+        .with_rume_core("sqlite")
+        .with_rume_auth("sqlite");
+    assert_eq!(combined.migrations().len(), 3);
+    assert_eq!(combined.migrations()[0].id, RUME_CORE_MIGRATION_ID);
+    assert_eq!(combined.migrations()[1].id, RUME_AUDIT_MIGRATION_ID);
+    assert_eq!(combined.migrations()[2].id, RUME_AUTH_MIGRATION_ID);
+    assert_eq!(
+        combined.migrations()[0].checksum(),
+        sqlite_core.migrations()[0].checksum()
+    );
+    assert_eq!(
+        combined.migrations()[1].checksum(),
+        sqlite_core.migrations()[1].checksum()
     );
 }

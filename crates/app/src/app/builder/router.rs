@@ -189,7 +189,8 @@ where
             Into<std::convert::Infallible> + 'static,
         <L::Service as tower::Service<axum::extract::Request>>::Future: Send + 'static,
     {
-        self.router = self.router.layer(layer);
+        self.layers
+            .push(Box::new(move |router| router.layer(layer)));
         self
     }
 
@@ -277,11 +278,20 @@ where
         self
     }
 
+    /// Set the [`OpenApiInfo`](rume_http::openapi::OpenApiInfo) metadata used by
+    /// [`ApplicationMode::OpenApi`](crate::app::state::ApplicationMode::OpenApi)
+    /// when exporting the OpenAPI specification.
+    pub fn openapi_info(mut self, info: rume_http::openapi::OpenApiInfo) -> Self {
+        self.openapi_info = Some(info);
+        self
+    }
+
     /// Mounts an OpenAPI JSON endpoint at the specified path (e.g. `/openapi.json`).
     ///
     /// The specification is generated lazily when requested from the shared route registry,
     /// guaranteeing that routes registered after `.openapi()` and module routes are included.
-    pub fn openapi(self, path: &str, info: rume_http::openapi::OpenApiInfo) -> Self {
+    pub fn openapi(mut self, path: &str, info: rume_http::openapi::OpenApiInfo) -> Self {
+        self.openapi_info = Some(info.clone());
         let registry = Arc::clone(&self.route_registry);
         self.get(path, move || {
             let reg = Arc::clone(&registry);
@@ -292,6 +302,42 @@ where
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .to_openapi(inf);
                 axum::Json(spec.to_json_value())
+            }
+        })
+    }
+
+    /// Mounts the OpenAPI documentation UI (Scalar or Swagger UI) at `docs_path`.
+    ///
+    /// Use this when the OpenAPI JSON spec is mounted separately or served externally.
+    pub fn openapi_ui(
+        self,
+        docs_path: &str,
+        config: rume_http::openapi::OpenApiDocsConfig,
+    ) -> Self {
+        self.merge(rume_http::openapi::openapi_docs_routes(docs_path, config))
+    }
+
+    /// Mounts both the OpenAPI JSON specification at `spec_path` and the documentation UI at `docs_path`.
+    pub fn openapi_docs(
+        self,
+        docs_path: &str,
+        spec_path: &str,
+        info: rume_http::openapi::OpenApiInfo,
+        config: rume_http::openapi::OpenApiDocsConfig,
+    ) -> Self {
+        self.openapi(spec_path, info).openapi_ui(docs_path, config)
+    }
+
+    /// Mounts the Prometheus/OpenMetrics scrape endpoint at `path` (e.g. `/metrics`).
+    ///
+    /// Open by default so it composes cleanly with user middleware (bearer auth, IP
+    /// allowlists, or a dedicated admin listener). Content-negotiates OpenMetrics 1.0
+    /// when `Accept` contains `application/openmetrics-text`; defaults to Prometheus 0.0.4.
+    pub fn metrics(self, path: &str, registry: rume_observability::MetricsRegistry) -> Self {
+        self.get(path, move |headers: axum::http::HeaderMap| {
+            let reg = registry.clone();
+            async move {
+                rume_http::routing::metrics_handler(axum::extract::State(reg), headers).await
             }
         })
     }
@@ -335,7 +381,14 @@ where
             groups_order,
             applied_middleware,
             applied_groups,
+            layers,
+            http_cache,
             route_registry,
+            body_limit,
+            cors,
+            compression,
+            redaction,
+            realtime,
             ..
         } = self;
 
@@ -368,6 +421,10 @@ where
             &applied_middleware,
             &applied_groups,
         )?;
+        let cors_layer = cors
+            .as_ref()
+            .map(rume_http::transport::CorsConfig::build_layer)
+            .transpose()?;
 
         // --- Step 3: Application phase: all references are now known valid ---
         //
@@ -410,6 +467,22 @@ where
         // and `on_shutdown` in sync with module routes and health checks.
         let mut router: Router<AppContext<E, C, S>> = router.with_state(ctx.clone());
 
+        // 0a. Apply `HttpCacheLayer` strictly inside all user `.layer()` and `.middleware()`
+        // layers so `TenantLayer` and auth middleware always run before cache key derivation.
+        if let Some(cache_layer) = http_cache {
+            router = router.layer(cache_layer);
+        }
+
+        // 0b. Apply deferred `.layer()` closures in reverse registration order so
+        // `.layer(A).layer(B)` executes `A` outside `B` on request entry, matching
+        // `.middleware(A).middleware(B)` top-to-bottom ordering.
+        // Why: Tower/Axum's `Router::layer` wraps inner-to-outer, so reversing `layers`
+        // establishes one unified top-to-bottom ordering contract across `.layer()` and
+        // `.middleware()`.
+        for layer_fn in layers.into_iter().rev() {
+            router = layer_fn(router);
+        }
+
         // 1. Apply group middleware (innermost middleware layers)
         for name in groups_order.iter().rev() {
             if applied_groups.contains(name) {
@@ -439,10 +512,44 @@ where
             }
         }
 
-        // 3. Apply the automatic ObservabilityLayer (outermost framework layer).
-        // Attaches RequestId, creates tracing spans, includes X-Request-ID header,
-        // and attaches request_id to Problem Details error responses.
-        router = router.layer(crate::app::observability::ObservabilityLayer::new());
+        // 3. Apply the 4-layer framework transport & observability onion.
+        //
+        // Why: Axum's `Router::layer` wraps inner -> outer, so request entry runs
+        // Compression -> Observability -> CORS -> BodyLimit -> DefaultBodyLimit::disable ->
+        // user middleware -> handlers, and response exit unwinds in reverse:
+        //   1. `DefaultBodyLimit::disable()` + `BodyLimitLayer`: disabling Axum's
+        //      extractor-level 2 MiB default makes `BodyLimitLayer` the single source of
+        //      truth so `.body_limit(> 2 MiB)` works on `Json`/`Bytes`/`String` extractors
+        //      and `.without_body_limit()` genuinely removes the cap, while rejecting
+        //      oversized payloads before user middleware executes.
+        //   2. `CorsLayer`: sits outside `BodyLimitLayer` so `OPTIONS` preflights
+        //      short-circuit before body limits and user middleware, and `413` / error
+        //      responses still receive `Access-Control-Allow-Origin` headers.
+        //   3. `ObservabilityLayer`: traces/logs every request (including preflights and
+        //      `413`s), attaches `X-Request-ID`, and inspects uncompressed
+        //      `application/problem+json` bodies to inject `request_id`.
+        //   4. `CompressionLayer` (outermost): compresses responses only after
+        //      `ObservabilityLayer` has injected `request_id` into JSON bodies, and
+        //      appends `Vary: accept-encoding` without clobbering `Vary: origin`.
+        router = router.layer(axum::extract::DefaultBodyLimit::disable());
+        if let Some(max_bytes) = body_limit {
+            router =
+                router.layer(rume_http::transport::BodyLimitConfig::new(max_bytes).build_layer());
+        }
+        if let Some(cors_layer) = cors_layer {
+            router = router.layer(cors_layer);
+        }
+        let observability_layer = match redaction {
+            Some(cfg) => crate::app::observability::ObservabilityLayer::with_redaction(cfg),
+            None => crate::app::observability::ObservabilityLayer::new(),
+        };
+        router = router.layer(observability_layer);
+        if let Some(compression_cfg) = compression {
+            router = router.layer(compression_cfg.build_layer());
+        }
+        if let Some(hub) = realtime {
+            router = router.layer(axum::Extension(hub));
+        }
 
         Ok((router, ctx))
     }

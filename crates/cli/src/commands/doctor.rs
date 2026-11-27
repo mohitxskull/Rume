@@ -400,39 +400,68 @@ fn check_redis_connectivity() -> DoctorCheck {
 }
 
 fn check_module_dag() -> (String, bool) {
-    let src_dir = Path::new("src");
+    check_module_dag_in(Path::new("src"))
+}
+
+fn check_module_dag_in(src_dir: &Path) -> (String, bool) {
     if !src_dir.exists() {
         return ("src directory not found (skipped)".to_string(), true);
     }
 
     let mut files = Vec::new();
-    fn visit_dirs(dir: &Path, files: &mut Vec<PathBuf>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    visit_dirs(&path, files);
-                } else if path.extension().and_then(|s| s.to_str()) == Some("rs") {
-                    files.push(path);
-                }
-            }
+    // Why: `walkdir::WalkDir` with `follow_links(false)` avoids symlink cycles cleanly
+    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`).
+    for entry in walkdir::WalkDir::new(src_dir)
+        .follow_links(false)
+        .into_iter()
+        .flatten()
+    {
+        if entry.file_type().is_file()
+            && entry.path().extension().and_then(|s| s.to_str()) == Some("rs")
+        {
+            files.push(entry.into_path());
         }
     }
-    visit_dirs(src_dir, &mut files);
+    files.sort();
 
     let mut deps_map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut module_origins: BTreeMap<String, PathBuf> = BTreeMap::new();
+    let mut diagnostics: Vec<String> = Vec::new();
 
     for file_path in files {
         let content = match std::fs::read_to_string(&file_path) {
             Ok(content) => content,
-            Err(_) => continue,
+            Err(err) => {
+                diagnostics.push(format!("failed to read {}: {err}", file_path.display()));
+                continue;
+            }
         };
-        for decl in extract_module_info(&content) {
+        let decls = match extract_module_info(&content) {
+            Ok(decls) => decls,
+            Err(err) => {
+                diagnostics.push(format!("syntax error in {}: {err}", file_path.display()));
+                continue;
+            }
+        };
+        for decl in decls {
             let Some(name) = decl.name else {
                 continue;
             };
+            if let Some(first_path) = module_origins.get(&name) {
+                diagnostics.push(format!(
+                    "duplicate module '{name}' declared in {} and {}",
+                    first_path.display(),
+                    file_path.display()
+                ));
+                continue;
+            }
+            module_origins.insert(name.clone(), file_path.clone());
             deps_map.insert(name, decl.dependencies);
         }
+    }
+
+    if !diagnostics.is_empty() {
+        return (diagnostics.join("; "), false);
     }
 
     if deps_map.is_empty() {
@@ -515,14 +544,12 @@ struct ModuleDecl {
 /// formatting — a `fn` signature split across lines, a string literal split
 /// across lines, or a `vec![...]` spread over several lines — is parsed
 /// correctly without a fragile hand-rolled brace-depth scanner (RC-20).
-fn extract_module_info(content: &str) -> Vec<ModuleDecl> {
-    let Ok(file) = parse_file(content) else {
-        return Vec::new();
-    };
+fn extract_module_info(content: &str) -> Result<Vec<ModuleDecl>, syn::Error> {
+    let file = parse_file(content)?;
 
     let mut extractor = ModuleExtractor::default();
     extractor.visit_file(&file);
-    extractor.decls
+    Ok(extractor.decls)
 }
 
 /// Walks a parsed syntax tree and records the `name` and `dependencies`
@@ -604,9 +631,18 @@ impl<'ast> Visit<'ast> for ModuleExtractor {
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         // syn's default visitor does not descend into macro bodies, so a
         // `dependencies()` body like `vec!["catalog", "inventory"]` would
-        // otherwise yield no string literals. Re-parse the macro token stream
-        // to collect them (RC-20).
+        // otherwise yield no string literals. Re-parse only `vec!` / `smallvec!`
+        // macro token streams so logging or formatting macros (e.g. `tracing::debug!`,
+        // `format!`) inside `dependencies()` never create false DAG edges (`RC-22`).
         if self.current_fn.as_deref() != Some("dependencies") {
+            return;
+        }
+        let is_vec_macro = node
+            .path
+            .segments
+            .last()
+            .is_some_and(|seg| seg.ident == "vec" || seg.ident == "smallvec");
+        if !is_vec_macro {
             return;
         }
         let Some(decl) = self.current_decl.as_mut() else {
@@ -659,7 +695,7 @@ impl Module for CatalogModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("catalog"));
         assert!(decls[0].dependencies.is_empty());
@@ -685,7 +721,7 @@ impl Module for OrdersModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("orders"));
         assert_eq!(
@@ -709,7 +745,7 @@ impl Module for ShippingModule {
     }
 }
 "##;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("shipping"));
         assert!(decls[0].dependencies.is_empty());
@@ -732,7 +768,7 @@ impl Module for InventoryModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("inventory"));
         assert_eq!(decls[0].dependencies, vec!["catalog".to_string()]);
@@ -761,7 +797,7 @@ impl rume::Module for InventoryModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 2);
         assert_eq!(decls[0].name.as_deref(), Some("orders"));
         assert_eq!(decls[0].dependencies, vec!["inventory".to_string()]);
@@ -811,7 +847,7 @@ impl Module for BillingModule {
     }
 }
 "#;
-        let decls = extract_module_info(content);
+        let decls = extract_module_info(content).unwrap();
         assert_eq!(decls.len(), 1);
         assert_eq!(decls[0].name.as_deref(), Some("billing"));
         assert_eq!(decls[0].dependencies, vec!["orders".to_string()]);
@@ -819,13 +855,98 @@ impl Module for BillingModule {
 
     #[test]
     fn extract_module_info_empty_input() {
-        let decls = extract_module_info("");
+        let decls = extract_module_info("").unwrap();
         assert!(decls.is_empty());
     }
 
     #[test]
     fn extract_module_info_unparseable_input() {
-        let decls = extract_module_info("this is not rust {{{");
-        assert!(decls.is_empty());
+        assert!(extract_module_info("this is not rust {{{").is_err());
+    }
+
+    #[test]
+    fn check_module_dag_surfaces_duplicate_modules_and_syntax_errors() {
+        let dup_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dup_dir.path().join("a.rs"),
+            r#"
+impl Module for OrdersA {
+    fn name(&self) -> &str { "orders" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dup_dir.path().join("b.rs"),
+            r#"
+impl Module for OrdersB {
+    fn name(&self) -> &str { "orders" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+
+        let (dup_msg, dup_ok) = check_module_dag_in(dup_dir.path());
+        assert!(!dup_ok, "duplicate modules must fail DAG check");
+        assert!(
+            dup_msg.contains("duplicate module 'orders'"),
+            "expected duplicate module diagnostic, got: {dup_msg}"
+        );
+
+        let err_dir = tempfile::tempdir().unwrap();
+        std::fs::write(err_dir.path().join("broken.rs"), "fn broken( {{{").unwrap();
+
+        let (err_msg, err_ok) = check_module_dag_in(err_dir.path());
+        assert!(!err_ok, "syntax errors must fail DAG check");
+        assert!(
+            err_msg.contains("syntax error") && err_msg.contains("broken.rs"),
+            "expected syntax error diagnostic, got: {err_msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn check_module_dag_skips_symlink_cycles() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("mod_a");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(
+            sub.join("mod.rs"),
+            r#"
+impl Module for ModA {
+    fn name(&self) -> &str { "mod_a" }
+    fn dependencies(&self) -> Vec<&str> { vec![] }
+}
+"#,
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(dir.path(), sub.join("loop")).unwrap();
+
+        let (msg, ok) = check_module_dag_in(dir.path());
+        assert!(ok, "symlink cycle must not fail or hang DAG check: {msg}");
+        assert!(msg.contains("1 module(s) verified acyclic"), "got: {msg}");
+    }
+
+    #[test]
+    fn extract_module_info_ignores_logging_and_format_macros_in_dependencies() {
+        let content = r#"
+impl Module for OrdersModule {
+    fn name(&self) -> &str {
+        "orders"
+    }
+
+    fn dependencies(&self) -> Vec<&str> {
+        tracing::debug!("orders");
+        let _msg = format!("billing");
+        vec!["catalog"]
+    }
+}
+"#;
+        let decls = extract_module_info(content).unwrap();
+        assert_eq!(decls.len(), 1);
+        assert_eq!(decls[0].name.as_deref(), Some("orders"));
+        assert_eq!(decls[0].dependencies, vec!["catalog".to_string()]);
     }
 }

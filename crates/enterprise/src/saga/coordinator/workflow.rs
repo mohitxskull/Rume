@@ -259,10 +259,50 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             .try_acquire_execution(saga_id)
             .await
             .map_err(|err| attach_saga_id(err, saga_id))?;
+        let renew_task = store.claim_ttl().map(|ttl| {
+            let store = Arc::clone(store);
+            let saga_id = saga_id.to_string();
+            let token = token.clone();
+            let interval = (ttl / 3).max(std::time::Duration::from_millis(50));
+            // Why: Renew lease-backed execution claims periodically while long-running steps
+            // execute (>60s) so the active worker stays fenced and another worker cannot
+            // steal the lease mid-step.
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Consume the immediate first tick so we wait one interval before renewing.
+                ticker.tick().await;
+                loop {
+                    ticker.tick().await;
+                    match store.renew_execution(&saga_id, &token).await {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            tracing::warn!(
+                                saga_id = %saga_id,
+                                "saga execution claim lost or expired; stopping renewal loop"
+                            );
+                            break;
+                        }
+                        Err(err) => {
+                            // Why: a single transient DB/Redis blip must not permanently abort
+                            // lease renewal while the step is still running; retry on the next
+                            // tick and only break on explicit claim loss (`Ok(false)`) or guard
+                            // cancellation.
+                            tracing::warn!(
+                                saga_id = %saga_id,
+                                error = %err,
+                                "transient error renewing saga execution claim; retrying on next tick"
+                            );
+                        }
+                    }
+                }
+            })
+        });
         Ok(Some(ExecutionClaimGuard {
             store: Some(Arc::clone(store)),
             saga_id: saga_id.to_string(),
             token,
+            renew_task,
         }))
     }
 
@@ -270,6 +310,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         saga_id: &str,
         version: &mut u64,
+        claim_token: Option<&str>,
         status: SagaStatus,
         completed_steps: &[String],
         compensated_steps: &[String],
@@ -286,11 +327,11 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 updated_at: current_timestamp(),
                 version: next_version,
             };
-            // Why: CAS (`save_record_cas`) protects individual state transitions against
-            // stale writes, while `acquire_execution_claim` holds an exclusive per-saga
-            // claim across step and compensation callbacks so two workers cannot interleave.
+            // Why: CAS (`save_record_cas_with_claim`) protects individual state transitions
+            // against both stale versions and stale claim tokens if another worker took over
+            // after a lease expiry.
             store
-                .save_record_cas(&record, expected_version)
+                .save_record_cas_with_claim(&record, expected_version, claim_token)
                 .await
                 .map_err(|err| attach_saga_id(err, saga_id))?;
             *version = next_version;
@@ -341,32 +382,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         saga_id: &str,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
-        let claim = match self.acquire_execution_claim(saga_id).await {
-            Ok(c) => c,
-            Err(error) => {
-                return Err(SagaRecoveryError::new(
-                    error,
-                    SagaRecoveryHandle {
-                        saga_id: saga_id.to_string(),
-                        saga_name: self.name.clone(),
-                        context: ctx,
-                        phase: SagaRecoveryPhase::Forward,
-                        completed_steps: Vec::new(),
-                        compensated_steps: Vec::new(),
-                        version: 0,
-                    },
-                ));
-            }
-        };
-
+        // Why: `SqlSagaStore` stores execution claim leases on the `rume_sagas` row itself, so
+        // the initial `Pending` row (`expected_version = 0`) must be inserted before acquiring
+        // the execution claim; `INSERT` atomicity also fences concurrent starters for the same ID.
         let mut version = 0u64;
         if let Err(error) = self
-            .persist_state(saga_id, &mut version, SagaStatus::Pending, &[], &[])
+            .persist_state(saga_id, &mut version, None, SagaStatus::Pending, &[], &[])
             .await
         {
-            if let Some(c) = claim {
-                c.release().await;
-            }
             return Err(SagaRecoveryError::new(
                 error,
                 SagaRecoveryHandle {
@@ -381,10 +404,30 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             ));
         }
 
+        let claim = match self.acquire_execution_claim(saga_id).await {
+            Ok(c) => c,
+            Err(error) => {
+                return Err(SagaRecoveryError::new(
+                    error,
+                    SagaRecoveryHandle {
+                        saga_id: saga_id.to_string(),
+                        saga_name: self.name.clone(),
+                        context: ctx,
+                        phase: SagaRecoveryPhase::Forward,
+                        completed_steps: Vec::new(),
+                        compensated_steps: Vec::new(),
+                        version,
+                    },
+                ));
+            }
+        };
+
+        let claim_token = claim.as_ref().map(|c| c.token.as_str());
         let res = self
             .execute_forward_from_recoverable(
                 saga_id,
                 version,
+                claim_token,
                 ctx,
                 0,
                 Vec::new(),
@@ -529,6 +572,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             ));
         }
 
+        let claim_token = claim.as_ref().map(|c| c.token.as_str());
         let res = match record.status {
             SagaStatus::Success
             | SagaStatus::Compensated { .. }
@@ -539,11 +583,12 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 compensated_steps: record.compensated_steps,
             }),
             SagaStatus::Compensating { .. } => {
-                self.resume_compensation_recoverable(saga_id, record, ctx)
+                self.resume_compensation_recoverable(saga_id, claim_token, record, ctx)
                     .await
             }
             SagaStatus::Pending | SagaStatus::Running { .. } => {
-                self.resume_forward_recoverable(saga_id, record, ctx).await
+                self.resume_forward_recoverable(saga_id, claim_token, record, ctx)
+                    .await
             }
         };
         if let Some(c) = claim {
@@ -573,6 +618,15 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 },
                 handle,
             ));
+        }
+        if handle.version == 0 && matches!(handle.phase, SagaRecoveryPhase::Forward) {
+            // Why: When the initial `persist_state(Pending)` failed before any row existed
+            // (`version == 0`), calling `acquire_execution_claim` on a non-existent row
+            // fails in `SqlSagaStore` with 0 rows updated. Delegate to `run_with_id_recoverable`
+            // so the initial row is created and execution runs with the preserved context.
+            return self
+                .run_with_id_recoverable(&handle.saga_id, handle.context)
+                .await;
         }
         let completed_indices = match self.resolve_completed_indices(&handle.completed_steps) {
             Ok(indices) => indices,
@@ -679,12 +733,14 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             }
         }
 
+        let claim_token = claim.as_ref().map(|c| c.token.as_str());
         let res = match handle.phase {
             SagaRecoveryPhase::Forward => {
                 let start_idx = completed_indices.last().map(|i| i + 1).unwrap_or(0);
                 self.execute_forward_from_recoverable(
                     &handle.saga_id,
                     handle.version,
+                    claim_token,
                     handle.context,
                     start_idx,
                     completed_indices,
@@ -700,6 +756,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 self.compensate_completed_recoverable(
                     &handle.saga_id,
                     handle.version,
+                    claim_token,
                     handle.context,
                     &completed_indices,
                     &handle.completed_steps,
@@ -750,6 +807,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         saga_id: &str,
         mut version: u64,
+        claim_token: Option<&str>,
         mut ctx: Ctx,
         start_idx: usize,
         mut completed_indices: Vec<usize>,
@@ -762,6 +820,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 .persist_state(
                     saga_id,
                     &mut version,
+                    claim_token,
                     SagaStatus::Running {
                         current_step: step.name().to_string(),
                     },
@@ -824,6 +883,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         .persist_state(
                             saga_id,
                             &mut version,
+                            claim_token,
                             SagaStatus::Running {
                                 current_step: step.name().to_string(),
                             },
@@ -851,6 +911,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         .compensate_completed_recoverable(
                             saga_id,
                             version,
+                            claim_token,
                             ctx,
                             &completed_indices,
                             &completed_names,
@@ -867,6 +928,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             .persist_state(
                 saga_id,
                 &mut version,
+                claim_token,
                 SagaStatus::Success,
                 &completed_names,
                 &compensated_names,
@@ -900,6 +962,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         &self,
         saga_id: &str,
         mut version: u64,
+        claim_token: Option<&str>,
         mut ctx: Ctx,
         completed_indices: &[usize],
         completed_names: &[String],
@@ -918,6 +981,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 .persist_state(
                     saga_id,
                     &mut version,
+                    claim_token,
                     SagaStatus::Compensating {
                         current_step: prev_step.name().to_string(),
                         error: original_error.clone(),
@@ -985,6 +1049,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                         .persist_state(
                             saga_id,
                             &mut version,
+                            claim_token,
                             SagaStatus::Compensating {
                                 current_step: prev_step.name().to_string(),
                                 error: original_error.clone(),
@@ -1048,6 +1113,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
             .persist_state(
                 saga_id,
                 &mut version,
+                claim_token,
                 status.clone(),
                 completed_names,
                 &compensated_names,
@@ -1082,6 +1148,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     async fn resume_forward_recoverable(
         &self,
         saga_id: &str,
+        claim_token: Option<&str>,
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
@@ -1107,6 +1174,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         self.execute_forward_from_recoverable(
             saga_id,
             record.version,
+            claim_token,
             ctx,
             start_idx,
             completed_indices,
@@ -1119,6 +1187,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
     async fn resume_compensation_recoverable(
         &self,
         saga_id: &str,
+        claim_token: Option<&str>,
         record: SagaRecord,
         ctx: Ctx,
     ) -> Result<SagaReport<Ctx>, SagaRecoveryError<Ctx>> {
@@ -1150,6 +1219,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         self.compensate_completed_recoverable(
             saga_id,
             record.version,
+            claim_token,
             ctx,
             &completed_indices,
             &record.completed_steps,
@@ -1301,6 +1371,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
         // Why: terminal sagas must never be rolled back or overwritten. A `Success`
         // saga already committed; already-`Compensated` / `CompensationFailed`
         // sagas are returned intact to preserve their original error record.
+        let claim_token = claim.as_ref().map(|c| c.token.as_str());
         let res = match record.status {
             SagaStatus::Success => Err(SagaRecoveryError::new(
                 SagaError::Aborted {
@@ -1326,7 +1397,7 @@ impl<Ctx: Send + Sync + 'static> Saga<Ctx> {
                 })
             }
             SagaStatus::Pending | SagaStatus::Running { .. } | SagaStatus::Compensating { .. } => {
-                self.resume_compensation_recoverable(saga_id, record, ctx)
+                self.resume_compensation_recoverable(saga_id, claim_token, record, ctx)
                     .await
             }
         };

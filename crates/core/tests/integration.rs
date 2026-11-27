@@ -1,7 +1,6 @@
 //! Fast zero-docker integration suites.
 
-// Why: #![deny(unsafe_code)] instead of #![forbid(unsafe_code)] is required to allow integration::config to use unsafe for process environment mutation via EnvVarGuard.
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 
 #[path = "common/mod.rs"]
 pub mod common;
@@ -40,6 +39,9 @@ pub mod events;
 #[path = "integration/health.rs"]
 pub mod health;
 
+#[path = "integration/http_baseline.rs"]
+pub mod http_baseline;
+
 #[path = "integration/http_smoke.rs"]
 pub mod http_smoke;
 
@@ -48,6 +50,31 @@ pub mod lifecycle;
 
 #[path = "integration/metrics.rs"]
 pub mod metrics;
+
+#[path = "integration/milestone_b_e2e.rs"]
+#[cfg(feature = "sqlite")]
+pub mod milestone_b_e2e;
+
+#[path = "integration/milestone_c_e2e.rs"]
+#[cfg(feature = "sqlite")]
+pub mod milestone_c_e2e;
+
+#[path = "integration/milestone_d_e2e.rs"]
+#[cfg(feature = "sqlite")]
+pub mod milestone_d_e2e;
+
+#[path = "integration/milestone_e_e2e.rs"]
+#[cfg(all(
+    feature = "sqlite",
+    feature = "tls",
+    feature = "scim",
+    feature = "grpc",
+    feature = "graphql"
+))]
+pub mod milestone_e_e2e;
+
+#[path = "integration/milestone_f_e2e.rs"]
+pub mod milestone_f_e2e;
 
 #[path = "integration/openapi.rs"]
 pub mod openapi;

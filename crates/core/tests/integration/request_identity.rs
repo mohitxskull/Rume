@@ -518,6 +518,8 @@ async fn test_w3c_trace_context_automatic_propagation_across_http_outbox_jobs_an
     let queued_job = QueuedJob {
         id: "job-123".into(),
         name: TraceJob::NAME.to_string(),
+        queue: "default".into(),
+        priority: 0,
         payload: serde_json::to_vec(&TraceJob {
             data: "test".into(),
         })

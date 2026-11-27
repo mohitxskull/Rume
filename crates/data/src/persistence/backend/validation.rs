@@ -106,7 +106,16 @@ fn sanitize_non_nested_block_comments_inner<'a>(
                     i += 1;
                 }
             }
-            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+            // Why: On MySQL, `--` only starts a line comment when followed by whitespace/control
+            // (` `, `\t`, `\r`, `\n`, `\x0b`, `\x0c`) or EOF; otherwise `--` is unary negation and
+            // trailing tokens such as `--/*!50000 ; COMMIT; */` remain executable (`RC-20`).
+            b'-' if bytes.get(i + 1) == Some(&b'-')
+                && (!is_mysql
+                    || matches!(
+                        bytes.get(i + 2),
+                        None | Some(b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)
+                    )) =>
+            {
                 i += 2;
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -1029,5 +1038,40 @@ mod data_sql_scanners_proptests {
             )
             .unwrap()
         );
+    }
+
+    #[test]
+    fn mysql_validator_rejects_exec_comment_after_non_whitespace_double_dash() {
+        for bypass in [
+            "SELECT 1--/*!50000 ; COMMIT; */\n",
+            "SELECT 1--/*!99999 SELECT 1 */\n",
+        ] {
+            assert!(
+                matches!(
+                    validate_managed_mysql_transaction_sql(bypass),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "MySQL validator must reject executable comment after `--` not followed by whitespace: {bypass}"
+            );
+            assert!(
+                matches!(
+                    mysql_sql_causes_implicit_commit(bypass),
+                    Err(PersistenceError::TransactionError(_))
+                ),
+                "MySQL implicit-commit classifier must reject executable comment after `--` not followed by whitespace: {bypass}"
+            );
+        }
+
+        // Real MySQL `-- ` line comments (followed by whitespace/control or EOF) still work.
+        for ok in [
+            "SELECT 1 -- /*!50000 ; COMMIT; */\n",
+            "SELECT 1 --\t/*!50000 ; COMMIT; */\n",
+            "SELECT 1 --",
+        ] {
+            assert!(
+                validate_managed_mysql_transaction_sql(ok).is_ok(),
+                "valid MySQL line comment must be allowed: {ok}"
+            );
+        }
     }
 }

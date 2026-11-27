@@ -3,5 +3,7 @@
 #![forbid(unsafe_code)]
 
 pub mod auth;
+pub mod flags;
+pub mod metering;
 pub mod security;
 pub mod tenant;

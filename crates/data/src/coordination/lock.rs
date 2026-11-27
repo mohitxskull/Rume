@@ -69,14 +69,33 @@ impl LockGuard {
     }
 }
 
+/// Safe upper bound fallback when `Instant::checked_add` overflows on extreme durations.
+#[cfg(any(test, feature = "postgres", feature = "redis"))]
+const MAX_SAFE_LEASE_FALLBACK: Duration = Duration::from_secs(365 * 24 * 3600);
+
+/// Adds `duration` to `base` without panicking on `Instant` overflow, falling back
+/// to a safe 1-year clamped bound (or `base` if even that overflows).
+#[cfg(any(test, feature = "postgres", feature = "redis"))]
+pub(crate) fn checked_lease_deadline(
+    base: std::time::Instant,
+    duration: Duration,
+) -> std::time::Instant {
+    base.checked_add(duration)
+        .or_else(|| base.checked_add(MAX_SAFE_LEASE_FALLBACK))
+        .unwrap_or(base)
+}
+
 /// Computes the effective millisecond TTL (`>= 1`) and a conservative local deadline
 /// captured before dispatching a backend lease operation.
 #[cfg(any(test, feature = "postgres", feature = "redis"))]
 pub(crate) fn conservative_lease_deadline(ttl: Duration) -> (u64, std::time::Instant) {
-    let ttl_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
-    let deadline = std::time::Instant::now()
-        .checked_add(Duration::from_millis(ttl_ms))
-        .unwrap_or_else(std::time::Instant::now);
+    // Why: clamp `ttl_ms` to `MAX_SAFE_LEASE_FALLBACK` (1 year, well below `i64::MAX / 2`)
+    // so extreme durations such as `Duration::MAX` cannot overflow Postgres `BIGINT`
+    // (`epoch_ms + ttl_ms`) or Redis `PX` millisecond limits (`RC-18`).
+    let ttl_ms = ttl
+        .as_millis()
+        .clamp(1, MAX_SAFE_LEASE_FALLBACK.as_millis()) as u64;
+    let deadline = checked_lease_deadline(std::time::Instant::now(), Duration::from_millis(ttl_ms));
     (ttl_ms, deadline)
 }
 
@@ -229,5 +248,23 @@ mod tests {
             guard.is_expired(),
             "delayed reply must leave guard locally expired when precomputed deadline passed"
         );
+    }
+
+    #[test]
+    fn checked_lease_deadline_does_not_panic_on_duration_max() {
+        let now = std::time::Instant::now();
+        let deadline = checked_lease_deadline(now, Duration::MAX);
+        assert!(deadline >= now);
+    }
+
+    #[test]
+    fn conservative_lease_deadline_clamps_duration_max_below_backend_limits() {
+        let (ttl_ms, deadline) = conservative_lease_deadline(Duration::MAX);
+        assert!(
+            ttl_ms <= (i64::MAX as u64) / 2,
+            "ttl_ms ({ttl_ms}) must stay safely below i64::MAX / 2"
+        );
+        assert_eq!(ttl_ms, MAX_SAFE_LEASE_FALLBACK.as_millis() as u64);
+        assert!(deadline >= std::time::Instant::now());
     }
 }

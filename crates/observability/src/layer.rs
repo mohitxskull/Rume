@@ -2,6 +2,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -17,6 +18,7 @@ use rume_foundation::telemetry::{RequestId, X_REQUEST_ID, is_valid_request_id};
 use tracing::Instrument;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
+use crate::redaction::RedactionConfig;
 use crate::trace_context::{TRACEPARENT, TRACESTATE, TraceContext};
 
 struct HeaderMapExtractor<'a>(&'a HeaderMap);
@@ -34,12 +36,21 @@ impl Extractor for HeaderMapExtractor<'_> {
 /// A Tower layer that attaches request IDs, propagates W3C TraceContext via OpenTelemetry,
 /// records tracing spans, and includes request/trace IDs in responses.
 #[derive(Debug, Clone, Default)]
-pub struct ObservabilityLayer;
+pub struct ObservabilityLayer {
+    redaction: Option<Arc<RedactionConfig>>,
+}
 
 impl ObservabilityLayer {
     /// Create a new observability layer.
     pub fn new() -> Self {
-        Self
+        Self { redaction: None }
+    }
+
+    /// Create an observability layer configured with HTTP header redaction.
+    pub fn with_redaction(config: RedactionConfig) -> Self {
+        Self {
+            redaction: Some(Arc::new(config)),
+        }
     }
 }
 
@@ -47,7 +58,10 @@ impl<S> tower::Layer<S> for ObservabilityLayer {
     type Service = ObservabilityService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        ObservabilityService { inner }
+        ObservabilityService {
+            inner,
+            redaction: self.redaction.clone(),
+        }
     }
 }
 
@@ -55,6 +69,7 @@ impl<S> tower::Layer<S> for ObservabilityLayer {
 #[derive(Debug, Clone)]
 pub struct ObservabilityService<S> {
     inner: S,
+    redaction: Option<Arc<RedactionConfig>>,
 }
 
 impl<S> tower::Service<Request<Body>> for ObservabilityService<S>
@@ -173,12 +188,35 @@ where
         let trace_parent_str = server_tc.traceparent;
         let tracestate_str = server_tc.tracestate;
         let span_clone = span.clone();
+        let redaction = self.redaction.clone();
 
         Box::pin(
             async move {
                 let start = Instant::now();
 
+                // Why: emit redacted request/response header debug events inside the instrumented
+                // async block so they attach to the `http_request` span, and never buffer request
+                // or response bodies here (body redaction is an explicit bounded helper via
+                // `RedactionConfig::redact_json_*` so streaming endpoints and the
+                // `application/problem+json` body-integrity invariant below remain untouched).
+                if let Some(ref cfg) = redaction
+                    && cfg.log_headers()
+                    && tracing::enabled!(tracing::Level::DEBUG)
+                {
+                    let redacted_headers = cfg.redact_headers(req.headers());
+                    tracing::debug!(headers = ?redacted_headers, "http request headers");
+                }
+
                 let mut response = inner.call(req).await?;
+
+                if let Some(ref cfg) = redaction
+                    && cfg.log_headers()
+                    && tracing::enabled!(tracing::Level::DEBUG)
+                {
+                    let redacted_headers = cfg.redact_headers(response.headers());
+                    tracing::debug!(headers = ?redacted_headers, "http response headers");
+                }
+
                 let elapsed = start.elapsed();
                 let latency_ms = elapsed.as_millis() as u64;
                 let status = response.status();
@@ -327,31 +365,33 @@ mod tests {
 
     #[tokio::test]
     async fn observability_layer_extracts_w3c_traceparent_into_otel_span_and_response() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let incoming_trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
         let incoming_span_id = "00f067aa0ba902b7";
         let captured_handler_tp = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let captured_clone = std::sync::Arc::clone(&captured_handler_tp);
 
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
-            let captured = std::sync::Arc::clone(&captured_clone);
-            async move {
-                let current =
-                    TraceContext::current().expect("TraceContext::current() must be active");
-                let ext = req
-                    .extensions()
-                    .get::<TraceContext>()
-                    .expect("TraceContext extension must be inserted");
-                assert_eq!(&current, ext);
-                assert_eq!(current.trace_id(), incoming_trace_id);
-                assert_ne!(current.span_id(), incoming_span_id);
-                assert_eq!(
-                    current.tracestate.as_deref(),
-                    Some("vendor=val1,other=val2")
-                );
-                *captured.lock().unwrap() = Some(current.traceparent);
-                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
-            }
-        }));
+        let mut svc =
+            ObservabilityLayer::new().layer(tower::service_fn(move |req: Request<Body>| {
+                let captured = std::sync::Arc::clone(&captured_clone);
+                async move {
+                    let current =
+                        TraceContext::current().expect("TraceContext::current() must be active");
+                    let ext = req
+                        .extensions()
+                        .get::<TraceContext>()
+                        .expect("TraceContext extension must be inserted");
+                    assert_eq!(&current, ext);
+                    assert_eq!(current.trace_id(), incoming_trace_id);
+                    assert_ne!(current.span_id(), incoming_span_id);
+                    assert_eq!(
+                        current.tracestate.as_deref(),
+                        Some("vendor=val1,other=val2")
+                    );
+                    *captured.lock().unwrap() = Some(current.traceparent);
+                    Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            }));
 
         let req = Request::builder()
             .uri("/test")
@@ -405,7 +445,7 @@ mod tests {
         let no_otel_captured = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
         let no_otel_captured_clone = std::sync::Arc::clone(&no_otel_captured);
         let mut no_otel_svc =
-            ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
+            ObservabilityLayer::new().layer(tower::service_fn(move |req: Request<Body>| {
                 let cap = std::sync::Arc::clone(&no_otel_captured_clone);
                 async move {
                     let current = TraceContext::current().expect("TraceContext::current() active");
@@ -447,7 +487,7 @@ mod tests {
         let otel_captured = std::sync::Arc::new(std::sync::Mutex::new(None::<TraceContext>));
         let otel_captured_clone = std::sync::Arc::clone(&otel_captured);
         let mut otel_svc =
-            ObservabilityLayer.layer(tower::service_fn(move |req: Request<Body>| {
+            ObservabilityLayer::new().layer(tower::service_fn(move |req: Request<Body>| {
                 let cap = std::sync::Arc::clone(&otel_captured_clone);
                 async move {
                     let current = TraceContext::current().expect("TraceContext::current() active");
@@ -522,6 +562,8 @@ mod tests {
         use axum::routing::get;
         use tower::ServiceExt;
 
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+
         let router = axum::Router::new()
             .route("/users/{id}", get(|| async { "user" }))
             .route_layer(axum::middleware::from_fn(
@@ -559,15 +601,17 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_body_on_invalid_problem_details_json() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let raw_payload = b"this is not valid json problem details";
-        let mut svc =
-            ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| async move {
+        let mut svc = ObservabilityLayer::new().layer(tower::service_fn(
+            move |_req: Request<Body>| async move {
                 let resp = Response::builder()
                     .header(CONTENT_TYPE, "application/problem+json")
                     .body(Body::from(raw_payload.as_slice()))
                     .unwrap();
                 Ok::<Response<Body>, std::convert::Infallible>(resp)
-            }));
+            },
+        ));
 
         let req = Request::builder()
             .uri("/error")
@@ -587,6 +631,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_body_on_oversized_stream() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let chunk_size = 64 * 1024;
         let num_chunks = 24;
         let chunks: Vec<axum::body::Bytes> = (0..num_chunks)
@@ -595,21 +640,22 @@ mod tests {
         let expected_total = num_chunks * chunk_size;
 
         let chunks_clone = chunks.clone();
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
-            let stream = futures_util::stream::iter(
-                chunks_clone
-                    .clone()
-                    .into_iter()
-                    .map(Ok::<_, std::io::Error>),
-            );
-            async move {
-                let resp = Response::builder()
-                    .header(CONTENT_TYPE, "application/problem+json")
-                    .body(Body::from_stream(stream))
-                    .unwrap();
-                Ok::<Response<Body>, std::convert::Infallible>(resp)
-            }
-        }));
+        let mut svc =
+            ObservabilityLayer::new().layer(tower::service_fn(move |_req: Request<Body>| {
+                let stream = futures_util::stream::iter(
+                    chunks_clone
+                        .clone()
+                        .into_iter()
+                        .map(Ok::<_, std::io::Error>),
+                );
+                async move {
+                    let resp = Response::builder()
+                        .header(CONTENT_TYPE, "application/problem+json")
+                        .body(Body::from_stream(stream))
+                        .unwrap();
+                    Ok::<Response<Body>, std::convert::Infallible>(resp)
+                }
+            }));
 
         let req = Request::builder()
             .uri("/oversized")
@@ -629,6 +675,7 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_injects_request_id_into_valid_problem_details() {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
         let raw_problem = serde_json::json!({
             "type": "https://example.com/probs/out-of-credit",
             "title": "You do not have enough credit.",
@@ -636,16 +683,17 @@ mod tests {
         });
         let raw_bytes = serde_json::to_vec(&raw_problem).unwrap();
 
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
-            let bytes = raw_bytes.clone();
-            async move {
-                let resp = Response::builder()
-                    .header(CONTENT_TYPE, "application/problem+json")
-                    .body(Body::from(bytes))
-                    .unwrap();
-                Ok::<Response<Body>, std::convert::Infallible>(resp)
-            }
-        }));
+        let mut svc =
+            ObservabilityLayer::new().layer(tower::service_fn(move |_req: Request<Body>| {
+                let bytes = raw_bytes.clone();
+                async move {
+                    let resp = Response::builder()
+                        .header(CONTENT_TYPE, "application/problem+json")
+                        .body(Body::from(bytes))
+                        .unwrap();
+                    Ok::<Response<Body>, std::convert::Infallible>(resp)
+                }
+            }));
 
         let req = Request::builder()
             .uri("/credit-check")
@@ -664,7 +712,8 @@ mod tests {
 
     #[tokio::test]
     async fn observability_service_preserves_stream_error_on_inspected_problem_details() {
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(|_req: Request<Body>| {
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+        let mut svc = ObservabilityLayer::new().layer(tower::service_fn(|_req: Request<Body>| {
             let stream = futures_util::stream::iter(vec![
                 Ok(axum::body::Bytes::from_static(b"{\"title\":\"partial\"")),
                 Err(std::io::Error::other("simulated mid-stream failure")),
@@ -714,17 +763,18 @@ mod tests {
         let obs_b = std::sync::Arc::clone(&observed_baggage);
         let obs_t = std::sync::Arc::clone(&observed_trace);
 
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
-            let obs_b = std::sync::Arc::clone(&obs_b);
-            let obs_t = std::sync::Arc::clone(&obs_t);
-            async move {
-                let cx = opentelemetry::Context::current();
-                let region = cx.baggage().get("region").map(|v| v.to_string());
-                *obs_b.lock().unwrap() = region;
-                *obs_t.lock().unwrap() = TraceContext::current();
-                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
-            }
-        }));
+        let mut svc =
+            ObservabilityLayer::new().layer(tower::service_fn(move |_req: Request<Body>| {
+                let obs_b = std::sync::Arc::clone(&obs_b);
+                let obs_t = std::sync::Arc::clone(&obs_t);
+                async move {
+                    let cx = opentelemetry::Context::current();
+                    let region = cx.baggage().get("region").map(|v| v.to_string());
+                    *obs_b.lock().unwrap() = region;
+                    *obs_t.lock().unwrap() = TraceContext::current();
+                    Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            }));
 
         // Version-02 traceparent is accepted by SDK 0.33.1's TraceContextPropagator even though
         // `TraceContext::is_valid_traceparent` only validates version `00`.
@@ -795,15 +845,16 @@ mod tests {
         let observed_baggage = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
         let observed_baggage_clone = std::sync::Arc::clone(&observed_baggage);
 
-        let mut svc = ObservabilityLayer.layer(tower::service_fn(move |_req: Request<Body>| {
-            let bag_cap = std::sync::Arc::clone(&observed_baggage_clone);
-            async move {
-                let cx = opentelemetry::Context::current();
-                let val = cx.baggage().get("region").map(|v| v.as_str().to_string());
-                *bag_cap.lock().unwrap() = val;
-                Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
-            }
-        }));
+        let mut svc =
+            ObservabilityLayer::new().layer(tower::service_fn(move |_req: Request<Body>| {
+                let bag_cap = std::sync::Arc::clone(&observed_baggage_clone);
+                async move {
+                    let cx = opentelemetry::Context::current();
+                    let val = cx.baggage().get("region").map(|v| v.as_str().to_string());
+                    *bag_cap.lock().unwrap() = val;
+                    Ok::<Response<Body>, std::convert::Infallible>(Response::new(Body::empty()))
+                }
+            }));
 
         let req = Request::builder()
             .uri("/baggage-only")
@@ -817,5 +868,174 @@ mod tests {
             Some("west"),
             "OpenTelemetryLayer execution context must retain baggage on requests without traceparent"
         );
+    }
+
+    #[tokio::test]
+    async fn observability_layer_with_redaction_never_logs_raw_authorization_or_cookie() {
+        use std::sync::{Arc, Mutex};
+        use tracing::field::{Field, Visit};
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        #[derive(Default)]
+        struct FieldCollector {
+            output: String,
+        }
+
+        impl Visit for FieldCollector {
+            fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+                use std::fmt::Write as _;
+                let _ = write!(self.output, "{}={:?} ", field.name(), value);
+            }
+
+            fn record_str(&mut self, field: &Field, value: &str) {
+                use std::fmt::Write as _;
+                let _ = write!(self.output, "{}={} ", field.name(), value);
+            }
+        }
+
+        #[derive(Debug)]
+        struct CapturedEvent {
+            level: tracing::Level,
+            span_name: Option<String>,
+            fields: String,
+        }
+
+        struct EventCaptureLayer {
+            events: Arc<Mutex<Vec<CapturedEvent>>>,
+        }
+
+        impl<S> tracing_subscriber::Layer<S> for EventCaptureLayer
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                ctx: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let mut visitor = FieldCollector::default();
+                event.record(&mut visitor);
+                let span_name = ctx.lookup_current().map(|s| s.name().to_string());
+                self.events.lock().unwrap().push(CapturedEvent {
+                    level: *event.metadata().level(),
+                    span_name,
+                    fields: visitor.output,
+                });
+            }
+        }
+
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(EventCaptureLayer {
+            events: Arc::clone(&captured),
+        });
+        let _sub_guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+
+        let redaction = crate::redaction::RedactionConfig::new().with_log_headers(true);
+        let mut svc = ObservabilityLayer::with_redaction(redaction).layer(tower::service_fn(
+            |_req: Request<Body>| async move {
+                let resp = Response::builder()
+                    .header("set-cookie", "session=xyz789; HttpOnly")
+                    .header("x-public", "visible-response")
+                    .body(Body::empty())
+                    .unwrap();
+                Ok::<Response<Body>, std::convert::Infallible>(resp)
+            },
+        ));
+
+        let req = Request::builder()
+            .uri("/secret-endpoint")
+            .header("authorization", "Bearer top-secret-token")
+            .header("cookie", "session=abc123")
+            .header("user-agent", "rume-test/1.0")
+            .body(Body::empty())
+            .unwrap();
+
+        let _resp = svc.call(req).await.expect("service call succeeds");
+
+        let events = captured.lock().unwrap();
+        let debug_events: Vec<&CapturedEvent> = events
+            .iter()
+            .filter(|ev| ev.level == tracing::Level::DEBUG)
+            .collect();
+        assert!(
+            debug_events.len() >= 2,
+            "expected request and response header debug events, got {debug_events:?}"
+        );
+        assert!(
+            debug_events
+                .iter()
+                .all(|ev| ev.span_name.as_deref() == Some("http_request")),
+            "redacted header debug events must attach to http_request span: {debug_events:?}"
+        );
+
+        let all_logged: String = events.iter().map(|ev| ev.fields.as_str()).collect();
+        assert!(
+            all_logged.contains("[REDACTED]"),
+            "captured debug events must contain [REDACTED]: {all_logged}"
+        );
+        assert!(
+            !all_logged.contains("top-secret-token"),
+            "raw Authorization header leaked: {all_logged}"
+        );
+        assert!(
+            !all_logged.contains("abc123"),
+            "raw Cookie header leaked: {all_logged}"
+        );
+        assert!(
+            !all_logged.contains("xyz789"),
+            "raw Set-Cookie header leaked: {all_logged}"
+        );
+    }
+
+    #[tokio::test]
+    async fn observability_layer_with_redaction_preserves_streaming_response() {
+        // Why: serialize with `test_global_otel_lock()` so this test's `with_log_headers(true)`
+        // debug callsites cannot race `tracing-core` callsite interest registration against
+        // sibling tests that install a thread-local `set_default` subscriber.
+        let _global_guard = crate::otel::test_global_otel_lock().lock().await;
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<axum::body::Bytes, std::io::Error>>(4);
+        tx.send(Ok(axum::body::Bytes::from_static(b"chunk-1-")))
+            .await
+            .unwrap();
+
+        let rx_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(rx)));
+        let redaction = crate::redaction::RedactionConfig::new().with_log_headers(true);
+        let mut svc = ObservabilityLayer::with_redaction(redaction).layer(tower::service_fn(
+            move |_req: Request<Body>| {
+                let mut rx = rx_holder.lock().unwrap().take().unwrap();
+                let stream = futures_util::stream::poll_fn(move |cx| rx.poll_recv(cx));
+                async move {
+                    let resp = Response::builder()
+                        .header(CONTENT_TYPE, "text/event-stream")
+                        .body(Body::from_stream(stream))
+                        .unwrap();
+                    Ok::<Response<Body>, std::convert::Infallible>(resp)
+                }
+            },
+        ));
+
+        let req = Request::builder()
+            .uri("/events")
+            .body(Body::empty())
+            .unwrap();
+
+        // Response must resolve before the stream terminates (proving no body buffering).
+        let resp = tokio::time::timeout(std::time::Duration::from_secs(2), svc.call(req))
+            .await
+            .expect("streaming response must not block waiting for full body")
+            .expect("service call succeeds");
+
+        tx.send(Ok(axum::body::Bytes::from_static(b"chunk-2")))
+            .await
+            .unwrap();
+        drop(tx);
+
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024)
+            .await
+            .expect("stream body readable");
+        assert_eq!(bytes.as_ref(), b"chunk-1-chunk-2");
     }
 }

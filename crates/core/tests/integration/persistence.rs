@@ -537,7 +537,7 @@ async fn migrator_with_rume_core_checksum_unchanged_and_rollback_preserves_ledge
         ),
         (
             "postgres",
-            "cd9cef147434fa0efa944539bf0b33445546de6d78208bad2176804bd0bdb1c3",
+            "cc1b960472da3e3723fcfad0f97c331a17d8a996de5f077fce8016592ab8c62d",
         ),
     ];
 

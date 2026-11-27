@@ -8,7 +8,9 @@ use deadpool_redis::Pool;
 use crate::cache::redis::RedisCacheBackend;
 use crate::coordination::error::CoordinationError;
 use crate::coordination::leader::{LeaderElector, LeaderLease};
-use crate::coordination::lock::{CoordinationFuture, conservative_lease_deadline};
+use crate::coordination::lock::{
+    CoordinationFuture, checked_lease_deadline, conservative_lease_deadline,
+};
 
 /// Redis-backed implementation of [`LeaderElector`].
 ///
@@ -53,12 +55,28 @@ impl RedisLeaderElector {
         self
     }
 
+    fn key_base(&self, role: &str) -> String {
+        // Why: length-prefixing both `prefix` and `role` inside a shared `{...}`
+        // hash tag prevents cross-prefix/role collisions (e.g. `app:` + `r` vs
+        // `app:term:` + `r`), guarantees a non-empty hash tag even when `role == ""`
+        // (preventing Redis Cluster `CROSSSLOT` errors), and keeps each leader/term
+        // pair on the same hash slot (`RC-06`). Distinct `:leader` / `:term` suffixes
+        // ensure leader keys and term counters can never alias.
+        format!(
+            "{{{}:{}:{}:{}}}",
+            self.prefix.len(),
+            self.prefix,
+            role.len(),
+            role
+        )
+    }
+
     fn leader_key(&self, role: &str) -> String {
-        format!("{}{{{}}}", self.prefix, role)
+        format!("{}:leader", self.key_base(role))
     }
 
     fn term_key(&self, role: &str) -> String {
-        format!("{}term:{{{}}}", self.prefix, role)
+        format!("{}:term", self.key_base(role))
     }
 }
 
@@ -179,11 +197,12 @@ impl LeaderElector for RedisLeaderElector {
 
             if let Some((term, effective_ttl_ms)) = result {
                 let effective_ms = u64::try_from(effective_ttl_ms.max(1)).unwrap_or(u64::MAX);
+                let deadline = checked_lease_deadline(pre_rtt, Duration::from_millis(effective_ms));
                 Ok(Some(LeaderLease {
                     role: r,
                     candidate_id: c,
                     term: term as u64,
-                    expires_at: Some(pre_rtt + Duration::from_millis(effective_ms)),
+                    expires_at: Some(deadline),
                 }))
             } else {
                 Ok(None)
@@ -207,22 +226,9 @@ impl LeaderElector for RedisLeaderElector {
                 .await
                 .map_err(|e| CoordinationError::Backend(e.to_string()))?;
 
-            if let Some(s) = val
-                && let Some((len_str, rest)) = s.split_once(':')
-                && let Ok(len) = len_str.parse::<usize>()
-                && rest.len() > len
-                && &rest[len..=len] == ":"
-                && let Ok(term) = rest[len + 1..].parse::<u64>()
-            {
-                let candidate = &rest[..len];
-                Ok(Some(LeaderLease {
-                    role: r,
-                    candidate_id: candidate.to_string(),
-                    term,
-                    expires_at: None,
-                }))
-            } else {
-                Ok(None)
+            match val {
+                Some(s) => Ok(Some(parse_leader_value(&s, r)?)),
+                None => Ok(None),
             }
         })
     }
@@ -262,5 +268,103 @@ impl LeaderElector for RedisLeaderElector {
 
             Ok(result == 1)
         })
+    }
+}
+
+fn parse_leader_value(s: &str, role: String) -> Result<LeaderLease, CoordinationError> {
+    let Some((len_str, rest)) = s.split_once(':') else {
+        return Err(CoordinationError::Backend(format!(
+            "malformed leader payload for role '{role}'"
+        )));
+    };
+    let len = len_str.parse::<usize>().map_err(|_| {
+        CoordinationError::Backend(format!("invalid leader payload length for role '{role}'"))
+    })?;
+    // Why: `len` is a byte length from Lua's `string.len`; check both the `:` separator
+    // byte AND `rest.is_char_boundary(len)` before slicing `&rest[..len]` so corrupted
+    // non-ASCII UTF-8 payloads (e.g. `"1:é:1"`) return an error instead of panicking (`RC-23`).
+    if rest.as_bytes().get(len) != Some(&b':') || !rest.is_char_boundary(len) {
+        return Err(CoordinationError::Backend(format!(
+            "malformed leader payload boundary for role '{role}'"
+        )));
+    }
+    let term = rest[len + 1..].parse::<u64>().map_err(|_| {
+        CoordinationError::Backend(format!("invalid leader term for role '{role}'"))
+    })?;
+    Ok(LeaderLease {
+        role,
+        candidate_id: rest[..len].to_string(),
+        term,
+        expires_at: None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn extract_hash_tag(key: &str) -> Option<&str> {
+        let start = key.find('{')?;
+        let rest = &key[start + 1..];
+        let end = rest.find('}')?;
+        (end > 0).then_some(&rest[..end])
+    }
+
+    #[test]
+    fn leader_and_term_keys_are_disjoint_across_prefixes_and_non_empty_hash_tag() {
+        let cfg = deadpool_redis::Config::from_url("redis://127.0.0.1:6379");
+        let pool = cfg
+            .create_pool(Some(deadpool_redis::Runtime::Tokio1))
+            .expect("pool");
+        let app = RedisLeaderElector::new(pool.clone()).with_prefix("app:");
+        let app_term = RedisLeaderElector::new(pool).with_prefix("app:term:");
+
+        assert_ne!(
+            app.term_key("r"),
+            app_term.leader_key("r"),
+            "app: term_key must never collide with app:term: leader_key"
+        );
+
+        let keys = [
+            app.leader_key("r"),
+            app.term_key("r"),
+            app_term.leader_key("r"),
+            app_term.term_key("r"),
+        ];
+        for i in 0..keys.len() {
+            for j in (i + 1)..keys.len() {
+                assert_ne!(keys[i], keys[j], "keys must never collide: {keys:?}");
+            }
+        }
+        assert_eq!(
+            extract_hash_tag(&keys[0]),
+            extract_hash_tag(&keys[1]),
+            "leader and term keys must share a Redis Cluster hash tag"
+        );
+
+        let empty_leader = app.leader_key("");
+        let empty_term = app.term_key("");
+        let tag_l = extract_hash_tag(&empty_leader);
+        let tag_t = extract_hash_tag(&empty_term);
+        assert!(
+            tag_l.is_some(),
+            "empty role must still produce a non-empty hash tag: {empty_leader}"
+        );
+        assert_eq!(
+            tag_l, tag_t,
+            "empty role leader and term keys must share the same non-empty hash tag"
+        );
+    }
+
+    #[test]
+    fn parse_leader_value_rejects_non_char_boundary_utf8_without_panicking() {
+        // `"é"` is 2 UTF-8 bytes; byte index 1 is mid-character and previously panicked.
+        assert!(parse_leader_value("1:é:1", "scheduler".to_string()).is_err());
+
+        // Valid multi-byte UTF-8 candidate with accurate byte length parses cleanly.
+        let lease =
+            parse_leader_value("2:é:7", "scheduler".to_string()).expect("valid utf8 leader");
+        assert_eq!(lease.candidate_id, "é");
+        assert_eq!(lease.term, 7);
     }
 }

@@ -9,6 +9,8 @@ members = [
     "crates/http",
     "crates/enterprise",
     "crates/app",
+    "crates/grpc",
+    "crates/graphql",
     "crates/testing",
     "crates/core",
     "crates/crash",
@@ -41,9 +43,12 @@ rume-security = { path = "crates/security", version = "=0.1.0" }
 rume-http = { path = "crates/http", version = "=0.1.0" }
 rume-enterprise = { path = "crates/enterprise", version = "=0.1.0" }
 rume-app = { path = "crates/app", version = "=0.1.0" }
+rume-grpc = { path = "crates/grpc", version = "=0.1.0" }
+rume-graphql = { path = "crates/graphql", version = "=0.1.0" }
 rume-testing = { path = "crates/testing", version = "=0.1.0" }
 axum = "=0.8.9"
 tower = "=0.5.3"
+tower-http = { version = "=0.7.1", default-features = false, features = ["cors", "compression-gzip", "compression-br", "compression-zstd", "limit"] }
 tokio = { version = "=1.54.1", features = ["full"] }
 serde = { version = "=1.0.229", features = ["derive"] }
 tracing = "=0.1.44"
@@ -51,14 +56,17 @@ tracing-subscriber = { version = "=0.3.23", features = ["env-filter", "fmt"] }
 thiserror = "=2.0.21"
 secrecy = { version = "=0.10.3", features = ["serde"] }
 figment = { version = "=0.10.19", features = ["toml", "env"] }
-dotenvy = "=0.15.7"
 url = { version = "=2.5.9", features = ["serde"] }
-toml = "=1.2.1"
+toml = "=1.2.3"
 serde_json = "=1.0.154"
+quick-xml = "=0.42.0"
+infer = "=0.22.0"
+walkdir = "=2.5.1"
 
-clap = { version = "=4.6.7", features = ["derive"] }
+clap = { version = "=4.6.10", features = ["derive"] }
 tempfile = "=3.27.0"
-sqlx = { version = "=0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
+sqlx = { version = "=0.9.1", default-features = false, features = ["runtime-tokio", "tls-rustls", "json"] }
+sea-query = { version = "=1.0.2", default-features = false, features = ["backend-sqlite", "backend-postgres", "backend-mysql", "thread-safe"] }
 # SQL parsing and validation used by `rume sql:check` and `rume-data` transaction/placeholder checks.
 # Pinned to an exact version so dialect-aware placeholder, statement, and comment lexing is deterministic.
 sqlparser = { version = "=0.64.0", features = ["visitor"] }
@@ -68,12 +76,28 @@ sqlparser = { version = "=0.64.0", features = ["visitor"] }
 chrono = { version = "=0.4.45", default-features = false, features = ["std"] }
 proptest = "=1.12.0"
 deadpool-redis = "=0.23.1"
-redis = { version = "=1.8.2", default-features = false, features = ["tokio-comp", "script"] }
-# SAML 2.0 namespace URNs (used by `crates/enterprise/src/enterprise/saml.rs` under the
-# `saml` feature). `saml-rs` supplies only the SAML/XML-DSig/Protocol namespace constants;
-# XML traversal uses `quick-xml`, RFC 3339 timestamps use `chrono`, and cryptographic
-# XML-DSig verification is delegated to the pluggable `SamlSignatureVerifier` boundary.
-saml-rs = "=0.8.0"
+redis = { version = "=1.8.3", default-features = false, features = ["tokio-comp", "script"] }
+# SAML 2.0 namespace URNs (used by `crates/enterprise/src/saml/` under the `saml` feature).
+# Why: `default-features = false` disables `saml-rs`'s default XML-DSig/legacy-algorithm
+# feature pull-through so Cargo feature unification cannot silently re-enable
+# `bergshamra/legacy-algorithms` (SHA-1).
+saml-rs = { version = "=0.8.0", default-features = false }
+# Milestone B security, crypto, JWT/JWKS, OAuth2/OIDC, and XML-DSig dependencies.
+argon2 = "=0.6.0"
+base64 = "=0.23.1"
+hex = "=0.4.3"
+sha1 = "=0.11.0"
+sha2 = "=0.11.2"
+hmac = "=0.13.0"
+rand = "=0.10.4"
+rsa = { version = "=0.10.0", features = ["pkcs1v15"] }
+p256 = "=0.14.0"
+p384 = "=0.14.0"
+ecdsa = "=0.17.0"
+signature = "=3.0.0"
+zeroize = "=1.9.2"
+reqwest = { version = "=0.13.5", default-features = false, features = ["json", "rustls", "http2"] }
+bergshamra = { version = "=0.12.0", default-features = false, features = ["rustcrypto"] }
 futures-util = { version = "=0.3.34", default-features = false, features = ["std"] }
 testcontainers-modules = { version = "=0.15.0", features = ["postgres", "redis", "mysql"] }
 garde = { version = "=0.23.0", features = ["derive", "email", "url"] }
@@ -81,6 +105,12 @@ garde = { version = "=0.23.0", features = ["derive", "email", "url"] }
 subtle = "=2.6.1"
 # Non-poisoning synchronous RwLock/Mutex for hot-path resilience, routing, and health registries.
 parking_lot = "=0.13.0"
+
+# Milestone D: cron scheduling, DNS SRV discovery, and external message brokers.
+croner = "=5.0.1"
+hickory-resolver = "=0.26.4"
+async-nats = "=0.53.0"
+lapin = "=4.13.0"
 
 # Rust source parsing used by `rume doctor` to validate module DAG acyclicity
 # (RC-20). Pinned to match crates/macro. syn::parse_file tokenizes the whole
@@ -96,6 +126,21 @@ opentelemetry-otlp = "=0.33.1"
 opentelemetry-appender-tracing = "=0.33.1"
 tracing-opentelemetry = "=0.34.0"
 
+# Milestone E: TLS, HTTP/2, ACME, static embedding, transactional email, gRPC, and GraphQL.
+tokio-rustls = "=0.26.6"
+rustls = "=0.23.46"
+rustls-pki-types = "=1.16.0"
+rustls-pemfile = "=2.2.0"
+hyper-util = "=0.1.21"
+rustls-acme = "=0.15.4"
+rust-embed = "=8.14.0"
+lettre = { version = "=0.11.24", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder", "hostname", "pool"] }
+minijinja = "=3.1.0"
+tonic = "=0.14.9"
+prost = "=0.14.6"
+async-graphql = "=7.2.1"
+async-graphql-axum = "=7.2.1"
+
 # Keep dev/test artifacts small. This workspace has many integration test
 # binaries that each statically link the full dependency stack (sqlx, axum,
 # testcontainers, tonic, ...), and the default `dev` profile embeds full
@@ -104,10 +149,4 @@ tracing-opentelemetry = "=0.34.0"
 # inherits this setting; use CARGO_PROFILE_DEV_DEBUG=2 for a one-off build
 # that needs full debug info.
 [profile.dev]
-debug = "line-tables-only"
-
-# Why: third-party crates (`sqlx`, `tonic`, `opentelemetry`, `sqlparser`, etc.) bloat
-# `target/` and link times when compiled with full DWARF (`debug = 2`); `line-tables-only`
-# preserves file:line backtraces while keeping full debug info for workspace crates.
-[profile.dev.package."*"]
 debug = "line-tables-only"

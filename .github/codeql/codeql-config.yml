@@ -1,0 +1,9 @@
+name: "Rume CodeQL Config"
+
+paths-ignore:
+  - "**/tests/**"
+  - "**/tests.rs"
+  - "**/*_tests.rs"
+  - "workbench/**"
+  - "benchmarks/**"
+  - "fuzz/**"

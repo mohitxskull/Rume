@@ -870,3 +870,40 @@ async fn test_redis_cache_tag_invalidation_does_not_shrink_longer_ttl() {
         "key N must be invalidated"
     );
 }
+
+#[cfg(feature = "saml")]
+#[tokio::test]
+async fn container_redis_saml_replay_cache_blocks_replay_and_sets_ttl() {
+    use rume::enterprise::{AsyncSamlReplayCache, RedisSamlReplayCache};
+
+    let _node = common::containers::shared_redis().await;
+    let pool = common::containers::create_isolated_redis_pool().await;
+    let cache = RedisSamlReplayCache::new(pool.clone()).with_max_clock_skew_secs(30);
+
+    let now = 1_700_000_000_u64;
+    let assertion_id = format!("_saml_replay_{}", uuid::Uuid::new_v4().simple());
+
+    // First sighting succeeds.
+    let first = cache
+        .record_if_absent_async(&assertion_id, now + 600, now)
+        .await
+        .expect("first record_if_absent_async");
+    assert!(first, "first assertion sighting must return Ok(true)");
+
+    // Replay is rejected.
+    let replay = cache
+        .record_if_absent_async(&assertion_id, now + 600, now + 1)
+        .await
+        .expect("replay record_if_absent_async");
+    assert!(!replay, "replayed assertion must return Ok(false)");
+
+    // TTL is set on the Redis key.
+    let key = cache.format_key(&assertion_id);
+    let mut conn = pool.get().await.expect("get redis connection");
+    let ttl: i64 = deadpool_redis::redis::cmd("TTL")
+        .arg(&key)
+        .query_async(&mut conn)
+        .await
+        .expect("query TTL");
+    assert!(ttl > 0, "expected positive TTL on {key}, got {ttl}");
+}

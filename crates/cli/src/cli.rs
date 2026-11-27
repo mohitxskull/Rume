@@ -102,6 +102,16 @@ pub enum Commands {
     /// Shortcut for `rume db rollback`.
     #[command(name = "db:rollback", alias = "db-rollback", hide = true)]
     DbRollback,
+    /// Shortcut for `rume db seed`.
+    #[command(name = "db:seed", alias = "db-seed", hide = true)]
+    DbSeed {
+        /// Directory containing `.sql` seed files (defaults to `seeds`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Comma-separated list of seed names to run.
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+    },
     /// Validate SQL files in the project for syntax and non-empty queries.
     #[command(name = "sql:check", alias = "sql-check")]
     SqlCheck {
@@ -121,6 +131,80 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// List or run registered application tasks.
+    Task {
+        #[command(subcommand)]
+        command: TaskCommands,
+    },
+    /// Export OpenAPI v3.1 JSON or generate a typed TypeScript SDK client.
+    Openapi {
+        #[command(subcommand)]
+        command: OpenapiCommands,
+    },
+    /// Run the application in live-reload development mode.
+    Dev {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Paths to watch for changes (repeatable; defaults to src, config, migrations, sql, Cargo.toml).
+        #[arg(long)]
+        watch: Vec<std::path::PathBuf>,
+        /// Skip running `db migrate` before initial server boot.
+        #[arg(long)]
+        no_migrate: bool,
+        /// Debounce window in milliseconds before restarting on changes.
+        #[arg(long, default_value_t = 300)]
+        debounce_ms: u64,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum OpenapiCommands {
+    /// Export the application's OpenAPI v3.1 JSON specification.
+    Export {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Write output to a file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+    /// Generate typed TypeScript interfaces and a fetch client from OpenAPI JSON.
+    Ts {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Read OpenAPI JSON from a file instead of inspecting the project binary.
+        #[arg(long)]
+        input: Option<std::path::PathBuf>,
+        /// Write generated TypeScript to a file instead of stdout.
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum TaskCommands {
+    /// List registered application tasks.
+    List {
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+        /// Output format: human (default) or json.
+        #[arg(long, default_value = "human")]
+        format: String,
+        /// Output tasks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a registered application task.
+    Run {
+        /// Name of the task to execute.
+        name: String,
+        /// Name of the binary to run if the project has multiple binaries.
+        #[arg(long)]
+        bin: Option<String>,
+    },
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -131,6 +215,15 @@ pub enum DbCommands {
     Migrate,
     /// Rollback the most recently applied migration.
     Rollback,
+    /// Execute database seed scripts.
+    Seed {
+        /// Directory containing `.sql` seed files (defaults to `seeds`).
+        #[arg(long)]
+        path: Option<String>,
+        /// Comma-separated list of seed names to run.
+        #[arg(long, value_delimiter = ',')]
+        only: Option<Vec<String>>,
+    },
 }
 
 #[derive(Subcommand)]

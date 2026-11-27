@@ -144,6 +144,9 @@ pub enum AppError {
     #[error("validation failed")]
     Validation { details: Vec<ValidationErrorDetail> },
 
+    #[error("conflict: {message}")]
+    Conflict { code: &'static str, message: String },
+
     #[error("internal server error")]
     Internal {
         source: InternalSource,
@@ -184,6 +187,14 @@ impl AppError {
         }
     }
 
+    /// Creates a 409 Conflict error with a custom message.
+    pub fn conflict(msg: impl Into<String>) -> Self {
+        Self::Conflict {
+            code: "CONFLICT",
+            message: msg.into(),
+        }
+    }
+
     /// The HTTP status code for this error.
     pub fn status_code(&self) -> StatusCode {
         match self {
@@ -192,6 +203,7 @@ impl AppError {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Forbidden => StatusCode::FORBIDDEN,
             Self::Validation { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
             Self::Public { status, .. } => *status,
         }
@@ -299,6 +311,18 @@ impl AppError {
                     Some(details),
                 ),
             ),
+            Self::Conflict { code, message } => {
+                warn!("conflict: {}", message);
+                let detail = if env.in_development() {
+                    message
+                } else {
+                    "The request conflicts with the current state of the resource.".to_string()
+                };
+                problem_details_response(
+                    status,
+                    &problem(status, "Conflict", detail, code, None, None),
+                )
+            }
             Self::Internal { source, request_id } => {
                 if let Some(ref bt) = source.backtrace {
                     error!(%source.message, span_context = ?source.span_context, backtrace = %bt, "internal server error");
@@ -638,6 +662,48 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("db password leaked")
+        );
+    }
+
+    #[tokio::test]
+    async fn conflict_error_maps_to_409_problem_details() {
+        let prod_env = crate::state::Environment::new("production");
+        let dev_env = crate::state::Environment::new("development");
+
+        let prod_resp =
+            AppError::conflict("version mismatch on secret_entity").into_response_in_env(&prod_env);
+        assert_eq!(prod_resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            prod_resp
+                .headers()
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+        let prod_bytes = to_bytes(prod_resp.into_body(), usize::MAX).await.unwrap();
+        let prod_value: serde_json::Value = serde_json::from_slice(&prod_bytes).unwrap();
+        assert_eq!(prod_value["status"].as_u64(), Some(409));
+        assert_eq!(prod_value["title"].as_str(), Some("Conflict"));
+        assert_eq!(prod_value["code"].as_str(), Some("CONFLICT"));
+        assert_eq!(
+            prod_value["detail"].as_str(),
+            Some("The request conflicts with the current state of the resource.")
+        );
+        assert!(
+            !prod_value["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("version mismatch")
+        );
+
+        let dev_resp =
+            AppError::conflict("version mismatch on secret_entity").into_response_in_env(&dev_env);
+        assert_eq!(dev_resp.status(), StatusCode::CONFLICT);
+        let dev_bytes = to_bytes(dev_resp.into_body(), usize::MAX).await.unwrap();
+        let dev_value: serde_json::Value = serde_json::from_slice(&dev_bytes).unwrap();
+        assert_eq!(
+            dev_value["detail"].as_str(),
+            Some("version mismatch on secret_entity")
         );
     }
 }

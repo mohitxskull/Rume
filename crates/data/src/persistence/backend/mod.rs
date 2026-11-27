@@ -420,6 +420,95 @@ pub trait DatabaseTransaction: Debug + Send + Sync {
 
     /// Explicitly discards and rolls back all changes made within this transaction.
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>>;
+
+    /// Sets the transaction-local PostgreSQL tenant context (`app.current_tenant`) for RLS.
+    fn set_tenant_context(&self, tenant_id: &str) -> BoxFuture<'_, Result<(), PersistenceError>> {
+        let tenant_id = tenant_id.to_string();
+        Box::pin(async move {
+            validate_tenant_id(&tenant_id)?;
+            if self.dialect() != "postgres" {
+                return Err(PersistenceError::DialectMismatch {
+                    query: "set_tenant_context".into(),
+                    expected: "postgres".into(),
+                    actual: self.dialect().into(),
+                });
+            }
+            // Why: Use parameterized `set_config('app.current_tenant', $1, true)` instead of
+            // string-interpolated `SET LOCAL` because PostgreSQL's `SET LOCAL` does not accept
+            // `$1` bind parameters; `set_config(..., true)` binds the tenant ID safely and
+            // scopes the GUC to the current transaction.
+            self.query_scalar_params(
+                crate::sql::PG_SET_TENANT_CONTEXT,
+                &[DbValue::from(tenant_id)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+
+    /// Sets the transaction-local PostgreSQL `search_path` for schema-per-tenant isolation.
+    fn set_tenant_search_path(&self, schema: &str) -> BoxFuture<'_, Result<(), PersistenceError>> {
+        let schema = schema.to_string();
+        Box::pin(async move {
+            validate_sql_identifier(&schema)?;
+            if self.dialect() != "postgres" {
+                return Err(PersistenceError::DialectMismatch {
+                    query: "set_tenant_search_path".into(),
+                    expected: "postgres".into(),
+                    actual: self.dialect().into(),
+                });
+            }
+            // Why: Use parameterized `set_config('search_path', $1, true)` rather than
+            // interpolated `SET LOCAL search_path` so the schema name is bound as a parameter
+            // and automatically reset when the transaction ends.
+            self.query_scalar_params(
+                crate::sql::PG_SET_TENANT_SEARCH_PATH,
+                &[DbValue::from(schema)],
+            )
+            .await?;
+            Ok(())
+        })
+    }
+}
+
+/// Validates a tenant identifier for safe persistence and RLS context binding.
+pub fn validate_tenant_id(tenant_id: &str) -> Result<(), PersistenceError> {
+    if tenant_id.is_empty() || tenant_id.len() > 128 {
+        return Err(PersistenceError::QueryFailed(
+            "tenant_id must be between 1 and 128 characters".into(),
+        ));
+    }
+    if !tenant_id.chars().all(|c| {
+        !c.is_control() && (c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+    }) {
+        return Err(PersistenceError::QueryFailed(
+            "tenant_id contains invalid characters; allowed: [A-Za-z0-9._:-]".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a SQL identifier against PostgreSQL's `NAMEDATALEN - 1` rules.
+pub fn validate_sql_identifier(ident: &str) -> Result<(), PersistenceError> {
+    let mut chars = ident.chars();
+    let Some(first) = chars.next() else {
+        return Err(PersistenceError::QueryFailed(
+            "SQL identifier must not be empty".into(),
+        ));
+    };
+    if ident.len() > 63 {
+        return Err(PersistenceError::QueryFailed(
+            "SQL identifier exceeds PostgreSQL NAMEDATALEN - 1 (63) limit".into(),
+        ));
+    }
+    if !(first.is_ascii_alphabetic() || first == '_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+    {
+        return Err(PersistenceError::QueryFailed(
+            "SQL identifier must match ^[a-zA-Z_][a-zA-Z0-9_]{0,62}$".into(),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -459,5 +548,65 @@ mod tests {
             map_sqlx_error(sqlx::Error::RowNotFound),
             PersistenceError::QueryFailed(_)
         ));
+    }
+
+    #[test]
+    fn validate_tenant_id_and_sql_identifier_reject_injection_and_control_chars() {
+        // Valid tenant IDs
+        assert!(validate_tenant_id("tenant-123_abc.def:01").is_ok());
+        assert!(validate_tenant_id(&"a".repeat(128)).is_ok());
+
+        // Invalid tenant IDs
+        assert!(validate_tenant_id("").is_err());
+        assert!(validate_tenant_id(&"a".repeat(129)).is_err());
+        assert!(validate_tenant_id("t1\0").is_err());
+        assert!(validate_tenant_id("t1\n").is_err());
+        assert!(validate_tenant_id("t1'; DROP TABLE users;--").is_err());
+        assert!(validate_tenant_id("t1/../../etc").is_err());
+        assert!(validate_tenant_id("t1 space").is_err());
+
+        // Valid SQL identifiers
+        assert!(validate_sql_identifier("tenant_acme").is_ok());
+        assert!(validate_sql_identifier("_private_1").is_ok());
+        assert!(validate_sql_identifier(&"a".repeat(63)).is_ok());
+
+        // Invalid SQL identifiers
+        assert!(validate_sql_identifier("").is_err());
+        assert!(validate_sql_identifier("1leading_digit").is_err());
+        assert!(validate_sql_identifier("has-hyphen").is_err());
+        assert!(validate_sql_identifier("has.dot").is_err());
+        assert!(validate_sql_identifier("a; DROP SCHEMA public").is_err());
+        assert!(validate_sql_identifier(&"a".repeat(64)).is_err());
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn database_transaction_set_tenant_context_fails_closed_on_sqlite() {
+        let backend = crate::persistence::SqliteBackend::in_memory()
+            .await
+            .expect("sqlite in-memory");
+        let tx = backend.begin_transaction().await.unwrap();
+
+        let ctx_err = tx.set_tenant_context("tenant-1").await.unwrap_err();
+        assert!(matches!(
+            ctx_err,
+            PersistenceError::DialectMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == "postgres" && actual == "sqlite"
+        ));
+
+        let sp_err = tx.set_tenant_search_path("tenant_1").await.unwrap_err();
+        assert!(matches!(
+            sp_err,
+            PersistenceError::DialectMismatch {
+                expected,
+                actual,
+                ..
+            } if expected == "postgres" && actual == "sqlite"
+        ));
+
+        tx.rollback().await.unwrap();
     }
 }

@@ -8,6 +8,7 @@ pub mod ext;
 pub mod fixtures;
 pub mod harness;
 pub mod jobs;
+pub mod mailer;
 pub mod module_harness;
 #[cfg(feature = "testing")]
 pub mod server;
@@ -21,6 +22,7 @@ pub use fixtures::PostgresSchemaFixture;
 pub use fixtures::SqliteTestFixture;
 pub use fixtures::TestTransactionFixture;
 pub use jobs::TestJobQueue;
+pub use mailer::TestMailer;
 pub use module_harness::{ModuleHarness, ModuleTestHarness};
 #[cfg(feature = "testing")]
 pub use server::TestServer;

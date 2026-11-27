@@ -13,11 +13,11 @@ pub enum EnvError {
         source: std::io::Error,
     },
 
-    #[error("failed to parse environment file {path}: {source}")]
+    #[error("failed to parse environment file {path} at line {line}: {message}")]
     Dotenv {
         path: PathBuf,
-        #[source]
-        source: dotenvy::Error,
+        line: usize,
+        message: String,
     },
 
     #[error("failed to interpolate ${{{variable}}}: variable not found")]
@@ -28,6 +28,9 @@ pub enum EnvError {
 
     #[error("maximum interpolation depth ({depth}) exceeded while interpolating ${{{variable}}}")]
     MaxDepthExceeded { variable: String, depth: usize },
+
+    #[error("interpolation budget exceeded while interpolating ${{{variable}}}: {reason}")]
+    BudgetExceeded { variable: String, reason: String },
 
     #[error("failed to validate environment: {0}")]
     Validation(String),
@@ -116,11 +119,39 @@ fn redact_figment_kind(
                 *msg = crate::env::secrets::redact_diagnostic_text(msg, known_secrets);
             }
         }
+        Kind::ISizeOutOfRange(val) => {
+            if is_secret_field || contains_known_secret(&val.to_string()) {
+                *kind = Kind::Message("[redacted]".to_string());
+            }
+        }
+        Kind::USizeOutOfRange(val) => {
+            if is_secret_field || contains_known_secret(&val.to_string()) {
+                *kind = Kind::Message("[redacted]".to_string());
+            }
+        }
         Kind::InvalidLength(..)
         | Kind::UnknownField(..)
         | Kind::MissingField(..)
-        | Kind::DuplicateField(..)
-        | Kind::ISizeOutOfRange(..)
-        | Kind::USizeOutOfRange(..) => {}
+        | Kind::DuplicateField(..) => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_figment_kind_redacts_isize_and_usize_out_of_range() {
+        let mut isize_err = figment::Error::from(figment::error::Kind::ISizeOutOfRange(-987_654));
+        isize_err.path = vec!["api_secret".to_string()];
+        let rendered = redact_figment_error(isize_err, &[], &std::collections::BTreeSet::new());
+        assert!(!rendered.contains("987654"));
+        assert!(rendered.contains("[redacted]"));
+
+        let mut usize_err = figment::Error::from(figment::error::Kind::USizeOutOfRange(123_456));
+        usize_err.path = vec!["auth_token".to_string()];
+        let rendered = redact_figment_error(usize_err, &[], &std::collections::BTreeSet::new());
+        assert!(!rendered.contains("123456"));
+        assert!(rendered.contains("[redacted]"));
     }
 }

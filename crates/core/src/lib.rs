@@ -23,20 +23,43 @@ pub use rume_data::cache;
 pub use rume_data::coordination;
 pub use rume_data::persistence;
 pub use rume_data::sql;
+pub use rume_data::storage;
 pub use rume_enterprise::enterprise;
 pub use rume_enterprise::saga;
 pub use rume_foundation::config;
 pub use rume_foundation::env;
 pub use rume_foundation::error;
 pub use rume_foundation::util;
-pub use rume_http::openapi;
+#[cfg(feature = "graphql")]
+pub use rume_graphql as graphql;
+#[cfg(feature = "grpc")]
+pub use rume_grpc as grpc;
+pub use rume_http::client;
+pub use rume_http::http_cache;
+pub use rume_http::pagination;
+pub use rume_http::realtime;
 pub use rume_http::resilience;
+#[cfg(feature = "scim")]
+pub use rume_http::scim;
+pub use rume_http::static_files;
+#[cfg(feature = "tls")]
+pub use rume_http::tls;
+pub use rume_http::transport;
+pub use rume_http::upload;
 pub use rume_http::validation;
+pub use rume_messaging::broker;
+pub use rume_messaging::cron;
 pub use rume_messaging::events;
 pub use rume_messaging::jobs;
+pub use rume_messaging::mailer;
 pub use rume_messaging::outbox;
+pub use rume_messaging::pubsub;
 pub use rume_observability::metrics;
+pub use rume_observability::prometheus;
+pub use rume_observability::redaction;
 pub use rume_security::auth;
+pub use rume_security::flags;
+pub use rume_security::metering;
 pub use rume_security::security;
 pub use rume_security::tenant;
 #[cfg(feature = "testing")]
@@ -44,11 +67,23 @@ pub use rume_testing as testing;
 
 pub mod prelude;
 
+/// OpenAPI v3.1 specification, docs UI, and `HasOpenApiSchema` derive.
+pub mod openapi {
+    pub use rume_http::openapi::*;
+    pub use rume_macros::HasOpenApiSchema;
+}
+
 /// First-class application modules (re-exported from `rume-app` and `rume-testing`).
 pub mod module {
     pub use rume_app::module::*;
     #[cfg(feature = "testing")]
     pub use rume_testing::{ModuleHarness, ModuleTestHarness};
+}
+
+/// Outbound webhook dispatching/signing and inbound HMAC-SHA256 verification.
+pub mod webhooks {
+    pub use rume_http::webhooks::*;
+    pub use rume_messaging::webhooks::*;
 }
 
 /// Routing re-exports from `rume-http` with `AppContext`-typed `health_routes`.
@@ -68,12 +103,12 @@ pub mod routing {
 
 pub use app::{
     AppContext, ApplicationMode, Availability, AvailabilityState, BuildError, Environment,
-    Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder, X_REQUEST_ID,
-    init_tracing, try_init_tracing,
+    Lifecycle, LifecycleState, ProjectPaths, RequestId, Rume, RumeBuilder, TaskHandler, TaskInfo,
+    TaskRegistry, X_REQUEST_ID, init_tracing, try_init_tracing,
 };
 pub use error::AppError;
-pub use events::{Event, EventBus};
+pub use events::{DistributedEventBus, Event, EventBus};
 pub use module::{Module, ModuleContext};
 pub use routing::Router;
 pub use rume_data::{MetricsRegistryPoolExt, params};
-pub use rume_macros::{embed_migrations, sql_assets};
+pub use rume_macros::{FromRow, HasOpenApiSchema, embed_migrations, sql_assets};

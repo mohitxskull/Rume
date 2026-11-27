@@ -1,0 +1,5 @@
+error: FromRow cannot be derived for enums; only structs with named fields are supported
+ --> tests/ui/from_row_enum_rejected.rs:4:1
+  |
+4 | enum BadEnum {
+  | ^^^^

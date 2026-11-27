@@ -296,10 +296,20 @@ impl OutboxRepository for PostgresBackend {
 
     fn recover_expired_claims(
         &self,
-        _max_lease_age_secs: u64,
+        max_lease_age_secs: u64,
     ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        self.recover_expired_claims_with_max_retries(max_lease_age_secs, 5)
+    }
+
+    fn recover_expired_claims_with_max_retries(
+        &self,
+        _max_lease_age_secs: u64,
+        max_retries: u32,
+    ) -> OutboxFuture<'_, Result<usize, OutboxError>> {
+        let max_retries_i32 = i32::try_from(max_retries).unwrap_or(i32::MAX);
         Box::pin(async move {
             let res = sqlx::query(OUTBOX_RECOVER_SQL)
+                .bind(max_retries_i32)
                 .execute(self.pool())
                 .await
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;

@@ -90,7 +90,8 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), OutboxError>>;
 
     /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
-    /// resetting their status back to `Pending`.
+    /// incrementing `retry_count` and transitioning rows at or above the default retry limit (`5`)
+    /// to `Failed` (otherwise back to `Pending`).
     fn recover_expired_claims(
         &self,
         max_lease_age_secs: u64,
@@ -101,6 +102,19 @@ pub trait OutboxRepository: Debug + Send + Sync + 'static {
                 "recover_expired_claims not supported by this repository backend".into(),
             ))
         })
+    }
+
+    /// Recovers abandoned or timed-out in-flight messages whose claim lease has expired,
+    /// incrementing `retry_count` and transitioning rows reaching `max_retries` to `Failed`.
+    ///
+    /// Defaults to delegating to [`recover_expired_claims`](Self::recover_expired_claims) for
+    /// backward compatibility with custom repository implementations.
+    fn recover_expired_claims_with_max_retries(
+        &self,
+        max_lease_age_secs: u64,
+        _max_retries: u32,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        self.recover_expired_claims(max_lease_age_secs)
     }
 
     /// Returns the number of currently pending outbox messages.
@@ -300,6 +314,22 @@ where
                 .map_err(|e| OutboxError::Repository(e.to_string()))?;
             self.backend()
                 .recover_expired_claims(max_lease_age_secs)
+                .await
+        })
+    }
+
+    fn recover_expired_claims_with_max_retries(
+        &self,
+        max_lease_age_secs: u64,
+        max_retries: u32,
+    ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+        Box::pin(async move {
+            let _lease = self
+                .acquire_lease_timeout(self.config().connect_timeout())
+                .await
+                .map_err(|e| OutboxError::Repository(e.to_string()))?;
+            self.backend()
+                .recover_expired_claims_with_max_retries(max_lease_age_secs, max_retries)
                 .await
         })
     }

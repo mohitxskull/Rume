@@ -2,9 +2,14 @@
 
 #![forbid(unsafe_code)]
 
+pub mod broker;
+pub mod cron;
 pub mod events;
 pub mod jobs;
+pub mod mailer;
 pub mod outbox;
+pub mod pubsub;
+pub mod webhooks;
 
 #[cfg(test)]
 mod tests {
@@ -85,6 +90,8 @@ mod tests {
                 let queued = QueuedJob {
                     id: "j-1".into(),
                     name: TestJob::NAME.into(),
+                    queue: "default".into(),
+                    priority: 0,
                     payload: serde_json::to_vec(&TestJob { id: "j-1".into() }).expect("json"),
                     attempt: 1,
                     retry_policy: RetryPolicy::default(),

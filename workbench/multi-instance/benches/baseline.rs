@@ -715,7 +715,7 @@ pub async fn run_full_production_suite(
     // 2. Start real Rume HTTP pipeline TCP server
     let rume_router = Router::new()
         .route("/bench", get(|| async { "pong" }))
-        .layer(ObservabilityLayer);
+        .layer(ObservabilityLayer::new());
     let rume_server = spawn_http_server(rume_router)
         .await
         .expect("spawn rume server");

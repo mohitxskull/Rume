@@ -63,12 +63,105 @@ impl RedisCacheBackend {
     }
 
     fn prefixed_key(&self, key: &str) -> String {
-        format!("{}{}", self.prefix, key)
+        // Why: separate value keys (`{prefix}val:{key}`) and tag set keys
+        // (`{prefix}tag:{tag}`) into disjoint subspaces so a user key like
+        // `"tag:users"` can never collide with tag set `"users"` (`RC-06`).
+        format!("{}val:{}", self.prefix, key)
     }
 
     fn tag_set_key(&self, tag: &str) -> String {
         format!("{}tag:{}", self.prefix, tag)
     }
+
+    fn tag_persist_key(&self, tag: &str) -> String {
+        // Why: place persist markers in a disjoint `tag_persist:` subspace rather than
+        // `tag:<t>:persist` so a user tag literally named `"foo:persist"` can never
+        // collide with the persist marker for tag `"foo"` and trigger `WRONGTYPE` (`RC-23`).
+        format!("{}tag_persist:{}", self.prefix, tag)
+    }
+
+    fn clear_pattern(&self) -> String {
+        format!("{}*", escape_redis_glob(&self.prefix))
+    }
+
+    fn clear_prefix_patterns(&self, prefix: &str) -> [String; 3] {
+        let escaped_base = escape_redis_glob(&self.prefix);
+        let escaped_ns = escape_redis_glob(prefix);
+        [
+            format!("{escaped_base}val:{escaped_ns}*"),
+            format!("{escaped_base}tag:{escaped_ns}*"),
+            format!("{escaped_base}tag_persist:{escaped_ns}*"),
+        ]
+    }
+
+    async fn scan_and_delete(
+        conn: &mut deadpool_redis::Connection,
+        pattern: &str,
+    ) -> Result<(), CacheError> {
+        let mut cursor: u64 = 0;
+        loop {
+            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut **conn)
+                .await
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
+
+            if !keys.is_empty() {
+                let mut del_cmd = redis::cmd("DEL");
+                for k in &keys {
+                    del_cmd.arg(k);
+                }
+                del_cmd
+                    .query_async::<()>(&mut **conn)
+                    .await
+                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+            }
+
+            cursor = next_cursor;
+            if cursor == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Upper bound on millisecond TTLs sent to Redis (`i64::MAX / 2` ≈ 146 million years).
+///
+/// Why: clamping before casting to `i64` guarantees `val_ttl_arg` and `tag_ttl_arg`
+/// stay strictly positive for any `Some(Duration)` and never wrap negative to trigger
+/// the Lua `if tag_ttl < 0 then PERSIST` branch (`RC-23`).
+const MAX_REDIS_TTL_MS: i64 = i64::MAX / 2;
+
+fn clamp_redis_ttl_ms(ttl: Duration) -> i64 {
+    ttl.as_millis().clamp(1, MAX_REDIS_TTL_MS as u128) as i64
+}
+
+fn redis_ttl_args(ttl: Option<Duration>) -> (i64, i64) {
+    match ttl {
+        Some(t) => {
+            let val_ms = clamp_redis_ttl_ms(t);
+            let tag_ms = val_ms.saturating_add(3_600_000).min(MAX_REDIS_TTL_MS);
+            (val_ms, tag_ms)
+        }
+        None => (-1, -1),
+    }
+}
+
+/// Escapes Redis `SCAN MATCH` glob metacharacters (`*`, `?`, `[`, `]`, `\`).
+fn escape_redis_glob(input: &str) -> String {
+    let mut escaped = String::with_capacity(input.len());
+    for ch in input.chars() {
+        if matches!(ch, '*' | '?' | '[' | ']' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 impl CacheBackend for RedisCacheBackend {
@@ -109,8 +202,9 @@ impl CacheBackend for RedisCacheBackend {
             cmd.arg(&k).arg(&value);
             if let Some(ttl) = ttl {
                 // Why: Redis `SET ... PX` rejects `0` with `ERR invalid expire time`.
-                // Clamp sub-millisecond and zero durations to 1ms, matching `set_with_tags`.
-                let px_ms = ttl.as_millis().clamp(1, u64::MAX as u128) as u64;
+                // Clamp sub-millisecond and zero durations to 1ms and extreme values to
+                // `MAX_REDIS_TTL_MS`, matching `set_with_tags`.
+                let px_ms = clamp_redis_ttl_ms(ttl);
                 cmd.arg("PX").arg(px_ms);
             }
 
@@ -130,7 +224,10 @@ impl CacheBackend for RedisCacheBackend {
         ttl: Option<Duration>,
     ) -> BoxFuture<'_, Result<(), CacheError>> {
         let k = self.prefixed_key(key);
-        let tag_keys: Vec<String> = tags.iter().map(|t| self.tag_set_key(t)).collect();
+        let tag_key_pairs: Vec<(String, String)> = tags
+            .iter()
+            .map(|t| (self.tag_set_key(t), self.tag_persist_key(t)))
+            .collect();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -138,11 +235,11 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            if tag_keys.is_empty() {
+            if tag_key_pairs.is_empty() {
                 let mut cmd = redis::cmd("SET");
                 cmd.arg(&k).arg(&value);
                 if let Some(ttl) = ttl {
-                    cmd.arg("PX").arg(ttl.as_millis().max(1) as u64);
+                    cmd.arg("PX").arg(clamp_redis_ttl_ms(ttl));
                 }
                 cmd.query_async::<()>(&mut *conn)
                     .await
@@ -201,20 +298,12 @@ impl CacheBackend for RedisCacheBackend {
                 return 1
             "#;
 
-            let val_ttl_arg: i64 = match ttl {
-                Some(t) => i64::try_from(t.as_millis().max(1)).unwrap_or(i64::MAX),
-                None => -1,
-            };
-            let tag_ttl_arg: i64 = match ttl {
-                Some(t) => (t.as_millis().max(1) as i64).saturating_add(3_600_000),
-                None => -1,
-            };
+            let (val_ttl_arg, tag_ttl_arg) = redis_ttl_args(ttl);
 
             let script = redis::Script::new(SET_WITH_TAGS_SCRIPT);
             let mut invocation = script.prepare_invoke();
             invocation.key(&k);
-            for tk in &tag_keys {
-                let persist_key = format!("{tk}:persist");
+            for (tk, persist_key) in &tag_key_pairs {
                 invocation.key(tk).key(persist_key);
             }
             invocation
@@ -269,8 +358,8 @@ impl CacheBackend for RedisCacheBackend {
 
     fn invalidate_tag_keys(&self, tag: &str) -> BoxFuture<'_, Result<Vec<String>, CacheError>> {
         let tk = self.tag_set_key(tag);
-        let persist_key = format!("{tk}:persist");
-        let prefix = self.prefix.clone();
+        let persist_key = self.tag_persist_key(tag);
+        let val_prefix = format!("{}val:", self.prefix);
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -305,7 +394,7 @@ impl CacheBackend for RedisCacheBackend {
 
             let deleted = raw_deleted
                 .into_iter()
-                .map(|k| k.strip_prefix(&prefix).unwrap_or(&k).to_string())
+                .map(|k| k.strip_prefix(&val_prefix).unwrap_or(&k).to_string())
                 .collect();
 
             Ok(deleted)
@@ -321,7 +410,7 @@ impl CacheBackend for RedisCacheBackend {
     }
 
     fn clear(&self) -> BoxFuture<'_, Result<(), CacheError>> {
-        let pattern = format!("{}*", self.prefix);
+        let pattern = self.clear_pattern();
         Box::pin(async move {
             let mut conn = self
                 .pool
@@ -329,35 +418,22 @@ impl CacheBackend for RedisCacheBackend {
                 .await
                 .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-            let mut cursor: u64 = 0;
-            loop {
-                let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .arg("COUNT")
-                    .arg(100)
-                    .query_async(&mut *conn)
-                    .await
-                    .map_err(|e| CacheError::Backend(e.to_string()))?;
+            Self::scan_and_delete(&mut conn, &pattern).await
+        })
+    }
 
-                if !keys.is_empty() {
-                    let mut del_cmd = redis::cmd("DEL");
-                    for k in &keys {
-                        del_cmd.arg(k);
-                    }
-                    del_cmd
-                        .query_async::<()>(&mut *conn)
-                        .await
-                        .map_err(|e| CacheError::Backend(e.to_string()))?;
-                }
+    fn clear_prefix(&self, prefix: &str) -> BoxFuture<'_, Result<(), CacheError>> {
+        let patterns = self.clear_prefix_patterns(prefix);
+        Box::pin(async move {
+            let mut conn = self
+                .pool
+                .get()
+                .await
+                .map_err(|e| CacheError::Backend(e.to_string()))?;
 
-                cursor = next_cursor;
-                if cursor == 0 {
-                    break;
-                }
+            for pattern in &patterns {
+                Self::scan_and_delete(&mut conn, pattern).await?;
             }
-
             Ok(())
         })
     }
@@ -377,5 +453,68 @@ impl CacheBackend for RedisCacheBackend {
 
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn value_and_tag_keys_are_disjoint() {
+        let backend = RedisCacheBackend::new("redis://127.0.0.1:6379")
+            .expect("pool")
+            .with_prefix("rume:cache:");
+        assert_ne!(
+            backend.prefixed_key("tag:users"),
+            backend.tag_set_key("users"),
+            "value key `tag:users` must never collide with tag set key `users`"
+        );
+        assert_eq!(
+            backend.prefixed_key("tag:users"),
+            "rume:cache:val:tag:users"
+        );
+        assert_eq!(backend.tag_set_key("users"), "rume:cache:tag:users");
+        assert_ne!(
+            backend.tag_persist_key("foo"),
+            backend.tag_set_key("foo:persist"),
+            "tag persist key for `foo` must never collide with tag set key `foo:persist`"
+        );
+        assert_eq!(backend.tag_persist_key("foo"), "rume:cache:tag_persist:foo");
+    }
+
+    #[test]
+    fn glob_metacharacters_are_escaped_in_scan_patterns() {
+        assert_eq!(escape_redis_glob(r"a*b?c[0]d\e"), r"a\*b\?c\[0\]d\\e");
+
+        let backend = RedisCacheBackend::new("redis://127.0.0.1:6379")
+            .expect("pool")
+            .with_prefix("app[1]*:");
+        assert_eq!(backend.clear_pattern(), r"app\[1\]\*:*");
+        assert_eq!(
+            backend.clear_prefix_patterns(r"t?a[0]\b:"),
+            [
+                r"app\[1\]\*:val:t\?a\[0\]\\b:*".to_string(),
+                r"app\[1\]\*:tag:t\?a\[0\]\\b:*".to_string(),
+                r"app\[1\]\*:tag_persist:t\?a\[0\]\\b:*".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn redis_ttl_args_clamps_large_durations_without_negative_wrap() {
+        let (val_ms, tag_ms) = redis_ttl_args(Some(Duration::MAX));
+        assert_eq!(val_ms, MAX_REDIS_TTL_MS);
+        assert_eq!(tag_ms, MAX_REDIS_TTL_MS);
+        assert!(val_ms > 0);
+        assert!(tag_ms > 0);
+
+        // Duration just above i64::MAX ms previously wrapped negative on `as i64`
+        let over_i64_max = Duration::from_millis((i64::MAX as u64) + 1);
+        let (val2, tag2) = redis_ttl_args(Some(over_i64_max));
+        assert!(val2 > 0 && val2 <= MAX_REDIS_TTL_MS);
+        assert!(tag2 > 0 && tag2 <= MAX_REDIS_TTL_MS);
+
+        assert_eq!(redis_ttl_args(None), (-1, -1));
     }
 }

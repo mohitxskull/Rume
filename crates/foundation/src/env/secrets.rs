@@ -51,12 +51,22 @@ pub fn is_secret_key(key: &str) -> bool {
         || upper.starts_with("PRIVATE_KEY")
 }
 
-/// Heuristic: does this value look like a URL containing credentials?
+/// Heuristic: does this value look like a URL (or list of URLs) containing credentials?
 pub fn value_looks_sensitive(value: &str) -> bool {
-    if let Some(rest) = value.split("://").nth(1)
-        && let Some(authority) = rest.split('/').next()
-    {
-        return authority.contains('@') && authority.split('@').next().unwrap_or("").contains(':');
+    // Why: scan every `://` occurrence (not just the first) so comma/whitespace-separated
+    // multi-URL values detect credentials in non-first URLs, and stop authority scanning
+    // at RFC 3986 authority delimiters (`/`, `?`, `#`) as well as `,` and whitespace so
+    // query/fragment `@` characters (e.g. `?email=a@b.com`) are not mistaken for userinfo (`RC-19`).
+    for rest in value.split("://").skip(1) {
+        let end_authority = rest
+            .find(|c: char| matches!(c, '/' | '?' | '#' | ',') || c.is_whitespace())
+            .unwrap_or(rest.len());
+        let authority = &rest[..end_authority];
+        if let Some(at_pos) = authority.rfind('@')
+            && !authority[..at_pos].is_empty()
+        {
+            return true;
+        }
     }
     false
 }
@@ -76,7 +86,7 @@ pub fn redact_value(key: &str, value: &str) -> String {
     }
 }
 
-/// Redact passwords from credential URLs found inside arbitrary text.
+/// Redact credentials (passwords and bare token userinfo) from URLs found inside arbitrary text.
 pub fn redact_credential_urls_in_text(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
@@ -86,21 +96,31 @@ pub fn redact_credential_urls_in_text(text: &str) -> String {
         out.push_str(before);
         rest = &rest[proto_pos + 3..];
 
-        // Find the boundary of the authority/URL
+        // Find the boundary of the authority/URL per RFC 3986 (`/` / `?` / `#`) plus
+        // common list/punctuation delimiters so `?email=a@b.com` is never corrupted (`RC-19`).
         let end_authority = rest
-            .find([
-                '/', ' ', '"', '\'', '\n', '\r', '\t', '>', '<', ')', ']', '}',
-            ])
+            .find(|c: char| {
+                matches!(
+                    c,
+                    '/' | '?' | '#' | ',' | '"' | '\'' | '>' | '<' | ')' | ']' | '}'
+                ) || c.is_whitespace()
+            })
             .unwrap_or(rest.len());
         let authority = &rest[..end_authority];
 
         if let Some(at_pos) = authority.rfind('@') {
             let user_info = &authority[..at_pos];
-            if let Some(colon_pos) = user_info.find(':') {
-                let user = &user_info[..colon_pos];
+            if !user_info.is_empty() {
                 let host_and_rest = &authority[at_pos..];
-                out.push_str(user);
-                out.push_str(":[redacted]");
+                if let Some(colon_pos) = user_info.find(':') {
+                    let user = &user_info[..colon_pos];
+                    out.push_str(user);
+                    out.push_str(":[redacted]");
+                } else {
+                    // Why: single-segment userinfo without `:` (e.g. `https://ghp_secret@github.com`)
+                    // is commonly a bearer/API token and must be redacted as well (`RC-22`).
+                    out.push_str("[redacted]");
+                }
                 out.push_str(host_and_rest);
                 rest = &rest[end_authority..];
                 continue;
@@ -141,56 +161,90 @@ fn line_targets_secret_field(line: &str) -> bool {
     false
 }
 
+const QUOTED_SECRET_PREFIXES: &[&str] = &["string \"", "invalid value: \"", "found \""];
+
+fn find_closing_quote(bytes: &[u8], start: usize) -> Option<usize> {
+    // Why: Figment/serde debug formatting escapes embedded quotes as `\"`
+    // and backslashes as `\\`, and multi-line values (such as PEM private keys)
+    // contain raw newlines inside quotes. Scan across newlines while honoring escapes.
+    let mut i = start;
+    let mut escaped = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if escaped {
+            escaped = false;
+        } else if b == b'\\' {
+            escaped = true;
+        } else if b == b'"' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 fn redact_secret_field_lines(text: &str) -> String {
-    let mut out_lines = Vec::new();
-    for line in text.lines() {
-        if line_targets_secret_field(line) {
-            out_lines.push(redact_line_values(line));
-        } else {
-            out_lines.push(line.to_string());
-        }
-    }
-    out_lines.join("\n")
-}
+    // Why: track quote state across newlines instead of splitting on `.lines()` first
+    // so multi-line secrets (such as PEM private keys) inside quoted error payloads
+    // are redacted completely rather than leaking lines 2..N (`RC-22`).
+    let mut out = text.to_string();
+    let mut line_start = 0usize;
 
-fn replace_quoted_after(mut text: String, prefix: &str) -> String {
-    let mut search_from = 0;
-    while let Some(pos) = text[search_from..].find(prefix) {
-        let start = search_from + pos + prefix.len();
-        // Why: Figment/serde debug formatting escapes embedded quotes as `\"`
-        // and backslashes as `\\`. Scanning naively for the first `"` stops
-        // early and leaks the suffix after `\"`.
-        let bytes = text.as_bytes();
-        let mut i = start;
-        let mut escaped = false;
-        let mut closing = None;
-        while i < bytes.len() {
-            let b = bytes[i];
-            if escaped {
-                escaped = false;
-            } else if b == b'\\' {
-                escaped = true;
-            } else if b == b'"' {
-                closing = Some(i);
-                break;
+    while line_start < out.len() {
+        let line_end = out[line_start..]
+            .find('\n')
+            .map_or(out.len(), |rel| line_start + rel);
+
+        if line_targets_secret_field(&out[line_start..line_end]) {
+            let mut cursor = line_start;
+            loop {
+                let current_line_end = out[cursor..]
+                    .find('\n')
+                    .map_or(out.len(), |rel| cursor + rel);
+                let line_slice = &out[cursor..current_line_end];
+
+                // Find the earliest secret-value prefix on this logical line.
+                let next_match = QUOTED_SECRET_PREFIXES
+                    .iter()
+                    .filter_map(|prefix| line_slice.find(prefix).map(|rel| (rel, *prefix)))
+                    .min_by_key(|(rel, _)| *rel);
+
+                let Some((rel, prefix)) = next_match else {
+                    break;
+                };
+
+                let quote_content_start = cursor + rel + prefix.len();
+                let closing = find_closing_quote(out.as_bytes(), quote_content_start);
+                match closing {
+                    Some(end) => {
+                        out.replace_range(quote_content_start..end, "[redacted]");
+                        cursor = quote_content_start + "[redacted]".len() + 1;
+                    }
+                    None => {
+                        // Unclosed quote on a secret field line: redact through end of text.
+                        out.replace_range(quote_content_start..out.len(), "[redacted]");
+                        return out;
+                    }
+                }
             }
-            i += 1;
-        }
-        if let Some(end) = closing {
-            text.replace_range(start..end, "[redacted]");
-            search_from = start + "[redacted]".len();
+
+            let next_nl = out[line_start..]
+                .find('\n')
+                .map_or(out.len(), |rel| line_start + rel);
+            line_start = if next_nl < out.len() {
+                next_nl + 1
+            } else {
+                out.len()
+            };
         } else {
-            break;
+            line_start = if line_end < out.len() {
+                line_end + 1
+            } else {
+                out.len()
+            };
         }
     }
-    text
-}
 
-fn redact_line_values(line: &str) -> String {
-    let mut out = line.to_string();
-    out = replace_quoted_after(out, "string \"");
-    out = replace_quoted_after(out, "invalid value: \"");
-    out = replace_quoted_after(out, "found \"");
     out
 }
 
@@ -327,5 +381,53 @@ mod tests {
             "api_key: invalid type: string \"[redacted]\", expected u32"
         );
         assert!(!redacted.contains("leaked_tail"));
+    }
+
+    #[test]
+    fn redact_diagnostic_text_redacts_multiline_pem_secret() {
+        let msg = "private_key: invalid type: string \"-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC\n-----END PRIVATE KEY-----\", expected u32\nport: invalid type: string \"abc\", expected u16";
+        let redacted = redact_diagnostic_text(msg, &[]);
+        assert!(!redacted.contains("BEGIN PRIVATE KEY"));
+        assert!(!redacted.contains("MIIEvQIBADAN"));
+        assert!(!redacted.contains("END PRIVATE KEY"));
+        assert!(
+            redacted.contains("private_key: invalid type: string \"[redacted]\", expected u32")
+        );
+        assert!(redacted.contains("port: invalid type: string \"abc\", expected u16"));
+    }
+
+    #[test]
+    fn redact_credential_urls_redacts_bare_userinfo_without_colon() {
+        let url = "https://ghp_secret_token_123@github.com/org/repo.git";
+        assert!(value_looks_sensitive(url));
+        assert_eq!(redact_value("REPO_URL", url), "[redacted]");
+        let redacted = redact_credential_urls_in_text(&format!("clone failed: {url}"));
+        assert_eq!(
+            redacted,
+            "clone failed: https://[redacted]@github.com/org/repo.git"
+        );
+        assert!(!redacted.contains("ghp_secret_token_123"));
+    }
+
+    #[test]
+    fn value_looks_sensitive_detects_credentials_in_non_first_url() {
+        let multi = "https://public.example.com,https://u:secret@priv.example.com";
+        assert!(value_looks_sensitive(multi));
+        assert_eq!(redact_value("ENDPOINTS", multi), "[redacted]");
+        assert_eq!(
+            redact_credential_urls_in_text(multi),
+            "https://public.example.com,https://u:[redacted]@priv.example.com"
+        );
+    }
+
+    #[test]
+    fn url_authority_scanning_stops_at_query_and_fragment_delimiters() {
+        let query_email = "https://example.com?email=a@b.com";
+        assert!(!value_looks_sensitive(query_email));
+        assert_eq!(redact_credential_urls_in_text(query_email), query_email);
+
+        let frag_email = "https://example.com#contact=a@b.com";
+        assert!(!value_looks_sensitive(frag_email));
+        assert_eq!(redact_credential_urls_in_text(frag_email), frag_email);
     }
 }

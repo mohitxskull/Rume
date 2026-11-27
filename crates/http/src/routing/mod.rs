@@ -18,11 +18,13 @@
 pub mod group;
 pub mod health;
 pub mod matchers;
+pub mod metrics;
 pub mod registry;
 pub mod resource;
 pub mod router;
 pub mod spec;
 pub mod validated_param;
+pub mod versioning;
 
 // Re-export the public routing surface at the module root for convenience.
 pub use group::RouteGroup;
@@ -31,8 +33,12 @@ pub use health::{
     health_routes,
 };
 pub use matchers::Matcher;
+pub use metrics::{metrics_handler, metrics_routes, metrics_routes_at};
 pub use registry::{RouteInfo, RouteRegistry};
 pub use resource::Resource;
 pub use router::Router;
 pub use spec::{ParamValidationLayer, RouteSpec};
 pub use validated_param::ValidatedParam;
+pub use versioning::{
+    ApiVersion, ApiVersionExtractor, DeprecationLayer, VersionHeaderLayer, versioned_group,
+};

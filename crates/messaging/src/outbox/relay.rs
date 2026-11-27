@@ -24,6 +24,50 @@ pub type CancellableMessageDispatcher = Arc<
         + 'static,
 >;
 
+/// Builds a dispatcher closure that publishes [`OutboxMessage`]s to any [`BrokerPublisher`]
+/// with `message_id`, `event_type`, and W3C `traceparent`/`tracestate` headers.
+pub fn broker_dispatcher(
+    broker: Arc<dyn crate::broker::BrokerPublisher>,
+) -> impl Fn(&OutboxMessage) -> BoxFuture<'static, Result<(), OutboxError>> + Send + Sync + 'static
+{
+    move |msg: &OutboxMessage| {
+        let broker = Arc::clone(&broker);
+        let msg_id = msg.id.clone();
+        let event_type = msg.event_type.clone();
+        let payload = msg.payload.clone();
+        let msg_trace_context = msg.trace_context.clone();
+        Box::pin(async move {
+            let mut headers = BTreeMap::new();
+            headers.insert("message_id".to_string(), msg_id);
+            headers.insert("event_type".to_string(), event_type.clone());
+            // Why: capture `TraceContext::current()` inside the async future so it
+            // observes the child span entered by `tc.scope_future(span, fut)` in
+            // `OutboxRelay::poll_and_dispatch` instead of synchronously capturing
+            // any ambient span active before entering the scope.
+            let trace_ctx = rume_observability::TraceContext::current().or_else(|| {
+                msg_trace_context
+                    .as_deref()
+                    .and_then(rume_observability::TraceContext::parse_serialized)
+            });
+            if let Some(tc) = trace_ctx {
+                headers.insert("traceparent".to_string(), tc.traceparent);
+                if let Some(ts) = tc.tracestate {
+                    headers.insert("tracestate".to_string(), ts);
+                }
+            }
+            let broker_msg = crate::broker::BrokerMessage {
+                topic: event_type,
+                payload,
+                headers,
+            };
+            broker
+                .publish(broker_msg)
+                .await
+                .map_err(|e| OutboxError::Dispatch(e.to_string()))
+        })
+    }
+}
+
 /// Result of an outbox relay polling pass, reporting counts for published messages,
 /// retry-scheduled messages, and failed state transitions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -233,6 +277,14 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         self
     }
 
+    /// Creates a new outbox relay that publishes claimed outbox messages to `broker`.
+    pub fn with_broker(
+        repository: Arc<R>,
+        broker: Arc<dyn crate::broker::BrokerPublisher>,
+    ) -> Self {
+        Self::new(repository, broker_dispatcher(broker))
+    }
+
     /// Claims pending messages atomically and dispatches them in order.
     pub async fn poll_and_dispatch(
         &self,
@@ -241,7 +293,10 @@ impl<R: OutboxRepository> OutboxRelay<R> {
         // Automatically reclaim any expired in-flight message leases before polling new items.
         // Propagate errors directly to prevent silent lease stalls or misconfigured repositories.
         self.repository
-            .recover_expired_claims(self.config.lease_duration_secs)
+            .recover_expired_claims_with_max_retries(
+                self.config.lease_duration_secs,
+                self.config.max_retries,
+            )
             .await?;
 
         let pending = self
@@ -249,20 +304,102 @@ impl<R: OutboxRepository> OutboxRelay<R> {
             .claim_pending_with_lease(batch_size, self.config.lease_duration_secs)
             .await?;
         let mut result = RelayPollResult::default();
+        if pending.is_empty() {
+            return Ok(result);
+        }
 
-        for message in pending {
+        let lease_duration_secs = self.config.lease_duration_secs;
+        let renew_extension_secs = lease_duration_secs.max(2);
+        let hb_interval = Duration::from_millis((lease_duration_secs * 1000 / 3).clamp(50, 20_000));
+
+        // Why: heartbeat ALL remaining claimed messages in the batch (not just the
+        // currently dispatching one) so slow earlier dispatches cannot starve later
+        // messages in the same batch into lease expiry and duplicate reclamation.
+        let batch_leases: Arc<Vec<Option<(String, String)>>> = Arc::new(
+            pending
+                .iter()
+                .map(|m| m.lease_token.as_ref().map(|t| (m.id.clone(), t.clone())))
+                .collect(),
+        );
+        let lease_lost_flags: Arc<Vec<Arc<AtomicBool>>> = Arc::new(
+            (0..pending.len())
+                .map(|_| Arc::new(AtomicBool::new(false)))
+                .collect(),
+        );
+        // Tracks the first index in `pending` that has not yet been finalized; guarded by a
+        // mutex so advancing `next_idx` before `mark_published`/`mark_failed` never races with
+        // an in-flight heartbeat renewal tick for that message.
+        let batch_cursor = Arc::new(tokio::sync::Mutex::new(0usize));
+        let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let hb_repo = Arc::clone(&self.repository);
+        let hb_leases = Arc::clone(&batch_leases);
+        let hb_lost = Arc::clone(&lease_lost_flags);
+        let hb_cursor = Arc::clone(&batch_cursor);
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(hb_interval);
+            interval.tick().await; // first tick immediate
+            loop {
+                tokio::select! {
+                    _ = &mut cancel_rx => break,
+                    _ = interval.tick() => {
+                        let cursor_guard = hb_cursor.lock().await;
+                        let start_idx = *cursor_guard;
+                        for idx in start_idx..hb_leases.len() {
+                            if hb_lost[idx].load(Ordering::SeqCst) {
+                                continue;
+                            }
+                            if let Some((ref msg_id, ref token)) = hb_leases[idx]
+                                && let Err(e) = hb_repo
+                                    .renew_outbox_lease(msg_id, token, renew_extension_secs)
+                                    .await
+                            {
+                                tracing::error!(
+                                    message_id = %msg_id,
+                                    error = %e,
+                                    "Failed to renew outbox lease heartbeat; lease ownership lost during batch dispatch"
+                                );
+                                hb_lost[idx].store(true, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        // Ensure the heartbeat task (and its Arc<Repository> reference) is aborted immediately
+        // if poll_and_dispatch is dropped by an outer drain timeout.
+        struct AbortOnDrop(tokio::task::AbortHandle);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
+        let _hb_guard = AbortOnDrop(heartbeat_handle.abort_handle());
+
+        for (idx, message) in pending.into_iter().enumerate() {
             let token = match message.lease_token.as_deref() {
                 Some(t) => t,
                 None => {
                     tracing::error!(message_id = %message.id, "Claimed outbox message is missing lease token");
+                    *batch_cursor.lock().await = idx + 1;
                     result.failed_transitions += 1;
                     continue;
                 }
             };
 
+            let lease_lost = Arc::clone(&lease_lost_flags[idx]);
+            if lease_lost.load(Ordering::SeqCst) {
+                tracing::warn!(
+                    message_id = %message.id,
+                    "Outbox message lease was lost while waiting in batch; skipping dispatch"
+                );
+                *batch_cursor.lock().await = idx + 1;
+                result.failed_transitions += 1;
+                continue;
+            }
+
             // Renew the lease before dispatching to refresh it after waiting in batch
-            let lease_duration_secs = self.config.lease_duration_secs;
-            let renew_extension_secs = lease_duration_secs.max(2);
             if let Err(e) = self
                 .repository
                 .renew_outbox_lease(&message.id, token, renew_extension_secs)
@@ -273,49 +410,11 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                     error = %e,
                     "Failed to renew outbox message lease before dispatch; lease expired or token mismatch"
                 );
+                lease_lost.store(true, Ordering::SeqCst);
+                *batch_cursor.lock().await = idx + 1;
                 result.failed_transitions += 1;
                 continue;
             }
-
-            // Spawn a heartbeat task to keep the lease renewed while the dispatcher runs
-            let hb_repo = Arc::clone(&self.repository);
-            let hb_msg_id = message.id.clone();
-            let hb_token = token.to_string();
-            let hb_interval =
-                Duration::from_millis((lease_duration_secs * 1000 / 3).clamp(50, 20_000));
-            let (cancel_tx, mut cancel_rx) = tokio::sync::oneshot::channel::<()>();
-            let lease_lost = Arc::new(AtomicBool::new(false));
-            let lease_lost_hb = Arc::clone(&lease_lost);
-
-            let heartbeat_handle = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(hb_interval);
-                interval.tick().await; // first tick immediate
-                loop {
-                    tokio::select! {
-                        _ = &mut cancel_rx => break,
-                        _ = interval.tick() => {
-                            if let Err(e) = hb_repo.renew_outbox_lease(&hb_msg_id, &hb_token, renew_extension_secs).await {
-                                tracing::error!(
-                                    message_id = %hb_msg_id,
-                                    error = %e,
-                                    "Failed to renew outbox lease heartbeat; lease ownership lost during dispatch"
-                                );
-                                lease_lost_hb.store(true, Ordering::SeqCst);
-                                break;
-                            }
-                        }
-                    }
-                }
-            });
-            // Ensure the heartbeat task (and its Arc<Repository> reference) is aborted immediately
-            // if poll_and_dispatch is dropped by an outer drain timeout.
-            struct AbortOnDrop(tokio::task::AbortHandle);
-            impl Drop for AbortOnDrop {
-                fn drop(&mut self) {
-                    self.0.abort();
-                }
-            }
-            let _hb_guard = AbortOnDrop(heartbeat_handle.abort_handle());
 
             let cancel_signal = Arc::clone(&lease_lost);
             let fut_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -351,8 +450,12 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 Err(_) => Err(OutboxError::Dispatch("outbox dispatcher panicked".into())),
             };
 
-            let _ = cancel_tx.send(());
-            let _ = heartbeat_handle.await;
+            // Advance the batch cursor under `batch_cursor` so any in-flight heartbeat tick
+            // finishes before we inspect `lease_lost` and transition the message state.
+            {
+                let mut cursor_guard = batch_cursor.lock().await;
+                *cursor_guard = idx + 1;
+            }
 
             // If heartbeat failed mid-dispatch, ownership was lost. Propagate this failure
             // to RelayPollResult and skip ack/nack to avoid corrupted state transitions.
@@ -405,6 +508,9 @@ impl<R: OutboxRepository> OutboxRelay<R> {
                 }
             }
         }
+
+        let _ = cancel_tx.send(());
+        let _ = heartbeat_handle.await;
 
         Ok(result)
     }
@@ -818,5 +924,212 @@ mod tests {
             .await
             .expect("sweeper started after try_drain must exit immediately")
             .expect("sweeper task must not panic");
+    }
+
+    #[cfg(feature = "sqlite")]
+    #[tokio::test]
+    async fn outbox_relay_publishes_to_message_broker() {
+        use crate::broker::{InMemoryBroker, MessageBroker};
+        use rume_observability::TraceContext;
+
+        let backend = Arc::new(
+            rume_data::persistence::SqliteBackend::in_memory()
+                .await
+                .expect("sqlite in-memory"),
+        );
+        backend
+            .init_outbox_table()
+            .await
+            .expect("init outbox table");
+
+        let trace_ctx = TraceContext::generate();
+        let msg = OutboxMessage::new("msg-broker-1", "order.created", br#"{"id":1}"#.to_vec())
+            .with_trace_context(trace_ctx.to_string());
+        backend.save(msg).await.expect("save outbox");
+
+        let broker = Arc::new(InMemoryBroker::new());
+        let mut consumer = broker.subscribe("order.created").await.expect("subscribe");
+
+        let relay = OutboxRelay::with_broker(Arc::clone(&backend), broker);
+        let poll = relay
+            .poll_and_dispatch(10)
+            .await
+            .expect("poll_and_dispatch");
+        assert_eq!(poll.published, 1);
+
+        let delivered = consumer
+            .next_message()
+            .await
+            .expect("next_message")
+            .expect("delivered message");
+        assert_eq!(delivered.topic, "order.created");
+        assert_eq!(delivered.payload, br#"{"id":1}"#);
+        let tp = delivered
+            .headers
+            .get("traceparent")
+            .expect("traceparent header");
+        assert!(tp.contains(trace_ctx.trace_id()));
+    }
+
+    #[tokio::test]
+    async fn outbox_relay_batch_heartbeat_renews_all_remaining_messages_in_batch() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        #[derive(Debug)]
+        struct RenewalTrackingRepo {
+            messages: Mutex<Vec<OutboxMessage>>,
+            renewals: Mutex<HashMap<String, usize>>,
+        }
+
+        impl OutboxRepository for RenewalTrackingRepo {
+            fn save(&self, _msg: OutboxMessage) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn fetch_pending(
+                &self,
+                _limit: usize,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                Box::pin(async { Ok(vec![]) })
+            }
+            fn claim_pending_with_lease(
+                &self,
+                _limit: usize,
+                _lease_duration_secs: u64,
+            ) -> BoxFuture<'_, Result<Vec<OutboxMessage>, OutboxError>> {
+                let batch = std::mem::take(&mut *self.messages.lock().unwrap());
+                Box::pin(async move { Ok(batch) })
+            }
+            fn renew_outbox_lease(
+                &self,
+                id: &str,
+                _lease_token: &str,
+                _extension_secs: u64,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                let id = id.to_string();
+                Box::pin(async move {
+                    *self.renewals.lock().unwrap().entry(id).or_insert(0) += 1;
+                    Ok(())
+                })
+            }
+            fn mark_published(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn mark_failed_with_max_retries(
+                &self,
+                _id: &str,
+                _lease_token: &str,
+                _error: String,
+                _max_retries: u32,
+            ) -> BoxFuture<'_, Result<(), OutboxError>> {
+                Box::pin(async { Ok(()) })
+            }
+            fn recover_expired_claims(
+                &self,
+                _max_lease_age_secs: u64,
+            ) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn pending_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+            fn published_count(&self) -> BoxFuture<'_, Result<usize, OutboxError>> {
+                Box::pin(async { Ok(0) })
+            }
+        }
+
+        let make_msg = |id: &str| {
+            let mut m = OutboxMessage::new(id, "evt.slow", b"{}".to_vec());
+            m.lease_token = Some(format!("tok-{id}"));
+            m
+        };
+        let repo = Arc::new(RenewalTrackingRepo {
+            messages: Mutex::new(vec![make_msg("m1"), make_msg("m2"), make_msg("m3")]),
+            renewals: Mutex::new(HashMap::new()),
+        });
+
+        let repo_for_check = Arc::clone(&repo);
+        let seen_queued_renewals = Arc::new(AtomicBool::new(false));
+        let seen_flag = Arc::clone(&seen_queued_renewals);
+        let relay = OutboxRelay::new(Arc::clone(&repo), move |msg| {
+            let id = msg.id.clone();
+            let repo = Arc::clone(&repo_for_check);
+            let seen_flag = Arc::clone(&seen_flag);
+            async move {
+                if id == "m1" {
+                    // Sleep past multiple 50ms heartbeat ticks while m2 and m3 wait in batch.
+                    tokio::time::sleep(Duration::from_millis(160)).await;
+                    let renewals = repo.renewals.lock().unwrap();
+                    if renewals.get("m2").copied().unwrap_or(0) >= 1
+                        && renewals.get("m3").copied().unwrap_or(0) >= 1
+                    {
+                        seen_flag.store(true, Ordering::SeqCst);
+                    }
+                }
+                Ok(())
+            }
+        })
+        .with_config(OutboxRelayConfig {
+            batch_size: 10,
+            lease_duration_secs: 0, // clamps hb_interval to 50ms
+            poll_interval: Duration::from_millis(50),
+            max_retries: 3,
+        });
+
+        let res = relay
+            .poll_and_dispatch(10)
+            .await
+            .expect("poll_and_dispatch");
+        assert_eq!(res.published, 3);
+        assert_eq!(res.failed_transitions, 0);
+        assert!(
+            seen_queued_renewals.load(Ordering::SeqCst),
+            "remaining batch messages m2 and m3 must be heartbeated while m1 is dispatching"
+        );
+    }
+
+    #[tokio::test]
+    async fn broker_dispatcher_captures_scoped_child_span_not_ambient_sync_span() {
+        use crate::broker::{InMemoryBroker, MessageBroker};
+        use rume_observability::TraceContext;
+
+        let broker = Arc::new(InMemoryBroker::new());
+        let mut consumer = broker.subscribe("order.scoped").await.expect("subscribe");
+        let dispatcher = broker_dispatcher(broker);
+
+        let ambient_tc = TraceContext::generate();
+        let child_tc = TraceContext::generate();
+        let msg = OutboxMessage::new("msg-scoped-1", "order.scoped", b"{}".to_vec());
+
+        // Invoke the dispatcher closure while an unrelated ambient OTel context is attached
+        // synchronously, then await the returned future inside `child_tc.scope_future(...)`.
+        let fut = {
+            let _ambient_guard = ambient_tc.to_otel_context().attach();
+            dispatcher(&msg)
+        };
+
+        let span = tracing::info_span!("outbox.dispatch.test");
+        child_tc
+            .scope_future(span, fut)
+            .await
+            .expect("broker dispatch");
+
+        let delivered = consumer
+            .next_message()
+            .await
+            .expect("next_message")
+            .expect("delivered");
+        let tp = delivered
+            .headers
+            .get("traceparent")
+            .expect("traceparent header");
+        assert_eq!(
+            tp, &child_tc.traceparent,
+            "broker_dispatcher must capture the async scoped span, not the synchronous ambient span"
+        );
     }
 }

@@ -56,14 +56,15 @@ jobs:
         run: cargo doc -p rume --no-deps --all-features
 
   audit:
-    name: security audit
+    name: security audit & cargo-deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7.0.1
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-audit
+          tool: cargo-audit,cargo-deny
       - run: cargo audit
+      - run: cargo deny check
 
   msrv:
     name: msrv (1.96)
@@ -119,10 +120,13 @@ jobs:
           - package: workbench
             name: "workbench (multi-instance cluster tests)"
             features: ""
-          - package: "rume-foundation -p rume-observability -p rume-data -p rume-messaging -p rume-security -p rume-http -p rume-enterprise -p rume-app -p rume-testing"
+          - package: "rume-foundation -p rume-observability -p rume-data -p rume-messaging -p rume-security -p rume-http -p rume-enterprise -p rume-app -p rume-testing -p rume-grpc -p rume-graphql"
             name: "workspace crates (unit tests, all features)"
             features: "--all-features"
             targets: "--lib"
+          - package: "rume-crash -p xtask"
+            name: "rume-crash & xtask"
+            features: ""
     services:
       postgres:
         image: postgres:16-alpine

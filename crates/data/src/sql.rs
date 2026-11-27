@@ -175,3 +175,677 @@ pub const SQLITE_OUTBOX_REPROCESS_FAILED: &str =
 /// Purge published messages.
 pub const SQLITE_OUTBOX_PURGE_PUBLISHED: &str =
     include_str!("../sql/sqlite/outbox_purge_published.sql");
+
+// Multi-tenancy & RLS (PostgreSQL).
+
+/// Sets transaction-local `app.current_tenant` for PostgreSQL Row-Level Security.
+pub const PG_SET_TENANT_CONTEXT: &str = include_str!("../sql/postgres/pg_set_tenant_context.sql");
+/// Sets transaction-local `search_path` for PostgreSQL schema-per-tenant isolation.
+pub const PG_SET_TENANT_SEARCH_PATH: &str =
+    include_str!("../sql/postgres/pg_set_tenant_search_path.sql");
+
+// Auth & Multi-Tenancy (PostgreSQL).
+
+/// Schema DDL for auth and multi-tenancy tables in PostgreSQL.
+pub const PG_AUTH_SCHEMA: &str = include_str!("../sql/postgres/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in PostgreSQL.
+pub const PG_AUTH_DOWN: &str = include_str!("../sql/postgres/auth_down.sql");
+/// Load a session by ID in PostgreSQL.
+pub const PG_AUTH_SESSION_LOAD: &str = include_str!("../sql/postgres/auth_session_load.sql");
+/// Upsert a session in PostgreSQL.
+pub const PG_AUTH_SESSION_UPSERT: &str = include_str!("../sql/postgres/auth_session_upsert.sql");
+/// Delete a session by ID in PostgreSQL.
+pub const PG_AUTH_SESSION_DELETE: &str = include_str!("../sql/postgres/auth_session_delete.sql");
+/// Prune expired sessions in PostgreSQL.
+pub const PG_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/postgres/auth_session_prune_expired.sql");
+/// Insert an API key record in PostgreSQL.
+pub const PG_AUTH_API_KEY_INSERT: &str = include_str!("../sql/postgres/auth_api_key_insert.sql");
+/// Find an API key by ID in PostgreSQL.
+pub const PG_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/postgres/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in PostgreSQL.
+pub const PG_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/postgres/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in PostgreSQL.
+pub const PG_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/postgres/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in PostgreSQL.
+pub const PG_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/postgres/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in PostgreSQL.
+pub const PG_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/postgres/auth_api_key_touch_last_used.sql");
+/// Insert a role in PostgreSQL.
+pub const PG_AUTH_ROLE_INSERT: &str = include_str!("../sql/postgres/auth_role_insert.sql");
+/// Delete a role in PostgreSQL.
+pub const PG_AUTH_ROLE_DELETE: &str = include_str!("../sql/postgres/auth_role_delete.sql");
+/// Grant a permission to a role in PostgreSQL.
+pub const PG_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/postgres/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in PostgreSQL.
+pub const PG_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/postgres/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in PostgreSQL.
+pub const PG_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/postgres/auth_role_permissions_list.sql");
+/// Assign a role to a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/postgres/auth_user_role_assign.sql");
+/// Unassign a role from a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/postgres/auth_user_role_unassign.sql");
+/// List roles assigned to a user in PostgreSQL.
+pub const PG_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/postgres/auth_user_roles_list.sql");
+/// List effective permissions for a user in PostgreSQL.
+pub const PG_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/postgres/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in PostgreSQL.
+pub const PG_AUTH_TENANT_UPSERT: &str = include_str!("../sql/postgres/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in PostgreSQL.
+pub const PG_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/postgres/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in PostgreSQL.
+pub const PG_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/postgres/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in PostgreSQL.
+pub const PG_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/postgres/auth_tenant_deactivate.sql");
+
+// Auth & Multi-Tenancy (MySQL).
+
+/// Schema DDL for auth and multi-tenancy tables in MySQL.
+pub const MYSQL_AUTH_SCHEMA: &str = include_str!("../sql/mysql/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in MySQL.
+pub const MYSQL_AUTH_DOWN: &str = include_str!("../sql/mysql/auth_down.sql");
+/// Load a session by ID in MySQL.
+pub const MYSQL_AUTH_SESSION_LOAD: &str = include_str!("../sql/mysql/auth_session_load.sql");
+/// Upsert a session in MySQL.
+pub const MYSQL_AUTH_SESSION_UPSERT: &str = include_str!("../sql/mysql/auth_session_upsert.sql");
+/// Delete a session by ID in MySQL.
+pub const MYSQL_AUTH_SESSION_DELETE: &str = include_str!("../sql/mysql/auth_session_delete.sql");
+/// Prune expired sessions in MySQL.
+pub const MYSQL_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/mysql/auth_session_prune_expired.sql");
+/// Insert an API key record in MySQL.
+pub const MYSQL_AUTH_API_KEY_INSERT: &str = include_str!("../sql/mysql/auth_api_key_insert.sql");
+/// Find an API key by ID in MySQL.
+pub const MYSQL_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/mysql/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in MySQL.
+pub const MYSQL_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/mysql/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in MySQL.
+pub const MYSQL_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/mysql/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in MySQL.
+pub const MYSQL_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/mysql/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in MySQL.
+pub const MYSQL_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/mysql/auth_api_key_touch_last_used.sql");
+/// Insert a role in MySQL.
+pub const MYSQL_AUTH_ROLE_INSERT: &str = include_str!("../sql/mysql/auth_role_insert.sql");
+/// Delete a role in MySQL.
+pub const MYSQL_AUTH_ROLE_DELETE: &str = include_str!("../sql/mysql/auth_role_delete.sql");
+/// Grant a permission to a role in MySQL.
+pub const MYSQL_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/mysql/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in MySQL.
+pub const MYSQL_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/mysql/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in MySQL.
+pub const MYSQL_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/mysql/auth_role_permissions_list.sql");
+/// Assign a role to a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/mysql/auth_user_role_assign.sql");
+/// Unassign a role from a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/mysql/auth_user_role_unassign.sql");
+/// List roles assigned to a user in MySQL.
+pub const MYSQL_AUTH_USER_ROLES_LIST: &str = include_str!("../sql/mysql/auth_user_roles_list.sql");
+/// List effective permissions for a user in MySQL.
+pub const MYSQL_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/mysql/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in MySQL.
+pub const MYSQL_AUTH_TENANT_UPSERT: &str = include_str!("../sql/mysql/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/mysql/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in MySQL.
+pub const MYSQL_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/mysql/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in MySQL.
+pub const MYSQL_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/mysql/auth_tenant_deactivate.sql");
+
+// Auth & Multi-Tenancy (SQLite).
+
+/// Schema DDL for auth and multi-tenancy tables in SQLite.
+pub const SQLITE_AUTH_SCHEMA: &str = include_str!("../sql/sqlite/auth_schema.sql");
+/// Rollback DDL for auth and multi-tenancy tables in SQLite.
+pub const SQLITE_AUTH_DOWN: &str = include_str!("../sql/sqlite/auth_down.sql");
+/// Load a session by ID in SQLite.
+pub const SQLITE_AUTH_SESSION_LOAD: &str = include_str!("../sql/sqlite/auth_session_load.sql");
+/// Upsert a session in SQLite.
+pub const SQLITE_AUTH_SESSION_UPSERT: &str = include_str!("../sql/sqlite/auth_session_upsert.sql");
+/// Delete a session by ID in SQLite.
+pub const SQLITE_AUTH_SESSION_DELETE: &str = include_str!("../sql/sqlite/auth_session_delete.sql");
+/// Prune expired sessions in SQLite.
+pub const SQLITE_AUTH_SESSION_PRUNE_EXPIRED: &str =
+    include_str!("../sql/sqlite/auth_session_prune_expired.sql");
+/// Insert an API key record in SQLite.
+pub const SQLITE_AUTH_API_KEY_INSERT: &str = include_str!("../sql/sqlite/auth_api_key_insert.sql");
+/// Find an API key by ID in SQLite.
+pub const SQLITE_AUTH_API_KEY_FIND_BY_ID: &str =
+    include_str!("../sql/sqlite/auth_api_key_find_by_id.sql");
+/// Find API keys by lookup prefix in SQLite.
+pub const SQLITE_AUTH_API_KEY_FIND_BY_PREFIX: &str =
+    include_str!("../sql/sqlite/auth_api_key_find_by_prefix.sql");
+/// List API keys for a user in SQLite.
+pub const SQLITE_AUTH_API_KEY_LIST_FOR_USER: &str =
+    include_str!("../sql/sqlite/auth_api_key_list_for_user.sql");
+/// Revoke an API key by ID in SQLite.
+pub const SQLITE_AUTH_API_KEY_REVOKE: &str = include_str!("../sql/sqlite/auth_api_key_revoke.sql");
+/// Update last-used timestamp for an API key in SQLite.
+pub const SQLITE_AUTH_API_KEY_TOUCH_LAST_USED: &str =
+    include_str!("../sql/sqlite/auth_api_key_touch_last_used.sql");
+/// Insert a role in SQLite.
+pub const SQLITE_AUTH_ROLE_INSERT: &str = include_str!("../sql/sqlite/auth_role_insert.sql");
+/// Delete a role in SQLite.
+pub const SQLITE_AUTH_ROLE_DELETE: &str = include_str!("../sql/sqlite/auth_role_delete.sql");
+/// Grant a permission to a role in SQLite.
+pub const SQLITE_AUTH_ROLE_GRANT_PERMISSION: &str =
+    include_str!("../sql/sqlite/auth_role_grant_permission.sql");
+/// Revoke a permission from a role in SQLite.
+pub const SQLITE_AUTH_ROLE_REVOKE_PERMISSION: &str =
+    include_str!("../sql/sqlite/auth_role_revoke_permission.sql");
+/// List permissions granted to a role in SQLite.
+pub const SQLITE_AUTH_ROLE_PERMISSIONS_LIST: &str =
+    include_str!("../sql/sqlite/auth_role_permissions_list.sql");
+/// Assign a role to a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLE_ASSIGN: &str =
+    include_str!("../sql/sqlite/auth_user_role_assign.sql");
+/// Unassign a role from a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLE_UNASSIGN: &str =
+    include_str!("../sql/sqlite/auth_user_role_unassign.sql");
+/// List roles assigned to a user in SQLite.
+pub const SQLITE_AUTH_USER_ROLES_LIST: &str =
+    include_str!("../sql/sqlite/auth_user_roles_list.sql");
+/// List effective permissions for a user in SQLite.
+pub const SQLITE_AUTH_USER_EFFECTIVE_PERMISSIONS: &str =
+    include_str!("../sql/sqlite/auth_user_effective_permissions.sql");
+/// Upsert a tenant record in SQLite.
+pub const SQLITE_AUTH_TENANT_UPSERT: &str = include_str!("../sql/sqlite/auth_tenant_upsert.sql");
+/// Find an active tenant by ID in SQLite.
+pub const SQLITE_AUTH_TENANT_FIND_BY_ID: &str =
+    include_str!("../sql/sqlite/auth_tenant_find_by_id.sql");
+/// Find an active tenant by slug in SQLite.
+pub const SQLITE_AUTH_TENANT_FIND_BY_SLUG: &str =
+    include_str!("../sql/sqlite/auth_tenant_find_by_slug.sql");
+/// Deactivate a tenant in SQLite.
+pub const SQLITE_AUTH_TENANT_DEACTIVATE: &str =
+    include_str!("../sql/sqlite/auth_tenant_deactivate.sql");
+
+// Jobs (SQLite).
+
+/// Schema DDL for the durable `rume_jobs` table in SQLite.
+pub const SQLITE_JOBS_SCHEMA: &str = include_str!("../sql/sqlite/jobs_schema.sql");
+/// Insert a new durable job in SQLite.
+pub const SQLITE_JOBS_INSERT: &str = include_str!("../sql/sqlite/jobs_insert.sql");
+/// Claim the next available pending job in SQLite.
+pub const SQLITE_JOBS_CLAIM: &str = include_str!("../sql/sqlite/jobs_claim.sql");
+/// Acknowledge a claimed job in SQLite.
+pub const SQLITE_JOBS_ACK: &str = include_str!("../sql/sqlite/jobs_ack.sql");
+/// Negatively acknowledge a claimed job in SQLite.
+pub const SQLITE_JOBS_NACK: &str = include_str!("../sql/sqlite/jobs_nack.sql");
+/// Defer a job until a later time in SQLite.
+pub const SQLITE_JOBS_DEFER: &str = include_str!("../sql/sqlite/jobs_defer.sql");
+/// Move a job to the dead-letter queue in SQLite.
+pub const SQLITE_JOBS_DEAD_LETTER: &str = include_str!("../sql/sqlite/jobs_dead_letter.sql");
+/// Renew the lease of an in-flight job in SQLite.
+pub const SQLITE_JOBS_RENEW_LEASE: &str = include_str!("../sql/sqlite/jobs_renew_lease.sql");
+/// Reap jobs abandoned by a dead worker in SQLite.
+pub const SQLITE_JOBS_REAP: &str = include_str!("../sql/sqlite/jobs_reap.sql");
+/// Count currently pending jobs in SQLite.
+pub const SQLITE_JOBS_PENDING_COUNT: &str = include_str!("../sql/sqlite/jobs_pending_count.sql");
+/// Count jobs in the dead-letter queue in SQLite.
+pub const SQLITE_JOBS_DEAD_LETTER_COUNT: &str =
+    include_str!("../sql/sqlite/jobs_dead_letter_count.sql");
+/// Check for an existing idempotency key in SQLite.
+pub const SQLITE_JOBS_IDEMPOTENCY_CHECK: &str =
+    include_str!("../sql/sqlite/jobs_idempotency_check.sql");
+/// List dead-lettered jobs in SQLite.
+pub const SQLITE_JOBS_LIST_DEAD_LETTERS: &str =
+    include_str!("../sql/sqlite/jobs_list_dead_letters.sql");
+/// Replay a dead-lettered job in SQLite.
+pub const SQLITE_JOBS_REPLAY_DEAD_LETTER: &str =
+    include_str!("../sql/sqlite/jobs_replay_dead_letter.sql");
+/// Purge terminal jobs in SQLite.
+pub const SQLITE_JOBS_PURGE: &str = include_str!("../sql/sqlite/jobs_purge.sql");
+
+// Jobs (MySQL).
+
+/// Schema DDL for the durable `rume_jobs` table in MySQL.
+pub const MYSQL_JOBS_SCHEMA: &str = include_str!("../sql/mysql/jobs_schema.sql");
+/// Insert a new durable job in MySQL.
+pub const MYSQL_JOBS_INSERT: &str = include_str!("../sql/mysql/jobs_insert.sql");
+/// Select and lock the next available pending job in MySQL.
+pub const MYSQL_JOBS_CLAIM: &str = include_str!("../sql/mysql/jobs_claim.sql");
+/// Update a locked job row to `in_flight` in MySQL.
+pub const MYSQL_JOBS_CLAIM_UPDATE: &str = include_str!("../sql/mysql/jobs_claim_update.sql");
+/// Acknowledge a claimed job in MySQL.
+pub const MYSQL_JOBS_ACK: &str = include_str!("../sql/mysql/jobs_ack.sql");
+/// Negatively acknowledge a claimed job in MySQL.
+pub const MYSQL_JOBS_NACK: &str = include_str!("../sql/mysql/jobs_nack.sql");
+/// Defer a job until a later time in MySQL.
+pub const MYSQL_JOBS_DEFER: &str = include_str!("../sql/mysql/jobs_defer.sql");
+/// Move a job to the dead-letter queue in MySQL.
+pub const MYSQL_JOBS_DEAD_LETTER: &str = include_str!("../sql/mysql/jobs_dead_letter.sql");
+/// Renew the lease of an in-flight job in MySQL.
+pub const MYSQL_JOBS_RENEW_LEASE: &str = include_str!("../sql/mysql/jobs_renew_lease.sql");
+/// Reap jobs abandoned by a dead worker in MySQL.
+pub const MYSQL_JOBS_REAP: &str = include_str!("../sql/mysql/jobs_reap.sql");
+/// Count currently pending jobs in MySQL.
+pub const MYSQL_JOBS_PENDING_COUNT: &str = include_str!("../sql/mysql/jobs_pending_count.sql");
+/// Count jobs in the dead-letter queue in MySQL.
+pub const MYSQL_JOBS_DEAD_LETTER_COUNT: &str =
+    include_str!("../sql/mysql/jobs_dead_letter_count.sql");
+/// Check for an existing idempotency key in MySQL.
+pub const MYSQL_JOBS_IDEMPOTENCY_CHECK: &str =
+    include_str!("../sql/mysql/jobs_idempotency_check.sql");
+/// List dead-lettered jobs in MySQL.
+pub const MYSQL_JOBS_LIST_DEAD_LETTERS: &str =
+    include_str!("../sql/mysql/jobs_list_dead_letters.sql");
+/// Replay a dead-lettered job in MySQL.
+pub const MYSQL_JOBS_REPLAY_DEAD_LETTER: &str =
+    include_str!("../sql/mysql/jobs_replay_dead_letter.sql");
+/// Purge terminal jobs in MySQL.
+pub const MYSQL_JOBS_PURGE: &str = include_str!("../sql/mysql/jobs_purge.sql");
+
+// Job Batches (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_job_batches` in SQLite.
+pub const SQLITE_BATCHES_SCHEMA: &str = include_str!("../sql/sqlite/batches_schema.sql");
+/// Insert a new job batch in SQLite.
+pub const SQLITE_BATCHES_INSERT: &str = include_str!("../sql/sqlite/batches_insert.sql");
+/// Load a job batch by ID in SQLite.
+pub const SQLITE_BATCHES_LOAD: &str = include_str!("../sql/sqlite/batches_load.sql");
+/// Record a completed job in a batch in SQLite.
+pub const SQLITE_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/sqlite/batches_record_success.sql");
+/// Record a failed job in a batch in SQLite.
+pub const SQLITE_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/sqlite/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in SQLite.
+pub const SQLITE_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/sqlite/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in SQLite.
+pub const SQLITE_BATCHES_CANCEL: &str = include_str!("../sql/sqlite/batches_cancel.sql");
+
+/// Schema DDL for `rume_job_batches` in PostgreSQL.
+pub const PG_BATCHES_SCHEMA: &str = include_str!("../sql/postgres/batches_schema.sql");
+/// Insert a new job batch in PostgreSQL.
+pub const PG_BATCHES_INSERT: &str = include_str!("../sql/postgres/batches_insert.sql");
+/// Load a job batch by ID in PostgreSQL.
+pub const PG_BATCHES_LOAD: &str = include_str!("../sql/postgres/batches_load.sql");
+/// Record a completed job in a batch in PostgreSQL.
+pub const PG_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/postgres/batches_record_success.sql");
+/// Record a failed job in a batch in PostgreSQL.
+pub const PG_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/postgres/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in PostgreSQL.
+pub const PG_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/postgres/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in PostgreSQL.
+pub const PG_BATCHES_CANCEL: &str = include_str!("../sql/postgres/batches_cancel.sql");
+
+/// Schema DDL for `rume_job_batches` in MySQL.
+pub const MYSQL_BATCHES_SCHEMA: &str = include_str!("../sql/mysql/batches_schema.sql");
+/// Insert a new job batch in MySQL.
+pub const MYSQL_BATCHES_INSERT: &str = include_str!("../sql/mysql/batches_insert.sql");
+/// Load a job batch by ID in MySQL.
+pub const MYSQL_BATCHES_LOAD: &str = include_str!("../sql/mysql/batches_load.sql");
+/// Record a completed job in a batch in MySQL.
+pub const MYSQL_BATCHES_RECORD_SUCCESS: &str =
+    include_str!("../sql/mysql/batches_record_success.sql");
+/// Record a failed job in a batch in MySQL.
+pub const MYSQL_BATCHES_RECORD_FAILURE: &str =
+    include_str!("../sql/mysql/batches_record_failure.sql");
+/// Mark batch callbacks as dispatched in MySQL.
+pub const MYSQL_BATCHES_MARK_CALLBACKS_DISPATCHED: &str =
+    include_str!("../sql/mysql/batches_mark_callbacks_dispatched.sql");
+/// Cancel a running batch in MySQL.
+pub const MYSQL_BATCHES_CANCEL: &str = include_str!("../sql/mysql/batches_cancel.sql");
+
+// Sagas (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_sagas` in SQLite.
+pub const SQLITE_SAGA_SCHEMA: &str = include_str!("../sql/sqlite/saga_schema.sql");
+/// Insert a new saga record in SQLite.
+pub const SQLITE_SAGA_INSERT: &str = include_str!("../sql/sqlite/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in SQLite.
+pub const SQLITE_SAGA_UPDATE_CAS: &str = include_str!("../sql/sqlite/saga_update_cas.sql");
+/// Load a saga record by ID in SQLite.
+pub const SQLITE_SAGA_LOAD: &str = include_str!("../sql/sqlite/saga_load.sql");
+/// List incomplete saga records in SQLite.
+pub const SQLITE_SAGA_LIST_INCOMPLETE: &str =
+    include_str!("../sql/sqlite/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/sqlite/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_RENEW_CLAIM: &str = include_str!("../sql/sqlite/saga_renew_claim.sql");
+/// Release an execution claim lease for a saga in SQLite.
+pub const SQLITE_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/sqlite/saga_release_claim.sql");
+
+/// Schema DDL for `rume_sagas` in PostgreSQL.
+pub const PG_SAGA_SCHEMA: &str = include_str!("../sql/postgres/saga_schema.sql");
+/// Insert a new saga record in PostgreSQL.
+pub const PG_SAGA_INSERT: &str = include_str!("../sql/postgres/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in PostgreSQL.
+pub const PG_SAGA_UPDATE_CAS: &str = include_str!("../sql/postgres/saga_update_cas.sql");
+/// Load a saga record by ID in PostgreSQL.
+pub const PG_SAGA_LOAD: &str = include_str!("../sql/postgres/saga_load.sql");
+/// List incomplete saga records in PostgreSQL.
+pub const PG_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/postgres/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/postgres/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_RENEW_CLAIM: &str = include_str!("../sql/postgres/saga_renew_claim.sql");
+/// Release an execution claim lease for a saga in PostgreSQL.
+pub const PG_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/postgres/saga_release_claim.sql");
+
+/// Schema DDL for `rume_sagas` in MySQL.
+pub const MYSQL_SAGA_SCHEMA: &str = include_str!("../sql/mysql/saga_schema.sql");
+/// Insert a new saga record in MySQL.
+pub const MYSQL_SAGA_INSERT: &str = include_str!("../sql/mysql/saga_insert.sql");
+/// Optimistically update a saga record with version CAS in MySQL.
+pub const MYSQL_SAGA_UPDATE_CAS: &str = include_str!("../sql/mysql/saga_update_cas.sql");
+/// Load a saga record by ID in MySQL.
+pub const MYSQL_SAGA_LOAD: &str = include_str!("../sql/mysql/saga_load.sql");
+/// List incomplete saga records in MySQL.
+pub const MYSQL_SAGA_LIST_INCOMPLETE: &str = include_str!("../sql/mysql/saga_list_incomplete.sql");
+/// Acquire an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_ACQUIRE_CLAIM: &str = include_str!("../sql/mysql/saga_acquire_claim.sql");
+/// Renew an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_RENEW_CLAIM: &str = include_str!("../sql/mysql/saga_renew_claim.sql");
+/// Release an execution claim lease for a saga in MySQL.
+pub const MYSQL_SAGA_RELEASE_CLAIM: &str = include_str!("../sql/mysql/saga_release_claim.sql");
+
+// Milestone E: Feature flags (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_feature_flags` in SQLite.
+pub const SQLITE_FEATURE_FLAGS_SCHEMA: &str =
+    include_str!("../sql/sqlite/feature_flags_schema.sql");
+
+/// Schema DDL for `rume_feature_flags` in PostgreSQL.
+pub const PG_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/postgres/feature_flags_schema.sql");
+
+/// Schema DDL for `rume_feature_flags` in MySQL.
+pub const MYSQL_FEATURE_FLAGS_SCHEMA: &str = include_str!("../sql/mysql/feature_flags_schema.sql");
+
+/// Upsert a feature flag in SQLite.
+pub const SQLITE_FEATURE_FLAGS_UPSERT: &str =
+    include_str!("../sql/sqlite/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in SQLite.
+pub const SQLITE_FEATURE_FLAGS_GET: &str = include_str!("../sql/sqlite/feature_flags_get.sql");
+/// List tenant-scoped feature flags in SQLite.
+pub const SQLITE_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/sqlite/feature_flags_list_tenant.sql");
+/// List global feature flags in SQLite.
+pub const SQLITE_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/sqlite/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in SQLite.
+pub const SQLITE_FEATURE_FLAGS_DELETE: &str =
+    include_str!("../sql/sqlite/feature_flags_delete.sql");
+
+/// Upsert a feature flag in PostgreSQL.
+pub const PG_FEATURE_FLAGS_UPSERT: &str = include_str!("../sql/postgres/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in PostgreSQL.
+pub const PG_FEATURE_FLAGS_GET: &str = include_str!("../sql/postgres/feature_flags_get.sql");
+/// List tenant-scoped feature flags in PostgreSQL.
+pub const PG_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/postgres/feature_flags_list_tenant.sql");
+/// List global feature flags in PostgreSQL.
+pub const PG_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/postgres/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in PostgreSQL.
+pub const PG_FEATURE_FLAGS_DELETE: &str = include_str!("../sql/postgres/feature_flags_delete.sql");
+
+/// Upsert a feature flag in MySQL.
+pub const MYSQL_FEATURE_FLAGS_UPSERT: &str = include_str!("../sql/mysql/feature_flags_upsert.sql");
+/// Fetch a feature flag by composite ID in MySQL.
+pub const MYSQL_FEATURE_FLAGS_GET: &str = include_str!("../sql/mysql/feature_flags_get.sql");
+/// List tenant-scoped feature flags in MySQL.
+pub const MYSQL_FEATURE_FLAGS_LIST_TENANT: &str =
+    include_str!("../sql/mysql/feature_flags_list_tenant.sql");
+/// List global feature flags in MySQL.
+pub const MYSQL_FEATURE_FLAGS_LIST_GLOBAL: &str =
+    include_str!("../sql/mysql/feature_flags_list_global.sql");
+/// Delete a feature flag by composite ID in MySQL.
+pub const MYSQL_FEATURE_FLAGS_DELETE: &str = include_str!("../sql/mysql/feature_flags_delete.sql");
+
+// Milestone E: Usage metering (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_usage_counters` in SQLite.
+pub const SQLITE_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/sqlite/usage_metering_schema.sql");
+
+/// Schema DDL for `rume_usage_counters` in PostgreSQL.
+pub const PG_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/postgres/usage_metering_schema.sql");
+
+/// Schema DDL for `rume_usage_counters` in MySQL.
+pub const MYSQL_USAGE_METERING_SCHEMA: &str =
+    include_str!("../sql/mysql/usage_metering_schema.sql");
+
+/// Increment a usage counter in SQLite.
+pub const SQLITE_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/sqlite/usage_metering_increment.sql");
+/// Fetch a usage counter in SQLite.
+pub const SQLITE_USAGE_METERING_GET: &str = include_str!("../sql/sqlite/usage_metering_get.sql");
+/// List non-zero usage counters in SQLite.
+pub const SQLITE_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/sqlite/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in SQLite.
+pub const SQLITE_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/sqlite/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in SQLite.
+pub const SQLITE_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/sqlite/usage_metering_batch_release_claim.sql");
+
+/// Increment a usage counter in PostgreSQL.
+pub const PG_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/postgres/usage_metering_increment.sql");
+/// Fetch a usage counter in PostgreSQL.
+pub const PG_USAGE_METERING_GET: &str = include_str!("../sql/postgres/usage_metering_get.sql");
+/// List non-zero usage counters in PostgreSQL.
+pub const PG_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/postgres/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in PostgreSQL.
+pub const PG_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/postgres/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/postgres/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/postgres/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/postgres/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/postgres/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in PostgreSQL.
+pub const PG_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/postgres/usage_metering_batch_release_claim.sql");
+
+/// Increment a usage counter in MySQL.
+pub const MYSQL_USAGE_METERING_INCREMENT: &str =
+    include_str!("../sql/mysql/usage_metering_increment.sql");
+/// Fetch a usage counter in MySQL.
+pub const MYSQL_USAGE_METERING_GET: &str = include_str!("../sql/mysql/usage_metering_get.sql");
+/// List non-zero usage counters in MySQL.
+pub const MYSQL_USAGE_METERING_LIST_NONZERO: &str =
+    include_str!("../sql/mysql/usage_metering_list_nonzero.sql");
+/// Decrement a usage counter after flush in MySQL.
+pub const MYSQL_USAGE_METERING_DECREMENT: &str =
+    include_str!("../sql/mysql/usage_metering_decrement.sql");
+/// Insert a staged usage export batch in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_INSERT: &str =
+    include_str!("../sql/mysql/usage_metering_batch_insert.sql");
+/// List pending unexported usage export batches in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_LIST_PENDING: &str =
+    include_str!("../sql/mysql/usage_metering_batch_list_pending.sql");
+/// Claim a pending usage export batch in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_CLAIM: &str =
+    include_str!("../sql/mysql/usage_metering_batch_claim.sql");
+/// Mark a usage export batch as exported in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_MARK_EXPORTED: &str =
+    include_str!("../sql/mysql/usage_metering_batch_mark_exported.sql");
+/// Release a usage export batch claim after sink failure in MySQL.
+pub const MYSQL_USAGE_METERING_BATCH_RELEASE_CLAIM: &str =
+    include_str!("../sql/mysql/usage_metering_batch_release_claim.sql");
+
+// Milestone E: Webhook deliveries (SQLite, PostgreSQL, MySQL).
+
+/// Schema DDL for `rume_webhook_deliveries` in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_schema.sql");
+
+/// Schema DDL for `rume_webhook_deliveries` in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/postgres/webhook_deliveries_schema.sql");
+
+/// Schema DDL for `rume_webhook_deliveries` in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_SCHEMA: &str =
+    include_str!("../sql/mysql/webhook_deliveries_schema.sql");
+
+/// Upsert a webhook delivery record in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_list_due.sql");
+/// Atomically claim due pending or lease-expired webhook delivery records in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_CLAIM_DUE: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_claim_due.sql");
+/// Conditionally finalize an in-flight webhook delivery record in SQLite.
+pub const SQLITE_WEBHOOK_DELIVERIES_COMPLETE: &str =
+    include_str!("../sql/sqlite/webhook_deliveries_complete.sql");
+
+/// Upsert a webhook delivery record in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/postgres/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/postgres/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/postgres/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/postgres/webhook_deliveries_list_due.sql");
+/// Atomically claim due pending or lease-expired webhook delivery records in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_CLAIM_DUE: &str =
+    include_str!("../sql/postgres/webhook_deliveries_claim_due.sql");
+/// Conditionally finalize an in-flight webhook delivery record in PostgreSQL.
+pub const PG_WEBHOOK_DELIVERIES_COMPLETE: &str =
+    include_str!("../sql/postgres/webhook_deliveries_complete.sql");
+
+/// Upsert a webhook delivery record in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_UPSERT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_upsert.sql");
+/// Fetch a webhook delivery record by ID in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_GET: &str =
+    include_str!("../sql/mysql/webhook_deliveries_get.sql");
+/// List webhook delivery records for an endpoint in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_LIST_BY_ENDPOINT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_list_by_endpoint.sql");
+/// List due pending webhook delivery records in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_LIST_DUE: &str =
+    include_str!("../sql/mysql/webhook_deliveries_list_due.sql");
+/// Select and lock due webhook delivery records in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_SELECT: &str =
+    include_str!("../sql/mysql/webhook_deliveries_claim_due_select.sql");
+/// Transition a locked webhook delivery record to `in_flight` in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_CLAIM_DUE_UPDATE: &str =
+    include_str!("../sql/mysql/webhook_deliveries_claim_due_update.sql");
+/// Conditionally finalize an in-flight webhook delivery record in MySQL.
+pub const MYSQL_WEBHOOK_DELIVERIES_COMPLETE: &str =
+    include_str!("../sql/mysql/webhook_deliveries_complete.sql");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Asserts that every Milestone E SQLite/Postgres/MySQL DDL constant for
+    /// feature flags, usage metering, and webhook deliveries is non-empty.
+    ///
+    /// Why: `include_str!` silently includes an empty file if the SQL asset was
+    /// accidentally created as a placeholder. This test catches that at
+    /// `cargo test` time, well before any migration runner executes the DDL.
+    #[test]
+    fn milestone_e_sql_assets_are_non_empty() {
+        // Feature flags.
+        assert!(
+            !SQLITE_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "SQLITE_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "PG_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_FEATURE_FLAGS_SCHEMA.trim().is_empty(),
+            "MYSQL_FEATURE_FLAGS_SCHEMA must be non-empty"
+        );
+
+        // Usage metering.
+        assert!(
+            !SQLITE_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "SQLITE_USAGE_METERING_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "PG_USAGE_METERING_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_USAGE_METERING_SCHEMA.trim().is_empty(),
+            "MYSQL_USAGE_METERING_SCHEMA must be non-empty"
+        );
+
+        // Webhook deliveries.
+        assert!(
+            !SQLITE_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "SQLITE_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+        assert!(
+            !PG_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "PG_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+        assert!(
+            !MYSQL_WEBHOOK_DELIVERIES_SCHEMA.trim().is_empty(),
+            "MYSQL_WEBHOOK_DELIVERIES_SCHEMA must be non-empty"
+        );
+    }
+}

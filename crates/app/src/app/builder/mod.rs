@@ -32,6 +32,8 @@ pub use self::middleware::MiddlewareConfigError;
 pub enum BuildError {
     /// Middleware configuration error.
     Middleware(MiddlewareConfigError),
+    /// CORS configuration error.
+    Cors(rume_http::transport::CorsConfigError),
     /// Module registration or dependency error.
     Module(crate::module::ModuleError),
     /// Application or module startup hook failure.
@@ -46,6 +48,7 @@ impl std::fmt::Display for BuildError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Middleware(err) => write!(f, "{err}"),
+            Self::Cors(err) => write!(f, "{err}"),
             Self::Module(err) => write!(f, "{err}"),
             Self::Startup(msg) => write!(f, "startup failure: {msg}"),
             Self::DuplicateRoute { method, path } => {
@@ -61,6 +64,12 @@ impl std::error::Error for BuildError {}
 impl From<MiddlewareConfigError> for BuildError {
     fn from(err: MiddlewareConfigError) -> Self {
         Self::Middleware(err)
+    }
+}
+
+impl From<rume_http::transport::CorsConfigError> for BuildError {
+    fn from(err: rume_http::transport::CorsConfigError) -> Self {
+        Self::Cors(err)
     }
 }
 
@@ -274,8 +283,42 @@ where
     applied_middleware: BTreeSet<String>,
     /// Group names marked for application via `use_group`.
     applied_groups: BTreeSet<String>,
+    /// Deferred Tower layers registered via [`layer`](Self::layer), applied after
+    /// module routes are merged and outside [`http_cache`](Self::http_cache).
+    layers: Vec<
+        Box<
+            dyn FnOnce(Router<AppContext<E, C, S>>) -> Router<AppContext<E, C, S>>
+                + Send
+                + Sync
+                + 'static,
+        >,
+    >,
+    /// Optional HTTP response cache layer applied strictly inside all user `.layer()`
+    /// and `.middleware()` layers so tenant/auth layers always execute first.
+    http_cache: Option<rume_http::http_cache::HttpCacheLayer>,
     /// Maximum time to wait for all shutdown hooks before force-terminating.
     shutdown_timeout: Duration,
+    /// Transport-level maximum request body size in bytes (default: 2 MiB; `None` disables the cap).
+    body_limit: Option<usize>,
+    /// Optional fail-closed CORS configuration (opt-in; `None` by default).
+    cors: Option<rume_http::transport::CorsConfig>,
+    /// Optional HTTP response compression configuration (opt-in; `None` by default).
+    compression: Option<rume_http::transport::CompressionConfig>,
+    /// Optional HTTP header & JSON PII redaction configuration for `ObservabilityLayer`.
+    redaction: Option<rume_observability::RedactionConfig>,
+    /// Optional native TLS configuration (feature-gated under `tls`).
+    #[cfg(feature = "tls")]
+    tls: Option<rume_http::tls::TlsConfig>,
+    /// Optional real-time WebSocket/SSE hub.
+    realtime: Option<rume_http::realtime::RealtimeHub>,
+    /// Registered one-off application tasks.
+    tasks: crate::app::task::TaskRegistry<E, C, S>,
+    /// Deferred duplicate-task registration error surfaced during task execution.
+    task_error: Option<crate::app::task::TaskError>,
+    /// Selected task name for [`ApplicationMode::Task`].
+    task_name: Option<String>,
+    /// OpenAPI metadata used by [`ApplicationMode::OpenApi`] (populated via `.openapi()` or `.openapi_info()`).
+    openapi_info: Option<rume_http::openapi::OpenApiInfo>,
 }
 
 impl<E, C, S> RumeBuilder<E, C, S>
@@ -301,7 +344,20 @@ where
             groups_order: Vec::new(),
             applied_middleware: BTreeSet::new(),
             applied_groups: BTreeSet::new(),
+            layers: Vec::new(),
+            http_cache: None,
             shutdown_timeout: Duration::from_secs(30),
+            body_limit: Some(rume_http::transport::DEFAULT_BODY_LIMIT_BYTES),
+            cors: None,
+            compression: None,
+            redaction: None,
+            #[cfg(feature = "tls")]
+            tls: None,
+            realtime: None,
+            tasks: crate::app::task::TaskRegistry::new(),
+            task_error: None,
+            task_name: None,
+            openapi_info: None,
         }
     }
 
@@ -419,28 +475,146 @@ where
         self
     }
 
+    /// Set the transport-level maximum request body size in bytes (default: 2 MiB).
+    pub fn body_limit(mut self, max_bytes: usize) -> Self {
+        self.body_limit = Some(max_bytes);
+        self
+    }
+
+    /// Disable the transport-level request body size limit.
+    pub fn without_body_limit(mut self) -> Self {
+        self.body_limit = None;
+        self
+    }
+
+    /// Enable fail-closed CORS middleware with the given [`rume_http::transport::CorsConfig`].
+    pub fn cors(mut self, config: rume_http::transport::CorsConfig) -> Self {
+        self.cors = Some(config);
+        self
+    }
+
+    /// Enable HTTP response compression (gzip, brotli, zstd) with the given [`rume_http::transport::CompressionConfig`].
+    pub fn compression(mut self, config: rume_http::transport::CompressionConfig) -> Self {
+        self.compression = Some(config);
+        self
+    }
+
+    /// Configure structured PII redaction on the framework [`ObservabilityLayer`](crate::app::observability::ObservabilityLayer).
+    pub fn redaction(mut self, config: rume_observability::RedactionConfig) -> Self {
+        self.redaction = Some(config);
+        self
+    }
+
+    /// Enable native TLS (HTTP/1.1 + HTTP/2 ALPN, and optional ACME) with the given [`rume_http::tls::TlsConfig`].
+    #[cfg(feature = "tls")]
+    pub fn tls(mut self, config: rume_http::tls::TlsConfig) -> Self {
+        self.tls = Some(config);
+        self
+    }
+
+    /// Attach a [`rume_http::realtime::RealtimeHub`] to application extensions and graceful shutdown.
+    pub fn realtime(mut self, hub: rume_http::realtime::RealtimeHub) -> Self {
+        self.realtime = Some(hub);
+        self
+    }
+
+    /// Serve static files from disk (with optional SPA fallback) as the router fallback.
+    pub fn static_files(mut self, config: rume_http::static_files::StaticFilesConfig) -> Self {
+        self.router = self
+            .router
+            .fallback_service(rume_http::static_files::static_files_router(config));
+        self
+    }
+
+    /// Serve compile-time embedded assets via `rust-embed` as the router fallback.
+    #[cfg(feature = "static-embed")]
+    pub fn embedded_assets<A>(
+        mut self,
+        config: rume_http::static_files::EmbeddedAssetsConfig,
+    ) -> Self
+    where
+        A: rume_http::static_files::RustEmbed + Send + Sync + 'static,
+    {
+        self.router =
+            self.router
+                .fallback_service(rume_http::static_files::embedded_assets_router::<A, _>(
+                    config,
+                ));
+        self
+    }
+
+    /// Apply an [`rume_http::http_cache::HttpCacheLayer`] strictly inside all user
+    /// `.layer()` and `.middleware()` layers so tenant/auth extractors always run first.
+    pub fn http_cache(mut self, layer: rume_http::http_cache::HttpCacheLayer) -> Self {
+        self.http_cache = Some(layer);
+        self
+    }
+
+    /// Register a named one-off application task for [`ApplicationMode::Task`].
+    pub fn task<F, Fut, R>(
+        mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
+        handler: F,
+    ) -> Self
+    where
+        F: FnOnce(AppContext<E, C, S>) -> Fut + Send + 'static,
+        Fut: Future<Output = R> + Send + 'static,
+        R: IntoHookResult + 'static,
+    {
+        if let Err(err) = self.tasks.register(
+            name,
+            description,
+            Box::new(move |ctx| Box::pin(async move { handler(ctx).await.into_hook_result() })),
+        ) && self.task_error.is_none()
+        {
+            self.task_error = Some(err);
+        }
+        self
+    }
+
+    /// Select the task name to run when executing in [`ApplicationMode::Task`].
+    pub fn task_name(mut self, name: impl Into<String>) -> Self {
+        self.task_name = Some(name.into());
+        self
+    }
+
     fn effective_mode(&self) -> ApplicationMode {
-        if std::env::var_os("RUME_INSPECT").is_some()
+        if std::env::var_os("RUME_INSPECT").as_deref() == Some(std::ffi::OsStr::new("openapi"))
+            || std::env::args_os()
+                .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-openapi"))
+        {
+            ApplicationMode::OpenApi
+        } else if std::env::var_os("RUME_INSPECT").is_some()
             || std::env::args_os().any(|a| {
                 a.as_os_str() == std::ffi::OsStr::new("--inspect")
                     || a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes")
             })
         {
             ApplicationMode::Inspect
+        } else if std::env::var("RUME_TASK").is_ok_and(|v| !v.is_empty())
+            || std::env::var("RUME_TASK_LIST").is_ok_and(|v| !v.is_empty())
+            || std::env::args_os().any(|a| {
+                let s = a.to_string_lossy();
+                s == "--rume-list-tasks" || s == "--rume-task" || s.starts_with("--rume-task=")
+            })
+        {
+            ApplicationMode::Task
         } else {
             self.mode
         }
     }
 
-    pub(crate) fn run_inspect_mode(mut self) -> Result<(), std::io::Error> {
-        // Why: `Inspect` mode runs `ModuleRegistry` DAG validation, middleware
-        // validation, `collect_and_validate_routes`, and the actual Axum router
-        // merge so module cycles, misconfigured middleware, and duplicate routes
-        // fail closed without starting the server. It intentionally skips
-        // `on_start`, `on_ready`, and `on_shutdown` hooks so `rume list:routes`
-        // and boot checks remain side-effect-free, and also skips
+    fn inspect_routes_preflight(mut self) -> Result<RouteRegistry, std::io::Error> {
+        // Why: `Inspect` and `OpenApi` modes run `ModuleRegistry` DAG validation,
+        // middleware validation, CORS config validation, `collect_and_validate_routes`,
+        // and the actual Axum router merge so module cycles, misconfigured
+        // middleware, invalid CORS configs, and duplicate routes fail closed
+        // without starting the server. They intentionally skip `on_start`,
+        // `on_ready`, and `on_shutdown` hooks so `rume list:routes` and
+        // `rume openapi export` remain side-effect-free, and also skip
         // `Module::register_health_checks` (so duplicate health-check names are
-        // detected by the serving build rather than `Inspect`).
+        // detected by the serving build rather than inspection).
         let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
         validate_middleware_config(
             &self.middleware,
@@ -450,6 +624,9 @@ where
             &self.applied_middleware,
             &self.applied_groups,
         )?;
+        if let Some(ref cors_cfg) = self.cors {
+            let _ = cors_cfg.build_layer().map_err(BuildError::from)?;
+        }
         let app_routes = self
             .route_registry
             .read()
@@ -459,28 +636,141 @@ where
             collect_and_validate_routes(&resolved.startup, &app_routes)?;
         let _merged = merge_module_router(self.router, module_axum)?;
 
-        {
+        let final_registry = {
             let mut reg = self
                 .route_registry
                 .write()
                 .map_err(|_| BuildError::RouteRegistryPoisoned)?;
             reg.extend(module_routes);
             self.ctx.route_registry = reg.clone();
-        }
+            reg.clone()
+        };
 
         self.ctx.lifecycle.set(LifecycleState::Booted);
         self.ctx.availability.set(AvailabilityState::Live);
+
+        Ok(final_registry)
+    }
+
+    pub(crate) fn run_inspect_mode(self) -> Result<(), std::io::Error> {
+        let registry = self.inspect_routes_preflight()?;
 
         if std::env::var_os("RUME_INSPECT").as_deref() == Some(std::ffi::OsStr::new("routes"))
             || std::env::args_os()
                 .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-inspect-routes"))
         {
-            let json = serde_json::to_string(self.ctx.route_registry.routes())
-                .unwrap_or_else(|_| "[]".to_string());
+            let json =
+                serde_json::to_string(registry.routes()).unwrap_or_else(|_| "[]".to_string());
             println!("__RUME_ROUTES_JSON_START__\n{json}\n__RUME_ROUTES_JSON_END__");
         }
 
         Ok(())
+    }
+
+    pub(crate) fn run_openapi_mode(mut self) -> Result<(), std::io::Error> {
+        let info = self
+            .openapi_info
+            .take()
+            .unwrap_or_else(|| rume_http::openapi::OpenApiInfo::new("Rume API", "0.1.0"));
+        let registry = self.inspect_routes_preflight()?;
+        let spec = registry.to_openapi(info);
+        let json = spec.to_json_string().map_err(std::io::Error::other)?;
+        println!("__RUME_OPENAPI_JSON_START__\n{json}\n__RUME_OPENAPI_JSON_END__");
+        Ok(())
+    }
+
+    fn resolve_cli_task_name(&self) -> Option<String> {
+        let mut args = std::env::args_os();
+        while let Some(arg) = args.next() {
+            let s = arg.to_string_lossy();
+            if s == "--rume-task" {
+                if let Some(val) = args.next() {
+                    let v = val.to_string_lossy().into_owned();
+                    if !v.is_empty() {
+                        return Some(v);
+                    }
+                }
+            } else if let Some(val) = s.strip_prefix("--rume-task=")
+                && !val.is_empty()
+            {
+                return Some(val.to_string());
+            }
+        }
+        if let Ok(val) = std::env::var("RUME_TASK")
+            && !val.is_empty()
+        {
+            return Some(val);
+        }
+        self.task_name.clone()
+    }
+
+    pub(crate) async fn run_task_mode(mut self) -> Result<(), std::io::Error> {
+        if let Some(err) = self.task_error.take() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                err.to_string(),
+            ));
+        }
+
+        let list_mode = std::env::var("RUME_TASK_LIST").is_ok_and(|v| !v.is_empty())
+            || std::env::args_os()
+                .any(|a| a.as_os_str() == std::ffi::OsStr::new("--rume-list-tasks"));
+        let selected_task = self.resolve_cli_task_name();
+
+        let resolved = crate::app::lifecycle::resolve_modules(&self.modules)?;
+        let mut tasks = std::mem::take(&mut self.tasks);
+        let mut on_shutdown = std::mem::take(&mut self.on_shutdown);
+        let on_ready = std::mem::take(&mut self.on_ready);
+        let shutdown_timeout = self.shutdown_timeout;
+        let ctx = self.ctx.clone();
+
+        let (_router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
+
+        crate::app::lifecycle::run_startup(
+            &serve_ctx,
+            &resolved.startup,
+            on_ready,
+            &mut on_shutdown,
+            shutdown_timeout,
+            None,
+        )
+        .await?;
+
+        let result = if list_mode {
+            let list = tasks.list();
+            let json = serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_string());
+            println!("__RUME_TASKS_JSON_START__\n{json}\n__RUME_TASKS_JSON_END__");
+            Ok(())
+        } else {
+            match selected_task {
+                None => Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "no task name specified (use --rume-task <name> or RUME_TASK=<name>)",
+                )),
+                Some(name) => match tasks.take(&name) {
+                    None => Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("unknown task '{name}'"),
+                    )),
+                    Some(handler) => handler(serve_ctx.clone()).await.map_err(|err| {
+                        std::io::Error::other(format!("task '{name}' failed: {err}"))
+                    }),
+                },
+            }
+        };
+
+        // Why: Always execute teardown hooks and module `on_shutdown` even if the
+        // selected task was missing or returned an error so DB pools and modules
+        // close cleanly.
+        crate::app::lifecycle::run_shutdown(
+            &serve_ctx,
+            on_shutdown,
+            resolved.shutdown,
+            shutdown_timeout,
+        )
+        .await;
+
+        result
     }
 
     fn prepare_serve(mut self) -> Result<PreparedServe<E, C, S>, std::io::Error> {
@@ -488,6 +778,9 @@ where
         let on_shutdown = std::mem::take(&mut self.on_shutdown);
         let on_ready = std::mem::take(&mut self.on_ready);
         let shutdown_timeout = self.shutdown_timeout;
+        #[cfg(feature = "tls")]
+        let tls = self.tls.take();
+        let realtime = self.realtime.clone();
         let ctx = self.ctx.clone();
 
         let (router, serve_ctx) = self.build_router_with_resolved(ctx, &resolved.startup)?;
@@ -500,6 +793,9 @@ where
             on_ready,
             on_shutdown,
             shutdown_timeout,
+            #[cfg(feature = "tls")]
+            tls,
+            realtime,
         })
     }
 
@@ -512,8 +808,11 @@ where
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if self.effective_mode() == ApplicationMode::Inspect {
-            return self.run_inspect_mode();
+        match self.effective_mode() {
+            ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::OpenApi => return self.run_openapi_mode(),
+            ApplicationMode::Task => return self.run_task_mode().await,
+            ApplicationMode::Run => {}
         }
 
         let bind_addr = self.bind.clone();
@@ -538,8 +837,11 @@ where
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if self.effective_mode() == ApplicationMode::Inspect {
-            return self.run_inspect_mode();
+        match self.effective_mode() {
+            ApplicationMode::Inspect => return self.run_inspect_mode(),
+            ApplicationMode::OpenApi => return self.run_openapi_mode(),
+            ApplicationMode::Task => return self.run_task_mode().await,
+            ApplicationMode::Run => {}
         }
 
         let prepared = self.prepare_serve()?;
@@ -562,6 +864,9 @@ where
             on_ready,
             mut on_shutdown,
             shutdown_timeout,
+            #[cfg(feature = "tls")]
+            tls,
+            realtime,
         } = prepared;
 
         let addr = listener.local_addr()?;
@@ -599,11 +904,11 @@ where
         )
         .await?;
 
-        println!("listening on http://{addr}");
-
         // --- Step 7: Serve traffic with immediate lifecycle & availability transition on shutdown ---
         let shutdown_lifecycle = serve_ctx.lifecycle.clone();
         let shutdown_availability = serve_ctx.availability.clone();
+        let shutdown_realtime = realtime.clone();
+        let drain_check_rx = shutdown_rx.clone();
 
         let graceful_signal = async move {
             let _ = shutdown_rx.wait_for(|&shutting_down| shutting_down).await;
@@ -612,16 +917,57 @@ where
             );
             shutdown_lifecycle.set(LifecycleState::Terminating);
             shutdown_availability.set(AvailabilityState::RefusingTraffic);
+            // Why: initiate_shutdown only broadcasts the shutdown signal so the HTTP/TLS
+            // accept loop exits immediately instead of blocking on connection drain.
+            if let Some(hub) = shutdown_realtime {
+                hub.initiate_shutdown();
+            }
         };
 
-        let result = axum::serve(
-            listener,
-            router
-                .with_state(serve_ctx.clone())
-                .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-        )
-        .with_graceful_shutdown(graceful_signal)
-        .await;
+        let result = {
+            #[cfg(feature = "tls")]
+            {
+                if let Some(tls_config) = tls {
+                    println!("listening on https://{addr}");
+                    rume_http::tls::serve_tls_listener(
+                        listener,
+                        router.with_state(serve_ctx.clone()),
+                        &tls_config,
+                        graceful_signal,
+                        shutdown_timeout,
+                    )
+                    .await
+                } else {
+                    println!("listening on http://{addr}");
+                    serve_plain_http(
+                        listener,
+                        router.with_state(serve_ctx.clone()),
+                        graceful_signal,
+                        shutdown_timeout,
+                    )
+                    .await
+                }
+            }
+            #[cfg(not(feature = "tls"))]
+            {
+                println!("listening on http://{addr}");
+                serve_plain_http(
+                    listener,
+                    router.with_state(serve_ctx.clone()),
+                    graceful_signal,
+                    shutdown_timeout,
+                )
+                .await
+            }
+        };
+
+        if let Some(hub) = realtime {
+            if *drain_check_rx.borrow() {
+                hub.wait_drained().await;
+            } else {
+                hub.shutdown().await;
+            }
+        }
 
         // --- Step 8: Post-drain shutdown hooks (modules shut down in reverse topological order) ---
         crate::app::lifecycle::run_shutdown(
@@ -651,6 +997,51 @@ where
     on_ready: Vec<ReadyHook<E, C, S>>,
     on_shutdown: Vec<ShutdownHook<E, C, S>>,
     shutdown_timeout: Duration,
+    #[cfg(feature = "tls")]
+    tls: Option<rume_http::tls::TlsConfig>,
+    realtime: Option<rume_http::realtime::RealtimeHub>,
+}
+
+async fn serve_plain_http<F>(
+    listener: TcpListener,
+    app: Router<()>,
+    graceful_signal: F,
+    shutdown_timeout: Duration,
+) -> Result<(), std::io::Error>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (signal_fired_tx, signal_fired_rx) = tokio::sync::oneshot::channel::<()>();
+    let serve_fut = std::future::IntoFuture::into_future(
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            graceful_signal.await;
+            let _ = signal_fired_tx.send(());
+        }),
+    );
+    tokio::pin!(serve_fut);
+
+    tokio::select! {
+        res = &mut serve_fut => res,
+        _ = signal_fired_rx => {
+            // Why: Bound plain-HTTP post-signal connection drain by `shutdown_timeout`
+            // (matching `serve_tls_listener`) so stalled/keep-alive clients cannot hang
+            // graceful shutdown indefinitely and prevent `run_shutdown()` hooks from running.
+            match tokio::time::timeout(shutdown_timeout, serve_fut).await {
+                Ok(res) => res,
+                Err(_) => {
+                    tracing::warn!(
+                        timeout_ms = shutdown_timeout.as_millis() as u64,
+                        "plain-HTTP graceful shutdown drain timed out; force-closing remaining connections"
+                    );
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

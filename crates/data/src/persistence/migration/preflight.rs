@@ -24,6 +24,13 @@ pub(super) const SQLITE_OUTBOX: &str = include_str!("../../../sql/sqlite/outbox_
 pub(super) const SQLITE_AUDIT: &str = include_str!("../../../sql/sqlite/audit_schema.sql");
 pub(super) const SQLITE_CORE_DOWN: &str = include_str!("../../../sql/sqlite/core_down.sql");
 
+pub(super) const PG_AUTH_SCHEMA: &str = include_str!("../../../sql/postgres/auth_schema.sql");
+pub(super) const PG_AUTH_DOWN: &str = include_str!("../../../sql/postgres/auth_down.sql");
+pub(super) const MYSQL_AUTH_SCHEMA: &str = include_str!("../../../sql/mysql/auth_schema.sql");
+pub(super) const MYSQL_AUTH_DOWN: &str = include_str!("../../../sql/mysql/auth_down.sql");
+pub(super) const SQLITE_AUTH_SCHEMA: &str = include_str!("../../../sql/sqlite/auth_schema.sql");
+pub(super) const SQLITE_AUTH_DOWN: &str = include_str!("../../../sql/sqlite/auth_down.sql");
+
 pub(super) const PG_MIGRATIONS_SCHEMA: &str =
     include_str!("../../../sql/postgres/migrations_schema.sql");
 pub(super) const MYSQL_MIGRATIONS_SCHEMA: &str =

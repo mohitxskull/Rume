@@ -36,3 +36,7 @@ pub mod pipeline;
 #[path = "containers/crash_recovery.rs"]
 #[cfg(all(feature = "postgres", feature = "redis"))]
 pub mod crash_recovery;
+
+#[path = "containers/milestone_d.rs"]
+#[cfg(any(feature = "postgres", feature = "mysql", feature = "redis"))]
+pub mod milestone_d;

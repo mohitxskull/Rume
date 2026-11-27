@@ -4,7 +4,7 @@ use std::fmt::Debug;
 use std::time::Duration;
 
 use crate::jobs::error::JobError;
-use crate::jobs::job::{BoxFuture, Job, QueuedJob};
+use crate::jobs::job::{BoxFuture, Job, QueuedJob, RawJob};
 
 /// Interface implemented by persistent message brokers and queue backends.
 pub trait JobQueue: Debug + Send + Sync + 'static {
@@ -49,8 +49,35 @@ pub trait JobQueue: Debug + Send + Sync + 'static {
         self.enqueue_delayed_with_trace(job, Duration::ZERO, trace_context)
     }
 
+    /// Enqueues a pre-serialized [`RawJob`] with an initial execution delay.
+    ///
+    /// Used by [`crate::jobs::batch::BatchBuilder`] and callback dispatchers where the
+    /// concrete `J: Job` type has already been erased.
+    fn enqueue_raw(
+        &self,
+        _job: RawJob,
+        _delay: Duration,
+    ) -> BoxFuture<'_, Result<String, JobError>> {
+        Box::pin(async {
+            Err(JobError::Unsupported(
+                "enqueue_raw not supported by this queue backend".into(),
+            ))
+        })
+    }
+
     /// Dequeues the next available job, recording the worker identifier that claimed it.
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>>;
+
+    /// Dequeues the next available job from the specified named queues (or all queues if `None`).
+    ///
+    /// Defaults to delegating to [`JobQueue::dequeue_for`] for backward compatibility.
+    fn dequeue_from(
+        &self,
+        worker_id: &str,
+        _queues: Option<&[&str]>,
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_for(worker_id)
+    }
 
     /// Dequeues the next available job whose `available_at` time has passed.
     ///

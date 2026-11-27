@@ -409,64 +409,52 @@ async fn test_tenant_extension_rate_limiting() {
 
 #[tokio::test]
 async fn test_rate_limiter_overflow_bucket_preserves_active_clients() {
-    use std::hash::{Hash, Hasher};
-
-    fn key_for_shard(shard_target: usize, prefix: &str) -> String {
-        for i in 0..10_000 {
-            let candidate = format!("{prefix}_{i}");
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            candidate.hash(&mut hasher);
-            if ((hasher.finish() as usize) % 16) == shard_target {
-                return candidate;
-            }
-        }
-        panic!("could not find key for shard");
-    }
-
     let config = RateLimitConfig::default()
         .with_max_requests(1)
         .with_window(Duration::from_secs(60))
         .with_max_entries_per_shard(2);
     let limiter = RateLimiter::new(config);
 
-    // Pick 4 keys that are guaranteed to map to the exact same shard
-    let key_a = key_for_shard(3, "client_a");
-    let key_b = key_for_shard(3, "client_b");
-    let key_c = key_for_shard(3, "client_c");
-    let key_d = key_for_shard(3, "client_d");
+    // With 16 shards, max_entries_per_shard=2, and max_requests=1, at most
+    // 16 * (2 regular + 1 overflow) = 48 distinct keys can be admitted before
+    // hitting saturated `__overflow__` buckets (shard hashing uses randomized
+    // `RandomState`, so we saturate via pigeonhole rather than precomputing hashes).
+    let mut admitted_keys = Vec::new();
+    let mut overflow_rejections = 0usize;
 
-    // 1. client_A exhausts its rate limit quota
-    assert!(limiter.check(&key_a).is_ok());
+    for i in 0..200 {
+        let key = format!("client_{i}");
+        match limiter.check(&key) {
+            Ok(_) => {
+                assert!(
+                    limiter.check(&key).is_err(),
+                    "second request for {key} must be rate limited"
+                );
+                admitted_keys.push(key);
+            }
+            Err(_) => {
+                overflow_rejections += 1;
+            }
+        }
+    }
+
     assert!(
-        limiter.check(&key_a).is_err(),
-        "second request for client_A must be rate limited"
+        admitted_keys.len() <= 48,
+        "at most 48 distinct keys (16 shards * (2 + 1 overflow)) should be admitted, got {}",
+        admitted_keys.len()
+    );
+    assert!(
+        overflow_rejections > 0,
+        "excess distinct keys must be rate limited by saturated __overflow__ buckets"
     );
 
-    // 2. client_B exhausts its rate limit quota; shard now has 2 entries (full capacity)
-    assert!(limiter.check(&key_b).is_ok());
-    assert!(
-        limiter.check(&key_b).is_err(),
-        "second request for client_B must be rate limited"
-    );
-
-    // 3. client_C arrives when shard is at capacity.
-    // Rather than evicting client_A, client_C is routed to the shared __overflow__ bucket.
-    assert!(
-        limiter.check(&key_c).is_ok(),
-        "client_C uses first request of __overflow__ bucket"
-    );
-
-    // 4. client_D also arrives; since __overflow__ bucket already consumed its 1 request, client_D is limited.
-    assert!(
-        limiter.check(&key_d).is_err(),
-        "client_D must be rate limited by saturated __overflow__ bucket"
-    );
-
-    // 5. Critical security invariant: client_A was NOT evicted, so it CANNOT bypass rate limiting!
-    assert!(
-        limiter.check(&key_a).is_err(),
-        "client_A must remain rate limited; new keys cannot evict active clients"
-    );
+    // Critical security invariant: NO admitted active client was evicted by cache churn.
+    for key in &admitted_keys {
+        assert!(
+            limiter.check(key).is_err(),
+            "{key} must remain rate limited; new keys cannot evict active clients"
+        );
+    }
 }
 
 #[test]

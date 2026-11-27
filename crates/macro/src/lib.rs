@@ -11,6 +11,9 @@ use quote::quote;
 use syn::parse::{Parse, ParseStream};
 use syn::{Ident, LitStr, Token, Visibility, parse_macro_input};
 
+mod from_row;
+mod openapi_schema;
+
 struct SqlAssetsArgs {
     vis: Visibility,
     mod_name: Ident,
@@ -51,6 +54,7 @@ impl Parse for SqlAssetsArgs {
     }
 }
 
+#[derive(Debug)]
 struct SqlFileItem {
     relative_path: String,
     dialect: Option<String>,
@@ -64,29 +68,25 @@ fn walk_sql_files(
     span: proc_macro2::Span,
     out: &mut Vec<PathBuf>,
 ) -> Result<(), syn::Error> {
-    let entries = fs::read_dir(dir).map_err(|e| {
-        syn::Error::new(
-            span,
-            format!("sql_assets!: failed to read directory {dir:?}: {e}"),
-        )
-    })?;
-    let mut sorted_entries = Vec::new();
-    for entry in entries {
+    // Why: `walkdir::WalkDir` with `follow_links(false)` prevents symlink cycles from
+    // causing infinite recursion / stack overflow at compile time and guarantees
+    // deterministic ordering via `sort_by_file_name()`.
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(false)
+        .sort_by_file_name()
+    {
         let entry = entry.map_err(|e| {
             syn::Error::new(
                 span,
-                format!("sql_assets!: failed to read directory entry in {dir:?}: {e}"),
+                format!("sql_assets!: failed to walk directory {dir:?}: {e}"),
             )
         })?;
-        sorted_entries.push(entry);
-    }
-    sorted_entries.sort_by_key(|e| e.path());
-    for entry in sorted_entries {
-        let path = entry.path();
-        if path.is_dir() {
-            walk_sql_files(&path, span, out)?;
-        } else if path.is_file() && path.extension().is_some_and(|ext| ext == "sql") {
-            out.push(path);
+        let file_type = entry.file_type();
+        if file_type.is_symlink() {
+            continue;
+        }
+        if file_type.is_file() && entry.path().extension().is_some_and(|ext| ext == "sql") {
+            out.push(entry.into_path());
         }
     }
     Ok(())
@@ -106,6 +106,161 @@ fn sanitize_ident(name: &str) -> String {
     } else {
         out
     }
+}
+
+fn validate_namespace_ident(
+    namespace: &str,
+    rel_path: &str,
+    span: proc_macro2::Span,
+) -> Result<Ident, syn::Error> {
+    // Why: `syn::parse_str::<Ident>("r#type")` succeeds for raw identifiers, whereas
+    // `Ident::new("r#type", ...)` panics. Construct raw idents via `Ident::new_raw`
+    // (or return `syn::Error` if invalid, e.g. `r#self`) so codegen never panics (`RC-18`).
+    let mut ident = syn::parse_str::<Ident>(namespace).map_err(|_| {
+        syn::Error::new(
+            span,
+            format!(
+                "sql_assets!: subdirectory namespace '{namespace}' (from '{rel_path}') is not a valid Rust identifier",
+            ),
+        )
+    })?;
+    ident.set_span(span);
+    Ok(ident)
+}
+
+fn ident_from_validated(name: &str, span: proc_macro2::Span) -> Ident {
+    if let Some(raw) = name.strip_prefix("r#") {
+        Ident::new_raw(raw, span)
+    } else {
+        Ident::new(name, span)
+    }
+}
+
+fn validate_query_ident(
+    file_name: &str,
+    query_name: &str,
+    span: proc_macro2::Span,
+) -> Result<String, syn::Error> {
+    if syn::parse_str::<syn::Ident>(query_name).is_err() {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "sql_assets!: SQL filename '{file_name}' contains invalid Rust identifier '{query_name}'",
+            ),
+        ));
+    }
+    let query_ident = sanitize_ident(query_name);
+    // Why: Unicode identifiers such as `α` pass `syn::parse_str::<Ident>`
+    // before ASCII sanitization, then collapse to `"_"`, which panics in
+    // `Ident::new`. Re-validate the sanitized identifier to emit a clean
+    // `compile_error!` instead.
+    if syn::parse_str::<syn::Ident>(&query_ident).is_err() {
+        return Err(syn::Error::new(
+            span,
+            format!(
+                "sql_assets!: sanitized identifier '{query_ident}' from SQL filename '{file_name}' is not a valid Rust identifier",
+            ),
+        ));
+    }
+    Ok(query_ident)
+}
+
+type ByDialect<'a> = BTreeMap<String, BTreeMap<String, Vec<&'a SqlFileItem>>>;
+type ByNamespace<'a> = BTreeMap<String, BTreeMap<String, &'a SqlFileItem>>;
+
+fn organize_sql_items<'a>(
+    items: &'a [SqlFileItem],
+    span: proc_macro2::Span,
+) -> Result<(ByDialect<'a>, ByNamespace<'a>), syn::Error> {
+    // Check for collision within the same dialect and namespace
+    let mut seen_in_ns: BTreeSet<(Option<String>, String, String)> = BTreeSet::new();
+    for item in items {
+        let key = (
+            item.dialect.clone(),
+            item.namespace.clone(),
+            item.query_ident.clone(),
+        );
+        if !seen_in_ns.insert(key) {
+            let dialect_label = item.dialect.as_deref().unwrap_or("common");
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "sql_assets!: duplicate query identifier '{}' in dialect '{}', namespace '{}' (file: {})",
+                    item.query_ident, dialect_label, item.namespace, item.relative_path
+                ),
+            ));
+        }
+    }
+
+    // 1. Organize by dialect: dialect -> namespace -> Vec<Item>
+    let mut by_dialect: ByDialect<'a> = BTreeMap::new();
+    for item in items {
+        if let Some(dialect) = &item.dialect {
+            by_dialect
+                .entry(dialect.clone())
+                .or_default()
+                .entry(item.namespace.clone())
+                .or_default()
+                .push(item);
+        }
+    }
+
+    // 2. Reject dialect/namespace module collisions (e.g. `sql/postgres/postgres/list.sql`)
+    // where a flat namespace submodule would have the same name as a dialect submodule.
+    for item in items {
+        if by_dialect.contains_key(&item.namespace) {
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "sql_assets!: namespace '{}' (file: {}) collides with dialect module '{}'",
+                    item.namespace, item.relative_path, item.namespace
+                ),
+            ));
+        }
+    }
+
+    // 3. Organize flat namespace bindings:
+    // - If a generic (non-dialect) query exists for `(namespace, query_ident)`, use it.
+    // - If only dialect-specific queries exist, allow a flat binding only when unambiguous
+    //   (exactly one dialect defines it); reject multi-dialect ambiguity with `compile_error!`.
+    let mut flat_candidates: BTreeMap<(String, String), Vec<&'a SqlFileItem>> = BTreeMap::new();
+    for item in items {
+        flat_candidates
+            .entry((item.namespace.clone(), item.query_ident.clone()))
+            .or_default()
+            .push(item);
+    }
+
+    let mut by_namespace: ByNamespace<'a> = BTreeMap::new();
+    for ((namespace, query_ident), candidates) in flat_candidates {
+        if let Some(generic) = candidates.iter().find(|item| item.dialect.is_none()) {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .insert(query_ident, *generic);
+        } else if candidates.len() == 1 {
+            by_namespace
+                .entry(namespace)
+                .or_default()
+                .insert(query_ident, candidates[0]);
+        } else {
+            let dialects: Vec<&str> = candidates
+                .iter()
+                .filter_map(|item| item.dialect.as_deref())
+                .collect();
+            return Err(syn::Error::new(
+                span,
+                format!(
+                    "sql_assets!: ambiguous flat query '{}::{}' defined in multiple dialects ({}) with no generic fallback",
+                    namespace,
+                    query_ident,
+                    dialects.join(", ")
+                ),
+            ));
+        }
+    }
+
+    Ok((by_dialect, by_namespace))
 }
 
 /// Resolves `raw_rel` inside `manifest_dir`, rejecting path traversal (`..`,
@@ -272,32 +427,21 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
             let file_name = &remaining[remaining.len() - 1];
             let query_name = file_name.trim_end_matches(".sql");
-            if syn::parse_str::<syn::Ident>(query_name).is_err() {
-                return syn::Error::new(
-                    args.dir_path.span(),
-                    format!(
-                        "sql_assets!: SQL filename '{file_name}' contains invalid Rust identifier '{query_name}'",
-                    ),
-                )
-                .to_compile_error()
-                .into();
-            }
-            let query_ident = sanitize_ident(query_name);
+            let query_ident =
+                match validate_query_ident(file_name, query_name, args.dir_path.span()) {
+                    Ok(ident) => ident,
+                    Err(err) => return err.to_compile_error().into(),
+                };
 
             let namespace = if remaining.len() > 1 {
                 remaining[..remaining.len() - 1].join("_")
             } else {
                 "common".to_string()
             };
-            if syn::parse_str::<syn::Ident>(&namespace).is_err() {
-                return syn::Error::new(
-                    args.dir_path.span(),
-                    format!(
-                        "sql_assets!: subdirectory namespace '{namespace}' (from '{full_rel_from_manifest}') is not a valid Rust identifier",
-                    ),
-                )
-                .to_compile_error()
-                .into();
+            if let Err(err) =
+                validate_namespace_ident(&namespace, &full_rel_from_manifest, args.dir_path.span())
+            {
+                return err.to_compile_error().into();
             }
 
             let logical_name = match &dialect {
@@ -315,57 +459,16 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
         }
     }
 
-    // Check for collision within the same dialect and namespace
-    let mut seen_in_ns: BTreeSet<(Option<String>, String, String)> = BTreeSet::new();
-    for item in &items {
-        let key = (
-            item.dialect.clone(),
-            item.namespace.clone(),
-            item.query_ident.clone(),
-        );
-        if !seen_in_ns.insert(key) {
-            let dialect_label = item.dialect.as_deref().unwrap_or("common");
-            return syn::Error::new(
-                args.dir_path.span(),
-                format!(
-                    "sql_assets!: duplicate query identifier '{}' in dialect '{}', namespace '{}' (file: {})",
-                    item.query_ident, dialect_label, item.namespace, item.relative_path
-                ),
-            )
-            .to_compile_error()
-            .into();
-        }
-    }
-
-    // Organize items into dialect modules and flat namespace modules
-    // 1. By dialect: dialect -> namespace -> Vec<Item>
-    let mut by_dialect: BTreeMap<String, BTreeMap<String, Vec<&SqlFileItem>>> = BTreeMap::new();
-    // 2. By namespace: namespace -> BTreeMap<query_ident, &SqlFileItem>
-    let mut by_namespace: BTreeMap<String, BTreeMap<String, &SqlFileItem>> = BTreeMap::new();
-
-    for item in &items {
-        if let Some(dialect) = &item.dialect {
-            by_dialect
-                .entry(dialect.clone())
-                .or_default()
-                .entry(item.namespace.clone())
-                .or_default()
-                .push(item);
-        }
-
-        // For flat namespace access (e.g. `queries::issues::CREATE`):
-        // If there is no dialect or if not yet registered, store it.
-        let ns_map = by_namespace.entry(item.namespace.clone()).or_default();
-        if !ns_map.contains_key(&item.query_ident) || item.dialect.is_none() {
-            ns_map.insert(item.query_ident.clone(), item);
-        }
-    }
+    let (by_dialect, by_namespace) = match organize_sql_items(&items, args.dir_path.span()) {
+        Ok(res) => res,
+        Err(err) => return err.to_compile_error().into(),
+    };
 
     // Generate dialect submodules
     let dialect_mods = by_dialect.iter().map(|(dialect_name, namespaces)| {
         let dialect_ident = Ident::new(dialect_name, proc_macro2::Span::call_site());
         let ns_mods = namespaces.iter().map(|(ns_name, query_items)| {
-            let ns_ident = Ident::new(ns_name, proc_macro2::Span::call_site());
+            let ns_ident = ident_from_validated(ns_name, proc_macro2::Span::call_site());
             let query_consts = query_items.iter().map(|q| {
                 let const_ident = Ident::new(&q.query_ident, proc_macro2::Span::call_site());
                 let logical_name = &q.logical_name;
@@ -399,7 +502,7 @@ pub fn sql_assets(input: TokenStream) -> TokenStream {
 
     // Generate flat namespace submodules
     let flat_ns_mods = by_namespace.iter().map(|(ns_name, queries)| {
-        let ns_ident = Ident::new(ns_name, proc_macro2::Span::call_site());
+        let ns_ident = ident_from_validated(ns_name, proc_macro2::Span::call_site());
         let query_consts = queries.iter().map(|(q_ident_str, q)| {
             let const_ident = Ident::new(q_ident_str, proc_macro2::Span::call_site());
             let logical_name = &q.logical_name;
@@ -648,9 +751,25 @@ pub fn embed_migrations(input: TokenStream) -> TokenStream {
     expanded.into()
 }
 
+/// Derives `HasOpenApiSchema` for a struct, reflecting field types, `Option<T>`
+/// optionality, `#[serde(...)]` attributes, and common `#[garde(...)]` rules.
+#[proc_macro_derive(HasOpenApiSchema, attributes(openapi, serde, garde))]
+pub fn derive_has_openapi_schema(input: TokenStream) -> TokenStream {
+    openapi_schema::expand(input)
+}
+
+/// Derives `FromRow` for a struct with named fields.
+#[proc_macro_derive(FromRow, attributes(from_row))]
+pub fn derive_from_row(input: TokenStream) -> TokenStream {
+    from_row::expand(input)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{extract_migration_version, resolve_manifest_subdir};
+    use super::{
+        SqlFileItem, extract_migration_version, ident_from_validated, organize_sql_items,
+        resolve_manifest_subdir, validate_namespace_ident, validate_query_ident, walk_sql_files,
+    };
 
     #[test]
     fn extract_migration_version_requires_all_digit_segments() {
@@ -690,5 +809,112 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validate_query_ident_rejects_post_sanitization_underscore_from_unicode() {
+        let span = proc_macro2::Span::call_site();
+        assert_eq!(
+            validate_query_ident("find_user.sql", "find_user", span).unwrap(),
+            "FIND_USER"
+        );
+        // `α` is a valid Unicode Rust Ident before sanitization, but collapses to `"_"`
+        // after ASCII sanitization, which must error rather than panicking in `Ident::new`.
+        let err = validate_query_ident("α.sql", "α", span).unwrap_err();
+        assert!(
+            err.to_string().contains("sanitized identifier '_'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn organize_sql_items_rejects_dialect_namespace_collision_and_ambiguous_flat_bindings() {
+        let span = proc_macro2::Span::call_site();
+
+        // 1. Dialect/namespace collision: `sql/postgres/postgres/list.sql`
+        let colliding = vec![SqlFileItem {
+            relative_path: "sql/postgres/postgres/list.sql".to_string(),
+            dialect: Some("postgres".to_string()),
+            namespace: "postgres".to_string(),
+            query_ident: "LIST".to_string(),
+            logical_name: "postgres.postgres.list".to_string(),
+        }];
+        let err = organize_sql_items(&colliding, span).unwrap_err();
+        assert!(
+            err.to_string().contains("collides with dialect module"),
+            "unexpected error: {err}"
+        );
+
+        // 2. Ambiguous multi-dialect flat binding with no generic fallback
+        let ambiguous = vec![
+            SqlFileItem {
+                relative_path: "sql/mysql/users/list.sql".to_string(),
+                dialect: Some("mysql".to_string()),
+                namespace: "users".to_string(),
+                query_ident: "LIST".to_string(),
+                logical_name: "mysql.users.list".to_string(),
+            },
+            SqlFileItem {
+                relative_path: "sql/postgres/users/list.sql".to_string(),
+                dialect: Some("postgres".to_string()),
+                namespace: "users".to_string(),
+                query_ident: "LIST".to_string(),
+                logical_name: "postgres.users.list".to_string(),
+            },
+        ];
+        let err = organize_sql_items(&ambiguous, span).unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous flat query"),
+            "unexpected error: {err}"
+        );
+
+        // 3. Multi-dialect with generic fallback succeeds and binds flat to generic
+        let mut with_fallback = ambiguous;
+        with_fallback.push(SqlFileItem {
+            relative_path: "sql/users/list.sql".to_string(),
+            dialect: None,
+            namespace: "users".to_string(),
+            query_ident: "LIST".to_string(),
+            logical_name: "users.list".to_string(),
+        });
+        let (by_dialect, by_namespace) =
+            organize_sql_items(&with_fallback, span).expect("generic fallback resolves ambiguity");
+        assert_eq!(by_dialect.len(), 2);
+        assert_eq!(by_namespace["users"]["LIST"].dialect, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn walk_sql_files_skips_directory_symlink_cycles() {
+        let dir = std::env::temp_dir().join(format!(
+            "rume_macro_symlink_cycle_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("users")).unwrap();
+        std::fs::write(dir.join("users/list.sql"), "SELECT 1;").unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("users/loop")).unwrap();
+
+        let mut out = Vec::new();
+        walk_sql_files(&dir, proc_macro2::Span::call_site(), &mut out)
+            .expect("walk_sql_files must skip symlink cycles");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].ends_with("users/list.sql"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raw_ident_namespace_directory_does_not_panic() {
+        let span = proc_macro2::Span::call_site();
+        let validated = validate_namespace_ident("r#type", "sql/r#type/list.sql", span)
+            .expect("r#type is a valid raw Rust identifier");
+        assert_eq!(validated.to_string(), "r#type");
+
+        let generated = ident_from_validated("r#type", span);
+        assert_eq!(generated.to_string(), "r#type");
+
+        // Non-raw-eligible keyword like `r#self` must return a clean syn::Error.
+        assert!(validate_namespace_ident("r#self", "sql/r#self/list.sql", span).is_err());
     }
 }

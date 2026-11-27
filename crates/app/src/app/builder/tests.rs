@@ -954,3 +954,695 @@ async fn wait_for_ready(
         tokio::task::yield_now().await;
     }
 }
+
+#[tokio::test]
+async fn inspect_mode_fails_closed_on_invalid_cors_config() {
+    let invalid_cors = rume_http::transport::CorsConfig::new()
+        .allow_any_origin()
+        .allow_credentials(true);
+
+    let err = RumeBuilder::new(test_ctx())
+        .mode(ApplicationMode::Inspect)
+        .cors(invalid_cors)
+        .get("/ping", || async { "pong" })
+        .run()
+        .await
+        .expect_err("inspect mode must fail closed on invalid CORS config");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("allow_credentials"),
+        "expected CORS error message, got: {err}"
+    );
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn rume_builder_tls_serves_https_and_drains_gracefully_on_shutdown() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    const TEST_CERT_PEM: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBwDCCAWWgAwIBAgIUIi3+ZI/tJFK4wTVlTFPD6QkG8XAwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNjEyMTYwMloYDzIxMDAxMDI5
+MTIxNjAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAATIw5glQvkynffHCd5iEclrqe+juD6xFx8A1F43+PqLjpra4wZ3non1
+Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrryo4GSMIGPMB0GA1UdDgQWBBQQ8rRAB+Bs
++SsH4WcR+cJEbH+hTzAfBgNVHSMEGDAWgBQQ8rRAB+Bs+SsH4WcR+cJEbH+hTzAM
+BgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcD
+ATAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDSQAwRgIh
+APyYGMmbXQV05SjOkoWARBTijDUQ9v3rvdTvfFFJ8HXSAiEA/rJYP8/AcQalmlJL
+MOAtrICgSzS3UyLAhl16728zqGc=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo2otzH6WgCrTvKb8
+Mad8NskKE+yg2Tqk/S0mX41X1AGhRANCAATIw5glQvkynffHCd5iEclrqe+juD6x
+Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
+-----END PRIVATE KEY-----
+";
+
+    let tls_config = rume_http::tls::TlsConfig::from_pem_bytes(TEST_CERT_PEM, TEST_KEY_PEM)
+        .expect("valid PEM cert and key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let shutdown_hook_ran = Arc::new(AtomicBool::new(false));
+    let hook_flag = shutdown_hook_ran.clone();
+
+    let app = Rume::new()
+        .tls(tls_config)
+        .get(
+            "/tls-ping",
+            |axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<SocketAddr>| async move {
+                format!("pong:{peer}")
+            },
+        )
+        .on_shutdown(move |ctx| async move {
+            assert_eq!(ctx.lifecycle.state(), LifecycleState::Terminating);
+            assert_eq!(ctx.availability.state(), AvailabilityState::RefusingTraffic);
+            hook_flag.store(true, Ordering::SeqCst);
+        });
+
+    let lifecycle = app.lifecycle();
+    let availability = app.availability();
+
+    let mut server = tokio::spawn(async move {
+        app.run_with_listener_and_signal(listener, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
+    for cert in rustls_pemfile::certs(&mut cert_reader) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    tls_stream
+        .write_all(b"GET /tls-ping HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tls_stream.read_to_string(&mut response).await.unwrap();
+    assert!(
+        response.starts_with("HTTP/1.1 200 OK"),
+        "expected HTTP/1.1 200 OK over TLS, got: {response}"
+    );
+    assert!(
+        response.contains("pong:127.0.0.1:"),
+        "expected ConnectInfo peer address in body, got: {response}"
+    );
+
+    let _ = shutdown_tx.send(());
+    let server_res = server.await.expect("server task panicked");
+    assert!(
+        server_res.is_ok(),
+        "server exited with error: {server_res:?}"
+    );
+    assert_eq!(lifecycle.state(), LifecycleState::Terminated);
+    assert_eq!(availability.state(), AvailabilityState::Unknown);
+    assert!(
+        shutdown_hook_ran.load(Ordering::SeqCst),
+        "on_shutdown hook must run after TLS drain"
+    );
+}
+
+#[cfg(feature = "tls")]
+#[tokio::test]
+async fn rume_builder_tls_negotiates_h2_alpn() {
+    use std::sync::Arc;
+
+    const TEST_CERT_PEM: &[u8] = b"\
+-----BEGIN CERTIFICATE-----
+MIIBwDCCAWWgAwIBAgIUIi3+ZI/tJFK4wTVlTFPD6QkG8XAwCgYIKoZIzj0EAwIw
+FDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTEyNjEyMTYwMloYDzIxMDAxMDI5
+MTIxNjAyWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjO
+PQMBBwNCAATIw5glQvkynffHCd5iEclrqe+juD6xFx8A1F43+PqLjpra4wZ3non1
+Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrryo4GSMIGPMB0GA1UdDgQWBBQQ8rRAB+Bs
++SsH4WcR+cJEbH+hTzAfBgNVHSMEGDAWgBQQ8rRAB+Bs+SsH4WcR+cJEbH+hTzAM
+BgNVHRMBAf8EAjAAMA4GA1UdDwEB/wQEAwIFoDATBgNVHSUEDDAKBggrBgEFBQcD
+ATAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwCgYIKoZIzj0EAwIDSQAwRgIh
+APyYGMmbXQV05SjOkoWARBTijDUQ9v3rvdTvfFFJ8HXSAiEA/rJYP8/AcQalmlJL
+MOAtrICgSzS3UyLAhl16728zqGc=
+-----END CERTIFICATE-----
+";
+
+    const TEST_KEY_PEM: &[u8] = b"\
+-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgo2otzH6WgCrTvKb8
+Mad8NskKE+yg2Tqk/S0mX41X1AGhRANCAATIw5glQvkynffHCd5iEclrqe+juD6x
+Fx8A1F43+PqLjpra4wZ3non1Dp6cLKCLOtYHLB05Rf2+7jxnMmyDVrry
+-----END PRIVATE KEY-----
+";
+
+    let tls_config = rume_http::tls::TlsConfig::from_pem_bytes(TEST_CERT_PEM, TEST_KEY_PEM)
+        .expect("valid PEM cert and key");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let app = Rume::new()
+        .tls(tls_config)
+        .get("/h2-ping", || async { "ok" });
+    let lifecycle = app.lifecycle();
+
+    let mut server = tokio::spawn(async move {
+        app.run_with_listener_and_signal(listener, async move {
+            let _ = shutdown_rx.await;
+        })
+        .await
+    });
+
+    wait_for_ready(&lifecycle, &mut server, Duration::from_secs(5)).await;
+
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut cert_reader = std::io::BufReader::new(TEST_CERT_PEM);
+    for cert in rustls_pemfile::certs(&mut cert_reader) {
+        root_store.add(cert.unwrap()).unwrap();
+    }
+    let provider = rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
+    let mut client_cfg = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    client_cfg.alpn_protocols = vec![b"h2".to_vec()];
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_cfg));
+    let server_name = rustls_pki_types::ServerName::try_from("localhost").unwrap();
+
+    let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let tls_stream = connector.connect(server_name, tcp).await.unwrap();
+    assert_eq!(
+        tls_stream.get_ref().1.alpn_protocol(),
+        Some(b"h2".as_slice()),
+        "server must negotiate h2 ALPN over TLS"
+    );
+    drop(tls_stream);
+
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn rume_builder_realtime_attaches_hub_and_drains_on_shutdown() {
+    let hub = rume_http::realtime::RealtimeHub::new(
+        rume_http::realtime::RealtimeConfig::default()
+            .with_shutdown_drain_timeout(Duration::from_millis(200)),
+    );
+    let hub_check = hub.clone();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        Rume::new()
+            .realtime(hub)
+            .get(
+                "/hub-node",
+                |axum::Extension(h): axum::Extension<rume_http::realtime::RealtimeHub>| async move {
+                    h.node_id().to_string()
+                },
+            )
+            .run_with_listener_and_signal(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut tcp = None;
+    for _ in 0..40 {
+        if let Ok(stream) = tokio::net::TcpStream::connect(addr).await {
+            tcp = Some(stream);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let mut tcp = tcp.expect("server did not start listening");
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tcp.write_all(b"GET /hub-node HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut response = String::new();
+    tcp.read_to_string(&mut response).await.unwrap();
+    assert!(response.starts_with("HTTP/1.1 200 OK"));
+    assert!(response.contains(hub_check.node_id()));
+
+    assert!(!hub_check.is_shutting_down());
+    let _ = shutdown_tx.send(());
+    server.await.unwrap().unwrap();
+    assert!(hub_check.is_shutting_down());
+}
+
+#[tokio::test]
+async fn task_mode_runs_selected_task_with_startup_and_shutdown() {
+    struct TaskLifecycleModule {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::module::Module for TaskLifecycleModule {
+        fn name(&self) -> &str {
+            "task-lifecycle"
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_start".to_string());
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_shutdown".to_string());
+            })
+        }
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let task_events = std::sync::Arc::clone(&events);
+
+    let ctx = AppContext::new(
+        (),
+        (),
+        ProjectPaths::from_current_dir(),
+        Availability::new(),
+        HealthChecks::new(),
+        "task-state-value".to_string(),
+    );
+
+    RumeBuilder::new(ctx)
+        .module(TaskLifecycleModule {
+            events: std::sync::Arc::clone(&events),
+        })
+        .task(
+            "greet",
+            "Read state from AppContext",
+            move |ctx| async move {
+                task_events
+                    .lock()
+                    .unwrap()
+                    .push(format!("task:{}", ctx.state));
+                Ok::<_, std::io::Error>(())
+            },
+        )
+        .mode(ApplicationMode::Task)
+        .task_name("greet")
+        .run_with_signal(std::future::pending())
+        .await
+        .expect("task mode should execute and shut down cleanly");
+
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec![
+            "on_start".to_string(),
+            "task:task-state-value".to_string(),
+            "on_shutdown".to_string(),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn task_mode_unknown_task_returns_not_found_after_shutdown() {
+    struct ShutdownTrackerModule {
+        events: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl crate::module::Module for ShutdownTrackerModule {
+        fn name(&self) -> &str {
+            "shutdown-tracker"
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_start".to_string());
+                Ok(())
+            })
+        }
+
+        fn on_shutdown<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, ()> {
+            Box::pin(async move {
+                self.events.lock().unwrap().push("on_shutdown".to_string());
+            })
+        }
+    }
+
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let ctx = test_ctx();
+
+    let err = RumeBuilder::new(ctx)
+        .module(ShutdownTrackerModule {
+            events: std::sync::Arc::clone(&events),
+        })
+        .task("existing", "An existing task", |_ctx| async {
+            Ok::<_, std::io::Error>(())
+        })
+        .mode(ApplicationMode::Task)
+        .task_name("missing")
+        .run_with_signal(std::future::pending())
+        .await
+        .expect_err("unknown task should return NotFound");
+
+    assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    assert_eq!(
+        *events.lock().unwrap(),
+        vec!["on_start".to_string(), "on_shutdown".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn openapi_mode_collects_app_and_module_routes_without_binding() {
+    struct OpenApiTestModule {
+        started: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl crate::module::Module for OpenApiTestModule {
+        fn name(&self) -> &str {
+            "openapi-test-module"
+        }
+
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router<()>,
+        ) -> rume_http::routing::Router<()> {
+            router.get("/module-items", || async { "items" })
+        }
+
+        fn on_start<'a>(
+            &'a self,
+            _ctx: &'a crate::module::ModuleContext,
+        ) -> crate::module::BoxFuture<'a, crate::module::ModuleHookResult> {
+            Box::pin(async move {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    let module_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_called = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let ready_flag = std::sync::Arc::clone(&ready_called);
+
+    let ctx = test_ctx();
+    let result = RumeBuilder::new(ctx)
+        .bind("127.0.0.1:0")
+        .module(OpenApiTestModule {
+            started: std::sync::Arc::clone(&module_started),
+        })
+        .get("/app-health", || async { "ok" })
+        .openapi_info(rume_http::openapi::OpenApiInfo::new("Test API", "1.2.3"))
+        .on_ready(move |_ctx| async move {
+            ready_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        })
+        .mode(ApplicationMode::OpenApi)
+        .run_with_signal(std::future::pending())
+        .await;
+
+    assert!(result.is_ok(), "OpenApi mode should succeed: {result:?}");
+    assert!(
+        !module_started.load(std::sync::atomic::Ordering::SeqCst),
+        "OpenApi mode must not run module on_start hooks"
+    );
+    assert!(
+        !ready_called.load(std::sync::atomic::Ordering::SeqCst),
+        "OpenApi mode must not run application on_ready hooks"
+    );
+}
+
+#[tokio::test]
+async fn deferred_layer_wraps_module_routes_and_later_routes() {
+    use axum::body::Body;
+    use axum::http::{HeaderValue, Request, StatusCode};
+    use tower::ServiceExt;
+
+    struct LayerTestModule;
+
+    impl crate::module::Module for LayerTestModule {
+        fn name(&self) -> &str {
+            "layer-test-module"
+        }
+
+        fn register_routes(
+            &self,
+            router: rume_http::routing::Router<()>,
+        ) -> rume_http::routing::Router<()> {
+            router.get("/module-ping", || async { "pong" })
+        }
+    }
+
+    let ctx = test_ctx();
+    let router = RumeBuilder::new(ctx)
+        .module(LayerTestModule)
+        .layer(axum::middleware::map_response(
+            |mut res: axum::response::Response| async move {
+                res.headers_mut().insert(
+                    axum::http::header::HeaderName::from_static("x-deferred-layer"),
+                    HeaderValue::from_static("applied"),
+                );
+                res
+            },
+        ))
+        .get("/app-ping", || async { "app-pong" })
+        .build_router(test_ctx())
+        .expect("build_router should succeed");
+
+    let app = router.with_state(test_ctx());
+
+    let mod_res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/module-ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(mod_res.status(), StatusCode::OK);
+    assert_eq!(
+        mod_res
+            .headers()
+            .get("x-deferred-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("applied")
+    );
+
+    let app_res = app
+        .oneshot(
+            Request::builder()
+                .uri("/app-ping")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(app_res.status(), StatusCode::OK);
+    assert_eq!(
+        app_res
+            .headers()
+            .get("x-deferred-layer")
+            .and_then(|v| v.to_str().ok()),
+        Some("applied")
+    );
+}
+
+#[tokio::test]
+async fn plain_http_shutdown_completes_within_shutdown_timeout_with_stalled_connection() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncWriteExt;
+
+    let handler_entered = Arc::new(tokio::sync::Notify::new());
+    let handler_entered_clone = Arc::clone(&handler_entered);
+    let shutdown_hook_ran = Arc::new(AtomicBool::new(false));
+    let shutdown_hook_ran_clone = Arc::clone(&shutdown_hook_ran);
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let server = tokio::spawn(async move {
+        Rume::new()
+            .shutdown_timeout(Duration::from_millis(120))
+            .get("/stall", move || {
+                let entered = Arc::clone(&handler_entered_clone);
+                async move {
+                    entered.notify_one();
+                    std::future::pending::<&'static str>().await
+                }
+            })
+            .on_shutdown(move |_ctx| async move {
+                shutdown_hook_ran_clone.store(true, Ordering::SeqCst);
+            })
+            .run_with_listener_and_signal(listener, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    let mut tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+    tcp.write_all(b"GET /stall HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    handler_entered.notified().await;
+
+    let started = tokio::time::Instant::now();
+    let _ = shutdown_tx.send(());
+
+    let res = tokio::time::timeout(Duration::from_secs(2), server)
+        .await
+        .expect("plain-HTTP shutdown must not hang past shutdown_timeout with a stalled client")
+        .expect("server task should not panic");
+    res.expect("server should complete shutdown cleanly");
+
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown should complete promptly after shutdown_timeout"
+    );
+    assert!(
+        shutdown_hook_ran.load(Ordering::SeqCst),
+        "on_shutdown hook must run after plain-HTTP drain timeout"
+    );
+    drop(tcp);
+}
+
+#[tokio::test]
+async fn builder_layer_before_http_cache_isolates_tenant_cached_responses() {
+    use axum::body::{Body, to_bytes};
+    use axum::http::{HeaderName, Request, StatusCode};
+    use rume_data::cache::InMemoryCacheBackend;
+    use rume_http::http_cache::{HttpCacheConfig, HttpCacheLayer};
+    use rume_security::tenant::Tenant;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tower::ServiceExt;
+
+    let backend = Arc::new(InMemoryCacheBackend::new());
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_clone = Arc::clone(&hits);
+
+    let inject_tenant_layer = axum::middleware::from_fn(
+        |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            if let Some(tid) = req
+                .headers()
+                .get(HeaderName::from_static("x-tenant-id"))
+                .and_then(|v| v.to_str().ok())
+                .map(ToOwned::to_owned)
+            {
+                req.extensions_mut().insert(Tenant::new(tid.clone(), tid));
+            }
+            next.run(req).await
+        },
+    );
+
+    let cache = HttpCacheLayer::new(backend, HttpCacheConfig::default());
+
+    let router = RumeBuilder::new(test_ctx())
+        .get("/tenant-data", move |req: axum::extract::Request| {
+            let hits = Arc::clone(&hits_clone);
+            async move {
+                let n = hits.fetch_add(1, Ordering::SeqCst) + 1;
+                let tid = req
+                    .extensions()
+                    .get::<Tenant>()
+                    .map(|t| t.id.clone())
+                    .unwrap_or_else(|| "none".to_string());
+                format!("tenant={tid},hit={n}")
+            }
+        })
+        .layer(inject_tenant_layer)
+        .http_cache(cache)
+        .build_router(test_ctx())
+        .expect("build_router should succeed");
+
+    let app = router.with_state(test_ctx());
+
+    let r_a1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_a1.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_a1.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-a,hit=1".as_slice()
+    );
+
+    // Second tenant must NOT receive tenant-a's cached response.
+    let r_b1 = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-b")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_b1.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_b1.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-b,hit=2".as_slice()
+    );
+
+    // Repeat request for tenant-a hits tenant-a's cache entry.
+    let r_a2 = app
+        .oneshot(
+            Request::builder()
+                .uri("/tenant-data")
+                .header("x-tenant-id", "tenant-a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r_a2.status(), StatusCode::OK);
+    assert_eq!(
+        to_bytes(r_a2.into_body(), usize::MAX).await.unwrap(),
+        b"tenant=tenant-a,hit=1".as_slice()
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+}

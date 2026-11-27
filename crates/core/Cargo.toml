@@ -25,6 +25,10 @@ rume-enterprise.workspace = true
 rume-app.workspace = true
 # Testing helpers, TestApp, TestServer, and declarative harnesses.
 rume-testing = { workspace = true, optional = true }
+# Optional gRPC server integration.
+rume-grpc = { workspace = true, optional = true }
+# Optional GraphQL server integration.
+rume-graphql = { workspace = true, optional = true }
 # Core HTTP substrate (used by `rume::prelude`).
 axum.workspace = true
 # Serialization (used by `rume::prelude`).
@@ -38,6 +42,8 @@ testing = ["dep:rume-testing", "rume-testing/testing"]
 postgres = [
     "rume-data/postgres",
     "rume-messaging/postgres",
+    "rume-security/postgres",
+    "rume-enterprise/postgres",
     "rume-testing?/postgres",
 ]
 redis = [
@@ -45,20 +51,37 @@ redis = [
     "rume-messaging/redis",
     "rume-security/redis",
     "rume-http/redis",
+    "rume-enterprise/redis",
 ]
+http-client = ["rume-security/http-client"]
+dns-srv = ["rume-http/dns-srv"]
+nats = ["rume-messaging/nats"]
+rabbitmq = ["rume-messaging/rabbitmq"]
 sqlite = [
     "rume-data/sqlite",
     "rume-messaging/sqlite",
+    "rume-security/sqlite",
+    "rume-enterprise/sqlite",
     "rume-testing?/sqlite",
 ]
 mysql = [
     "rume-data/mysql",
     "rume-messaging/mysql",
+    "rume-security/mysql",
+    "rume-enterprise/mysql",
     "rume-testing?/mysql",
 ]
 saml = ["rume-enterprise/saml"]
 enterprise = ["saml", "rume-enterprise/enterprise"]
 schemars = ["rume-foundation/schemars"]
+s3 = ["rume-data/s3"]
+tls = ["rume-app/tls", "rume-http/tls"]
+acme = ["tls", "rume-app/acme", "rume-http/acme"]
+static-embed = ["rume-app/static-embed", "rume-http/static-embed"]
+mailer = ["rume-messaging/mailer"]
+scim = ["rume-http/scim"]
+grpc = ["dep:rume-grpc"]
+graphql = ["dep:rume-graphql"]
 
 [dev-dependencies]
 # Why: `tokio`, `sqlx`, and `uuid` belong in `[dev-dependencies]` rather than runtime
@@ -67,21 +90,38 @@ schemars = ["rume-foundation/schemars"]
 # when tests enable `postgres`, `sqlite`, or `mysql`.
 tokio = { workspace = true, features = ["test-util"] }
 sqlx.workspace = true
-uuid = { version = "=1.29.2", features = ["v4"] }
+uuid = { version = "=1.29.3", features = ["v4"] }
 deadpool-redis.workspace = true
 futures-util.workspace = true
 garde = { workspace = true, features = ["derive", "email", "url"] }
 redis.workspace = true
 serde_json = "=1.0.154"
 tower = "=0.5.3"
+tower-http = { workspace = true, features = ["decompression-gzip", "decompression-br", "decompression-zstd"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
 tempfile = "=3.27.0"
 testcontainers-modules = { workspace = true }
 insta = { version = "=1.49.0", features = ["json"] }
-rstest = "=0.28.0"
+rstest = "=0.29.0"
 wiremock = "=0.6.5"
 ureq = "=3.5.2"
 proptest.workspace = true
 criterion = { version = "=0.8.2", features = ["async_tokio"] }
+base64.workspace = true
+bergshamra.workspace = true
+rand.workspace = true
+rsa.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+signature.workspace = true
+sea-query.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+tonic.workspace = true
+async-graphql.workspace = true
 
 [[test]]
 name = "integration"

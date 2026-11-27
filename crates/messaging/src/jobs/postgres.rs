@@ -8,7 +8,7 @@ use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
 use crate::jobs::error::JobError;
-use crate::jobs::job::{BoxFuture, Job, QueuedJob};
+use crate::jobs::job::{BoxFuture, Job, QueuedJob, RawJob};
 use crate::jobs::queue::JobQueue;
 use crate::jobs::retry::RetryPolicy;
 use rume_data::persistence::postgres::PostgresBackend;
@@ -109,38 +109,41 @@ impl JobQueue for PostgresJobQueue {
         delay: Duration,
         trace_context: Option<String>,
     ) -> BoxFuture<'_, Result<String, JobError>> {
-        let name = J::NAME.to_string();
-        let retry_policy = job.retry_policy();
-        let timeout = job.timeout();
-        let idempotency_key = job.idempotency_key();
-        let tenant_id = job.tenant_id();
+        match RawJob::from_job(job, trace_context) {
+            Ok(raw) => self.enqueue_raw(raw, delay),
+            Err(e) => Box::pin(async move { Err(e) }),
+        }
+    }
+
+    fn enqueue_raw(&self, job: RawJob, delay: Duration) -> BoxFuture<'_, Result<String, JobError>> {
         let id = Uuid::new_v4().to_string();
 
         Box::pin(async move {
-            let payload =
-                serde_json::to_vec(&job).map_err(|e| JobError::Serialization(e.to_string()))?;
-
             let delay_ms = i64::try_from(delay.as_millis()).unwrap_or(i64::MAX);
-            let max_attempts = i32::try_from(retry_policy.max_attempts).unwrap_or(i32::MAX);
+            let max_attempts = i32::try_from(job.retry_policy.max_attempts).unwrap_or(i32::MAX);
             let initial_backoff_ms =
-                i64::try_from(retry_policy.initial_backoff_ms).unwrap_or(i64::MAX);
-            let max_backoff_ms = i64::try_from(retry_policy.max_backoff_ms).unwrap_or(i64::MAX);
-            let backoff_factor = retry_policy.backoff_factor;
-            let timeout_ms = timeout.map(|t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
+                i64::try_from(job.retry_policy.initial_backoff_ms).unwrap_or(i64::MAX);
+            let max_backoff_ms = i64::try_from(job.retry_policy.max_backoff_ms).unwrap_or(i64::MAX);
+            let backoff_factor = job.retry_policy.backoff_factor;
+            let timeout_ms = job
+                .timeout
+                .map(|t| i64::try_from(t.as_millis()).unwrap_or(i64::MAX));
 
             let row = sqlx::query(INSERT_JOB_SQL)
                 .bind(&id)
-                .bind(&name)
-                .bind(&payload)
+                .bind(&job.name)
+                .bind(&job.payload)
                 .bind(max_attempts)
                 .bind(initial_backoff_ms)
                 .bind(max_backoff_ms)
                 .bind(backoff_factor)
                 .bind(timeout_ms)
-                .bind(&idempotency_key)
-                .bind(&tenant_id)
+                .bind(&job.idempotency_key)
+                .bind(&job.tenant_id)
                 .bind(delay_ms)
-                .bind(&trace_context)
+                .bind(&job.trace_context)
+                .bind(&job.queue)
+                .bind(job.priority)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -148,9 +151,9 @@ impl JobQueue for PostgresJobQueue {
             if let Some(r) = row {
                 let inserted_id: String = r.try_get(0).unwrap_or(id);
                 Ok(inserted_id)
-            } else if let Some(ref ikey) = idempotency_key {
+            } else if let Some(ref ikey) = job.idempotency_key {
                 let existing = sqlx::query(JOBS_IDEMPOTENCY_CHECK_SQL)
-                    .bind(&tenant_id)
+                    .bind(&job.tenant_id)
                     .bind(ikey)
                     .fetch_optional(&self.pool)
                     .await
@@ -179,21 +182,62 @@ impl JobQueue for PostgresJobQueue {
     }
 
     fn dequeue_for(&self, worker_id: &str) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
+        self.dequeue_from(worker_id, None)
+    }
+
+    fn dequeue_from(
+        &self,
+        worker_id: &str,
+        queues: Option<&[&str]>,
+    ) -> BoxFuture<'_, Result<Option<QueuedJob>, JobError>> {
         let wid = worker_id.to_string();
+        let queue_filter: Option<Vec<String>> =
+            queues.map(|qs| qs.iter().map(|s| (*s).to_string()).collect());
         Box::pin(async move {
+            if queue_filter.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(None);
+            }
             // Use database-evaluated time: lease_expires_at = clock_timestamp() + $2 ms
             // No host-clock values are bound; the DB is the sole clock authority.
             let lease_duration_ms =
                 i64::try_from(self.default_lease_duration.as_millis()).unwrap_or(i64::MAX);
             let new_lease_token = Uuid::new_v4().to_string();
 
-            let row: Option<PgRow> = sqlx::query(JOBS_CLAIM_SQL)
+            let row: Option<PgRow> = if let Some(qs) = queue_filter {
+                sqlx::query(
+                    "UPDATE rume_jobs
+SET status = 'in_flight',
+    assigned_worker = $1,
+    attempt = attempt + 1,
+    lease_expires_at = (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT + $2,
+    lease_token = $3
+WHERE id IN (
+    SELECT id FROM rume_jobs
+    WHERE queue = ANY($4)
+      AND ((status = 'pending' AND available_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT)
+       OR (status = 'in_flight' AND lease_expires_at <= (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::BIGINT))
+    ORDER BY priority DESC, available_at ASC, created_at ASC
+    LIMIT 1
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, name, payload, attempt, max_attempts, initial_backoff_ms, max_backoff_ms, backoff_factor, timeout_ms, idempotency_key, tenant_id, assigned_worker, available_at, lease_token, trace_context, queue, priority;",
+                )
                 .bind(&wid)
                 .bind(lease_duration_ms)
                 .bind(&new_lease_token)
+                .bind(qs)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|e| JobError::Fatal(e.to_string()))?;
+                .map_err(|e| JobError::Fatal(e.to_string()))?
+            } else {
+                sqlx::query(JOBS_CLAIM_SQL)
+                    .bind(&wid)
+                    .bind(lease_duration_ms)
+                    .bind(&new_lease_token)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|e| JobError::Fatal(e.to_string()))?
+            };
 
             if let Some(r) = row {
                 let id: String = r.try_get(0).map_err(|e| JobError::Fatal(e.to_string()))?;
@@ -214,6 +258,8 @@ impl JobQueue for PostgresJobQueue {
                     .try_get(14)
                     .ok()
                     .or_else(|| r.try_get("trace_context").ok());
+                let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+                let priority: i32 = r.try_get(16).unwrap_or(0);
 
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
@@ -234,6 +280,8 @@ impl JobQueue for PostgresJobQueue {
                 Ok(Some(QueuedJob {
                     id,
                     name,
+                    queue,
+                    priority,
                     payload,
                     attempt: attempt.max(1) as u32,
                     retry_policy,
@@ -478,6 +526,8 @@ impl JobQueue for PostgresJobQueue {
                 let trace_context: Option<String> = r
                     .try_get::<Option<String>, _>("trace_context")
                     .map_err(|e| JobError::Fatal(e.to_string()))?;
+                let queue: String = r.try_get(15).unwrap_or_else(|_| "default".to_string());
+                let priority: i32 = r.try_get(16).unwrap_or(0);
                 let retry_policy = RetryPolicy {
                     max_attempts: max_attempts.max(1) as u32,
                     initial_backoff_ms: initial_backoff_ms.max(0) as u64,
@@ -488,6 +538,8 @@ impl JobQueue for PostgresJobQueue {
                 jobs.push(QueuedJob {
                     id,
                     name,
+                    queue,
+                    priority,
                     payload,
                     attempt: attempt.max(1) as u32,
                     retry_policy,

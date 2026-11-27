@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::error::AuthError;
 use crate::auth::identity::AuthUser;
+use crate::auth::jwt::{JwtClaims, JwtVerifier};
 use crate::auth::session::{BoxFuture, SessionStore};
 
 /// An authentication scheme that extracts and verifies credentials from request parts.
@@ -28,6 +29,41 @@ pub type TokenValidator = Arc<
     dyn Fn(&str) -> BoxFuture<'static, Result<Option<AuthUser>, AuthError>> + Send + Sync + 'static,
 >;
 
+/// Maps verified [`JwtClaims`] into an [`AuthUser`].
+#[derive(Clone)]
+pub struct JwtClaimsMapper {
+    mapper: Arc<dyn Fn(JwtClaims) -> Result<AuthUser, AuthError> + Send + Sync + 'static>,
+}
+
+impl std::fmt::Debug for JwtClaimsMapper {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JwtClaimsMapper").finish_non_exhaustive()
+    }
+}
+
+impl Default for JwtClaimsMapper {
+    fn default() -> Self {
+        Self::new(JwtClaims::into_auth_user)
+    }
+}
+
+impl JwtClaimsMapper {
+    /// Creates a custom claims-to-user mapper.
+    pub fn new<F>(mapper: F) -> Self
+    where
+        F: Fn(JwtClaims) -> Result<AuthUser, AuthError> + Send + Sync + 'static,
+    {
+        Self {
+            mapper: Arc::new(mapper),
+        }
+    }
+
+    /// Maps verified [`JwtClaims`] into an [`AuthUser`].
+    pub fn map(&self, claims: JwtClaims) -> Result<AuthUser, AuthError> {
+        (self.mapper)(claims)
+    }
+}
+
 /// Bearer token authentication scheme (`Authorization: Bearer <token>`).
 #[derive(Clone)]
 pub struct BearerTokenScheme {
@@ -46,6 +82,27 @@ impl BearerTokenScheme {
                 let token_owned = token.to_string();
                 let fut = validator(token_owned);
                 Box::pin(fut)
+            }),
+        }
+    }
+
+    /// Creates a Bearer token scheme backed by a [`JwtVerifier`] and [`JwtClaimsMapper`].
+    pub fn from_jwt_verifier(verifier: JwtVerifier, mapper: JwtClaimsMapper) -> Self {
+        let verifier = Arc::new(verifier);
+        Self {
+            validator: Arc::new(move |token| {
+                let verifier = Arc::clone(&verifier);
+                let mapper = mapper.clone();
+                let token = token.to_owned();
+                Box::pin(async move {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs();
+                    let claims = verifier.verify(&token, now).await?;
+                    let user = mapper.map(claims)?;
+                    Ok(Some(user))
+                })
             }),
         }
     }
@@ -84,6 +141,7 @@ impl AuthenticationScheme for BearerTokenScheme {
 pub struct ApiKeyScheme {
     header_name: String,
     keys: Arc<HashMap<[u8; 32], AuthUser>>,
+    store: Option<Arc<dyn crate::auth::api_key::ApiKeyStore>>,
 }
 
 impl ApiKeyScheme {
@@ -92,6 +150,7 @@ impl ApiKeyScheme {
         Self {
             header_name: "x-api-key".to_string(),
             keys: Arc::new(HashMap::new()),
+            store: None,
         }
     }
 
@@ -110,6 +169,12 @@ impl ApiKeyScheme {
         hasher.update(key.as_ref());
         let hash: [u8; 32] = hasher.finalize().into();
         Arc::make_mut(&mut self.keys).insert(hash, user);
+        self
+    }
+
+    /// Backs this scheme with a persistent [`ApiKeyStore`](crate::auth::api_key::ApiKeyStore).
+    pub fn with_store(mut self, store: impl crate::auth::api_key::ApiKeyStore) -> Self {
+        self.store = Some(Arc::new(store));
         self
     }
 }
@@ -144,6 +209,21 @@ impl AuthenticationScheme for ApiKeyScheme {
                 return Ok(Some(user.clone()));
             }
 
+            if let Some(store) = &self.store {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if let Some(record) = store.verify_key(key_str, now).await? {
+                    let _ = store.touch_last_used(&record.id, now).await;
+                    let mut user = AuthUser::new(record.user_id).with_permissions(record.scopes);
+                    if let Some(tenant_id) = record.tenant_id {
+                        user = user.with_tenant_id(tenant_id);
+                    }
+                    return Ok(Some(user));
+                }
+            }
+
             Err(AuthError::InvalidCredentials("unrecognized api key".into()))
         })
     }
@@ -172,15 +252,23 @@ impl<S: SessionStore> SessionScheme<S> {
     }
 }
 
+/// Maximum number of matching session cookie candidates queried against the store per request.
+///
+/// Why: bounds per-request store lookups against cookie-flooding DoS while still tolerating
+/// legitimate stale/tossed duplicate cookies.
+const MAX_SESSION_COOKIE_CANDIDATES: usize = 8;
+
 impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
     fn authenticate<'a>(
         &'a self,
         parts: &'a Parts,
     ) -> BoxFuture<'a, Result<Option<AuthUser>, AuthError>> {
         Box::pin(async move {
-            // Security M2: Iterate through all Cookie headers and all matching cookie pairs.
+            // Security M2: Iterate through all Cookie headers and all matching cookie pairs,
+            // capped at `MAX_SESSION_COOKIE_CANDIDATES` store lookups per request.
             // Continuing past invalid/stale cookies defeats subdomain cookie-tossing DoS,
             // where an attacker sets a bogus parent-domain cookie with the same name.
+            let mut candidates_checked = 0usize;
             for cookie_header in parts.headers.get_all(COOKIE) {
                 let Ok(cookie_str) = cookie_header.to_str() else {
                     continue;
@@ -190,6 +278,10 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
                     if let Some((name, val)) = cookie.trim().split_once('=')
                         && name == self.cookie_name
                     {
+                        if candidates_checked >= MAX_SESSION_COOKIE_CANDIDATES {
+                            return Ok(None);
+                        }
+                        candidates_checked += 1;
                         match self.store.load(val).await {
                             Ok(Some(session)) => {
                                 let mut user = AuthUser::new(session.user_id)
@@ -218,3 +310,7 @@ impl<S: SessionStore> AuthenticationScheme for SessionScheme<S> {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "schemes_tests.rs"]
+mod tests;
