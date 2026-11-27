@@ -19,6 +19,7 @@ const BRIDGE_MAX_BACKOFF: Duration = Duration::from_secs(5);
 ///
 /// Dropping the handle aborts the background task; call [`Self::shutdown`] to stop the
 /// bridge gracefully and await task termination.
+#[must_use = "dropping BridgeHandle aborts the background event bridge"]
 #[derive(Debug)]
 pub struct BridgeHandle {
     shutdown_tx: watch::Sender<bool>,
@@ -233,7 +234,17 @@ impl DistributedEventBus {
                                 }
                                 _ = tokio::time::sleep(backoff) => {}
                             }
-                            match pubsub.subscribe(E::TYPE).await {
+                            let sub_res = tokio::select! {
+                                biased;
+                                res = shutdown_rx.changed() => {
+                                    if res.is_err() || *shutdown_rx.borrow() {
+                                        break None;
+                                    }
+                                    continue;
+                                }
+                                res = pubsub.subscribe(E::TYPE) => res,
+                            };
+                            match sub_res {
                                 Ok(new_sub) => {
                                     backoff = BRIDGE_INITIAL_BACKOFF;
                                     break Some(new_sub);

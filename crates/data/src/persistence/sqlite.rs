@@ -690,15 +690,16 @@ pub(crate) fn validate_sqlite_placeholders(
 
                 if placeholder == "?" {
                     max_required = max_required.max(next_positional);
-                    next_positional = next_positional.saturating_add(1);
+                    next_positional = max_required.saturating_add(1);
                 } else if let Some(rest) = placeholder.strip_prefix('?') {
                     let pos = parse_positive_placeholder_index(rest, placeholder)?;
                     max_required = max_required.max(pos);
-                    next_positional = pos.saturating_add(1);
+                    next_positional = max_required.saturating_add(1);
                 } else if let Some(rest) = placeholder.strip_prefix('$') {
                     if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
                         let pos = parse_positive_placeholder_index(rest, placeholder)?;
                         max_required = max_required.max(pos);
+                        next_positional = max_required.saturating_add(1);
                     } else {
                         return Err(PersistenceError::QueryFailed(format!(
                             "statement contains unsupported SQLite named placeholder '{placeholder}'"

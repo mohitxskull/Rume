@@ -263,8 +263,8 @@ async fn run_election_loop(
             let call_start = Instant::now();
             let renew_res = tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
                     continue;
@@ -297,8 +297,8 @@ async fn run_election_loop(
             let call_start = Instant::now();
             let acquire_res = tokio::select! {
                 biased;
-                _ = shutdown_rx.changed() => {
-                    if *shutdown_rx.borrow() {
+                res = shutdown_rx.changed() => {
+                    if res.is_err() || *shutdown_rx.borrow() {
                         break;
                     }
                     continue;
@@ -323,8 +323,8 @@ async fn run_election_loop(
         }
 
         tokio::select! {
-            _ = shutdown_rx.changed() => {
-                if *shutdown_rx.borrow() {
+            res = shutdown_rx.changed() => {
+                if res.is_err() || *shutdown_rx.borrow() {
                     break;
                 }
             }
@@ -530,6 +530,15 @@ impl CronSchedulerHandle {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for CronSchedulerHandle {
+    fn drop(&mut self) {
+        let _ = self.job_shutdown_tx.send(true);
+        let _ = self.election_shutdown_tx.send(true);
+        self.job_tasks.abort_all();
+        self.election_task.abort();
     }
 }
 
