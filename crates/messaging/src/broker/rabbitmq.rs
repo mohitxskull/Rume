@@ -1,11 +1,13 @@
 //! RabbitMQ [`MessageBroker`] implementation via `lapin`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::StreamExt;
 use lapin::BasicProperties;
+use lapin::Confirmation;
 use lapin::options::{
     BasicAckOptions, BasicConsumeOptions, BasicNackOptions, BasicPublishOptions,
     ConfirmSelectOptions, QueueDeclareOptions,
@@ -78,11 +80,60 @@ impl RabbitMqBroker {
     }
 }
 
+/// Validates a RabbitMQ publisher confirmation, rejecting broker `Nack` or disabled confirms.
+///
+/// Why: `PublisherConfirm::await` resolves to `Ok(Confirmation::Nack(_))` when the broker
+/// rejects a publish (and `Ok(Confirmation::NotRequested)` if confirms are not enabled).
+/// Accepting any non-`Ack` variant as `Ok(())` would let `OutboxRelay` mark an undelivered
+/// message as published.
+fn verify_publish_confirmation(confirmation: &Confirmation) -> Result<(), BrokerError> {
+    if confirmation.is_ack() {
+        Ok(())
+    } else if confirmation.is_nack() {
+        Err(BrokerError::Transport(
+            "RabbitMQ broker negatively acknowledged published message".into(),
+        ))
+    } else {
+        Err(BrokerError::Transport(
+            "RabbitMQ publisher confirms were not enabled on channel".into(),
+        ))
+    }
+}
+
+/// FIFO queue of unacknowledged AMQP delivery tags.
+///
+/// Why: a single `Option<u64>` silently overwrote earlier unacked tags if `next_message()` was
+/// called more than once before `ack()`, and calling `.take()` before awaiting `basic_ack` /
+/// `basic_nack` dropped the tag on transient transport errors. Peeking the front tag and popping
+/// only after the broker call succeeds preserves delivery tags across retries.
+#[derive(Debug, Default)]
+struct PendingDeliveryTags {
+    tags: VecDeque<u64>,
+}
+
+impl PendingDeliveryTags {
+    fn push(&mut self, tag: u64) {
+        self.tags.push_back(tag);
+    }
+
+    async fn consume_front<F, Fut>(&mut self, op: F) -> Result<(), BrokerError>
+    where
+        F: FnOnce(u64) -> Fut,
+        Fut: Future<Output = Result<(), BrokerError>>,
+    {
+        if let Some(&tag) = self.tags.front() {
+            op(tag).await?;
+            self.tags.pop_front();
+        }
+        Ok(())
+    }
+}
+
 struct RabbitMqConsumer {
     topic: String,
     channel: lapin::Channel,
     consumer: lapin::Consumer,
-    pending_delivery_tag: Option<u64>,
+    pending_delivery_tags: PendingDeliveryTags,
 }
 
 impl Debug for RabbitMqConsumer {
@@ -99,9 +150,9 @@ impl BrokerConsumer for RabbitMqConsumer {
             match self.consumer.next().await {
                 Some(Ok(delivery)) => {
                     // Why: do NOT ack before yielding to the caller; retain the delivery
-                    // tag so the caller explicitly invokes `ack()` after processing or
-                    // `nack(requeue)` on failure, preventing message loss on crash.
-                    self.pending_delivery_tag = Some(delivery.delivery_tag);
+                    // tag in FIFO order so the caller explicitly invokes `ack()` after
+                    // processing or `nack(requeue)` on failure, preventing message loss.
+                    self.pending_delivery_tags.push(delivery.delivery_tag);
                     let mut headers = BTreeMap::new();
                     if let Some(table) = delivery.properties.headers() {
                         for (key, value) in table.inner() {
@@ -124,31 +175,35 @@ impl BrokerConsumer for RabbitMqConsumer {
 
     fn ack(&mut self) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            if let Some(tag) = self.pending_delivery_tag.take() {
-                self.channel
-                    .basic_ack(tag, BasicAckOptions::default())
-                    .await
-                    .map_err(|e| BrokerError::Transport(e.to_string()))?;
-            }
-            Ok(())
+            let channel = &self.channel;
+            self.pending_delivery_tags
+                .consume_front(|tag| async move {
+                    channel
+                        .basic_ack(tag, BasicAckOptions::default())
+                        .await
+                        .map_err(|e| BrokerError::Transport(e.to_string()))
+                })
+                .await
         })
     }
 
     fn nack(&mut self, requeue: bool) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
-            if let Some(tag) = self.pending_delivery_tag.take() {
-                self.channel
-                    .basic_nack(
-                        tag,
-                        BasicNackOptions {
-                            requeue,
-                            ..Default::default()
-                        },
-                    )
-                    .await
-                    .map_err(|e| BrokerError::Transport(e.to_string()))?;
-            }
-            Ok(())
+            let channel = &self.channel;
+            self.pending_delivery_tags
+                .consume_front(|tag| async move {
+                    channel
+                        .basic_nack(
+                            tag,
+                            BasicNackOptions {
+                                requeue,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .map_err(|e| BrokerError::Transport(e.to_string()))
+                })
+                .await
         })
     }
 }
@@ -191,11 +246,23 @@ impl BrokerPublisher for RabbitMqBroker {
                 }
             };
 
-            if let Err(e) = confirm.await {
-                if !channel.status().connected() {
-                    *self.publish_channel.lock().await = None;
+            match confirm.await {
+                Ok(confirmation) => {
+                    if let Err(err) = verify_publish_confirmation(&confirmation) {
+                        if !channel.status().connected()
+                            || matches!(confirmation, Confirmation::NotRequested)
+                        {
+                            *self.publish_channel.lock().await = None;
+                        }
+                        return Err(err);
+                    }
                 }
-                return Err(BrokerError::Transport(e.to_string()));
+                Err(e) => {
+                    if !channel.status().connected() {
+                        *self.publish_channel.lock().await = None;
+                    }
+                    return Err(BrokerError::Transport(e.to_string()));
+                }
             }
 
             Ok(())
@@ -238,8 +305,73 @@ impl MessageBroker for RabbitMqBroker {
                 topic: topic.to_string(),
                 channel,
                 consumer,
-                pending_delivery_tag: None,
+                pending_delivery_tags: PendingDeliveryTags::default(),
             }) as Box<dyn BrokerConsumer>)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_publish_confirmation_accepts_ack_and_rejects_nack_or_not_requested() {
+        assert!(verify_publish_confirmation(&Confirmation::Ack(None)).is_ok());
+
+        let nack_err = verify_publish_confirmation(&Confirmation::Nack(None)).unwrap_err();
+        assert!(
+            matches!(nack_err, BrokerError::Transport(ref msg) if msg.contains("negatively acknowledged")),
+            "expected transport error on Nack, got {nack_err:?}"
+        );
+
+        let not_req_err = verify_publish_confirmation(&Confirmation::NotRequested).unwrap_err();
+        assert!(
+            matches!(not_req_err, BrokerError::Transport(ref msg) if msg.contains("not enabled")),
+            "expected transport error on NotRequested, got {not_req_err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_delivery_tags_preserves_fifo_order_and_retains_tag_on_failed_ack() {
+        let mut pending = PendingDeliveryTags::default();
+        pending.push(10);
+        pending.push(11);
+
+        // Simulated transient transport failure on ack of tag 10 must retain tag 10 at the front.
+        let mut seen = Vec::new();
+        let err = pending
+            .consume_front(|tag| {
+                seen.push(tag);
+                async { Err(BrokerError::Transport("transient socket error".into())) }
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BrokerError::Transport(_)));
+        assert_eq!(seen, vec![10]);
+        assert_eq!(pending.tags.front().copied(), Some(10));
+        assert_eq!(pending.tags.len(), 2);
+
+        // Retry succeeds: tag 10 is popped, leaving tag 11 next in FIFO order.
+        pending
+            .consume_front(|tag| {
+                seen.push(tag);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![10, 10]);
+        assert_eq!(pending.tags.front().copied(), Some(11));
+
+        // Second ack pops tag 11.
+        pending
+            .consume_front(|tag| {
+                seen.push(tag);
+                async { Ok(()) }
+            })
+            .await
+            .unwrap();
+        assert_eq!(seen, vec![10, 10, 11]);
+        assert!(pending.tags.is_empty());
     }
 }

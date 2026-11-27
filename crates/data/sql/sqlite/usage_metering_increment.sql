@@ -1,4 +1,4 @@
-INSERT INTO rume_usage_counters (id, tenant_id, metric, window, count, period_start)
+INSERT INTO rume_usage_counters (id, tenant_id, metric, "window", count, period_start)
 VALUES (?, ?, ?, ?, ?, ?)
 ON CONFLICT (id) DO UPDATE SET
     count = rume_usage_counters.count + EXCLUDED.count,

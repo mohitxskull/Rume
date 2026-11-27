@@ -287,4 +287,36 @@ mod tests {
         assert_eq!(period_start_for_dialect("postgres"), "1970-01-01T00:00:00Z");
         assert_eq!(period_start_for_dialect("sqlite"), "1970-01-01T00:00:00Z");
     }
+
+    #[test]
+    fn postgres_and_sqlite_usage_metering_sql_double_quote_window_keyword() {
+        assert!(
+            sql::PG_USAGE_METERING_SCHEMA.contains("\"window\""),
+            "PostgreSQL usage_metering_schema.sql must double-quote reserved keyword \"window\""
+        );
+        assert_eq!(
+            sql::PG_USAGE_METERING_SCHEMA.matches("\"window\"").count(),
+            2,
+            "PostgreSQL usage_metering_schema.sql must double-quote \"window\" in both column def and unique index"
+        );
+        assert!(
+            sql::PG_USAGE_METERING_INCREMENT.contains("\"window\""),
+            "PostgreSQL usage_metering_increment.sql must double-quote reserved keyword \"window\""
+        );
+        assert!(
+            sql::SQLITE_USAGE_METERING_SCHEMA.contains("\"window\""),
+            "SQLite usage_metering_schema.sql must double-quote \"window\""
+        );
+        assert_eq!(
+            sql::SQLITE_USAGE_METERING_SCHEMA
+                .matches("\"window\"")
+                .count(),
+            2,
+            "SQLite usage_metering_schema.sql must double-quote \"window\" in both column def and unique index"
+        );
+        assert!(
+            sql::SQLITE_USAGE_METERING_INCREMENT.contains("\"window\""),
+            "SQLite usage_metering_increment.sql must double-quote \"window\""
+        );
+    }
 }

@@ -1,6 +1,6 @@
 use super::assertion::{SamlAssertion, SamlParser};
 use super::redis_replay::AsyncSamlReplayCache;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::Mutex;
 use thiserror::Error;
 
@@ -89,7 +89,27 @@ pub trait SamlReplayCache: Send + Sync {
 #[derive(Debug, Default)]
 struct ReplayCacheState {
     entries: HashMap<String, u64>,
+    /// Secondary expiry index `(expires_at, assertion_id)` so pruning expired entries
+    /// is `O(k log N)` for `k` expired entries instead of an `O(N)` full-map scan.
+    expiry_index: BTreeSet<(u64, String)>,
     last_pruned_at: u64,
+}
+
+impl ReplayCacheState {
+    fn prune_up_to(&mut self, cutoff: u64) {
+        self.last_pruned_at = self.last_pruned_at.max(cutoff);
+        let watermark = self.last_pruned_at;
+        while let Some((exp, _)) = self.expiry_index.first() {
+            if *exp > watermark {
+                break;
+            }
+            if let Some((exp, id)) = self.expiry_index.pop_first()
+                && self.entries.get(&id).copied() == Some(exp)
+            {
+                self.entries.remove(&id);
+            }
+        }
+    }
 }
 
 const DEFAULT_MAX_REPLAY_ENTRIES: usize = 100_000;
@@ -138,9 +158,7 @@ impl InMemorySamlReplayCache {
     /// watermark so concurrent late validations cannot re-insert an already-pruned ID.
     pub fn prune_expired(&self, now_epoch_sec: u64) {
         if let Ok(mut guard) = self.state.lock() {
-            guard.last_pruned_at = guard.last_pruned_at.max(now_epoch_sec);
-            let cutoff = guard.last_pruned_at;
-            guard.entries.retain(|_, exp| *exp > cutoff);
+            guard.prune_up_to(now_epoch_sec);
         }
     }
 }
@@ -170,9 +188,12 @@ impl SamlReplayCache for InMemorySamlReplayCache {
                 current: effective_now,
             });
         }
-        // Why: prune expired entries inline and fail closed at `max_entries` (never evicting
-        // active unexpired IDs) so unbounded traffic cannot OOM the process or evict replay state.
-        guard.entries.retain(|_, exp| *exp > effective_now);
+        // Why: advance `last_pruned_at` to `effective_now` before evicting expired entries so
+        // an evicted ID can never be re-accepted by a lagging/concurrent validation with an
+        // earlier `now_epoch_sec`, and prune via `expiry_index` in O(k log N) instead of an
+        // O(N) scan; fail closed at `max_entries` so unbounded traffic cannot OOM or evict
+        // active replay state.
+        guard.prune_up_to(effective_now);
         if guard.entries.contains_key(assertion_id) {
             return Ok(false);
         }
@@ -182,7 +203,9 @@ impl SamlReplayCache for InMemorySamlReplayCache {
                 self.max_entries
             )));
         }
-        guard.entries.insert(assertion_id.to_string(), expires_at);
+        let id = assertion_id.to_string();
+        guard.entries.insert(id.clone(), expires_at);
+        guard.expiry_index.insert((expires_at, id));
         Ok(true)
     }
 }
@@ -662,5 +685,22 @@ mod replay_cache_tests {
 
         // Once id-1 expires (now >= 100), inline pruning frees its slot for id-3.
         assert!(cache.record_if_absent("id-3", 250, 100).unwrap());
+    }
+
+    #[test]
+    fn in_memory_replay_cache_advances_watermark_on_inline_prune() {
+        let cache = InMemorySamlReplayCache::new();
+        assert!(cache.record_if_absent("id-a", 120, 100).unwrap());
+        // Advances time past id-a's expiry (120) and evicts id-a inline.
+        assert!(cache.record_if_absent("id-b", 200, 125).unwrap());
+        // A lagging/concurrent validation with an earlier `now_epoch_sec` must NOT
+        // re-accept the evicted id-a; it must fail closed with Expired.
+        assert_eq!(
+            cache.record_if_absent("id-a", 120, 115),
+            Err(SamlError::Expired {
+                not_on_or_after: 120,
+                current: 125,
+            })
+        );
     }
 }

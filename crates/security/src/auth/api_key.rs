@@ -343,6 +343,9 @@ impl ApiKeyStore for InMemoryApiKeyStore {
                     "api key already revoked".into(),
                 ));
             }
+            if old.expires_at.is_some_and(|exp| exp <= now_epoch_sec) {
+                return Err(AuthError::Expired);
+            }
             old.revoked_at = Some(now_epoch_sec);
             let issued = generate_api_key(
                 &old.user_id,
@@ -522,6 +525,10 @@ impl<B: DatabaseBackend> ApiKeyStore for SqlApiKeyStore<B> {
                 return Err(AuthError::InvalidCredentials(
                     "api key already revoked".into(),
                 ));
+            }
+            if old.expires_at.is_some_and(|exp| exp <= now_epoch_sec) {
+                let _ = tx.rollback().await;
+                return Err(AuthError::Expired);
             }
 
             let revoke_stmt = select_sql(
@@ -732,5 +739,74 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn in_memory_api_key_store_rotate_rejects_expired_key() {
+        let store = InMemoryApiKeyStore::new();
+        let issued = store
+            .create(
+                "user-expired",
+                Some("tenant-a"),
+                "expiring-key",
+                vec!["read".into()],
+                Some(2_000),
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .rotate(&issued.record.id, Some(9_000), 2_000)
+                .await
+                .unwrap_err(),
+            AuthError::Expired
+        );
+        assert_eq!(
+            store
+                .rotate(&issued.record.id, Some(9_000), 2_001)
+                .await
+                .unwrap_err(),
+            AuthError::Expired
+        );
+        // No replacement key should have been created.
+        assert_eq!(store.list_for_user("user-expired").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sql_api_key_store_rotate_rejects_expired_key_and_rolls_back() {
+        let backend = setup_sqlite().await;
+        let store = SqlApiKeyStore::new(backend);
+        let issued = store
+            .create(
+                "user-expired",
+                Some("tenant-a"),
+                "expiring-key",
+                vec!["read".into()],
+                Some(2_000),
+                1_000,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .rotate(&issued.record.id, Some(9_000), 2_000)
+                .await
+                .unwrap_err(),
+            AuthError::Expired
+        );
+        assert_eq!(
+            store
+                .rotate(&issued.record.id, Some(9_000), 2_001)
+                .await
+                .unwrap_err(),
+            AuthError::Expired
+        );
+        // Transaction rolled back: no replacement key created and original key not revoked.
+        let keys = store.list_for_user("user-expired").await.unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].revoked_at, None);
     }
 }
