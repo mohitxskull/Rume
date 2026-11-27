@@ -28,8 +28,9 @@ fn emit_component_schemas(spec: &Value, out: &mut String) {
         return;
     };
 
+    let mut used_schema_names = HashSet::new();
     for (name, schema) in schemas {
-        let ts_name = sanitize_pascal_ident(name);
+        let ts_name = deduplicate_name(sanitize_pascal_ident(name), &mut used_schema_names);
         if is_object_schema(schema) {
             let _ = writeln!(out, "export interface {ts_name} {{");
             emit_object_fields(schema, out, "  ");
@@ -86,7 +87,7 @@ fn schema_to_ts(schema: &Value) -> String {
         let variants: Vec<String> = enum_vals
             .iter()
             .map(|v| match v {
-                Value::String(s) => format!("{s:?}"),
+                Value::String(s) => js_string_literal(s),
                 Value::Number(n) => n.to_string(),
                 Value::Bool(b) => b.to_string(),
                 Value::Null => "null".to_string(),
@@ -113,7 +114,17 @@ fn schema_to_ts(schema: &Value) -> String {
     {
         return variants
             .iter()
-            .map(schema_to_ts)
+            .map(|v| {
+                let ts = schema_to_ts(v);
+                // Why: in TypeScript `&` binds tighter than `|`, so an unparenthesized
+                // union inside an intersection (`A | B & C`) parses as `A | (B & C)` instead
+                // of `(A | B) & C` (`RC-39`).
+                if ts.contains(" | ") && !(ts.starts_with('(') && ts.ends_with(')')) {
+                    format!("({ts})")
+                } else {
+                    ts
+                }
+            })
             .collect::<Vec<_>>()
             .join(" & ");
     }
@@ -219,16 +230,23 @@ fn emit_client(spec: &Value, out: &mut String) {
     out.push_str("  }\n");
 
     let mut used_names = HashSet::new();
+    // Why: reserve `constructor` so an operation named `constructor` never emits
+    // `async constructor(...)` which fails TypeScript compilation (`TS1089`, `RC-39`).
+    used_names.insert("constructor".to_string());
     if let Some(paths) = spec.get("paths").and_then(Value::as_object) {
         for (path, path_item) in paths {
             let Some(path_obj) = path_item.as_object() else {
                 continue;
             };
+            let path_item_params = path_obj
+                .get("parameters")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice);
             for &method in HTTP_METHODS {
                 let Some(op) = path_obj.get(method).and_then(Value::as_object) else {
                     continue;
                 };
-                emit_operation_method(path, method, op, &mut used_names, out);
+                emit_operation_method(path, method, path_item_params, op, &mut used_names, out);
             }
         }
     }
@@ -244,6 +262,7 @@ fn emit_client(spec: &Value, out: &mut String) {
 fn emit_operation_method(
     path: &str,
     method: &str,
+    path_item_params: Option<&[Value]>,
     op: &Map<String, Value>,
     used_names: &mut HashSet<String>,
     out: &mut String,
@@ -256,7 +275,7 @@ fn emit_operation_method(
         .unwrap_or_else(|| sanitize_camel_ident(&format!("{method}_{path}")));
 
     let method_name = deduplicate_name(raw_name, used_names);
-    let (mut path_params, query_params) = collect_parameters(path, op);
+    let (mut path_params, query_params) = collect_parameters(path, path_item_params, op);
     let request_body = extract_request_body(op);
     let return_type = extract_response_type(op);
 
@@ -326,15 +345,15 @@ fn emit_operation_method(
     if let Some(ref q_param) = query_param_name {
         let _ = writeln!(out, "    const searchParams = new URLSearchParams();");
         for q in &query_params {
+            let q_lit = js_string_literal(&q.name);
             let prop_access = if is_valid_js_ident(&q.name) {
                 format!("{q_param}?.{}", q.name)
             } else {
-                format!("{q_param}?.[{:?}]", q.name)
+                format!("{q_param}?.[{q_lit}]")
             };
             let _ = writeln!(
                 out,
-                "    if ({prop_access} !== undefined) searchParams.set({:?}, String({prop_access}));",
-                q.name
+                "    if ({prop_access} !== undefined) searchParams.set({q_lit}, String({prop_access}));"
             );
         }
         let _ = writeln!(out, "    const qs = searchParams.toString();");
@@ -346,10 +365,10 @@ fn emit_operation_method(
         let _ = writeln!(out, "    const url = `{url_expr}`;");
     }
 
-    let upper_method = method.to_ascii_uppercase();
+    let upper_method = js_string_literal(&method.to_ascii_uppercase());
     if let Some(ref b_param) = body_param_name {
         let _ = writeln!(out, "    const res = await this.fetchImpl(url, {{");
-        let _ = writeln!(out, "      method: {upper_method:?},");
+        let _ = writeln!(out, "      method: {upper_method},");
         let _ = writeln!(
             out,
             "      headers: {b_param} !== undefined ? {{ \"Content-Type\": \"application/json\" }} : undefined,"
@@ -362,7 +381,7 @@ fn emit_operation_method(
     } else {
         let _ = writeln!(
             out,
-            "    const res = await this.fetchImpl(url, {{ method: {upper_method:?} }});"
+            "    const res = await this.fetchImpl(url, {{ method: {upper_method} }});"
         );
     }
 
@@ -377,63 +396,109 @@ fn emit_operation_method(
     out.push_str("  }");
 }
 
-fn collect_parameters(path: &str, op: &Map<String, Value>) -> (Vec<ParamSpec>, Vec<ParamSpec>) {
-    let mut path_params = Vec::new();
-    let mut query_params = Vec::new();
+fn collect_parameters(
+    path: &str,
+    path_item_params: Option<&[Value]>,
+    op: &Map<String, Value>,
+) -> (Vec<ParamSpec>, Vec<ParamSpec>) {
+    let mut path_params: Vec<ParamSpec> = Vec::new();
+    let mut query_params: Vec<ParamSpec> = Vec::new();
     let mut seen_path = BTreeSet::new();
 
-    if let Some(params) = op.get("parameters").and_then(Value::as_array) {
-        for p in params {
-            let Some(name) = p.get("name").and_then(Value::as_str) else {
+    // Merge path-item-level `parameters` with operation-level `parameters`, letting
+    // operation-level definitions override path-item definitions by `(name, in)` (`RC-39`).
+    let mut merged: Vec<&Value> = Vec::new();
+    if let Some(pip) = path_item_params {
+        merged.extend(pip.iter());
+    }
+    if let Some(op_params) = op.get("parameters").and_then(Value::as_array) {
+        for p in op_params {
+            let key = (
+                p.get("name").and_then(Value::as_str),
+                p.get("in").and_then(Value::as_str),
+            );
+            if let (Some(name), Some(loc)) = key
+                && let Some(pos) = merged.iter().position(|existing| {
+                    existing.get("name").and_then(Value::as_str) == Some(name)
+                        && existing.get("in").and_then(Value::as_str) == Some(loc)
+                })
+            {
+                merged[pos] = p;
                 continue;
-            };
-            let location = p.get("in").and_then(Value::as_str).unwrap_or("");
-            let required = p.get("required").and_then(Value::as_bool).unwrap_or(false);
-            let ts_type = p
-                .get("schema")
-                .map(schema_to_ts)
-                .unwrap_or_else(|| "string".to_string());
-
-            match location {
-                "path" => {
-                    seen_path.insert(name.to_string());
-                    path_params.push(ParamSpec {
-                        name: name.to_string(),
-                        ts_name: sanitize_param_ident(name),
-                        required: true,
-                        ts_type,
-                    });
-                }
-                "query" => {
-                    query_params.push(ParamSpec {
-                        name: name.to_string(),
-                        ts_name: sanitize_param_ident(name),
-                        required,
-                        ts_type,
-                    });
-                }
-                _ => {}
             }
+            merged.push(p);
         }
     }
 
-    // Ensure any `{param}` in the path template is present even if `parameters` omitted it.
-    for seg in path.split('/') {
-        if let Some(raw) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            let name = raw.strip_prefix('*').unwrap_or(raw);
-            if !name.is_empty() && !seen_path.contains(name) {
+    for p in merged {
+        let Some(name) = p.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let location = p.get("in").and_then(Value::as_str).unwrap_or("");
+        let required = p.get("required").and_then(Value::as_bool).unwrap_or(false);
+        let ts_type = p
+            .get("schema")
+            .map(schema_to_ts)
+            .unwrap_or_else(|| "string".to_string());
+
+        match location {
+            "path" => {
                 seen_path.insert(name.to_string());
                 path_params.push(ParamSpec {
                     name: name.to_string(),
                     ts_name: sanitize_param_ident(name),
                     required: true,
-                    ts_type: "string".to_string(),
+                    ts_type,
                 });
             }
+            "query" => {
+                query_params.push(ParamSpec {
+                    name: name.to_string(),
+                    ts_name: sanitize_param_ident(name),
+                    required,
+                    ts_type,
+                });
+            }
+            _ => {}
+        }
+    }
+
+    // Ensure any `{param}` or `{*wildcard}` (including partial-segment `{id}.json`) in the
+    // path template is present even if `parameters` omitted it (`RC-39`).
+    for (name, _is_wildcard) in extract_path_placeholders(path) {
+        if !name.is_empty() && !seen_path.contains(&name) {
+            seen_path.insert(name.clone());
+            path_params.push(ParamSpec {
+                ts_name: sanitize_param_ident(&name),
+                name,
+                required: true,
+                ts_type: "string".to_string(),
+            });
         }
     }
 
     (path_params, query_params)
+}
+
+fn extract_path_placeholders(path: &str) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            break;
+        };
+        let raw = &after_open[..close];
+        if let Some(wild) = raw.strip_prefix('*') {
+            if !wild.is_empty() {
+                out.push((wild.to_string(), true));
+            }
+        } else if !raw.is_empty() {
+            out.push((raw.to_string(), false));
+        }
+        rest = &after_open[close + 1..];
+    }
+    out
 }
 
 fn extract_request_body(op: &Map<String, Value>) -> Option<(bool, String)> {
@@ -483,22 +548,42 @@ fn build_url_template(path: &str, path_params: &[ParamSpec]) -> String {
     if !path.starts_with('/') {
         rendered.push('/');
     }
-    for (idx, seg) in path.split('/').enumerate() {
-        if idx > 0 {
-            rendered.push('/');
-        }
-        if let Some(raw) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
-            let name = raw.strip_prefix('*').unwrap_or(raw);
+    // Why: scan inline `{param}` and `{*wildcard}` occurrences so partial-segment templates
+    // like `/files/{id}.json` and wildcard catch-alls like `/assets/{*path}` interpolate
+    // properly rather than being emitted as raw literals (`RC-39`).
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        rendered.push_str(&escape_ts_template_literal(&rest[..open]));
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find('}') else {
+            rendered.push_str(&escape_ts_template_literal(&rest[open..]));
+            return rendered;
+        };
+        let raw = &after_open[..close];
+        let (name, is_wildcard) = match raw.strip_prefix('*') {
+            Some(wild) => (wild, true),
+            None => (raw, false),
+        };
+        if name.is_empty() {
+            rendered.push_str(&escape_ts_template_literal(&rest[open..=open + close + 1]));
+        } else {
             let ts_name = path_params
                 .iter()
                 .find(|p| p.name == name)
                 .map(|p| p.ts_name.as_str())
                 .unwrap_or(name);
-            let _ = write!(rendered, "${{encodeURIComponent(String({ts_name}))}}");
-        } else {
-            rendered.push_str(&escape_ts_template_literal(seg));
+            if is_wildcard {
+                let _ = write!(
+                    rendered,
+                    "${{String({ts_name}).split(\"/\").map(encodeURIComponent).join(\"/\")}}"
+                );
+            } else {
+                let _ = write!(rendered, "${{encodeURIComponent(String({ts_name}))}}");
+            }
         }
+        rest = &after_open[close + 1..];
     }
+    rendered.push_str(&escape_ts_template_literal(rest));
     rendered
 }
 
@@ -664,11 +749,15 @@ fn is_valid_js_ident(s: &str) -> bool {
     chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
 }
 
+fn js_string_literal(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| format!("{s:?}"))
+}
+
 fn format_prop_key(name: &str) -> String {
     if is_valid_js_ident(name) {
         name.to_string()
     } else {
-        format!("{name:?}")
+        js_string_literal(name)
     }
 }
 
@@ -1102,6 +1191,94 @@ mod tests {
         assert!(
             ts.contains("${encodeURIComponent(String(res_2))}"),
             "URL template must reference renamed `res_2`:\n{ts}"
+        );
+    }
+
+    #[test]
+    fn rc39_openapi_ts_hardening_edge_cases() {
+        let spec = json!({
+            "openapi": "3.1.0",
+            "info": { "title": "Edge", "version": "1.0.0" },
+            "components": {
+                "schemas": {
+                    "user-item": {
+                        "type": "object",
+                        "properties": { "a": { "type": "string" } }
+                    },
+                    "user_item": {
+                        "type": "object",
+                        "properties": { "b": { "type": "number" } }
+                    },
+                    "Combined": {
+                        "allOf": [
+                            { "oneOf": [{ "type": "string" }, { "type": "number" }] },
+                            { "type": "object", "properties": { "tag": { "type": "string" } } }
+                        ]
+                    }
+                }
+            },
+            "paths": {
+                "/files/{id}.json": {
+                    "parameters": [
+                        { "name": "id", "in": "path", "required": true, "schema": { "type": "integer" } },
+                        { "name": "fmt", "in": "query", "required": false, "schema": { "type": "string" } }
+                    ],
+                    "get": {
+                        "operationId": "constructor",
+                        "parameters": [
+                            { "name": "fmt", "in": "query", "required": true, "schema": { "type": "string" } }
+                        ],
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                },
+                "/assets/{*filepath}": {
+                    "get": {
+                        "operationId": "getAsset",
+                        "responses": { "204": { "description": "No Content" } }
+                    }
+                }
+            }
+        });
+
+        let ts = generate_typescript(&spec);
+        // 1. `constructor` method name is reserved (no `async constructor(`).
+        assert!(
+            !ts.contains("async constructor("),
+            "must not emit async constructor:\n{ts}"
+        );
+        assert!(
+            ts.contains("async constructor_2("),
+            "must deduplicate constructor:\n{ts}"
+        );
+        // 2. Colliding sanitized schema names are deduplicated.
+        assert!(
+            ts.contains("export interface UserItem {"),
+            "missing UserItem:\n{ts}"
+        );
+        assert!(
+            ts.contains("export interface UserItem_2 {"),
+            "missing UserItem_2:\n{ts}"
+        );
+        // 3. Union inside allOf intersection is parenthesized.
+        assert!(
+            ts.contains("(string | number) & { tag?: string; }"),
+            "union inside allOf must be parenthesized:\n{ts}"
+        );
+        // 4. Path-item parameters merged & overridden by operation parameters (`id: number`, required `fmt`).
+        assert!(
+            ts.contains("id: number, query: { fmt: string; }"),
+            "path-item params must merge and allow op override:\n{ts}"
+        );
+        // 5. Partial-segment `{id}.json` and `{*filepath}` wildcard templates work.
+        assert!(
+            ts.contains("/files/${encodeURIComponent(String(id))}.json"),
+            "partial-segment {{id}}.json must interpolate:\n{ts}"
+        );
+        assert!(
+            ts.contains(
+                "/assets/${String(filepath).split(\"/\").map(encodeURIComponent).join(\"/\")}"
+            ),
+            "wildcard {{*filepath}} must interpolate:\n{ts}"
         );
     }
 }

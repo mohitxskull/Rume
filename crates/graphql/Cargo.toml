@@ -9,6 +9,7 @@ description = "Optional async-graphql integration with W3C TraceContext and AppE
 [dependencies]
 rume-foundation.workspace = true
 rume-observability.workspace = true
+rume-security.workspace = true
 axum.workspace = true
 tokio.workspace = true
 async-graphql.workspace = true

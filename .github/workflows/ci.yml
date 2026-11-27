@@ -41,6 +41,7 @@ jobs:
       # to ensure no feature-gated code or platform integrations introduce warnings or unsafe code.
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo check -p rume --no-default-features
+      - run: cargo check --manifest-path fuzz/Cargo.toml
 
   doc:
     name: doc & doctests
@@ -142,7 +143,7 @@ jobs:
         ports:
           - 5432:5432
       redis:
-        image: redis:alpine
+        image: redis:7-alpine
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s
@@ -192,7 +193,7 @@ jobs:
         ports:
           - 5432:5432
       redis:
-        image: redis:alpine
+        image: redis:7-alpine
         options: >-
           --health-cmd "redis-cli ping"
           --health-interval 2s

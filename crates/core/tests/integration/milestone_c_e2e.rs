@@ -611,7 +611,7 @@ async fn e2e_s3_object_store_with_wiremock_and_presigned_url() {
         region: "us-east-1".to_string(),
         bucket: "rume-e2e-bucket".to_string(),
         access_key_id: "test-access-key".to_string(),
-        secret_access_key: "test-secret-key".to_string(),
+        secret_access_key: "test-secret-key".into(),
         session_token: None,
         path_style: true,
         ..Default::default()

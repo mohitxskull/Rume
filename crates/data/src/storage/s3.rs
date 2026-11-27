@@ -6,8 +6,10 @@ use chrono::{DateTime, Utc};
 use hmac::{Hmac, KeyInit, Mac};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HOST, HeaderMap, HeaderName, HeaderValue};
 use reqwest::{Client, Method, StatusCode};
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
 use url::Url;
+use zeroize::Zeroizing;
 
 use crate::storage::{
     BoxFuture, ObjectKey, ObjectMeta, ObjectStore, ObjectStoreError, PresignedUrl, PutObjectOptions,
@@ -33,8 +35,8 @@ pub struct S3Config {
     pub region: String,
     pub bucket: String,
     pub access_key_id: String,
-    pub secret_access_key: String,
-    pub session_token: Option<String>,
+    pub secret_access_key: SecretString,
+    pub session_token: Option<SecretString>,
     pub path_style: bool,
     /// Optional TCP connect timeout (defaults to [`DEFAULT_S3_CONNECT_TIMEOUT`]).
     pub connect_timeout: Option<Duration>,
@@ -91,7 +93,7 @@ impl S3ObjectStore {
         if config.bucket.is_empty()
             || config.region.is_empty()
             || config.access_key_id.is_empty()
-            || config.secret_access_key.is_empty()
+            || config.secret_access_key.expose_secret().is_empty()
         {
             return Err(ObjectStoreError::Configuration(
                 "S3 bucket, region, access_key_id, and secret_access_key must be non-empty"
@@ -175,7 +177,10 @@ impl S3ObjectStore {
     }
 
     fn signing_key(&self, date_stamp: &str) -> [u8; 32] {
-        let k_secret = format!("AWS4{}", self.config.secret_access_key);
+        let k_secret = Zeroizing::new(format!(
+            "AWS4{}",
+            self.config.secret_access_key.expose_secret()
+        ));
         let k_date = hmac_sha256(k_secret.as_bytes(), date_stamp.as_bytes());
         let k_region = hmac_sha256(&k_date, self.config.region.as_bytes());
         let k_service = hmac_sha256(&k_region, b"s3");
@@ -198,7 +203,8 @@ impl S3ObjectStore {
         let mut signed_headers = String::from("host;x-amz-content-sha256;x-amz-date");
 
         if let Some(token) = &self.config.session_token {
-            canonical_headers.push_str(&format!("x-amz-security-token:{token}\n"));
+            canonical_headers
+                .push_str(&format!("x-amz-security-token:{}\n", token.expose_secret()));
             signed_headers.push_str(";x-amz-security-token");
         }
 
@@ -236,7 +242,7 @@ impl S3ObjectStore {
         if let Some(token) = &self.config.session_token {
             headers.insert(
                 HeaderName::from_static("x-amz-security-token"),
-                HeaderValue::from_str(token)
+                HeaderValue::from_str(token.expose_secret())
                     .map_err(|e| ObjectStoreError::Configuration(e.to_string()))?,
             );
         }
@@ -313,7 +319,10 @@ impl S3ObjectStore {
             ),
         ];
         if let Some(token) = &self.config.session_token {
-            query_params.push(("X-Amz-Security-Token", percent_encode_component(token)));
+            query_params.push((
+                "X-Amz-Security-Token",
+                percent_encode_component(token.expose_secret()),
+            ));
         }
         query_params.sort_by(|a, b| a.0.cmp(b.0));
 

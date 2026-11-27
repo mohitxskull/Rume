@@ -289,6 +289,7 @@ impl DatabaseBackend for SqliteBackend {
             let tx = self.pool.begin().await.map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                restore_busy_timeout: false,
             })
         })
     }
@@ -314,6 +315,7 @@ impl DatabaseBackend for SqliteBackend {
                     .map_err(map_sqlx_error)?;
             Ok(SqliteTransaction {
                 tx: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+                restore_busy_timeout: true,
             })
         })
     }
@@ -345,6 +347,10 @@ impl DatabaseBackend for SqliteBackend {
 #[derive(Clone)]
 pub struct SqliteTransaction {
     tx: Arc<tokio::sync::Mutex<Option<sqlx::Transaction<'static, sqlx::Sqlite>>>>,
+    /// When `true`, restore `PRAGMA busy_timeout = 5000` before returning the connection
+    /// to the pool so `begin_immediate_transaction` never leaves pooled connections stuck
+    /// at 60000ms (`RC-42`).
+    restore_busy_timeout: bool,
 }
 
 impl SqliteTransaction {
@@ -494,11 +500,17 @@ impl DatabaseTransaction for SqliteTransaction {
 
     fn commit(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
+        let restore = self.restore_busy_timeout;
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard.take().ok_or_else(|| {
+            let mut tx = guard.take().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            if restore {
+                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *tx)
+                    .await;
+            }
             tx.commit()
                 .await
                 .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;
@@ -508,11 +520,17 @@ impl DatabaseTransaction for SqliteTransaction {
 
     fn rollback(&self) -> BoxFuture<'_, Result<(), PersistenceError>> {
         let tx_arc = Arc::clone(&self.tx);
+        let restore = self.restore_busy_timeout;
         Box::pin(async move {
             let mut guard = tx_arc.lock().await;
-            let tx = guard.take().ok_or_else(|| {
+            let mut tx = guard.take().ok_or_else(|| {
                 PersistenceError::TransactionError("transaction already resolved".into())
             })?;
+            if restore {
+                let _ = sqlx::query("PRAGMA busy_timeout = 5000")
+                    .execute(&mut *tx)
+                    .await;
+            }
             tx.rollback()
                 .await
                 .map_err(|e| PersistenceError::TransactionError(e.to_string()))?;

@@ -248,37 +248,75 @@ impl ObservabilityBuilder {
             return Ok((tracer_provider, meter_provider, logger_provider));
         };
 
+        let trace_endpoint = normalize_otlp_http_endpoint(endpoint, "/v1/traces");
         let span_exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
+            .with_endpoint(trace_endpoint)
             .build()?;
         let tracer_provider = SdkTracerProvider::builder()
             .with_resource(resource.clone())
             .with_batch_exporter(span_exporter)
             .build();
 
-        let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+        let metric_endpoint = normalize_otlp_http_endpoint(endpoint, "/v1/metrics");
+        let metric_exporter = match opentelemetry_otlp::MetricExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .build()?;
+            .with_endpoint(metric_endpoint)
+            .build()
+        {
+            Ok(exp) => exp,
+            Err(err) => {
+                // Why: shut down already-built `tracer_provider` on partial init failure
+                // so its background batch exporter task does not leak (`RC-25`).
+                let _ = tracer_provider.shutdown();
+                return Err(err.into());
+            }
+        };
         let meter_provider = SdkMeterProvider::builder()
             .with_resource(resource.clone())
             .with_periodic_exporter(metric_exporter)
             .build();
 
-        let log_exporter = opentelemetry_otlp::LogExporter::builder()
+        let log_endpoint = normalize_otlp_http_endpoint(endpoint, "/v1/logs");
+        let log_exporter = match opentelemetry_otlp::LogExporter::builder()
             .with_http()
             .with_protocol(Protocol::HttpBinary)
-            .with_endpoint(endpoint)
-            .build()?;
+            .with_endpoint(log_endpoint)
+            .build()
+        {
+            Ok(exp) => exp,
+            Err(err) => {
+                let _ = tracer_provider.shutdown();
+                let _ = meter_provider.shutdown();
+                return Err(err.into());
+            }
+        };
         let logger_provider = SdkLoggerProvider::builder()
             .with_resource(resource)
             .with_batch_exporter(log_exporter)
             .build();
 
         Ok((tracer_provider, meter_provider, logger_provider))
+    }
+}
+
+/// Normalizes an OTLP HTTP base endpoint URL by appending the per-signal path
+/// (`/v1/traces`, `/v1/metrics`, or `/v1/logs`) when not already present (`RC-25`).
+///
+/// Why: `opentelemetry-otlp`'s `.with_endpoint(...)` treats the argument as the full
+/// per-signal URL rather than a collector base URL; passing `http://collector:4318`
+/// directly would POST all three signals to `/` instead of `/v1/{traces,metrics,logs}`.
+#[cfg(feature = "otel")]
+pub(crate) fn normalize_otlp_http_endpoint(base: &str, signal_path: &str) -> String {
+    let trimmed = base.trim().trim_end_matches('/');
+    let suffix = signal_path.trim_start_matches('/');
+    let full_suffix = format!("/{suffix}");
+    if trimmed.ends_with(&full_suffix) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{full_suffix}")
     }
 }
 
@@ -375,5 +413,96 @@ mod tests {
         let _ = t.shutdown();
         let _ = m.shutdown();
         let _ = l.shutdown();
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn otlp_http_base_endpoint_posts_to_per_signal_paths() {
+        use opentelemetry::logs::{LogRecord as _, Logger as _, LoggerProvider as _};
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry::trace::Tracer as _;
+        use std::collections::HashSet;
+        use std::sync::{Arc, Mutex};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        assert_eq!(
+            normalize_otlp_http_endpoint("http://127.0.0.1:4318/", "/v1/traces"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+        assert_eq!(
+            normalize_otlp_http_endpoint("http://127.0.0.1:4318/v1/traces", "/v1/traces"),
+            "http://127.0.0.1:4318/v1/traces"
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        let seen_paths: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+        let seen_clone = Arc::clone(&seen_paths);
+
+        let server = tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let seen = Arc::clone(&seen_clone);
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    if let Ok(n) = stream.read(&mut buf).await
+                        && n > 0
+                    {
+                        let req = String::from_utf8_lossy(&buf[..n]);
+                        if let Some(first_line) = req.lines().next()
+                            && let Some(path) = first_line.split_whitespace().nth(1)
+                        {
+                            seen.lock().unwrap().insert(path.to_string());
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        let resource = Resource::builder().with_service_name("otel-test").build();
+        let builder = ObservabilityBuilder::new().with_otlp_endpoint(format!("http://{addr}"));
+        let (tracer_provider, meter_provider, logger_provider) =
+            builder.build_providers(resource).expect("build providers");
+
+        // Emit one span, one metric observation, and one log record, then flush/shutdown.
+        tracer_provider.tracer("test").in_span("ping", |_| {});
+        let counter = meter_provider.meter("test").u64_counter("reqs").build();
+        counter.add(1, &[]);
+        let logger = logger_provider.logger("test");
+        let mut record = logger.create_log_record();
+        record.set_body("hello".into());
+        logger.emit(record);
+
+        tokio::task::spawn_blocking(move || {
+            let _ = tracer_provider.force_flush();
+            let _ = meter_provider.force_flush();
+            let _ = logger_provider.force_flush();
+            let _ = tracer_provider.shutdown();
+            let _ = meter_provider.shutdown();
+            let _ = logger_provider.shutdown();
+        })
+        .await
+        .expect("flush providers");
+
+        server.abort();
+        let paths = seen_paths.lock().unwrap().clone();
+        assert!(
+            paths.contains("/v1/traces"),
+            "expected POST to /v1/traces, saw {paths:?}"
+        );
+        assert!(
+            paths.contains("/v1/metrics"),
+            "expected POST to /v1/metrics, saw {paths:?}"
+        );
+        assert!(
+            paths.contains("/v1/logs"),
+            "expected POST to /v1/logs, saw {paths:?}"
+        );
     }
 }

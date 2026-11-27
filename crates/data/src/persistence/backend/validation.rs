@@ -181,9 +181,9 @@ fn sanitize_non_nested_block_comments_inner<'a>(
     }
 
     Ok(match out {
-        Some(vec) => std::borrow::Cow::Owned(
-            String::from_utf8(vec).expect("replacing ASCII '*' with ' ' preserves valid UTF-8"),
-        ),
+        Some(vec) => std::borrow::Cow::Owned(String::from_utf8(vec).expect(
+            "replacing non-newline bytes inside block comment with ASCII ' ' preserves valid UTF-8",
+        )),
         None => std::borrow::Cow::Borrowed(statement),
     })
 }

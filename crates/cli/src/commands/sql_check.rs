@@ -254,25 +254,25 @@ fn collect_target_sql_files(target: &Path) -> Result<Vec<PathBuf>, String> {
         return Ok(vec![target.to_path_buf()]);
     }
     let mut files = Vec::new();
-    collect_sql_files(target, &mut files);
+    collect_sql_files(target, &mut files)?;
     files.sort();
     Ok(files)
 }
 
-fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) {
+fn collect_sql_files(dir: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
     // Why: `walkdir::WalkDir` with `follow_links(false)` avoids symlink cycles cleanly
-    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`).
-    for entry in walkdir::WalkDir::new(dir)
-        .follow_links(false)
-        .into_iter()
-        .flatten()
-    {
+    // without a hand-rolled recursive `fs::read_dir` walker (`RC-20`), and returning
+    // traversal errors prevents silently skipping unreadable directories (`RC-42`).
+    for entry_res in walkdir::WalkDir::new(dir).follow_links(false) {
+        let entry =
+            entry_res.map_err(|err| format!("failed to traverse {}: {err}", dir.display()))?;
         if entry.file_type().is_file()
             && entry.path().extension().and_then(|s| s.to_str()) == Some("sql")
         {
             files.push(entry.into_path());
         }
     }
+    Ok(())
 }
 
 /// Returns `true` only when `statements` contains exactly one zero-parameter

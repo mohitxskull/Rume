@@ -16,6 +16,11 @@ pub(crate) fn is_valid_identifier(name: &str) -> bool {
     if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
         return false;
     }
+    // Why: reject underscore-only identifiers like `"_"` or `"___"`, which are not valid
+    // Rust module/struct names (`RC-39`).
+    if !name.chars().any(|c| c.is_ascii_alphanumeric()) {
+        return false;
+    }
     let normalized = name.to_ascii_lowercase().replace('-', "_");
     // Rust 2024 reserved keywords (lowercased; `Self` is unreachable after lowercasing).
     const RESERVED_KEYWORDS: &[&str] = &[
@@ -129,7 +134,27 @@ pub(crate) fn ensure_main_mod(module_name: &str) {
                 }
                 None => format!("{mod_stmt}\n{content}"),
             };
-            let _ = std::fs::write(target_path, new_content);
+            if let Err(err) = std::fs::write(target_path, new_content) {
+                eprintln!("error: failed to update {target_path}: {err}");
+                std::process::exit(1);
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn is_valid_identifier_rejects_underscore_only_and_keywords() {
+        assert!(!is_valid_identifier("_"));
+        assert!(!is_valid_identifier("___"));
+        assert!(!is_valid_identifier("_-"));
+        assert!(!is_valid_identifier(""));
+        assert!(!is_valid_identifier("type"));
+        assert!(is_valid_identifier("user"));
+        assert!(is_valid_identifier("_internal_1"));
+        assert!(is_valid_identifier("user-profile"));
     }
 }

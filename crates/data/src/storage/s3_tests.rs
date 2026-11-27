@@ -10,7 +10,7 @@ async fn s3_sigv4_presigned_urls_match_canonical_format() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        secret_access_key: SecretString::from("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         session_token: None,
         path_style: false,
         ..Default::default()
@@ -95,7 +95,7 @@ async fn s3_store_put_get_head_delete_against_mock_server() {
         region: "us-east-1".to_string(),
         bucket: "test-bucket".to_string(),
         access_key_id: "test-key".to_string(),
-        secret_access_key: "test-secret".to_string(),
+        secret_access_key: SecretString::from("test-secret"),
         session_token: None,
         path_style: true,
         ..Default::default()
@@ -133,7 +133,7 @@ async fn s3_presign_put_includes_content_type_in_signed_headers() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+        secret_access_key: SecretString::from("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
         session_token: None,
         path_style: false,
         ..Default::default()
@@ -213,7 +213,7 @@ async fn s3_list_paginates_truncated_responses_with_continuation_token() {
         region: "us-east-1".to_string(),
         bucket: "test-bucket".to_string(),
         access_key_id: "test-key".to_string(),
-        secret_access_key: "test-secret".to_string(),
+        secret_access_key: SecretString::from("test-secret"),
         session_token: None,
         path_style: true,
         ..Default::default()
@@ -244,8 +244,8 @@ fn s3_config_debug_redacts_secret_access_key_and_session_token() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
-        secret_access_key: "super_secret_aws_key".to_string(),
-        session_token: Some("super_secret_session_token".to_string()),
+        secret_access_key: SecretString::from("super_secret_aws_key"),
+        session_token: Some(SecretString::from("super_secret_session_token")),
         path_style: false,
         ..Default::default()
     };
@@ -278,7 +278,7 @@ fn s3_rejects_malformed_xml_invalid_bucket_and_invalid_presign_params() {
             region: "us-east-1".to_string(),
             bucket: bad_bucket.to_string(),
             access_key_id: "ak".to_string(),
-            secret_access_key: "sk".to_string(),
+            secret_access_key: SecretString::from("sk"),
             ..Default::default()
         })
         .unwrap_err();
@@ -294,7 +294,7 @@ fn s3_rejects_malformed_xml_invalid_bucket_and_invalid_presign_params() {
         region: "us-east-1".to_string(),
         bucket: "my-bucket".to_string(),
         access_key_id: "ak".to_string(),
-        secret_access_key: "sk".to_string(),
+        secret_access_key: SecretString::from("sk"),
         ..Default::default()
     })
     .unwrap();
@@ -339,7 +339,7 @@ async fn s3_list_rejects_repeating_continuation_token() {
         region: "us-east-1".to_string(),
         bucket: "test-bucket".to_string(),
         access_key_id: "ak".to_string(),
-        secret_access_key: "sk".to_string(),
+        secret_access_key: SecretString::from("sk"),
         path_style: true,
         ..Default::default()
     })

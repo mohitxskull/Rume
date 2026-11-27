@@ -23,7 +23,7 @@ tracing.workspace = true
 thiserror.workspace = true
 garde.workspace = true
 parking_lot.workspace = true
-uuid = { version = "=1.29.3", features = ["v4"] }
+uuid = { version = "1.29.3", features = ["v4"] }
 reqwest.workspace = true
 rand.workspace = true
 sha2.workspace = true

@@ -9,6 +9,7 @@ pub fn app_error_to_graphql(err: &AppError) -> async_graphql::Error {
     let status = err.status_code().as_u16();
     let (message, code): (String, &'static str) = match err {
         AppError::NotFound => ("not found".to_string(), "NOT_FOUND"),
+        AppError::NotFoundWithDetail { message } => (message.clone(), "NOT_FOUND"),
         AppError::BadRequest { code, message } => (message.clone(), code),
         AppError::Unauthorized => ("unauthorized".to_string(), "UNAUTHORIZED"),
         AppError::Forbidden => ("forbidden".to_string(), "FORBIDDEN"),
@@ -19,8 +20,18 @@ pub fn app_error_to_graphql(err: &AppError) -> async_graphql::Error {
         AppError::Public { code, message, .. } => (message.clone(), code),
     };
 
+    let validation_details = match err {
+        AppError::Validation { details } => serde_json::to_value(details)
+            .ok()
+            .and_then(|v| async_graphql::Value::from_json(v).ok()),
+        _ => None,
+    };
+
     async_graphql::Error::new(message).extend_with(|_, e| {
         e.set("code", code);
         e.set("status", status);
+        if let Some(details) = validation_details {
+            e.set("details", details);
+        }
     })
 }

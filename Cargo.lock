@@ -5703,6 +5703,7 @@ dependencies = [
  "rume-foundation",
  "rume-observability",
  "sea-query",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.11.2",
@@ -5715,6 +5716,7 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -5775,6 +5777,7 @@ dependencies = [
  "axum",
  "rume-foundation",
  "rume-observability",
+ "rume-security",
  "serde_json",
  "tokio",
  "tower",

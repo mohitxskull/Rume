@@ -19,10 +19,17 @@ jobs:
       - uses: actions/checkout@v7.0.1
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit,cargo-deny
+      - name: Security audit and dependency policy check
+        run: |
+          cargo audit
+          cargo deny check
       - name: Verify crate packaging
         run: |
           cargo package -p rume-macros --allow-dirty
-          for pkg in rume-foundation rume-observability rume-data rume-messaging rume-security rume-http rume-enterprise rume-app rume-testing rume rume-cli; do
+          for pkg in rume-foundation rume-observability rume-data rume-messaging rume-security rume-http rume-enterprise rume-app rume-grpc rume-graphql rume-testing rume rume-cli; do
             cargo package --list -p "$pkg" --allow-dirty > /dev/null
           done
           cargo test -p rume --lib --features testing
