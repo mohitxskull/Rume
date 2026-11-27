@@ -128,7 +128,9 @@ impl IntoResponse for RealtimeError {
             Self::InvalidIdentifier { .. } => {
                 (StatusCode::BAD_REQUEST, self.to_string()).into_response()
             }
-            Self::PubSub(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg).into_response(),
+            Self::PubSub(msg) => {
+                AppError::internal(format!("realtime pubsub error: {msg}")).into_response()
+            }
             Self::ShuttingDown => {
                 (StatusCode::SERVICE_UNAVAILABLE, self.to_string()).into_response()
             }
@@ -808,5 +810,39 @@ mod tests {
             .expect("sub2 should receive event from respawned pump");
         assert!(matches!(ev1, RealtimeRecv::Event(e) if e.event == "ping"));
         assert!(matches!(ev2, RealtimeRecv::Event(e) if e.event == "ping"));
+    }
+
+    #[tokio::test]
+    async fn pubsub_error_into_response_uses_problem_json_without_leaking_raw_message() {
+        use axum::body::to_bytes;
+        use axum::http::header::CONTENT_TYPE;
+
+        let raw_secret_err = "redis://admin:s3cr3t@10.0.4.12:6379 TLS certificate verify failed";
+        let resp = RealtimeError::PubSub(raw_secret_err.to_string()).into_response();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            resp.headers()
+                .get(CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/problem+json")
+        );
+
+        let body_bytes = to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .expect("read response body");
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            !body.contains("s3cr3t"),
+            "response body leaked secret: {body}"
+        );
+        assert!(
+            !body.contains("10.0.4.12"),
+            "response body leaked internal host: {body}"
+        );
+        assert!(
+            !body.contains("TLS certificate verify failed"),
+            "response body leaked raw transport error: {body}"
+        );
     }
 }

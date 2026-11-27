@@ -23,6 +23,8 @@ use crate::auth::error::AuthError;
 use crate::auth::identity::AuthUser;
 use crate::auth::session::BoxFuture;
 
+/// Minimum RSA modulus size accepted from a JWK (2048 bits).
+const MIN_RSA_MODULUS_BYTES: usize = 256;
 /// Maximum RSA modulus size accepted from a JWK (8192 bits).
 const MAX_RSA_MODULUS_BYTES: usize = 1024;
 /// Maximum JWKS HTTP response size (1 MiB).
@@ -86,7 +88,7 @@ impl JwtAlgorithm {
 }
 
 /// JSON Web Key (RFC 7517).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Jwk {
     /// Key type (`"RSA"`, `"EC"`, `"oct"`).
     pub kty: String,
@@ -111,6 +113,24 @@ pub struct Jwk {
     pub y: Option<String>,
     /// Symmetric key material (base64url).
     pub k: Option<String>,
+}
+
+impl std::fmt::Debug for Jwk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Jwk")
+            .field("kty", &self.kty)
+            .field("kid", &self.kid)
+            .field("key_use", &self.key_use)
+            .field("key_ops", &self.key_ops)
+            .field("alg", &self.alg)
+            .field("n", &self.n)
+            .field("e", &self.e)
+            .field("crv", &self.crv)
+            .field("x", &self.x)
+            .field("y", &self.y)
+            .field("k", &self.k.as_ref().map(|_| "[REDACTED]"))
+            .finish()
+    }
 }
 
 /// JSON Web Key Set (RFC 7517).
@@ -354,7 +374,17 @@ fn parse_single_jwk(jwk: &Jwk) -> Result<Option<ParsedKey>, String> {
             let e_bytes = URL_SAFE_NO_PAD
                 .decode(e_b64)
                 .map_err(|_| "invalid RSA JWK 'e'".to_owned())?;
-            if n_bytes.is_empty() || n_bytes.len() > MAX_RSA_MODULUS_BYTES || e_bytes.is_empty() {
+            // Why: strip leading zero bytes before checking the 2048-bit floor so a weak
+            // RSA modulus (e.g. 1024-bit) padded with leading zeros cannot bypass
+            // `MIN_RSA_MODULUS_BYTES` (`RC-16`).
+            let significant_n = match n_bytes.iter().position(|&b| b != 0) {
+                Some(pos) => &n_bytes[pos..],
+                None => &[],
+            };
+            if significant_n.len() < MIN_RSA_MODULUS_BYTES
+                || n_bytes.len() > MAX_RSA_MODULUS_BYTES
+                || e_bytes.is_empty()
+            {
                 return Err("invalid RSA JWK modulus or exponent".to_owned());
             }
             let n = BoxedUint::from_be_slice_vartime(&n_bytes);

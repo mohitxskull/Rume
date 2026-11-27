@@ -201,11 +201,8 @@ impl DatabaseBackend for SqliteBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             if params_vec.is_empty() {
-                // Why: SQLite silently binds unbound `?` / `:name` placeholders to
-                // `NULL` when executed via `raw_sql` without parameters; reject them
-                // up front, matching `SqliteTransaction::execute_params`.
-                reject_unbound_sqlite_placeholders(&statement)?;
                 let res = sqlx::raw_sql(AssertSqlSafe(statement.clone()))
                     .execute(&self.pool)
                     .await
@@ -227,6 +224,7 @@ impl DatabaseBackend for SqliteBackend {
         let query = query.trim().to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
+            validate_sqlite_placeholders(&query, params_vec.len())?;
             let query_obj = bind_sqlite_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&self.pool)
@@ -245,6 +243,7 @@ impl DatabaseBackend for SqliteBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<SqliteRow> = query.fetch_all(&self.pool).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
@@ -259,6 +258,7 @@ impl DatabaseBackend for SqliteBackend {
         let statement = statement.to_string();
         let params_vec = params.to_vec();
         Box::pin(async move {
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<SqliteRow> = query
                 .fetch_optional(&self.pool)
@@ -423,8 +423,8 @@ impl DatabaseTransaction for SqliteTransaction {
                 &statement,
                 &sqlparser::dialect::SQLiteDialect {},
             )?;
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             let res = if params_vec.is_empty() {
-                reject_unbound_sqlite_placeholders(&statement)?;
                 sqlx::raw_sql(AssertSqlSafe(statement))
                     .execute(&mut **tx)
                     .await
@@ -458,6 +458,7 @@ impl DatabaseTransaction for SqliteTransaction {
                 &query,
                 &sqlparser::dialect::SQLiteDialect {},
             )?;
+            validate_sqlite_placeholders(&query, params_vec.len())?;
             let query_obj = bind_sqlite_params(sqlx::query(AssertSqlSafe(query)), &params_vec);
             let row: Option<SqliteRow> = query_obj
                 .fetch_optional(&mut **tx)
@@ -484,6 +485,7 @@ impl DatabaseTransaction for SqliteTransaction {
                 &statement,
                 &sqlparser::dialect::SQLiteDialect {},
             )?;
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let rows: Vec<SqliteRow> = query.fetch_all(&mut **tx).await.map_err(map_sqlx_error)?;
             rows.iter().map(sqlx_sqlite_row_to_db_row).collect()
@@ -507,6 +509,7 @@ impl DatabaseTransaction for SqliteTransaction {
                 &statement,
                 &sqlparser::dialect::SQLiteDialect {},
             )?;
+            validate_sqlite_placeholders(&statement, params_vec.len())?;
             let query = bind_sqlite_params(sqlx::query(AssertSqlSafe(statement)), &params_vec);
             let row: Option<SqliteRow> = query
                 .fetch_optional(&mut **tx)
@@ -637,17 +640,22 @@ pub(crate) fn sqlx_sqlite_row_to_db_row(row: &SqliteRow) -> Result<DbRow, Persis
     Ok(DbRow::new(columns, values))
 }
 
-/// Rejects SQLite bind placeholders (`?`, `?NNN`, `:name`, `@name`, `$name`) outside
-/// string literals, quoted identifiers, and comments when executing with empty params.
+/// Validates SQLite bind placeholders outside string literals, quoted identifiers, and comments
+/// so SQLite can never silently bind an unbound placeholder to `NULL` (`RC-02`).
+///
+/// Rejects named placeholders (`:name`, `@name`, non-numeric `$name`) and verifies that
+/// `param_count` covers every positional placeholder (`?`, `?NNN`, `$NNN`).
 ///
 /// Why: Delegate SQLite lexical scanning (comments, single/double/backtick quotes, `[...]`
 /// identifiers) to `sqlparser = "=0.64.0"` instead of maintaining a hand-rolled byte scanner.
 /// `SQLiteDialect` tokenizes `?`, `?NNN`, and `$name` as `Token::Placeholder`, while `:name`
 /// and `@name` tokenize as `Token::Colon` / `Token::AtSign` immediately adjacent (`tok.span.end
-/// == next.span.start`) to an unquoted `Token::Word` (plus `Token::Number` after `@`). Fails
-/// closed with `PersistenceError::QueryFailed` on `TokenizerError` (revisit only if `sqlparser`
-/// natively tokenizes `:name` / `@name` as `Token::Placeholder` under `SQLiteDialect`).
-pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), PersistenceError> {
+/// == next.span.start`) to an unquoted `Token::Word` (plus `Token::Number` after `@` or `:`).
+/// Fails closed with `PersistenceError::QueryFailed` on `TokenizerError`.
+pub(crate) fn validate_sqlite_placeholders(
+    statement: &str,
+    param_count: usize,
+) -> Result<(), PersistenceError> {
     use sqlparser::dialect::SQLiteDialect;
     use sqlparser::tokenizer::{Token, Tokenizer};
 
@@ -660,13 +668,16 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
             PersistenceError::QueryFailed(format!("failed to tokenize SQLite SQL: {e}"))
         })?;
 
+    let mut max_required: usize = 0;
+    let mut next_positional: usize = 1;
+
     for (idx, tok) in tokens.iter().enumerate() {
         match &tok.token {
             Token::Placeholder(placeholder) => {
                 // Why: SQLite allows `$` inside an unquoted identifier (e.g. `price$usd`),
                 // which `sqlparser`'s `SQLiteDialect` splits into `Word("price")` immediately
                 // adjacent to `Placeholder("$usd")`. Preserve identifiers containing `$` while
-                // still rejecting standalone `$name` bind parameters.
+                // still validating standalone `$...` bind parameters.
                 if placeholder.starts_with('$')
                     && idx > 0
                     && let Some(prev) = tokens.get(idx - 1)
@@ -676,9 +687,28 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
                 {
                     continue;
                 }
-                return Err(PersistenceError::QueryFailed(format!(
-                    "statement contains unbound SQLite placeholder '{placeholder}' with empty parameters"
-                )));
+
+                if placeholder == "?" {
+                    max_required = max_required.max(next_positional);
+                    next_positional = next_positional.saturating_add(1);
+                } else if let Some(rest) = placeholder.strip_prefix('?') {
+                    let pos = parse_positive_placeholder_index(rest, placeholder)?;
+                    max_required = max_required.max(pos);
+                    next_positional = pos.saturating_add(1);
+                } else if let Some(rest) = placeholder.strip_prefix('$') {
+                    if !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit()) {
+                        let pos = parse_positive_placeholder_index(rest, placeholder)?;
+                        max_required = max_required.max(pos);
+                    } else {
+                        return Err(PersistenceError::QueryFailed(format!(
+                            "statement contains unsupported SQLite named placeholder '{placeholder}'"
+                        )));
+                    }
+                } else {
+                    return Err(PersistenceError::QueryFailed(format!(
+                        "statement contains unsupported SQLite placeholder '{placeholder}'"
+                    )));
+                }
             }
             Token::Colon => {
                 if let Some(next) = tokens.get(idx + 1)
@@ -687,8 +717,7 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
                         || matches!(&next.token, Token::Number(_, _)))
                 {
                     return Err(PersistenceError::QueryFailed(
-                        "statement contains unbound SQLite named placeholder ':' with empty parameters"
-                            .into(),
+                        "statement contains unsupported SQLite named placeholder ':'".into(),
                     ));
                 }
             }
@@ -699,8 +728,7 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
                         || matches!(&next.token, Token::Number(_, _)))
                 {
                     return Err(PersistenceError::QueryFailed(
-                        "statement contains unbound SQLite named placeholder '@' with empty parameters"
-                            .into(),
+                        "statement contains unsupported SQLite named placeholder '@'".into(),
                     ));
                 }
             }
@@ -708,7 +736,35 @@ pub(crate) fn reject_unbound_sqlite_placeholders(statement: &str) -> Result<(), 
         }
     }
 
+    if param_count < max_required {
+        return Err(PersistenceError::QueryFailed(format!(
+            "SQLite statement requires at least {max_required} bound parameter(s), but only {param_count} provided"
+        )));
+    }
+
     Ok(())
+}
+
+fn parse_positive_placeholder_index(
+    digits: &str,
+    placeholder: &str,
+) -> Result<usize, PersistenceError> {
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(PersistenceError::QueryFailed(format!(
+            "invalid SQLite positional placeholder '{placeholder}'"
+        )));
+    }
+    let idx = digits.parse::<usize>().map_err(|_| {
+        PersistenceError::QueryFailed(format!(
+            "SQLite positional placeholder '{placeholder}' index out of range"
+        ))
+    })?;
+    if idx == 0 {
+        return Err(PersistenceError::QueryFailed(format!(
+            "SQLite positional placeholder '{placeholder}' must be >= 1"
+        )));
+    }
+    Ok(idx)
 }
 
 #[cfg(test)]
@@ -861,6 +917,179 @@ mod tests {
             .expect("bracketed identifier [BEGIN] should be allowed");
         tx.rollback().await.expect("rollback tx");
     }
+
+    #[tokio::test]
+    async fn sqlite_backend_and_tx_validate_placeholders_across_all_four_methods() {
+        let backend = SqliteBackend::in_memory().await.expect("in-memory sqlite");
+        backend
+            .execute("CREATE TABLE items (id INTEGER PRIMARY KEY, name TEXT, tag TEXT)")
+            .await
+            .expect("create table");
+        backend
+            .execute_params(
+                "INSERT INTO items (id, name, tag) VALUES (?, ?, ?)",
+                &[
+                    DbValue::Int(1),
+                    DbValue::Text("alpha".into()),
+                    DbValue::Text("v1".into()),
+                ],
+            )
+            .await
+            .expect("valid ? bind");
+        backend
+            .execute_params(
+                "INSERT INTO items (id, name, tag) VALUES ($1, $2, $3)",
+                &[
+                    DbValue::Int(2),
+                    DbValue::Text("beta".into()),
+                    DbValue::Text("v2".into()),
+                ],
+            )
+            .await
+            .expect("valid $1/$2/$3 bind");
+
+        // Backend: all 4 methods reject empty params, partial binds, and named placeholders.
+        for (sql, params) in [
+            ("UPDATE items SET name = ? WHERE id = ?", vec![]),
+            (
+                "UPDATE items SET name = ? WHERE id = ?",
+                vec![DbValue::Text("x".into())],
+            ),
+            (
+                "UPDATE items SET name = $1 WHERE id = $2",
+                vec![DbValue::Text("x".into())],
+            ),
+            (
+                "UPDATE items SET name = :name WHERE id = 1",
+                vec![DbValue::Text("x".into())],
+            ),
+            (
+                "UPDATE items SET name = @name WHERE id = 1",
+                vec![DbValue::Text("x".into())],
+            ),
+            (
+                "UPDATE items SET name = $name WHERE id = 1",
+                vec![DbValue::Text("x".into())],
+            ),
+        ] {
+            let err = backend
+                .execute_params(sql, &params)
+                .await
+                .expect_err(&format!("execute_params should fail for {sql}"));
+            assert!(matches!(err, PersistenceError::QueryFailed(_)));
+        }
+
+        for (sql, params) in [
+            ("SELECT name FROM items WHERE id = ? AND tag = ?", vec![]),
+            (
+                "SELECT name FROM items WHERE id = ? AND tag = ?",
+                vec![DbValue::Int(1)],
+            ),
+            (
+                "SELECT name FROM items WHERE id = $1 AND tag = $2",
+                vec![DbValue::Int(1)],
+            ),
+            (
+                "SELECT name FROM items WHERE id = :id",
+                vec![DbValue::Int(1)],
+            ),
+            (
+                "SELECT name FROM items WHERE id = @id",
+                vec![DbValue::Int(1)],
+            ),
+            (
+                "SELECT name FROM items WHERE id = $id",
+                vec![DbValue::Int(1)],
+            ),
+        ] {
+            assert!(matches!(
+                backend.query_scalar_params(sql, &params).await,
+                Err(PersistenceError::QueryFailed(_))
+            ));
+            assert!(matches!(
+                backend.fetch_all(sql, &params).await,
+                Err(PersistenceError::QueryFailed(_))
+            ));
+            assert!(matches!(
+                backend.fetch_optional(sql, &params).await,
+                Err(PersistenceError::QueryFailed(_))
+            ));
+        }
+
+        // Backend: valid positional `?` and `$1`/`$2` succeed on all read methods.
+        assert_eq!(
+            backend
+                .query_scalar_params(
+                    "SELECT name FROM items WHERE id = ? AND tag = ?",
+                    &[DbValue::Int(1), DbValue::Text("v1".into())],
+                )
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("alpha")
+        );
+        assert_eq!(
+            backend
+                .fetch_all(
+                    "SELECT name FROM items WHERE id = $1 AND tag = $2",
+                    &[DbValue::Int(2), DbValue::Text("v2".into())],
+                )
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            backend
+                .fetch_optional(
+                    "SELECT name FROM items WHERE id = ?1 AND tag = ?2",
+                    &[DbValue::Int(1), DbValue::Text("v1".into())],
+                )
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Transaction: all 4 methods enforce the same choke-point.
+        let tx = backend.begin_transaction().await.expect("begin tx");
+        assert!(matches!(
+            tx.execute_params(
+                "UPDATE items SET name = ? WHERE id = ?",
+                &[DbValue::Text("partial".into())],
+            )
+            .await,
+            Err(PersistenceError::QueryFailed(_))
+        ));
+        assert!(matches!(
+            tx.query_scalar_params("SELECT name FROM items WHERE id = ?", &[])
+                .await,
+            Err(PersistenceError::QueryFailed(_))
+        ));
+        assert!(matches!(
+            tx.fetch_all(
+                "SELECT name FROM items WHERE id = ? AND tag = ?",
+                &[DbValue::Int(1)],
+            )
+            .await,
+            Err(PersistenceError::QueryFailed(_))
+        ));
+        assert!(matches!(
+            tx.fetch_optional("SELECT name FROM items WHERE id = :id", &[DbValue::Int(1)],)
+                .await,
+            Err(PersistenceError::QueryFailed(_))
+        ));
+        assert_eq!(
+            tx.query_scalar_params(
+                "SELECT name FROM items WHERE id = $1 AND tag = $2",
+                &[DbValue::Int(2), DbValue::Text("v2".into())],
+            )
+            .await
+            .unwrap()
+            .as_deref(),
+            Some("beta")
+        );
+        tx.rollback().await.expect("rollback tx");
+    }
 }
 
 #[cfg(test)]
@@ -870,12 +1099,12 @@ mod data_sql_scanners_proptests {
 
     proptest! {
         #[test]
-        fn reject_unbound_sqlite_placeholders_never_panics_on_arbitrary_utf8(s in "\\PC*") {
-            let _ = reject_unbound_sqlite_placeholders(&s);
+        fn validate_sqlite_placeholders_never_panics_on_arbitrary_utf8(s in "\\PC*") {
+            let _ = validate_sqlite_placeholders(&s, 0);
         }
 
         #[test]
-        fn reject_unbound_sqlite_placeholders_always_rejects_unbound_markers(
+        fn validate_sqlite_placeholders_always_rejects_unbound_markers(
             ident in "[a-zA-Z_][a-zA-Z0-9_]{0,14}",
             digits in "[0-9]{1,4}",
         ) {
@@ -888,14 +1117,14 @@ mod data_sql_scanners_proptests {
                 format!("${ident}"),
             ] {
                 let sql = format!("SELECT * FROM t WHERE a = {ph}");
-                let err = reject_unbound_sqlite_placeholders(&sql)
+                let err = validate_sqlite_placeholders(&sql, 0)
                     .expect_err(&format!("expected QueryFailed for '{sql}'"));
                 prop_assert!(matches!(err, PersistenceError::QueryFailed(_)));
             }
         }
 
         #[test]
-        fn reject_unbound_sqlite_placeholders_permits_markers_in_quotes_comments_and_ids(
+        fn validate_sqlite_placeholders_permits_markers_in_quotes_comments_and_ids(
             ident in "[a-zA-Z_][a-zA-Z0-9_]{0,10}",
             pad in "[a-zA-Z0-9_ ]{0,8}",
         ) {
@@ -909,7 +1138,7 @@ mod data_sql_scanners_proptests {
                 format!("SELECT [{ident}@{ident}] FROM t;"),
             ] {
                 prop_assert!(
-                    reject_unbound_sqlite_placeholders(&sql).is_ok(),
+                    validate_sqlite_placeholders(&sql, 0).is_ok(),
                     "quoted/commented markers must be permitted: {sql}"
                 );
             }

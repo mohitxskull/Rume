@@ -771,7 +771,7 @@ pub mod fuzz_support {
         let _ = validate_managed_transaction_sql(statement, &sqlparser::dialect::SQLiteDialect {});
         let _ = validate_managed_mysql_transaction_sql(statement);
         let _ = mysql_sql_causes_implicit_commit(statement);
-        let _ = crate::persistence::sqlite::reject_unbound_sqlite_placeholders(statement);
+        let _ = crate::persistence::sqlite::validate_sqlite_placeholders(statement, 0);
     }
 }
 

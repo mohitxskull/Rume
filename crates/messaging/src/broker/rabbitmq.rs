@@ -1,6 +1,6 @@
 //! RabbitMQ [`MessageBroker`] implementation via `lapin`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::future::Future;
 use std::sync::Arc;
@@ -39,6 +39,7 @@ struct RabbitMqState {
     connection: Arc<lapin::Connection>,
     conn_gen: u64,
     publish_channel: Option<(u64, lapin::Channel)>,
+    declared_queues: HashSet<String>,
 }
 
 /// RabbitMQ-backed [`MessageBroker`].
@@ -69,6 +70,7 @@ impl RabbitMqBroker {
                 connection,
                 conn_gen: 1,
                 publish_channel: None,
+                declared_queues: HashSet::new(),
             })),
             prefetch_count: DEFAULT_PREFETCH_COUNT,
             durable: true,
@@ -86,6 +88,7 @@ impl RabbitMqBroker {
                 connection: Arc::new(connection),
                 conn_gen: 1,
                 publish_channel: None,
+                declared_queues: HashSet::new(),
             })),
             prefetch_count: DEFAULT_PREFETCH_COUNT,
             durable: true,
@@ -119,18 +122,18 @@ impl RabbitMqBroker {
                 .await
                 .map_err(|e| BrokerError::Transport(e.to_string()))?,
         );
-        state.conn_gen = state.conn_gen.wrapping_add(1);
+        let state = &mut *state;
+        let new_gen =
+            advance_connection_generation(&mut state.conn_gen, &mut state.declared_queues);
         state.connection = Arc::clone(&reconnected);
         if state
             .publish_channel
             .as_ref()
-            .is_some_and(|(cached_gen, _)| {
-                should_clear_channel_on_reconnect(*cached_gen, state.conn_gen)
-            })
+            .is_some_and(|(cached_gen, _)| should_clear_channel_on_reconnect(*cached_gen, new_gen))
         {
             state.publish_channel = None;
         }
-        Ok((state.conn_gen, reconnected))
+        Ok((new_gen, reconnected))
     }
 
     /// Returns a connected `lapin::Connection`, reconnecting transparently when `uri` is configured.
@@ -196,6 +199,54 @@ impl RabbitMqBroker {
             state.publish_channel = None;
         }
     }
+    /// Ensures the target queue is declared once per `conn_gen` before publishing to the
+    /// default exchange so messages published before any consumer subscribes are never
+    /// silently dropped by RabbitMQ (`RC-01`).
+    async fn ensure_queue_declared(
+        &self,
+        conn_gen: u64,
+        channel: &lapin::Channel,
+        topic: &str,
+    ) -> Result<(), BrokerError> {
+        {
+            let state = self.state.lock().await;
+            if state.conn_gen == conn_gen && state.declared_queues.contains(topic) {
+                return Ok(());
+            }
+        }
+
+        if let Err(e) = channel
+            .queue_declare(
+                topic.into(),
+                QueueDeclareOptions {
+                    durable: self.durable,
+                    ..Default::default()
+                },
+                FieldTable::default(),
+            )
+            .await
+        {
+            if !channel.status().connected() {
+                self.invalidate_publish_channel(conn_gen, channel.id())
+                    .await;
+            }
+            return Err(BrokerError::Transport(e.to_string()));
+        }
+
+        let mut state = self.state.lock().await;
+        if state.conn_gen == conn_gen {
+            state.declared_queues.insert(topic.to_string());
+        }
+        Ok(())
+    }
+}
+
+/// Advances `conn_gen` on reconnect and clears cached `declared_queues` so queues are
+/// re-declared against the new broker connection (`RC-01`).
+fn advance_connection_generation(conn_gen: &mut u64, declared_queues: &mut HashSet<String>) -> u64 {
+    *conn_gen = conn_gen.wrapping_add(1);
+    declared_queues.clear();
+    *conn_gen
 }
 
 /// Pure decision helper for `P2-04`: returns `true` iff a cached publish channel came from
@@ -348,6 +399,8 @@ impl BrokerPublisher for RabbitMqBroker {
     fn publish(&self, message: BrokerMessage) -> BoxFuture<'_, Result<(), BrokerError>> {
         Box::pin(async move {
             let (conn_gen, channel) = self.acquire_publish_channel().await?;
+            self.ensure_queue_declared(conn_gen, &channel, &message.topic)
+                .await?;
 
             let mut props =
                 BasicProperties::default().with_delivery_mode(AMQP_DELIVERY_MODE_PERSISTENT);
@@ -485,6 +538,20 @@ mod tests {
         // Reconnect clears channels from older generations and preserves current-generation channels.
         assert!(should_clear_channel_on_reconnect(1, 2));
         assert!(!should_clear_channel_on_reconnect(2, 2));
+    }
+
+    #[test]
+    fn declared_queues_cleared_when_conn_gen_advances() {
+        let mut conn_gen = 1;
+        let mut declared = HashSet::from(["orders".to_string(), "emails".to_string()]);
+
+        let next_gen = advance_connection_generation(&mut conn_gen, &mut declared);
+        assert_eq!(next_gen, 2);
+        assert_eq!(conn_gen, 2);
+        assert!(
+            declared.is_empty(),
+            "declared_queues must be cleared when conn_gen advances on reconnect"
+        );
     }
 
     #[test]

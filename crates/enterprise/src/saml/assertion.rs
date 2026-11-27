@@ -698,6 +698,11 @@ impl SamlParser {
                         capture.buf.push_str(&resolved);
                     }
                 }
+                Ok((_res, Event::DocType(_))) => {
+                    return Err(SamlError::Malformed(
+                        "DOCTYPE declarations are forbidden in SAML XML".into(),
+                    ));
+                }
                 Ok((_res, Event::Eof)) => {
                     if !element_stack.is_empty() {
                         return Err(SamlError::Malformed(

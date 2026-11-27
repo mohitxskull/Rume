@@ -5,5 +5,5 @@ pub mod csrf;
 pub mod headers;
 
 pub use audit::{AuditError, AuditLogger, AuditRecord, AuditStatus, SqlAuditLogger};
-pub use csrf::{CsrfConfig, CsrfLayer, CsrfService};
+pub use csrf::{CsrfConfig, CsrfConfigError, CsrfLayer, CsrfService, MIN_CSRF_SECRET_LEN};
 pub use headers::{SecurityHeadersConfig, SecurityHeadersLayer, SecurityHeadersService};
